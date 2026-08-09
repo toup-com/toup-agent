@@ -85,6 +85,11 @@ KNOWN_PROVIDER_APPS: frozenset[str] = frozenset({
     # rides the existing `microsoft` app.
     "jira",
     "notion",
+    # 2026-08-09 — Slack. Requests USER scopes (`user_scope`), so the
+    # token arrives nested under `authed_user`; both quirks are declared
+    # on the template. A bot token would be a different, much blinder
+    # product — see the manifest's opening comment.
+    "slack",
     "stub_provider_app",
 })
 

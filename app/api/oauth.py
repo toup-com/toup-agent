@@ -139,6 +139,7 @@ def _build_authorize_url(
     provider_name: str = "",
     force_account_selection: bool = False,
     extra_params: Optional[Mapping[str, str]] = None,
+    scope_param: str = "scope",
 ) -> str:
     """Compose the standard OAuth 2.0 authorize URL.
 
@@ -147,6 +148,13 @@ def _build_authorize_url(
     signed in. Drives the connected-card "Switch account" action;
     Google/Microsoft/GitHub all honour the standard OAuth 2.0 `prompt`
     parameter.
+
+    `scope_param` names the parameter the scope list rides in. It is
+    `scope` per RFC 6749 §3.1 for everyone except Slack, which issues a
+    BOT token for `scope` and a USER token for `user_scope` — see
+    `ProviderAppConfig.scope_param`. Only the chosen key is emitted; a
+    provider that partitions its scopes this way rejects an empty
+    counterpart rather than ignoring it.
 
     `provider_name` is the registered provider-app key (`google`,
     `microsoft`, `github`, `linkedin`). Used to apply provider-specific
@@ -161,7 +169,7 @@ def _build_authorize_url(
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": " ".join(scopes) if scopes else "",
+        scope_param: " ".join(scopes) if scopes else "",
         "state": state,
     }
     if use_pkce:
@@ -263,6 +271,32 @@ def _parse_token_response(r: httpx.Response) -> dict:
     return payload
 
 
+def _lift_nested_token(tokens: dict, key: str) -> dict:
+    """Overlay `tokens[key]`'s keys onto `tokens`, if it holds a dict.
+
+    OVERLAY, not replace, and that is the whole design. Slack's response
+    is `{ok, access_token: <bot>, team: {...}, authed_user: {id, scope,
+    access_token: <user>}}` on success and `{ok: false, error: …}` on
+    failure — with no `authed_user` at all. Replacing would delete the
+    error channel exactly when it is needed, and dropping `team` costs
+    the only workspace identifier in the response.
+
+    Nested keys win: that is the point, since the outer `access_token`
+    and the outer `scope` both describe the bot.
+    """
+    if not key:
+        return tokens
+    nested = tokens.get(key)
+    if not isinstance(nested, dict) or not nested:
+        # Not an error worth failing on. The caller's missing-
+        # `access_token` branch already reports the provider's own words,
+        # and it does so with more context than this function has.
+        return tokens
+    merged = dict(tokens)
+    merged.update(nested)
+    return merged
+
+
 async def _exchange_code_for_tokens(
     *,
     token_url: str,
@@ -275,6 +309,7 @@ async def _exchange_code_for_tokens(
     token_auth_style: str = "body",
     token_body_format: str = "form",
     extra_headers: Optional[Mapping[str, str]] = None,
+    token_lift_key: str = "",
 ) -> dict:
     """Standard PKCE token exchange. Returns the parsed token response.
 
@@ -286,6 +321,13 @@ async def _exchange_code_for_tokens(
     `_parse_token_response`. Nor does a 2xx mean success: GitHub returns
     HTTP 200 with an `error=` body, so the caller must check for
     `access_token` rather than trusting the status.
+
+    `token_lift_key` names a nested object whose keys are overlaid onto
+    the result (`ProviderAppConfig.token_lift_key`). Slack nests the USER
+    token under `authed_user` and keeps the top level for the bot token,
+    so without the lift the callback stores the wrong principal's
+    credential — a token that authenticates fine and then cannot see any
+    of the user's conversations.
     """
     body = {
         "grant_type": "authorization_code",
@@ -320,7 +362,7 @@ async def _exchange_code_for_tokens(
         # In-process: caller wires us through directly. Production never
         # hits this branch — real provider URLs are absolute.
         from app.api.oauth import _stub_token_exchange  # self-import OK
-        return await _stub_token_exchange(body)
+        return _lift_nested_token(await _stub_token_exchange(body), token_lift_key)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
         # `Accept` is load-bearing for GitHub and a no-op everywhere
@@ -332,7 +374,7 @@ async def _exchange_code_for_tokens(
         else:
             r = await client.post(token_url, data=body, headers=headers, auth=auth)
         r.raise_for_status()
-        return _parse_token_response(r)
+        return _lift_nested_token(_parse_token_response(r), token_lift_key)
 
 
 # ─── /connect ────────────────────────────────────────────────────────
@@ -448,6 +490,7 @@ async def oauth_connect(
         provider_name=app_cfg.name,
         force_account_selection=switch_account,
         extra_params=app_cfg.extra_authorize_params,
+        scope_param=app_cfg.scope_param,
     )
 
     # T1d Q2: absolutise stub authorize URLs so the frontend's
@@ -658,6 +701,7 @@ async def oauth_callback(
             token_auth_style=app_cfg.token_auth_style,
             token_body_format=app_cfg.token_body_format,
             extra_headers=app_cfg.extra_token_headers,
+            token_lift_key=app_cfg.token_lift_key,
         )
     except (httpx.HTTPError, TokenResponseUnparseable) as e:
         await db.rollback()

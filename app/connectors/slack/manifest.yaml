@@ -1,0 +1,273 @@
+# Slack connector manifest.
+#
+# ── Why USER tokens and not a bot token ───────────────────────────────
+# Slack's OAuth v2 issues two different tokens from one install: a BOT
+# token (`xoxb-`, from the `scope` param) and a USER token (`xoxp-`,
+# from `user_scope`). They are not two spellings of the same thing —
+# they see different workspaces:
+#
+#   A bot can only read a channel it has been INVITED to, and it cannot
+#   see the user's DMs at all (`im:history` for a bot means "DMs with
+#   the bot"). So "what did I miss in #eng?" answers "I'm not in that
+#   channel" until the user runs /invite in every channel they care
+#   about, and "what did Sara DM me?" can never work.
+#
+#   A user token sees exactly what the user sees, and `search.messages`
+#   — the single most useful thing an agent can do with Slack — is
+#   user-token-only. Slack does not expose search to bots at all.
+#
+# It also matches every other connector here: Gmail reads your mail,
+# Jira comments as you, Teams sends as you. So Toup requests USER
+# scopes only, and messages it sends are from the user, not from an app.
+# That is a deliberate trade: it means there is no "Toup" bot identity
+# in the workspace, and a message the agent sends is indistinguishable
+# from one the user typed. `slack__send_message` is therefore both
+# `mutates` and `elevation` — it goes out under the user's name into a
+# conversation other people are reading.
+#
+# The mechanical consequence is that `access_token` is NOT at the top
+# level of Slack's token response — it is nested under `authed_user`.
+# `ProviderAppConfig.token_lift_key` lifts it; see `_TEMPLATES["slack"]`.
+#
+# ── Why eleven scopes ─────────────────────────────────────────────────
+# Slack partitions read access by conversation TYPE, and each type needs
+# a separate list scope and history scope. There is no umbrella scope.
+# Dropping `im:*` would make the connector silently blind to DMs, which
+# is where most of a person's Slack actually is; dropping `mpim:*` does
+# the same to group DMs. Every scope below is required by a declared
+# tool — nothing is requested speculatively.
+#
+# Deliberately NOT requested, and each one is a real capability we are
+# giving up: `files:read` (file contents), `users:read.email` (email
+# addresses), `chat:write.public` (posting to channels the user has not
+# joined), `reactions:write`, `channels:write`, and every `admin.*`
+# scope. See `scope_descriptions` for the ones users are most likely to
+# ask about.
+#
+# ── Status: beta ──────────────────────────────────────────────────────
+# No live round-trip has been observed yet: Slack requires an app
+# registered at api.slack.com/apps with our redirect URL, and public
+# distribution activated before anyone outside that workspace can
+# install it. Flip to `stable` after a real connect + read + send.
+manifest_version: 1
+id: slack
+name: Slack
+short_description: Read and search your Slack conversations, and send messages as you.
+icon: slack
+docs_url: https://api.slack.com/methods
+status: beta
+category: communication
+
+oauth:
+  provider_app: slack
+  # Sent as `user_scope`, not `scope` — see `token_lift_key` /
+  # `scope_param` in provider_apps.py. Slack's own docs call these
+  # "user token scopes".
+  scopes:
+    - channels:read
+    - channels:history
+    - groups:read
+    - groups:history
+    - im:read
+    - im:history
+    - mpim:read
+    - mpim:history
+    - chat:write
+    # Opens a DM conversation with someone the user has never messaged.
+    # Without it "@sara" can only be resolved to an EXISTING DM, so
+    # messaging a new person fails — and `conversations.open` is the
+    # only way to get that channel id. It creates a conversation; it
+    # grants no additional read.
+    - im:write
+    - users:read
+    - search:read
+  scopes_optional: []
+  # Slack OAuth v2 has no PKCE. Its documented authorize parameters are
+  # client_id / scope / user_scope / redirect_uri / state / team, and
+  # the token endpoint takes no `code_verifier`.
+  pkce: false
+  # Slack user tokens do not expire unless the app owner switches on
+  # "token rotation", in which case the token response carries
+  # `refresh_token` + `expires_in` and the vault picks them up with no
+  # change here. `provider.refresh()` implements the rotation exchange
+  # so that switch is a config change rather than a code change.
+  refresh: false
+
+scope_descriptions:
+  channels:read: List the public channels in your workspace.
+  channels:history: Read messages in public channels you can see.
+  groups:read: List the private channels you are a member of.
+  groups:history: Read messages in those private channels.
+  im:read: List your direct-message conversations.
+  im:history: Read your direct messages.
+  mpim:read: List your group direct messages.
+  mpim:history: Read messages in your group direct messages.
+  chat:write: Send messages as you. Anything sent appears under your own name.
+  im:write: Start a direct message with someone you have not messaged before.
+  users:read: Look up display names, so the agent can say "Sara" instead of "U04J1F2".
+  search:read: Search your Slack history the way Slack's own search box does.
+  files:read: Not requested. Would expose the contents of files shared in your workspace.
+  users:read.email: Not requested. Would expose every member's email address.
+  chat:write.public: Not requested. Would let messages be posted to channels you have not joined.
+
+health:
+  probe: slack__list_channels
+
+tools:
+  - name: slack__list_channels
+    description: |
+      List Slack conversations the user belongs to or can see — public channels, private channels, group DMs and 1:1 DMs. Returns the `id` needed by every other Slack tool. 1:1 DMs have no name; they carry `user_name` instead, so this is also how to find the conversation with a particular person. Slack returns conversations in no useful order, so filter with `types` and `name_contains` rather than paging blindly.
+    input_schema:
+      type: object
+      properties:
+        types:
+          type: string
+          description: 'Comma-separated subset of: public_channel, private_channel, mpim, im. Default covers all four.'
+          default: public_channel,private_channel,mpim,im
+        name_contains:
+          type: string
+          description: Case-insensitive substring filter on channel name (or the other person''s name, for a DM). Applied after fetching.
+        exclude_archived:
+          type: boolean
+          default: true
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 100
+        cursor:
+          type: string
+          description: Pagination cursor from a previous call's next_cursor.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["channels"]
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__read_messages
+    description: |
+      Read recent messages from one Slack conversation, newest first. Pass a `channel` id from slack__list_channels (a `#name` or `@name` also works and is resolved for you). To read a THREAD rather than the main conversation, pass the parent message's `thread_ts` — there is no separate thread tool. Messages whose `reply_count` is above zero have a thread worth reading; the main view shows only the parent. User ids are resolved to display names.
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Channel id (C…/G…/D…), or "#general", or "@sara".
+        thread_ts:
+          type: string
+          description: Timestamp of a parent message. When set, returns that thread's replies instead of the channel's main messages.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 30
+        oldest:
+          type: string
+          description: Unix timestamp (seconds, may be fractional). Only messages at or after this point. Use for "since yesterday".
+        cursor:
+          type: string
+          description: Pagination cursor from a previous call's next_cursor.
+      required: [channel]
+    mutates: false
+    elevation: false
+    output_redaction: ["messages"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__search_messages
+    description: |
+      Search the user's whole Slack history — every channel and DM they can see — using Slack's own search syntax. Supports modifiers like `in:#eng`, `from:@sara`, `before:2026-08-01`, `has:link` and quoted phrases. This is the right first move for "find the message where…" or "what did we decide about…"; it is far cheaper than reading channels one at a time.
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+          description: 'Search terms plus optional Slack modifiers, e.g. ''deploy plan in:#eng from:@sara''.'
+        sort:
+          type: string
+          enum: [score, timestamp]
+          description: score = most relevant (default), timestamp = most recent.
+          default: score
+        count:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+        page:
+          type: integer
+          minimum: 1
+          default: 1
+      required: [query]
+    mutates: false
+    elevation: false
+    output_redaction: ["matches"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__send_message
+    description: |
+      Send a Slack message AS THE USER — it appears under their own name and photo, indistinguishable from one they typed. Pass a `channel` id from slack__list_channels, or "#general", or "@sara" (a DM conversation is opened if one does not exist). Set `thread_ts` to reply inside a thread instead of posting to the channel. Slack `mrkdwn` is supported: *bold*, _italic_, `code`, <https://url|label>, and <@U123> to mention someone.
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Channel id (C…/G…/D…), or "#general", or "@sara".
+        text:
+          type: string
+          description: Message body, in Slack mrkdwn.
+        thread_ts:
+          type: string
+          description: Parent message timestamp. When set, the message is posted as a threaded reply.
+        reply_broadcast:
+          type: boolean
+          description: With thread_ts, also show the reply in the main channel. Ignored otherwise.
+          default: false
+      required: [channel, text]
+    mutates: true
+    elevation: true
+    rate_limit: 10/min
+    output_redaction: []
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__list_users
+    description: |
+      List members of the Slack workspace with their display names, real names, ids and whether they are a bot or deactivated. Use it to turn "Sara" into the `@name` or user id that slack__send_message and search's `from:` modifier need. Deactivated members and bots are excluded by default. Email addresses are never returned — Toup does not request that scope.
+    input_schema:
+      type: object
+      properties:
+        name_contains:
+          type: string
+          description: Case-insensitive substring matched against display name, real name and handle.
+        include_bots:
+          type: boolean
+          default: false
+        include_deactivated:
+          type: boolean
+          default: false
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 100
+        cursor:
+          type: string
+          description: Pagination cursor from a previous call's next_cursor.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["users"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []

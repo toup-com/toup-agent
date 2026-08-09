@@ -81,6 +81,30 @@ class ProviderAppConfig:
     # other provider in this repo versions its OAuth endpoint at all.
     extra_token_headers: Mapping[str, str] = field(default_factory=dict)
 
+    # Which authorize-URL parameter carries the manifest's scope list.
+    # RFC 6749 §3.1 says `scope` and everyone here uses it except Slack,
+    # whose one install issues TWO tokens from TWO scope lists: `scope`
+    # grants a bot token, `user_scope` grants a user token. They are not
+    # interchangeable — a bot cannot read a channel it was not invited
+    # to, cannot see the user's DMs, and cannot use `search.messages` at
+    # all. Toup asks for `user_scope`, so the agent sees what the person
+    # sees. Sending Slack's scopes under `scope` would look like it
+    # worked and hand back a token to the wrong principal.
+    scope_param: str = "scope"
+
+    # Key of a nested object in the token response to lift onto the top
+    # level. The corollary of `scope_param` above: when the grant is for
+    # user scopes, Slack puts the user's `access_token` (and, under token
+    # rotation, `refresh_token` / `expires_in`) inside `authed_user`, and
+    # leaves the top-level `access_token` for the bot. The callback reads
+    # `tokens["access_token"]`, so without this it would either store the
+    # bot token or find nothing at all.
+    #
+    # Lift, not replace: the outer object still carries `team` and — on
+    # failure — `error`, and the error path must keep working. Nested
+    # keys win, which is exactly the intent.
+    token_lift_key: str = ""
+
 
 # Module-level registry. Populated at platform lifespan; cleared via
 # `reset_for_tests` when needed.
@@ -177,6 +201,30 @@ _TEMPLATES: dict[str, dict] = {
         "token_body_format": "json",
         "extra_token_headers": {"Notion-Version": "2026-03-11"},
     },
+    "slack": {
+        # Slack OAuth v2. Two deviations, and they are the same deviation
+        # seen from both ends of the flow: Toup asks for USER scopes, so
+        # the scope list goes out as `user_scope` and the token comes
+        # back inside `authed_user`. See the field comments on
+        # `scope_param` / `token_lift_key` for why a bot token is the
+        # wrong principal for this product.
+        #
+        # No PKCE: Slack's documented authorize parameters are client_id,
+        # scope, user_scope, redirect_uri, state and team — there is no
+        # `code_challenge`, and the token endpoint takes no verifier.
+        #
+        # Note that a Slack failure is an HTTP 200 carrying
+        # `{"ok": false, "error": …}`. The callback's
+        # missing-`access_token` branch is what catches it, reading the
+        # top-level `error` — which survives the lift precisely because
+        # the lift only overlays keys and a failed response has no
+        # `authed_user` to overlay.
+        "authorize_url": "https://slack.com/oauth/v2/authorize",
+        "token_url": "https://slack.com/api/oauth.v2.access",
+        "use_pkce": False,
+        "scope_param": "user_scope",
+        "token_lift_key": "authed_user",
+    },
     "stub_provider_app": {
         "authorize_url": "/api/oauth/_stub/authorize",
         "token_url": "/api/oauth/_stub/token",
@@ -271,6 +319,8 @@ async def get_provider_app_async(name: str) -> Optional[ProviderAppConfig]:
                 token_auth_style=template.get("token_auth_style", "body"),
                 token_body_format=template.get("token_body_format", "form"),
                 extra_token_headers=template.get("extra_token_headers", {}),
+                scope_param=template.get("scope_param", "scope"),
+                token_lift_key=template.get("token_lift_key", ""),
             )
     except Exception as e:
         # Never block /connect on a transient DB hiccup — fall through
