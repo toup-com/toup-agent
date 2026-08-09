@@ -537,6 +537,17 @@ async def get_memory_with_relations(
     db: AsyncSession = Depends(get_db)
 ):
     """Get a memory with its related memories and entities"""
+    # The web app's memory detail view calls this; unproxied it read the
+    # platform DB's stale monolith rows and 404'd (or answered from 2026-05
+    # data) for every user with an active agent — i.e. all of them.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(
+            proxy[0], proxy[1], f"{memory_id}/related", params={"depth": depth}
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     memory = await service.get_memory(memory_id, current_user.id)
     
@@ -722,6 +733,15 @@ async def get_memories_by_region(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memories by brain region (deprecated, use /category/{category})"""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(
+            proxy[0], proxy[1], f"region/{region}",
+            params={"limit": limit, "offset": offset},
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     memories = await service.get_memories_by_category(
         current_user.id, region, limit, offset
@@ -738,8 +758,19 @@ async def get_memories_by_type(
     db: AsyncSession = Depends(get_db)
 ):
     """Get memories by type"""
+    # Called by the web app's type-filtered memory list (api.ts). Same class
+    # as /related: the real rows live in the tenant DB.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(
+            proxy[0], proxy[1], f"type/{memory_type.value}",
+            params={"limit": limit, "offset": offset},
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     from sqlalchemy import select, and_
-    
+
     result = await db.execute(
         select(Memory)
         .where(
@@ -773,8 +804,18 @@ async def get_memory_events(
     Events include: created, accessed, reinforced, decayed, consolidated, updated, deleted.
     This provides a complete history of all operations on the memory.
     """
+    # memory_events is AGENT_ONLY too — an unproxied read shows an empty
+    # audit trail for a memory that has a real one on the tenant.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(
+            proxy[0], proxy[1], f"{memory_id}/events", params={"limit": limit}
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
-    
+
     # First verify the memory belongs to this user
     memory = await service.get_memory(memory_id, current_user.id)
     if not memory:
@@ -854,6 +895,12 @@ async def get_memory_history(
     Returns the complete history of how this memory changed over time,
     including all versions, merge events, and change summaries.
     """
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], f"{memory_id}/history")
+        if data is not None:
+            return JSONResponse(content=data)
+
     service = MemoryService(db)
     history = await service.get_memory_history(memory_id, current_user.id)
     
@@ -890,6 +937,24 @@ async def deduplicate_memories(
         brain_type: Optional brain type to limit scan
         dry_run: If True, just report what would be merged without doing it
     """
+    # A WRITE (it retires rows via is_active=False). Unproxied, it merged the
+    # platform DB's stale monolith rows while the user's real duplicates sat
+    # untouched on the tenant — and reported success. Writes must reach the
+    # tenant or 502 (`_proxy_memories_write` contract); dry_run goes through
+    # the same door because a report computed from the wrong database is a
+    # lie with a smaller blast radius, not a safe fallback.
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        _params = {"dry_run": dry_run}
+        if category is not None:
+            _params["category"] = category
+        if brain_type is not None:
+            _params["brain_type"] = brain_type
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], "deduplicate", "POST", params=_params
+        )
+        return JSONResponse(content=data or {})
+
     from app.services.memory_dedup_service import MemoryDedupService
     _key = await _get_user_api_key(db, current_user.id)
     dedup_service = MemoryDedupService(db, api_key=_key)
@@ -924,6 +989,17 @@ async def get_duplicate_report(
     
     Returns statistics and detailed groups of potential duplicates.
     """
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        _params = {"threshold": threshold}
+        if category is not None:
+            _params["category"] = category
+        data = await _proxy_memories(
+            proxy[0], proxy[1], "duplicates/report", params=_params
+        )
+        if data is not None:
+            return JSONResponse(content=data)
+
     from app.services.memory_dedup_service import MemoryDedupService
     _key = await _get_user_api_key(db, current_user.id)
     dedup_service = MemoryDedupService(db, api_key=_key)
@@ -952,9 +1028,44 @@ async def merge_into_memory(
     
     The merge is tracked in the memory's history.
     """
+    # Never-store backstop, same as create_memory and update_memory: this
+    # route calls MemoryDedupService._merge_memories directly, which UPDATES
+    # an existing row — it passes through neither smart_create_memory's full
+    # gate nor create_memory's storage backstop, so a card number refused at
+    # create and update was still accepted here, as a query parameter.
+    # Never-store tier only (a manual merge is an explicit user action).
+    #
+    # It runs FIRST because it is a pure function: checking before proxying
+    # keeps the 422 (with its reason) instead of letting the tenant's refusal
+    # come back through the write proxy as a generic 502. The tenant enters
+    # this same handler at the top, so it runs the identical check locally.
+    _secret_early = sensitive_content_reason(new_content or "", explicit_save=True)
+    if _secret_early:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "That content carries a value we never store "
+                f"({_secret_early.removeprefix('sensitive_')}). "
+                "Card numbers, government identity numbers and API keys are "
+                "refused on every path."
+            ),
+        )
+
+    # A WRITE against an existing row. Unproxied, the row it looked up lived
+    # in the platform DB — real memories on the tenant 404'd, and any stale
+    # monolith row with the same id got silently rewritten. Must 502, never
+    # fall back (same contract as PATCH/DELETE above).
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], f"{memory_id}/merge", "POST",
+            params={"new_content": new_content, "source_type": source_type},
+        )
+        return JSONResponse(content=data or {})
+
     from app.services.memory_dedup_service import MemoryDedupService
     from app.schemas import MemoryCreate, BrainType, MemoryType
-    
+
     service = MemoryService(db)
     
     # First verify the memory exists and belongs to user
@@ -965,29 +1076,6 @@ async def merge_into_memory(
             detail="Memory not found"
         )
     
-    # Never-store backstop, same as create_memory and update_memory.
-    #
-    # This route calls MemoryDedupService._merge_memories directly, which
-    # UPDATES an existing row — so it passes through neither smart_create_
-    # memory's full gate nor create_memory's storage backstop. A card number
-    # refused at create and refused at update was still accepted here, as a
-    # query parameter.
-    #
-    # Never-store tier only: a manual merge is an explicit user action, so the
-    # junk rules (which ask "did the user actually state this?") do not apply —
-    # the same argument create_memory makes for its own backstop.
-    _secret = sensitive_content_reason(new_content or "", explicit_save=True)
-    if _secret:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "That content carries a value we never store "
-                f"({_secret.removeprefix('sensitive_')}). "
-                "Card numbers, government identity numbers and API keys are "
-                "refused on every path."
-            ),
-        )
-
     _key = await _get_user_api_key(db, current_user.id)
     dedup_service = MemoryDedupService(db, api_key=_key)
 
