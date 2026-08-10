@@ -86,11 +86,19 @@ def _render_platform_knowledge(voice: bool) -> str:
 def _channel_guidance_for(channel: str) -> str:
     """The real guidance string for one channel.
 
-    ``_channel_guidance`` is not a dict — it is ``{...}.get(_channel_safe,
+    ``_channel_guidance`` is not a dict — it is ``<table>.get(_channel_safe,
     <fallback>)``, i.e. already resolved at the assignment. Evaluating the
     whole Call rather than digging the Dict out of it means the lookup and
     its fallback are exercised too, which is what the model actually sees.
+
+    The table itself moved to module level as ``CHANNEL_GUIDANCE`` (G-19b,
+    so policy tests can reference it by name), so it is supplied to the
+    eval namespace here. Evaluating the assignment expression — rather
+    than calling the dict directly — is deliberate: it keeps the fallback
+    branch inside what this helper covers.
     """
+    from app.agent.agent_runner import CHANNEL_GUIDANCE
+
     tree = ast.parse(_AGENT_RUNNER.read_text())
     for node in ast.walk(tree):
         if (
@@ -100,7 +108,11 @@ def _channel_guidance_for(channel: str) -> str:
             and node.targets[0].id == "_channel_guidance"
         ):
             code = compile(ast.Expression(body=node.value), "<cg>", "eval")
-            return eval(code, {"__builtins__": {}}, {"_channel_safe": channel})  # noqa: S307
+            return eval(  # noqa: S307
+                code,
+                {"__builtins__": {}},
+                {"_channel_safe": channel, "CHANNEL_GUIDANCE": CHANNEL_GUIDANCE},
+            )
     raise AssertionError("_channel_guidance assignment not found")
 
 

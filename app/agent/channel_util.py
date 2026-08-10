@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Channels the agent recognizes end-to-end. Keep in sync with
 # channel_util tests, CHANNEL_GUIDANCE in agent_runner, and the
 # RadioSessionManager.RADIO_ALLOWED_CHANNELS (which is a subset).
+# The background channels (trigger/routine/autopilot/subagent) are
+# established policy values — connector_dispatcher's deny sets and the
+# per-channel prompt code key on them — but each fired the per-turn
+# unknown_value warning below until they were admitted here (G-19b).
 KNOWN_CHANNELS = frozenset({
     "web",
     "app",
@@ -38,6 +42,10 @@ KNOWN_CHANNELS = frozenset({
     "vibecoding",
     "extension",  # Chrome side-panel chat — first-class Day-as-Chat channel
     "agent",  # internal / legacy
+    "trigger",  # unattended email_received turn (G-19b runner path)
+    "routine",  # scheduled agent_task turn (routines runner)
+    "autopilot",  # autonomous mission tick
+    "subagent",  # spawned child run
 })
 
 

@@ -89,6 +89,7 @@ class TriggerRunner:
             session_maker = _proxy  # type: ignore[assignment]
         self._session_maker = session_maker
         self._mcp_client = mcp_client
+        self._agent_runner: Any = None
         self._retry_delays = retry_delays or self.DEFAULT_RETRY_DELAYS
         self._limiter = TriggerRateLimiter()
         self._running = False
@@ -106,6 +107,17 @@ class TriggerRunner:
         for handler in KIND_HANDLERS.values():
             if hasattr(handler, "_mcp_client"):
                 handler._mcp_client = mcp_client
+
+    def set_agent_runner(self, agent_runner: Any) -> None:
+        """Wire the AgentRunner ref — same push pattern as
+        `set_mcp_client`. Handlers use it for the flag-gated
+        `trigger_turns_via_runner` path (G-19b); with no ref wired the
+        handlers keep the bare-summarize behaviour regardless of the
+        flag."""
+        self._agent_runner = agent_runner
+        for handler in KIND_HANDLERS.values():
+            if hasattr(handler, "_agent_runner"):
+                handler._agent_runner = agent_runner
 
     def set_session_maker(self, session_maker: async_sessionmaker) -> None:
         self._session_maker = session_maker

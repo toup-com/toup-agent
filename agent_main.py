@@ -934,6 +934,12 @@ async def lifespan(app: FastAPI):
             # call at module load.
             from app.agent.triggers import email_received_handler  # noqa: F401
             trigger_runner = TriggerRunner()
+            # G-19b: hand the AgentRunner to the trigger handlers so the
+            # flag-gated email_received turn (trigger_turns_via_runner)
+            # can run the full pipeline. Unlike the MCP client (which
+            # late-binds via mcp_bootstrap), the AgentRunner already
+            # exists at this lifespan point — wire it at construction.
+            trigger_runner.set_agent_runner(agent_runner)
             await trigger_runner.start()
             from app.api.triggers_inbound import set_runner_ref as set_triggers_runner_ref
             set_triggers_runner_ref(trigger_runner)
