@@ -1120,8 +1120,12 @@ def test_extraction_records_the_slot_it_used():
     import inspect
     from app.api import media_proxy as mp
 
-    src = inspect.getsource(mp._extract_audio)
+    # The chain body lives in `_extract_audio_via` since the egress-tier split
+    # (2026-08-10); the invariant is unchanged — slot AND tier travel with the
+    # result, because the byte-pump must leave from the address that signed it.
+    src = inspect.getsource(mp._extract_audio_via)
     assert '"proxy_slot": slot' in src, "the extraction result must carry its slot"
+    assert '"proxy_tier": tier' in src, "the extraction result must carry its tier"
     assert "opts[\"proxy\"] = proxy" in src, "extraction must use the pooled proxy"
 
 

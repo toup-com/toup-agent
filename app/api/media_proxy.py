@@ -264,9 +264,44 @@ def _is_proxy_outage(err: BaseException) -> bool:
     True means: out of prepaid traffic, bad credentials, or the proxy is down.
     Whole-platform, operator-actionable, and identical for every video — as
     opposed to a bot-block or an unavailable video, which are per-request.
+
+    NOTE: a device-lock 403 (`_is_proxy_busy`) also matches these markers, so
+    callers that can fall back must check busy FIRST — busy is transient by
+    construction and must not raise the platform-wide outage alarm.
     """
     msg = str(err).lower()
     return any(m in msg for m in _PROXY_OUTAGE_MARKERS)
+
+
+# The proxy's own CONNECT rejection when another source IP holds its bind.
+# 403 specifically: auth failures are 407, exhausted credit is 402 — both
+# durable outages. 403 at CONNECT is "come back in a few seconds".
+_PROXY_BUSY_MARKER = "tunnel connection failed: 403"
+
+
+def _is_proxy_busy(err: BaseException) -> bool:
+    """Did the egress proxy refuse the CONNECT because its device-lock is held?
+
+    IPRoyal static (ISP) proxies are IP-BOUND: one source IP may use them at a
+    time, and the bind is a ~10s sticky window from connection start (measured
+    2026-08-10 — a second source IP gets a CONNECT 403 from the proxy itself,
+    then succeeds once the window lapses; tunnels already established survive
+    a takeover). platform-api runs 2 replicas with distinct egress IPs, so
+    concurrent cold plays on different replicas collide exactly this way.
+    Transient, NOT an outage.
+
+    TWO phrasings for the SAME event, and both call sites are live: yt-dlp
+    (extraction) wraps urllib's `Tunnel connection failed: 403 Forbidden`,
+    while httpx (spool download, stream byte-pump) raises `ProxyError("403
+    Forbidden")` — no "tunnel" substring at all. Matching only the urllib
+    phrasing made the stream path's busy recovery dead code on 2026-08-10
+    (prod log: `spool FAILED …: 403 Forbidden`); an upstream googlevideo 403
+    can never reach here as an exception (it arrives as a response object),
+    so the ProxyError isinstance check cannot over-match."""
+    msg = str(err).lower()
+    if _PROXY_BUSY_MARKER in msg:
+        return True
+    return isinstance(err, httpx.ProxyError) and "403" in msg
 
 
 _RESOLVED_COOKIEFILE: str | None = None
@@ -352,14 +387,65 @@ def _proxy_slot_for(video_id: str) -> int:
     return int(hashlib.sha256(video_id.encode()).hexdigest()[:8], 16) % _PROXY_SESSION_POOL
 
 
-def _proxy_with_slot(slot: int) -> str | None:
-    """The configured proxy URL with its sticky-session token varied by `slot`.
+def _proxy_base(tier: str) -> str:
+    """The configured proxy URL for an egress tier.
+
+    "primary" is `yt_dlp_proxy` (in production: a static ISP IP — fast, but
+    IP-bound to one source at a time); "fallback" is `yt_dlp_proxy_fallback`
+    (the rotating residential gateway — slower, no device-lock). An unset
+    fallback returns "" and every fallback engagement point checks
+    `_fallback_available` first, so a single-proxy config behaves
+    byte-identically to before tiers existed.
+    """
+    if tier == "fallback":
+        return (settings.yt_dlp_proxy_fallback or "").strip()
+    return (settings.yt_dlp_proxy or "").strip()
+
+
+def _fallback_available() -> bool:
+    """Is there a DISTINCT fallback egress worth engaging?
+
+    Equal URLs make every "retrying via fallback tier" log line a lie and
+    double the latency of every honest failure for zero benefit — a config
+    slip the order form invites ("set both"), so it is neutralized here
+    rather than documented against (adversarial review, 2026-08-10).
+    """
+    fb = _proxy_base("fallback")
+    return bool(fb) and fb != _proxy_base("primary")
+
+
+# Circuit breaker for a DURABLY failing primary. A bot-flagged or dead-creds
+# primary otherwise costs every uncached play the full 5-attempt primary
+# chain (10s+ of tail) before the fallback saves it. Busy NEVER trips this —
+# the device-lock is a ~10s window and skipping the primary for minutes over
+# it would hand routine collisions a permanent residential demotion.
+_PRIMARY_BREAK_SECS = float(os.environ.get("AUDIO_PRIMARY_BREAK_SECS", "120"))
+_primary_down_until: float = 0.0
+
+
+def _primary_broken() -> bool:
+    return time.monotonic() < _primary_down_until
+
+
+def _trip_primary_breaker(reason: str, video_id: str) -> None:
+    global _primary_down_until
+    _primary_down_until = time.monotonic() + _PRIMARY_BREAK_SECS
+    logger.error(
+        "[media_proxy] PRIMARY BREAKER tripped (%s) — extraction goes "
+        "straight to the fallback tier for %.0fs. video_id=%s",
+        reason, _PRIMARY_BREAK_SECS, video_id,
+    )
+
+
+def _proxy_with_slot(slot: int, tier: str = "primary") -> str | None:
+    """The tier's proxy URL with its sticky-session token varied by `slot`.
 
     Returns the URL untouched for slot 0, for a provider whose URL carries no
-    session token, and for anything it cannot parse — a proxy we fail to
-    understand must still be used exactly as configured, never dropped.
+    session token (the static primary), and for anything it cannot parse — a
+    proxy we fail to understand must still be used exactly as configured,
+    never dropped.
     """
-    base = (settings.yt_dlp_proxy or "").strip()
+    base = _proxy_base(tier)
     if not base:
         return None
     if not slot:
@@ -380,15 +466,66 @@ def _proxy_for_result(result: dict) -> str | None:
 
     A cached extraction from before this shipped has no slot; treating that as
     slot 0 is exactly right, because it WAS taken through the unmodified URL.
+    Same for `proxy_tier`: absent means primary, which is what every result
+    predating tiers was extracted through. googlevideo signs the URL to the
+    extracting IP, so a fallback-tier result MUST be fetched via the fallback
+    egress — if the operator unsets the fallback env while such a result is
+    cached, this returns None (direct fetch), googlevideo 403s the mismatch,
+    and the existing 403/410 purge-and-re-extract path self-heals it.
     """
+    tier = "fallback" if result.get("proxy_tier") == "fallback" else "primary"
     try:
-        return _proxy_with_slot(int(result.get("proxy_slot") or 0))
+        return _proxy_with_slot(int(result.get("proxy_slot") or 0), tier)
     except (TypeError, ValueError):
-        return _proxy_with_slot(0)
+        return _proxy_with_slot(0, tier)
 
 
 def _extract_audio(video_id: str) -> dict:
-    """Blocking extract; callers must run in a thread / executor.
+    """Blocking extract with EGRESS TIERS; callers run it in an executor.
+
+    Tries the primary egress first. Three failure classes there engage the
+    fallback tier when one is configured (`yt_dlp_proxy_fallback`):
+
+      • proxy_busy — the static primary's device-lock is held by the other
+        replica (see `_is_proxy_busy`); transient, the fallback serves NOW.
+      • proxy_unavailable — dead credentials / no credit / proxy down. This
+        is the 2026-08-10 morning incident: the provider rotated the primary's
+        credentials and every uncached play 502'd platform-wide; with a
+        fallback configured the same event costs one WARNING line instead.
+      • all_clients_blocked — YouTube bot-flagged the primary IP itself (how
+        the first two US ISP draws died). Static IPs can burn at any time;
+        falling back turns that into degraded speed instead of dead audio.
+
+    Permanent per-video errors (private/removed/region-locked) abort on the
+    primary WITHOUT a fallback attempt — a second chain can't fix the video
+    and would double the latency of every honest failure.
+
+    The winning tier is stamped into the result as `proxy_tier`, and every
+    byte-fetch reads it back via `_proxy_for_result` — googlevideo signs the
+    URL to the extracting IP, so extraction and bytes must share an egress.
+    """
+    slot = _proxy_slot_for(video_id)
+    if _primary_broken() and _fallback_available():
+        return _extract_audio_via(video_id, slot, "fallback")
+    result = _extract_audio_via(video_id, slot, "primary")
+    err = result.get("error")
+    if err in ("proxy_busy", "proxy_unavailable", "all_clients_blocked") and _fallback_available():
+        if err != "proxy_busy":
+            # Durable primary failure (dead creds / bot-flagged IP): stop
+            # paying the full primary chain on every uncached play until the
+            # breaker window lapses. Busy never trips it — see the breaker note.
+            _trip_primary_breaker(err, video_id)
+        else:
+            logger.warning(
+                "[media_proxy] primary egress busy — retrying via fallback tier video_id=%s",
+                video_id,
+            )
+        result = _extract_audio_via(video_id, slot, "fallback")
+    return result
+
+
+def _extract_audio_via(video_id: str, slot: int, tier: str) -> dict:
+    """One egress tier's multi-client extraction chain. Blocking.
 
     Multi-client fallback is the production posture for working around
     YouTube's anti-bot challenges on cloud egress. We try clients in
@@ -411,9 +548,10 @@ def _extract_audio(video_id: str) -> dict:
     last_err: BaseException | None = None
     # One slot for the whole extraction, and it travels with the result: the
     # byte-pump and the remux download must leave from the address that signed
-    # the URL. See the pool note above.
-    slot = _proxy_slot_for(video_id)
-    proxy = _proxy_with_slot(slot)
+    # the URL. See the pool note above. The slot is chosen by the ORCHESTRATOR
+    # so both tiers share it — it only rewrites URLs that carry a session
+    # token, so it is inert on the static primary and active on the fallback.
+    proxy = _proxy_with_slot(slot, tier)
 
     # FAST FIRST ATTEMPT (flag: AUDIO_EXTRACT_FAST=0 to disable): android with
     # player_skip — one innertube /player POST instead of the ~1MB watch-page
@@ -470,13 +608,32 @@ def _extract_audio(video_id: str) -> dict:
             # Check the proxy BEFORE the per-client fall-through: a dead proxy
             # also matches the bot-block heuristic sometimes, and retrying the
             # other three clients through the same dead egress just multiplies
-            # the latency of a request that cannot succeed.
+            # the latency of a request that cannot succeed. Busy FIRST — a
+            # device-locked proxy also matches the outage markers, and the
+            # distinction is what keeps a routine replica collision from
+            # raising the platform-wide outage alarm.
+            if _is_proxy_busy(e) and tier == "primary":
+                # Only the static primary HAS a device-lock. A CONNECT 403
+                # from the rotating fallback gateway is durable (whitelist /
+                # account trouble) and must fall through to the OUTAGE
+                # classification below, not masquerade as a transient
+                # collision (adversarial review, 2026-08-10).
+                logger.warning(
+                    "[media_proxy] egress BUSY (device-lock) tier=%s "
+                    "video_id=%s client=%s",
+                    tier, video_id, client,
+                )
+                return {"error": "proxy_busy", "detail": str(e)}
             if _is_proxy_outage(e):
                 logger.error(
-                    "[media_proxy] PROXY OUTAGE — egress proxy is unusable, "
-                    "ALL uncached audio is failing platform-wide (not this "
-                    "video). Check YT_DLP_PROXY credit/credentials. "
+                    "[media_proxy] PROXY OUTAGE — egress tier=%s is unusable%s. "
+                    "Check YT_DLP_PROXY%s credit/credentials. "
                     "video_id=%s client=%s err=%s",
+                    tier,
+                    (", ALL uncached audio is failing platform-wide (not "
+                     "this video)") if tier == "fallback" or not _proxy_base("fallback")
+                    else " — retrying via fallback tier",
+                    "_FALLBACK" if tier == "fallback" else "",
                     video_id, client, str(e)[:200],
                 )
                 return {"error": "proxy_unavailable", "detail": str(e)}
@@ -515,12 +672,13 @@ def _extract_audio(video_id: str) -> dict:
         url = info["url"]
         ext = info.get("ext") or "m4a"
         logger.info(
-            "[media_proxy] audio_url ok video_id=%s client=%s fast=%d ext=%s bitrate=%s slot=%d",
-            video_id, client, int(fast), ext, info.get("abr"), slot,
+            "[media_proxy] audio_url ok video_id=%s client=%s fast=%d ext=%s bitrate=%s slot=%d tier=%s",
+            video_id, client, int(fast), ext, info.get("abr"), slot, tier,
         )
         return {
             "url": url,
             "proxy_slot": slot,
+            "proxy_tier": tier,
             "expires_at": _parse_expires(url),
             "duration": int(info.get("duration") or 0),
             "mime_type": _mime_from_ext(ext),
@@ -550,6 +708,7 @@ def _extract_audio(video_id: str) -> dict:
 # forced the earlier cache revert (commit 4039597a) can't happen through it.
 _EXTRACT_CACHE: dict[str, tuple[dict, float]] = {}
 _EXTRACT_CACHE_TTL_CAP = 3600.0  # never serve an extraction older than 1h
+_FALLBACK_TIER_TTL_SECS = float(os.environ.get("AUDIO_FALLBACK_TIER_TTL_SECS", "600"))
 
 
 def _extract_cache_deadline(result: dict, base: float) -> float:
@@ -562,6 +721,13 @@ def _extract_cache_deadline(result: dict, base: float) -> float:
     if "error" in result or not result.get("url"):
         return 0.0
     deadline = base + _EXTRACT_CACHE_TTL_CAP
+    if result.get("proxy_tier") == "fallback":
+        # A fallback-tier entry is a DEMOTION: both caches serve it tier-blind
+        # and nothing ever re-probes the primary while it lives, so a 10s
+        # device-lock collision otherwise parks the video on the slow metered
+        # gateway fleet-wide for the full hour (adversarial review,
+        # 2026-08-10). A short deadline is the migration path back.
+        deadline = min(deadline, base + _FALLBACK_TIER_TTL_SECS)
     exp = result.get("expires_at") or 0
     if exp:
         # Stop serving 5 min before the signed URL itself expires.
@@ -722,6 +888,13 @@ async def _purge_extraction(video_id: str, poisoned_url: str | None = None) -> N
     say what it was holding.
     """
     _EXTRACT_CACHE.pop(video_id, None)
+    # Unlink (never cancel — other callers may be awaiting it) any in-flight
+    # extraction: a purge-then-re-extract caller must start a FRESH run, not
+    # join a pre-purge future whose result is the very thing being purged
+    # (adversarial review, 2026-08-10). The orphaned future's own tail may
+    # still re-cache its result; the conditional shared purge plus the busy
+    # recovery's post-re-extract connect check bound that window.
+    _extract_inflight.pop(video_id, None)
 
     def _drop() -> None:
         client = _get_r2_meta_client()
@@ -2175,9 +2348,141 @@ async def stream_audio(
         return JSONResponse(status_code=504, content={"error": "upstream_connect_timeout"})
     except Exception as e:
         await client.aclose()
-        _release()
-        logger.warning("[media_proxy] audio_stream upstream-connect failed video_id=%s: %s", video_id, e)
-        return JSONResponse(status_code=502, content={"error": "upstream_fetch_failed", "detail": str(e)})
+        # Recover when the PRIMARY egress refused the CONNECT — busy (the
+        # other replica holds the device-lock) or a durable outage (dead
+        # creds strand every warm primary-tier cache entry at 502 for up to
+        # an hour if only busy recovers — adversarial review). Never for a
+        # prefetch: it is opportunistic, and recovering it would purge a
+        # healthy shared entry and demote the video to the metered fallback
+        # over bytes nobody is waiting on.
+        if not (
+            (_is_proxy_busy(e) or _is_proxy_outage(e))
+            and _fallback_available()
+            and not prefetch
+            and result.get("proxy_tier") != "fallback"
+        ):
+            _release()
+            logger.warning("[media_proxy] audio_stream upstream-connect failed video_id=%s: %s", video_id, e)
+            return JSONResponse(status_code=502, content={"error": "upstream_fetch_failed", "detail": str(e)})
+        # Purge the now-unfetchable primary-tier entry and re-extract:
+        # `_extract_audio` routes a busy/dead primary to the fallback tier on
+        # its own, so the fresh result carries an egress that will accept us.
+        # Same shape as the signed-URL 403/410 recovery below. Collision
+        # cost: ~1-2s and a residential-speed serve — never a failed play.
+        logger.warning(
+            "[media_proxy] audio_stream egress %s — re-extracting toward the "
+            "fallback tier video_id=%s",
+            "BUSY" if _is_proxy_busy(e) else "DOWN", video_id,
+        )
+        await _purge_extraction(video_id, poisoned_url=upstream_url)
+        client = None
+        try:
+            result = await asyncio.wait_for(
+                _extract_coalesced(video_id), timeout=_AUDIO_EXTRACT_TIMEOUT_SECS
+            )
+            if "error" in result or not result.get("url"):
+                raise RuntimeError(result.get("error") or "no stream url")
+            mime = result.get("mime_type") or mime
+            # Serve the recovery through the SPOOL when possible — a
+            # legacy-direct recovery broke the one-download-per-track promise
+            # and pulled the same bytes through the metered gateway twice
+            # (once for this response, once for the deferred remux build).
+            if _SPOOL_ENABLED:
+                spool = await _spool_get_or_start(video_id, result)
+                if spool is not None:
+                    await _spool_wait(spool, lambda: spool.total is not None, _SPOOL_HEADERS_WAIT)
+                    resp = _spool_response(
+                        spool, request.headers.get("range"), prefetch=False,
+                        mime=mime, video_id=video_id, on_release=_release,
+                        t0=_t0, cache_ms=_cache_ms, extract_ms=_extract_ms,
+                    )
+                    if resp is not None:
+                        return resp
+            # The 403/410 handler below purges conditionally on
+            # `upstream_url` — point it at the URL actually in flight or a
+            # bad retry entry survives its own purge.
+            upstream_url = result["url"]
+            client = httpx.AsyncClient(
+                timeout=_STREAM_TIMEOUT,
+                follow_redirects=True,
+                proxy=_proxy_for_result(result),
+            )
+            upstream_req = client.build_request(
+                "GET", upstream_url, headers=upstream_headers
+            )
+            try:
+                upstream = await asyncio.wait_for(
+                    client.send(upstream_req, stream=True),
+                    timeout=_UPSTREAM_HEADERS_TIMEOUT,
+                )
+            except Exception as e2:
+                # The re-extract can hand back a RESURRECTED primary-tier
+                # entry: `_purge_extraction` races concurrent cache readers
+                # and the in-flight tail, both of which can re-install the
+                # purged result (adversarial review — losing that race made
+                # the retry a hard 502 despite a healthy fallback). If the
+                # egress refused us AGAIN, force a fallback-tier extraction
+                # PAST both caches and connect once more.
+                if (
+                    not (_is_proxy_busy(e2) or _is_proxy_outage(e2))
+                    or result.get("proxy_tier") == "fallback"
+                ):
+                    raise
+                await client.aclose()
+                client = None
+                logger.warning(
+                    "[media_proxy] audio_stream recovery hit the primary again "
+                    "— forcing a fallback-tier extraction video_id=%s",
+                    video_id,
+                )
+                forced = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, _extract_audio_via,
+                        video_id, _proxy_slot_for(video_id), "fallback",
+                    ),
+                    timeout=_AUDIO_EXTRACT_TIMEOUT_SECS,
+                )
+                if "error" in forced or not forced.get("url"):
+                    raise RuntimeError(forced.get("error") or "no stream url")
+                _fnow = time.time()
+                _fdl = _extract_cache_deadline(forced, _fnow)
+                if _fdl > _fnow:
+                    _EXTRACT_CACHE[video_id] = (forced, _fdl)
+                result = forced
+                mime = result.get("mime_type") or mime
+                upstream_url = result["url"]
+                client = httpx.AsyncClient(
+                    timeout=_STREAM_TIMEOUT,
+                    follow_redirects=True,
+                    proxy=_proxy_for_result(result),
+                )
+                upstream_req = client.build_request(
+                    "GET", upstream_url, headers=upstream_headers
+                )
+                upstream = await asyncio.wait_for(
+                    client.send(upstream_req, stream=True),
+                    timeout=_UPSTREAM_HEADERS_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            if client is not None:
+                await client.aclose()
+            _release()
+            logger.warning(
+                "[media_proxy] audio_stream recovery timed out video_id=%s", video_id
+            )
+            return JSONResponse(status_code=504, content={"error": "upstream_connect_timeout"})
+        except Exception as e2:
+            if client is not None:
+                await client.aclose()
+            _release()
+            logger.warning(
+                "[media_proxy] audio_stream busy-fallback retry failed video_id=%s: %s",
+                video_id, e2,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={"error": "upstream_fetch_failed", "detail": str(e2)},
+            )
 
     if upstream.status_code in (403, 410):
         # The signed URL was refused for our own egress. The cause that

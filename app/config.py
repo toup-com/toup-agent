@@ -1656,6 +1656,23 @@ class Settings(BaseSettings):
     # isn't blocking the server IP). Cookies (yt_dlp_cookies_b64) are the
     # cheaper alternative — no per-GB proxy bandwidth — but need refresh.
     yt_dlp_proxy: Optional[str] = None
+    # Optional SECOND egress for the audio pipeline. When set, `yt_dlp_proxy`
+    # is the PRIMARY (a fast static ISP IP) and this is the fallback the
+    # pipeline retries through when the primary refuses a CONNECT with 403.
+    # IPRoyal static (ISP) proxies are IP-BOUND — one source IP at a time,
+    # held for a ~10s sticky window from connection start (measured
+    # 2026-08-10) — and platform-api runs 2 replicas with distinct egress
+    # IPs, so concurrent cold plays on different replicas lock each other
+    # out of a static primary. Same format as yt_dlp_proxy; point it at the
+    # rotating residential gateway (sticky-session tokens supported). Unset =
+    # single-proxy behaviour through whatever yt_dlp_proxy points at — NOTE
+    # that with prod's yt_dlp_proxy repointed at the static ISP IP, the full
+    # ROLLBACK to the pre-tier world is "yt_dlp_proxy = the residential
+    # gateway URL, this unset", never just unsetting this field. The two URLs
+    # must DIFFER: an equal pair is treated as no fallback
+    # (media_proxy._fallback_available), because retrying through the same
+    # egress doubles every honest failure and makes the logs lie.
+    yt_dlp_proxy_fallback: Optional[str] = None
 
     # Base URL of the bgutil PO-token provider (the `bgutil-pot` Railway
     # service, reachable on the private network). When set, yt-dlp's web

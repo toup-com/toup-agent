@@ -28,17 +28,26 @@ def _ytmusic():
     datacenter IP, so `get_watch_playlist` / `search` return empty FROM THE VPS
     (→ the radio toggle is rejected with `station_unavailable`) even when the
     seed is a perfectly valid Song id — the exact same call from a residential
-    IP returns a full 50-track station. Route these requests through
-    `settings.yt_dlp_proxy` (the residential Tailscale exit node already used
-    for audio extraction in media_proxy.py) so YT Music sees a non-datacenter
-    IP. Falls back to a direct client when no proxy is configured (dev/local),
-    so behaviour off-VPS — and the web's existing flow — is unchanged.
+    IP returns a full 50-track station. Route these requests through the
+    configured egress proxy (the rotating residential gateway when the tiered
+    config sets one — see the comment below) so YT Music sees a
+    non-datacenter IP. Falls back to a direct client when no proxy is
+    configured (dev/local), so behaviour off-VPS — and the web's existing
+    flow — is unchanged.
     """
     from ytmusicapi import YTMusic
     proxy = None
     try:
         from app.config import settings
-        proxy = settings.yt_dlp_proxy
+        # Prefer the FALLBACK gateway (rotating residential) when configured:
+        # the primary is a static ISP IP that is IP-BOUND to one source at a
+        # time (see media_proxy._is_proxy_busy), and search/window calls run
+        # concurrently with audio pulls on both replicas — routing them
+        # through the static primary would make searches lose the device-lock
+        # race. Search payloads are small, so the per-GB gateway cost is
+        # negligible, and this is byte-identical to the pre-tier behaviour
+        # (search always rode the residential gateway).
+        proxy = settings.yt_dlp_proxy_fallback or settings.yt_dlp_proxy
     except Exception:
         proxy = None
     if proxy:
