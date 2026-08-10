@@ -197,8 +197,10 @@ def _profile_name_for_log(profile) -> str:
 # Vault CP4.1: channels that cannot render the CredentialConfirmCard today.
 # `telegram` and `voice` are permanently excluded (their retention model
 # makes chat-save the wrong UX). `mobile` is excluded until the RN
-# renderer ships; CP4.4 removes `mobile` from this set.
-VAULT_TOOL_CHANNEL_BLOCK = frozenset({"telegram", "voice", "mobile", "autopilot"})
+# renderer ships; CP4.4 removes `mobile` from this set. `trigger` (G-19b)
+# is permanently excluded — an unattended email-triggered turn has no user
+# present, so the confirm card could never resolve.
+VAULT_TOOL_CHANNEL_BLOCK = frozenset({"telegram", "voice", "mobile", "autopilot", "trigger"})
 VAULT_TOOL_NAME = "save_streaming_credential"
 
 
@@ -209,6 +211,89 @@ def strip_vault_tool_for_channel(tools, channel):
         t for t in tools
         if (t.get("name", "") or t.get("function", {}).get("name", "")) != VAULT_TOOL_NAME
     ]
+
+
+# Per-channel formatting guidance. Hardcoded table today; channel_config
+# wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values
+# short — this goes into every system prompt, tokens matter.
+# Each line has two parts: WHERE the user is (so the agent can
+# answer "where are you chatting with me?" without hallucinating)
+# + HOW to format. The where-part is mandatory — we saw the agent
+# say "Telegram on your mobile" when channel=mobile because
+# "mobile" alone was too terse to distinguish transport from
+# surface. Names each channel's app explicitly.
+# Module-level (G-19b) so policy tests and channel_util's keep-in-sync
+# comment can reference it by name; previously an inline literal at the
+# prompt-assembly site.
+CHANNEL_GUIDANCE = {
+    "web":       "User is in the Toup web app in a browser (toup.ai). Full markdown and formatting OK — long code blocks, tables, headings all fine.",
+    "app":       "User is inside a Toup in-app workspace (one of their custom apps). Full markdown and formatting OK.",
+    "mobile":    "User is in the Toup mobile app (React Native on iOS or Android). This is the native Toup app — NOT Telegram, NOT a web browser. Keep responses compact: short paragraphs, avoid large code blocks or tables. Small screen.",
+    "voice": (
+        "User is on the Toup voice/realtime surface (spoken audio, not text). Conversational tone. "
+        "No markdown. Sentences should read naturally when spoken aloud.\n\n"
+        "BEHAVIOR — this is the part that matters most on this surface. The user is holding a live "
+        "audio session open and waiting. An answer that arrives 'later' arrives nowhere: they are "
+        "listening, not watching a dashboard.\n"
+        "  1. ANSWER IN THIS TURN, FROM THE SNIPPETS. For anything factual, current, or "
+        "researchable, call `web_search` immediately and answer from what it returns. Each result "
+        "already carries several extra passages from the page — that is usually enough. Use "
+        "`web_fetch` on at most ONE source, and only when the snippets genuinely do not answer the "
+        "question: a fetch costs seconds per page and the caller is listening to silence while it "
+        "runs. Do not narrate that you are about to start; just do it and then talk.\n"
+        "  2. NEVER promise a deliverable. No 'I'll put together a report', no 'when it's ready I'll "
+        "tell you', no 'let me look into that and get back to you'. If you cannot finish it now, say "
+        "what you DO know now and offer `start_mission` in plain words.\n"
+        "  3. SPEAK THE FINDINGS, not a description of them. 'There are four: Gerald Penn in Computer "
+        "Science, who works on speech and computational linguistics; …' — not 'I found some professors "
+        "and can summarise them for you'. The list IS the answer.\n"
+        "  4. LENGTH: aim for 3-6 sentences. If the honest answer is a long list, give the top three "
+        "aloud and offer the rest — a spoken paragraph the user cannot skim is worse than a short one.\n"
+        "  5. CITE BRIEFLY. Name the site ('according to the department's own page'), never read a URL "
+        "aloud — the sources appear on the user's screen as cards while you speak.\n"
+        "  6. If the user repeats a request you are already working on, do NOT start it again — say "
+        "you are on it and keep going."
+    ),
+    "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
+    "whatsapp":  "User is on WhatsApp (talking to the Toup bot there). Short messages, plain text first. WhatsApp renders only *bold*, _italic_ and ```monospace``` — no headings, no tables, no links-as-markdown. Avoid long code blocks.",
+    "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
+    "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
+    "extension": (
+        "User is in the Toup Chrome side-panel extension — they're browsing the web and you can see the page "
+        "they're on (a [PAGE_CONTEXT] block precedes their message). You can also DRIVE their browser via the "
+        "`browser_*` tools: open tabs, click, type, scroll, capture screenshots, take DOM snapshots. "
+        "Format: full markdown OK but keep responses compact — the side-panel is narrow.\n\n"
+        "BEHAVIOR — this is critical. The user is watching you act in real time. They want a Claude-Computer-"
+        "Use / ChatGPT-Agent / Atlas-Browser experience, not a chatbot that asks permission for every step.\n"
+        "  1. ALWAYS attempt the next obvious action before asking the user for input. If you don't have an "
+        "address, try clicking sign-in (the user is signed into their browser, sites usually know their "
+        "address). If a search box is visible, type into it. If a button looks right, click it. "
+        "Read the page → try the most likely action → check the result. Only ask the user when you've "
+        "genuinely run out of plausible moves OR when the next step legally requires THEIR data (payment, "
+        "personal info, password).\n"
+        "  2. After each browser_action, take a `browser_screenshot` so YOU have visual grounding for the "
+        "next click and the USER sees what you see. Skipping this is the #1 reason agentic browsing feels "
+        "broken — without the screenshot you're flying blind on the next coordinate.\n"
+        "  3. If `browser_action` returns `ERROR: TIMEOUT`, the element you targeted probably wasn't there "
+        "yet (slow page or wrong selector). Take a fresh `browser_action` with `kind: \"dom_snapshot\"` to "
+        "re-orient, then try a different selector — do NOT give up and ask the user.\n"
+        "  4. If `browser_action` returns `ERROR: BLOCKED`, the user is on a chrome:// or extension page "
+        "Chrome won't let any extension touch. Ask them to switch to a normal site.\n"
+        "  5. Cookie banners, sign-in nags, and 'allow notifications' popups are agent kryptonite. Dismiss "
+        "them (look for ✕, 'Reject all', 'Got it', 'Not now') before trying the main task.\n"
+        "  6. Narrate sparingly. The user is watching the tool-pill row update live; you don't need to "
+        "say 'now I'm clicking the search button' — just click it. Save text replies for: confirming what "
+        "you accomplished, surfacing data you extracted, or asking when you genuinely need user input."
+    ),
+    "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
+    "trigger": (
+        "Unattended background turn — an email trigger fired; the user is NOT present and nothing "
+        "interactive can render. Output plain text / minimal markdown suitable for a chat card and "
+        "email-derived summaries. No interactive confirmations, no questions that wait for an answer. "
+        "Be brief. NEVER claim to have sent, replied to, or completed anything unless a tool call in "
+        "THIS turn actually executed it."
+    ),
+}
 
 
 def same_local_day(started_utc, now_utc, tz_name: Optional[str]) -> bool:
@@ -4399,83 +4484,19 @@ class AgentRunner:
         if is_founder_email(getattr(_user_row, "email", None) if _user_row else None):
             section_parts["owner_recognition"] = founder_recognition_block()
 
-        # Per-channel formatting guidance. Hardcoded table today; channel_config
-        # wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values
-        # short — this goes into every system prompt, tokens matter.
+        # Per-channel formatting guidance — module-level CHANNEL_GUIDANCE
+        # table (hoisted for G-19b policy pins); channel_config wire-up
+        # is a follow-up (TODO(time-channel-fix followup)).
         from app.agent.channel_util import resolve_channel
         _channel_safe = resolve_channel(
             explicit=channel,
             user_id=user_id,
             site="prompt_label",
         )
-        # Each line has two parts: WHERE the user is (so the agent can
-        # answer "where are you chatting with me?" without hallucinating)
-        # + HOW to format. The where-part is mandatory — we saw the agent
-        # say "Telegram on your mobile" when channel=mobile because
-        # "mobile" alone was too terse to distinguish transport from
-        # surface. Names each channel's app explicitly.
-        _channel_guidance = {
-            "web":       "User is in the Toup web app in a browser (toup.ai). Full markdown and formatting OK — long code blocks, tables, headings all fine.",
-            "app":       "User is inside a Toup in-app workspace (one of their custom apps). Full markdown and formatting OK.",
-            "mobile":    "User is in the Toup mobile app (React Native on iOS or Android). This is the native Toup app — NOT Telegram, NOT a web browser. Keep responses compact: short paragraphs, avoid large code blocks or tables. Small screen.",
-            "voice": (
-                "User is on the Toup voice/realtime surface (spoken audio, not text). Conversational tone. "
-                "No markdown. Sentences should read naturally when spoken aloud.\n\n"
-                "BEHAVIOR — this is the part that matters most on this surface. The user is holding a live "
-                "audio session open and waiting. An answer that arrives 'later' arrives nowhere: they are "
-                "listening, not watching a dashboard.\n"
-                "  1. ANSWER IN THIS TURN, FROM THE SNIPPETS. For anything factual, current, or "
-                "researchable, call `web_search` immediately and answer from what it returns. Each result "
-                "already carries several extra passages from the page — that is usually enough. Use "
-                "`web_fetch` on at most ONE source, and only when the snippets genuinely do not answer the "
-                "question: a fetch costs seconds per page and the caller is listening to silence while it "
-                "runs. Do not narrate that you are about to start; just do it and then talk.\n"
-                "  2. NEVER promise a deliverable. No 'I'll put together a report', no 'when it's ready I'll "
-                "tell you', no 'let me look into that and get back to you'. If you cannot finish it now, say "
-                "what you DO know now and offer `start_mission` in plain words.\n"
-                "  3. SPEAK THE FINDINGS, not a description of them. 'There are four: Gerald Penn in Computer "
-                "Science, who works on speech and computational linguistics; …' — not 'I found some professors "
-                "and can summarise them for you'. The list IS the answer.\n"
-                "  4. LENGTH: aim for 3-6 sentences. If the honest answer is a long list, give the top three "
-                "aloud and offer the rest — a spoken paragraph the user cannot skim is worse than a short one.\n"
-                "  5. CITE BRIEFLY. Name the site ('according to the department's own page'), never read a URL "
-                "aloud — the sources appear on the user's screen as cards while you speak.\n"
-                "  6. If the user repeats a request you are already working on, do NOT start it again — say "
-                "you are on it and keep going."
-            ),
-            "telegram":  "User is on Telegram messenger (talking to the Toup bot there). Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
-            "whatsapp":  "User is on WhatsApp (talking to the Toup bot there). Short messages, plain text first. WhatsApp renders only *bold*, _italic_ and ```monospace``` — no headings, no tables, no links-as-markdown. Avoid long code blocks.",
-            "discord":   "User is on Discord (Toup bot). Full markdown and code blocks OK. Keep message length under ~2000 chars.",
-            "slack":     "User is on Slack (Toup integration). Slack-flavored markdown (limited). Short messages preferred.",
-            "extension": (
-                "User is in the Toup Chrome side-panel extension — they're browsing the web and you can see the page "
-                "they're on (a [PAGE_CONTEXT] block precedes their message). You can also DRIVE their browser via the "
-                "`browser_*` tools: open tabs, click, type, scroll, capture screenshots, take DOM snapshots. "
-                "Format: full markdown OK but keep responses compact — the side-panel is narrow.\n\n"
-                "BEHAVIOR — this is critical. The user is watching you act in real time. They want a Claude-Computer-"
-                "Use / ChatGPT-Agent / Atlas-Browser experience, not a chatbot that asks permission for every step.\n"
-                "  1. ALWAYS attempt the next obvious action before asking the user for input. If you don't have an "
-                "address, try clicking sign-in (the user is signed into their browser, sites usually know their "
-                "address). If a search box is visible, type into it. If a button looks right, click it. "
-                "Read the page → try the most likely action → check the result. Only ask the user when you've "
-                "genuinely run out of plausible moves OR when the next step legally requires THEIR data (payment, "
-                "personal info, password).\n"
-                "  2. After each browser_action, take a `browser_screenshot` so YOU have visual grounding for the "
-                "next click and the USER sees what you see. Skipping this is the #1 reason agentic browsing feels "
-                "broken — without the screenshot you're flying blind on the next coordinate.\n"
-                "  3. If `browser_action` returns `ERROR: TIMEOUT`, the element you targeted probably wasn't there "
-                "yet (slow page or wrong selector). Take a fresh `browser_action` with `kind: \"dom_snapshot\"` to "
-                "re-orient, then try a different selector — do NOT give up and ask the user.\n"
-                "  4. If `browser_action` returns `ERROR: BLOCKED`, the user is on a chrome:// or extension page "
-                "Chrome won't let any extension touch. Ask them to switch to a normal site.\n"
-                "  5. Cookie banners, sign-in nags, and 'allow notifications' popups are agent kryptonite. Dismiss "
-                "them (look for ✕, 'Reject all', 'Got it', 'Not now') before trying the main task.\n"
-                "  6. Narrate sparingly. The user is watching the tool-pill row update live; you don't need to "
-                "say 'now I'm clicking the search button' — just click it. Save text replies for: confirming what "
-                "you accomplished, surfacing data you extracted, or asking when you genuinely need user input."
-            ),
-            "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
-        }.get(_channel_safe, "Unknown channel — format conservatively: short, minimal markdown.")
+        _channel_guidance = CHANNEL_GUIDANCE.get(
+            _channel_safe,
+            "Unknown channel — format conservatively: short, minimal markdown.",
+        )
 
         # Time is rendered in the USER'S LOCAL TIMEZONE, never UTC. The
         # agent faces the user; the user cares about their clock, not the

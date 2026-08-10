@@ -873,9 +873,19 @@ class Settings(BaseSettings):
     # FORWARD-only correctness: no retroactive charges, no pricing/tier
     # changes; flag OFF keeps the legacy deduction path byte-identical
     # (regression-tested in tests/test_metering_correctness_v2.py).
-    # DEFAULT OFF — flipping it changes user-visible metering and is
-    # gated on written approval; see docs/audits/2026-07-g2-billing-gate.md.
-    metering_correctness_v2: bool = False
+    #
+    # DEFAULT ON since 2026-08-10 (G-16), under the written approval in
+    # docs/audits/2026-07-g2-billing-gate.md. What the flip actually moves
+    # TODAY: nothing. Measured on production the same day — 44 of 44
+    # agent_configs are llm_mode='bundle', and `agent_deduct`'s bundle
+    # guard returns an idempotent hit BEFORE the key is consulted, so the
+    # only path this flag touches has zero tenants on it. The last
+    # legacy-key ledger row is from 2026-06-05. It ships ON so that the
+    # first manual/BYOK tenant to appear meters per REQUEST instead of
+    # once per session — the bug is closed before it can bite, not after.
+    # Rollback: METERING_CORRECTNESS_V2=false in the bridge env (already
+    # forwarded by pool_addon's _FEATURE_FLAG_ENVS) + a recreate wave.
+    metering_correctness_v2: bool = True
     stripe_price_id_starter: str = ""
     stripe_price_id_builder: str = ""
     stripe_price_id_pro: str = ""
@@ -1399,6 +1409,18 @@ class Settings(BaseSettings):
     # webhook still 200s — Pub/Sub stops retrying — but no agent
     # dispatch happens). Mirrors the routine flag pattern.
     triggers_email_enabled: bool = True
+    # G-19b: routes email_received trigger turns through AgentRunner.run
+    # (day context + memory + persona + attributable metering) instead of
+    # the bare call_system_llm summarize. Ships default-OFF; ops flips it
+    # later via env TRIGGER_TURNS_VIA_RUNNER. Fail-open: any runner
+    # failure falls back to the summarize path so a trigger never goes
+    # silent because the new path broke.
+    trigger_turns_via_runner: bool = False
+    # Per-fire runner credit ceiling (credits; 1 credit = 1 cent).
+    # Enforced by AgentRunner's in-loop budget hard-stop
+    # (credit_budget kwarg) — a runaway tool loop on an unattended
+    # turn stops here, not at the user's monthly balance.
+    trigger_turn_credit_budget: float = 25.0
 
     # T4a — GitHub OAuth client. PKCE off (provider doesn't support
     # it on the standard OAuth app type — see provider_apps.py).

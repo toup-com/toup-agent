@@ -219,11 +219,16 @@ class EmailReceivedHandler:
         llm_fn: Any = None,
         writer: Any = None,
         broadcaster: Any = None,
+        agent_runner: Any = None,
     ):
         self._mcp_client = mcp_client
         self._llm_fn = llm_fn
         self._writer = writer
         self._broadcaster = broadcaster
+        # G-19b: AgentRunner ref, wired by TriggerRunner.set_agent_runner
+        # (same late-bind pattern as _mcp_client). Only used when
+        # settings.trigger_turns_via_runner is on.
+        self._agent_runner = agent_runner
 
     async def execute(
         self,
@@ -375,7 +380,12 @@ class EmailReceivedHandler:
         action = (trigger.action or "").strip()
         try:
             if action == "summarize_and_post":
-                msg_id, model = await self._do_summarize_and_post(
+                # G-19b: _do_agent_turn routes through AgentRunner when
+                # settings.trigger_turns_via_runner is on AND a runner
+                # ref is wired; otherwise (and on ANY runner failure)
+                # it IS _do_summarize_and_post — same signature, same
+                # persistence path, fail-open.
+                msg_id, model = await self._do_agent_turn(
                     trigger, kept, db,
                 )
             elif action == "notify_only":
@@ -715,6 +725,98 @@ class EmailReceivedHandler:
         return fetched, errors
 
     # ── Actions ───────────────────────────────────────────────────
+
+    async def _do_agent_turn(
+        self, trigger: Any, emails: list[_FetchedEmail], db: AsyncSession,
+    ) -> tuple[str, str]:
+        """G-19b: run the email turn through AgentRunner.run so it gets
+        day context + memory retrieval + persona + attributable
+        metering, instead of the bare call_system_llm summarize.
+
+        Flag-gated on ``settings.trigger_turns_via_runner`` (ships OFF;
+        ops flips via env TRIGGER_TURNS_VIA_RUNNER) AND on a wired
+        runner ref. Flag off / no ref / ANY runner failure → falls back
+        to ``_do_summarize_and_post`` — fail-open, a trigger must never
+        go silent because the new path broke.
+
+        The runner does NOT persist (save_user_message /
+        save_assistant_message False, post-processing disabled): the
+        synthesized prompt is not something the user typed, and
+        ``_persist_message`` (write_trigger_message + broadcast +
+        extra-channel delivery) stays the single persistence path, same
+        as every other action here.
+        """
+        from app.config import settings
+
+        runner = self._agent_runner
+        if not settings.trigger_turns_via_runner or runner is None:
+            return await self._do_summarize_and_post(trigger, emails, db)
+
+        cfg = trigger.config_json or {}
+        # Same default-cheap policy as _do_summarize_and_post — the
+        # trigger's configured model wins, gpt-4o-mini otherwise.
+        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
+
+        try:
+            if len(emails) == 1:
+                email_block = _format_one_for_llm(emails[0])
+            else:
+                email_block = _format_batch_for_llm(emails)
+            prompt = (
+                f"[Automated turn — Gmail trigger "
+                f"\"{trigger.name or 'Email trigger'}\" fired; the user is "
+                "not present.]\n\n"
+                f"New email{'s' if len(emails) > 1 else ''}:\n\n"
+                f"{email_block}\n\n"
+                "Write the short notification body for the user's day "
+                "chat: 1-3 sentences on what the email actually says "
+                "(one bullet per email for a burst), plus an "
+                "\"Action: …\" line only when it explicitly asks for a "
+                "reply, deadline, approval, or RSVP. Do not take any "
+                "action beyond reading context; never claim to have "
+                "sent or completed anything."
+            )
+            # Kwarg set proven by autopilot_handler / agent_task_handler:
+            # synthetic turn, no persistence, no memory mining, hard
+            # credit ceiling. current_job_id = the claimed BuildJob row
+            # (events ARE BuildJobs post-PR#49; event_id carries its id).
+            response = await runner.run(
+                user_message=prompt,
+                user_id=trigger.user_id,
+                channel="trigger",
+                current_job_id=(emails[0].event_id if emails else None),
+                save_user_message=False,
+                save_assistant_message=False,
+                disable_post_processing=True,
+                model_override=model_choice,
+                credit_budget=settings.trigger_turn_credit_budget,
+            )
+            text = (
+                getattr(response, "text", None)
+                or getattr(response, "content", None)
+                or ""
+            )
+            if not text.strip():
+                raise RuntimeError("agent runner returned empty response")
+        except Exception as e:
+            # Fail-open — the summarize path has been delivering since
+            # launch; the runner path is the experiment.
+            logger.warning(
+                "[trigger_email] agent_turn_failed trigger_id=%s err=%s "
+                "— falling back to summarize",
+                trigger.id, e,
+            )
+            return await self._do_summarize_and_post(trigger, emails, db)
+
+        # Same Gmail-flavoured header + persistence path as
+        # _do_summarize_and_post — only the body's author differs.
+        content = _compose_email_chat_card(emails, text)
+        return await self._persist_message(
+            trigger=trigger, db=db,
+            content=content,
+            model_used=model_choice,
+            title_suffix=_compose_title_suffix(emails),
+        )
 
     async def _do_summarize_and_post(
         self, trigger: Any, emails: list[_FetchedEmail], db: AsyncSession,

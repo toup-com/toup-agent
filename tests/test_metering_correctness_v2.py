@@ -41,11 +41,18 @@ pytestmark = pytest.mark.asyncio
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_flag_defaults_off():
-    """G2 gate: the flag must ship OFF. Flipping it is a written-approval
-    action, never a code-merge side effect."""
+def test_flag_defaults_on_under_the_g2_approval():
+    """The G2 gate was written approval, and it was given on 2026-08-10
+    (docs/audits/2026-07-g2-billing-gate.md; finish-run W-3).
+
+    This assertion is kept — inverted, not deleted — because its job never
+    was "OFF"; its job is that the value is a DELIBERATE one. A silent
+    flip back to legacy per-session keys would restore the
+    meter-once-per-conversation bug, and that must fail here rather than
+    show up as a billing discrepancy weeks later.
+    """
     from app.config import Settings
-    assert Settings.model_fields["metering_correctness_v2"].default is False
+    assert Settings.model_fields["metering_correctness_v2"].default is True
 
 
 @pytest.mark.parametrize(

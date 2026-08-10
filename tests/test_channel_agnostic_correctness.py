@@ -65,13 +65,19 @@ def test_the_shared_classifier_gates_a_telegram_photo_and_not_a_document():
 def test_every_user_facing_channel_has_a_guidance_entry():
     """A first-class channel falling to the 'Unknown channel' default is a
     prefix-quality bug (it also contradicts channel_util's keep-in-sync
-    contract). Parse the dict literal so a removed key fails loudly."""
-    from app.agent import agent_runner
+    contract).
 
-    src = inspect.getsource(agent_runner.AgentRunner)
-    m = re.search(r"_channel_guidance = \{(.*?)\n        \}", src, re.DOTALL)
-    assert m, "could not locate the _channel_guidance dict literal"
-    keys = set(re.findall(r'\n\s+"([a-z_]+)":', m.group(1)))
+    Read the real table, not its source text. This used to regex the dict
+    literal out of ``AgentRunner``'s source, which meant the pin broke the
+    moment the table was hoisted to module level (G-19b) even though every
+    key it guards was still present — a source-shape assertion failing for
+    a reason that has nothing to do with the invariant. The object is what
+    the prompt builder actually reads, so a removed key still fails loudly,
+    and a refactor that preserves behaviour no longer fails at all.
+    """
+    from app.agent.agent_runner import CHANNEL_GUIDANCE
+
+    keys = set(CHANNEL_GUIDANCE)
 
     required = {"web", "app", "mobile", "voice", "telegram", "whatsapp",
                 "discord", "slack", "extension", "vibecoding"}
