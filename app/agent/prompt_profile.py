@@ -327,25 +327,6 @@ VOICE_DISABLED_TOOLS: frozenset[str] = frozenset({
 })
 
 
-# G-19b: an email trigger's runner turn is UNATTENDED background work.
-# It must not schedule MORE background work — a trigger that spawns
-# missions/jobs on every inbound email is a fork bomb with a Gmail
-# fuse, and unlike voice there is no user in the loop to notice.
-# `start_mission` IS here (voice keeps it because the user asks for it
-# in words; no one asked for anything on a trigger turn).
-# `save_streaming_credential` is also denied — belt and braces with
-# VAULT_TOOL_CHANNEL_BLOCK in agent_runner, which already strips the
-# tool for channel="trigger": prompts are advisory, tool-list omission
-# is hard, and this set survives if the vault block set ever drifts.
-TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
-    "create_job",
-    "update_job",
-    "spawn",
-    "start_mission",
-    "save_streaming_credential",
-})
-
-
 def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
     """Extra tool-disable set implied by the SURFACE, independent of profile.
 
@@ -355,6 +336,4 @@ def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
     """
     if (channel or "").strip().lower() == "voice":
         return VOICE_DISABLED_TOOLS
-    if (channel or "").strip().lower() == "trigger":
-        return TRIGGER_DISABLED_TOOLS
     return frozenset()

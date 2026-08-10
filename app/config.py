@@ -1399,18 +1399,6 @@ class Settings(BaseSettings):
     # webhook still 200s — Pub/Sub stops retrying — but no agent
     # dispatch happens). Mirrors the routine flag pattern.
     triggers_email_enabled: bool = True
-    # G-19b: routes email_received trigger turns through AgentRunner.run
-    # (day context + memory + persona + attributable metering) instead of
-    # the bare call_system_llm summarize. Ships default-OFF; ops flips it
-    # later via env TRIGGER_TURNS_VIA_RUNNER. Fail-open: any runner
-    # failure falls back to the summarize path so a trigger never goes
-    # silent because the new path broke.
-    trigger_turns_via_runner: bool = False
-    # Per-fire runner credit ceiling (credits; 1 credit = 1 cent).
-    # Enforced by AgentRunner's in-loop budget hard-stop
-    # (credit_budget kwarg) — a runaway tool loop on an unattended
-    # turn stops here, not at the user's monthly balance.
-    trigger_turn_credit_budget: float = 25.0
 
     # T4a — GitHub OAuth client. PKCE off (provider doesn't support
     # it on the standard OAuth app type — see provider_apps.py).
