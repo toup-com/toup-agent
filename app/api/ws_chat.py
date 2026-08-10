@@ -594,8 +594,17 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
         # (measured 2026-08-04). By the time /audio_stream asks, the result is
         # cached or the call is already in flight and coalesces onto it.
         #
-        # EXTRACT, never build: a build would pull the whole track through the
-        # same proxy the imminent stream needs. See warm_audio_cache.
+        # EXTRACT, deliberately, even now that the spool exists. The arithmetic
+        # (adversarial review, 2026-08-09): the phone's own /audio_stream lands
+        # ~1.5s after this frame, but extraction finishes at ~3.4s — so on the
+        # SAME replica the phone's request is already waiting when the spool
+        # could first start, and it starts the spool itself; a build here buys
+        # nothing extraction doesn't. On the OTHER replica (platform runs 2), a
+        # build-warm's spool would run a full duplicate pull through the same
+        # per-video sticky proxy slot DURING the phone's pre-roll — the exact
+        # contention the old rule existed to prevent. Extract is the whole win
+        # with none of the risk. (The flip and broadcast warms differ: there
+        # the proxy is idle when they fire — see radio/player.py.)
         try:
             from app.agent.radio.player import warm_audio_cache as _warm
             _warm([video_id], mode="extract")
@@ -1667,10 +1676,40 @@ async def _handle_radio_skip_prev(user_id: str, msg: dict) -> None:
     await _broadcast_track_for_mode(user_id, channel, sess, prev_track, "skip_prev", record=False)
 
 
+def _length_to_seconds(length: str | int | None) -> int:
+    """StationTrack.length is YT Music's display string ("4:18", "1:02:07").
+    0 on anything unparseable — the frame simply omits the field then."""
+    if isinstance(length, int):
+        return max(0, length)
+    if not length or not isinstance(length, str):
+        return 0
+    parts = length.strip().split(":")
+    try:
+        secs = 0
+        for p in parts:
+            secs = secs * 60 + int(p)
+        return max(0, secs)
+    except (ValueError, TypeError):
+        return 0
+
+
+# Serializes concurrent display-mode flips per user. The handler is dispatched
+# as a task (it must not block the WS receive loop — its variant resolves can
+# take seconds), but two rapid pill taps interleaving through the awaits would
+# corrupt the session's current-track/window state, so flips queue here.
+_display_mode_locks: dict[str, asyncio.Lock] = {}
+
+
 async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
+    lock = _display_mode_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        await _handle_radio_display_mode_locked(user_id, msg)
+
+
+async def _handle_radio_display_mode_locked(user_id: str, msg: dict) -> None:
     from app.agent.radio import get_radio_manager, RadioSessionManager
     from app.agent.radio.playlist import find_topic_version, find_music_video, StationTrack
-    from app.agent.radio.player import broadcast_radio_track
+    from app.agent.radio.player import broadcast_radio_track, warm_audio_cache
 
     channel = (msg.get("channel") or "").strip().lower()
     mode = (msg.get("mode") or "").strip().lower()
@@ -1690,6 +1729,27 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
     # User-initiated click: flip the override flag so auto-detect stops on
     # subsequent track loads. The pick sticks for the rest of the session.
     mgr.set_display_mode(sess, mode, user_initiated=True, source="user_mode_toggle")
+
+    # ACK FIRST. The variant resolves below run for up to ~15s
+    # (find_music_video ≤6s + the 9s window budget), and the founder's P2
+    # recording shows what holding the ack hostage to them costs: the client
+    # flipped optimistically, heard nothing from the server, and sat in
+    # silence with no authoritative mode. The state snapshot is cheap and
+    # idempotent — a second one ships at the end for paths that mutate the
+    # current track.
+    await broadcast_to_user(user_id, sess.to_broadcast_dict())
+
+    # Video→Song on the app channel means the phone is about to stream native
+    # audio for the CURRENT id — audio that has never been through the proxy
+    # (it was playing inside the WebKit iframe, which streams from YouTube
+    # directly). Start the platform's spool/remux NOW, before the window
+    # resolve spends its budget: by the time the phone's /audio_stream lands,
+    # extraction is in flight or done and the spool is filling. This was the
+    # structural half of the founder's 30s Video→Song silence (2026-08-09).
+    # now_playing=True: on a pre-spool platform this downgrades to extract —
+    # a build there would race the very stream the flip is about to start.
+    if channel == "app" and sess.enabled and mode == "song" and sess.current_track_id:
+        warm_audio_cache([sess.current_track_id], mode="build", now_playing=True)
 
     # Mid-track swap rules (bidirectional, same overwrite-history semantics):
     #   Song  + OMV current → Topic lookup → swap to ATV if found.
@@ -1759,6 +1819,23 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
         else:
             swap_log = fail_log = ""
 
+        # REVALIDATE the capture before mutating. The handler is a task now and
+        # find_music_video/find_topic_version yield the loop for up to 6s —
+        # an ungated skip or a natural media_ended can advance the station in
+        # that window (skips serialize on a different lock). Executing the swap
+        # against the stale capture would overwrite the NEW track's tape entry
+        # and yank the card back to the track the user just skipped away from.
+        # The mode flip itself stands; only the stale swap is dropped.
+        if alt is not None and (
+            not sess.enabled or sess.current_track_id != current_track.video_id
+        ):
+            print(
+                f"[radio] mode_toggle swap SKIPPED — station moved during lookup "
+                f"(captured={current_track.video_id} now={sess.current_track_id})",
+                flush=True,
+            )
+            alt = None
+
         if alt is not None and alt.video_id != current_track.video_id:
             reload_needed = True
             print(
@@ -1780,6 +1857,12 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
                 user_id[:8], channel, prev_current, alt.video_id,
                 sess.history_cursor, swap_log,
             )
+            # reason: the frame used to default to "auto_advance", which the
+            # client can only read as "new track, start from zero" — the P3
+            # reset-to-0:00 card. "mv_swap"/"topic_swap" says "same song, new
+            # surface, carry your position". duration: the backend holds
+            # alt.length in hand; without it the client shows '--:--' (or a
+            # STALE previous-track duration) until the player reports one.
             await broadcast_radio_track(
                 user_id=user_id,
                 video_id=alt.video_id,
@@ -1788,6 +1871,8 @@ async def _handle_radio_display_mode(user_id: str, msg: dict) -> None:
                 artist=alt.artist,
                 thumbnail_url=alt.thumbnail_url,
                 video_type=alt.video_type,
+                reason=swap_log,
+                duration=_length_to_seconds(alt.length),
             )
         elif swap_log:
             # Lookup was attempted but yielded nothing.
@@ -2215,7 +2300,13 @@ async def ws_chat(
                     continue
 
                 if msg_type == "radio_display_mode":
-                    await _handle_radio_display_mode(user_id, msg)
+                    # Task, not await: the handler's variant resolves can run
+                    # ~15s (6s MV lookup + 9s window budget), and awaiting it
+                    # inline blocked every subsequent client frame behind a
+                    # pill tap — including the media_ended/skip frames that
+                    # keep the station moving. Rapid flips serialize on
+                    # _display_mode_locks, so tasking this is order-safe.
+                    asyncio.create_task(_handle_radio_display_mode(user_id, msg))
                     continue
 
                 if msg_type != "message":

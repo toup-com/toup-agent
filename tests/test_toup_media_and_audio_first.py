@@ -874,7 +874,7 @@ def test_resolver_demotes_download_farm_rips_but_still_answers():
 
 @pytest.mark.asyncio
 async def test_fast_path_pre_extracts_the_track_it_just_broadcast(monkeypatch):
-    """Extraction must start at BROADCAST time, not when the phone asks.
+    """Warming must start at BROADCAST time, not when the phone asks.
 
     Extraction is the single largest item on the cold-start path — a median
     3.4s, mean 7.1s and worst case 20.8s against the production proxy
@@ -882,8 +882,17 @@ async def test_fast_path_pre_extracts_the_track_it_just_broadcast(monkeypatch):
     audio. Started when the frame goes out, it overlaps the agent's reply and
     the card render, so `/audio_stream` finds it cached or coalesces onto it.
 
-    It must be an EXTRACT: a build would pull the whole track through the same
-    residential proxy the imminent stream needs.
+    It must be an EXTRACT, and the reason is arithmetic, not dogma
+    (adversarial review, 2026-08-09): the phone's /audio_stream lands ~1.5s
+    after this frame while extraction finishes at ~3.4s, so on the same
+    replica the phone's own request starts the spool the moment extraction
+    completes — a build here buys nothing extraction doesn't. And on the
+    OTHER replica (platform runs 2), a build-warm's spool is a duplicate full
+    pull through the same sticky proxy slot DURING the phone's pre-roll — the
+    exact contention the old "extract, never build" rule existed to prevent.
+    The broadcast/flip warms are the ones that legitimately build (proxy idle
+    when they fire), and they carry now_playing=True so a pre-spool platform
+    downgrades them.
     """
     import httpx
     from app.api import ws_chat
@@ -925,6 +934,7 @@ async def test_fast_path_pre_extracts_the_track_it_just_broadcast(monkeypatch):
     ids, mode = warmed[0]
     assert ids == ["vid12345678"], "it must warm the track it just broadcast"
     assert mode == "extract", (
-        "must be an EXTRACT — a build competes with the stream the phone is "
-        "about to start for the same residential proxy"
+        "must be an EXTRACT — the phone's own request starts the spool at "
+        "extract-done on the same replica, and a build-warm on the OTHER "
+        "replica is a duplicate pull racing the phone's pre-roll"
     )

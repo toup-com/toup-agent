@@ -61,7 +61,19 @@ def infer_requested_mode(text: str) -> str | None:
     return None
 
 
-def warm_audio_cache(video_ids: list, mode: str = "build") -> None:
+# Does the platform this agent talks to have the single-flight SPOOL
+# (media_proxy, 2026-08-09)? None = not yet known. Learned from the warm
+# endpoint's response ({"spool": true/false}) and cached for the process.
+# Until confirmed, a NOW-PLAYING build warm is downgraded to extract: on a
+# pre-spool platform the build is a second full download racing the very
+# stream it was meant to accelerate (the 2026-08-05 regression class — and
+# the old live-first gate cannot save it, because at warm time no live start
+# exists yet, so the gate waves the build through). Upcoming-track builds are
+# not downgraded; they were always safe.
+_platform_spool: "bool | None" = None
+
+
+def warm_audio_cache(video_ids: list, mode: str = "build", now_playing: bool = False) -> None:
     """Fire-and-forget: ask the PLATFORM to warm these tracks the moment they are
     broadcast/queued, so the phone's native play lands warm instead of cold.
 
@@ -92,20 +104,29 @@ def warm_audio_cache(video_ids: list, mode: str = "build") -> None:
     mode = mode if mode in ("build", "extract") else "build"
 
     async def _go() -> None:
+        global _platform_spool
         try:
             from app.config import settings
         except Exception:
             return
         if getattr(settings, "run_mode", "") != "agent":
-            # Platform/monolith: media_proxy is in-process — warm directly.
+            # Platform/monolith: media_proxy is in-process — warm directly,
+            # and the spool capability is directly readable.
             try:
-                from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg
-                warmer = _ensure_extract_bg if mode == "extract" else _ensure_remux_bg
+                from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg, _SPOOL_ENABLED
+                _platform_spool = bool(_SPOOL_ENABLED)
+                eff = mode
+                if eff == "build" and now_playing and not _platform_spool:
+                    eff = "extract"
+                warmer = _ensure_extract_bg if eff == "extract" else _ensure_remux_bg
                 for vid in ids:
                     asyncio.create_task(warmer(vid))
             except Exception:
                 pass
             return
+        eff = mode
+        if eff == "build" and now_playing and _platform_spool is not True:
+            eff = "extract"
         base = (getattr(settings, "platform_api_url", "") or "").rstrip("/")
         key = getattr(settings, "agent_api_key", "") or ""
         uid = getattr(settings, "user_id", "") or ""
@@ -124,14 +145,22 @@ def warm_audio_cache(video_ids: list, mode: str = "build") -> None:
                         resp = await hc.post(
                             url,
                             headers={"X-Agent-Key": key},
-                            json={"user_id": uid, "video_ids": ids, "mode": mode},
+                            json={"user_id": uid, "video_ids": ids, "mode": eff},
                         )
                     except Exception:
                         continue
                     if resp.status_code == 200:
-                        logger.info("[radio/player] warm ok mode=%s ids=%s", mode, ids)
+                        # Learn the platform's spool capability from the ack so
+                        # the NEXT now-playing warm can be a real build.
+                        try:
+                            body = resp.json()
+                            if isinstance(body, dict) and "spool" in body:
+                                _platform_spool = bool(body["spool"])
+                        except Exception:
+                            pass
+                        logger.info("[radio/player] warm ok mode=%s ids=%s", eff, ids)
                         return
-                logger.info("[radio/player] warm unreachable mode=%s ids=%s", mode, ids)
+                logger.info("[radio/player] warm unreachable mode=%s ids=%s", eff, ids)
         except Exception as e:
             logger.debug("[radio/player] warm failed: %s", e)
 
@@ -151,6 +180,7 @@ async def broadcast_radio_track(
     video_type: str = "",
     reason: str = "auto_advance",
     upcoming: list | None = None,
+    duration: int = 0,
 ) -> bool:
     """Emit a media_play event flagged radio_auto + kick age-check in background.
 
@@ -192,6 +222,11 @@ async def broadcast_radio_track(
             "thumbnail_url": thumbnail_url,
             "video_type": video_type,
         }
+        if duration and duration > 0:
+            # Seconds. Lets the card render a real length the instant the frame
+            # lands, instead of '--:--' (or a stale previous-track value) until
+            # the player reports one. Additive; older clients ignore it.
+            frame["duration"] = int(duration)
         if upcoming:
             frame["upcoming"] = upcoming
         sent = await broadcast_to_user(user_id, frame)
@@ -200,25 +235,25 @@ async def broadcast_radio_track(
         # plays NEXT — audio-first means the phone asks for these bytes within
         # seconds on the 'app' channel.
         if channel == "app":
-            # The now-playing track gets an EXTRACT-only warm; upcoming tracks
-            # get the full build.
+            # The now-playing track gets a BUILD warm — a deliberate reversal
+            # of the old "build is upcoming-only" rule, enabled by the
+            # platform's single-flight SPOOL (media_proxy, 2026-08-09).
             #
-            # A BUILD is still upcoming-only, for the original reason: it pulls
-            # the whole itag-18 through the SAME single residential proxy the
-            # live progressive stream is about to use, so aiming it at the
-            # now-playing id starves the playback it was meant to accelerate
-            # (media_proxy defers its own background build to AFTER the
-            # response body for exactly this reason).
+            # The old rule existed because a build was a SECOND download of the
+            # same itag-18 through the same residential proxy the live stream
+            # was using — it starved the playback it was meant to accelerate.
+            # With the spool, a build STARTS (or joins) the ONE shared upstream
+            # download that the phone's own /audio_stream request reads from.
+            # At an advance the phone usually plays its prebuffered LOCAL file,
+            # so this build runs on an idle proxy and its real value is filling
+            # R2 — every future replay of the track, platform-wide, goes warm.
             #
-            # An EXTRACT is a different animal — a metadata handshake, no media
-            # bytes — so it does not compete, and it is where the wait actually
-            # is. The claim this comment used to make, that the live track
-            # "gains nothing because its extraction is already coalesced", was
-            # wrong: coalescing dedupes CONCURRENT calls, it does not make the
-            # first one faster, and that first one is a median 3.4s / mean 7.1s
-            # / worst-case 20.8s against the production proxy (measured
-            # 2026-08-04) sitting directly in front of the first byte of audio.
-            warm_audio_cache([video_id], mode="extract")
+            # now_playing=True is the deploy-skew guard: until the platform has
+            # confirmed it HAS the spool ({"spool":true} on the warm ack), this
+            # is sent as an extract — on a pre-spool image a now-playing build
+            # is the 2026-08-05 regression, and its live-first gate cannot save
+            # it (checked before any live start exists).
+            warm_audio_cache([video_id], mode="build", now_playing=True)
             # Explicit, for the same reason as the ws_chat call site: the
             # dangerous mode is the DEFAULT one, so an omitted argument reads
             # as "cheap" and is not.

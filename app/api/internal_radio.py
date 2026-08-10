@@ -138,14 +138,19 @@ async def warm(req: WarmReq, x_agent_key: Optional[str] = Header(default=None)) 
     no-op.
     """
     await _auth_agent(x_agent_key, req.user_id)
-    ids = [v for v in req.video_ids if isinstance(v, str) and _VIDEO_ID_RE.match(v)][:3]
-    if not ids:
-        return {"ok": True, "warmed": 0}
     try:
-        from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg
+        from app.api.media_proxy import _ensure_extract_bg, _ensure_remux_bg, _SPOOL_ENABLED
     except Exception as e:  # media proxy unavailable in this process shape
         logger.warning("[internal/media] warm unavailable: %s", e)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "media proxy unavailable")
+    # `spool` advertises the single-flight spool capability (2026-08-09).
+    # Agents read it off the ack to decide whether a NOW-PLAYING build warm is
+    # safe (radio/player.py::warm_audio_cache) — on a pre-spool image such a
+    # build is a duplicate download racing the live stream. Older platform
+    # images simply omit the key, which agents treat as "no".
+    ids = [v for v in req.video_ids if isinstance(v, str) and _VIDEO_ID_RE.match(v)][:3]
+    if not ids:
+        return {"ok": True, "warmed": 0, "spool": bool(_SPOOL_ENABLED)}
     warmer = _ensure_extract_bg if req.mode == "extract" else _ensure_remux_bg
     for vid in ids:
         asyncio.create_task(warmer(vid))
@@ -153,4 +158,4 @@ async def warm(req: WarmReq, x_agent_key: Optional[str] = Header(default=None)) 
         "[internal/media] warm accepted mode=%s ids=%s user=%s",
         req.mode, ids, req.user_id[:8],
     )
-    return {"ok": True, "warmed": len(ids), "mode": req.mode}
+    return {"ok": True, "warmed": len(ids), "mode": req.mode, "spool": bool(_SPOOL_ENABLED)}

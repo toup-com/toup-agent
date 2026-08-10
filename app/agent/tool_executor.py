@@ -5701,24 +5701,17 @@ class ToolExecutor:
                 })
                 logger.info("[play_media] Broadcast media_play: %s - %s (mode=%s)", video_id, video_title, mode or "audio")
                 asyncio.create_task(_check_age_and_swap(video_id, user_id))
-                # NO *BUILD* FOR THE TRACK WE JUST BROADCAST. A build downloads
-                # the whole ~12MB itag-18 through the SAME single residential
-                # proxy the phone is about to stream these exact bytes over, so
-                # it competes with the play it was meant to accelerate — and it
-                # cannot even help it: the phone's non-prefetch request never
-                # joins that in-flight build, and media_proxy already schedules
-                # the remux AFTER the response drains for precisely this reason.
-                # The station's UPCOMING window is warmed instead, by the _auto
-                # toggle and by broadcast_radio_track.
-                #
-                # An EXTRACT is a different thing and it IS for this track. No
-                # media bytes, so nothing to compete with, and it lifts the
-                # single largest item off the cold-start path: extraction is a
-                # median 3.4s / mean 7.1s / worst-case 20.8s against the
-                # production proxy (measured 2026-08-04), and every one of
-                # those seconds is spent before the first byte of audio. The
-                # phone's own request then hits the extract cache or coalesces
-                # onto this call.
+                # EXTRACT warm for the track we just broadcast — deliberately
+                # NOT a build, even with the platform's single-flight spool
+                # (2026-08-09). Same arithmetic as the ws_chat fast path: on an
+                # app-channel play the phone's /audio_stream lands before
+                # extraction finishes, so on the same replica the phone starts
+                # the spool itself and a build buys nothing; on the OTHER
+                # replica a build-warm's spool is a duplicate full pull through
+                # the same sticky proxy slot during the phone's pre-roll. The
+                # extract is the whole win with none of the risk. (The
+                # broadcast/flip warms in radio/player.py and ws_chat differ:
+                # they fire when the proxy is idle.)
                 try:
                     from app.agent.radio.player import warm_audio_cache as _warm
                     _warm([video_id], mode="extract")

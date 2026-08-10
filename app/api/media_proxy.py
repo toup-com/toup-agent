@@ -202,6 +202,12 @@ def _pick_artwork(info: dict) -> str:
 #    and even with it would only expose the unplayable fragmented audio. Kept
 #    as last-ditch fallbacks; they normally just error through.
 _PLAYER_CLIENTS = ("android", "ios", "web_safari", "web")
+# Fast first attempt: android + player_skip (one /player POST, no ~1MB
+# watch-page through the throttled proxy). Fail-open to the full chain on any
+# error — see the attempt loop in _extract_audio. AUDIO_EXTRACT_FAST=0 kills it.
+_EXTRACT_FAST_FIRST = os.environ.get("AUDIO_EXTRACT_FAST", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 def _should_try_next_client(err: BaseException) -> bool:
@@ -409,8 +415,21 @@ def _extract_audio(video_id: str) -> dict:
     slot = _proxy_slot_for(video_id)
     proxy = _proxy_with_slot(slot)
 
-    for client in _PLAYER_CLIENTS:
+    # FAST FIRST ATTEMPT (flag: AUDIO_EXTRACT_FAST=0 to disable): android with
+    # player_skip — one innertube /player POST instead of the ~1MB watch-page
+    # fetch + /player. Every yt-dlp byte rides the residential proxy (median
+    # 0.73 MB/s, TTFB 2.4-4.2s measured 2026-08-09), so the skipped webpage is
+    # most of the 3.4s median. Fail-open: ANY failure of this attempt falls
+    # through to the unmodified full chain below (proxy outage still aborts —
+    # retrying three more clients through a dead egress helps nobody).
+    attempts: list[tuple[str, bool]] = [(c, False) for c in _PLAYER_CLIENTS]
+    if _EXTRACT_FAST_FIRST:
+        attempts.insert(0, ("android", True))
+
+    for client, fast in attempts:
         extractor_args: dict = {"youtube": {"player_client": [client]}}
+        if fast:
+            extractor_args["youtube"]["player_skip"] = ["webpage", "configs", "initial_data"]
         # Arm the bgutil PO-token provider. No-op for android_music/tv_embedded
         # (they don't request a token), but if YouTube's bot challenge fires on
         # the server IP the android/ios gvs clients fetch a proof-of-origin
@@ -461,6 +480,17 @@ def _extract_audio(video_id: str) -> dict:
                     video_id, client, str(e)[:200],
                 )
                 return {"error": "proxy_unavailable", "detail": str(e)}
+            if fast:
+                # The fast attempt is an optimization, never an oracle: its
+                # error strings differ from the full chain's (no webpage, no
+                # configs), so judging permanence from them would wrongly
+                # abort videos the full chain can serve. Fall through to the
+                # unmodified chain for EVERY non-outage failure.
+                logger.info(
+                    "[media_proxy] fast-extract fall-through video_id=%s err=%s",
+                    video_id, str(e)[:120],
+                )
+                continue
             if _should_try_next_client(e):
                 logger.warning(
                     "[media_proxy] client=%s fall-through video_id=%s err=%s",
@@ -485,8 +515,8 @@ def _extract_audio(video_id: str) -> dict:
         url = info["url"]
         ext = info.get("ext") or "m4a"
         logger.info(
-            "[media_proxy] audio_url ok video_id=%s client=%s ext=%s bitrate=%s slot=%d",
-            video_id, client, ext, info.get("abr"), slot,
+            "[media_proxy] audio_url ok video_id=%s client=%s fast=%d ext=%s bitrate=%s slot=%d",
+            video_id, client, int(fast), ext, info.get("abr"), slot,
         )
         return {
             "url": url,
@@ -954,7 +984,19 @@ async def _bounded_build(video_id: str) -> str | None:
         # before the semaphore would let a build acquire a slot during a quiet
         # moment and then pull 11.8MB straight through somebody's first play.
         await _await_live_idle(video_id)
-        path = await asyncio.get_event_loop().run_in_executor(None, _do_remux, video_id)
+        # Spool-fed when possible: the build reads the (shared, possibly still
+        # filling) upstream download instead of opening its own. Slot occupancy
+        # is unchanged — the legacy path held this slot for the same download.
+        src_path = await _spool_file_for_build(video_id)
+        path = await asyncio.get_event_loop().run_in_executor(
+            None, _do_remux, video_id, src_path
+        )
+        # The spool is deliberately NOT discarded on publish. A playing item
+        # that started on the spool has the itag-18 total baked into its
+        # AVPlayer state; the tier-pinning block in stream_audio keeps serving
+        # it from the spool, and only a FRESH item start adopts the m4a (and
+        # retires the spool then). MAX_AGE eviction + the prune sweep bound
+        # the leftover.
     if path:
         # R2 is the durable, uncapped, Mac-independent store — and now the ONLY
         # one. The Postgres L2 that used to be written here has been retired:
@@ -1140,15 +1182,63 @@ def _ensure_cache_dir() -> bool:
     return os.access(d, os.W_OK | os.X_OK)
 
 
-def _do_remux(video_id: str) -> str | None:
+def _do_remux(video_id: str, src_path: str | None = None) -> str | None:
     """Blocking: extract the audio-only URL → ffmpeg remux to a progressive
     faststart m4a on local disk. Returns the cached path, or None so the caller
-    falls back to the itag-18 proxy. Idempotent. Run in an executor."""
+    falls back to the itag-18 proxy. Idempotent. Run in an executor.
+
+    `src_path`: an already-downloaded itag-18 file (a finished spool). When
+    given, the extract + download stages are skipped entirely — ffmpeg reads
+    the local file and the build costs zero proxy bytes. The file is owned by
+    the SPOOL, not this function: never unlink it here."""
     ready = _remuxed_ready(video_id)
     if ready:
         return ready
     if not _ffmpeg_available():
         return None
+    if src_path is not None:
+        try:
+            if os.path.getsize(src_path) <= 0:
+                src_path = None
+        except OSError:
+            src_path = None
+    if src_path is not None:
+        if not _ensure_cache_dir():
+            return None
+        out = _remuxed_path(video_id)
+        tmp = f"{out}.{os.getpid()}.tmp"
+        _safe_unlink(tmp)
+        t0 = time.time()
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "error",
+            "-i", src_path,
+            "-vn", "-c:a", "copy", "-movflags", "+faststart",
+            "-f", "mp4", tmp,
+        ]
+        try:
+            proc = subprocess.run(cmd, timeout=60, capture_output=True)
+        except Exception as e:
+            logger.warning("[media_proxy] remux(spool) ffmpeg error video_id=%s: %s", video_id, e)
+            _safe_unlink(tmp)
+            return None
+        if proc.returncode != 0 or not (os.path.exists(tmp) and os.path.getsize(tmp) > 0):
+            logger.warning(
+                "[media_proxy] remux(spool) failed video_id=%s rc=%s err=%s",
+                video_id, proc.returncode, (proc.stderr or b"")[:200],
+            )
+            _safe_unlink(tmp)
+            return None
+        try:
+            os.replace(tmp, out)
+        except OSError:
+            _safe_unlink(tmp)
+            return None
+        logger.info(
+            "[media_proxy] remux ok (spool) video_id=%s %.2fs size=%d",
+            video_id, time.time() - t0, os.path.getsize(out),
+        )
+        _prune_audio_cache()
+        return out
     # Source the UN-THROTTLED itag-18 (android/ios client + POT, ~2-5 MB/s) via
     # the same extraction the proxy already uses — then ffmpeg strips the video.
     # We do NOT use the audio-only itag-140: from the default client it has no
@@ -1230,15 +1320,26 @@ def _do_remux(video_id: str) -> str | None:
 
 
 def _prune_audio_cache() -> None:
-    """Keep the newest _AUDIO_CACHE_MAX_FILES remuxed files; drop older ones."""
+    """Keep the newest _AUDIO_CACHE_MAX_FILES remuxed files; drop older ones.
+    Also sweep dead .spool files — a spool whose mtime is an hour old stopped
+    being written long ago (crash, restart, abandoned download)."""
     try:
-        entries = [
-            os.path.join(_AUDIO_CACHE_DIR, f)
-            for f in os.listdir(_AUDIO_CACHE_DIR)
-            if f.endswith(".m4a")
-        ]
+        listing = os.listdir(_AUDIO_CACHE_DIR)
     except OSError:
         return
+    now = time.time()
+    live_spool_paths = {sp.path for sp in _spools.values()}
+    for f in listing:
+        if f.endswith(".spool"):
+            p = os.path.join(_AUDIO_CACHE_DIR, f)
+            if p in live_spool_paths:
+                continue  # a registered spool is never swept, whatever its mtime
+            try:
+                if now - os.path.getmtime(p) > 3600:
+                    _safe_unlink(p)
+            except OSError:
+                pass
+    entries = [os.path.join(_AUDIO_CACHE_DIR, f) for f in listing if f.endswith(".m4a")]
     if len(entries) <= _AUDIO_CACHE_MAX_FILES:
         return
     try:
@@ -1520,6 +1621,318 @@ def _tenant_stream_sem(user_id: str) -> asyncio.Semaphore:
     return sem
 
 
+# ── Single-flight upstream SPOOL ───────────────────────────────────────────
+#
+# On a cold MISS, one video used to cost the residential proxy the same bytes
+# THREE times: AVFoundation's 2-byte probe opened a full upstream connection
+# (4.2s of TTFB for 2 bytes, measured in prod 2026-08-09), its real range
+# request opened another (upstream_ms=4239 on the same track, same minute),
+# and the post-response remux build downloaded the whole itag-18 AGAIN —
+# ~23.6MB of metered traffic for an ~11.8MB file, all through a peer measured
+# at 0.04-1.14 MB/s while the user sat in silence.
+#
+# The spool is ONE download per video id: an async task pulls the itag-18 to a
+# local file, and every consumer reads from that file as it fills — the probe
+# (answered the moment 2 bytes exist), every parallel range connection, and
+# the remux build (which no longer downloads at all; ffmpeg reads the spool).
+# A warm(mode="build") issued at broadcast time starts the spool BEFORE the
+# phone asks, so the phone's first request joins a download already in flight.
+#
+# Fail-open by construction: any spool problem (download error, header-wait
+# timeout, a deep seek beyond what has arrived) returns None and the caller
+# falls through to the legacy direct-upstream path unchanged. Kill switch:
+# AUDIO_STREAM_SPOOL=0 restores the legacy path outright.
+_SPOOL_ENABLED = os.environ.get("AUDIO_STREAM_SPOOL", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+# Bounded wait for the spool download's response HEADERS (Content-Length) —
+# mirrors _UPSTREAM_HEADERS_TIMEOUT plus scheduling slack.
+_SPOOL_HEADERS_WAIT = float(os.environ.get("AUDIO_SPOOL_HEADERS_WAIT", "25"))
+# How long a build waits for a spool to finish before falling back to its own
+# download. A 13-minute video is ~38MB; at the measured worst residential
+# throughput that is minutes, so this is generous — the build budget
+# (_ensure_remux_bg's 120s) is the real ceiling.
+_SPOOL_BUILD_WAIT = float(os.environ.get("AUDIO_SPOOL_BUILD_WAIT", "110"))
+# Serve a range from the spool only when its start is within this many bytes
+# of what has already arrived (or the download is done). A deep seek would
+# otherwise WAIT for the sequential download to reach it — the legacy path
+# serves that one request with its own upstream Range instead.
+_SPOOL_READ_AHEAD_LIMIT = 3 * 1024 * 1024
+# A spool this old is a leak, not a download.
+_SPOOL_MAX_AGE_SECS = float(os.environ.get("AUDIO_SPOOL_MAX_AGE_SECS", "900"))
+
+
+class _Spool:
+    """State of one in-flight (or completed) upstream download.
+
+    All mutation happens on the event loop (the downloader task), so plain
+    attributes are safe; readers poll rather than wait on a Condition —
+    50ms granularity is noise against multi-second network stages, and it
+    sidesteps asyncio.Condition's cancellation sharp edges entirely.
+    """
+
+    __slots__ = ("video_id", "path", "total", "received", "done", "error", "task", "created", "mime")
+
+    def __init__(self, video_id: str, path: str) -> None:
+        self.video_id = video_id
+        self.path = path
+        self.total: int | None = None
+        self.received = 0
+        self.done = False
+        self.error: str | None = None
+        self.task: "asyncio.Task | None" = None
+        self.created = time.monotonic()
+        self.mime = "audio/mp4"
+
+
+_spools: dict[str, _Spool] = {}
+_spools_lock = asyncio.Lock()
+
+
+async def _spool_wait(spool: _Spool, predicate, timeout: float) -> bool:
+    """Poll until predicate() holds. False on error/timeout — never raises."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if spool.error is not None:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+
+
+async def _spool_download(spool: _Spool, result: dict) -> None:
+    """The one upstream pull. Writes the growing file, then kicks the remux —
+    which reads the file instead of re-downloading it."""
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=_STREAM_TIMEOUT, follow_redirects=True, proxy=_proxy_for_result(result)
+        ) as client:
+            async with client.stream(
+                "GET", result["url"], headers={"User-Agent": "Mozilla/5.0"}
+            ) as r:
+                if r.status_code >= 400:
+                    raise RuntimeError(f"upstream status {r.status_code}")
+                try:
+                    spool.total = int(r.headers.get("content-length") or 0) or None
+                except ValueError:
+                    spool.total = None
+                with open(spool.path, "wb") as f:
+                    async for chunk in r.aiter_bytes(_STREAM_CHUNK_BYTES):
+                        f.write(chunk)
+                        spool.received += len(chunk)
+        if spool.total is None:
+            spool.total = spool.received
+        if spool.received != spool.total:
+            raise RuntimeError(f"short body {spool.received}/{spool.total}")
+        spool.done = True
+        logger.info(
+            "[media_proxy] spool COMPLETE video_id=%s bytes=%d %.1fs",
+            spool.video_id, spool.received, time.monotonic() - t0,
+        )
+        # Build the remux NOW from the finished file — zero additional proxy
+        # bytes. Deduped downstream (_remux_tasks / _remuxed_ready).
+        asyncio.create_task(_ensure_remux_bg(spool.video_id))
+    except Exception as e:
+        spool.error = str(e)
+        logger.warning("[media_proxy] spool FAILED video_id=%s: %s", spool.video_id, e)
+        async with _spools_lock:
+            if _spools.get(spool.video_id) is spool:
+                _spools.pop(spool.video_id, None)
+                # Unlink ONLY when this task still owned the registry entry.
+                # A replaced spool (MAX_AGE eviction swapped in a successor at
+                # the SAME deterministic path) must never touch the file — it
+                # is the successor's live download now, and a stale unlink
+                # here left every later reader open()ing a vanished path after
+                # 206 headers had already been sent (adversarial review).
+                _safe_unlink(spool.path)
+
+
+async def _spool_get_or_start(video_id: str, result: dict) -> "_Spool | None":
+    """Join the live spool for this video, or start one. None = spooling is
+    unavailable (dir not writable) and the caller must use the legacy path."""
+    if not _SPOOL_ENABLED:
+        return None
+    async with _spools_lock:
+        sp = _spools.get(video_id)
+        if sp is not None:
+            if sp.error is None and (time.monotonic() - sp.created) < _SPOOL_MAX_AGE_SECS:
+                return sp
+            _spools.pop(video_id, None)
+            # Mark BEFORE cancel/unlink: any reader mid-body on the evicted
+            # object polls (received / error / done) — without an error it
+            # would sleep-loop forever on a frozen download.
+            if sp.error is None and not sp.done:
+                sp.error = "evicted"
+            # Cancel the evicted download BEFORE unlinking: left running, its
+            # failure handler would fire later — its identity check now fails
+            # (we popped it), so it won't unlink, but it must also stop
+            # trickling metered bytes into an unlinked inode. (CancelledError
+            # is a BaseException — the downloader's except Exception does not
+            # catch it, so a cancelled task never runs the failure cleanup.)
+            if sp.task is not None and not sp.task.done():
+                sp.task.cancel()
+            _safe_unlink(sp.path)
+        if not _ensure_cache_dir():
+            return None
+        path = os.path.join(_AUDIO_CACHE_DIR, f"{video_id}.spool")
+        try:
+            # Created empty up front so readers can open it before the first
+            # byte lands (the downloader truncates/rewrites the same handle).
+            open(path, "wb").close()
+        except OSError:
+            return None
+        sp = _Spool(video_id, path)
+        sp.mime = result.get("mime_type") or "audio/mp4"
+        _spools[video_id] = sp
+        sp.task = asyncio.create_task(_spool_download(sp, result))
+        return sp
+
+
+def _spool_discard(video_id: str) -> None:
+    """Drop a spool whose bytes are no longer needed (remux published)."""
+    sp = _spools.pop(video_id, None)
+    if sp is not None:
+        _safe_unlink(sp.path)
+
+
+async def _spool_file_for_build(video_id: str) -> str | None:
+    """Hand the remux build a finished spool file so it never downloads.
+
+    Joins a live spool, or STARTS one when none exists — that is what makes a
+    warm(mode="build") at broadcast time pre-start the very download the
+    phone's first /audio_stream request will read from. Starting a spool opens
+    a new upstream pull, so the live-first gate is honored first, exactly like
+    the legacy download this replaces. None = no usable spool (caller falls
+    back to its own gated download)."""
+    if not _SPOOL_ENABLED:
+        return None
+    sp = _spools.get(video_id)
+    if sp is None or sp.error is not None:
+        await _await_live_idle(video_id)
+        try:
+            result = await asyncio.wait_for(
+                _extract_coalesced(video_id), timeout=_AUDIO_EXTRACT_TIMEOUT_SECS
+            )
+        except Exception:
+            return None
+        if "error" in result or not result.get("url"):
+            return None
+        sp = await _spool_get_or_start(video_id, result)
+        if sp is None:
+            return None
+    ok = await _spool_wait(sp, lambda: sp.done, _SPOOL_BUILD_WAIT)
+    if not ok or sp.error is not None:
+        return None
+    return sp.path
+
+
+def _spool_response(
+    spool: _Spool,
+    range_header: "str | None",
+    *,
+    prefetch: bool,
+    mime: str,
+    video_id: str,
+    on_release,
+    t0: float,
+    cache_ms: int,
+    extract_ms: int,
+) -> "StreamingResponse | None":
+    """Range-aware response served from the spool file as it fills.
+
+    None when this REQUEST can't be served from the spool (headers not yet
+    known is handled by the caller's wait; a deep seek past the read-ahead
+    limit falls back to legacy). The live-first gate semantics mirror the
+    legacy body exactly: held from first byte until _LIVE_GATE_BYTES for a
+    non-prefetch stream, released idempotently in finally."""
+    total = spool.total
+    if total is None or total <= 0:
+        return None
+    rng = _parse_byte_range(range_header, total)
+    if rng:
+        start, end = rng
+        if not spool.done and start > spool.received + _SPOOL_READ_AHEAD_LIMIT:
+            return None  # deep seek — don't make AVPlayer wait for sequential fill
+        status = 206
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Range": f"bytes {start}-{end}/{total}",
+            "Content-Length": str(end - start + 1),
+        }
+    else:
+        start, end = 0, total - 1
+        status = 200
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Length": str(total),
+        }
+
+    async def _spool_body():
+        sent = 0
+        pos = start
+        t_first: "float | None" = None
+        gating = not prefetch
+        if gating:
+            _live_start_begin()
+
+        def _ungate() -> None:
+            nonlocal gating
+            if gating:
+                gating = False
+                _live_start_done()
+
+        try:
+            with open(spool.path, "rb") as fh:
+                while pos <= end:
+                    avail = spool.received
+                    if pos < avail:
+                        fh.seek(pos)
+                        chunk = fh.read(min(_STREAM_CHUNK_BYTES, end + 1 - pos, avail - pos))
+                        if not chunk:
+                            break
+                        if t_first is None:
+                            t_first = time.monotonic()
+                            logger.info(
+                                "[media_proxy] audio_stream TIMING video_id=%s tier=MISS "
+                                "spool=1 cache_lookup_ms=%d extract_ms=%d first_byte_ms=%d",
+                                video_id, cache_ms, extract_ms,
+                                int((time.monotonic() - t0) * 1000),
+                            )
+                        pos += len(chunk)
+                        sent += len(chunk)
+                        if sent >= _LIVE_GATE_BYTES:
+                            _ungate()
+                        yield chunk
+                    elif spool.error is not None:
+                        break  # truncated — AVPlayer re-ranges; retry hits legacy
+                    elif spool.done:
+                        break
+                    else:
+                        await asyncio.sleep(0.05)
+        finally:
+            _ungate()
+            if t_first is not None and sent > 0:
+                _dur = max(time.monotonic() - t_first, 1e-3)
+                logger.info(
+                    "[media_proxy] audio_stream DELIVERED video_id=%s spool=1 bytes=%d "
+                    "stream_ms=%d throughput_mbps=%.2f total_ms=%d",
+                    video_id, sent, int(_dur * 1000), (sent / _dur) / 1e6,
+                    int((time.monotonic() - t0) * 1000),
+                )
+            on_release()
+            # If the spool died mid-serve, give the legacy build path its shot
+            # at warming the cache (deduped; no-op when the remux exists).
+            if spool.error is not None:
+                asyncio.create_task(_ensure_remux_bg(video_id))
+
+    return StreamingResponse(_spool_body(), status_code=status, headers=headers, media_type=mime)
+
+
 # NOTE: do NOT cache+reuse one googlevideo URL across AVFoundation's multiple
 # fetch connections — googlevideo rejects the repeat hits (observed as
 # SwiftAudioEx PlaybackError 1 on the device, playback stuck at 0:00). Each
@@ -1572,14 +1985,53 @@ async def stream_audio(
     def _ms(since: float) -> int:
         return int((time.monotonic() - since) * 1000)
 
+    prefetch = (request.query_params.get("prefetch") or "").lower() in ("1", "true", "yes")
+    range_header = request.headers.get("range")
+
+    # ── TIER PINNING ──────────────────────────────────────────────────────
+    # While a spool exists for this id, every non-prefetch request serves from
+    # the itag-18 byte space — NEVER the m4a. The playing AVPlayer item learned
+    # total = the itag-18 size from its probe; if the remux published mid-track
+    # and a later range request (stall recovery, seek, buffer drain) were
+    # answered from the ~4x-smaller m4a, the offsets would land in a different
+    # container — CoreMedia errors out and auto-skip walks the user off the
+    # track (adversarial review, 2026-08-09; the hazard predated the spool but
+    # the at-completion remux kick made it the common case). A FRESH item start
+    # (range absent or from byte 0 — AVFoundation always probes first) is the
+    # one safe moment to adopt the m4a: do so and retire the spool.
+    pin_itag = False
+    if _SPOOL_ENABLED and not prefetch:
+        sp_live = _spools.get(video_id)
+        if sp_live is not None and sp_live.error is not None:
+            sp_live = None
+        if sp_live is not None:
+            _rng = _parse_byte_range(range_header, sp_live.total or (1 << 62))
+            fresh_start = _rng is None or _rng[0] == 0
+            if fresh_start and sp_live.done and _remuxed_ready(video_id):
+                _spool_discard(video_id)  # new item + m4a ready → adopt it below
+                sp_live = None
+        if sp_live is not None:
+            await _spool_wait(sp_live, lambda: sp_live.total is not None, _SPOOL_HEADERS_WAIT)
+            resp = _spool_response(
+                sp_live, range_header, prefetch=False, mime=sp_live.mime,
+                video_id=video_id, on_release=_release, t0=_t0,
+                cache_ms=0, extract_ms=0,
+            )
+            if resp is not None:
+                return resp
+            # Unusable for THIS request (deep seek past the fill, headers still
+            # unknown): stay in the SAME byte space — skip the remux tiers and
+            # let the legacy upstream proxy below serve the itag-18 range.
+            pin_itag = True
+
     # FAST PATH: serve the cached audio-only remux straight off local disk —
     # ~4x smaller than itag-18 and no googlevideo/proxy round-trip on playback.
     # A local-file serve holds no upstream connection, so release the stream
     # semaphore. (See _local_audio_response for the Range/206 detail that fixed
     # the PlaybackError-1-no-audio bug, root-caused on device 2026-06-08.)
-    rpath = _remuxed_ready(video_id)
+    rpath = None if pin_itag else _remuxed_ready(video_id)
     tier = "L1" if rpath else None
-    if not rpath:
+    if not rpath and not pin_itag:
         # Shared store — pull a once-built remux to local disk and serve it (no
         # proxy fetch, no throttle). R2 is now the only shared tier; the
         # Postgres blob fallback that used to sit behind it has been retired.
@@ -1613,7 +2065,6 @@ async def stream_audio(
     # The build is deduped (one per video) and we release the per-tenant
     # semaphore before waiting — a build holds no stream slot, and the cap is
     # only 5 which AVFoundation's parallel connections would otherwise trip.
-    prefetch = (request.query_params.get("prefetch") or "").lower() in ("1", "true", "yes")
     if _ffmpeg_available() and prefetch:
         _release()
         built = await _remux_now(video_id, budget=_REMUX_SYNC_BUDGET_SECS)
@@ -1654,14 +2105,39 @@ async def stream_audio(
         _release()
         return JSONResponse(status_code=502, content=result)
 
-    upstream_url = result["url"]
     mime = result.get("mime_type") or "audio/mp4"
+
+    # SPOOL FIRST: one upstream download serves this request, AVFoundation's
+    # other parallel connections, and the remux build (see the spool section).
+    # Any None below falls through to the legacy direct-upstream path, which
+    # is byte-for-byte the pre-spool behaviour.
+    if _SPOOL_ENABLED:
+        spool = await _spool_get_or_start(video_id, result)
+        if spool is not None:
+            # The response needs Content-Length up front — bounded wait for the
+            # downloader's headers. A spool started at broadcast-warm time has
+            # them already; one started by this very request pays one TTFB.
+            await _spool_wait(spool, lambda: spool.total is not None, _SPOOL_HEADERS_WAIT)
+            resp = _spool_response(
+                spool,
+                request.headers.get("range"),
+                prefetch=prefetch,
+                mime=mime,
+                video_id=video_id,
+                on_release=_release,
+                t0=_t0,
+                cache_ms=_cache_ms,
+                extract_ms=_extract_ms,
+            )
+            if resp is not None:
+                return resp
+
+    upstream_url = result["url"]
     _t_upstream = time.monotonic()
 
     # Forward the client's Range header so AVFoundation can seek; googlevideo
     # honours it and replies 206 + Content-Range.
     upstream_headers = {"User-Agent": "Mozilla/5.0"}
-    range_header = request.headers.get("range")
     if range_header:
         upstream_headers["Range"] = range_header
 
