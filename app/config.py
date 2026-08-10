@@ -1202,12 +1202,35 @@ class Settings(BaseSettings):
     reranker_model: str = "rerank-v3.5"  # Cohere rerank model
     # Hard wall-clock budget for the whole rerank attempt (Cohere AND the
     # LLM fallback share it). On expiry the search degrades to hybrid
-    # (RRF+weighted) order — never fails, never blocks the turn. 900ms keeps
-    # end-to-end retrieval inside memverify's 1500ms ceiling with room for
-    # the embedding RTT; with no Cohere key the gpt-4o-mini fallback rarely
-    # beats this, which is deliberate — a 1-3s LLM hop for marginal
-    # precision is a bad trade on the turn path.
+    # (RRF+weighted) order — never fails, never blocks the turn.
+    #
+    # 900ms is sized for COHERE, which is purpose-built and answers in
+    # ~100-300ms. It is deliberately NOT enough for the gpt-4o-mini
+    # fallback — see reranker_llm_fallback_enabled for why that is a
+    # setting and not a race.
     reranker_timeout_ms: int = 900
+    # The gpt-4o-mini fallback re-ranker, OFF on the turn path.
+    #
+    # Measured in production (Loki, 7d, 2026-08-10): the fallback really
+    # does run — three successful re-ranks on the founder's tenant at
+    # 2754ms, 2776ms and 4054ms. That is the G-18 latency, and it was not
+    # a test artefact: an earlier read of `docker logs --since 168h` found
+    # "zero" only because the fleet had been recreated minutes before, so
+    # the window could not reach back past the container's own birth.
+    #
+    # Given it is real, the choice is explicit rather than accidental.
+    # 2.7-4s of turn latency for a precision improvement over hybrid order
+    # is a bad trade on a path a user is waiting on, and the alternative
+    # the budget produced on its own was the WORST of the three: start the
+    # hop, burn the full 900ms, then throw the answer away and return
+    # hybrid order anyway (4 of 4 attempts after the budget shipped). Dead
+    # latency for nothing.
+    #
+    # So the fallback is opt-in. Default OFF means hybrid order is reached
+    # immediately and honestly. Turning it on is a considered decision to
+    # buy precision with seconds; the real fix for precision is a COHERE
+    # key, which fits inside the budget.
+    reranker_llm_fallback_enabled: bool = False
     
     # ── Discord ──────────────────────────────────────────────
     discord_bot_token: Optional[str] = None  # Set via DISCORD_BOT_TOKEN env var

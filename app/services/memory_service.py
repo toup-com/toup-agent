@@ -3049,11 +3049,15 @@ class MemoryService:
         # keyword/graph/temporal don't need the embedding, so degrade
         # to them instead of raising (per-strategy isolation below only
         # covers the gather, not this shared call).
+        _embed_ms = 0.0
+        _t_embed = time.monotonic()
         try:
             query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
         except Exception as e:
             query_embedding = None
             logger.warning(f"[HYBRID] Query embedding failed, skipping vector strategy: {e}")
+        finally:
+            _embed_ms = (time.monotonic() - _t_embed) * 1000
 
         # Run enabled strategies in parallel
         tasks = {}
@@ -3120,13 +3124,17 @@ class MemoryService:
         # p95 is ~26ms against a 150ms budget).
         task_names = list(tasks.keys())
         results = []
-        # Per-leg wall-clock. Production retrieval spans have reached seconds
-        # with the re-ranker never firing (G-18 follow-up, 2026-08-10:
-        # founder-tenant retrieval_events p50 4.1s / p95 10.1s, zero
-        # [RERANKER] lines fleet-wide) — the slow phase was not attributable
-        # from the [PERF] hybrid_search total alone. The vector leg's time
-        # includes the query-embedding call, so this line separates
-        # embed-dominated latency from DB-dominated latency per strategy.
+        # Per-leg wall-clock. Production retrieval spans reach seconds
+        # (founder-tenant retrieval_events p50 4.1s / p95 10.1s) and the
+        # single [PERF] hybrid_search total could not say which phase was
+        # responsible.
+        #
+        # The embedding hop is timed SEPARATELY, above. The first version of
+        # this comment claimed "the vector leg's time includes the
+        # query-embedding call" — it does not and cannot: the embedding is
+        # awaited before the leg coroutine is even constructed, so vector=
+        # was pure pgvector time and the one network hop this instrumentation
+        # existed to attribute was the one it could not see.
         _leg_ms: Dict[str, float] = {}
         for _name in task_names:
             _t_leg = time.monotonic()
@@ -3287,6 +3295,7 @@ class MemoryService:
         # Counts and milliseconds only — no memory content, no query text.
         logger.info(
             "[HYBRID] timing "
+            + f"embed={_embed_ms:.0f}ms "
             + " ".join(f"{n}={_leg_ms.get(n, 0.0):.0f}ms" for n in task_names)
             + f" rerank={_rerank_ms:.0f}ms results={len(scored_memories)}"
         )

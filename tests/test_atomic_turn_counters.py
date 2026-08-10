@@ -9,9 +9,12 @@ concurrent turns for one user (a voice think beside a chat turn, a second
 device) each held a stale value and the last writer erased the other's
 increment. The fix is an atomic `UPDATE ... SET c = COALESCE(c,0) + :n`.
 
-The source pin fails on the pre-fix code; the semantics test pins that the
-atomic form actually accumulates across two sessions that both start from a
-stale read (the exact interleaving that lost increments before).
+The source pin fails on the pre-fix code. The behavioural test below drives
+the REAL `AgentRunner._save_messages` twice — it used to build its own
+UPDATE and assert that SQLAlchemy arithmetic works, which passed happily on
+the buggy code and even survived pointing the UPDATE at a row that cannot
+exist. A test that never calls the function it is named after is not a
+detector; an adversarial review proved that one vacuous by mutation.
 """
 
 import re
@@ -43,52 +46,80 @@ def test_no_read_modify_write_on_turn_counters():
     )
 
 
-async def test_atomic_increment_survives_the_stale_read_interleaving(tmp_path):
-    """Two sessions, both holding a stale read, both increment: nothing lost.
+async def test_save_messages_does_not_erase_a_concurrent_increment(tmp_path):
+    """Drive the real `_save_messages` against a STALE identity-mapped row.
 
-    This is the interleaving that dropped increments pre-fix: A loads
-    count=0, B loads count=0, A writes, B writes. With the ORM assignment B
-    overwrote A (final 1). The atomic UPDATE computes against the row's
-    CURRENT value at execution time (final 2). NULL start pins the COALESCE.
+    This is the interleaving two concurrent turns produce, made
+    deterministic. Session A loads the Conversation (count=0). Session B
+    commits a turn, so the row is now 2. Session A then runs
+    `_save_messages` — and because SQLAlchemy's identity map returns the
+    instance A already loaded, `session.message_count` is still the stale
+    0. The pre-fix `x = (x or 0) + n` therefore writes 2, erasing B's turn.
+    The atomic `UPDATE ... SET c = COALESCE(c,0) + n` computes against the
+    row's CURRENT value and lands 4.
+
+    The previous version of this test opened a fresh session per turn, so
+    nothing was ever stale and it passed on the buggy code — an adversarial
+    review proved it vacuous by reverting the fix and by pointing the
+    UPDATE at a non-existent row. Both mutations now fail here.
     """
-    from app.db.models import Conversation
-    from app.db.database import Base
+    from unittest.mock import AsyncMock
+    from app.agent.agent_runner import AgentRunner
+    from app.db.models import Conversation, Message, User
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/c.db")
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/t.db")
     async with engine.begin() as conn:
-        await conn.run_sync(
-            lambda sc: Conversation.__table__.create(sc, checkfirst=True)
-        )
+        for table in (User.__table__, Conversation.__table__, Message.__table__):
+            await conn.run_sync(lambda sc, t=table: t.create(sc, checkfirst=True))
     maker = async_sessionmaker(engine, expire_on_commit=False)
 
-    async with maker() as s:
-        conv = Conversation(user_id="u1", title="t", message_count=None, total_tokens=None)
-        s.add(conv)
-        await s.commit()
-        cid = conv.id
+    user_id = "u-counters"
+    async with maker() as db:
+        db.add(User(id=user_id, email="c@t.local", hashed_password="x", name="C"))
+        conv = Conversation(user_id=user_id, title="t", message_count=0, total_tokens=0)
+        db.add(conv)
+        await db.commit()
+        conv_id = conv.id
 
-    async def bump(n_msgs: int, n_toks: int):
-        async with maker() as s:
-            # Stale read first — pre-fix code based its write on this value.
-            await s.execute(select(Conversation).where(Conversation.id == cid))
-            await s.execute(
-                update(Conversation)
-                .where(Conversation.id == cid)
-                .values(
-                    message_count=func.coalesce(Conversation.message_count, 0) + n_msgs,
-                    total_tokens=func.coalesce(Conversation.total_tokens, 0) + n_toks,
-                )
-            )
-            await s.commit()
+    tools = AsyncMock()
+    tools._last_media = None
+    tools._last_pending_action = None
+    runner = AgentRunner(llm_service=AsyncMock(), tool_executor=tools)
 
-    await bump(2, 100)
-    await bump(2, 150)
+    async def save(db):
+        await runner._save_messages(
+            db=db, session_id=conv_id, user_id=user_id,
+            user_message="hi", assistant_response="hello",
+            tokens_input=100, tokens_output=20,
+            model="gpt-4o-mini", processing_time_ms=5,
+        )
+        await db.commit()
 
-    async with maker() as s:
-        row = (
-            await s.execute(select(Conversation).where(Conversation.id == cid))
-        ).scalar_one()
-        assert row.message_count == 4, f"lost increment: {row.message_count}"
-        assert row.total_tokens == 250, f"lost tokens: {row.total_tokens}"
+    async with maker() as session_a:
+        # A loads the row FIRST and holds it in its identity map.
+        stale = (await session_a.execute(
+            select(Conversation).where(Conversation.id == conv_id)
+        )).scalar_one()
+        assert (stale.message_count or 0) == 0
+
+        # B commits a whole turn underneath A.
+        async with maker() as session_b:
+            await save(session_b)
+
+        # A now writes. Its re-query returns the STALE instance above.
+        await save(session_a)
+
+    async with maker() as db:
+        row = (await db.execute(
+            select(Conversation).where(Conversation.id == conv_id)
+        )).scalar_one()
+
+    assert row.message_count == 4, (
+        f"expected 4 messages from two turns, got {row.message_count} — a "
+        "concurrent turn's increment was erased (last-writer-wins)"
+    )
+    assert row.total_tokens == 240, (
+        f"expected 240 tokens from two turns, got {row.total_tokens}"
+    )
 
     await engine.dispose()

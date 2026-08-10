@@ -134,3 +134,57 @@ async def test_small_candidate_set_short_circuits_without_budget(monkeypatch):
     out = await svc.rerank("query", _cands(5), top_k=10)
     assert len(out) == 5
     assert all(c["rerank_score"] == c["final_score"] for c in out)
+
+
+# ── The fallback that could never fit the budget ─────────────────────────
+#
+# Production ran the gpt-4o-mini fallback at 2754/2776/4054 ms (Loki, 7d).
+# The 900 ms budget therefore never let it finish — it just burned 900 ms
+# and returned hybrid order anyway (4 of 4 attempts after the budget
+# shipped). Dead latency for nothing. So the fallback is gated BEFORE the
+# race, not raced and discarded.
+
+
+async def test_llm_fallback_is_not_started_when_it_cannot_finish(monkeypatch):
+    """Default OFF: no backend is started, so hybrid order is reached
+    immediately instead of 900 ms later."""
+    monkeypatch.setattr(settings, "reranker_timeout_ms", 300, raising=False)
+    monkeypatch.setattr(settings, "reranker_llm_fallback_enabled", False, raising=False)
+    svc = RerankerService(openai_api_key="test-key")
+    called = {"n": 0}
+
+    async def _slow_llm(*a, **k):
+        called["n"] += 1
+        await asyncio.sleep(3.0)
+        return []
+
+    monkeypatch.setattr(svc, "_llm_rerank", _slow_llm)
+
+    t0 = time.monotonic()
+    out = await svc.rerank("query", _cands(30), top_k=10)
+    elapsed = time.monotonic() - t0
+
+    assert called["n"] == 0, (
+        "the LLM fallback was started even though it cannot finish inside "
+        "the budget — that is the dead-latency regression"
+    )
+    assert elapsed < 0.2, (
+        f"hybrid order took {elapsed:.2f}s; with no runnable backend it "
+        "must be immediate, not budget-delayed"
+    )
+    assert [c["id"] for c in out] == [str(i) for i in range(10)]
+
+
+async def test_llm_fallback_still_runs_when_explicitly_enabled(monkeypatch):
+    """Opt-in must actually opt in — the gate is a decision, not a removal."""
+    monkeypatch.setattr(settings, "reranker_timeout_ms", 2000, raising=False)
+    monkeypatch.setattr(settings, "reranker_llm_fallback_enabled", True, raising=False)
+    svc = RerankerService(openai_api_key="test-key")
+    cands = _cands(30)
+    reranked = list(reversed(cands[:10]))
+
+    async def _fast_llm(*a, **k):
+        return reranked
+
+    monkeypatch.setattr(svc, "_llm_rerank", _fast_llm)
+    assert await svc.rerank("query", cands, top_k=10) is reranked

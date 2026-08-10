@@ -127,8 +127,16 @@ class RerankerService:
             except Exception as exc:
                 logger.warning(f"[RERANKER] Cohere failed, falling back: {exc}")
 
-        # --- Fallback: GPT-4o-mini scoring ---
-        if self.openai_api_key and _remaining() > 0:
+        # --- Fallback: GPT-4o-mini scoring (opt-in) ---
+        # Measured at 2754-4054ms in production, i.e. never inside the
+        # budget. Starting it anyway means burning the whole budget and
+        # then discarding the result — strictly worse than not starting
+        # it. Gate first, race second.
+        if (
+            getattr(_settings, "reranker_llm_fallback_enabled", False)
+            and self.openai_api_key
+            and _remaining() > 0
+        ):
             try:
                 result = await asyncio.wait_for(
                     self._llm_rerank(query, candidates, top_k),

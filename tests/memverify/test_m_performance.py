@@ -103,15 +103,18 @@ async def test_retrieval_latency_within_budget(db, populated, monkeypatch):
     from app.services import embedding_service as es
     from app.services.embedding_service import get_embedding_service
 
-    # The re-ranker is deliberately OUT of this measurement. When the fused
-    # candidate set exceeds `limit` it adds an external hop — Cohere, or with
-    # no Cohere key the gpt-4o-mini fallback at 1-3s — whose latency is not
-    # ours, and which made this ceiling stochastically unholdable (G-18: the
-    # p95 reached 2535-3440 ms on runs where enough queries tripped the
-    # branch). Boundedness of that hop is pinned deterministically in
-    # tests/test_reranker_timeout.py; this test measures the pipeline we
-    # control plus the embedding RTT the ceiling exists to watch.
-    monkeypatch.setattr(settings, "enable_reranker", False)
+    # The re-ranker stays IN this measurement, and the LLM fallback stays
+    # OUT of the product — which is the honest version of the same idea.
+    #
+    # The first attempt at G-18 pinned `enable_reranker=False` here to make
+    # the ceiling deterministic. That removed the only watchdog on the hop
+    # that was actually blowing the budget: production was running the
+    # gpt-4o-mini fallback at 2754-4054ms, and quieting the test is exactly
+    # how that stayed invisible. Now the fallback is gated off at the
+    # source (`reranker_llm_fallback_enabled`), so the remaining backend is
+    # Cohere — which fits the budget — and this test measures the real
+    # retrieval path again, ceiling included.
+    monkeypatch.setattr(settings, "reranker_llm_fallback_enabled", False)
 
     embedder = get_embedding_service()
     await recall(db, populated, "warmup")  # warm pool, plans, HTTPS session
