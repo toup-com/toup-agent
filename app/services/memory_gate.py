@@ -34,8 +34,15 @@ Rules added 2026-08-01 by the memory verification job
     sensitive_*           secret values are never written down verbatim
     negated_predicate     (relationships) "USER nots lives in Toronto"
     inferred_interest     (2026-08-03) asking about something is not being
-                          something — the ONLY control on the cross-lingual
-                          case, where assistant_echo abstains by design
+                          something — was the ONLY control on the
+                          cross-lingual case, where assistant_echo abstains
+                          by design; being a regex blocklist, it holds only
+                          for the phrasings it names
+    cross_script_question_only
+                          (2026-08-10) a question-only turn in one script
+                          cannot source a memory written in another — closes
+                          the corridor where echo, unsupported_claim and the
+                          interest regex all abstain at once (the B06 flake)
 
 Every one of them ships with must-REJECT *and* must-KEEP cases in
 backend/tests/test_memory_gate_regressions.py, because a gate that rejects
@@ -1181,6 +1188,66 @@ def unsupported_claim_reason(
     return "unsupported_on_question_turn"
 
 
+# ── The script boundary is where every other provenance rule goes quiet ────
+#
+# Follow B06 across the rules above and watch each one abstain in turn.
+# `assistant_echo_reason` abstains cross-lingually BY DESIGN — a memory
+# written in English from a Persian turn overlaps neither side lexically, so
+# its margin is unmeasurable and it stays silent rather than guess.
+# `unsupported_claim_reason` abstains on a script mismatch EXPLICITLY, because
+# "the user's words support none of this" is an artefact of the alphabet
+# there, not a measurement. And `inferred_interest_reason` is a BLOCKLIST: an
+# English regex over phrasings like "is interested in", which catches the
+# extractor's favourite sentence shape and nothing else — "The user knows
+# about 409A valuations" or a bare encyclopedia line sails past it.
+#
+# Stack those three abstentions and a corridor opens: a non-Latin
+# question-only turn, answered in the same script, from which the extractor
+# emits an ENGLISH memory. Nothing lexical can judge it, the regex misses any
+# free phrasing, and the gate admits it. The extractor is sampled
+# (temperature 0.3, once per CI run), so memverify's B06-world-knowledge-farsi
+# walks through that corridor on some runs and not others — a flake that is
+# really a sleeping junk-admission.
+#
+# The provenance argument is the same structural one `inferred_interest`
+# makes, taken one step further: when the user's own voice for the turn is
+# nothing but questions, they asserted nothing — so a memory rendered in a
+# script the user did not even WRITE cannot be quoting them. Whatever it
+# says, it came from the assistant's answer or the model's own knowledge.
+# Script equality is the one signal that survives translation, because it
+# does not require the two texts to share a single token.
+#
+# The trade, named honestly: a REAL fact embedded in a cross-lingual
+# question-only turn is refused too ("چی بخورم؟ من به بادام‌زمینی حساسیت
+# دارم" extracted into English — `_FIRST_PERSON_ASSERT_RE` is English-only,
+# so the Farsi declarative does not disqualify the turn). That class is
+# absent from the labeled corpus (A08/A09/A30 are declarative turns, A25 is
+# same-script), absent from the founder's hand-labelled live rows, and an
+# explicit "remember this" bypasses the rule entirely — so the cost is
+# currently theoretical while the corridor it closes fired in production
+# (the five 409A encyclopedia rows) and flakes in CI.
+def cross_script_question_only_reason(
+    content: str, user_message: Optional[str]
+) -> Optional[str]:
+    """Refuse a memory whose script the user never wrote, on a turn where
+    they only asked."""
+    if not user_message:
+        return None
+    _quoted, own_voice = _split_quoted(user_message)
+    text = own_voice if own_voice.strip() else user_message
+    if not is_question_only(text):
+        return None
+    content_script = _dominant_script(content)
+    turn_script = _dominant_script(text)
+    # A side with no alphabetic characters at all cannot be judged — abstain,
+    # as every rule here does when its signal is unmeasurable.
+    if content_script is None or turn_script is None:
+        return None
+    if content_script != turn_script:
+        return "cross_script_question_only"
+    return None
+
+
 def memory_gate_reason(
     content: str,
     *,
@@ -1234,6 +1301,18 @@ def memory_gate_reason(
         if reason:
             return reason
 
+    # Wider still — it needs no overlap measurement at all — so it runs after
+    # `unsupported_claim` for the same reporting reason: the most specific
+    # rule that fires is the one whose name lands in the logs. The two are
+    # disjoint in practice (`unsupported_claim` abstains on the very script
+    # mismatch this rule keys on), but the ordering keeps that property
+    # structural rather than coincidental. Yields to an explicit save ask,
+    # as every provenance rule does.
+    if not explicit_save:
+        reason = cross_script_question_only_reason(text, user_message)
+        if reason:
+            return reason
+
     return None
 
 
@@ -1249,6 +1328,7 @@ __all__ = [
     "SCHEDULABLE_REASONS",
     "SCHEDULED_MIN_TTL_DAYS",
     "assistant_echo_reason",
+    "cross_script_question_only_reason",
     "inferred_interest_reason",
     "is_question_only",
     "degenerate_relationship_reason",

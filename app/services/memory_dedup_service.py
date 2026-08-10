@@ -1236,6 +1236,11 @@ Respond in JSON:
                 # W1.4a: explicit pin — the service default rides the premium
                 # chat model whenever an Anthropic key is present.
                 model=settings.memory_extraction_model,
+                # This is a classifier whose verdicts can RETIRE rows (#517).
+                # Without the pin it inherited the CHAT default of 0.7 from
+                # config.py — an accident, not a choice. Adjudication runs
+                # greedy.
+                temperature=0.0,
             )
 
             # Parse response — strip markdown fences if present
@@ -1370,6 +1375,10 @@ Respond in JSON with EXACTLY one decision per pair, in order:
                 messages=[{"role": "user", "content": prompt}],
                 # W1.4a: explicit pin (see _llm_decide_action)
                 model=settings.memory_extraction_model,
+                # Greedy for the same reason as _llm_decide_action — and this
+                # is the batched population #517 measured at up to 70% wrong
+                # on straddles, so sampled variance on top was pure downside.
+                temperature=0.0,
             )
 
             if hasattr(response, 'content'):
@@ -1456,6 +1465,9 @@ Rules:
                 messages=[{"role": "user", "content": prompt}],
                 # W1.4a: explicit pin (see _llm_decide_action)
                 model=settings.memory_extraction_model,
+                # Merging rewrites a stored row in place — deterministic for
+                # the same reason the verdicts above are (#517).
+                temperature=0.0,
             )
 
             # Parse JSON response — strip markdown fences if present
