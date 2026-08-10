@@ -91,6 +91,10 @@ def test_forwarded_flag_maps_to_a_real_settings_field(flag: str):
     "CACHE_AWARE_OVERFLOW",
     "EMBEDDINGS_VIA_PROXY",
     "METERING_CORRECTNESS_V2",
+    # G-15: the tool-family gate's fleet value. Dropping it strands every
+    # container on whatever value its last recreate baked in — and a fresh
+    # spawn silently reverts to "*" (all families), un-gating the fleet.
+    "AGENT_TOOL_FAMILIES",
 ])
 def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     """Dropping one of these from the bridge list is how a fleet silently

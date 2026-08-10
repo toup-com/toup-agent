@@ -665,10 +665,13 @@ class Settings(BaseSettings):
     # = today's behaviour, byte-identical. "none"/"-" = no optional family.
     # Otherwise a comma-separated subset, e.g. "doc_generation".
     #
-    # NOT yet wired per tenant: the bridge's env writer (`_build_env` in
-    # /opt/toup-bridge/main.py) is out of this repo, and pool_addon's
-    # _FEATURE_FLAG_ENVS is a FLEET-wide forwarder, so it is deliberately
-    # not listed there. This ships BUILT, not ENABLED.
+    # Delivered fleet-uniform via pool_addon's _FEATURE_FLAG_ENVS (G-15
+    # close-out, 2026-08-10): a bridge-env value reaches every spawn and
+    # blue-green recreate. Per-TENANT values remain unwired — that needs
+    # the AgentEnvContract + the hand-deployed /opt/toup-bridge/main.py —
+    # and were evaluated and declined: the only per-tenant candidate,
+    # app_builder (~2,800 tok), must stay reachable wherever a tenant can
+    # ask to build an app.
     agent_tool_families: str = "*"
 
     # PR 8 of the unified-jobs arc: when True, every Auto Builder
