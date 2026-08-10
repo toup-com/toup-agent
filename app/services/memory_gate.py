@@ -1080,6 +1080,25 @@ def inferred_interest_reason(
 #: On a question-only turn, this much support from the user's own words is
 #: "essentially none" — the claim did not come from them.
 UNSUPPORTED_USER_MAX = 0.10
+#: ...and a ratio alone cannot express "essentially none" for a short memory.
+#: A ratio has granularity 1/len(tokens), so a nine-token memory sharing ONE
+#: word with the question already scores 0.111 and clears a 0.10 ceiling —
+#: the ceiling is unreachable below the token count where 1/n <= 0.10, i.e.
+#: for anything under ten distinctive tokens. That is how
+#: B12-speculation-no-user-statement walked out of memverify three times on
+#: three unrelated diffs: the user asked *"What's a good framework for a side
+#: project?"*, the assistant volunteered that side projects die from scope
+#: creep, and the stored row — "The user is considering side projects and is
+#: aware that many of them fail due to scope creep" — shared exactly one
+#: token with the question ("projects"), which is the topic word they used to
+#: ASK. One shared word is not the user gesturing at a claim; it is the
+#: subject of their own question coming back at them.
+#:
+#: So support is now BOTH a ratio and a count. The rule's own worked example
+#: is unaffected: *"Do you know if my flight to Berlin is on time?"* → a
+#: memory about a Berlin flight shares `flight` and `berlin`, two tokens and
+#: a ratio far above the ceiling, so it survives exactly as documented.
+UNSUPPORTED_USER_MIN_SHARED = 2
 #: ...and it must demonstrably come from the assistant instead. Below this it
 #: overlaps neither side, which is the cross-lingual case the echo rule
 #: deliberately abstains on. Staying quiet there is the whole reason BUG-26
@@ -1181,7 +1200,14 @@ def unsupported_claim_reason(
     tokens = _content_tokens(content)
     if len(tokens) < _ECHO_MIN_TOKENS:
         return None
-    if _overlap(tokens, _content_tokens(text)) > UNSUPPORTED_USER_MAX:
+    # Support from the user must clear BOTH bars — see
+    # UNSUPPORTED_USER_MIN_SHARED for why a ratio alone cannot say
+    # "essentially none" about a short memory.
+    user_tokens = _content_tokens(text)
+    if (
+        _overlap(tokens, user_tokens) > UNSUPPORTED_USER_MAX
+        and len(tokens & user_tokens) >= UNSUPPORTED_USER_MIN_SHARED
+    ):
         return None
     if _overlap(tokens, _content_tokens(assistant_response)) < UNSUPPORTED_ASSISTANT_MIN:
         return None

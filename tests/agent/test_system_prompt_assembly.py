@@ -62,6 +62,11 @@ async def _make_engine():
                 role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
                 updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
                 stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
+                email_verified_at TIMESTAMP,
+                email_verification_token VARCHAR(64),
+                email_verification_sent_at TIMESTAMP,
+                apple_refresh_token TEXT, apple_sub VARCHAR(255),
+                notification_preferences TEXT,
                 is_canary BOOLEAN DEFAULT 0
             )""",
             """CREATE TABLE IF NOT EXISTS identities (
@@ -87,10 +92,12 @@ async def _make_engine():
                 last_reinforced_at TIMESTAMP,
                 consolidation_count INTEGER DEFAULT 0,
                 decay_rate FLOAT DEFAULT 0.1,
+                last_decayed_at TIMESTAMP, expires_at TIMESTAMP,
                 created_at TIMESTAMP, updated_at TIMESTAMP,
                 last_accessed_at TIMESTAMP, access_count INTEGER DEFAULT 0,
                 source_message_id VARCHAR(36),
                 source_type VARCHAR(50) DEFAULT 'conversation',
+                ref_kind VARCHAR(50), ref_id VARCHAR(100),
                 metadata_json TEXT, tags_json TEXT, canonical_content TEXT,
                 history_json TEXT, merged_from_json TEXT,
                 superseded_by VARCHAR(36),
@@ -163,7 +170,12 @@ async def test_active_tasks_marker_in_built_prompt():
             prompt = await runner._build_system_prompt(
                 db=db,
                 user_id=user_id,
-                user_message="hello",
+                # NOT "hello". TKT-LAT-019 added a trivial-query skip that
+                # short-circuits the active_tasks DB load entirely (a
+                # one-word answer does not need to know what threads are
+                # open), so a greeting exercises the skip branch rather
+                # than the assembly this test exists to guard.
+                user_message="what am I in the middle of working on right now?",
             )
 
     assert "<active_tasks>" in prompt, (
@@ -183,36 +195,45 @@ async def test_active_tasks_marker_in_built_prompt():
 
 def test_built_keys_are_subset_of_section_order():
     """Structural invariant: every key assigned to `section_parts` in
-    `_build_system_prompt` MUST appear in `SECTION_ORDER`. Anything else
-    is silently dropped at assembly — that's the F1 bug class.
+    `_build_system_prompt` MUST appear in the FULL profile's section order.
+    Anything else is silently dropped at assembly — that's the F1 bug class.
 
-    This test runs without instantiating the runner or hitting a DB —
-    it's a pure source grep. It generalises beyond active_tasks: any
-    future section with the same bug pattern fails this test.
+    SECTION_ORDER is no longer a literal list in agent_runner.py — it's
+    `list(sections_for(_profile))`, resolved per-run from
+    app/agent/prompt_profile.py. FULL is the superset profile (every other
+    profile is pinned as a strict subset of it there), so a key missing
+    from FULL is dropped for every profile.
+
+    Assignments are still gathered by source grep — a key assigned inside a
+    conditional branch our fixtures never trigger must still be ordered.
+    It generalises beyond active_tasks: any future section with the same
+    bug pattern fails this test.
     """
+    from app.agent.prompt_profile import PromptProfile, sections_for
+
     src = (
         Path(__file__).resolve().parent.parent.parent
         / "app" / "agent" / "agent_runner.py"
     ).read_text()
 
     # Every section_parts["KEY"] = ... assignment in the prompt builder.
-    assigned = set(re.findall(r'section_parts\["([a-z_]+)"\]\s*=', src))
-
-    # The SECTION_ORDER list contents.
-    order_match = re.search(r'SECTION_ORDER\s*=\s*\[(.*?)\]', src, re.DOTALL)
-    assert order_match, (
-        "SECTION_ORDER list not found in agent_runner.py — "
-        "test cannot verify the invariant."
+    assigned = set(re.findall(r'section_parts\["([a-z_]+)"\]', src))
+    assert assigned, (
+        "No section_parts[...] assignments found in agent_runner.py — "
+        "the builder was restructured and this grep no longer sees it; "
+        "repoint the test."
     )
-    order_keys = set(re.findall(r'"([a-z_]+)"', order_match.group(1)))
+
+    order_keys = set(sections_for(PromptProfile.FULL))
 
     dropped = assigned - order_keys
     assert not dropped, (
-        f"section_parts keys assigned but missing from SECTION_ORDER: "
-        f"{sorted(dropped)}. These sections are silently dropped at "
-        f"assembly time. See docs/memory/continuity-audit.md F1 for the "
-        f"bug class. Add the missing key(s) to SECTION_ORDER, picking "
-        f"the right position for the section's intent."
+        f"section_parts keys assigned in _build_system_prompt but missing "
+        f"from the FULL profile's section order: {sorted(dropped)}. These "
+        f"sections are silently dropped at assembly time. See "
+        f"docs/memory/continuity-audit.md F1 for the bug class. Add the "
+        f"missing key(s) to _FULL_SECTIONS in app/agent/prompt_profile.py, "
+        f"picking the right position for the section's intent."
     )
 
     # Spot-check: active_tasks must be in both halves (current F1 fix).
@@ -221,7 +242,8 @@ def test_built_keys_are_subset_of_section_order():
         "agent_runner.py — the build block was removed?"
     )
     assert "active_tasks" in order_keys, (
-        "active_tasks missing from SECTION_ORDER — F1 has regressed."
+        "active_tasks missing from the FULL profile's section order — "
+        "F1 has regressed."
     )
 
 

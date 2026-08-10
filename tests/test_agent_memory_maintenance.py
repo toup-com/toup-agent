@@ -46,9 +46,18 @@ def _tool_executor_src() -> str:
 # ── A6-1: agent-side memory maintenance scheduling ──────────────────
 
 
-def test_maintenance_flag_defaults_off():
-    """Behavior change with regression risk → flag-gated, default OFF."""
-    assert "agent_memory_maintenance_enabled: bool = False" in _config_src()
+def test_maintenance_flag_default_is_deliberate():
+    """Default ON since 2026-08-10 (G-17), after the curve was run against
+    a restored copy of a real tenant store rather than reasoned about.
+
+    The assertion is inverted rather than deleted: what matters is that
+    the value is a decision someone made with evidence, not a default that
+    drifts. The evidence is recorded beside the field in config.py — most
+    importantly that decay clamps at MIN_STRENGTH=0.1 while hybrid_search
+    floors at `strength >= 0.1`, so decay can only re-weight, never
+    remove a memory from recall.
+    """
+    assert "agent_memory_maintenance_enabled: bool = True" in _config_src()
 
 
 def test_agent_main_registers_all_four_memory_jobs_behind_flag():

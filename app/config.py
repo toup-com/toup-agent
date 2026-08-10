@@ -205,7 +205,47 @@ class Settings(BaseSettings):
     # day_chats tables — they have never run against tenant data. When
     # True, agent_main's lifespan registers the same job entry points on
     # the tenant container's scheduler where those tables actually live.
-    agent_memory_maintenance_enabled: bool = False
+    #
+    # DEFAULT ON since 2026-08-10 (G-17), after the curve was finally run
+    # against a real tenant — a pg_dump of the founder's 143-memory store
+    # restored into a throwaway pgvector instance and driven through the
+    # real `run_decay_for_all_users` entry point (128 of 133 rows updated).
+    # What it would do to live rows, measured on that copy:
+    #
+    #   rows <30d old   n=50   strength 0.999 -> 0.971
+    #   rows 30-90d     n=15            1.000 -> 0.690
+    #   rows >90d       n=1             1.000 -> 0.539
+    #   high-importance n=24            1.000 -> 0.937   (min 0.539)
+    #   rows landing at the 0.1 floor: 0     mean drop: 0.098
+    #
+    # The load-bearing structural fact: decay CLAMPS at MIN_STRENGTH=0.1
+    # and hybrid_search's floor is `strength >= 0.1`, so no amount of decay
+    # can push a memory out of recall — the worst case is re-weighting
+    # (strength is 20% of final_score), never forgetting. Meanwhile
+    # reinforcement-on-cite is on, which without decay makes strength a
+    # ONE-WAY RATCHET: every row drifts to 1.0 and the 20% term stops
+    # discriminating anything. This is the counterweight that was designed
+    # for it. TTL/expiry remains a separate, always-on per-turn sweep.
+    # This flag starts FOUR jobs, not one, so decay alone was not enough
+    # evidence. Consolidation was dry-run the same way, on the same copy:
+    # 27 candidates -> 5 groups -> 11 memories consolidated, and the diff
+    # against the pre-run snapshot is the reassuring part —
+    #
+    #   rows whose content changed .......... 0
+    #   rows retired/superseded/deactivated . 0
+    #   memory levels changed ............... 0
+    #   source rows marked consolidated ..... 11
+    #   NEW semantic summary rows ........... 5
+    #
+    # i.e. consolidation is ADDITIVE: it writes summary rows and stamps its
+    # sources, it does not rewrite or retire anything. Cost is ~10
+    # gpt-4o-mini calls per tenant per day at 03:00. The remaining two jobs
+    # are retrieval_feedback_analysis (weekly, reads retrieval_events) and
+    # day_archival (hourly, already gated separately on enable_day_recall).
+    #
+    # Rollback: AGENT_MEMORY_MAINTENANCE_ENABLED=false in the bridge env
+    # (already forwarded by pool_addon) + a recreate wave.
+    agent_memory_maintenance_enabled: bool = True
 
     # Agent-brain reflection (2026-07-29). The ONLY producer of
     # brain_type='agent' rows, which back the app's "Learned" tab — that tab
