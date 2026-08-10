@@ -140,3 +140,64 @@ async def test_under_limit_requests_flow_untouched(proxied, monkeypatch):
     monkeypatch.setattr(settings, "llm_proxy_rate_limit_per_min", 90, raising=False)
     for _ in range(5):
         await proxied()  # raises nothing → the limiter is invisible below the cap
+
+
+# ── Coverage: every spending handler, not just the one the tests drove ───
+#
+# The first version of this file drove `proxy_chat` twice and nothing else,
+# so it could not see that five of the eight authenticated handlers had no
+# limiter — including image generation, the most expensive call on the
+# proxy, whose only other ceiling is a FREE-TIER monthly slot count (paid
+# and admin tenants therefore had none at all). An adversarial review found
+# it by reading the file the tests were meant to be guarding.
+
+
+def test_every_spending_handler_enforces_the_limit():
+    """Structural, and deliberately so: driving all eight endpoints needs
+    eight different upstreams stubbed, but the property — *a handler that
+    authenticates a tenant token and then spends must call the limiter* —
+    is checkable from the source and is exactly what drifted."""
+    import inspect
+    import re
+
+    src = inspect.getsource(lp)
+
+    # Handlers that can spend on the tenant's behalf.
+    spending = [
+        "proxy_chat",
+        "proxy_responses",
+        "proxy_embeddings",
+        "proxy_openai_images",
+        "proxy_openai_image_edits",
+        "proxy_kie_image",
+        "proxy_kie_image_start",
+        "proxy_kie_image_poll",
+    ]
+    # Reporting only — must NOT be limited (it causes no spend).
+    non_spending = ["get_proxy_usage"]
+
+    def body_of(name: str) -> str:
+        start = src.index(f"async def {name}(")
+        nxt = src.find("\nasync def ", start + 1)
+        return src[start: nxt if nxt != -1 else len(src)]
+
+    missing = [n for n in spending if "_enforce_rate_limit(" not in body_of(n)]
+    assert not missing, (
+        f"authenticated spending handlers with no rate limit: {missing} — "
+        "a leaked tenant token can call these without any ceiling"
+    )
+
+    for n in spending:
+        b = body_of(n)
+        auth_at = b.index("_auth_agent(")
+        limit_at = b.index("_enforce_rate_limit(")
+        assert limit_at > auth_at, (
+            f"{n} limits before it authenticates — the window would be "
+            "keyed on a config that does not exist yet"
+        )
+
+    for n in non_spending:
+        assert "_enforce_rate_limit(" not in body_of(n), (
+            f"{n} reports spend rather than causing it; limiting it only "
+            "hides the dashboard when a tenant is already in trouble"
+        )

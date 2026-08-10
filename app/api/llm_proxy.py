@@ -69,15 +69,27 @@ def _invalidate_cache(user_id: str):
 # overshoot), but nothing bounded REQUESTS: a leaked or runaway
 # TOUP_LLM_TOKEN could fire unlimited RPS until the monthly cents cap
 # tripped — and for an admin-role tenant _check_budget returns None, so a
-# leaked admin token had no ceiling at all. 30-day measured peak across
-# every tenant (canary and the founder account both) is 33 calls in a
-# minute; the default cap is ~2.7x that, so no legitimate minute ever
-# observed would have tripped it.
+# leaked admin token had no ceiling at all.
 #
-# In-memory sliding window is the right shape here: platform-api runs as
-# one process, and the key (the tenant's user_id) only exists after
-# _auth_agent resolves the token inside the handler — a middleware cannot
-# key this. Admins are deliberately NOT exempt.
+# THIS WINDOW IS PER PROCESS, AND platform-api RUNS TWO REPLICAS
+# (railway.json: "numReplicas": 2). So the effective ceiling is up to 2x
+# the configured value, and which replica a request lands on decides
+# whether it counts — Retry-After is computed from one replica's view of
+# the world. An earlier version of this comment claimed "platform-api runs
+# as one process", which was simply false.
+#
+# That is tolerable ONLY because of what this control is for. It is a
+# backstop against a leaked or runaway token, which does not look like 2x
+# normal traffic; it looks like orders of magnitude more, and it trips on
+# either replica. It is NOT a fair-share quota, and it must not be sized
+# as though it were — see llm_proxy_rate_limit_per_min for the measured
+# distribution behind the number. A precise cap needs shared state
+# (Redis/Postgres) and should not pretend to exist until it does.
+#
+# In-memory is still the right shape for the backstop: the key (the
+# tenant's user_id) only exists after _auth_agent resolves the token
+# inside the handler, so a middleware cannot key this. Admins are
+# deliberately NOT exempt.
 _rate_windows: dict[str, list[float]] = {}
 _RATE_WINDOW_S = 60.0
 
@@ -100,8 +112,24 @@ def _check_rate_limit(user_id: str) -> Optional[int]:
 
 
 def _enforce_rate_limit(config) -> None:
-    """Shared by chat/responses/embeddings (the SDK-shim aliases delegate
-    into proxy_chat, so three call sites cover every provider path)."""
+    """Called by every handler that can SPEND on the tenant's behalf.
+
+    That is chat, responses, embeddings, and the five image routes
+    (`/openai/v1/images/generations`, `/openai/v1/images/edits`,
+    `/kie/image`, `/kie/image/start`, `/kie/image/poll`). The SDK-shim
+    aliases delegate into `proxy_chat`, so they are covered by it.
+
+    An earlier version of this docstring claimed three call sites covered
+    "every provider path". They did not: the image routes are independent
+    handlers, not shims, and they are the most expensive calls on the
+    proxy per request. Their only other ceiling is
+    `reserve_free_image_slot`, which is a FREE-TIER monthly cap — so paid
+    and admin tenants had none at all, which is exactly the leaked-token
+    threat this limiter exists for.
+
+    `get_proxy_usage` (GET /usage) is deliberately NOT limited: it reports
+    spend, it does not cause any.
+    """
     retry_after = _check_rate_limit(str(config.user_id))
     if retry_after is None:
         return
@@ -1820,6 +1848,7 @@ async def proxy_openai_images(
     (0 tokens) so the LLMProxyEvent cost shows in usage/budget dashboards.
     """
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     # Free-tier monthly image cap (audit-2026 re-audit round 7): the same hard
     # product limit the Kie route enforces. Without it here, a free-tier user
     # bypasses the cap by routing image generation through the OpenAI proxy.
@@ -1921,6 +1950,7 @@ async def proxy_openai_image_edits(
     /credits/agent-charge, so they never reach this route.
     """
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     # Free-tier monthly image cap — mirror the generate route so the edit path
     # can't bypass the cap either. RESERVE before generating (round 12 TOCTOU).
     from app.services.credit_service import (
@@ -2061,6 +2091,7 @@ async def proxy_kie_image(
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
 
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     body = await request.json()
     mode = (body.get("mode") or "generate").strip().lower()
     prompt = (body.get("prompt") or "").strip()
@@ -2153,6 +2184,7 @@ async def proxy_kie_image_start(
     from app.services.credit_service import reserve_free_image_slot, release_free_image_slot
 
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     body = await request.json()
     mode = (body.get("mode") or "generate").strip().lower()
     prompt = (body.get("prompt") or "").strip()
@@ -2241,6 +2273,7 @@ async def proxy_kie_image_poll(
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
 
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     body = await request.json()
     task_id = (body.get("task_id") or "").strip()
     if not task_id:

@@ -1881,12 +1881,35 @@ class Settings(BaseSettings):
     bundle_openai_budget_cents: int = 1000              # $10/month OpenAI allocation
     bundle_anthropic_daily_cap_cents: int = 100          # $1/day Anthropic soft cap (triggers fallback)
     # G-20: per-tenant request cap on the LLM proxy (sliding 60s window,
-    # all endpoints share one budget). 30-day measured per-user peak is
-    # 33 calls/min — 90 is ~2.7x that, so no observed legitimate minute
-    # would have tripped it, while a leaked token stops here instead of
-    # at the monthly cents cap (admins have NO cents cap; they are not
-    # exempt from this). 0 disables.
-    llm_proxy_rate_limit_per_min: int = 90
+    # ALL endpoints share one budget — chat, responses and embeddings).
+    #
+    # Sized from the real distribution, re-measured 2026-08-10 after an
+    # earlier figure of "33/min peak" turned out to be a narrower slice.
+    # Over 30 days and 1,072 active user-minutes the true per-user maxima
+    # are: 80, 59, 33, 33, 32, ... with p99.9 = 57 and exactly ONE minute
+    # above 60.
+    #
+    # So the observed ceiling is 80, and the first value shipped here (90)
+    # sat only 12% above it — which is the wrong shape for this control.
+    # What it defends against is a leaked or runaway token, and that does
+    # not look like 1.2x normal traffic; it looks like thousands of calls
+    # a minute. A margin that thin buys almost no safety and risks real
+    # 429s, and an embedding 429 is not free: create_memory stores the row
+    # UNEMBEDDED rather than failing, so the memory survives but silently
+    # drops to keyword-only retrieval.
+    #
+    # A true sliding-60s measurement (not calendar-minute buckets) puts the
+    # real ceiling higher still: 93, set by this run's own load harness at
+    # 5 virtual users — i.e. the first value shipped here (90) was already
+    # below traffic WE generated on purpose.
+    #
+    # 300 is ~3.2x that — still an instant stop for a runaway, with enough
+    # headroom that a legitimate burst (a memory backfill fanning out
+    # embeddings) is not quietly degraded. Note the window is per PROCESS
+    # and platform-api runs 2 replicas, so the fleet-effective ceiling is
+    # up to 600/min; that is acceptable for a runaway backstop and would
+    # NOT be acceptable for a quota. 0 disables.
+    llm_proxy_rate_limit_per_min: int = 300
 
     # Pricing per 1K tokens (USD)
     #
