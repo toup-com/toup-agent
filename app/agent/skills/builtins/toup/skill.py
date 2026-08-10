@@ -342,10 +342,20 @@ class ToupSkill(Skill):
             "- `toup__changeset` — Plan code changes as a structured changeset\n"
             "- `toup__review_diff` — Review a code diff for bugs, security, style\n"
             "- `toup__plan_sprint` — Break an epic into sprint tasks\n\n"
-            "**IMPORTANT:** Do NOT use these tools when the user asks to BUILD or CREATE an app. "
-            "All app creation MUST go through the App Builder (`app_builder__build_app`). "
-            "Only use toup tools for planning/reviewing EXISTING software, analyzing diffs, "
-            "or breaking work into sprints — never for building new applications."
+            # This used to read "All app creation MUST go through the App
+            # Builder" — an unconditional instruction pointing at a tool that
+            # is not on every tenant's plan. Where the app_builder family is
+            # withheld it switched off `toup__scaffold`, which really does
+            # write fastapi/nextjs/fullstack projects, in favour of a tool the
+            # model could not call. Scoped to the case it is actually about:
+            # a full mobile/Expo app, which the builder alone can produce.
+            "**When the user asks for a full mobile or Expo app** and "
+            "`app_builder__build_app` is available, prefer it — it handles "
+            "scaffolding, dependency install, a repo and a live preview end to "
+            "end, which `toup__scaffold` does not. For a backend, a web project "
+            "or a scaffold the user wants to own outright, `toup__scaffold` is "
+            "the right tool. Use the rest of these for planning and reviewing "
+            "software rather than generating it."
         )
 
     # ------------------------------------------------------------------

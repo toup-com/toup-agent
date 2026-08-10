@@ -461,6 +461,30 @@ _PIPELINE_REDIRECT_MSG = (
 )
 
 
+def _pipeline_guard_active() -> bool:
+    """False when this tenant has no app builder to be redirected to.
+
+    The guard's entire output is "call `app_builder__build_app` instead". A
+    tenant whose `AGENT_TOOL_FAMILIES` withholds the `app_builder` family has
+    no such tool: the model is blocked, told to call something that is not in
+    its tool list, and — if it tries — refused again by the entitlement layer.
+    Two refusals and no permitted route, for a request the user is entitled to
+    make.
+
+    That was latent while the family was effectively always on. It stopped
+    being latent the moment withholding it became the recommended way to stay
+    under OpenAI's 128-tool cap (#536).
+
+    Unknown families default to entitled, so this is a no-op for every tenant
+    on the default `AGENT_TOOL_FAMILIES="*"`.
+    """
+    try:
+        from app.agent.tool_entitlements import family_enabled
+        return family_enabled("app_builder")
+    except Exception:  # pragma: no cover — the guard must never break exec
+        return True
+
+
 def _is_app_building_exec(command: str) -> bool:
     """Check if an exec command is trying to scaffold/build an app project."""
     for pattern in _APP_BUILD_EXEC_PATTERNS:
@@ -469,20 +493,55 @@ def _is_app_building_exec(command: str) -> bool:
     return False
 
 
+# Content signals that a file is EXPO/REACT-NATIVE app scaffolding rather than
+# ordinary React. Matched with word boundaries, which is the whole point:
+# `"expo" in content` is True for any file containing the word **export**, so
+# every React component ever written scored that indicator. Paired with
+# `import React` — the second most common line in a React file — two indicators
+# were reached by, in practice, all of them.
+#
+# `import React` is gone from the list for the same reason: it says "this is
+# React", not "this is an Expo project being scaffolded", and it was carrying
+# half of every false positive.
+_APP_SCAFFOLD_INDICATORS = [
+    r"\breact-native\b",
+    r"\bexpo\b",                      # NOT `expo`, which matches export
+    r"\breact-navigation\b",
+    r"\bStyleSheet\.create\b",
+    r"\bNavigationContainer\b",
+    r"\bcreateBottomTabNavigator\b",
+    r"\bcreateNativeStackNavigator\b",
+    r'"expo"\s*:',                    # package.json / app.json keys
+    r'"react-native"\s*:',
+    r'"expo-router"\s*:',
+]
+
+
 def _is_app_building_write(file_path: str, content: str) -> bool:
-    """Check if a write_file call is manually creating app project files."""
-    # Only flag if the content looks like a React/Expo app file
-    # (not just any .tsx file — check for app-specific imports)
+    """Check if a write_file call is manually creating app project files.
+
+    This guard is a redirect, not a security boundary: when it fires the model
+    is told to call `app_builder__build_app` instead. So a false positive is
+    expensive in a way a false negative is not — it refuses ordinary work and
+    hands the model an instruction it may not be able to follow.
+
+    It was firing on essentially every React file. `"expo" in content` is True
+    for anything containing the word **export**, and `"import React" in
+    content` is True for every React file, so `src/components/Button.tsx`
+    holding nothing but an import and an export scored 2 and was blocked —
+    with the refusal text ordering a call to a tool that is not on every
+    tenant's plan, leaving no permitted route at all.
+
+    Word boundaries and a scaffolding-specific signal list fix that. Both
+    halves are asserted in `tests/test_app_build_guard.py`.
+    """
     for pattern in _APP_BUILD_FILE_PATTERNS:
         if re.search(pattern, file_path):
             # Verify content looks like app scaffolding (not editing an existing app)
-            app_indicators = [
-                "react-native", "expo", "react-navigation",
-                "StyleSheet.create", "NavigationContainer",
-                "createBottomTabNavigator", "createNativeStackNavigator",
-                '"expo":', '"react-native":', "import React",
-            ]
-            indicator_count = sum(1 for ind in app_indicators if ind in content)
+            indicator_count = sum(
+                1 for ind in _APP_SCAFFOLD_INDICATORS
+                if re.search(ind, content, re.IGNORECASE)
+            )
             if indicator_count >= 2:
                 return True
     return False
@@ -1131,7 +1190,7 @@ class ToolExecutor:
                 return f"ERROR: Blocked dangerous command pattern: {pattern}"
 
         # Pipeline guard — block app scaffolding commands
-        if _is_app_building_exec(command):
+        if _pipeline_guard_active() and _is_app_building_exec(command):
             logger.warning(f"[PIPELINE-GUARD] Blocked app-building exec: {command[:100]}")
             return _PIPELINE_REDIRECT_MSG
 
@@ -1405,7 +1464,7 @@ class ToolExecutor:
         content = inp.get("content", "")
 
         # Pipeline guard — block manual app file creation
-        if _is_app_building_write(path, content):
+        if _pipeline_guard_active() and _is_app_building_write(path, content):
             logger.warning(f"[PIPELINE-GUARD] Blocked app-building write_file: {path}")
             return _PIPELINE_REDIRECT_MSG
 
