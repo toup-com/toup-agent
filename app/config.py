@@ -809,6 +809,23 @@ class Settings(BaseSettings):
     # label-only change this guards, and the OFF escape hatch
     # (VOICE_DAY_CONTEXT_DATE_GUARD=false) remains.
     voice_day_context_date_guard: bool = True
+    # G-19a PR-B: ask the AGENT to assemble voice's instructions instead of
+    # rebuilding them here from the platform's own copy of the data.
+    #
+    # The relay's builder reads `identities` from the PLATFORM database and
+    # the day chat over HTTP, then renders them with a hand-copy of the
+    # runner's persona logic. That split is where #448 (voice with no
+    # persona) and #488 (voice narrating yesterday) both came from. The
+    # agent-side assembler runs inside the tenant, on the same rows text
+    # chat reads, and resolves the day the way every other surface does.
+    #
+    # Ships OFF. `voice_context_shadow` is the safer half: call BOTH, serve
+    # the legacy string, and log a section-level comparison — so the two
+    # can be shown to agree on real traffic before anything depends on it.
+    # Any failure of the agent call falls back to the legacy builder, and
+    # then to the base stub; a voice session must never open with nothing.
+    voice_context_from_agent: bool = False
+    voice_context_shadow: bool = True
     # Full-parity `think` (V2): the realtime relay runs on platform-api, where
     # the in-process agent_runner is absent, so `think` runs the user's OWN
     # agent over its HTTP /api/chat (the SAME AgentRunner text chat uses — full

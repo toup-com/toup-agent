@@ -38,6 +38,7 @@ import sys
 import time
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
 import httpx
@@ -726,7 +727,7 @@ async def _direct_openai(
         return None, 0, 0, "error", _classify_failure_reason(exception=e)
 
 
-def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
+def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> Decimal:
     """Compute the cost of a system-op LLM call in cents.
 
     Tries the platform pricing table first (same source the proxy uses so
@@ -739,7 +740,12 @@ def _calc_cost_cents(model: str, input_tokens: int, output_tokens: int) -> int:
     if not pricing:
         pricing = _fallback_pricing_for_model(model)
     cost_usd = (input_tokens * pricing["input"] / 1000) + (output_tokens * pricing["output"] / 1000)
-    return max(1, int(cost_usd * 100))
+    # R-3: exact to 4dp, capped at the legacy floored value — recorded cost
+    # may only ever go down (see llm_proxy._never_higher_cents, same rule).
+    exact = (Decimal(str(cost_usd)) * 100).quantize(Decimal("0.0001"))
+    if exact <= 0:
+        return Decimal("0")
+    return min(exact, Decimal(max(1, int(cost_usd * 100))))
 
 
 def _fallback_pricing_for_model(model: str) -> Dict[str, float]:

@@ -177,7 +177,10 @@ class LLMProxyEvent(Base):
     endpoint: Mapped[str] = mapped_column(String(20), nullable=False)  # chat | embeddings | tts
     input_tokens: Mapped[int] = mapped_column(Integer, default=0)
     output_tokens: Mapped[int] = mapped_column(Integer, default=0)
-    cost_cents: Mapped[int] = mapped_column(Integer, default=0)
+    # Numeric since alembic 084 (R-3): the 1¢/call floor is gone, so a
+    # sub-cent call records its true fractional cost. An Integer column
+    # here would silently re-floor every fraction on INSERT.
+    cost_cents: Mapped[Decimal] = mapped_column(Numeric(12, 4), default=0)
     was_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(10), default="ok")  # ok | error

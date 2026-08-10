@@ -88,6 +88,30 @@ const LOG_LEVEL = process.env.WHATSAPP_LOG_LEVEL || 'info';
 // Pino → stderr so the parent Python process captures it via journalctl.
 const logger = pino({ level: LOG_LEVEL }, pino.destination(2));
 const log = (msg, fields = {}) => logger.info(fields, msg);
+
+/**
+ * Describe an object's values without reproducing them.
+ *
+ * WhatsApp message metadata carries subscriber phone numbers
+ * (`participantPn`) and, in `messageContextInfo`, a per-message
+ * cryptographic `messageSecret`. These log lines ship to Loki with
+ * 14-day retention, so the values must never appear — but the SHAPE is
+ * what a WhatsApp identity-format change actually shows up in, and that
+ * is the whole reason this line exists. So: keep type and length,
+ * discard content. Booleans are safe to keep verbatim (`fromMe`).
+ */
+function redactValues(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v === null || v === undefined) out[k] = null;
+    else if (typeof v === 'boolean') out[k] = v;
+    else if (typeof v === 'number') out[k] = 'number';
+    else if (typeof v === 'string') out[k] = `str(${v.length})`;
+    else if (Array.isArray(v)) out[k] = `array(${v.length})`;
+    else out[k] = `object(${Object.keys(v).length})`;
+  }
+  return out;
+}
 const warn = (msg, fields = {}) => logger.warn(fields, msg);
 const error = (msg, fields = {}) => logger.error(fields, msg);
 
@@ -606,12 +630,20 @@ function wireSocket(s, saveCreds) {
         // Dump ALL key fields, not just the ones we know about, so a
         // newly-introduced identity field surfaces in the very next
         // message instead of needing another debug round-trip.
+        // NEVER log messageContextInfo itself. It carries
+        // `messageSecret` — a 32-byte per-message cryptographic secret —
+        // plus deviceListMetadata.{recipient,sender}KeyHash, and these
+        // lines ship to Loki with 14-day retention. The KEY NAMES are
+        // what a format change surfaces in, and they are already logged
+        // above; the values add nothing diagnostic and everything
+        // sensitive. Same reasoning for the key fields: `participantPn`
+        // is a subscriber phone number, so log the field names and a
+        // shape hint, never the value.
         log('messages.upsert.entry', {
-          allKeyFields: m.key ? Object.fromEntries(Object.entries(m.key)) : null,
+          allKeyFieldNames: m.key ? Object.keys(m.key) : [],
+          allKeyFieldShapes: m.key ? redactValues(m.key) : null,
           messageKeys: m.message ? Object.keys(m.message) : [],
-          pushName: m.pushName,
           messageContextInfoKeys: m.message?.messageContextInfo ? Object.keys(m.message.messageContextInfo) : [],
-          messageContextInfo: m.message?.messageContextInfo,
         });
         // Skip our own replies: messages.upsert fires for the message
         // we just sent, key.fromMe=true with the id rememberOutbound()

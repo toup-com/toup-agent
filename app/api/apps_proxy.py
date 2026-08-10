@@ -953,7 +953,9 @@ async def preview_proxy(
     user = None
     resolved_token = token  # from query param
     try:
-        user = await get_current_user(request, db)
+        # (request, None, db): the two-arg form bound the SESSION to the
+        # credentials parameter and AttributeError'd before any auth ran.
+        user = await get_current_user(request, None, db)
         # If authenticated via Bearer, extract the JWT from the header
         # so we can pass it to the bridge script.
         if user and not resolved_token:
@@ -1112,7 +1114,9 @@ async def app_chat_proxy(
     # (bound to app_id) before the full-account fallback.
     user = None
     try:
-        user = await get_current_user(request, db)
+        # (request, None, db): the two-arg form bound the SESSION to the
+        # credentials parameter and AttributeError'd before any auth ran.
+        user = await get_current_user(request, None, db)
     except Exception:
         pass
     if not user and token:

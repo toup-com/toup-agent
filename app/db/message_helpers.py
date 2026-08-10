@@ -18,6 +18,7 @@ async def resolve_day_chat_id_for_now(
     db: AsyncSession,
     user_id: str,
     tz_override: Optional[str] = None,
+    utc_now: Optional[datetime] = None,
 ) -> Optional[str]:
     """Resolve the DayChat ID for the current moment using the user's timezone.
 
@@ -32,6 +33,10 @@ async def resolve_day_chat_id_for_now(
             User row. This is critical for WebSocket callers that have the client's
             timezone from the message payload — avoids a race where the User.timezone
             hasn't been persisted yet or is still NULL.
+        utc_now: Freeze the instant "now" resolves to. Defaults to the real
+            clock, which is every production caller. Only a test that has to
+            place the user on a specific side of their local midnight passes
+            it; it is forwarded verbatim to `get_or_create_day_chat`.
     """
     if not user_id:
         return None
@@ -44,7 +49,9 @@ async def resolve_day_chat_id_for_now(
             from sqlalchemy import select
             user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
             tz_name = getattr(user, 'timezone', None) if user else None
-        dc = await get_or_create_day_chat(db, user_id, tz_name=tz_name)
+        dc = await get_or_create_day_chat(
+            db, user_id, utc_now=utc_now, tz_name=tz_name,
+        )
         return dc.id
     except Exception:
         return None

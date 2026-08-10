@@ -424,6 +424,85 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
 
 
+class VoiceContextRequest(BaseModel):
+    onboarding: bool = Field(default=False)
+    # 0 = no trimming. The relay passes its own
+    # voice_realtime_instructions_budget_chars when V2 is on, so the
+    # budget stays a caller decision — an agent container has no opinion
+    # about what the Realtime API's instruction ceiling is today.
+    budget_chars: int = Field(default=0, ge=0, le=1_000_000)
+    # IANA zone from the client. None → the tenant's User.timezone, which
+    # is what every other day-chat caller falls back to.
+    tz_name: Optional[str] = Field(default=None, max_length=64)
+
+
+class VoiceContextResponse(BaseModel):
+    instructions: str
+    day_date: Optional[str] = None
+    sections: Dict[str, str] = Field(default_factory=dict)
+    degraded: List[str] = Field(default_factory=list)
+
+
+@router.post("/internal/voice-context", response_model=VoiceContextResponse,
+             include_in_schema=False)
+async def internal_voice_context(req: VoiceContextRequest, request: Request):
+    """Internal-only: assemble the Realtime session's instructions HERE.
+
+    Same hop, same authentication and same visibility rules as
+    `/internal/agent-turn` above — voice reasoning already comes to this
+    container for its tools; this brings the PROMPT here too, so the
+    persona voice speaks from is the persona text chat speaks from, read
+    from the tenant DB rather than from the platform's leftover copy of
+    `identities` (see app/agent/voice_context.py for the full drift list
+    and the #488 day-selection argument).
+
+    PR-A ships it dark: nothing calls this yet. The relay swap is PR-B,
+    behind a canary, and only then does ws_realtime's own builder go.
+    """
+    # Only meaningful on tenant agent containers. On the platform, 404 so the
+    # endpoint is invisible to probers (mirrors agent.py:refresh-tools).
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    # X-Agent-Key auth — same primitive as agent.py:437.
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+
+    try:
+        from app.agent.voice_context import build_voice_context
+
+        async with async_session_maker() as db:
+            ctx = await build_voice_context(
+                db, user_id,
+                onboarding=req.onboarding,
+                budget_chars=req.budget_chars,
+                tz_name=req.tz_name,
+            )
+            # `build_voice_context` is read-SHAPED but not read-only:
+            # `get_or_create_day_chat` INSERTs today's `day_chats` row when
+            # it is missing and primes the process-wide id cache. Without
+            # this commit the INSERT rolls back at session close while the
+            # cache keeps the id — a cached pointer to a row that does not
+            # exist. It self-heals on the next resolve, but it also means
+            # the "creates the row when missing" half of the day fix was
+            # not actually true through this endpoint.
+            await db.commit()
+        return VoiceContextResponse(
+            instructions=ctx.instructions,
+            day_date=ctx.day_date,
+            sections=ctx.sections,
+            degraded=ctx.degraded,
+        )
+    except Exception as e:
+        logger.exception(f"Internal voice-context error for user {user_id}")
+        raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+
+
 # ── Voice inner-tool stream ───────────────────────────────────────────
 # Live visibility for the realtime-voice `think` path: which tool is running,
 # the exact query, and the sources the answer is grounded in — emitted WHILE

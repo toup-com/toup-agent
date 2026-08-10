@@ -29,7 +29,7 @@ try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:  # pragma: no cover — VPS Python 3.12 has it
     ZoneInfo = None  # type: ignore
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +64,10 @@ from app.agent.prefix_stability import (
     tools_array_change,
 )
 from app.config import settings
+# Leaf module (pure `enum` declarations, no ORM/engine import), so this is
+# safe at module scope — the persona renderers below key their section
+# headers off the enum instead of bare string literals.
+from app.db.models.enums import IdentityType
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
 from app.services.model_router import classify_request, RoutingDecision
@@ -227,6 +231,7 @@ def strip_vault_tool_for_channel(tools, channel):
 # prompt-assembly site.
 CHANNEL_GUIDANCE = {
     "web":       "User is in the Toup web app in a browser (toup.ai). Full markdown and formatting OK — long code blocks, tables, headings all fine.",
+    "api":       "Turn arrived through the developer API (/v1/chat). The consumer is a program or a developer's own integration: full markdown OK, keep structure stable and parseable, no UI-dependent phrasing like 'click the button below'.",
     "app":       "User is inside a Toup in-app workspace (one of their custom apps). Full markdown and formatting OK.",
     "mobile":    "User is in the Toup mobile app (React Native on iOS or Android). This is the native Toup app — NOT Telegram, NOT a web browser. Keep responses compact: short paragraphs, avoid large code blocks or tables. Small screen.",
     "voice": (
@@ -334,6 +339,178 @@ def stable_prefix_enabled(user_id: Optional[str]) -> bool:
     if not raw or not user_id:
         return False
     return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Persona renderers — ONE copy, used by every channel (G-19a)
+# ══════════════════════════════════════════════════════════════════════
+#
+# Text chat rendered these two blocks here; the voice relay rendered its
+# own hand-copy in app/api/ws_realtime.py. The copies had drifted in nine
+# ways, three of them user-visible: voice sorted identities by priority
+# and did NOT hoist the soul (a user_profile at 90 out-ranked a soul at
+# 50); voice emitted NO Core Identity at all for a soul-less user with
+# memories (the runner emits a default persona); and the anchor carried
+# different wording on each side. Both callers now go through the two
+# functions below, so a change to the persona is a change in ONE place.
+#
+# These are PURE — no DB, no settings, no clock. That is what lets the
+# same bytes be produced on the tenant (agent_runner) and, via
+# app/agent/voice_context.py, for the realtime session.
+
+# Identity document type → its section header. Keyed off the enum's
+# values, not bare string literals: the voice copy compared against
+# "soul"/"user_profile"/… by hand, so renaming an enum member would have
+# desynced it silently (drift D6). `system` and `context` documents are
+# deliberately absent — neither copy has ever rendered them.
+IDENTITY_SECTION_HEADERS: Dict[str, str] = {
+    IdentityType.SOUL.value: "# Core Identity",
+    IdentityType.AGENT_INSTRUCTIONS.value: "# Behavioral Guidelines",
+    IdentityType.USER_PROFILE.value: "# About the User",
+    IdentityType.TOOLS.value: "# Tool Guidelines",
+}
+
+# Shown when the user has no `soul` document. Pre-Soul users see this on
+# every turn until they configure tone — so it must already feel like a
+# person, not a corporate assistant. The agent NAME is left to the
+# anchor below; here we set voice and posture.
+DEFAULT_SOUL_CONTENT = (
+    "You are the user's personal agent — present in their life as a "
+    "real person who happens to be exceptionally capable. Not a "
+    "chatbot, not an FAQ, not a help desk. Be warm, direct, curious. "
+    "A trusted friend who can also actually get things done."
+)
+
+
+def _identity_attr(row: Any, name: str, default: Any = None) -> Any:
+    """Read a field off an ORM Identity row OR a plain dict.
+
+    The tenant path passes ORM rows; a relay/JSON path passes dicts.
+    One accessor keeps the renderer indifferent to which.
+    """
+    if isinstance(row, dict):
+        value = row.get(name, default)
+    else:
+        value = getattr(row, name, default)
+    return default if value is None else value
+
+
+def render_identity_sections(identities: Any) -> Tuple[str, bool]:
+    """Render the identity/persona block from Identity rows.
+
+    Returns ``(text, has_soul)``. ``has_soul`` is what gates the
+    agent-brain `agent_soul` de-dup downstream, so it reports whether a
+    REAL soul document existed — not whether the default fired.
+
+    Ordering rule (unified — the runner's, which wins over voice's):
+    priority DESCENDING, then every `soul` document hoisted to the front.
+    The soul IS the persona; an imported or legacy soul row with a low
+    priority must not render underneath a profile blob. The sort is
+    stable, so rows the caller already ordered by priority keep their
+    relative order and the chat path's bytes do not move.
+    """
+    rows = sorted(
+        list(identities or []),
+        key=lambda r: _identity_attr(r, "priority", 0) or 0,
+        reverse=True,
+    )
+
+    has_soul = False
+    parts: List[str] = []
+    for row in rows:
+        itype = _identity_attr(row, "identity_type", "")
+        header = IDENTITY_SECTION_HEADERS.get(itype)
+        if header is None:
+            continue
+        block = f"{header}\n{_identity_attr(row, 'content', '')}"
+        if itype == IdentityType.SOUL.value:
+            parts.insert(0, block)
+            has_soul = True
+        else:
+            parts.append(block)
+
+    if not has_soul:
+        parts.insert(0, f"# Core Identity\n{DEFAULT_SOUL_CONTENT}")
+
+    return "\n\n".join(parts), has_soul
+
+
+def render_identity_anchor(agent_name: Optional[str], fmt: str = "chat") -> str:
+    """The white-label anchor: "you are NOT Claude / GPT / any model".
+
+    LLMs carry a baked-in self-identity ("I'm Claude 3.5 Sonnet"), so
+    without this block "what model are you?" breaks the white-label
+    illusion by naming the provider.
+
+    ``fmt`` selects the surface wording, and ONLY the wording:
+      * ``"chat"``  — markdown emphasis; the text channel renders it.
+      * ``"voice"`` — no markdown at all (a Realtime model reads
+        asterisks aloud), and it carries the founder/ownership carve-out
+        that voice added: who FOUNDED Toup is an allowed question, the
+        guard is about the underlying model/technology only.
+
+    Both branches state the name POSITIVELY when there is one — the
+    negative-only guard is what made voice answer "I don't have a name".
+    """
+    label = (agent_name or "").strip()
+
+    if fmt == "voice":
+        name_line = (
+            f"Your name is {label}. That is your name — use it when you "
+            f"introduce or refer to yourself, and when the user asks your name, "
+            f"answer {label} (never 'Toup', which is only the platform).\n"
+            if label else ""
+        )
+        return (
+            "# Who you are (identity)\n"
+            + name_line
+            + "You are the user's own personal agent on Toup. Toup is the "
+            "platform you run on (toup.ai), not your name.\n"
+            "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+            "specific provider model. If the user asks what model you are, "
+            "who built you, what powers you, or what technology/stack Toup "
+            "is built with, answer as their agent — never name the "
+            "underlying LLM provider or version, and don't disclose the "
+            "underlying tech stack (it's proprietary). The provider may "
+            "change without notice; your identity to the user is stable.\n"
+            "(If the user asks who FOUNDED or owns Toup — the company — that "
+            "is a separate, allowed question; answer it if you know. This "
+            "guard is only about the underlying model/technology.)"
+        )
+
+    # "chat" (default). The previous wording "you are <name> — a Toup
+    # agent" was ambiguous in English: the model parsed "a Toup agent" as
+    # "an agent named Toup" and self-IDed as Toup on greetings. Toup is
+    # the *platform*; the agent's name is a separate thing.
+    if label:
+        return (
+            "# Identity\n"
+            f"Your name is **{label}**. That is your name — use it "
+            "when self-identifying.\n\n"
+            "Toup is the **platform** you run on (toup.ai), NOT your name. "
+            "Never introduce yourself as 'Toup' or call yourself 'Toup'. "
+            f"When asked your name, say **{label}**, not Toup.\n\n"
+            "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+            "specific provider model. When the user asks what you are, "
+            "who built you, or what model is powering you, answer as "
+            f"**{label}** — never name the underlying LLM provider "
+            "or version, and don't disclose Toup's underlying tech stack "
+            "or how it's built (that's proprietary). The provider may "
+            "change without notice; your identity to the user is stable."
+        )
+    return (
+        "# Identity\n"
+        "You don't have a name yet — the user hasn't picked one. "
+        "Don't introduce yourself with a made-up name, and especially "
+        "do NOT call yourself 'Toup'. Toup is the platform you run on "
+        "(toup.ai), not your name. If naming comes up naturally, ask "
+        "what they'd like to call you.\n\n"
+        "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
+        "specific provider model. When the user asks what model is "
+        "powering you, answer as the agent — never name the underlying "
+        "LLM provider or version, and don't disclose Toup's underlying "
+        "tech stack or how it's built (that's proprietary)."
+    )
 
 
 @dataclass
@@ -3322,34 +3499,14 @@ class AgentRunner:
         identities = result.scalars().all()
         logger.info(f"[AGENT] Found {len(identities)} identities")
 
-        has_soul_identity = False
-        identity_parts = []
-        for identity in identities:
-            if identity.identity_type == IdentityType.SOUL.value:
-                identity_parts.insert(0, f"# Core Identity\n{identity.content}")
-                has_soul_identity = True
-            elif identity.identity_type == IdentityType.AGENT_INSTRUCTIONS.value:
-                identity_parts.append(f"# Behavioral Guidelines\n{identity.content}")
-            elif identity.identity_type == IdentityType.USER_PROFILE.value:
-                identity_parts.append(f"# About the User\n{identity.content}")
-            elif identity.identity_type == IdentityType.TOOLS.value:
-                identity_parts.append(f"# Tool Guidelines\n{identity.content}")
-
-        # Default identity if no Soul exists. Pre-Soul users see this on every
-        # turn until they configure tone — so it must already feel like a
-        # person, not a corporate assistant. The agent name is left to the
-        # identity_anchor block below; here we set voice and posture.
+        # ONE renderer, shared with the voice assembler
+        # (app/agent/voice_context.py) — see render_identity_sections for
+        # the ordering rule and the no-soul default.
+        _identity_text, has_soul_identity = render_identity_sections(identities)
         if not has_soul_identity:
-            identity_parts.insert(0, (
-                "# Core Identity\n"
-                "You are the user's personal agent — present in their life as a "
-                "real person who happens to be exceptionally capable. Not a "
-                "chatbot, not an FAQ, not a help desk. Be warm, direct, curious. "
-                "A trusted friend who can also actually get things done."
-            ))
             logger.warning(f"No soul config found for user {user_id}, using default")
 
-        section_parts["identity"] = "\n\n".join(identity_parts)
+        section_parts["identity"] = _identity_text
 
         # ── 1b. Identity anchor — kill the "I'm Claude / GPT" hallucination ──
         # LLMs have stale self-identity baked into their training data
@@ -3367,43 +3524,12 @@ class AgentRunner:
         except Exception:
             _name_cfg = None
         _agent_label = (_name_cfg or "").strip()
-        # Two cases: agent has a real name (use it everywhere) vs no name set
-        # yet (don't fake one). The previous wording "you are <name> — a Toup
-        # agent" was ambiguous in English: the model parsed "a Toup agent" as
-        # "an agent named Toup" and self-IDed as Toup on greetings. The voice
-        # channel had a hand-rolled guard for exactly this (see
-        # ws_realtime.py:368). We hoist it to every channel and disambiguate
-        # the sentence: Toup is the *platform*, the agent's name is separate.
-        if _agent_label:
-            section_parts["identity_anchor"] = (
-                "# Identity\n"
-                f"Your name is **{_agent_label}**. That is your name — use it "
-                "when self-identifying.\n\n"
-                "Toup is the **platform** you run on (toup.ai), NOT your name. "
-                f"Never introduce yourself as 'Toup' or call yourself 'Toup'. "
-                f"When asked your name, say **{_agent_label}**, not Toup.\n\n"
-                "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
-                "specific provider model. When the user asks what you are, "
-                "who built you, or what model is powering you, answer as "
-                f"**{_agent_label}** — never name the underlying LLM provider "
-                "or version, and don't disclose Toup's underlying tech stack "
-                "or how it's built (that's proprietary). The provider may "
-                "change without notice; your identity to the user is stable."
-            )
-        else:
-            section_parts["identity_anchor"] = (
-                "# Identity\n"
-                "You don't have a name yet — the user hasn't picked one. "
-                "Don't introduce yourself with a made-up name, and especially "
-                "do NOT call yourself 'Toup'. Toup is the platform you run on "
-                "(toup.ai), not your name. If naming comes up naturally, ask "
-                "what they'd like to call you.\n\n"
-                "You are NOT Claude, NOT GPT, NOT Sonnet, NOT Opus, NOT any "
-                "specific provider model. When the user asks what model is "
-                "powering you, answer as the agent — never name the underlying "
-                "LLM provider or version, and don't disclose Toup's underlying "
-                "tech stack or how it's built (that's proprietary)."
-            )
+        # ONE renderer, shared with the voice assembler — the "chat" format
+        # is the markdown wording; voice asks the SAME function for its
+        # asterisk-free variant. See render_identity_anchor above.
+        section_parts["identity_anchor"] = render_identity_anchor(
+            _agent_label, fmt="chat"
+        )
 
         # ── 1d. Platform knowledge — what Toup is, every page, every capability ──
         # Always-on. The agent's job is to be the user's ultimate assistant on

@@ -28,6 +28,70 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 
+def _tenant_ddl_for(marker: str) -> str:
+    """Pull a DDL statement verbatim out of ``database.py``'s ALTER list.
+
+    ``memories`` is AGENT_ONLY and its indexes are created by the ALTER
+    mirror in ``app/db/database.py`` at boot — NOT by ``create_all()``,
+    which only builds what the ORM models declare, and a PARTIAL unique
+    index is not expressible there. So a test database gets the table
+    without the constraint, and this test asserted an invariant its own
+    database could not hold.
+
+    Reading the statement out of the shipped source rather than copying
+    it means the two cannot drift: edit the index in database.py and this
+    test exercises the edited version, or fails loudly because the marker
+    stopped matching.
+    """
+    import inspect
+
+    from app.db import database as _db
+
+    lines = inspect.getsource(_db).splitlines()
+    idx = next(
+        (i for i, ln in enumerate(lines) if marker in ln and "CREATE" in ln),
+        None,
+    )
+    assert idx is not None, f"marker {marker!r} not found in database.py DDL"
+    # The list literal wraps one statement across adjacent string
+    # fragments; re-join the run that starts at the marker.
+    parts, j = [], idx
+    while j < len(lines):
+        raw = lines[j].strip()
+        if not raw.startswith('"'):
+            break
+        parts.append(raw.rstrip(",").strip('"'))
+        if lines[j].rstrip().endswith(","):
+            break
+        j += 1
+    assert parts, f"no DDL found for marker {marker!r} in database.py"
+    return "".join(parts)
+
+
+@pytest_asyncio.fixture
+async def memories_ref_unique_index(requires_agent_tables):
+    """Apply the real partial unique index to the test database.
+
+    Without this the test SKIPPED in CI (``requires_agent_tables``
+    short-circuits when the AGENT_ONLY tables are absent, which is every
+    platform-lane run) and FAILED anywhere the tables did exist — so the
+    "floor invariant" in this module's docstring had never once been
+    verified. Production does carry the index; probed on the canary
+    tenant 2026-08-10: ``ix_memories_ref_unique | UNIQUE | partial``.
+    """
+    from sqlalchemy import text
+
+    from app.db.database import engine
+
+    ddl = _tenant_ddl_for("ix_memories_ref_unique")
+    async with engine.begin() as conn:
+        try:
+            await conn.execute(text(ddl))
+        except Exception as e:  # pragma: no cover - dialect-specific
+            pytest.skip(f"cannot create partial unique index here: {e}")
+    yield
+
+
 @pytest_asyncio.fixture
 async def memory_user():
     """Create a User row. Returns the id."""
@@ -45,7 +109,9 @@ async def memory_user():
 
 
 @pytest.mark.asyncio
-async def test_partial_unique_index_blocks_duplicate_ref(memory_user, requires_agent_tables):
+async def test_partial_unique_index_blocks_duplicate_ref(
+    memory_user, memories_ref_unique_index
+):
     """Floor invariant: two active memories with the same (user_id,
     ref_kind, ref_id) cannot coexist. This is what makes the Ticket 2
     upsert behavior correct — even if an MCP tool regression slips in,

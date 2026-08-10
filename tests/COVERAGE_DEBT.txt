@@ -104,3 +104,4 @@ test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-
 #
 # the test's own scaffolding is wrong; neither the assertion nor production is:
 test_token_budget.py  # INFRA: stub lacks _meter_web_tool + pins a tail the INJ-2 fence changed (the real bug it found shipped in #431)
+agent/test_voice_context_parity.py  # agent-mode — identities is AGENT_ONLY

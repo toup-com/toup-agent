@@ -46,6 +46,9 @@ KNOWN_CHANNELS = frozenset({
     "routine",  # scheduled agent_task turn (routines runner)
     "autopilot",  # autonomous mission tick
     "subagent",  # spawned child run
+    "api",  # developer API (/v1/chat, chat.py API path) — first-class
+    "agent_task",  # apps.py agent-task runner (internal stamp)
+    "health_probe",  # connector_health_probe (internal stamp)
 })
 
 

@@ -197,13 +197,16 @@ class TestProxyCostMath(unittest.TestCase):
         # Bogus provider usage claiming more cached+written than prompt
         # tokens must clamp, never go negative: 10k in, "20k cached, 20k
         # written" → cached clamps to 10k, written to 0.
+        from decimal import Decimal
         self.assertEqual(
             _calc_cost_cents(
                 "gpt-5.6-terra", 10_000, 0,
                 cached_tokens=20_000, cache_write_tokens=20_000,
             ),
-            # 10k * $0.25/M = $0.0025 → 0.25c → floor max(1, 0) = 1.
-            1,
+            # 10k * $0.25/M = $0.0025 → 0.25¢. Before R-3 the 1¢/call floor
+            # turned this into 1; the clamp arithmetic this test pins is
+            # unchanged — the recorded value is just no longer inflated.
+            Decimal("0.25"),
         )
 
     def test_gpt55_cached_reads_are_discounted(self):

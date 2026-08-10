@@ -38,7 +38,7 @@ admin_router = APIRouter(prefix="/admin/llm", tags=["Admin LLM"])
 
 # ── Budget cache (in-memory, TTL-based) ──────────────────────────────
 
-_budget_cache: dict[str, tuple[float, int]] = {}  # key → (expiry_ts, cost_cents)
+_budget_cache: dict[str, tuple[float, Decimal]] = {}  # key → (expiry_ts, cost_cents)
 _CACHE_TTL = 30  # seconds
 
 
@@ -46,14 +46,14 @@ def _cache_key(user_id: str, provider: str, scope: str) -> str:
     return f"{user_id}:{provider}:{scope}"
 
 
-def _get_cached_spend(key: str) -> Optional[int]:
+def _get_cached_spend(key: str) -> Optional[Decimal]:
     entry = _budget_cache.get(key)
     if entry and entry[0] > time.time():
         return entry[1]
     return None
 
 
-def _set_cached_spend(key: str, cents: int):
+def _set_cached_spend(key: str, cents: Decimal):
     _budget_cache[key] = (time.time() + _CACHE_TTL, cents)
 
 
@@ -203,7 +203,7 @@ async def _get_spend(
     provider: str,
     since: datetime,
     cache_scope: str,
-) -> int:
+) -> Decimal:
     """Get user-attributable spend in cents for a user+provider since a given time.
 
     Excludes events tagged with operation_type starting with "system." — those are
@@ -226,7 +226,9 @@ async def _get_spend(
             | (~LLMProxyEvent.operation_type.startswith("system.")),
         )
     )
-    cents = int(result.scalar())
+    # Numeric column → Decimal sum. int() here would truncate fractional
+    # spend just before the budget comparison; keep the fraction.
+    cents = Decimal(str(result.scalar() or 0))
     _set_cached_spend(cache_key, cents)
     return cents
 
@@ -305,7 +307,7 @@ def _calc_cost_cents(
     output_tokens: int,
     cached_tokens: int = 0,
     cache_write_tokens: int = 0,
-) -> int:
+) -> Decimal:
     """Calculate cost in cents from token counts using the pricing table.
 
     G1 prep (docs/audits/2026-07-g1-model-gate.md): cache-aware billing is
@@ -356,7 +358,33 @@ def _calc_cost_cents(
         + (written * write_rate / 1000 if written else 0.0)
         + (output_tokens * pricing["output"] / 1000)
     )
-    return max(1, int(cost_usd * 100))  # At least 1 cent per request
+    return _never_higher_cents(cost_usd)
+
+
+def _never_higher_cents(cost_usd: float) -> Decimal:
+    """Recorded cost in cents: exact to 4 decimal places, capped at the
+    legacy ``max(1, int(cents))`` value.
+
+    The old floor recorded a 0.03¢ embedding as 1¢ (55 calls / 630 tokens
+    were recorded as 55¢), and the bundle budget gate SUMS this column —
+    fake spend consumed real user budget. The R-3 authorization allows
+    recorded costs to go DOWN or stay equal, never up, so the exact value
+    is capped at the legacy one: sub-cent calls become accurate, and the
+    int() truncation on multi-cent calls (3.7¢ recorded as 3¢) stays until
+    a change that may raise recorded costs is separately approved.
+    """
+    exact = (Decimal(str(cost_usd)) * 100).quantize(Decimal("0.0001"))
+    if exact <= 0:
+        return Decimal("0")
+    legacy = Decimal(max(1, int(cost_usd * 100)))
+    return min(exact, legacy)
+
+
+def _embedding_cost_cents(total_tokens: int) -> Decimal:
+    """text-embedding-3-small at $0.00002/token, unfloored (see
+    ``_never_higher_cents``). The price constant is unchanged from the
+    route's original inline math — R-3's scope is the floor, not pricing."""
+    return _never_higher_cents(total_tokens * 0.00002)
 
 
 # ── Usage event logging ──────────────────────────────────────────────
@@ -409,7 +437,7 @@ async def _log_event(
     endpoint: str,
     input_tokens: int,
     output_tokens: int,
-    cost_cents: int,
+    cost_cents: Decimal | int,
     latency_ms: int,
     was_fallback: bool = False,
     status: str = "ok",
@@ -1150,9 +1178,12 @@ def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS) -> tuple[list, list]
 
 
 class UsageResponse(BaseModel):
-    anthropic_monthly_cents: int
-    anthropic_daily_cents: int
-    openai_monthly_cents: int
+    # float since R-3/alembic 084: these come from SUM(cost_cents) over a
+    # Numeric column — a fractional Decimal into an int field is a
+    # ValidationError, i.e. a 500 on /usage.
+    anthropic_monthly_cents: float
+    anthropic_daily_cents: float
+    openai_monthly_cents: float
     anthropic_budget_cents: int
     anthropic_daily_cap_cents: int
     openai_budget_cents: int
@@ -1820,7 +1851,7 @@ async def proxy_embeddings(
     # OpenAI embeddings don't return token counts in the same way — estimate
     usage = resp_data.get("usage", {})
     total_tokens = usage.get("total_tokens", 0)
-    cost = max(1, int(total_tokens * 0.00002 * 100))  # text-embedding-3-small pricing
+    cost = _embedding_cost_cents(total_tokens)
 
     await _log_event(db, config.user_id, "openai", model, "embeddings", total_tokens, 0, cost, latency)
 
@@ -2454,9 +2485,12 @@ def _anthropic_to_openai_request(body: dict) -> dict:
 
 class AdminStatsResponse(BaseModel):
     total_requests_today: int
-    total_cost_cents_today: int
-    anthropic_cost_cents_today: int
-    openai_cost_cents_today: int
+    # float, not int: cost_cents is Numeric(12,4) since R-3 (alembic 084) —
+    # a fractional Decimal into an int field is a ValidationError, i.e. a
+    # 500 on the admin dashboard the first sub-cent call after the deploy.
+    total_cost_cents_today: float
+    anthropic_cost_cents_today: float
+    openai_cost_cents_today: float
     fallback_count_today: int
     error_count_today: int
     top_users: list[dict]
@@ -2464,18 +2498,17 @@ class AdminStatsResponse(BaseModel):
 
 @admin_router.get("/stats", response_model=AdminStatsResponse)
 async def get_admin_stats(
-    request: Request,
+    _admin=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin-only: aggregate LLM proxy stats for today."""
-    # Simple admin check via platform auth
-    from app.api.auth import get_current_user
-    try:
-        user = await get_current_user(request, db)
-        if user.role != "admin":
-            raise HTTPException(403, "Admin only")
-    except Exception:
-        raise HTTPException(403, "Admin only")
+    """Admin-only: aggregate LLM proxy stats for today.
+
+    require_admin, same as /cache-daily. The previous hand-rolled check
+    called get_current_user with two positional args — binding the SESSION
+    to the ``credentials`` parameter — so it AttributeError'd before any
+    auth strategy ran and the blanket except 403'd every caller, admins
+    included, since the route shipped.
+    """
 
     today = _today_utc_start()
 
@@ -2497,7 +2530,7 @@ async def get_admin_stats(
             func.coalesce(func.sum(LLMProxyEvent.cost_cents), 0).label("cost"),
         ).where(LLMProxyEvent.created_at >= today).group_by(LLMProxyEvent.provider)
     )
-    provider_costs = {r.provider: int(r.cost) for r in by_provider}
+    provider_costs = {r.provider: round(float(r.cost), 4) for r in by_provider}
 
     # Fallback + error counts
     fallback_result = await db.execute(
@@ -2529,7 +2562,7 @@ async def get_admin_stats(
         .limit(10)
     )
     top_users = [
-        {"user_id": r.user_id[:8], "cost_cents": int(r.cost), "requests": r.cnt}
+        {"user_id": r.user_id[:8], "cost_cents": round(float(r.cost), 4), "requests": r.cnt}
         for r in top_users_result
     ]
 

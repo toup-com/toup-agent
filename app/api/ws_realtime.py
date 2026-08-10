@@ -1232,6 +1232,57 @@ async def _get_user_tz_name(user_id: str) -> Optional[str]:
         return None
 
 
+async def _persist_user_tz(user_id: str, tz_name: str) -> None:
+    """Fill a blank ``users.timezone`` with a device-detected zone.
+
+    Restricted to rows where the column IS NULL: the account page's
+    precise-location flow writes a zone the user chose deliberately, and
+    a laptop that happens to be in another country must not overwrite it.
+    """
+    try:
+        from sqlalchemy import update
+        from app.db.database import async_session_maker
+        from app.db.models import User
+        async with async_session_maker() as db:
+            await db.execute(
+                update(User)
+                .where(User.id == user_id, User.timezone.is_(None))
+                .values(timezone=tz_name)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.warning("[REALTIME] tz self-heal failed user=%s: %s", user_id[:8], e)
+
+
+async def _apply_client_tz(user_id: str, raw) -> Optional[str]:
+    """Validate a client-supplied IANA zone, persist it, return it.
+
+    Voice sends no tz in the WebRTC payload, so it fell back to the
+    PLATFORM copy of ``users.timezone`` — while chat and mobile persist
+    the zone they collect to the TENANT copy. Same column name, different
+    database: 36 of 43 platform rows were NULL on 2026-08-10, 23 of them
+    belonging to users active in the last 30 days, and every one of those
+    voice sessions resolved "today" in UTC.
+
+    Validation is not optional here. ``resolve_local_date`` falls back to
+    UTC on a zone it cannot parse, so an unvalidated string reintroduces
+    exactly the bug this closes (#488) while looking like it fixed it.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    tz_name = raw.strip()
+    if not tz_name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz_name)
+    except Exception:
+        logger.warning("[REALTIME] ignoring unparseable client tz for user=%s", user_id[:8])
+        return None
+    await _persist_user_tz(user_id, tz_name)
+    return tz_name
+
+
 def _parse_utc_dt(raw) -> Optional[datetime]:
     """Parse an ISO timestamp from the VPS API. Naive values are UTC
     (Conversation.started_at is stored as naive utcnow)."""
@@ -2492,14 +2543,112 @@ async def realtime_voice_ws(
                 logger.exception("[REALTIME] Failed to create fresh DB session")
                 return None
 
+    async def _agent_voice_context() -> Optional[str]:
+        """Ask the tenant's own agent to assemble the instructions (G-19a).
+
+        Returns None on ANY failure so the caller falls back to the legacy
+        builder — a Realtime session must never open with no instructions,
+        which is the 2026-07-31 shape.
+        """
+        vps = await _get_vps_info(user_id)
+        if not vps:
+            return None
+        agent_url, agent_api_key = vps
+        body = {
+            "onboarding": onboarding,
+            "budget_chars": settings.voice_realtime_instructions_budget_chars if _v2_active() else 0,
+            "tz_name": await _get_user_tz_name(user_id),
+        }
+        data = await _vps_api(
+            agent_url, agent_api_key, "POST",
+            "/api/v1/internal/voice-context", json_body=body, timeout=20.0,
+        )
+        if not isinstance(data, dict):
+            return None
+        instr = data.get("instructions") or ""
+        if not instr.strip():
+            return None
+        degraded = data.get("degraded") or []
+        if degraded:
+            logger.warning(
+                "[REALTIME] agent voice-context DEGRADED user=%s legs=%s",
+                str(user_id)[:8], ",".join(map(str, degraded)),
+            )
+        logger.info(
+            "[REALTIME] agent voice-context ok user=%s chars=%d day=%s",
+            str(user_id)[:8], len(instr), data.get("day_date"),
+        )
+        return instr
+
+    def _section_fingerprints(text: str) -> dict:
+        """`{section header: (chars, 8-hex hash)}` — counts and digests only.
+
+        Never the content: this goes in a log line, and the sections are the
+        user's persona, brains and day transcript.
+        """
+        import hashlib
+        out = {}
+        for block in (text or "").split("\n\n# "):
+            block = block.strip()
+            if not block:
+                continue
+            head = block.split("\n", 1)[0].lstrip("# ").strip()[:40]
+            out[head] = (
+                len(block),
+                hashlib.sha256(block.encode("utf-8")).hexdigest()[:8],
+            )
+        return out
+
     async def _instructions_step() -> Optional[str]:
+        legacy: Optional[str] = None
         try:
-            instr = await build_realtime_instructions(user_id, onboarding=onboarding)
-            logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(instr), onboarding)
-            return instr
+            legacy = await build_realtime_instructions(user_id, onboarding=onboarding)
+            logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(legacy), onboarding)
         except Exception:
             logger.exception("[REALTIME] Failed to build instructions")
-            return None
+
+        # Serve the agent's version only when explicitly enabled; otherwise
+        # the agent call is a SHADOW — compared and logged, never served —
+        # so the two can be shown to agree on real traffic first.
+        want_agent = settings.voice_context_from_agent
+        want_shadow = settings.voice_context_shadow and not want_agent
+        if not (want_agent or want_shadow):
+            return legacy
+
+        agent_instr = None
+        try:
+            agent_instr = await _agent_voice_context()
+        except Exception:
+            logger.exception("[REALTIME] agent voice-context call failed")
+
+        if want_shadow:
+            if agent_instr and legacy:
+                a, l = _section_fingerprints(agent_instr), _section_fingerprints(legacy)
+                same = sorted(k for k in a if k in l and a[k][1] == l[k][1])
+                diff = sorted(set(a) ^ set(l)) + sorted(
+                    k for k in a if k in l and a[k][1] != l[k][1]
+                )
+                logger.info(
+                    "[REALTIME] ctx_shadow match=%s agent_chars=%d legacy_chars=%d "
+                    "same=%s differs=%s",
+                    not diff, len(agent_instr), len(legacy),
+                    ",".join(same) or "-", ",".join(diff) or "-",
+                )
+            else:
+                logger.info(
+                    "[REALTIME] ctx_shadow unavailable agent=%s legacy=%s",
+                    bool(agent_instr), bool(legacy),
+                )
+            return legacy
+
+        # want_agent: serve it, but never at the cost of having nothing.
+        if agent_instr:
+            return agent_instr
+        logger.warning(
+            "[REALTIME] agent voice-context unavailable — falling back to the "
+            "legacy builder for user=%s", str(user_id)[:8],
+        )
+        return legacy
 
     async def _lang_step() -> Optional[str]:
         try:
@@ -2867,6 +3016,13 @@ async def realtime_voice_ws(
                                 "audio": {"output": {"voice": voice}},
                             },
                         }))
+                    # Client's IANA zone. Voice has none in the WebRTC
+                    # payload, so without this the relay falls back to a
+                    # platform users row that is NULL for most users and
+                    # resolves the user's day in UTC.
+                    if msg.get("tz"):
+                        await _apply_client_tz(user_id, msg.get("tz"))
+
                     # Client can also pass session_id via config
                     if "session_id" in msg and msg["session_id"] and not db_session_id:
                         try:
