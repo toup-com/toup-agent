@@ -63,6 +63,60 @@ def _invalidate_cache(user_id: str):
         _budget_cache.pop(k, None)
 
 
+# ── Per-tenant request-rate limit (G-20) ─────────────────────────────
+#
+# The budget caps bound SPEND per month (with a 30s cache the burst can
+# overshoot), but nothing bounded REQUESTS: a leaked or runaway
+# TOUP_LLM_TOKEN could fire unlimited RPS until the monthly cents cap
+# tripped — and for an admin-role tenant _check_budget returns None, so a
+# leaked admin token had no ceiling at all. 30-day measured peak across
+# every tenant (canary and the founder account both) is 33 calls in a
+# minute; the default cap is ~2.7x that, so no legitimate minute ever
+# observed would have tripped it.
+#
+# In-memory sliding window is the right shape here: platform-api runs as
+# one process, and the key (the tenant's user_id) only exists after
+# _auth_agent resolves the token inside the handler — a middleware cannot
+# key this. Admins are deliberately NOT exempt.
+_rate_windows: dict[str, list[float]] = {}
+_RATE_WINDOW_S = 60.0
+
+
+def _check_rate_limit(user_id: str) -> Optional[int]:
+    """None = allowed (and the call is recorded). Otherwise the number of
+    seconds after which the oldest recorded call leaves the window —
+    served as Retry-After on the 429."""
+    limit = settings.llm_proxy_rate_limit_per_min
+    if limit <= 0:
+        return None
+    now = time.time()
+    window = [t for t in _rate_windows.get(user_id, ()) if t > now - _RATE_WINDOW_S]
+    if len(window) >= limit:
+        _rate_windows[user_id] = window
+        return max(1, int(window[0] + _RATE_WINDOW_S - now) + 1)
+    window.append(now)
+    _rate_windows[user_id] = window
+    return None
+
+
+def _enforce_rate_limit(config) -> None:
+    """Shared by chat/responses/embeddings (the SDK-shim aliases delegate
+    into proxy_chat, so three call sites cover every provider path)."""
+    retry_after = _check_rate_limit(str(config.user_id))
+    if retry_after is None:
+        return
+    logger.warning(
+        "[RATELIMIT] 429 user=%s retry_after=%ss limit=%s/min",
+        str(config.user_id)[:8], retry_after,
+        settings.llm_proxy_rate_limit_per_min,
+    )
+    raise HTTPException(
+        status_code=429,
+        detail="Rate limit exceeded for this tenant token.",
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 # ── Token auth ───────────────────────────────────────────────────────
 
 
@@ -1088,6 +1142,7 @@ async def proxy_chat(
     Streams SSE responses without buffering.
     """
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     # Captured once, then passed explicitly to every _log_event below —
     # including the ones inside the streaming generator. A local (closed over
     # by the generator) rather than a ContextVar, because _log_event runs
@@ -1446,6 +1501,7 @@ async def proxy_responses(
     toward the openai monthly budget automatically.
     """
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     req_channel = _sanitize_channel(request.headers.get(CHANNEL_HEADER))
     body = await request.json()
     requested_model = body.get("model")
@@ -1706,6 +1762,7 @@ async def proxy_embeddings(
 ):
     """Proxy an embeddings request to OpenAI."""
     config = await _auth_agent(request, db)
+    _enforce_rate_limit(config)
     body = await request.json()
     model = body.get("model", "text-embedding-3-small")
 

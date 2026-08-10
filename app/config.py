@@ -1766,6 +1766,13 @@ class Settings(BaseSettings):
     bundle_anthropic_budget_cents: int = 3000           # $30/month Anthropic allocation
     bundle_openai_budget_cents: int = 1000              # $10/month OpenAI allocation
     bundle_anthropic_daily_cap_cents: int = 100          # $1/day Anthropic soft cap (triggers fallback)
+    # G-20: per-tenant request cap on the LLM proxy (sliding 60s window,
+    # all endpoints share one budget). 30-day measured per-user peak is
+    # 33 calls/min — 90 is ~2.7x that, so no observed legitimate minute
+    # would have tripped it, while a leaked token stops here instead of
+    # at the monthly cents cap (admins have NO cents cap; they are not
+    # exempt from this). 0 disables.
+    llm_proxy_rate_limit_per_min: int = 90
 
     # Pricing per 1K tokens (USD)
     #
