@@ -1118,6 +1118,14 @@ class Settings(BaseSettings):
     enable_reranker: bool = True  # Enable cross-encoder re-ranking after RRF
     cohere_api_key: Optional[str] = None  # Set via COHERE_API_KEY env var
     reranker_model: str = "rerank-v3.5"  # Cohere rerank model
+    # Hard wall-clock budget for the whole rerank attempt (Cohere AND the
+    # LLM fallback share it). On expiry the search degrades to hybrid
+    # (RRF+weighted) order — never fails, never blocks the turn. 900ms keeps
+    # end-to-end retrieval inside memverify's 1500ms ceiling with room for
+    # the embedding RTT; with no Cohere key the gpt-4o-mini fallback rarely
+    # beats this, which is deliberate — a 1-3s LLM hop for marginal
+    # precision is a bad trade on the turn path.
+    reranker_timeout_ms: int = 900
     
     # ── Discord ──────────────────────────────────────────────
     discord_bot_token: Optional[str] = None  # Set via DISCORD_BOT_TOKEN env var

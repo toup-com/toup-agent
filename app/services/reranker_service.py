@@ -92,33 +92,65 @@ class RerankerService:
 
         t0 = time.monotonic()
 
+        # One wall-clock budget shared by BOTH backends: a slow Cohere
+        # attempt eats into the LLM fallback's time, so the total can never
+        # exceed the budget regardless of which path runs. On expiry the
+        # caller gets hybrid (RRF+weighted) order — degraded precision,
+        # never a failed or slow search. Read per-call (not in __init__) so
+        # the setting is runtime-reloadable like enable_reranker.
+        from app.config import settings as _settings
+        budget_s = max(0.05, getattr(_settings, "reranker_timeout_ms", 900) / 1000.0)
+
+        def _remaining() -> float:
+            return budget_s - (time.monotonic() - t0)
+
         # --- Try Cohere first ---
-        if self.cohere_api_key:
+        if self.cohere_api_key and _remaining() > 0:
             try:
-                result = await self._cohere_rerank(query, candidates, top_k)
+                result = await asyncio.wait_for(
+                    self._cohere_rerank(query, candidates, top_k),
+                    timeout=_remaining(),
+                )
                 elapsed = (time.monotonic() - t0) * 1000
                 logger.info(
                     f"[RERANKER] Cohere re-ranked {len(candidates)}→{len(result)} "
                     f"in {elapsed:.0f}ms"
                 )
                 return result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[RERANKER] degraded backend=cohere reason=timeout "
+                    f"elapsed_ms={(time.monotonic() - t0) * 1000:.0f} "
+                    f"budget_ms={budget_s * 1000:.0f} "
+                    f"candidates={len(candidates)} top_k={top_k}"
+                )
             except Exception as exc:
                 logger.warning(f"[RERANKER] Cohere failed, falling back: {exc}")
 
         # --- Fallback: GPT-4o-mini scoring ---
-        if self.openai_api_key:
+        if self.openai_api_key and _remaining() > 0:
             try:
-                result = await self._llm_rerank(query, candidates, top_k)
+                result = await asyncio.wait_for(
+                    self._llm_rerank(query, candidates, top_k),
+                    timeout=_remaining(),
+                )
                 elapsed = (time.monotonic() - t0) * 1000
                 logger.info(
                     f"[RERANKER] LLM re-ranked {len(candidates)}→{len(result)} "
                     f"in {elapsed:.0f}ms"
                 )
                 return result
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[RERANKER] degraded backend=llm reason=timeout "
+                    f"elapsed_ms={(time.monotonic() - t0) * 1000:.0f} "
+                    f"budget_ms={budget_s * 1000:.0f} "
+                    f"candidates={len(candidates)} top_k={top_k}"
+                )
             except Exception as exc:
                 logger.warning(f"[RERANKER] LLM fallback failed: {exc}")
 
-        # --- Final fallback: passthrough ---
+        # --- Final fallback: passthrough (hybrid order) ---
         logger.info("[RERANKER] No re-ranker available, returning top-K by score")
         for c in candidates:
             c["rerank_score"] = c.get("final_score", 0.0)

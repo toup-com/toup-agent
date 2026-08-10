@@ -3120,11 +3120,22 @@ class MemoryService:
         # p95 is ~26ms against a 150ms budget).
         task_names = list(tasks.keys())
         results = []
+        # Per-leg wall-clock. Production retrieval spans have reached seconds
+        # with the re-ranker never firing (G-18 follow-up, 2026-08-10:
+        # founder-tenant retrieval_events p50 4.1s / p95 10.1s, zero
+        # [RERANKER] lines fleet-wide) — the slow phase was not attributable
+        # from the [PERF] hybrid_search total alone. The vector leg's time
+        # includes the query-embedding call, so this line separates
+        # embed-dominated latency from DB-dominated latency per strategy.
+        _leg_ms: Dict[str, float] = {}
         for _name in task_names:
+            _t_leg = time.monotonic()
             try:
                 results.append(await tasks[_name])
             except Exception as e:  # noqa: BLE001 - one leg must not kill the search
                 results.append(e)
+            finally:
+                _leg_ms[_name] = (time.monotonic() - _t_leg) * 1000
 
         # Collect valid ranked lists
         ranked_lists = []
@@ -3253,22 +3264,32 @@ class MemoryService:
         scored_memories.sort(key=lambda x: x["final_score"], reverse=True)
 
         # Phase 6: Cross-encoder re-ranking for improved precision
+        _rerank_ms = 0.0
         try:
             from app.config import settings as _settings
             if _settings.enable_reranker and len(scored_memories) > limit:
                 from app.services.reranker_service import get_reranker_service
                 reranker = get_reranker_service()
+                _t_rr = time.monotonic()
                 reranked = await reranker.rerank(
                     query=query,
                     candidates=scored_memories,
                     top_k=limit,
                 )
+                _rerank_ms = (time.monotonic() - _t_rr) * 1000
                 logger.info(
                     f"[HYBRID] Re-ranked {len(scored_memories)}→{len(reranked)} candidates"
                 )
                 scored_memories = reranked
         except Exception as e:
             logger.warning(f"[HYBRID] Re-ranker failed, using score-based ranking: {e}")
+
+        # Counts and milliseconds only — no memory content, no query text.
+        logger.info(
+            "[HYBRID] timing "
+            + " ".join(f"{n}={_leg_ms.get(n, 0.0):.0f}ms" for n in task_names)
+            + f" rerank={_rerank_ms:.0f}ms results={len(scored_memories)}"
+        )
 
         # `limit` is a contract, not a hint. Every leg above deliberately
         # over-fetches to give the re-ranker something to choose from
