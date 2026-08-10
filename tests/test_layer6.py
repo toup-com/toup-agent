@@ -494,8 +494,8 @@ class TestVoiceWake(unittest.TestCase):
     def test_default_wake_words(self):
         from app.agent.voice_handler import VoiceWakeDetector
         det = VoiceWakeDetector()
-        self.assertTrue(det.check("hey hex what's up"))
-        self.assertTrue(det.check("ok hex tell me"))
+        self.assertTrue(det.check("hey toup what's up"))
+        self.assertTrue(det.check("ok toup tell me"))
         self.assertTrue(det.check("toup do this"))
         self.assertTrue(det.check("toup hello"))
 
@@ -508,7 +508,7 @@ class TestVoiceWake(unittest.TestCase):
     def test_strip_wake_word(self):
         from app.agent.voice_handler import VoiceWakeDetector
         det = VoiceWakeDetector()
-        self.assertEqual(det.strip_wake_word("hey hex what time"), "what time")
+        self.assertEqual(det.strip_wake_word("hey toup what time"), "what time")
         self.assertEqual(det.strip_wake_word("toup search"), "search")
 
     def test_custom_wake_words(self):
@@ -843,7 +843,7 @@ class TestCLIDoctor(unittest.TestCase):
         text = report.to_text()
         self.assertIn("✅", text)
         self.assertIn("⚠️", text)
-        self.assertIn("Toup Doctor Report", text)
+        self.assertIn("Toup Agent Doctor Report", text)
 
     def test_check_python_deps(self):
         from app.agent.cli_doctor import _check_python_deps

@@ -122,11 +122,47 @@ def _wire(defs) -> str:
 # 1. The "nothing changes on merge" proof — the most important test here
 # ----------------------------------------------------------------------
 
-def test_default_wire_array_is_byte_identical_to_today():
-    """Default entitlement ("*") must reproduce origin/main's array EXACTLY.
+def test_shipped_default_withholds_exactly_the_toup_family():
+    """The loadout is a decision, and this is where it is pinned.
 
-    This is the whole safety argument for merging: the gate ships BUILT,
-    not ENABLED, so no tenant's cache lineage moves.
+    G-15 (2026-08-10) enabled the gate with `doc_generation,app_builder`,
+    withholding `toup` — the only family with zero invocations by any
+    tenant across 14 days of production telemetry. Withholding a family
+    makes it UNREACHABLE (the intent filter iterates loaded definitions),
+    so widening or narrowing this set is a product decision, never a
+    drive-by edit. Both directions fail here:
+
+      * adding `toup` back silently re-inflates every tenant's prefix by
+        685 tokens and can push the founder's array back over OpenAI's
+        128-tool cap;
+      * dropping `app_builder` or `doc_generation` breaks tenants that
+        were measured using them, with a scripted refusal and no way for
+        the turn to recover.
+    """
+    from app.config import Settings
+    from app.agent.tool_entitlements import FAMILIES
+
+    default = Settings.model_fields["agent_tool_families"].default
+    shipped = {f.strip() for f in default.split(",") if f.strip()}
+
+    assert shipped == {"doc_generation", "app_builder"}, (
+        f"the shipped tool-family loadout changed to {sorted(shipped)} — "
+        "see the measurement recorded beside the field in config.py"
+    )
+    assert set(FAMILIES) - shipped == {"toup"}, (
+        "the withheld set is no longer exactly {'toup'} — either a family "
+        "was added without a loadout decision, or one was renamed"
+    )
+
+
+def test_default_wire_array_is_byte_identical_to_today():
+    """Entitlement "*" must reproduce origin/main's array EXACTLY.
+
+    This pins that the GATE ITSELF is transparent: with every family
+    entitled, the assembled wire is byte-for-byte what the pre-gate code
+    produced, so the only thing that ever moves a tenant's cache lineage
+    is a deliberate loadout change (pinned in the test above) — never the
+    mechanism.
 
     ANTI-VACUITY / control note: this test stays GREEN if `navigate_to` is
     moved back inside `get_doc_generation_tools()`, because the assembled

@@ -661,18 +661,47 @@ class Settings(BaseSettings):
     # anything turn-conditional here forks the cache lineage and costs more
     # than it saves (see [PERF] tools_array_changed).
     #
-    # "*" (default, and the value used when unset or blank) = every family
-    # = today's behaviour, byte-identical. "none"/"-" = no optional family.
-    # Otherwise a comma-separated subset, e.g. "doc_generation".
+    # "*" (and the value used when unset or blank) = every family = the
+    # pre-gate behaviour, byte-identical. "none"/"-" = no optional family.
+    # Otherwise a comma-separated subset.
     #
     # Delivered fleet-uniform via pool_addon's _FEATURE_FLAG_ENVS (G-15
     # close-out, 2026-08-10): a bridge-env value reaches every spawn and
-    # blue-green recreate. Per-TENANT values remain unwired — that needs
-    # the AgentEnvContract + the hand-deployed /opt/toup-bridge/main.py —
-    # and were evaluated and declined: the only per-tenant candidate,
-    # app_builder (~2,800 tok), must stay reachable wherever a tenant can
-    # ask to build an app.
-    agent_tool_families: str = "*"
+    # blue-green recreate, and overrides the default below. Per-TENANT
+    # values remain unwired — that needs the AgentEnvContract + the
+    # hand-deployed /opt/toup-bridge/main.py — and were evaluated and
+    # declined: the only per-tenant candidate, app_builder (~2,800 tok),
+    # must stay reachable wherever a tenant can ask to build an app.
+    #
+    # ENABLED 2026-08-10 (G-15). The loadout is decided from 14 days of
+    # production tool-call telemetry (Loki's full retention; 553 of 553
+    # `[AGENT] Tool called:` lines parsed, attributed by channel):
+    #
+    #   toup            0 invocations by ANY tenant, canary included, and
+    #                   no durable artifacts  -> WITHHELD (685 tok/request)
+    #   app_builder     0 direct calls, BUT the founder tenant has 2 `apps`
+    #                   rows and three pool tenants ran channel="app" turns;
+    #                   a built app needs `app__*` at runtime -> KEPT
+    #   doc_generation  real users invoked generate_pdf on voice and mobile
+    #                   inside the window -> KEPT
+    #
+    # Withholding is not "not-default", it is UNREACHABLE: the intent
+    # filter iterates loaded definitions, so a withheld family cannot be
+    # merged back in for a turn that needs it (and making it
+    # turn-conditional is the exact defect class tool_entitlements.py
+    # exists to prevent). That asymmetry is why only the family with zero
+    # observed use anywhere is withheld.
+    #
+    # Side effect worth the change on its own: the founder tenant's wire
+    # array measured 117-129 definitions, i.e. at or over OpenAI's hard
+    # 128-tool cap, where the tail is silently truncated. Dropping `toup`
+    # lands it at <=124.
+    #
+    # Rollback: AGENT_TOOL_FAMILIES=* in the bridge env (forwarded by
+    # pool_addon's _FEATURE_FLAG_ENVS) + a recreate wave; blank and "*"
+    # both parse to ALL. Expect exactly one cache-lineage bust per tenant
+    # on the flip, and one on the rollback.
+    agent_tool_families: str = "doc_generation,app_builder"
 
     # PR 8 of the unified-jobs arc: when True, every Auto Builder
     # job completion (success or failure) writes one Message into

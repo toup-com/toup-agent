@@ -63,17 +63,15 @@ test_connector_dispatcher.py  # needs a real database; sqlite has no such table/
 test_connector_mcp.py  # asserts something the code no longer does
 test_connector_providers_t3_t4.py  # needs a real database; sqlite has no such table/column
 test_connector_schema.py  # asserts something the code no longer does
-test_consolidation.py  # references code that no longer exists
+test_consolidation.py  # agent-mode — rewritten 2026-08-10 against the current ConsolidationService API
 test_conversation_resolver.py  # fails for a reason not yet triaged
 test_cron_service_deprecation.py  # fails for a reason not yet triaged
 test_cron_tool_removed.py  # references code that no longer exists
 test_day_chat_resolver.py  # exceeds a 240s per-file budget
 test_day_chats_api.py  # exceeds a 240s per-file budget
 test_email_briefing_handler.py  # fails for a reason not yet triaged
-test_friendly_error_provider_mapping.py  # asserts something the code no longer does
 test_gap_features.py  # fails for a reason not yet triaged
 test_grandfather_byo_llm_mode.py  # asserts something the code no longer does
-test_layer6.py  # fails for a reason not yet triaged
 test_mcp_auth.py  # fails for a reason not yet triaged
 test_models_endpoint.py  # asserts something the code no longer does
 test_notify_coverage.py  # needs a real database; sqlite has no such table/column
@@ -81,7 +79,6 @@ test_oauth_flow.py  # needs a real database; sqlite has no such table/column
 
 # --- red on its own, and my file scan never even saw it ---
 # My sweep globbed tests/test_*.py and missed subdirectories entirely.
-agent/test_system_prompt_assembly.py  # 2 tests fail standalone; never scanned, never run
 
 # --- TRIAGED 2026-08-04: red under the exact CI env, cause known ---
 # Every line below carries a DIAGNOSIS, not a shrug. The previous round wrote
