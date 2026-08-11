@@ -113,6 +113,20 @@ class RadioSession:
     # another track.
     last_ended_video_id: str = ""
     last_ended_ts: float = 0.0
+    # Every end honored recently, {video_id: ts}. The single last_ended pair
+    # above is blind to ALTERNATION: ends arriving A, B, A each looked new to
+    # a memory that holds only the previous one, and each popped a track —
+    # three cursor moves for two physical events (the 2026-08-10 recording's
+    # four-identities-in-3s cycle). Pruned to _MEDIA_ENDED_DEDUP_SEC.
+    recent_ended_ids: Dict[str, float] = field(default_factory=dict)
+    # Timestamps of recent MACHINE advances (the client's auto-skip-on-error
+    # lane, radio_skip_next reason="auto_error"). A human ⏭ is authoritative
+    # and never throttled; a machine walking the station because streams keep
+    # dying must be paced and capped — see _handle_radio_skip_next.
+    auto_advance_ts: List[float] = field(default_factory=list)
+    # Last "playback is having trouble" notice, same modal-stacking rationale
+    # as last_exhaustion_notice_ts.
+    last_trouble_notice_ts: float = 0.0
     # ── Library auto-save (2026-08-03) ───────────────────────────────
     # Row id of the media_playlists entry that mirrors THIS station, so the
     # library keeps a record of everything the user has actually listened to
@@ -248,6 +262,13 @@ class RadioSessionManager:
         sess.autosave_playlist_id = ""   # new station → its own library entry
         sess.station_built_ts = time.time()
         sess.autosave_suppressed = False
+        # A new station is a new advance ledger. Carrying the dead station's
+        # machine-advance history over meant the user's own escape hatch —
+        # asking for different music — arrived pre-capped: one failure on the
+        # fresh station and the lane said "keeps failing" (review finding).
+        sess.auto_advance_ts = []
+        sess.recent_ended_ids = {}
+        sess.last_trouble_notice_ts = 0.0
         logger.info(
             "[radio] seed_bind source=%s user=%s channel=%s videoId=%s "
             "intent=%r old_seed=%s station=%d",
@@ -305,6 +326,10 @@ class RadioSessionManager:
         sess.display_mode_user_override = False
         sess.current_station_track = None
         sess.last_activity_ts = time.time()
+        # Same reset as enable(): a user-driven reseed is a fresh start.
+        sess.auto_advance_ts = []
+        sess.recent_ended_ids = {}
+        sess.last_trouble_notice_ts = 0.0
         return sess
 
     def record_auto_play(self, sess: RadioSession, track: StationTrack, source: str = "advance") -> None:

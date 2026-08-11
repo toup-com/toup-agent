@@ -1692,6 +1692,17 @@ _STREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 # Ceiling on getting RESPONSE HEADERS back, separate from `read` above, which
 # has to stay long enough to cover a slow progressive body. See the call site.
 _UPSTREAM_HEADERS_TIMEOUT = float(os.environ.get("AUDIO_UPSTREAM_HEADERS_TIMEOUT", "20"))
+# Mid-body stall bound. When a response has ALREADY sent bytes and the
+# upstream then goes quiet, holding the client open is the worst option:
+# AVPlayer drains its ~2s buffer, the position freezes, the UI still says
+# "playing", and NOTHING errors for the full 60s read timeout — the recorded
+# "frozen at 0:02 under an animating equalizer". Cutting the response after a
+# few silent seconds turns an invisible hang into an immediate client-side
+# error the phone's recovery ladder can act on. This bounds the wait for the
+# NEXT chunk mid-body, never time-to-first-byte (extraction/connect have their
+# own budgets) and never client backpressure (a paused player blocks on
+# `yield`, not on this wait).
+_MID_STREAM_STALL_SECS = float(os.environ.get("AUDIO_MID_STREAM_STALL_SECS", "8"))
 
 
 def _parse_byte_range(range_header: str | None, file_size: int):
@@ -1723,7 +1734,8 @@ def _parse_byte_range(range_header: str | None, file_size: int):
     return start, min(end, file_size - 1)
 
 
-def _local_audio_response(rpath: str, range_header: str | None):
+def _local_audio_response(rpath: str, range_header: str | None,
+                          if_range: str | None = None):
     """Range-aware (206) / full (200) StreamingResponse for a cached local audio
     file, or None if the file vanished / is empty (caller falls through). A
     correct Content-Length is what stops AVFoundation re-requesting the whole
@@ -1736,7 +1748,33 @@ def _local_audio_response(rpath: str, range_header: str | None):
         file_size = 0
     if file_size <= 0:
         return None
-    base = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
+    # Entity identity. The same URL serves DIFFERENT entities over time (the
+    # ~11.8MB progressive itag-18 while cold, the ~3MB remuxed m4a once
+    # built), and a client resuming with byte offsets from the OLD entity gets
+    # silently wrong bytes whenever its offset happens to fit inside the new
+    # file (the size-only 416 below can't see that case — review finding). A
+    # strong ETag + If-Range is the HTTP answer: a client that validates gets
+    # a full 200 instead of a mismatched slice.
+    etag = f'"{file_size}-{int(os.path.getmtime(rpath)) if os.path.exists(rpath) else 0}"'
+    base = {"Accept-Ranges": "bytes", "Cache-Control": "no-store", "ETag": etag}
+    if if_range and if_range.strip() != etag:
+        # RFC 7233 §3.2: an If-Range that doesn't match ⇒ ignore Range, serve
+        # the full current entity.
+        range_header = None
+    # A range starting AT or BEYOND this file's size means the client is
+    # resuming against a DIFFERENT entity — the ~11.8MB progressive itag-18 it
+    # buffered before an idle, now answered by the ~3MB remuxed m4a after the
+    # spool retired. Serving a silent 200 of the whole other container (the
+    # old behaviour, via _parse_byte_range's None) restarts the track at 0:00
+    # with CoreMedia none the wiser. 416 is the honest answer: the client
+    # knowingly re-fetches from byte 0 instead of being lied to.
+    _m = re.match(r"\s*bytes\s*=\s*(\d+)\s*-", range_header or "")
+    if _m and int(_m.group(1)) >= file_size:
+        from fastapi import Response
+        return Response(
+            status_code=416,
+            headers={**base, "Content-Range": f"bytes */{file_size}"},
+        )
     rng = _parse_byte_range(range_header, file_size)
     if rng:
         start, end = rng
@@ -2059,11 +2097,14 @@ def _spool_response(
                 gating = False
                 _live_start_done()
 
+        stalled_for = 0.0
+        server_cut = False
         try:
             with open(spool.path, "rb") as fh:
                 while pos <= end:
                     avail = spool.received
                     if pos < avail:
+                        stalled_for = 0.0
                         fh.seek(pos)
                         chunk = fh.read(min(_STREAM_CHUNK_BYTES, end + 1 - pos, avail - pos))
                         if not chunk:
@@ -2086,6 +2127,26 @@ def _spool_response(
                     elif spool.done:
                         break
                     else:
+                        # Mid-body stall watchdog. A quiet upstream must
+                        # become a VISIBLE failure fast — held open, the phone
+                        # shows a playing UI over dead audio for the
+                        # downloader's full 60s read timeout. Applies from
+                        # byte 0 too: after a stall cut, AVPlayer's recovery
+                        # re-ranges at its buffered edge, which lands right
+                        # back in this wait with sent==0 — an exemption there
+                        # degraded the 8s bound straight back to 60s (review
+                        # finding). Client backpressure never waits here (a
+                        # paused player blocks on `yield`), so this bound only
+                        # ever measures the upstream.
+                        if stalled_for >= _MID_STREAM_STALL_SECS:
+                            logger.warning(
+                                "[media_proxy] audio_stream STALLED video_id=%s spool=1 "
+                                "pos=%d/%d sent=%d silent_for=%.1fs — cutting the response",
+                                video_id, pos, end + 1, sent, stalled_for,
+                            )
+                            server_cut = True
+                            break
+                        stalled_for += 0.05
                         await asyncio.sleep(0.05)
         finally:
             _ungate()
@@ -2096,6 +2157,17 @@ def _spool_response(
                     "stream_ms=%d throughput_mbps=%.2f total_ms=%d",
                     video_id, sent, int(_dur * 1000), (sent / _dur) / 1e6,
                     int((time.monotonic() - t0) * 1000),
+                )
+            if (server_cut or spool.error is not None) and sent < (end - start + 1):
+                # Distinct signature for a body WE ended short of its declared
+                # Content-Length. Gated on a server-side cut: an ordinary
+                # client disconnect also lands in this finally with
+                # sent < promised, and logging that as TRUNCATED made the new
+                # signature noise on day one (review finding).
+                logger.warning(
+                    "[media_proxy] audio_stream TRUNCATED video_id=%s spool=1 "
+                    "sent=%d promised=%d spool_error=%r server_cut=%s",
+                    video_id, sent, end - start + 1, spool.error, server_cut,
                 )
             on_release()
             # If the spool died mid-serve, give the legacy build path its shot
@@ -2213,7 +2285,9 @@ async def stream_audio(
             tier = "R2"
     _cache_ms = _ms(_t0)
     if rpath:
-        resp = _local_audio_response(rpath, request.headers.get("range"))
+        resp = _local_audio_response(
+            rpath, request.headers.get("range"), request.headers.get("if-range"),
+        )
         if resp is not None:
             _release()
             logger.info(
@@ -2242,7 +2316,9 @@ async def stream_audio(
         _release()
         built = await _remux_now(video_id, budget=_REMUX_SYNC_BUDGET_SECS)
         if built:
-            resp = _local_audio_response(built, request.headers.get("range"))
+            resp = _local_audio_response(
+                built, request.headers.get("range"), request.headers.get("if-range"),
+            )
             if resp is not None:
                 logger.info("[media_proxy] audio_stream remux BUILT (prefetch) video_id=%s", video_id)
                 return resp
@@ -2550,6 +2626,7 @@ async def stream_audio(
 
     async def _body():
         sent = 0
+        server_cut = False
         t_first: float | None = None
         # Only a LIVE play holds the build gate. A `?prefetch=1` pull is the
         # phone filling its own disk for a future ⏭ — nobody is waiting on it,
@@ -2566,7 +2643,28 @@ async def stream_audio(
                 _live_start_done()
 
         try:
-            async for chunk in upstream.aiter_bytes(_STREAM_CHUNK_BYTES):
+            # Per-chunk bound once bytes are flowing (see _MID_STREAM_STALL_SECS):
+            # the httpx read timeout is 60s, and a mid-song upstream stall held
+            # the response open — silently — for all of it.
+            _chunks = upstream.aiter_bytes(_STREAM_CHUNK_BYTES)
+            while True:
+                try:
+                    if sent > 0:
+                        chunk = await asyncio.wait_for(
+                            _chunks.__anext__(), timeout=_MID_STREAM_STALL_SECS + 2.0,
+                        )
+                    else:
+                        chunk = await _chunks.__anext__()
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[media_proxy] audio_stream STALLED video_id=%s sent=%d "
+                        "— cutting the response",
+                        video_id, sent,
+                    )
+                    server_cut = True
+                    break
                 if t_first is None:
                     t_first = time.monotonic()
                     # The one number that maps to what the user hears. iOS needs
@@ -2601,6 +2699,16 @@ async def stream_audio(
                     "[media_proxy] audio_stream DELIVERED video_id=%s bytes=%d "
                     "stream_ms=%d throughput_mbps=%.2f total_ms=%d",
                     video_id, sent, int(_dur * 1000), (sent / _dur) / 1e6, _ms(_t0),
+                )
+            try:
+                _promised = int(resp_headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                _promised = 0
+            # Server-cut only — a client disconnect also ends short (review).
+            if server_cut and 0 < sent < _promised:
+                logger.warning(
+                    "[media_proxy] audio_stream TRUNCATED video_id=%s sent=%d promised=%d",
+                    video_id, sent, _promised,
                 )
             await upstream.aclose()
             await client.aclose()

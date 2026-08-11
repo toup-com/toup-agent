@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -230,6 +231,17 @@ def _biggest_thumbnail_url(raw: dict) -> str:
     return (best.get("url") or "").strip()
 
 
+# The right-hand side of an "X - Y" split that is a FORMAT marker, not a song
+# title ("Song - Official Video"). When the right side is one of these, the
+# left side is the TITLE, not the artist, and the split must not run.
+_JUNK_TITLE_RIGHT = re.compile(
+    r"^\(?\[?\s*(official\s+)?(music\s+)?"
+    r"(video|audio|lyrics?(\s+video)?|visuali[sz]er|mv|hd|4k|remaster(ed)?)"
+    r"\s*\)?\]?\s*$",
+    re.I,
+)
+
+
 def _parse_track(raw: dict) -> Optional[StationTrack]:
     vid = (raw.get("videoId") or "").strip()
     title = (raw.get("title") or "").strip()
@@ -242,6 +254,22 @@ def _parse_track(raw: dict) -> Optional[StationTrack]:
         artist_name = (first.get("name") or "").strip()
     length = (raw.get("length") or "").strip()
     video_type = (raw.get("videoType") or "").strip()
+    # For UGC entries YT Music's `artists[0]` is the UPLOADER — an aggregator
+    # channel ("Radio Javan"), not the artist — and regional catalogs (Persian
+    # music especially) live almost entirely on such channels, so the card
+    # credited songs to their uploader. UGC titles conventionally carry the
+    # truth as "Artist - Title"; trust that over the channel name, and give
+    # tracks with NO artist the same derivation. Catalog entries (ATV/OMV)
+    # keep their real artist field untouched.
+    if video_type == "MUSIC_VIDEO_TYPE_UGC" or not artist_name:
+        try:
+            from app.agent.media_resolve import split_artist_title
+            _a, _t = split_artist_title(title)
+            if _a and _t and len(_a) <= 60 and not _JUNK_TITLE_RIGHT.match(_t):
+                artist_name = _a
+                title = _t
+        except Exception:
+            pass
     thumbnail_url = _biggest_thumbnail_url(raw)
     return StationTrack(
         video_id=vid,

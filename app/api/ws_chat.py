@@ -416,6 +416,34 @@ async def _check_age_and_swap(video_id: str, user_id: str) -> None:
         if not age_limit or age_limit <= 0:
             return  # Not restricted — YouTube embed works fine
 
+        # Currency check: this task fires up to ~10s after its media_play,
+        # and during a skip burst the station has moved on by the time the
+        # yt-dlp probe answers. The swap frame is channel-less (it reaches
+        # every device), so a late swap for a track a station has provably
+        # MOVED PAST is pure churn on a live card. Only that case is dropped:
+        # sessions never expire on their own, so "some session's current isn't
+        # this video" is the NORMAL state for every one-off play (an enabled
+        # app session from yesterday would have suppressed every age swap on
+        # web — review finding). Moved-past = in a session's recent tape and
+        # no longer its current, with no session still on it.
+        try:
+            from app.agent.radio import get_radio_manager as _grm
+            _enabled = [
+                s for s in list(getattr(_grm(), "_sessions", {}).values())
+                if s.user_id == user_id and s.enabled
+            ]
+            _is_current = any(s.current_track_id == video_id for s in _enabled)
+            _moved_past = any(
+                s.current_track_id != video_id
+                and any(t.video_id == video_id for t in s.played_history[-10:])
+                for s in _enabled
+            )
+            if _moved_past and not _is_current:
+                logger.info("[AGE-SWAP] stale swap suppressed video=%s", video_id)
+                return
+        except Exception:  # noqa: BLE001 — a failed check must not block the swap
+            pass
+
         # Age-restricted → tell frontend to swap embed to Piped
         embed_url = f"{_PIPED_EMBED_BASE}/{video_id}?autoplay=1"
         logger.info("[AGE-SWAP] Video %s is age-restricted (age_limit=%s), swapping to Piped", video_id, age_limit)
@@ -665,7 +693,40 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
 # Track-ended: when current track ends AND radio is ON, pick next via Haiku
 # and broadcast a radio_auto media_play.
 
+_radio_toggle_locks: dict = {}
+
+
+def _radio_toggle_lock(user_id: str, channel: str) -> asyncio.Lock:
+    key = (user_id, channel)
+    lock = _radio_toggle_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _radio_toggle_locks[key] = lock
+    return lock
+
+
 async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
+    """Serialized per (user, channel). A typed play fires the server-side
+    `_auto` toggle as a create_task while the client's own reseed toggle rides
+    the socket — with no lock the two BUILD CONCURRENTLY: the dup-toggle
+    dedupe below requires a COMMITTED station, so a reseed landing mid-build
+    sails past it, `variety` guarantees the two stations hold different
+    tracks, and the user hears one station while the card and window describe
+    another (the 2026-08-10 recording's mid-song identity flips). Under the
+    lock the second toggle waits, then lands in the committed-station dedupe
+    and re-ships the live station instead of rebuilding it."""
+    channel = (msg.get("channel") or "").strip().lower()
+    # Validate BEFORE creating a lock: the dict is keyed on the raw channel
+    # string, so unvalidated input grew it unboundedly (review finding).
+    from app.agent.radio import RadioSessionManager as _RSM
+    if not _RSM.is_channel_allowed(channel):
+        await _handle_radio_toggle_locked(user_id, msg)  # its own reject path
+        return
+    async with _radio_toggle_lock(user_id, channel):
+        await _handle_radio_toggle_locked(user_id, msg)
+
+
+async def _handle_radio_toggle_locked(user_id: str, msg: dict) -> None:
     from app.agent.radio import (
         get_radio_manager,
         RadioSessionManager,
@@ -933,6 +994,7 @@ async def _handle_radio_toggle(user_id: str, msg: dict) -> None:
             video_type=(seed_meta.video_type if seed_meta else ""),
             reason="toggle_seed",
             upcoming=_upcoming_tracks(sess),
+            duration=_length_sec(seed_meta.length) if seed_meta else 0,
         )
         print(
             f"[radio] iframe_force_sync from=unknown to={seed_video_id} reason=toggle_on",
@@ -1003,12 +1065,22 @@ async def _dispatch_radio_frame(user_id: str, msg: dict) -> None:
         logger.warning("[radio] mid-turn %s failed: %s", t, e)
 
 
-async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger: str) -> bool:
+async def _advance_and_broadcast_next(
+    user_id: str, channel: str, sess, trigger: str, target_video_id: str = "",
+) -> bool:
     """Shared path for media_ended + skip_next: advance the playlist (possibly
     extending it first), apply Song-mode Topic lookup if set, record in history,
     broadcast media_play. Returns True on success, False on exhaustion.
 
     `trigger` is a log label: 'media_ended' | 'skip_next'.
+
+    `target_video_id` (skip only) is the id the PHONE already advanced its card
+    to — its upcoming[0]. The phone hops optimistically, so when the pop would
+    resolve to a different id (the pop-time variant swap re-searching under
+    load), the user watches their card get "corrected" to a stranger a second
+    later — 3 of 9 skips did this on 2026-08-06. If the target is what the pop
+    would give (or sits within the next few slots after a racing advance),
+    honor it verbatim and pin its variant so nothing downstream re-resolves it.
     """
     from app.agent.radio import build_station, PLAYLIST_REFILL_THRESHOLD, get_radio_manager
     from app.agent.radio.playlist import find_topic_version, find_music_video
@@ -1029,6 +1101,43 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             )
             await _broadcast_track_for_mode(user_id, channel, sess, stepped, trigger, record=False)
             return True
+
+    # Honor the phone's optimistic hop: if the target it already shows sits in
+    # the next few unplayed slots, advance TO it. Marking anything popped over
+    # as played keeps the dedupe set truthful (rapid taps legitimately jump
+    # slots when an in-flight advance raced this skip).
+    if target_video_id and trigger == "skip_next":
+        _probe = sess.playlist_cursor
+        _found_at = -1
+        _seen = 0
+        while _probe < len(sess.playlist) and _seen < 4:
+            _t = sess.playlist[_probe]
+            if _t.video_id not in sess.played_track_ids:
+                if _t.video_id == target_video_id:
+                    _found_at = _probe
+                    break
+                _seen += 1
+            _probe += 1
+        if _found_at >= 0:
+            _cursor_was = sess.playlist_cursor
+            for _j in range(sess.playlist_cursor, _found_at):
+                _mid = sess.playlist[_j]
+                if _mid.video_id not in sess.played_track_ids:
+                    sess.played_track_ids.add(_mid.video_id)
+            sess.playlist_cursor = _found_at
+            # The phone's surface already holds THIS id; a pop-time variant
+            # re-search replacing it is exactly the divergence we're closing.
+            sess.playlist[_found_at].variant_resolved_mode = sess.display_mode
+            print(
+                f"[radio] skip target honored id={target_video_id} "
+                f"at={_found_at} (cursor was {_cursor_was})",
+                flush=True,
+            )
+        else:
+            print(
+                f"[radio] skip target not in window id={target_video_id} — normal pop",
+                flush=True,
+            )
 
     # Pop next from playlist; extend if within threshold.
     next_track = mgr.pop_next_from_playlist(sess)
@@ -1066,11 +1175,25 @@ async def _advance_and_broadcast_next(user_id: str, channel: str, sess, trigger:
             if _ext_title.strip().casefold() in ("", "youtube video"):
                 _ext_title = ""
                 _ext_artist = ""
+            _seed_before = sess.seed_track.video_id if sess.seed_track else None
             _seed_meta, new_tracks = await build_station(
                 extend_seed, limit=50,
                 seed_title=_ext_title, seed_artist=_ext_artist,
                 variety=True,
             )
+            # The build can run many seconds under the advance lock while a
+            # RESEED (which takes the toggle lock, not this one) replaces the
+            # whole station. Extending + broadcasting the DEAD station's pick
+            # over the just-requested song is an uncommanded jump (review
+            # finding). A changed seed or a disable ends this advance.
+            _seed_now = sess.seed_track.video_id if sess.seed_track else None
+            if not sess.enabled or _seed_now != _seed_before:
+                print(
+                    f"[radio] advance abandoned mid-refill — station replaced "
+                    f"(seed {_seed_before} → {_seed_now}, enabled={sess.enabled})",
+                    flush=True,
+                )
+                return False
             if new_tracks:
                 mgr.extend_playlist(sess, new_tracks)
         if next_track is None:
@@ -1216,6 +1339,20 @@ def _video_type_source(video_type: str) -> str:
     return "other" if video_type else "unknown"
 
 
+def _length_sec(length) -> int:
+    """Duration in whole seconds from a YT Music "4:18" string; 0 = unknown.
+    parse_length_sec is a staticmethod — reaching it through a session
+    instance coupled the window builder to the session TYPE, and one bad
+    slot then emptied the whole window inside its blanket except. A bad
+    length may cost that slot its duration, never the caller its window."""
+    try:
+        from app.agent.radio.session import RadioSession
+
+        return int(RadioSession.parse_length_sec(length))
+    except Exception:
+        return 0
+
+
 def _upcoming_tracks(sess, n: int = 5) -> list:
     """The next `n` station tracks the playlist will pop, as lightweight dicts
     for the mobile pre-load queue. Mobile prefetches + queues these to local
@@ -1252,6 +1389,9 @@ def _upcoming_tracks(sess, n: int = 5) -> list:
                 "title": t.display_title(),
                 "artist": t.artist,
                 "thumbnail_url": t.thumbnail_url,
+                # Seconds; 0 = unknown. Lets an optimistic hop into this slot
+                # render a real length instead of '--:--' until first buffer.
+                "duration": _length_sec(t.length),
             })
     except Exception:
         pass
@@ -1429,6 +1569,10 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
         thumbnail_url=track.thumbnail_url,
         video_type=track.video_type,
         upcoming=_upcoming_tracks(sess),
+        # Every advance ships the length YT Music already gave us. Without it
+        # the card sits on '--:--' (or the PREVIOUS track's length) until the
+        # player has buffered enough to measure — the whole 'Starting…' window.
+        duration=_length_sec(track.length),
     )
     await broadcast_to_user(user_id, sess.to_broadcast_dict())
 
@@ -1446,6 +1590,17 @@ _MIN_TRACK_PLAY_SEC = 30.0
 _MIN_TRACK_PLAY_FRACTION = 0.5
 # Two ends for the same video inside this window are the same physical event.
 _MEDIA_ENDED_DEDUP_SEC = 20.0
+# Machine advances (the client's auto-skip-on-error, radio_skip_next
+# reason="auto_error"). A HUMAN ⏭ is authoritative and never throttled; a
+# machine advancing because streams keep dying gets pacing and a cap — the
+# 2026-08-10 recording shows what the unpaced lane does: a failure train
+# walks the station one card flash at a time, each skip arriving with the
+# user's authority. Past the cap the station STOPS advancing and the user is
+# told, which is the honest outcome the client's own give-up already
+# implements for its local player.
+_AUTO_SKIP_MIN_INTERVAL_SEC = 5.0
+_AUTO_SKIP_WINDOW_SEC = 90.0
+_AUTO_SKIP_MAX_PER_WINDOW = 3
 # One advance at a time per user. `_handle_media_ended` is dispatched with
 # `asyncio.create_task` from two independent places (the main receive loop and
 # the mid-turn stop-watcher), so without this two copies interleave: both read
@@ -1539,12 +1694,39 @@ async def _handle_media_ended_locked(user_id: str, msg: dict) -> None:
         await broadcast_to_user(user_id, sess.to_broadcast_dict())
         return
     elif ended_video_id and ended_video_id != sess.current_track_id:
-        # Matches the session somewhere (seed or history) but not current —
-        # typically a user replay of an earlier track. Advance.
+        # Matches the session somewhere (seed or history) but NOT the current
+        # track. This branch used to ADVANCE ("typically a user replay of an
+        # earlier track") — but no client replays history through this lane,
+        # and the 2026-08-10 recordings show what it actually caught: late
+        # ends from players still holding a PREVIOUS track (a torn-down
+        # WebView, a dead prebuffered queue item, a second device). Advancing
+        # the CURRENT track off a previous track's end is exactly the
+        # uncommanded jump the user recorded, and because the dedupe below
+        # keys on the ended id (not the track it advanced), a stale end for
+        # A followed by a stale end for B walks the station twice. A stray
+        # end moves nothing; re-anchor the sender instead.
         logger.info(
-            "[radio] ended_video_id=%s != current=%s but in_session=true — advancing",
+            "[radio] media_ended for non-current session track video=%s current=%s "
+            "— no advance; re-anchoring to the session's current",
             ended_video_id, sess.current_track_id,
         )
+        # Re-anchor with a real media_play for the CURRENT track, not only a
+        # radio_state. Web's inline cards replay history by swapping the
+        # iframe LOCALLY (no backend frame), so when that replay ends, the
+        # only thing that can resume the station is a play command for what
+        # the session actually holds — the old code advanced here, which
+        # double-moved on stray ends but was also the resume path for the
+        # replay flow. A same-id media_play is a no-op on the app (hop guard /
+        # active-track resume) and a clean resume on web. (Review finding:
+        # a bare radio_state left web sitting on a dead end screen.)
+        _cur = sess.current_station_track
+        if _cur is not None and sess.enabled:
+            await _broadcast_track_for_mode(
+                user_id, channel, sess, _cur, "reanchor", record=False,
+            )
+        else:
+            await broadcast_to_user(user_id, sess.to_broadcast_dict())
+        return
 
     # ── Idempotency ──────────────────────────────────────────────────
     # One physical track-end can reach us more than once: a second connected
@@ -1554,14 +1736,17 @@ async def _handle_media_ended_locked(user_id: str, msg: dict) -> None:
     # the station by two and leave the phone's card and its lock screen showing
     # different songs.
     now = time.time()
-    if (
-        ended_video_id
-        and ended_video_id == sess.last_ended_video_id
-        and now - sess.last_ended_ts < _MEDIA_ENDED_DEDUP_SEC
-    ):
+    # Keyed on EVERY recently-honored end, not only the last one: the single
+    # last_ended pair cannot see alternation (ends A, B, A each looked new and
+    # each popped a track — one per card flash in the recorded rapid cycle).
+    sess.recent_ended_ids = {
+        v: t for v, t in sess.recent_ended_ids.items()
+        if now - t < _MEDIA_ENDED_DEDUP_SEC
+    }
+    if ended_video_id and ended_video_id in sess.recent_ended_ids:
         logger.info(
             "[radio] media_ended duplicate video=%s within %.1fs — no-op",
-            ended_video_id, now - sess.last_ended_ts,
+            ended_video_id, now - sess.recent_ended_ids[ended_video_id],
         )
         return
 
@@ -1578,7 +1763,21 @@ async def _handle_media_ended_locked(user_id: str, msg: dict) -> None:
     # Deliberately scoped to media_ended, the only PASSIVE advance trigger. An
     # explicit `radio_skip_next` is authoritative and is never gated: the user
     # may skip whenever they like.
-    if sess.current_track_started_ts:
+    # Completion evidence: the client can now prove an end (reported playhead
+    # at the track's own duration). A user who SEEKS to the last seconds of a
+    # track and lets it finish produced a genuine end the wall-clock floor
+    # cannot see — refusing it left web/video sitting on an ENDED screen with
+    # every client-side latch spent (review finding). Evidence-backed ends
+    # waive the pin; unevidenced ends keep the full wall-clock discipline.
+    _rep_pos = msg.get("position")
+    _rep_dur = msg.get("duration")
+    completed_by_evidence = (
+        isinstance(_rep_pos, (int, float))
+        and isinstance(_rep_dur, (int, float))
+        and _rep_dur > 0
+        and _rep_pos >= _rep_dur - 5
+    )
+    if sess.current_track_started_ts and not completed_by_evidence:
         elapsed = now - sess.current_track_started_ts
         # Proportional floor when we know the length (a 4-minute track cannot
         # end at 45s), absolute floor when we don't.
@@ -1598,15 +1797,67 @@ async def _handle_media_ended_locked(user_id: str, msg: dict) -> None:
 
     sess.last_ended_video_id = ended_video_id
     sess.last_ended_ts = now
+    if ended_video_id:
+        sess.recent_ended_ids[ended_video_id] = now
 
     await _advance_and_broadcast_next(user_id, channel, sess, trigger="media_ended")
+
+
+def _reconcile_cursor_to_target(mgr, sess, target_video_id: str) -> bool:
+    """Adopt a move the phone's queue already made: advance the cursor TO
+    `target_video_id` if it sits in the next few unplayed slots. Marks
+    jumped-over slots played, records history — but broadcasts nothing (the
+    phone is already audibly there; the caller ships state + a fresh window).
+    False when the target is not in the window (caller falls back to the
+    request rules)."""
+    _probe = sess.playlist_cursor
+    _seen = 0
+    while _probe < len(sess.playlist) and _seen < 4:
+        _t = sess.playlist[_probe]
+        if _t.video_id not in sess.played_track_ids:
+            if _t.video_id == target_video_id:
+                for _j in range(sess.playlist_cursor, _probe):
+                    _mid = sess.playlist[_j]
+                    if _mid.video_id not in sess.played_track_ids:
+                        sess.played_track_ids.add(_mid.video_id)
+                sess.playlist_cursor = _probe + 1
+                _t.variant_resolved_mode = sess.display_mode
+                mgr.record_auto_play(sess, _t, source="reconcile")
+                print(
+                    f"[radio] cursor reconciled to phone's advance "
+                    f"target={target_video_id} at={_probe}",
+                    flush=True,
+                )
+                return True
+            _seen += 1
+        _probe += 1
+    print(
+        f"[radio] reconcile target not in window target={target_video_id}",
+        flush=True,
+    )
+    return False
 
 
 async def _handle_radio_skip_next(user_id: str, msg: dict) -> None:
     from app.agent.radio import get_radio_manager, RadioSessionManager
 
     channel = (msg.get("channel") or "").strip().lower()
-    print(f"[radio] skip_next entry user={user_id[:8]} channel={channel!r}", flush=True)
+    # Who is asking. Absent ⇒ "user" (every existing client), so a human ⏭
+    # keeps its full authority. "auto_error" is the client's auto-skip-on-
+    # error lane declaring itself a machine — it used to arrive as a bare
+    # skip, indistinguishable from a tap, which handed the failure train the
+    # one verb the pinning defence deliberately exempts.
+    reason = (msg.get("reason") or "user").strip().lower()
+    # What the machine is skipping AWAY from (auto_error only), and what the
+    # phone optimistically hopped TO (its upcoming[0]) — see the target
+    # honoring in _advance_and_broadcast_next.
+    from_video_id = (msg.get("video_id") or "").strip()
+    target_video_id = (msg.get("target_video_id") or "").strip()
+    print(
+        f"[radio] skip_next entry user={user_id[:8]} channel={channel!r} "
+        f"reason={reason} from={from_video_id or '-'} target={target_video_id or '-'}",
+        flush=True,
+    )
 
     if not RadioSessionManager.is_channel_allowed(channel):
         return
@@ -1631,8 +1882,8 @@ async def _handle_radio_skip_next(user_id: str, msg: dict) -> None:
     # (main loop + mid-turn stop-watcher), and _advance_and_broadcast_next
     # awaits network mid-flight (refill build, variant search): two unlocked
     # skip tasks interleave around those awaits and pop twice / broadcast out
-    # of order. The skip stays UNGATED (no pinning, no dedup — an explicit
-    # skip is authoritative); the lock only serializes.
+    # of order. A USER skip stays UNGATED (no pinning, no dedup — an explicit
+    # tap is authoritative); the lock only serializes it.
     async with _media_ended_lock(user_id, channel):
         # Re-check under the lock. The wait is not instant — the holder may be
         # a media_ended advance in the middle of a station refill (a build can
@@ -1642,7 +1893,79 @@ async def _handle_radio_skip_next(user_id: str, msg: dict) -> None:
         if not sess.enabled:
             print(f"[radio] skip_next abandoned — radio turned off while queued user={user_id[:8]}", flush=True)
             return
-        await _advance_and_broadcast_next(user_id, channel, sess, trigger="skip_next")
+        if reason == "auto_error":
+            now = time.time()
+            sess.auto_advance_ts = [
+                t for t in sess.auto_advance_ts if now - t < _AUTO_SKIP_WINDOW_SEC
+            ]
+            # RECONCILE vs REQUEST — the distinction the whole lane hangs on.
+            # A machine report that carries a TARGET describes a move the
+            # phone's queue ALREADY made (a dead track auto-advanced into the
+            # prebuffered next). Refusing it — pacing, caps, staleness —
+            # cannot un-advance the phone; it can only freeze this cursor
+            # behind reality, after which every natural end the phone sends is
+            # "non-current" (a no-op), no window ever refills, and the station
+            # dies silently when the phone's ~5 local tracks drain. Pacing
+            # throttles the POP, never the bookkeeping of a done deed.
+            if target_video_id and _reconcile_cursor_to_target(
+                mgr, sess, target_video_id,
+            ):
+                sess.auto_advance_ts.append(now)
+                await _resolve_upcoming_variants(sess)
+                _win = _upcoming_tracks(sess)
+                if _win:
+                    await broadcast_to_user(user_id, {
+                        "type": "radio_upcoming",
+                        "channel": channel,
+                        "upcoming": _win,
+                        "resolved_mode": sess.display_mode,
+                    })
+                await broadcast_to_user(user_id, sess.to_broadcast_dict())
+                return
+            # No target (or an unknown one): the phone is ASKING us to advance
+            # it. These are the requests the discipline below exists for.
+            #
+            # A request naming a track the station already advanced past is
+            # the same death reported twice (an ended+skip pair, or two client
+            # error lanes racing) — honoring it moves the cursor twice.
+            if from_video_id and from_video_id != sess.current_track_id:
+                print(
+                    f"[radio] auto_skip stale from={from_video_id} "
+                    f"current={sess.current_track_id} — no-op",
+                    flush=True,
+                )
+                await broadcast_to_user(user_id, sess.to_broadcast_dict())
+                return
+            if sess.auto_advance_ts and now - sess.auto_advance_ts[-1] < _AUTO_SKIP_MIN_INTERVAL_SEC:
+                print(
+                    f"[radio] auto_skip paced — last machine advance "
+                    f"{now - sess.auto_advance_ts[-1]:.1f}s ago — re-anchoring",
+                    flush=True,
+                )
+                # Never a SILENT refusal: the client defers-and-retries off
+                # this state, and a bare return left it guessing (review
+                # finding: a swallowed second death froze the station).
+                await broadcast_to_user(user_id, sess.to_broadcast_dict())
+                return
+            if len(sess.auto_advance_ts) >= _AUTO_SKIP_MAX_PER_WINDOW:
+                print(
+                    f"[radio] auto_skip CAPPED — {len(sess.auto_advance_ts)} machine "
+                    f"advances in {_AUTO_SKIP_WINDOW_SEC:.0f}s — station holds",
+                    flush=True,
+                )
+                if now - sess.last_trouble_notice_ts >= 60.0:
+                    sess.last_trouble_notice_ts = now
+                    await broadcast_to_user(user_id, {
+                        "type": "radio_notice",
+                        "channel": channel,
+                        "message": "Playback keeps failing — check your connection, or tap ⏭ to try the next track.",
+                    })
+                return
+            sess.auto_advance_ts.append(now)
+        await _advance_and_broadcast_next(
+            user_id, channel, sess, trigger="skip_next",
+            target_video_id=target_video_id,
+        )
 
 
 async def _handle_radio_skip_prev(user_id: str, msg: dict) -> None:
@@ -2164,6 +2487,30 @@ async def ws_chat(
                     "[WS] announced in-flight turn %s to reconnecting client %s",
                     _resume.get("mission_id"), user_id[:8],
                 )
+        except Exception:  # noqa: BLE001 — never block a connect on the announce
+            pass
+
+        # ── Resume: re-anchor radio state ──
+        # The contract had NO media resync on reconnect: radio_state is
+        # broadcast only on radio EVENTS, so a phone returning from a long
+        # background kept whatever frame it last saw — a dead card over an
+        # expired stream, prev/next pills in the wrong state. Announce each
+        # enabled session to THIS socket so the client can re-anchor and
+        # decide to re-warm. Additive and idempotent: radio_state carries no
+        # play command, and clients already receive it on every advance.
+        try:
+            from app.agent.radio import get_radio_manager as _grm
+            for _rs in list(getattr(_grm(), "_sessions", {}).values()):
+                # Recency-bounded: sessions never self-expire, so an
+                # unbounded announce re-lit a days-old station's pills and
+                # lock transport on every app open, forever (review finding).
+                # A station idle >2h is history, not state worth resurrecting.
+                if (
+                    _rs.user_id == user_id
+                    and _rs.enabled
+                    and time.time() - _rs.last_activity_ts < 2 * 3600
+                ):
+                    await websocket.send_json(_rs.to_broadcast_dict())
         except Exception:  # noqa: BLE001 — never block a connect on the announce
             pass
 
