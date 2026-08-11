@@ -1557,6 +1557,23 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
     """Broadcast a media_play for `track` plus a radio_state update. `record`
     is False for skip_prev and history-step-forward (track already in tape)."""
     from app.agent.radio.player import broadcast_radio_track
+    # A re-anchor is a correction, not an advance, and the wire must say so:
+    # trigger used to die at this boundary, so re-anchors went out as
+    # reason="auto_advance" — indistinguishable from a real pop (observed live
+    # 2026-08-11: a duplicate media_ended produced two identical auto_advance
+    # frames for one advance). Genuine advances keep the default; clients that
+    # branch on reason are unaffected.
+    reason = "reanchor" if trigger == "reanchor" else "auto_advance"
+    if trigger == "reanchor":
+        # …and corrections are paced. Every stray/duplicate end earns at most
+        # one media_play re-anchor per window; inside it, state alone. A
+        # client looping bogus ends otherwise gets a media_play per report,
+        # and on web each one can re-trigger the very report being answered.
+        _now = time.time()
+        if _now - getattr(sess, "last_reanchor_ts", 0.0) < _REANCHOR_MIN_INTERVAL_SEC:
+            await broadcast_to_user(user_id, sess.to_broadcast_dict())
+            return
+        sess.last_reanchor_ts = _now
     # Keep `upcoming` in lockstep with what the pop will actually play: resolve the
     # window's variants (cached, time-bounded) before shipping the prebuffer hints.
     await _resolve_upcoming_variants(sess)
@@ -1568,6 +1585,7 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
         artist=track.artist,
         thumbnail_url=track.thumbnail_url,
         video_type=track.video_type,
+        reason=reason,
         upcoming=_upcoming_tracks(sess),
         # Every advance ships the length YT Music already gave us. Without it
         # the card sits on '--:--' (or the PREVIOUS track's length) until the
@@ -1590,6 +1608,9 @@ _MIN_TRACK_PLAY_SEC = 30.0
 _MIN_TRACK_PLAY_FRACTION = 0.5
 # Two ends for the same video inside this window are the same physical event.
 _MEDIA_ENDED_DEDUP_SEC = 20.0
+# At most one media_play re-anchor per this window; further corrections send
+# radio_state alone (see _broadcast_track_for_mode).
+_REANCHOR_MIN_INTERVAL_SEC = 5.0
 # Machine advances (the client's auto-skip-on-error, radio_skip_next
 # reason="auto_error"). A HUMAN ⏭ is authoritative and never throttled; a
 # machine advancing because streams keep dying gets pacing and a cap — the

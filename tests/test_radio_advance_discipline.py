@@ -482,6 +482,61 @@ async def test_every_advance_broadcast_ships_a_duration(monkeypatch):
     assert got.get("duration") == 200, f"duration missing from the advance broadcast: {got}"
 
 
+@pytest.mark.asyncio
+async def test_reanchor_says_reanchor_and_is_paced(monkeypatch):
+    """Live finding 2026-08-11: `trigger` died at _broadcast_track_for_mode's
+    boundary, so a duplicate-end re-anchor went out as reason="auto_advance" —
+    one advance, two identical 'advance' frames on the wire. A correction must
+    name itself, and repeated corrections inside the window must degrade to
+    radio_state alone (an end-looping client otherwise gets a media_play per
+    bogus report, each of which can re-trigger the report on web)."""
+    from app.api import ws_chat
+    import app.agent.radio.player as player_mod
+
+    sess = _session(playlist_n=6)
+    plays: list = []
+    states: list = []
+
+    async def _capture(**kwargs):
+        plays.append(kwargs)
+        return True
+
+    async def _bcast(user_id, payload):
+        states.append(payload)
+        return 1
+
+    monkeypatch.setattr(player_mod, "broadcast_radio_track", _capture)
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _bcast)
+
+    await ws_chat._broadcast_track_for_mode(
+        sess.user_id, "app", sess, sess.playlist[0], "reanchor", record=False,
+    )
+    assert plays and plays[0].get("reason") == "reanchor", (
+        f"a re-anchor must not masquerade as an advance: {plays}"
+    )
+
+    # A genuine advance still says auto_advance.
+    await ws_chat._broadcast_track_for_mode(
+        sess.user_id, "app", sess, sess.playlist[1], "media_ended", record=False,
+    )
+    assert plays[1].get("reason") == "auto_advance"
+
+    # A second re-anchor inside the window ships state only, no media_play.
+    n_plays = len(plays)
+    await ws_chat._broadcast_track_for_mode(
+        sess.user_id, "app", sess, sess.playlist[0], "reanchor", record=False,
+    )
+    assert len(plays) == n_plays, "paced re-anchor must not emit a media_play"
+    assert states, "…but it must still re-anchor with radio_state"
+
+    # Outside the window a re-anchor may carry a media_play again.
+    sess.last_reanchor_ts = time.time() - ws_chat._REANCHOR_MIN_INTERVAL_SEC - 1
+    await ws_chat._broadcast_track_for_mode(
+        sess.user_id, "app", sess, sess.playlist[0], "reanchor", record=False,
+    )
+    assert len(plays) == n_plays + 1 and plays[-1].get("reason") == "reanchor"
+
+
 # ── A late embed swap must match the card it lands on ───────────────────
 
 class _FakeProc:
@@ -890,6 +945,41 @@ def test_if_range_mismatch_serves_the_full_current_entity(tmp_path):
     other = _local_audio_response(str(f), "bytes=100-199", '"stale-entity"')
     assert other is not None and other.status_code == 200, (
         "an If-Range mismatch must ignore the Range and serve the full entity"
+    )
+
+
+def test_etag_is_stable_across_replicas(tmp_path):
+    """Regression: an mtime-flavoured ETag differed between the two replicas'
+    local copies of the SAME R2 artifact, so ~half of all If-Range resumes
+    landed on the other replica, mismatched, and restarted the full entity
+    (measured live 2026-08-11). The tag must name the entity — deterministic
+    basename + size — not the moment a replica happened to download it."""
+    from app.api.media_proxy import _local_audio_response
+
+    a_dir, b_dir = tmp_path / "replica_a", tmp_path / "replica_b"
+    a_dir.mkdir(), b_dir.mkdir()
+    (a_dir / "vid123.m4a").write_bytes(b"m" * 1000)
+    (b_dir / "vid123.m4a").write_bytes(b"m" * 1000)
+    # The live pair was 20s apart (each replica pulled R2 at its own moment).
+    # Set it explicitly — a sleep can land inside the same integer second and
+    # let an mtime-flavoured tag slip through (it did, in mutation testing).
+    now = os.path.getmtime(a_dir / "vid123.m4a")
+    os.utime(b_dir / "vid123.m4a", (now + 20, now + 20))
+
+    ra = _local_audio_response(str(a_dir / "vid123.m4a"), "bytes=0-99")
+    rb = _local_audio_response(str(b_dir / "vid123.m4a"), "bytes=0-99")
+    ea, eb = ra.headers.get("ETag"), rb.headers.get("ETag")
+    assert ea and ea == eb, f"same artifact, different tags: {ea} vs {eb}"
+
+    # …and A's tag validates on B: the resume keeps its 206.
+    cross = _local_audio_response(str(b_dir / "vid123.m4a"), "bytes=100-199", ea)
+    assert cross is not None and cross.status_code == 206
+
+    # A different-size file at the same name is a different entity.
+    (b_dir / "vid123.m4a").write_bytes(b"m" * 4000)
+    swapped = _local_audio_response(str(b_dir / "vid123.m4a"), "bytes=100-199", ea)
+    assert swapped is not None and swapped.status_code == 200, (
+        "a size change is the container swap — the stale tag must force a full 200"
     )
 
 

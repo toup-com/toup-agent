@@ -127,6 +127,9 @@ class RadioSession:
     # Last "playback is having trouble" notice, same modal-stacking rationale
     # as last_exhaustion_notice_ts.
     last_trouble_notice_ts: float = 0.0
+    # Last media_play re-anchor (stray/duplicate-end correction). Purely a
+    # throttle clock — deliberately NOT reset on a new station.
+    last_reanchor_ts: float = 0.0
     # ── Library auto-save (2026-08-03) ───────────────────────────────
     # Row id of the media_playlists entry that mirrors THIS station, so the
     # library keeps a record of everything the user has actually listened to

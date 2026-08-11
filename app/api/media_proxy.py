@@ -1755,7 +1755,15 @@ def _local_audio_response(rpath: str, range_header: str | None,
     # file (the size-only 416 below can't see that case — review finding). A
     # strong ETag + If-Range is the HTTP answer: a client that validates gets
     # a full 200 instead of a mismatched slice.
-    etag = f'"{file_size}-{int(os.path.getmtime(rpath)) if os.path.exists(rpath) else 0}"'
+    #
+    # basename+size, NOT mtime: both replicas pull the same R2 artifact to
+    # local disk at different moments, so an mtime-flavoured tag differed per
+    # replica and ~half of all If-Range resumes drew the other replica and
+    # restarted the full entity (measured live 2026-08-11: two tags 20s
+    # apart, 206 x3 / 200 x5 over 8 validated resumes). The name is the
+    # deterministic <video_id>.m4a and the swap this tag exists to catch —
+    # itag-18 vs m4a — is a ~4x size difference, so size discriminates it.
+    etag = f'"{os.path.basename(rpath)}-{file_size}"'
     base = {"Accept-Ranges": "bytes", "Cache-Control": "no-store", "ETag": etag}
     if if_range and if_range.strip() != etag:
         # RFC 7233 §3.2: an If-Range that doesn't match ⇒ ignore Range, serve
