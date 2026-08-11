@@ -563,3 +563,33 @@ async def test_last_rotated_endpoint(
     # default precision but we don't need to assert on that.
     assert post.json()["last_rotated_at"] is not None
     assert post.json()["last_rotated_at"][:19] == rotated_at[:19]
+
+
+# ─── Verify deadline must clear a real heavy-tenant boot ──────────────
+
+
+def test_verify_deadline_clears_a_heavy_tenant_boot():
+    """The rotation verify polls the recreated container's /agent/health
+    and rolls back if it does not answer 200 within
+    `agent_key_rotation_verify_timeout_s`. Two LIVE rotations of the
+    founder's container on 2026-08-11 rolled back at 12s AND at 45s: a
+    heavy multi-channel tenant (WhatsApp + Telegram + workspace restore)
+    does not report healthy until its full boot completes, ~2 minutes.
+    The loop early-exits on the first 200, so a large cap never slows a
+    light tenant (pool-origin boot ~15s) — it only stops the verify from
+    racing the boot and rolling back a rotation that already succeeded.
+
+    120s is the floor that clears the measured ~2-minute worst case with
+    margin. A future regression back toward 12s silently reinstates
+    "every heavy-tenant rotation rolls back", which no other test covers
+    because the suite's verify is monkeypatched to a boolean.
+    """
+    from app.config import settings
+
+    assert settings.model_fields[
+        "agent_key_rotation_verify_timeout_s"
+    ].default >= 120, (
+        "verify deadline shorter than a heavy tenant's ~2-minute boot — "
+        "rotation will roll back a rotation that already wrote the new key "
+        "(observed live 2026-08-11 at 12s and 45s on the founder)"
+    )

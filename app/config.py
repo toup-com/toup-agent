@@ -1469,10 +1469,25 @@ class Settings(BaseSettings):
     # → DB rollback; replay token rejected; etc.).
     enable_agent_key_rotation: bool = False
     # Total time we'll spend polling the new container's /agent/health
-    # with the new X-Agent-Key after rotation, before declaring failure
-    # and rolling back. 12s is empirically enough for a bridge recreate
-    # (~2-5s) plus FastAPI lifespan boot (~3-5s) on Contabo.
-    agent_key_rotation_verify_timeout_s: int = 12
+    # after rotation, before declaring failure and rolling back. The
+    # original 12s was far too short and was never exercised against a
+    # real tenant: two live rotations of the founder's container on
+    # 2026-08-11 (`4f390ce07383`) BOTH rolled back — a heavy
+    # multi-channel tenant (WhatsApp + Telegram + workspace restore)
+    # does not answer `/agent/health` 200 until its FULL boot finishes,
+    # ~2 minutes, so 12s and even 45s hit the deadline and rolled back a
+    # rotation that had already written the new key. The loop early-exits
+    # the instant health returns 200, so a large cap never penalises a
+    # light tenant (pool-origin containers boot in ~15s); it only stops
+    # stranding a genuinely-dead container forever. 180s covers the
+    # heaviest observed boot with margin.
+    #
+    # NOTE: rotating a heavy tenant still drops that tenant's live
+    # WS/channel sessions for the ~2-minute recreate — an operator-aware
+    # window, not an unattended action. `_sync_soul_after_start`'s own
+    # 30s health wait (docker_host_service.py) is the same class of
+    # too-short gate and should move to the same readiness model.
+    agent_key_rotation_verify_timeout_s: int = 180
     agent_key_rotation_verify_retry_interval_s: float = 2.0
 
     # ── Connector OAuth (T1d) ────────────────────────────────
