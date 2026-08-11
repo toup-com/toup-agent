@@ -197,9 +197,50 @@ def _iter_files(roots: list[Path]):
                 yield p
 
 
+def _git_tracked_files(root: Path):
+    """Every file git tracks under ``root`` — the honest scope for a rule
+    whose text is "no secret may enter the REPO".
+
+    The original gate scanned a hand-picked list of 5 top-level dirs; the
+    repo has 14, so frontend/, extensions/ and every root file were never
+    scanned (20.5% of tracked files). A hand-picked list also rots as
+    trees are added. Tracked-files-only is deliberate the other way too:
+    a developer's local, untracked ``backend/.env`` holds a real local
+    DSN and MUST NOT fail the gate — untracked files are not "in the
+    repo".
+    """
+    import subprocess
+
+    res = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z"],
+        capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"git ls-files failed in {root}: {res.stderr.strip()}")
+    for rel in res.stdout.split("\0"):
+        if not rel:
+            continue
+        p = root / rel
+        if p.suffix.lower() in _SKIP_SUFFIXES or not p.is_file():
+            continue
+        yield p
+
+
+#: Patterns whose match is a CONSTANT, not key material. Digesting the
+#: bare match would mean ONE allowlist acknowledgement exempts the whole
+#: class — which happened: acknowledging the synthetic PEM banner in
+#: PRE-LAUNCH-CHECKLIST.md silently allowlisted every private key ever
+#: pasted anywhere in the repo. For these, the digest binds the banner
+#: to the LINE THAT FOLLOWS it (the first line of key material), so each
+#: acknowledgement covers one specific key and a real key — whose body
+#: cannot equal a fixture's — always produces an unacknowledged digest.
+_CONSTANT_MATCH_PATTERNS = frozenset({"private-key-block"})
+
+
 def scan_text(text: str, path: str) -> list[Finding]:
     out: list[Finding] = []
-    for lineno, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    for lineno, line in enumerate(lines, 1):
         if len(line) > 20_000:          # minified bundle — not source we own
             continue
         for name, rx in _PATTERNS:
@@ -214,15 +255,25 @@ def scan_text(text: str, path: str) -> list[Finding]:
                         or _INDIRECTION.search(m.group(0))
                     ):
                         continue
+                if name in _CONSTANT_MATCH_PATTERNS:
+                    rest_of_line = line[m.end():].strip()
+                    next_line = lines[lineno].strip() if lineno < len(lines) else ""
+                    digest_input = f"{value}\n{rest_of_line or next_line}"
+                else:
+                    digest_input = value
                 out.append(
-                    Finding(path, lineno, name, digest(value), len(value))
+                    Finding(path, lineno, name, digest(digest_input), len(value))
                 )
     return out
 
 
-def scan_paths(roots: list[Path], allow: set[str]) -> list[Finding]:
+def scan_paths(roots: list[Path], allow: set[str], git_tracked: bool = False) -> list[Finding]:
     findings: list[Finding] = []
-    for p in _iter_files(roots):
+    if git_tracked:
+        files = (p for root in roots for p in _git_tracked_files(root))
+    else:
+        files = _iter_files(roots)
+    for p in files:
         try:
             if p.stat().st_size > _MAX_BYTES:
                 continue
@@ -250,6 +301,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("paths", nargs="*", default=["."])
     ap.add_argument("--allowlist", type=Path, default=None)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument(
+        "--git-tracked", action="store_true",
+        help="scan every git-tracked file under PATH (default '.', the "
+        "repo root) instead of walking the directory — the gate's mode",
+    )
     args = ap.parse_args(argv)
 
     roots = [Path(p) for p in (args.paths or ["."])]
@@ -258,7 +314,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no such path: {r}", file=sys.stderr)
             return 2
 
-    findings = scan_paths(roots, load_allowlist(args.allowlist))
+    try:
+        findings = scan_paths(roots, load_allowlist(args.allowlist), args.git_tracked)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps([f.__dict__ for f in findings], indent=2))
     else:

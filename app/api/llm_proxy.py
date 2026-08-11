@@ -380,11 +380,29 @@ def _never_higher_cents(cost_usd: float) -> Decimal:
     return min(exact, legacy)
 
 
+#: text-embedding-3-small: $0.02 per MILLION tokens = $0.00002 per 1,000.
+#: Same per-1k convention as ``settings.pricing_per_1k``.
+_EMBEDDING_USD_PER_1K = 0.00002
+
+
 def _embedding_cost_cents(total_tokens: int) -> Decimal:
-    """text-embedding-3-small at $0.00002/token, unfloored (see
-    ``_never_higher_cents``). The price constant is unchanged from the
-    route's original inline math — R-3's scope is the floor, not pricing."""
-    return _never_higher_cents(total_tokens * 0.00002)
+    """Cost of an embeddings call in cents, unfloored.
+
+    The rate is **per 1,000 tokens**, not per token. The route's original
+    inline math was ``total_tokens * 0.00002``, which applied the per-1k
+    rate once per token and overstated every embedding by 1000x — the
+    sibling ``_calc_cost_cents`` divides by 1000 for exactly this reason,
+    because the table it reads is named ``pricing_per_1k``.
+
+    The 1¢ floor hid it: nearly every embeddings call clamped to 1¢
+    whatever the arithmetic said. Taking the floor off made the pricing
+    error load-bearing instead of cosmetic, so it is fixed here with it.
+    Cross-check: ``docs/credits/coverage.md`` and
+    ``credit_health_monitor.py`` both state that a 15-token call "truly
+    costs about $0.0000003" — which is 15/1000 × $0.00002, and 1000x
+    below what this function used to return.
+    """
+    return _never_higher_cents(total_tokens / 1000 * _EMBEDDING_USD_PER_1K)
 
 
 # ── Usage event logging ──────────────────────────────────────────────
@@ -561,7 +579,10 @@ async def _log_event(
 
     logger.info(
         "llm_proxy user=%s provider=%s model=%s tokens_in=%d tokens_out=%d "
-        "cached=%d cost_cents=%d latency=%dms fallback=%s status=%s op=%s",
+        # cost_cents is a Decimal since R-3 and is usually SUB-CENT; %d
+        # truncates toward zero, so every fractional call logged as 0 —
+        # the exact class of call the floor removal exists to record.
+        "cached=%d cost_cents=%s latency=%dms fallback=%s status=%s op=%s",
         user_id[:8], provider, model, input_tokens, output_tokens,
         cached_tokens or 0, cost_cents, latency_ms, was_fallback, status,
         operation_type or "user",

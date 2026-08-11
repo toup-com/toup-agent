@@ -810,7 +810,8 @@ async def _log_system_event(
         logger.warning("[internal_llm] Failed to log system event: %s", e)
 
     logger.info(
-        "internal_llm user=%s provider=%s model=%s op=%s tokens_in=%d tokens_out=%d cost_cents=%d latency=%dms status=%s",
+        # cost_cents is a Decimal since R-3; %d truncates sub-cent costs to 0.
+        "internal_llm user=%s provider=%s model=%s op=%s tokens_in=%d tokens_out=%d cost_cents=%s latency=%dms status=%s",
         (user_id or "-")[:8], provider, model, operation_type,
         input_tokens, output_tokens, cost_cents, latency_ms, status,
     )

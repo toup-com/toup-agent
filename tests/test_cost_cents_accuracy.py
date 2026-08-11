@@ -175,14 +175,63 @@ def test_embeddings_route_uses_the_shared_unfloored_helper():
     assert "max(1" not in src, "a 1-cent floor is back in the embeddings route"
 
 
+def test_embedding_price_is_per_1k_tokens_not_per_token():
+    """text-embedding-3-small is $0.02 per MILLION tokens — i.e. $0.00002
+    per 1,000 tokens, the same per-1k convention as `pricing_per_1k`.
+
+    The original inline math (and the helper that replaced it) applied
+    that constant once per TOKEN, overstating every embedding by 1000x.
+    The 1¢ floor hid it: almost every embedding clamped to 1¢ regardless.
+    Removing the floor made the pricing error load-bearing, so it has to
+    be fixed with it.
+
+    Cross-check, from the repo's own docs: `docs/credits/coverage.md`
+    and `credit_health_monitor.py` both state a 15-token call "truly
+    costs about $0.0000003" — which is 15/1000 * $0.00002.
+    """
+    from app.api.llm_proxy import _embedding_cost_cents
+
+    # 1,000,000 tokens = $0.02 = 2¢ exactly. This is the anchor: it is
+    # OpenAI's published per-million price, so it pins the rate itself
+    # rather than a rounding artefact.
+    assert _embedding_cost_cents(1_000_000) == Decimal("2")
+    # 1,000 tokens = $0.00002 = 0.002¢
+    assert _embedding_cost_cents(1000) == Decimal("0.002")
+    # Pre-fix these returned 2000¢ and 2¢ — 1000x too high.
+    assert _embedding_cost_cents(1_000_000) < Decimal("100")
+
+
+def test_embedding_costs_below_storage_resolution_record_zero():
+    """`cost_cents` is Numeric(12,4), so 0.0001¢ is the smallest value
+    the column can hold. A 15-token embedding truly costs 0.00003¢ —
+    below that — and records 0.
+
+    That is honest rather than lossy: it says "this call cost less than
+    the ledger can represent", which for embeddings is the truth. The
+    old behaviour recorded the same call as 1¢, i.e. ~33,000x its real
+    cost, and that number gated real budgets.
+    """
+    from app.api.llm_proxy import _embedding_cost_cents
+
+    assert _embedding_cost_cents(15) == Decimal("0")
+    # The rate is still exact where the column can express it.
+    assert _embedding_cost_cents(50_000) == Decimal("0.1")
+
+
 def test_embedding_cost_helper_is_unfloored_and_never_higher():
     from app.api.llm_proxy import _embedding_cost_cents
 
-    # 630 tokens at $0.00002/token = 1.26¢ — the finish-run example that
-    # was recorded as 55¢ across 55 calls.
-    assert _embedding_cost_cents(630) == Decimal("1")  # min(1.26, legacy int 1)
-    assert _embedding_cost_cents(11) == Decimal("0.022")
+    # 630 tokens: 630/1000 * $0.00002 = $0.0000126 = 0.00126¢, which
+    # quantizes to 0.0013¢ at the column's Numeric(12,4) resolution.
+    # Recorded as 55¢ across 55 calls before the floor came off — the
+    # finish-run example, now ~770x smaller than the floor made it look.
+    assert _embedding_cost_cents(630) == Decimal("0.0013")
     assert _embedding_cost_cents(0) == Decimal("0")
+
+    # The never-higher bound still holds against the legacy expression.
+    for n in (0, 1, 11, 630, 10_000, 5_000_000):
+        legacy = max(1, int(n * 0.00002 * 100)) if n else 1
+        assert _embedding_cost_cents(n) <= Decimal(legacy), n
 
 
 def test_get_spend_preserves_fractions():

@@ -10,8 +10,9 @@ spending limit.)
 What it protects against, concretely:
 
 * ``RESTIC_PASSWORD`` sat in ``docs/new-vps/DECISIONS.md`` in cleartext
-  from 2026-04-23 until the GA run found it — visible to every org member
-  and to the public mirror.
+  from 2026-04-23 until the GA run found it — visible to every org
+  member. (NOT on the public mirror: the sync workflow ships ``backend/*``
+  only, verified by a full-history grep of both repos.)
 * Audit subagents printed live production credentials into session
   transcripts on 2026-08-09/10.
 
@@ -35,35 +36,67 @@ REPO = BACKEND.parent
 SCANNER = BACKEND / "scripts" / "scan_secrets.py"
 ALLOWLIST = BACKEND / "tests" / "secret_scan_allowlist.txt"
 
-#: Trees that ship to GitHub. `backend/` and `docs/` are where the two
-#: real incidents happened; `.github/` holds workflow files that carry
-#: secret NAMES and must keep carrying only names.
-_SCAN_ROOTS = ["backend", "docs", ".github", "bridge", "scripts"]
-
 sys.path.insert(0, str(BACKEND))
 
 
-def _scan(paths: list[str], allowlist: Path | None = ALLOWLIST):
+def _scan(paths: list[str], allowlist: Path | None = ALLOWLIST,
+          git_tracked: bool = False, cwd: Path = REPO):
     cmd = [sys.executable, str(SCANNER), *paths]
+    if git_tracked:
+        cmd += ["--git-tracked"]
     if allowlist:
         cmd += ["--allowlist", str(allowlist)]
-    return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
 def test_repo_has_no_unacknowledged_secret_shaped_values():
-    roots = [r for r in _SCAN_ROOTS if (REPO / r).exists()]
-    result = _scan(roots)
+    """Every git-tracked file, not a hand-picked subtree list.
+
+    The first version scanned 5 named top-level dirs of the repo's 14 —
+    frontend/, extensions/, new-vps/ (the provisioning scripts that
+    install the credentials this guard was written about) and every root
+    file were never scanned: 20.5% of tracked files, proven by planting
+    probes there that the gate passed. A hand-picked list also rots as
+    trees are added; `git ls-files` cannot. Tracked-only is deliberate
+    the other way too — a developer's local untracked backend/.env holds
+    a real local DSN and must not fail the gate.
+    """
+    result = _scan(["."], git_tracked=True)
     assert result.returncode == 0, (
         "secret-shaped value(s) found that are not in the allowlist.\n\n"
         f"{result.stdout}\n"
         "Each finding is reported as path:line, pattern, length and a "
         "SALTED digest — never the value itself.\n\n"
         "If it is a real credential: remove it, then ROTATE it (removing "
-        "from HEAD does not purge git history or the public mirror).\n"
+        "from HEAD does not purge git history).\n"
         "If it is a synthetic fixture: add its digest to "
         "backend/tests/secret_scan_allowlist.txt with a comment saying "
         "why it is not a credential."
     )
+
+
+def test_gate_scope_is_the_whole_tracked_tree(tmp_path):
+    """The scope control: a secret in a tree the OLD gate never scanned
+    must fail the gate. Builds a minimal git repo shaped like ours."""
+    import shutil
+
+    if shutil.which("git") is None:
+        pytest.skip("git unavailable")
+    repo = tmp_path / "repo"
+    (repo / "frontend" / "src").mkdir(parents=True)
+    fake = "sk-ant-api03-" + "Qw3rTy" * 8
+    (repo / "frontend" / "src" / "config.ts").write_text(
+        f'const KEY = "{fake}"\n'
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+
+    result = _scan(["."], allowlist=ALLOWLIST, git_tracked=True, cwd=repo)
+    assert result.returncode == 1, (
+        "a synthetic anthropic-key in frontend/ scanned clean — the gate "
+        "is back to scanning a subtree list"
+    )
+    assert "frontend/src/config.ts" in result.stdout
 
 
 def test_scanner_detects_a_real_committed_secret(tmp_path):
@@ -124,6 +157,59 @@ def test_allowlist_entries_are_digests_with_a_reason():
             f"line {i}: allowlisted without a reason — say why this value "
             "is not a credential"
         )
+
+
+# Assembled at runtime so THIS file does not carry the banner's shape —
+# the scanner scans source text, and a contiguous banner here would flag
+# the gate's own test file (it did, on the first run of the whole-repo
+# scope).
+_PEM_BANNER = "-----BEGIN " + "PRIVATE KEY-----"
+
+
+def test_acknowledged_pem_fixtures_do_not_exempt_real_private_keys(tmp_path):
+    """The class control. The PEM banner is a CONSTANT: when its digest
+    was the bare banner, acknowledging one synthetic fixture allowlisted
+    every private key in the repo — three planted real keys passed the
+    gate. The digest now binds banner + first line of key material, so
+    this key (generated here, never a credential) must fail against the
+    COMMITTED allowlist, which acknowledges four PEM fixtures."""
+    fake_body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ" + "Xy4"
+    leak = tmp_path / "restore-runbook.md"
+    leak.write_text(
+        "Paste the backup key here:\n\n"
+        f"{_PEM_BANNER}\n"
+        f"{fake_body}\n"
+        f"{_PEM_BANNER.replace('BEGIN', 'END')}\n"
+    )
+
+    result = _scan([str(leak)], allowlist=ALLOWLIST)
+    assert result.returncode == 1, (
+        "a private key with an unacknowledged BODY scanned clean — the "
+        "banner acknowledgements are exempting the class again"
+    )
+    assert "private-key-block" in result.stdout
+
+
+def test_pem_digest_is_per_key_not_per_banner(tmp_path):
+    """Two keys, same banner, different bodies → different digests, and
+    acknowledging one must not silence the other."""
+    from scripts.scan_secrets import digest
+
+    a = tmp_path / "a.pem"
+    b = tmp_path / "b.pem"
+    a.write_text(f"{_PEM_BANNER}\nMIIBodyAaaa111\n")
+    b.write_text(f"{_PEM_BANNER}\nMIIBodyBbbb222\n")
+
+    allow = tmp_path / "allow.txt"
+    allow.write_text(
+        f"{digest(_PEM_BANNER + chr(10) + 'MIIBodyAaaa111')}"
+        "  # synthetic fixture A\n"
+    )
+
+    result = _scan([str(a), str(b)], allowlist=allow)
+    assert result.returncode == 1, "acknowledging key A silenced key B"
+    assert "b.pem" in result.stdout
+    assert "a.pem" not in result.stdout
 
 
 def test_allowlist_cannot_hide_a_new_secret_in_an_allowlisted_file(tmp_path):

@@ -2300,6 +2300,31 @@ def _usage_to_cost_cents(model: str, usage: dict) -> float:
     return usd * 100.0
 
 
+def _voice_recorded_cost_cents(cost_cents: float):
+    """The value written to llm_proxy_events.cost_cents for a voice turn.
+
+    This was `int(round(cost_cents))`, which ROUNDS UP half the time —
+    measured on production: 15 of 27 voice rows recorded HIGHER than the
+    exact cost stored one line below in credit_ledger.underlying_cost_cents
+    (worst +0.47¢). The R-3 rule is that recorded cost may only go DOWN or
+    stay equal versus what the legacy expression produced, so the fix is
+    `min(exact_4dp, legacy)`, the same bound llm_proxy._never_higher_cents
+    applies — with THIS surface's legacy formula, not chat's 1¢ floor.
+
+    The other half of int(round()) — a 0.35¢ turn recorded as 0 — is kept,
+    deliberately: raising it to 0.35 would record MORE than legacy, which
+    the authorization forbids. Documented residual, same as chat's
+    truncation half.
+    """
+    from decimal import Decimal
+
+    exact = Decimal(str(cost_cents)).quantize(Decimal("0.0001"))
+    if exact <= 0:
+        return Decimal("0")
+    legacy = Decimal(int(round(cost_cents)))
+    return min(exact, legacy)
+
+
 async def _meter_voice_turn(user_id: str, model: str, usage: dict, response_id: str) -> None:
     """Charge one realtime response to the user's message credits.
 
@@ -2334,7 +2359,7 @@ async def _meter_voice_turn(user_id: str, model: str, usage: dict, response_id: 
                 endpoint="realtime_voice",
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                cost_cents=int(round(cost_cents)),
+                cost_cents=_voice_recorded_cost_cents(cost_cents),
                 was_fallback=False,
                 latency_ms=0,
                 status="ok",
