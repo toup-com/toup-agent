@@ -1012,10 +1012,24 @@ def setup_scheduler(
     # APScheduler also means a scheduler-start failure can't take the
     # notification pipeline down with it.
 
-    # Memory Decay - runs every N hours
+    # Memory Decay — fixed clock times, NOT an elapsed-time interval.
+    #
+    # This was `IntervalTrigger(hours=6)`, whose first fire is six hours
+    # after the scheduler STARTS. The agent fleet is recreated on every
+    # merge to main under `backend/**` — 178 such commits in the 14 days
+    # to 2026-08-10, median gap 0.3h, only 13 of 177 gaps reaching six
+    # hours. Every recreation reset the timer, so the first fire kept
+    # being cancelled by the next deploy and decay never ran once:
+    # `last_decayed_at` was NULL for every memory on every tenant checked.
+    #
+    # Wall-clock slots survive restarts — the same reason the
+    # consolidation job below has always used CronTrigger. Four slots
+    # preserve the ~6-hourly cadence `decay_interval_hours` asks for, and
+    # 02:00 lands before consolidation at 03:00 so strengths are current
+    # when episodic memories are summarised.
     scheduler.add_job(
         run_decay_for_all_users,
-        trigger=IntervalTrigger(hours=decay_interval_hours),
+        trigger=CronTrigger(hour="2,8,14,20", minute=0),
         id="memory_decay",
         name="Memory Decay (Ebbinghaus Curve)",
         replace_existing=True,
@@ -1134,16 +1148,24 @@ def setup_scheduler(
         misfire_grace_time=3600,
     )
 
-    # Day-as-Chat archival — runs hourly, gated on feature flag. Not timezone-bound:
-    # each run iterates every user and compares THEIR local today to their DayChat
-    # local_date values. A day rolling over in Asia/Tokyo will be caught within the
-    # hour; same for America/Los_Angeles. Cheaper than per-timezone cron entries.
+    # Day-as-Chat archival — runs hourly ON THE HOUR, gated on feature flag.
+    # Not timezone-bound: each run iterates every user and compares THEIR local
+    # today to their DayChat local_date values. A day rolling over in Asia/Tokyo
+    # will be caught within the hour; same for America/Los_Angeles. Cheaper than
+    # per-timezone cron entries.
+    #
+    # `CronTrigger(minute=0)` rather than `IntervalTrigger(hours=1)`: identical
+    # cadence, but an interval's next fire is measured from scheduler START, and
+    # this fleet is recreated on every backend merge (median gap 0.3h over the 14
+    # days to 2026-08-10). An elapsed-time timer keeps getting reset before it
+    # fires — that is exactly how `memory_decay` above went its whole life
+    # without running once. Wall-clock slots survive restarts.
     try:
         from app.config import settings as _s
         if getattr(_s, "enable_day_recall", False):
             scheduler.add_job(
                 run_end_of_day_archival,
-                trigger=IntervalTrigger(hours=1),
+                trigger=CronTrigger(minute=0),
                 id="day_archival",
                 name="End-of-Day Archival Summaries",
                 replace_existing=True,
