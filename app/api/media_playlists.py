@@ -710,6 +710,17 @@ async def play_playlist(
         seed_track=SeedTrack(video_id=first["video_id"], title=first.get("title") or row.name),
         station=station,
         source="playlist_play",
+        # Row 1 of the saved list carries its own clean metadata; without this
+        # the replayed seed regresses to artist="" and no length, exactly the
+        # gap the autosave path just closed.
+        seed_meta=StationTrack(
+            video_id=first["video_id"],
+            title=first.get("title") or row.name,
+            artist=first.get("artist") or "",
+            length=first.get("length") or "",
+            video_type=first.get("video_type") or "",
+            thumbnail_url=first.get("thumbnail_url") or "",
+        ),
     )
     # A saved playlist is an audio library object — pin the surface so the
     # variant machinery and the phone agree (same rule as the voice bridge).

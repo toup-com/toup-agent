@@ -633,6 +633,31 @@ async def create_session_message(
     await db.commit()
     await db.refresh(msg)
 
+    # Hand the row to any open chat socket live, WITH its media. Voice rows
+    # used to reach the phone only on the next resync (as plain text until
+    # then), so a song the agent genuinely started rendered as a bare
+    # transcript line while it played. Fire-and-forget — live delivery must
+    # never be on the persist path.
+    try:
+        from app.api.ws_chat import broadcast_to_user
+        _frame = {
+            "type": "message",
+            "id": msg.id,
+            "role": msg.role,
+            "content": msg.content,
+            "created_at": (msg.created_at.isoformat() + "Z")
+            if getattr(msg, "created_at", None) else datetime.utcnow().isoformat() + "Z",
+            "channel": session.channel,
+        }
+        if _day_chat_id:
+            _frame["day_chat_id"] = _day_chat_id
+        if media:
+            _frame["media"] = media
+        import asyncio as _asyncio
+        _asyncio.create_task(broadcast_to_user(current_user.id, _frame))
+    except Exception:
+        logger.warning("[sessions] live message broadcast failed", exc_info=True)
+
     return _message_to_response(msg, None, None, {session.id: session.channel})
 
 

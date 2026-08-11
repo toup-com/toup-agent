@@ -998,3 +998,110 @@ def test_range_beyond_entity_is_416(tmp_path):
 
     ok = _local_audio_response(str(f), "bytes=0-99")
     assert ok is not None and ok.status_code == 206
+
+
+def test_wire_titles_are_bare_and_artist_rides_its_own_field():
+    """2026-08-11 founder screenshots: cards titled 'void — Wok' over a
+    subtitle of 'void'. display_title() composes 'Artist — Title' for LOGS
+    (its own contract), but three wire sites shipped it as the frame title
+    while `artist` rode the same payload — both clients drew the artist twice."""
+    from app.api.ws_chat import _upcoming_tracks
+
+    sess = _session(playlist_n=2)
+    sess.playlist[0].title = "Wok"
+    sess.playlist[0].artist = "void"
+    win = _upcoming_tracks(sess, n=1)
+    assert win[0]["title"] == "Wok"
+    assert win[0]["artist"] == "void"
+
+
+@pytest.mark.asyncio
+async def test_advance_broadcast_title_is_bare(monkeypatch):
+    from app.api import ws_chat
+    import app.agent.radio.player as player_mod
+
+    sess = _session(playlist_n=6)
+    sess.playlist[0].title = "ORANGE SODA"
+    sess.playlist[0].artist = "Baby Keem"
+    got: dict = {}
+
+    async def _capture(**kwargs):
+        got.update(kwargs)
+        return True
+
+    async def _bcast(user_id, payload):
+        return 1
+
+    monkeypatch.setattr(player_mod, "broadcast_radio_track", _capture)
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _bcast)
+    await ws_chat._broadcast_track_for_mode(
+        sess.user_id, "app", sess, sess.playlist[0], "media_ended", record=False,
+    )
+    assert got.get("title") == "ORANGE SODA", f"composed title on the wire: {got.get('title')!r}"
+    assert got.get("artist") == "Baby Keem"
+
+
+@pytest.mark.asyncio
+async def test_skip_target_already_played_reconciles_without_a_pop(monkeypatch):
+    """2026-08-11 founder clip: during a 4-in-11s skip burst the server's own
+    earlier pops consumed the id the phone then named as its target. 'Normal
+    pop' popped one slot FURTHER and each divergent broadcast repainted the
+    card — the ORANGE SODA ↔ NOSTYLIST fight. A target the server has already
+    played means the PHONE IS THERE: move the cursor to it, ship state, and
+    never navigate the phone."""
+    from app.api import ws_chat
+
+    sess = _session(playlist_n=8)
+    # The burst, as the server experienced it: it popped ghost, then later —
+    # its cursor now sits PAST the track the phone is actually playing.
+    ghost, later = sess.playlist[0], sess.playlist[1]
+    sess.played_track_ids.update({ghost.video_id, later.video_id})
+    sess.played_history.extend([ghost, later])
+    sess.history_cursor = len(sess.played_history) - 1
+    sess.current_station_track = later
+    sess.mark_current_track(later.video_id, 200.0)
+    sess.playlist_cursor = 2
+    played = _advance_env(monkeypatch, sess)
+
+    states: list = []
+
+    async def _bcast(user_id, payload):
+        states.append(payload)
+        return 1
+
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _bcast)
+
+    ok = await ws_chat._advance_and_broadcast_next(
+        sess.user_id, "app", sess, trigger="skip_next",
+        target_video_id=ghost.video_id,
+    )
+    assert ok is True
+    assert played == [], f"a played target must never pop further: {played}"
+    assert sess.current_track_id == ghost.video_id
+    assert sess.current_station_track is ghost
+    assert states and states[-1].get("current_track_id") == ghost.video_id
+
+
+@pytest.mark.asyncio
+async def test_skip_target_equal_to_current_is_a_state_reship(monkeypatch):
+    """A late duplicate of a skip this cursor already honored (echoes drain
+    behind the advance lock during a burst) must confirm, not advance."""
+    from app.api import ws_chat
+
+    sess = _session(playlist_n=8)
+    played = _advance_env(monkeypatch, sess)
+    states: list = []
+
+    async def _bcast(user_id, payload):
+        states.append(payload)
+        return 1
+
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _bcast)
+
+    ok = await ws_chat._advance_and_broadcast_next(
+        sess.user_id, "app", sess, trigger="skip_next",
+        target_video_id=sess.current_track_id,
+    )
+    assert ok is True
+    assert played == [], f"a duplicate skip must not advance: {played}"
+    assert states and states[-1].get("current_track_id") == sess.current_track_id

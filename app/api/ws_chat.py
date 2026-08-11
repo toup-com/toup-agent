@@ -936,6 +936,10 @@ async def _handle_radio_toggle_locked(user_id: str, msg: dict) -> None:
         seed_track=SeedTrack(video_id=seed_video_id, title=seed_title or "Now Playing"),
         station=station,
         source="toggle_on",
+        # The watch playlist's own index-0 entry: real artist, split title,
+        # length, art. Without it the seed is the one track with no metadata
+        # (the "YouTube"-artist autosave row, the duration-0 seed re-anchor).
+        seed_meta=seed_meta,
     )
     if initial_mode:
         mgr.set_display_mode(sess, initial_mode, user_initiated=True, source="toggle_mode")
@@ -1133,6 +1137,49 @@ async def _advance_and_broadcast_next(
                 f"at={_found_at} (cursor was {_cursor_was})",
                 flush=True,
             )
+        elif target_video_id == (sess.current_track_id or ""):
+            # A late duplicate of a skip this cursor already honored — during a
+            # rapid burst the echoes drain behind the advance lock. Popping
+            # again would walk the station past the phone; confirm instead.
+            print(
+                f"[radio] skip target is current id={target_video_id} — "
+                f"duplicate honored skip, state re-ship only",
+                flush=True,
+            )
+            await broadcast_to_user(user_id, sess.to_broadcast_dict())
+            return True
+        elif target_video_id in sess.played_track_ids:
+            # The phone already sits on a track this cursor popped PAST — a
+            # raced burst where our own earlier pops consumed the id the phone
+            # then named. "Normal pop" here popped one slot FURTHER, and each
+            # divergent broadcast was faithfully painted by the phone: the
+            # ORANGE SODA ↔ NOSTYLIST card fight of 2026-08-11. Reality wins:
+            # move the cursor to the id the phone is playing, ship state only
+            # (the phone needs no navigation — it is already there).
+            _tape = next(
+                (t for t in reversed(sess.played_history)
+                 if t.video_id == target_video_id), None,
+            ) or next(
+                (t for t in sess.playlist if t.video_id == target_video_id),
+                None,
+            )
+            sess.mark_current_track(
+                target_video_id,
+                _length_sec(_tape.length) if _tape else 0.0,
+            )
+            if _tape is not None:
+                sess.current_station_track = _tape
+                for _i in range(len(sess.played_history) - 1, -1, -1):
+                    if sess.played_history[_i].video_id == target_video_id:
+                        sess.history_cursor = _i
+                        break
+            print(
+                f"[radio] skip target already played id={target_video_id} — "
+                f"cursor reconciled to the phone, no pop",
+                flush=True,
+            )
+            await broadcast_to_user(user_id, sess.to_broadcast_dict())
+            return True
         else:
             print(
                 f"[radio] skip target not in window id={target_video_id} — normal pop",
@@ -1386,7 +1433,11 @@ def _upcoming_tracks(sess, n: int = 5) -> list:
                 break
             out.append({
                 "video_id": t.video_id,
-                "title": t.display_title(),
+                # Bare title — display_title() composes "Artist — Title", and
+                # with `artist` riding the same slot both clients rendered the
+                # artist twice ("void — Wok" over a subtitle of "void").
+                # display_title() is for logs, per its own contract.
+                "title": t.title,
                 "artist": t.artist,
                 "thumbnail_url": t.thumbnail_url,
                 # Seconds; 0 = unknown. Lets an optimistic hop into this slot
@@ -1580,7 +1631,9 @@ async def _broadcast_track_for_mode(user_id, channel, sess, track, trigger: str,
     await broadcast_radio_track(
         user_id=user_id,
         video_id=track.video_id,
-        title=track.display_title(),
+        # Bare title; `artist` is its own field below. display_title()'s
+        # "Artist — Title" doubled the artist on every card (see _upcoming_tracks).
+        title=track.title,
         channel=channel,
         artist=track.artist,
         thumbnail_url=track.thumbnail_url,
@@ -2210,7 +2263,8 @@ async def _handle_radio_display_mode_locked(user_id: str, msg: dict) -> None:
             await broadcast_radio_track(
                 user_id=user_id,
                 video_id=alt.video_id,
-                title=alt.display_title(),
+                # Bare title, same rule as every other wire site.
+                title=alt.title,
                 channel=channel,
                 artist=alt.artist,
                 thumbnail_url=alt.thumbnail_url,

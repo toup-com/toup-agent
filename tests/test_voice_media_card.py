@@ -319,3 +319,45 @@ def test_voice_play_description_forbids_guessing_a_misheard_name():
     # …without undoing the speed instruction that made plays one tool call.
     assert "immediately" in d
     assert "if you did hear the name clearly, do not ask" in d
+
+
+# ── The completed frame is the card, never the prose (2026-08-11) ────────
+# play_media's result string is the MODEL's sentence ("Now playing: X. It is
+# already audible on the user's device…") — it shipped verbatim as
+# result_preview and the voice canvas rendered it: raw English, third person,
+# truncated at the clamp, in a Farsi session. The user-facing shape is the
+# structured card.
+
+
+def test_completed_frame_ships_the_card_not_the_prose():
+    from app.api.ws_realtime import _tool_completed_frame
+
+    media = {"type": "youtube", "video_id": "vX", "title": "Suspicious Minds",
+             "thumbnail_url": "https://i.ytimg.com/vi/vX/hqdefault.jpg"}
+    f = _tool_completed_frame(
+        "c1", "play_media",
+        "Now playing: Elvis Presley - Suspicious Minds. It is already audible "
+        "on the user's device, and more in the same style will follow automatically.",
+        media=media,
+    )
+    assert f["ok"] is True
+    assert f["result_preview"] == ""
+    assert f["media"] == media
+
+
+def test_completed_frame_failed_play_has_no_card_and_no_prose():
+    from app.api.ws_realtime import _tool_completed_frame
+
+    f = _tool_completed_frame("c1", "play_media",
+                              "ERROR: could not start that track.", media=None)
+    assert f["ok"] is False
+    assert f["result_preview"] == ""
+    assert "media" not in f
+
+
+def test_completed_frame_other_tools_keep_their_previews():
+    from app.api.ws_realtime import _tool_completed_frame
+
+    f = _tool_completed_frame("c2", "web_search", "3 sources · example.com")
+    assert f["result_preview"] == "3 sources · example.com"
+    assert "media" not in f

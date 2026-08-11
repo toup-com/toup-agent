@@ -269,3 +269,74 @@ def test_dispatch_radio_frame_swallows_handler_errors(monkeypatch):
     monkeypatch.setattr(ws, "_handle_media_ended", _boom)
     asyncio.get_event_loop_policy()
     asyncio.run(ws._dispatch_radio_frame("u" * 32, {"type": "media_ended"}))
+
+
+# ── Seed metadata (2026-08-11) ──────────────────────────────────────────
+# The seed used to be the ONE track that bypassed every metadata path:
+# artist="", the raw combined fast-path label as title, no length. The
+# autosaved playlist's row 1 read 'Playboi Carti - Magnolia' over an artist
+# line of "YouTube" while every window track was clean, a seed re-anchor
+# broadcast duration=0, and the seed's proportional end-guard never armed.
+
+
+def _mgr():
+    from app.agent.radio.session import RadioSessionManager
+    return RadioSessionManager()
+
+
+def test_enable_backfills_seed_from_seed_meta():
+    meta = StationTrack(
+        video_id="atvSeedX", title="Magnolia", artist="Playboi Carti",
+        length="3:24", video_type="MUSIC_VIDEO_TYPE_ATV",
+        thumbnail_url="https://i.ytimg.com/vi/atvSeedX/hqdefault.jpg",
+    )
+    sess = _mgr().enable(
+        user_id="u" * 32, channel="app", seed_intent="carti",
+        seed_track=SeedTrack(video_id="omvSeed", title="Playboi Carti - Magnolia"),
+        station=[StationTrack(video_id="w1", title="Next", artist="A")],
+        seed_meta=meta,
+    )
+    seed = sess.played_history[0]
+    # The id that is PLAYING, never seed_meta's — that may be the ATV/OMV
+    # counterpart of the playing video.
+    assert seed.video_id == "omvSeed"
+    assert seed.title == "Magnolia"
+    assert seed.artist == "Playboi Carti"
+    assert seed.length == "3:24"
+    assert sess.current_station_track is seed
+    # The play clock knows the length, so the proportional end-guard arms.
+    assert sess.current_track_length_sec == 204.0
+
+
+def test_enable_without_meta_derives_artist_from_the_title():
+    sess = _mgr().enable(
+        user_id="u" * 32, channel="app", seed_intent="carti",
+        seed_track=SeedTrack(video_id="vSeed", title="Playboi Carti - Magnolia"),
+        station=[],
+    )
+    seed = sess.played_history[0]
+    assert seed.title == "Magnolia"
+    assert seed.artist == "Playboi Carti"
+
+
+def test_enable_split_never_eats_a_format_marker():
+    sess = _mgr().enable(
+        user_id="u" * 32, channel="app", seed_intent="x",
+        seed_track=SeedTrack(video_id="vSeed", title="Magnolia - Official Video"),
+        station=[],
+    )
+    seed = sess.played_history[0]
+    # "Official Video" is a format marker, not a title — the split must not run.
+    assert seed.title == "Magnolia - Official Video"
+    assert seed.artist == ""
+
+
+def test_parse_track_reads_search_style_duration_keys():
+    from app.agent.radio.playlist import _parse_track
+
+    t = _parse_track({"videoId": "v1", "title": "X",
+                      "artists": [{"name": "A"}], "duration": "3:35"})
+    assert t.length == "3:35"
+    t2 = _parse_track({"videoId": "v2", "title": "Y",
+                       "artists": [{"name": "A"}], "duration_seconds": 215})
+    assert t2.length == "3:35"

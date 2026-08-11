@@ -170,3 +170,29 @@ def test_repr_does_not_recurse_on_a_linked_pair():
     a.counterpart, b.counterpart = b, a
     assert "counterpart" not in repr(a)
     repr(b)  # must not raise RecursionError
+
+
+def test_counterpart_never_inherits_the_other_variants_length(monkeypatch):
+    """2026-08-11 founder recording: a freshly hopped-to track rendered 0:58 on
+    a ~3:35 song. The variant finders stamped the counterpart with the OTHER
+    video's duration whenever the search hit carried none — a wrong number
+    styled as fact. An empty length renders '--:--' until the player measures,
+    which is honest."""
+    import app.agent.radio.playlist as pl
+
+    caller = _omv(1)
+    caller.length = "9:59"  # must NOT leak onto the counterpart
+    hits = [{"videoId": "atvHit1", "title": "Song 1", "resultType": "song",
+             "artists": [{"name": "A"}]}]  # no duration on the hit
+    monkeypatch.setattr(pl, "_yt_remote", lambda *a, **k: hits)
+
+    got = asyncio.run(pl.find_topic_version(caller))
+    assert got is not None and got.video_id == "atvHit1"
+    assert got.length == "", f"inherited the caller's length: {got.length!r}"
+
+    # And a present hit duration IS used.
+    hits[0]["videoId"] = "omvHit2"
+    hits[0]["videoType"] = OMV
+    hits[0]["duration"] = "3:35"
+    got2 = asyncio.run(pl.find_music_video(_atv(2)))
+    assert got2 is not None and got2.length == "3:35"

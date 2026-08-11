@@ -252,7 +252,14 @@ def _parse_track(raw: dict) -> Optional[StationTrack]:
     if isinstance(artists, list) and artists:
         first = artists[0] or {}
         artist_name = (first.get("name") or "").strip()
-    length = (raw.get("length") or "").strip()
+    # Watch-playlist entries say "length"; SEARCH results say "duration" (and
+    # sometimes duration_seconds). Reading only one key left every
+    # search-sourced track with no length at all.
+    length = (raw.get("length") or raw.get("duration") or "").strip()
+    if not length:
+        _ds = raw.get("duration_seconds")
+        if isinstance(_ds, (int, float)) and _ds > 0:
+            length = f"{int(_ds) // 60}:{int(_ds) % 60:02d}"
     video_type = (raw.get("videoType") or "").strip()
     # For UGC entries YT Music's `artists[0]` is the UPLOADER — an aggregator
     # channel ("Radio Javan"), not the artist — and regional catalogs (Persian
@@ -564,7 +571,12 @@ async def find_topic_version(
             video_id=vid,
             title=(r.get("title") or track.title).strip(),
             artist=r_artist_name or track.artist,
-            length=(r.get("duration") or track.length or "").strip(),
+            # The search hit's OWN length only. Inheriting `track.length`
+            # across a video_id change stamped the counterpart variant with the
+            # other video's duration — the founder's 0:58 card on a 3:35 track.
+            # An empty length renders '--:--' until the player measures, which
+            # is honest; a wrong number is not.
+            length=(r.get("duration") or "").strip(),
             video_type=_ATV_VIDEO_TYPE,
             thumbnail_url=_biggest_thumbnail_url(r) or track.thumbnail_url,
         )
@@ -640,7 +652,12 @@ async def find_music_video(
             video_id=vid,
             title=(r.get("title") or track.title).strip(),
             artist=r_artist_name or track.artist,
-            length=(r.get("duration") or track.length or "").strip(),
+            # The search hit's OWN length only. Inheriting `track.length`
+            # across a video_id change stamped the counterpart variant with the
+            # other video's duration — the founder's 0:58 card on a 3:35 track.
+            # An empty length renders '--:--' until the player measures, which
+            # is honest; a wrong number is not.
+            length=(r.get("duration") or "").strip(),
             video_type=_OMV_VIDEO_TYPE,
             thumbnail_url=_biggest_thumbnail_url(r) or track.thumbnail_url,
         )

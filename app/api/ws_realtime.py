@@ -313,6 +313,32 @@ _TOOL_TITLES = {
 }
 
 
+def _tool_completed_frame(
+    call_id: str, func_name: str, result_str: str, media: Optional[dict] = None,
+) -> dict:
+    """The tool_call.completed frame the voice client renders.
+
+    For play_media the result string is the MODEL's sentence ("Now playing: …
+    audible on the user's device…") — third-person English prose that used to
+    render verbatim in the voice canvas, in every session language. The
+    user-facing shape is the card: ship the structured media dict (same shape
+    the thread persist writes) and keep the prose model-only — it still goes
+    to OpenAI as the function_call_output, never to the phone.
+    """
+    frame = {
+        "type": "tool_call.completed",
+        "call_id": call_id,
+        "name": func_name,
+        "ok": not result_str.strip().upper().startswith("ERROR"),
+        "result_preview": result_str[:600],
+    }
+    if func_name == "play_media":
+        frame["result_preview"] = ""
+        if media:
+            frame["media"] = media
+    return frame
+
+
 def _tool_activity(func_name: str, arguments: dict) -> tuple:
     """(title, detail) for a client tool-activity row. `detail` is a short,
     human string pulled from the most salient argument (the search query, the
@@ -3424,6 +3450,11 @@ async def realtime_voice_ws(
                             arguments = {}
 
                         logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
+                        # Structured card for THIS call's completed frame (play_media
+                        # only). Deliberately separate from `pending_media`, which is
+                        # the persist-side slot cleared on a later response.done — a
+                        # failed play must not ship a previous play's card.
+                        _frame_media = None
                         # Legacy coarse flag (kept for older app builds that only
                         # read state) + the discrete lifecycle event the tool UI uses.
                         await websocket.send_json({"type": "state", "state": "tool_use"})
@@ -3460,6 +3491,7 @@ async def realtime_voice_ws(
                             # produces. Cleared after the persist below.
                             if _played:
                                 pending_media = _played
+                                _frame_media = _played
 
                         # ── Think: delegate reasoning to best model ──
                         elif func_name == "think":
@@ -3532,13 +3564,8 @@ async def realtime_voice_ws(
 
                         # Discrete completion event → client findings card.
                         _res_str = result if isinstance(result, str) else str(result)
-                        await websocket.send_json({
-                            "type": "tool_call.completed",
-                            "call_id": call_id,
-                            "name": func_name,
-                            "ok": not _res_str.strip().upper().startswith("ERROR"),
-                            "result_preview": _res_str[:600],
-                        })
+                        await websocket.send_json(_tool_completed_frame(
+                            call_id, func_name, _res_str, media=_frame_media))
 
                         # Send result back to OpenAI
                         await openai_ws.send(json.dumps({

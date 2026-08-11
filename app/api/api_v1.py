@@ -315,6 +315,13 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
     tools.set_channel("app")
     result = await tools._tool_play_media({
         "query": req.query, "channel": req.channel, "variety": req.variety,
+        # Voice is ALWAYS audio. Without this pin, infer_requested_mode can
+        # stamp mode='video' on a spoken request ("play the music video for…"),
+        # and because the frame rides the chat socket it may be surface-judged
+        # AFTER the call ends — mounting an autoplaying WebView over the chat
+        # the user just returned to. A voice session has no visible surface to
+        # watch on, ever; the user can flip to Video from the card afterwards.
+        "mode": "audio",
     })
 
     text = str(result or "")

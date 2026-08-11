@@ -237,6 +237,7 @@ class RadioSessionManager:
         seed_track: SeedTrack,
         station: List[StationTrack],
         source: str = "toggle_on",
+        seed_meta: Optional[StationTrack] = None,
     ) -> RadioSession:
         """Turn radio on with a freshly-built station."""
         sess = self.get_or_create(user_id, channel)
@@ -244,17 +245,50 @@ class RadioSessionManager:
         sess.enabled = True
         sess.seed_intent = seed_intent or sess.seed_intent
         sess.seed_track = seed_track
-        sess.mark_current_track(seed_track.video_id)
         sess.consecutive_failures = 0
         sess.playlist = list(station)
         sess.playlist_cursor = 0
         sess.played_track_ids = {seed_track.video_id}
         # Seed the tape with the seed track itself so skip_prev from track 1
         # lands back on the seed (and from the seed is disabled).
-        seed_station_track = StationTrack(
-            video_id=seed_track.video_id,
-            title=seed_track.title,
-            artist="",
+        #
+        # The seed used to be the ONE track that bypassed every metadata path:
+        # artist="", the raw combined fast-path label as title, no length. That
+        # single gap is why the autosaved playlist's row 1 read
+        # 'Playboi Carti - Magnolia' over an artist line of "YouTube" while
+        # every window track was clean, why a seed re-anchor broadcast
+        # duration=0, and why the seed's proportional end-guard never armed.
+        # `seed_meta` is the watch-playlist's own index-0 entry (build_station)
+        # or the saved playlist's row 1; without one, derive artist/title the
+        # same way _parse_track does for UGC entries.
+        if seed_meta is not None:
+            seed_station_track = StationTrack(
+                video_id=seed_track.video_id,   # NOT seed_meta's — that may be
+                                                # the ATV/OMV counterpart id
+                title=seed_meta.title or seed_track.title,
+                artist=seed_meta.artist,
+                length=seed_meta.length,
+                video_type=seed_meta.video_type,
+                thumbnail_url=seed_meta.thumbnail_url,
+            )
+        else:
+            _title, _artist = seed_track.title, ""
+            try:
+                from app.agent.media_resolve import split_artist_title
+                from app.agent.radio.playlist import _JUNK_TITLE_RIGHT
+                _a, _t = split_artist_title(seed_track.title)
+                if _a and _t and len(_a) <= 60 and not _JUNK_TITLE_RIGHT.match(_t):
+                    _artist, _title = _a, _t
+            except Exception:
+                pass
+            seed_station_track = StationTrack(
+                video_id=seed_track.video_id,
+                title=_title,
+                artist=_artist,
+            )
+        sess.mark_current_track(
+            seed_track.video_id,
+            length_sec=RadioSession.parse_length_sec(seed_station_track.length),
         )
         sess.played_history = [seed_station_track]
         sess.history_cursor = 0
