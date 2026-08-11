@@ -225,6 +225,65 @@ def test_blank_line_after_banner_still_binds_per_key(tmp_path):
         "digest — the binding skipped to the empty string, not the body"
     )
 
+
+def test_all_uppercase_and_digit_secrets_are_caught():
+    """Round 2 pinned BOTH opacity lookaheads case-sensitive, which forced
+    the value to contain a real LOWERCASE letter — so all-uppercase+digit
+    secrets (base32 TOTP/HOTP seeds, uppercase-hex HMAC keys) silently
+    escaped both assignment rules. They are secrets and must be caught."""
+    from scripts.scan_secrets import scan_text
+
+    totp = "TOTP_" + "SECRET=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    assert scan_text(totp, "x.env"), "base32 all-caps secret escaped the gate"
+
+    hexkey = "HMAC_" + "SECRET=A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6"
+    assert scan_text(hexkey, "x.env"), "uppercase-hex secret escaped the gate"
+
+    # And the round-2 false positive it must NOT reintroduce:
+    prose = "JWT_" + "SECRET=change-this-to-a-long-random-secret-value-now"
+    assert scan_text(prose, "x.env") == []
+
+
+def test_real_pgp_private_key_armor_is_caught():
+    """GnuPG emits a PGP private-key BLOCK armor. The pattern used to list a
+    `PGP ` qualifier that built a banner no tool produces — a dead branch —
+    so real PGP secret keys escaped. Assemble the real banner at runtime so
+    this file does not carry it."""
+    from scripts.scan_secrets import scan_text
+
+    banner = "-----BEGIN PGP PRIVATE KEY " + "BLOCK-----"
+    key = f"{banner}\nlQVYBGXFsomekeymaterial\n"
+    result = scan_text(key, "backup.asc")
+    assert any(f.pattern == "private-key-block" for f in result), (
+        "a real GnuPG private-key armor was not flagged"
+    )
+
+
+def test_encrypted_pem_with_proc_type_header_binds_per_key():
+    """A traditional OpenSSL encrypted PEM's first non-empty line is the
+    constant `Proc-Type: 4,ENCRYPTED` header. Binding the digest there
+    would collide every such key — the class exemption again. The binding
+    must skip armor headers and reach the base64 body."""
+    from scripts.scan_secrets import scan_text
+
+    rsa_banner = _PEM_BANNER.replace("BEGIN ", "BEGIN RSA ")
+
+    def enc(iv, body):
+        return (
+            f"{rsa_banner}\n"
+            "Proc-Type: 4,ENCRYPTED\n"
+            f"DEK-Info: AES-256-CBC,{iv}\n\n{body}\n"
+        )
+
+    a = scan_text(enc("AAAA1111", "MIIEncBodyA"), "a.pem")
+    b = scan_text(enc("BBBB2222", "MIIEncBodyB"), "b.pem")
+    da = [f for f in a if f.pattern == "private-key-block"][0].digest
+    db = [f for f in b if f.pattern == "private-key-block"][0].digest
+    assert da != db, (
+        "two different encrypted keys share a digest — the binding stopped "
+        "at the constant Proc-Type header instead of the body"
+    )
+
     # Body-less banners bind to a path-scoped sentinel: an acknowledgement
     # can never reach beyond its own file.
     e1 = scan_text(f"{_PEM_BANNER}\n", "one.md")

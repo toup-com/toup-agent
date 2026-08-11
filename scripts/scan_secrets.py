@@ -97,9 +97,21 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("stripe-key", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{20,}")),
     ("google-key", re.compile(r"\bAIza[A-Za-z0-9_\-]{35}\b")),
     # ENCRYPTED is openssl's DEFAULT output for passphrase-protected keys
-    # (`genpkey -aes-256-cbc`, `pkcs8 -topk8`) — the round-2 audit committed
-    # one with ZERO findings while this alternation lacked it.
-    ("private-key-block", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----")),
+    # (`genpkey -aes-256-cbc`, `pkcs8 -topk8`) — round 2 committed one with
+    # ZERO findings while this alternation lacked it.
+    #
+    # PGP is its OWN alternative, not a `PGP ` qualifier on the PKCS banner:
+    # GnuPG's private-key armor puts the word BLOCK between KEY and the
+    # closing dashes, so the qualifier form `PGP <space> PRIVATE KEY----`
+    # matched a string no tool ever produces — a dead branch that gave
+    # false confidence of PGP coverage while real PGP secret keys escaped
+    # (round 3). The literals below are split across adjacent string parts
+    # so this scanner's own source does not carry a contiguous banner and
+    # flag itself. Every banner is one a real tool emits.
+    ("private-key-block", re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE " + "KEY-----"
+        r"|-----BEGIN PGP PRIVATE KEY " + "BLOCK-----"
+    )),
     # A JWT with a payload — two base64url segments joined by a dot.
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     # DSN carrying an inline password. Group 1 = the password only.
@@ -116,16 +128,22 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # which is code, not key material. Quotes are what separate "this
     # program computes a token" from "this file contains one".
     # The (?i) is for the NAME (jwt_secret= and JWT_SECRET= both count).
-    # The value's opacity lookahead is pinned case-sensitive with (?-i:),
-    # because under a bare (?i) the [A-Z0-9] class matched lowercase too,
-    # collapsing "must contain an upper or digit" into "contains a letter"
-    # — which flagged all-lowercase placeholder prose as key material.
+    # Value opacity is two lookaheads, and ONLY the second is pinned
+    # case-sensitive:
+    #   1. `(?=[^'"\s]*[a-zA-Z])` — contains a letter (excludes pure-numeric
+    #      IDs), case-insensitive on purpose.
+    #   2. `(?-i:(?=[^'"\s]*[A-Z0-9]))` — contains an UPPERCASE or digit,
+    #      case-sensitive, so all-lowercase placeholder prose is not opaque.
+    # Round 2 pinned BOTH under (?-i:), which also forced the first to
+    # require a real lowercase — so all-uppercase secrets (base32 TOTP
+    # seeds, uppercase-hex HMAC keys) silently escaped (round 3). Scoping
+    # only the second keeps the prose filter and restores that coverage.
     (
         "assigned-secret",
         re.compile(
             r"(?i)\b(?:[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|TOKEN|PRIVATE_?KEY)"
             r"[A-Z0-9_]*)\s*[:=]\s*"
-            r"['\"]((?-i:(?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})['\"]"
+            r"['\"]((?=[^'\"\s]*[a-zA-Z])(?-i:(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})['\"]"
         ),
     ),
     # Env-file shape: NAME=value on its own line, unquoted, no spaces.
@@ -136,7 +154,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"(?im)^\s*(?:export\s+)?[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|TOKEN|PRIVATE_?KEY)"
             r"[A-Z0-9_]*\s*=\s*"
-            r"((?-i:(?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})\s*$"
+            r"((?=[^'\"\s]*[a-zA-Z])(?-i:(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})\s*$"
         ),
     ),
     # PROXIMITY: a secret-ish NAME and an opaque high-entropy token on the
@@ -246,24 +264,39 @@ def _git_tracked_files(root: Path):
 _CONSTANT_MATCH_PATTERNS = frozenset({"private-key-block"})
 
 
+#: PEM / PGP-armor structural header lines — ``Name: value``. These
+#: (``Proc-Type: 4,ENCRYPTED``, ``Version: GnuPG``, ``Comment:`` …) precede
+#: the base64 body and are constant or near-constant across keys, so
+#: binding a digest to one collapses two different keys to the same digest
+#: — the very class exemption the binding exists to prevent (round 3).
+_PEM_HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:\s")
+
+
 def _constant_match_binding(lines: list[str], lineno: int, tail: str, path: str) -> str:
     """What a constant-match banner's digest binds to.
 
-    Skipping blank lines matters: binding to `lines[lineno]` verbatim
-    meant a banner followed by a blank line — or sitting at EOF — bound
-    to the empty string, giving every such key the SAME digest. One
-    acknowledged degenerate fixture would then have exempted the whole
-    blank-after-banner class, the exact defect this mechanism removes.
+    The goal is a digest that DIFFERS between two different keys, so one
+    acknowledged fixture cannot exempt the class. That means binding to
+    the base64 key material, skipping over anything constant:
+
+    * blank lines — else a banner followed by a blank line (or at EOF)
+      bound to the empty string, one digest for every such key;
+    * ``Name: value`` armor headers — for a traditional encrypted PEM the
+      first non-empty line is ``Proc-Type: 4,ENCRYPTED``, and for PGP it is
+      ``Version:``/``Comment:``; binding there collides all keys of that
+      shape.
+
     A banner with no body at all binds to a path-scoped sentinel, so an
-    acknowledgement of a body-less fixture can never reach beyond its
-    own file.
+    acknowledgement of a body-less fixture can never reach beyond its own
+    file.
     """
-    if tail:
+    if tail and not _PEM_HEADER_LINE.match(tail):
         return tail
     for follow in lines[lineno:]:
         stripped = follow.strip()
-        if stripped:
-            return stripped
+        if not stripped or _PEM_HEADER_LINE.match(stripped):
+            continue
+        return stripped
     return f"<no-body:{path}>"
 
 
