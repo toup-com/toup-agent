@@ -1079,6 +1079,7 @@ class AgentRunner:
         client_tz: Optional[str] = None,
         app_id: Optional[str] = None,
         force_new_session: bool = False,
+        suppress_tools: bool = False,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -1288,9 +1289,16 @@ class AgentRunner:
                 # session id — so a persisted Conversation would just be one
                 # empty row per ~5min tick (W1.7d litter). Ephemeral sentinel
                 # instead; terminal transitions write through the routine
-                # message-writer, never this session.
+                # message-writer, never this session. Trigger turns are the
+                # same shape (B-3): their output persists through
+                # write_trigger_message's own per-day conversation, so the
+                # runner-side session row was pure litter — one per fire on
+                # the live path, one per fire again on the shadow path.
                 _ephemeral_session = (
-                    prompt_profile == PromptProfile.AUTOPILOT
+                    (
+                        prompt_profile == PromptProfile.AUTOPILOT
+                        or (channel or "").strip().lower() == "trigger"
+                    )
                     and not session_id
                     and not save_user_message
                     and not save_assistant_message
@@ -1378,6 +1386,25 @@ class AgentRunner:
                 logger.info(
                     "[AGENT] channel=%s — disabling deferral tools (%s)",
                     channel, ", ".join(sorted(_channel_disabled)),
+                )
+            if suppress_tools:
+                # Shadow turns (B-3 trigger shadow): the output is DISCARDED,
+                # so no tool may fire — a ghost turn that sends a Telegram
+                # message or writes a memory is user-visible for a result no
+                # user sees. Prompts are advisory; tool-list omission is
+                # hard (prompt_profile.py's own words). Disabling the full
+                # def set removes every tool from the wire array AND the
+                # executor refuses any call that slips through.
+                _all_names = {
+                    (t.get("name") or t.get("function", {}).get("name"))
+                    for t in self.tool_defs
+                } | set(_RUN_DISABLED_TOOLS_CTX.get() or ())
+                _all_names.discard(None)
+                self.tools.user_disabled_tools = set(_all_names)
+                _RUN_DISABLED_TOOLS_CTX.set(frozenset(_all_names))
+                logger.info(
+                    "[AGENT] suppress_tools — %d tool defs withheld (shadow turn)",
+                    len(_all_names),
                 )
             logger.info(f"[PERF] load_agent_config: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 

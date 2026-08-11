@@ -303,3 +303,177 @@ def test_runner_wiring_exists_on_trigger_runner():
     sentinel = object()
     tr.set_agent_runner(sentinel)
     assert get_handler()._agent_runner is sentinel
+
+
+# ── 8. B-3 (closeout run): the shadow + the per-tenant canary ────────
+#
+# The two written flip prerequisites, built: a W-6-style shadow that
+# runs the runner leg BESIDE the served summarize path (tools
+# suppressed, output discarded, one fingerprint log line), and a
+# per-tenant canary list so one tenant can flip alone. The outputs are
+# generative prose, so the shadow's criterion is availability — a
+# non-empty body within budget on consecutive real fires — not hash
+# equality, which two LLM calls will essentially never achieve.
+
+
+def test_shadow_and_canary_ship_default_off():
+    from app.config import Settings
+
+    assert Settings.model_fields["trigger_turn_shadow"].default is False, (
+        "the shadow doubles LLM cost per fire — it ships OFF and is "
+        "enabled via bridge env TRIGGER_TURN_SHADOW for the evidence run"
+    )
+    assert Settings.model_fields["trigger_turns_via_runner_user_ids"].default == "", (
+        "the canary list ships empty — nobody is flipped by a merge"
+    )
+
+
+async def test_shadow_serves_legacy_and_runs_runner_leg_suppressed(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trigger_turns_via_runner", False)
+    monkeypatch.setattr(settings, "trigger_turns_via_runner_user_ids", "")
+    monkeypatch.setattr(settings, "trigger_turn_shadow", True)
+    runner = FakeRunner(replies=("shadow runner body",))
+    llm_calls: list = []
+    h, writes, broadcasts = _handler(runner=runner, llm_calls=llm_calls)
+
+    msg_id, model = await h._do_agent_turn(_trigger(), [_email()], db=None)
+
+    # Served result is the LEGACY summarize text — the shadow never
+    # touches what the user sees.
+    assert msg_id == "msg-1"
+    assert len(writes) == 1 and "summarize text" in writes[0]["content"]
+    assert "shadow runner body" not in writes[0]["content"]
+    assert len(broadcasts) == 1 and "shadow runner body" not in broadcasts[0]["content"]
+    assert len(llm_calls) == 1, "the summarize leg must serve"
+
+    # The runner leg ran exactly once, tools suppressed, no persistence.
+    assert len(runner.calls) == 1
+    kw = runner.calls[0]
+    assert kw["suppress_tools"] is True, (
+        "a DISCARDED turn that can fire tools is a user-visible ghost — "
+        "the shadow must suppress the entire tool surface"
+    )
+    assert kw["save_user_message"] is False
+    assert kw["save_assistant_message"] is False
+    assert kw["disable_post_processing"] is True
+
+
+async def test_shadow_failure_never_reaches_the_trigger_result(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trigger_turns_via_runner", False)
+    monkeypatch.setattr(settings, "trigger_turn_shadow", True)
+    runner = FakeRunner(replies=(RuntimeError("shadow leg exploded"),))
+    h, writes, _ = _handler(runner=runner)
+
+    msg_id, model = await h._do_agent_turn(_trigger(), [_email()], db=None)
+
+    assert msg_id == "msg-1", (
+        "a shadow failure cost the user their notification — the served "
+        "path must complete before and independent of the shadow"
+    )
+    assert len(writes) == 1 and "summarize text" in writes[0]["content"]
+
+
+async def test_shadow_log_carries_fingerprints_not_content(monkeypatch, caplog):
+    import logging as _logging
+
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trigger_turns_via_runner", False)
+    monkeypatch.setattr(settings, "trigger_turn_shadow", True)
+    runner = FakeRunner(replies=("the runner's secret-ish body",))
+    h, _, _ = _handler(runner=runner)
+
+    with caplog.at_level(_logging.INFO, logger="app.agent.triggers.email_received_handler"):
+        await h._do_agent_turn(_trigger(), [_email()], db=None)
+
+    shadow_lines = [r.getMessage() for r in caplog.records if "turn_shadow" in r.getMessage()]
+    assert shadow_lines, "the shadow ran but logged no turn_shadow line"
+    line = shadow_lines[0]
+    assert "runner_chars=" in line and "legacy_chars=" in line and "runner_fp=" in line
+    assert "secret-ish" not in line and "summarize text" not in line, (
+        "the shadow log leaked a body — the bodies carry the user's email "
+        "substance; fingerprints only"
+    )
+
+
+async def test_canary_list_serves_runner_for_listed_user_only(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "trigger_turns_via_runner", False)
+    monkeypatch.setattr(settings, "trigger_turn_shadow", True)
+
+    # Listed tenant → runner path SERVES (no shadow, no summarize call).
+    monkeypatch.setattr(settings, "trigger_turns_via_runner_user_ids", " user-1 , other")
+    runner = FakeRunner(replies=("canary runner body",))
+    llm_calls: list = []
+    h, writes, _ = _handler(runner=runner, llm_calls=llm_calls)
+    msg_id, _ = await h._do_agent_turn(_trigger(), [_email()], db=None)
+    assert "canary runner body" in writes[0]["content"]
+    assert llm_calls == [], "listed tenant must not also bill the summarize leg"
+    assert "suppress_tools" not in runner.calls[0], (
+        "the SERVED canary turn runs with its real tool surface — "
+        "suppression is the shadow's rail, not the product's"
+    )
+
+    # Unlisted tenant → legacy serves, shadow compares.
+    monkeypatch.setattr(settings, "trigger_turns_via_runner_user_ids", "someone-else")
+    runner2 = FakeRunner(replies=("shadow body",))
+    llm_calls2: list = []
+    h2, writes2, _ = _handler(runner=runner2, llm_calls=llm_calls2)
+    await h2._do_agent_turn(_trigger(), [_email()], db=None)
+    assert "summarize text" in writes2[0]["content"]
+    assert len(llm_calls2) == 1
+    assert runner2.calls and runner2.calls[0].get("suppress_tools") is True
+
+
+def test_fp_is_content_free():
+    from app.agent.triggers.email_received_handler import _fp
+
+    chars, digest = _fp("a private email body")
+    assert chars == 20 and len(digest) == 8
+    assert "private" not in repr((chars, digest))
+
+
+def test_suppress_tools_and_ephemeral_trigger_session_exist_in_runner():
+    """The two runner-side rails the shadow depends on. Source pins in
+    the house style (test_voice_context_relay.py): a rename shows up
+    here, not as a silently tool-firing shadow in production."""
+    import inspect
+
+    from app.agent.agent_runner import AgentRunner
+
+    sig = inspect.signature(AgentRunner._run_inner)
+    assert "suppress_tools" in sig.parameters, (
+        "_run_inner lost the suppress_tools kwarg — the trigger shadow "
+        "would fire real tools on discarded turns"
+    )
+    src = inspect.getsource(AgentRunner._run_inner)
+    assert "suppress_tools" in src and "shadow turn" in src
+    assert '== "trigger"' in src and "_ephemeral_session" in src, (
+        "trigger turns lost the ephemeral-session rail — one litter "
+        "Conversation row per fire (and per shadow fire) returns"
+    )
+
+
+def test_trigger_flip_envs_are_bridge_forwardable():
+    """G-19b's own config comment said 'ops flips via env
+    TRIGGER_TURNS_VIA_RUNNER' — but the name was never in the bridge's
+    `_FEATURE_FLAG_ENVS`, so a bridge env set reached no container. The
+    flip machinery must stay forwardable, all three names."""
+    import pathlib
+
+    bridge = pathlib.Path(__file__).resolve().parents[2] / "bridge" / "pool_addon.py"
+    src = bridge.read_text()
+    # The tuple's comments contain ')' — cut at the closing line, not the
+    # first close-paren.
+    tuple_src = src.split("_FEATURE_FLAG_ENVS = (")[1].split("\n)")[0]
+    for name in (
+        "TRIGGER_TURNS_VIA_RUNNER",
+        "TRIGGER_TURN_SHADOW",
+        "TRIGGER_TURNS_VIA_RUNNER_USER_IDS",
+    ):
+        assert f'"{name}"' in tuple_src, f"{name} not bridge-forwardable"

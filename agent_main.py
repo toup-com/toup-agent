@@ -1627,11 +1627,37 @@ async def lifespan(app: FastAPI):
     print("🤖 Toup Agent shutdown complete.")
 
 
+# The App-MCP ASGI app must exist BEFORE the FastAPI constructor: its
+# lifespan starts FastMCP's StreamableHTTPSessionManager task group, and
+# mounting alone never runs a sub-app's lifespan. Without this
+# composition every authenticated /api/app-mcp/mcp request 500s
+# (GA audit, closeout B-1). Fail-open on build failure — app-MCP
+# degrades, the tenant container still boots.
+try:
+    from app.agent.app_mcp_server import app_mcp as _app_mcp_server
+    mcp_app = _app_mcp_server.http_app(path="/mcp")
+except Exception as _mcp_build_err:
+    mcp_app = None
+    print(f"⚠️ App MCP app not built: {_mcp_build_err}", flush=True)
+
+if mcp_app is not None:
+    @asynccontextmanager
+    async def _combined_lifespan(_app: FastAPI):
+        # Agent services up first, MCP session manager second,
+        # torn down in reverse.
+        async with lifespan(_app):
+            async with mcp_app.lifespan(_app):
+                yield
+
+    _boot_lifespan = _combined_lifespan
+else:
+    _boot_lifespan = lifespan
+
 app = FastAPI(
     title="Toup Agent",
     description="Personal AI Agent with tools, channels, and memory access",
     version="6.0.0",
-    lifespan=lifespan,
+    lifespan=_boot_lifespan,
 )
 
 # CORS — allow the platform frontend to connect
@@ -1768,13 +1794,14 @@ except ImportError as _e:
 from app.api.extension import router as extension_router
 app.include_router(extension_router, prefix=settings.api_prefix)
 
-# Mount App MCP server for external MCP clients
-try:
-    from app.agent.app_mcp_server import app_mcp, set_mcp_skill_loader
-    mcp_app = app_mcp.http_app(path="/mcp")
+# Mount App MCP server for external MCP clients. The ASGI app was built
+# BEFORE the FastAPI constructor so its lifespan is composed into
+# _combined_lifespan (see above) — mounting here keeps router
+# registration order unchanged.
+if mcp_app is not None:
     app.mount("/api/app-mcp", mcp_app)
-except Exception as _mcp_err:
-    print(f"⚠️ App MCP server not mounted: {_mcp_err}")
+else:
+    print("⚠️ App MCP server not mounted: build failed at boot", flush=True)
 
 
 def _resolved_default_model() -> str:

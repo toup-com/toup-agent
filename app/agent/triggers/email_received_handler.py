@@ -58,6 +58,38 @@ logger = logging.getLogger(__name__)
 _SUMMARY_MAX_TOKENS = 1500
 _OPERATION_TYPE = "user.trigger.email_received"
 
+# The B-3 shadow leg must never delay a trigger past its own retry budget
+# (runner.py backs off at (5, 30, 120)s) — the served message is already
+# persisted+broadcast when the shadow starts, so past this bound the
+# shadow is abandoned, not the trigger.
+_SHADOW_TIMEOUT_S = 90.0
+
+
+def _fp(text: str) -> "tuple[int, str]":
+    """(chars, 8-hex sha256) — the W-6 fingerprint idiom (ctx_shadow).
+
+    Never the content: both bodies carry sender names and the substance
+    of the user's email, and this goes in a log line.
+    """
+    import hashlib
+
+    t = text or ""
+    return len(t), hashlib.sha256(t.encode("utf-8")).hexdigest()[:8]
+
+
+def _runner_enabled_for(user_id: str) -> bool:
+    """Serve the runner path: global flag OR the per-tenant canary list.
+
+    Same idiom as `stable_prefix_enabled` / `_agent_ctx_enabled_for` —
+    parsed per call so an env change takes effect on the next fire.
+    """
+    from app.config import settings
+
+    if settings.trigger_turns_via_runner:
+        return True
+    raw = getattr(settings, "trigger_turns_via_runner_user_ids", "") or ""
+    return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
 
 # Per-process dedupe for reauth notices. Key: (user_id, trigger_id);
 # value: epoch seconds of last notify. Pub/Sub retries + sibling pushes
@@ -749,55 +781,16 @@ class EmailReceivedHandler:
         from app.config import settings
 
         runner = self._agent_runner
-        if not settings.trigger_turns_via_runner or runner is None:
+        if not _runner_enabled_for(trigger.user_id) or runner is None:
+            # Legacy serves. The shadow (B-3 flip prerequisite) runs the
+            # runner leg BESIDE it — tools suppressed, output discarded,
+            # one fingerprint log line — for every tenant not yet flipped.
+            if getattr(settings, "trigger_turn_shadow", False) and runner is not None:
+                return await self._legacy_with_shadow(trigger, emails, db)
             return await self._do_summarize_and_post(trigger, emails, db)
 
-        cfg = trigger.config_json or {}
-        # Same default-cheap policy as _do_summarize_and_post — the
-        # trigger's configured model wins, gpt-4o-mini otherwise.
-        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
-
         try:
-            if len(emails) == 1:
-                email_block = _format_one_for_llm(emails[0])
-            else:
-                email_block = _format_batch_for_llm(emails)
-            prompt = (
-                f"[Automated turn — Gmail trigger "
-                f"\"{trigger.name or 'Email trigger'}\" fired; the user is "
-                "not present.]\n\n"
-                f"New email{'s' if len(emails) > 1 else ''}:\n\n"
-                f"{email_block}\n\n"
-                "Write the short notification body for the user's day "
-                "chat: 1-3 sentences on what the email actually says "
-                "(one bullet per email for a burst), plus an "
-                "\"Action: …\" line only when it explicitly asks for a "
-                "reply, deadline, approval, or RSVP. Do not take any "
-                "action beyond reading context; never claim to have "
-                "sent or completed anything."
-            )
-            # Kwarg set proven by autopilot_handler / agent_task_handler:
-            # synthetic turn, no persistence, no memory mining, hard
-            # credit ceiling. current_job_id = the claimed BuildJob row
-            # (events ARE BuildJobs post-PR#49; event_id carries its id).
-            response = await runner.run(
-                user_message=prompt,
-                user_id=trigger.user_id,
-                channel="trigger",
-                current_job_id=(emails[0].event_id if emails else None),
-                save_user_message=False,
-                save_assistant_message=False,
-                disable_post_processing=True,
-                model_override=model_choice,
-                credit_budget=settings.trigger_turn_credit_budget,
-            )
-            text = (
-                getattr(response, "text", None)
-                or getattr(response, "content", None)
-                or ""
-            )
-            if not text.strip():
-                raise RuntimeError("agent runner returned empty response")
+            text, model_choice, _resp = await self._runner_text(trigger, emails)
         except Exception as e:
             # Fail-open — the summarize path has been delivering since
             # launch; the runner path is the experiment.
@@ -818,11 +811,130 @@ class EmailReceivedHandler:
             title_suffix=_compose_title_suffix(emails),
         )
 
-    async def _do_summarize_and_post(
+    async def _runner_text(
+        self, trigger: Any, emails: list[_FetchedEmail],
+        *, suppress_tools: bool = False,
+    ) -> tuple[str, str, Any]:
+        """The runner leg's raw body: (text, model, AgentResponse).
+
+        Raises on any failure or empty output — the caller decides
+        whether that means fail-open (serve path) or a shadow log line
+        (shadow path). ``suppress_tools`` is the shadow's safety rail:
+        a discarded turn must not fire a single tool.
+        """
+        from app.config import settings
+
+        runner = self._agent_runner
+        cfg = trigger.config_json or {}
+        # Same default-cheap policy as _summarize_text — the trigger's
+        # configured model wins, gpt-4o-mini otherwise.
+        model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
+
+        if len(emails) == 1:
+            email_block = _format_one_for_llm(emails[0])
+        else:
+            email_block = _format_batch_for_llm(emails)
+        prompt = (
+            f"[Automated turn — Gmail trigger "
+            f"\"{trigger.name or 'Email trigger'}\" fired; the user is "
+            "not present.]\n\n"
+            f"New email{'s' if len(emails) > 1 else ''}:\n\n"
+            f"{email_block}\n\n"
+            "Write the short notification body for the user's day "
+            "chat: 1-3 sentences on what the email actually says "
+            "(one bullet per email for a burst), plus an "
+            "\"Action: …\" line only when it explicitly asks for a "
+            "reply, deadline, approval, or RSVP. Do not take any "
+            "action beyond reading context; never claim to have "
+            "sent or completed anything."
+        )
+        # Kwarg set proven by autopilot_handler / agent_task_handler:
+        # synthetic turn, no persistence, no memory mining, hard
+        # credit ceiling. current_job_id = the claimed BuildJob row
+        # (events ARE BuildJobs post-PR#49; event_id carries its id).
+        kwargs = dict(
+            user_message=prompt,
+            user_id=trigger.user_id,
+            channel="trigger",
+            current_job_id=(emails[0].event_id if emails else None),
+            save_user_message=False,
+            save_assistant_message=False,
+            disable_post_processing=True,
+            model_override=model_choice,
+            credit_budget=settings.trigger_turn_credit_budget,
+        )
+        if suppress_tools:
+            kwargs["suppress_tools"] = True
+        response = await runner.run(**kwargs)
+        text = (
+            getattr(response, "text", None)
+            or getattr(response, "content", None)
+            or ""
+        )
+        if not text.strip():
+            raise RuntimeError("agent runner returned empty response")
+        return text, model_choice, response
+
+    async def _legacy_with_shadow(
         self, trigger: Any, emails: list[_FetchedEmail], db: AsyncSession,
     ) -> tuple[str, str]:
-        """LLM summary action. Single email → tight summary. Multi
-        (coalesced burst) → digest."""
+        """Serve the summarize path; run the runner leg as a SHADOW.
+
+        Mirrors W-6's `_instructions_step`: the served result is
+        persisted FIRST (a shadow failure or timeout must never cost the
+        user their notification), then the runner leg runs with tools
+        suppressed and its body is reduced to a fingerprint log line and
+        discarded. The outputs are generative prose, so `match=` is
+        expected False on virtually every fire — the flip criterion is
+        availability (non-empty body, within budget, sane latency) on
+        consecutive real fires, per the ledger's B-3 row.
+        """
+        import asyncio
+        import time as _time
+
+        legacy_text, model_used = await self._summarize_text(trigger, emails)
+        content = _compose_email_chat_card(emails, legacy_text)
+        result = await self._persist_message(
+            trigger=trigger, db=db,
+            content=content,
+            model_used=model_used,
+            title_suffix=_compose_title_suffix(emails),
+        )
+
+        try:
+            t0 = _time.monotonic()
+            text, rmodel, resp = await asyncio.wait_for(
+                self._runner_text(trigger, emails, suppress_tools=True),
+                timeout=_SHADOW_TIMEOUT_S,
+            )
+            runner_ms = int((_time.monotonic() - t0) * 1000)
+            r_chars, r_fp = _fp(text)
+            l_chars, l_fp = _fp(legacy_text)
+            logger.info(
+                "[trigger_email] turn_shadow match=%s runner_chars=%d "
+                "legacy_chars=%d runner_fp=%s legacy_fp=%s model=%s "
+                "credits=%s runner_ms=%d stopped=%s",
+                r_fp == l_fp, r_chars, l_chars, r_fp, l_fp, rmodel,
+                getattr(resp, "credits_spent", None), runner_ms,
+                getattr(resp, "stopped_reason", None),
+            )
+        except Exception as e:
+            # The shadow must never raise into the trigger result.
+            logger.info(
+                "[trigger_email] turn_shadow unavailable trigger_id=%s "
+                "err=%s", trigger.id, e,
+            )
+        return result
+
+    async def _summarize_text(
+        self, trigger: Any, emails: list[_FetchedEmail],
+    ) -> tuple[str, str]:
+        """The summarize leg's raw body: (text, model).
+
+        Split out of `_do_summarize_and_post` so the B-3 shadow can
+        compare the two legs' bodies at the last common seam — the raw
+        LLM text, before the shared `_compose_email_chat_card` wrapper.
+        """
         llm = self._llm_fn
         if llm is None:
             from app.services.internal_llm import call_system_llm
@@ -870,8 +982,14 @@ class EmailReceivedHandler:
         # so the user always sees what they wrote. Catches single-email
         # case; batch case is rarer and the per-email gist guards itself.
         text = _guard_summary_against_no_body(text, emails)
+        return text, model_choice
 
-        model_used = model_choice
+    async def _do_summarize_and_post(
+        self, trigger: Any, emails: list[_FetchedEmail], db: AsyncSession,
+    ) -> tuple[str, str]:
+        """LLM summary action. Single email → tight summary. Multi
+        (coalesced burst) → digest."""
+        text, model_used = await self._summarize_text(trigger, emails)
 
         # Wrap the LLM body with a Gmail-flavoured header so the chat
         # card reads like a notification, not a generic agent reply.

@@ -1537,6 +1537,20 @@ class Settings(BaseSettings):
     # (credit_budget kwarg) — a runaway tool loop on an unattended
     # turn stops here, not at the user's monthly balance.
     trigger_turn_credit_budget: float = 25.0
+    # B-3 flip prerequisite 1 — the W-6-style shadow: on a real trigger
+    # fire, run the runner path BESIDE the served summarize path
+    # (tools suppressed, output discarded), log a one-line fingerprint
+    # comparison, and serve legacy. The outputs are generative prose,
+    # so the criterion is not hash equality (it never will be) but
+    # runner availability: non-empty body, within budget, sane latency,
+    # on consecutive real fires. Env TRIGGER_TURN_SHADOW via the bridge.
+    trigger_turn_shadow: bool = False
+    # B-3 flip prerequisite 2 — the per-tenant canary. The global flag
+    # above is fleet-uniform on the next rollout; this comma-separated
+    # user-id list serves the runner path to listed tenants only
+    # (canary → founder → fleet), same idiom as
+    # stable_prefix_canary_user_ids. Env TRIGGER_TURNS_VIA_RUNNER_USER_IDS.
+    trigger_turns_via_runner_user_ids: str = ""
 
     # T4a — GitHub OAuth client. PKCE off (provider doesn't support
     # it on the standard OAuth app type — see provider_apps.py).
