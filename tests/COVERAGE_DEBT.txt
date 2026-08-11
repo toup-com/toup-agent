@@ -51,6 +51,7 @@ test_subagent_orphan_sweep.py  # agent-mode
 test_trigger_health_and_reverify.py  # agent-mode
 test_trigger_schema.py  # agent-mode
 test_triggers_api.py  # agent-mode
+test_memory_upsert_and_enum.py  # agent-mode — the floor-invariant index tests skip under platform ("requires AGENT_ONLY tables"); under RUN_MODE=agent all 5 run, incl. the partial-unique-index fixture #564 added. In the platform sweep this file passed as 2-passed-3-skipped, i.e. the invariant it exists for was never checked anywhere (GA audit C10).
 
 # --- QUARANTINED: red on 2026-08-03, none of them ever run by CI ---
 test_agent_defer_boot_init.py  # asserts something the code no longer does
