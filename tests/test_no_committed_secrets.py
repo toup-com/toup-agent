@@ -190,6 +190,67 @@ def test_acknowledged_pem_fixtures_do_not_exempt_real_private_keys(tmp_path):
     assert "private-key-block" in result.stdout
 
 
+def test_encrypted_private_keys_are_flagged(tmp_path):
+    """The round-2 audit committed a passphrase-protected key with ZERO
+    findings: `openssl genpkey ... -aes-256-cbc` emits the ENCRYPTED
+    banner, which the alternation lacked. An encrypted key is still a
+    credential — the passphrase is usually weaker than the key, and the
+    file names exactly what to brute-force."""
+    leak = tmp_path / "backup.pem"
+    leak.write_text(
+        f"{_PEM_BANNER.replace('BEGIN ', 'BEGIN ENCRYPTED ')}\n"
+        "MIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0B\n"
+    )
+
+    result = _scan([str(leak)], allowlist=ALLOWLIST)
+    assert result.returncode == 1, (
+        "a passphrase-protected private key scanned clean — the ENCRYPTED "
+        "banner escaped the private-key pattern"
+    )
+    assert "private-key-block" in result.stdout
+
+
+def test_blank_line_after_banner_still_binds_per_key(tmp_path):
+    """A banner followed by a blank line (or at EOF) must not collapse
+    every such key to one digest — that would recreate the class
+    exemption in an edge: one acknowledged degenerate fixture would
+    silence every blank-after-banner key."""
+    from scripts.scan_secrets import scan_text
+
+    a = scan_text(f"{_PEM_BANNER}\n\nMIIBodyAaaa111\n", "a.pem")
+    b = scan_text(f"{_PEM_BANNER}\n\nMIIBodyBbbb222\n", "b.pem")
+    assert a and b
+    assert a[0].digest != b[0].digest, (
+        "two different keys with a blank line after the banner share one "
+        "digest — the binding skipped to the empty string, not the body"
+    )
+
+    # Body-less banners bind to a path-scoped sentinel: an acknowledgement
+    # can never reach beyond its own file.
+    e1 = scan_text(f"{_PEM_BANNER}\n", "one.md")
+    e2 = scan_text(f"{_PEM_BANNER}\n", "two.md")
+    assert e1[0].digest != e2[0].digest
+
+
+def test_opacity_lookahead_is_case_sensitive(tmp_path):
+    """(?i) on the NAME must not leak into the value's [A-Z0-9] opacity
+    check — under a bare (?i) it matched lowercase too, flagging
+    all-lowercase placeholder prose (`change-this-to-a-...`) as key
+    material, which is how allowlist noise gets manufactured."""
+    from scripts.scan_secrets import scan_text
+
+    # Assembled at runtime so THIS file does not carry the shapes.
+    name = "JWT_" + "SECRET"
+    prose = name + "=change-this-to-a-long-random-secret-value-now"
+    assert scan_text(prose, "x.env") == [], (
+        "an all-lowercase dictionary-word value was flagged as a secret"
+    )
+    # The control: a value with real opacity still fires.
+    opaque_value = "aB3dEf9hIjKlMnOpQrStUvWx" + "Yz01234567890abcdef"
+    opaque = name + "=" + opaque_value
+    assert any(f.pattern == "env-assignment" for f in scan_text(opaque, "x.env"))
+
+
 def test_pem_digest_is_per_key_not_per_banner(tmp_path):
     """Two keys, same banner, different bodies → different digests, and
     acknowledging one must not silence the other."""

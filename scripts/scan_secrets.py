@@ -96,7 +96,10 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("slack-token", re.compile(r"\bxox[abposr]-[A-Za-z0-9\-]{10,}")),
     ("stripe-key", re.compile(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{20,}")),
     ("google-key", re.compile(r"\bAIza[A-Za-z0-9_\-]{35}\b")),
-    ("private-key-block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----")),
+    # ENCRYPTED is openssl's DEFAULT output for passphrase-protected keys
+    # (`genpkey -aes-256-cbc`, `pkcs8 -topk8`) — the round-2 audit committed
+    # one with ZERO findings while this alternation lacked it.
+    ("private-key-block", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----")),
     # A JWT with a payload — two base64url segments joined by a dot.
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}")),
     # DSN carrying an inline password. Group 1 = the password only.
@@ -112,12 +115,17 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # expression (`_token = _ctx_token.set(...)`, `cached = _extract(u)`),
     # which is code, not key material. Quotes are what separate "this
     # program computes a token" from "this file contains one".
+    # The (?i) is for the NAME (jwt_secret= and JWT_SECRET= both count).
+    # The value's opacity lookahead is pinned case-sensitive with (?-i:),
+    # because under a bare (?i) the [A-Z0-9] class matched lowercase too,
+    # collapsing "must contain an upper or digit" into "contains a letter"
+    # — which flagged all-lowercase placeholder prose as key material.
     (
         "assigned-secret",
         re.compile(
             r"(?i)\b(?:[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|TOKEN|PRIVATE_?KEY)"
             r"[A-Z0-9_]*)\s*[:=]\s*"
-            r"['\"]((?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9])[A-Za-z0-9+/_\-=]{20,})['\"]"
+            r"['\"]((?-i:(?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})['\"]"
         ),
     ),
     # Env-file shape: NAME=value on its own line, unquoted, no spaces.
@@ -128,7 +136,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(
             r"(?im)^\s*(?:export\s+)?[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|TOKEN|PRIVATE_?KEY)"
             r"[A-Z0-9_]*\s*=\s*"
-            r"((?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9])[A-Za-z0-9+/_\-=]{20,})\s*$"
+            r"((?-i:(?=[^'\"\s]*[a-z])(?=[^'\"\s]*[A-Z0-9]))[A-Za-z0-9+/_\-=]{20,})\s*$"
         ),
     ),
     # PROXIMITY: a secret-ish NAME and an opaque high-entropy token on the
@@ -231,10 +239,32 @@ def _git_tracked_files(root: Path):
 #: class — which happened: acknowledging the synthetic PEM banner in
 #: PRE-LAUNCH-CHECKLIST.md silently allowlisted every private key ever
 #: pasted anywhere in the repo. For these, the digest binds the banner
-#: to the LINE THAT FOLLOWS it (the first line of key material), so each
-#: acknowledgement covers one specific key and a real key — whose body
-#: cannot equal a fixture's — always produces an unacknowledged digest.
+#: to the first NON-EMPTY line that follows it (the first line of key
+#: material), so each acknowledgement covers one specific key and a real
+#: key — whose body cannot equal a fixture's — always produces an
+#: unacknowledged digest.
 _CONSTANT_MATCH_PATTERNS = frozenset({"private-key-block"})
+
+
+def _constant_match_binding(lines: list[str], lineno: int, tail: str, path: str) -> str:
+    """What a constant-match banner's digest binds to.
+
+    Skipping blank lines matters: binding to `lines[lineno]` verbatim
+    meant a banner followed by a blank line — or sitting at EOF — bound
+    to the empty string, giving every such key the SAME digest. One
+    acknowledged degenerate fixture would then have exempted the whole
+    blank-after-banner class, the exact defect this mechanism removes.
+    A banner with no body at all binds to a path-scoped sentinel, so an
+    acknowledgement of a body-less fixture can never reach beyond its
+    own file.
+    """
+    if tail:
+        return tail
+    for follow in lines[lineno:]:
+        stripped = follow.strip()
+        if stripped:
+            return stripped
+    return f"<no-body:{path}>"
 
 
 def scan_text(text: str, path: str) -> list[Finding]:
@@ -256,9 +286,10 @@ def scan_text(text: str, path: str) -> list[Finding]:
                     ):
                         continue
                 if name in _CONSTANT_MATCH_PATTERNS:
-                    rest_of_line = line[m.end():].strip()
-                    next_line = lines[lineno].strip() if lineno < len(lines) else ""
-                    digest_input = f"{value}\n{rest_of_line or next_line}"
+                    binding = _constant_match_binding(
+                        lines, lineno, line[m.end():].strip(), path
+                    )
+                    digest_input = f"{value}\n{binding}"
                 else:
                     digest_input = value
                 out.append(

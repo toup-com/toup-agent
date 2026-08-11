@@ -159,10 +159,15 @@ async def check_credit_health() -> dict:
                 # NOT IN drops NULLs in SQL and most rows have no such key, so
                 # the IS NULL arm is load-bearing, not defensive.
                 or_(_is_admin.is_(None), ~_is_admin),
-                # Exclude the 1-cent FLOOR. `_calc_cost_cents` ends in
-                # `max(1, int(cost_usd * 100))`, so a 15-token embedding whose
-                # true cost is ~$0.0000003 is recorded as a full cent — five
-                # orders of magnitude high. Measured over 30 days of production:
+                # Exclude the 1-cent FLOOR era. Until 2026-08-10 (#559/084)
+                # `_calc_cost_cents` ended in `max(1, int(cost_usd * 100))`,
+                # so a 15-token embedding whose true cost is ~$0.0000003 was
+                # recorded as a full cent — five orders of magnitude high.
+                # Post-084 rows are exact (min(exact_4dp, legacy)); this
+                # filter keeps excluding the historical floored mass, and
+                # drops post-084 sub-cent rows as ratio noise, which is the
+                # conservative direction for this alarm.
+                # Measured over 30 days of pre-084 production:
                 # 3507 floored rows contributing a fictitious $35.07 against
                 # 1059 real rows worth $70.37, which dragged this ratio to 0.428
                 # — under the 0.5 critical bar. The alarm would have paged

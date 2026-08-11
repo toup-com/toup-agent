@@ -382,6 +382,13 @@ def _never_higher_cents(cost_usd: float) -> Decimal:
 
 #: text-embedding-3-small: $0.02 per MILLION tokens = $0.00002 per 1,000.
 #: Same per-1k convention as ``settings.pricing_per_1k``.
+#:
+#: MODEL-BLIND, knowingly: the embeddings route prices every request at
+#: this one rate. The only production caller (embedding_service) pins
+#: text-embedding-3-small; a hypothetical 3-large request ($0.13/1M)
+#: would be under-recorded 6.5x — an undercharge, which the R-3
+#: never-higher rule permits. If a second embedding model ever ships,
+#: this constant must become a lookup keyed on the request's model.
 _EMBEDDING_USD_PER_1K = 0.00002
 
 
