@@ -18,10 +18,14 @@ Also pinned here:
   * the UNIFIED ordering rule — soul first, even when a higher-priority
     non-soul row exists (the runner's rule wins; voice's plain
     priority-sorted append is the one that changes);
-  * #488 by construction — `build_voice_context` resolves TODAY's day
-    chat via `resolve_day_chat_id_for_now`, so a user whose newest day
-    chat is YESTERDAY gets today's (empty) history, never yesterday's
-    transcript relabelled.
+  * #488 the way the live relay fixed it — the newest day chat is
+    served, and when it is not the user's local today its header names
+    the real date and says so. The earlier draft resolved-and-created
+    TODAY instead; that was byte-divergent from the relay, and the W-6
+    flip criterion is `ctx_shadow match=True` on real sessions, so the
+    day leg now mirrors the relay exactly (header, line format, raw-row
+    count, 500-row cap). A previous day narrated as today stays
+    impossible in both designs.
 
 Tables: this file is swept under RUN_MODE=platform, where init_db does
 not build `identities` (AGENT_ONLY, base.py). It therefore creates every
@@ -413,8 +417,13 @@ def test_voice_anchor_carries_no_markdown_and_keeps_the_founder_carve_out():
 # 3. build_voice_context — the assembler
 # ──────────────────────────────────────────────────────────────────────
 
-async def _seed_day(db, user_id: str, local_date: Date, msgs):
-    """msgs: list of (role, content, channel, hour)."""
+async def _seed_day(db, user_id: str, local_date: Date, msgs, conv_channel: str = "web"):
+    """msgs: list of (role, content, channel, hour).
+
+    `conv_channel` is what the day feed actually renders — the endpoint
+    (and therefore the assembler) reads the CONVERSATION's channel via the
+    join, not the per-message column.
+    """
     import uuid as _uuid
     from app.db.models import Conversation, Message
     from app.db.models.day_chat import DayChat
@@ -427,7 +436,7 @@ async def _seed_day(db, user_id: str, local_date: Date, msgs):
     await db.flush()
     conv_id = str(_uuid.uuid4())
     db.add(Conversation(
-        id=conv_id, user_id=user_id, channel="web", day_chat_id=dc_id,
+        id=conv_id, user_id=user_id, channel=conv_channel, day_chat_id=dc_id,
         started_at=datetime(local_date.year, local_date.month, local_date.day, 9, 0, 0),
     ))
     for i, (role, content, channel, hour) in enumerate(msgs):
@@ -508,18 +517,18 @@ async def test_voice_context_soul_hoist_and_no_soul_default(voice_tables):
 
 
 @pytest.mark.asyncio
-async def test_488_day_is_today_by_construction_not_the_newest_row(voice_tables):
-    """#488, pinned.
+async def test_488_previous_day_is_served_with_its_real_date_label(voice_tables):
+    """#488, pinned the way the live relay pins it.
 
     The user has a day chat for YESTERDAY and has said nothing today. The
-    relay asked `/api/day-chats?limit=1` (ordered local_date DESC) and
-    printed yesterday's transcript under "Today's Full Conversation
-    History". This assembler resolves the day from the user's local NOW,
-    so it gets today's row — created on the spot — and an empty history.
+    pre-guard relay printed yesterday's transcript under "Today's Full
+    Conversation History" — that mislabelling IS #488. The shipped guard
+    (and now this assembler, byte-identically) serves the newest day but
+    labels it with its real date and says nothing has been said today.
 
     The frozen instant matters: 2026-08-04 02:30 UTC is still
-    2026-08-03 in Toronto, so a UTC-based resolver would ALSO get the
-    wrong day (2026-08-04). Both failure modes are excluded at once.
+    2026-08-03 in Toronto, so a UTC-based labeller would call the block
+    "not today" with the WRONG today (2026-08-04) in the sentence.
     """
     from app.db import async_session_maker
     from app.agent.voice_context import build_voice_context
@@ -537,27 +546,32 @@ async def test_488_day_is_today_by_construction_not_the_newest_row(voice_tables)
             db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
         )
 
-    assert ctx.day_date == LOCAL_TODAY, (
-        f"expected the user's LOCAL today {LOCAL_TODAY}; "
-        f"{LOCAL_YESTERDAY} is #488 (newest existing row), "
-        f"2026-08-04 is the UTC date"
+    assert ctx.day_date == LOCAL_YESTERDAY, (
+        "the newest existing day chat is what the relay serves — parity "
+        "means serving the same one"
     )
-    assert "day_history" not in ctx.sections
-    assert "book the dentist" not in ctx.instructions, (
-        "yesterday's transcript must not reach the voice prompt at all"
+    day = ctx.sections["day_history"]
+    assert day.startswith(
+        f"# Conversation from {LOCAL_YESTERDAY} — the last day you and the "
+        "user spoke (2 messages across all channels). This is NOT today: "
+        f"today is {LOCAL_TODAY} and nothing has been said today yet."
+    ), "the #488 protection is the truthful label, not an empty prompt"
+    assert "book the dentist" in ctx.instructions, (
+        "the transcript itself is served — context is kept, only the "
+        "mislabelling is gone"
     )
-    assert "Today's Full Conversation History" not in ctx.instructions
-    # The leg SUCCEEDED and today is genuinely blank — that is `empty`,
-    # not `degraded`. Reporting it as degraded would fire the alarm on the
-    # first voice call of every morning for every user.
-    assert "day" in ctx.empty and not ctx.degraded
+    assert "Today's Full Conversation History" not in ctx.instructions, (
+        "a previous day must never carry the today header — that IS #488"
+    )
+    assert not ctx.degraded
 
 
 @pytest.mark.asyncio
 async def test_488_control_todays_messages_do_load(voice_tables):
     """ANTI-VACUITY CONTROL for the pin above: the same code path with
-    messages stamped on TODAY renders them. Without this, a resolver that
-    simply returned nothing would pass the #488 test."""
+    messages stamped on TODAY renders them under the today header, in the
+    relay's exact line format (`{speaker} [{channel}]: {content}`, channel
+    from the CONVERSATION row)."""
     from app.db import async_session_maker
     from app.agent.voice_context import build_voice_context
 
@@ -567,7 +581,7 @@ async def test_488_control_todays_messages_do_load(voice_tables):
         await _seed_day(db, user_id, Date(2026, 8, 3), [
             ("user", "remind me about the flight", "telegram", 9),
             ("assistant", "It leaves at six.", "telegram", 9),
-        ])
+        ], conv_channel="telegram")
 
     async with async_session_maker() as db:
         ctx = await build_voice_context(
@@ -576,11 +590,11 @@ async def test_488_control_todays_messages_do_load(voice_tables):
 
     assert ctx.day_date == LOCAL_TODAY
     day = ctx.sections["day_history"]
-    assert day.startswith(
-        "# Today's Full Conversation History (2 messages across all channels)"
+    assert day == (
+        "# Today's Full Conversation History (2 messages across all channels)\n"
+        "User [telegram]: remind me about the flight\n"
+        "You [telegram]: It leaves at six."
     )
-    assert "User: [telegram" in day and "remind me about the flight" in day
-    assert "You: [telegram" in day and "It leaves at six." in day
     assert "day" not in ctx.degraded
 
 
@@ -666,8 +680,10 @@ async def test_voice_context_degraded_names_every_empty_leg(voice_tables):
 
 @pytest.mark.asyncio
 async def test_voice_context_honours_the_frozen_clock_and_onboarding(voice_tables):
-    """`now_utc` reaches BOTH the day resolver and the clock line — a
-    module that read the wall clock for either would fail here."""
+    """`now_utc` reaches BOTH the clock line and the day labelling — a
+    module that read the wall clock for either would fail here. With no
+    day chats at all, `day_date` is None: the relay serves nothing here
+    and creates nothing, so parity means we do too."""
     from app.db import async_session_maker
     from app.agent.voice_context import build_voice_context
 
@@ -681,7 +697,7 @@ async def test_voice_context_honours_the_frozen_clock_and_onboarding(voice_table
         )
 
     assert "The current date and time is 2026-08-04 02:30 UTC." in ctx.instructions
-    assert ctx.day_date == LOCAL_TODAY
+    assert ctx.day_date is None and "day_history" not in ctx.sections
     assert ctx.sections["onboarding"].startswith("# ONBOARDING MODE")
     assert ctx.instructions.rstrip().endswith(
         "Do NOT call finalize_onboarding until you have gathered enough info."
@@ -723,6 +739,215 @@ async def test_voice_context_budget_trims_only_the_trimmable_blocks(voice_tables
     # Persona survives the budget untouched.
     assert small.sections["identity"] == big.sections["identity"]
     assert small.sections["identity"] == IDENTITY_GOLDEN_FOUR_DOCS
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 3b. W-6 flip criterion — byte parity with the relay's day block, and
+#     the documented-benign divergence classes
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_day_header_matches_the_relay_byte_for_byte():
+    """Cross-pin: `voice_context.day_history_header` IS the relay's
+    `_day_history_header`. Two copies exist only until the legacy builder
+    is deleted; until then this test is what holds them together.
+    """
+    import app.api.ws_realtime as rt
+    from app.agent.voice_context import day_history_header
+
+    grid = [
+        (0, None, None),
+        (2, "2026-08-03", None),
+        (2, None, "2026-08-03"),
+        (2, "2026-08-03", "2026-08-03"),
+        (82, "2026-08-02", "2026-08-03"),
+        (500, "2025-12-31", "2026-01-01"),
+    ]
+    for total, day_date, local_today in grid:
+        assert day_history_header(total, day_date, local_today) == \
+            rt._day_history_header(total, day_date, local_today), (
+                f"header diverged for {(total, day_date, local_today)} — "
+                "the shadow will report every session as differs="
+            )
+
+
+@pytest.mark.asyncio
+async def test_day_header_counts_raw_rows_like_the_relay(voice_tables):
+    """The relay's header counts the RAW endpoint rows; the lines below
+    filter to user/assistant turns with non-empty content. A day holding
+    a tool row and a blank assistant row therefore says "4 messages" over
+    2 rendered lines — on both sides identically, because the comparator
+    hashes bytes, not intentions."""
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        await _seed(db, user_id, rows=FOUR_DOCS, agent_name=AGENT_NAME)
+        await _seed_day(db, user_id, Date(2026, 8, 3), [
+            ("user", "what's on today?", "web", 9),
+            ("tool", '{"result": "noise"}', "web", 9),
+            ("assistant", "", "web", 9),
+            ("assistant", "Your day is clear.", "web", 9),
+        ])
+
+    async with async_session_maker() as db:
+        ctx = await build_voice_context(
+            db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
+        )
+
+    day = ctx.sections["day_history"]
+    assert day == (
+        "# Today's Full Conversation History (4 messages across all channels)\n"
+        "User [web]: what's on today?\n"
+        "You [web]: Your day is clear."
+    )
+
+
+@pytest.mark.asyncio
+async def test_divergence_class_empty_day_emits_nothing(voice_tables):
+    """DOCUMENTED-BENIGN divergence class 1 (W-6 flip justification).
+
+    A day chat exists but holds zero messages. The relay falls back to a
+    legacy sessions-based block ("# Today's Conversation History (most
+    recent)" — up to 20 stale, 300-char-truncated lines); this assembler
+    serves nothing. The shadow reports differs= for such sessions, and
+    that is accepted: the stale block is noise the deletion PR removes,
+    the persona and brains are unaffected, and reproducing a
+    session-table scan just to match dead code would keep the dead code's
+    behaviour alive past its deletion. Pinned so the class is a decision,
+    not an accident."""
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        await _seed(db, user_id, rows=FOUR_DOCS, agent_name=AGENT_NAME)
+        await _seed_day(db, user_id, Date(2026, 8, 3), [])
+
+    async with async_session_maker() as db:
+        ctx = await build_voice_context(
+            db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
+        )
+
+    assert "day_history" not in ctx.sections
+    assert "Today's Conversation History (most recent)" not in ctx.instructions
+    assert "day" in ctx.empty and "day" not in ctx.degraded
+
+
+@pytest.mark.asyncio
+async def test_divergence_class_tenant_tz_labels_when_relay_cannot(voice_tables):
+    """DOCUMENTED-BENIGN divergence class 2 (W-6 flip justification).
+
+    The relay's date guard reads the PLATFORM `users.timezone`, NULL for
+    most accounts, and with no zone it puts the today-header on whatever
+    day it serves — #488 alive for exactly those users. This assembler
+    falls back to the TENANT copy (the one chat and mobile actually
+    write) and labels truthfully. For a platform-NULL/tenant-set user
+    whose newest day is not today, the shadow reports the day section as
+    differs= — and the agent side is the RIGHT one, so the class is
+    accepted rather than "fixed" by reproducing the relay's mislabel.
+    The class shrinks as clients send their zone (#566 self-heal fills
+    the platform copy)."""
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        # _seed writes tenant User.timezone=TORONTO; the relay would pass
+        # tz_name=None for a platform-NULL account, which is what we do.
+        await _seed(db, user_id, rows=FOUR_DOCS, agent_name=AGENT_NAME)
+        await _seed_day(db, user_id, Date(2026, 8, 2), [
+            ("user", "wrap up my day", "web", 22),
+            ("assistant", "Done — three tasks closed.", "web", 22),
+        ])
+
+    async with async_session_maker() as db:
+        ctx = await build_voice_context(
+            db, user_id, tz_name=None, now_utc=FROZEN_UTC,
+        )
+
+    day = ctx.sections["day_history"]
+    assert day.startswith(f"# Conversation from {LOCAL_YESTERDAY}"), (
+        "the tenant zone must label the stale day truthfully — the "
+        "mislabelled alternative is #488"
+    )
+    assert "day_timezone" not in ctx.degraded, (
+        "the tenant zone resolved; degraded would be a false alarm"
+    )
+
+
+@pytest.mark.asyncio
+async def test_divergence_class_soulless_default_persona_is_pinned(voice_tables):
+    """DOCUMENTED-BENIGN divergence class 3 (W-6 flip justification).
+
+    A user with no identity documents in the tenant DB: this assembler
+    emits the runner's default persona (D3 — voice matches text chat);
+    the relay emits no identity block at all when other sections exist.
+    The shadow reports Core Identity as differs= for such sessions. The
+    class is accepted because the default IS the product decision text
+    chat already ships, and it EMPTIES after the identity backfill: every
+    assigned tenant then carries real rows on both sides. Byte-pinned so
+    a drift in the default text shows up here, not in the shadow."""
+    from app.db import async_session_maker
+    from app.agent.agent_runner import DEFAULT_SOUL_CONTENT
+    from app.agent.voice_context import build_voice_context
+    from app.db.models.user import User
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(
+            id=user_id, email=f"g19a-nosoul-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="x", name="NoSoul", timezone=TORONTO,
+        ))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        ctx = await build_voice_context(
+            db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
+        )
+
+    assert ctx.sections["identity"] == f"# Core Identity\n{DEFAULT_SOUL_CONTENT}"
+
+
+def test_flip_allowlist_serves_agent_context_per_user():
+    """`voice_context_from_agent` is a platform-process GLOBAL; the
+    allowlist is what makes canary→founder→fleet a real sequence instead
+    of a fleet flip with a reassuring name."""
+    from unittest.mock import patch as _patch
+
+    from app.api.ws_realtime import _agent_ctx_enabled_for
+    from app.config import settings
+
+    canary = "533354ce-0000-0000-0000-000000000000"
+    other = "871bac24-0000-0000-0000-000000000000"
+
+    with _patch.object(settings, "voice_context_from_agent", False), \
+         _patch.object(settings, "voice_context_from_agent_user_ids", f" {canary} , "):
+        assert _agent_ctx_enabled_for(canary) is True
+        assert _agent_ctx_enabled_for(other) is False
+
+    with _patch.object(settings, "voice_context_from_agent", False), \
+         _patch.object(settings, "voice_context_from_agent_user_ids", ""):
+        assert _agent_ctx_enabled_for(canary) is False
+
+    with _patch.object(settings, "voice_context_from_agent", True), \
+         _patch.object(settings, "voice_context_from_agent_user_ids", ""):
+        assert _agent_ctx_enabled_for(other) is True
+
+
+def test_internal_route_request_accepts_the_relay_clock():
+    """The `now` field parses an ISO instant (the relay sends
+    `.isoformat()` of an aware UTC datetime). A schema that rejected it
+    would silently un-align the two builders' clock lines again."""
+    from app.api.api_v1 import VoiceContextRequest
+
+    req = VoiceContextRequest(
+        onboarding=False, budget_chars=0, tz_name=TORONTO,
+        now="2026-08-04T02:30:00+00:00",
+    )
+    assert req.now == FROZEN_UTC
+    assert VoiceContextRequest().now is None
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -879,7 +1104,8 @@ async def test_no_timezone_anywhere_still_serves_the_day():
 
 async def test_users_persisted_timezone_is_used_when_the_caller_sends_none():
     """The normal case for a client that does not know the zone: fall back
-    to `User.timezone` and keep the today-by-construction guarantee."""
+    to `User.timezone`, and let it drive the date labelling — today's day
+    chat renders under the today header with no false degradation."""
     from app.db import async_session_maker
     from app.agent.voice_context import build_voice_context
 
@@ -890,13 +1116,17 @@ async def test_users_persisted_timezone_is_used_when_the_caller_sends_none():
         from app.db.models import User
         await db.execute(_upd(User).where(User.id == user_id).values(timezone=TORONTO))
         await db.commit()
+        await _seed_day(db, user_id, Date(2026, 8, 3), [
+            ("user", "morning — what's first?", "web", 8),
+        ])
 
     async with async_session_maker() as db:
         ctx = await build_voice_context(
             db, user_id, tz_name=None, now_utc=FROZEN_UTC,
         )
 
-    assert ctx.day_date == LOCAL_TODAY, (
-        "with a persisted zone the day must still be the user's LOCAL today"
-    )
+    assert ctx.day_date == LOCAL_TODAY
+    assert ctx.sections["day_history"].startswith(
+        "# Today's Full Conversation History (1 messages across all channels)"
+    ), "the persisted zone recognises today's chat AS today"
     assert "day_timezone" not in ctx.degraded

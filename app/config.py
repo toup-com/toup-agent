@@ -826,6 +826,13 @@ class Settings(BaseSettings):
     # then to the base stub; a voice session must never open with nothing.
     voice_context_from_agent: bool = False
     voice_context_shadow: bool = True
+    # Per-user canary for the flip above. `voice_context_from_agent` is a
+    # platform-process global — one process serves every tenant — so the
+    # canary→founder→fleet sequence needs a user-scoped override. Comma-
+    # separated user ids; listed users are SERVED the agent context while
+    # the global flag stays False (and the shadow keeps running for
+    # everyone else).
+    voice_context_from_agent_user_ids: str = ""
     # Full-parity `think` (V2): the realtime relay runs on platform-api, where
     # the in-process agent_runner is absent, so `think` runs the user's OWN
     # agent over its HTTP /api/chat (the SAME AgentRunner text chat uses — full

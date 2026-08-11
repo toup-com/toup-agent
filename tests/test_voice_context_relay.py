@@ -79,8 +79,23 @@ def test_legacy_builder_still_runs_and_is_the_default_return():
 def test_agent_result_is_only_served_behind_the_flag():
     node = _instructions_step_ast()
     src = ast.unparse(node)
-    assert "settings.voice_context_from_agent" in src, (
-        "the agent path is not gated on its flag"
+    # The gate moved into `_agent_ctx_enabled_for` (module level, so the
+    # per-user canary allowlist is unit-testable). The step must call it,
+    # and the helper must read BOTH the global flag and the allowlist —
+    # a helper that read neither would be an ungated fleet flip.
+    assert "_agent_ctx_enabled_for(user_id)" in src, (
+        "the agent path is not gated on its flag helper"
+    )
+    import inspect as _inspect
+
+    import app.api.ws_realtime as _rt
+
+    helper_src = _inspect.getsource(_rt._agent_ctx_enabled_for)
+    assert "settings.voice_context_from_agent" in helper_src, (
+        "the gate helper does not read the global flag"
+    )
+    assert "voice_context_from_agent_user_ids" in helper_src, (
+        "the gate helper does not read the canary allowlist"
     )
     assert "settings.voice_context_shadow" in src, "shadow mode is not wired"
     # In shadow mode the agent string must not be returned. Walk the actual

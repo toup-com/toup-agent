@@ -434,6 +434,10 @@ class VoiceContextRequest(BaseModel):
     # IANA zone from the client. None → the tenant's User.timezone, which
     # is what every other day-chat caller falls back to.
     tz_name: Optional[str] = Field(default=None, max_length=64)
+    # The relay's clock instant. The W-6 shadow hashes sections on both
+    # sides; without a shared instant a minute tick between the legacy
+    # build and this call reads as a Voice Conversation Mode divergence.
+    now: Optional[datetime] = None
 
 
 class VoiceContextResponse(BaseModel):
@@ -474,7 +478,16 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
         raise HTTPException(status_code=503, detail="Agent user not configured")
 
     try:
+        from datetime import timezone as _tz
+
         from app.agent.voice_context import build_voice_context
+
+        # Pydantic parses "now" from ISO; a bare timestamp is treated as
+        # UTC so `.astimezone()` in the day-labelling leg cannot shift it
+        # by the server's zone.
+        _now = req.now
+        if _now is not None and _now.tzinfo is None:
+            _now = _now.replace(tzinfo=_tz.utc)
 
         async with async_session_maker() as db:
             ctx = await build_voice_context(
@@ -482,16 +495,11 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
                 onboarding=req.onboarding,
                 budget_chars=req.budget_chars,
                 tz_name=req.tz_name,
+                now_utc=_now,
             )
-            # `build_voice_context` is read-SHAPED but not read-only:
-            # `get_or_create_day_chat` INSERTs today's `day_chats` row when
-            # it is missing and primes the process-wide id cache. Without
-            # this commit the INSERT rolls back at session close while the
-            # cache keeps the id — a cached pointer to a row that does not
-            # exist. It self-heals on the next resolve, but it also means
-            # the "creates the row when missing" half of the day fix was
-            # not actually true through this endpoint.
-            await db.commit()
+            # Genuinely read-only since the day leg moved to the relay's
+            # newest-day selection (W-6 parity): nothing here INSERTs any
+            # more, so there is nothing to commit and nothing to roll back.
         return VoiceContextResponse(
             instructions=ctx.instructions,
             day_date=ctx.day_date,

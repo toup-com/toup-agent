@@ -15,21 +15,26 @@ catalogued; four of them are ended here, by construction:
       no soul document got NO persona at all on voice while text chat got
       the personal-agent default. One renderer, one trigger.
   D4  day SELECTION — voice asked for `/api/day-chats?limit=1`, which is
-      ordered `local_date DESC`, and printed whatever came back. On a
-      voice-first morning that is YESTERDAY (#488). This module resolves
-      the day the way every other surface does:
-      `resolve_day_chat_id_for_now` → `get_or_create_day_chat`, which
-      RETURNS TODAY and creates the row when it is missing.
+      ordered `local_date DESC`, and printed whatever came back under a
+      "Today's ..." header. On a voice-first morning that is YESTERDAY
+      (#488). The live relay closed #488 with a DATE GUARD
+      (`voice_day_context_date_guard`): it still serves the newest
+      existing day, but when that day is not the user's local today the
+      header names the real date and says nothing has been said today.
 
-      That guarantee is conditional on knowing the user's zone, and the
-      condition is load-bearing: `resolve_local_date` falls back to UTC on
-      an unparseable zone, and in the Americas evening the UTC day is
-      already tomorrow — which has no messages. Resolving "today" into an
-      empty tomorrow is the #488 error inverted and worse, because it
-      looks like a user who has not spoken. So the zone is validated first
-      (`_resolve_effective_tz`); when nothing resolves, this falls back to
-      the newest existing day chat — what the relay did — and says
-      `day_timezone` in `degraded` rather than serving a silent blank.
+      This module reproduces that shipped behaviour BYTE FOR BYTE —
+      newest existing day chat, the guard's exact header — rather than
+      the earlier draft's resolve-today-and-create approach. The W-6
+      flip criterion is `ctx_shadow match=True` on consecutive real
+      sessions, and match is computed over section fingerprints; a day
+      block that is *better* than the relay's is still a mismatch, and a
+      mismatch withholds the flip. #488 stays fixed the way users
+      actually have it today: the transcript is never mislabelled as
+      today's. The zone that decides "is this today" is validated first
+      (`_resolve_effective_tz`, relay-passed zone falling back to the
+      tenant's `User.timezone`); with no resolvable zone the header
+      carries no date claim at all, exactly like the relay with the
+      guard unresolved, and `day_timezone` is reported in `degraded`.
   D5  data plane — voice read `identities` from the PLATFORM DB (a
       partitioning leftover: `identities` is AGENT_ONLY, see
       tests/test_agent_serves_identity.py) and memories over HTTP. This
@@ -72,6 +77,10 @@ logger = logging.getLogger(__name__)
 # so the dump this module produces is the same set the relay used to
 # fetch over HTTP.
 VOICE_MEMORIES_LIMIT = 200
+
+# The relay requests `/{date}/messages?limit=500`; the same cap here keeps
+# a 501-message day rendering the same 500 rows on both sides.
+DAY_MESSAGES_LIMIT = 500
 
 # Budget split, unchanged from the relay: agent brain keeps its head
 # (highest-priority entries first), user brain likewise, day history keeps
@@ -160,27 +169,61 @@ def _render_brain(header: str, memories: List[Any]) -> str:
     return "\n".join(lines)
 
 
-def render_day_history(day_context: Dict[str, Any]) -> str:
-    """The day block, from `load_day_context`'s annotated messages.
+def day_history_header(
+    total: int, day_date: Optional[str], local_today: Optional[str]
+) -> str:
+    """Header for the day block — the relay's `_day_history_header`, byte
+    for byte (a cross-pin test holds the two copies together until the
+    legacy builder is deleted and this one remains).
 
-    The header no longer carries a date guard because it cannot be wrong:
-    the day_chat_id came from `resolve_day_chat_id_for_now`, so it IS the
-    user's local today. `load_day_context` already prefixes each row with
-    `[{channel} {local time}]` — strictly more than the relay's
-    ` [{channel}]`, and it is the annotation every other channel sees.
+    `local_today` is None when the zone could not be resolved — then the
+    historical wording is returned with no date claim, exactly like the
+    relay with its guard unresolved. With a known local date and a block
+    that is genuinely not from today, the block is still included but
+    labelled with its real date, because the Realtime model otherwise
+    narrates a previous day as "earlier today" (#488).
     """
-    messages = day_context.get("messages") or []
-    rows = [m for m in messages if m.get("role") in ("user", "assistant")
-            and (m.get("content") or "").strip()]
+    _today = f"# Today's Full Conversation History ({total} messages across all channels)"
+    if not local_today or not day_date or day_date == local_today:
+        return _today
+    return (
+        f"# Conversation from {day_date} — the last day you and the user "
+        f"spoke ({total} messages across all channels). This is NOT today: "
+        f"today is {local_today} and nothing has been said today yet. Do "
+        f"not describe any of it as having happened today."
+    )
+
+
+def render_day_history(
+    rows: List[Any], day_date: Optional[str], local_today: Optional[str]
+) -> str:
+    """The day block, byte-identical to the relay's rendering.
+
+    `rows` are (role, content, channel) in the exact shape and order
+    `GET /api/day-chats/{date}/messages` serves (raw content, channel
+    already defaulted to "web"). Two relay quirks are reproduced on
+    purpose, because the shadow comparator hashes bytes:
+
+      * the header counts the RAW rows (`total = len(day_msgs)`), while
+        the lines below filter to user/assistant turns with non-empty
+        content — so a day containing tool rows shows a count larger
+        than its rendered lines, on both sides identically;
+      * each line is `{speaker} [{channel}]: {content}` — the relay's
+        format, NOT `load_day_context`'s `[{channel} {local time}]`
+        annotation. Richer labelling is a product change to make ONCE,
+        in this file, after the legacy copy is gone.
+    """
     if not rows:
         return ""
-    lines = [
-        f"# Today's Full Conversation History ({len(rows)} messages "
-        "across all channels)"
-    ]
-    for m in rows:
-        speaker = "User" if m.get("role") == "user" else "You"
-        lines.append(f"{speaker}: {(m.get('content') or '').strip()}")
+    lines = [day_history_header(len(rows), day_date, local_today)]
+    for role, content, channel in rows:
+        content = (content or "").strip()
+        if role in ("user", "assistant") and content:
+            speaker = "User" if role == "user" else "You"
+            ch = f" [{channel}]" if channel else ""
+            lines.append(f"{speaker}{ch}: {content}")
+    if len(lines) <= 1:
+        return ""
     return "\n".join(lines)
 
 
@@ -351,6 +394,41 @@ async def _load_user_timezone(db: AsyncSession, user_id: str) -> Optional[str]:
         return None
 
 
+async def _load_newest_day(db: AsyncSession, user_id: str):
+    """(newest DayChat row | None, message rows) — the relay's day feed.
+
+    Mirrors the exact query behind `GET /api/day-chats/{date}/messages`
+    for the newest `local_date` (which is what `/api/day-chats?limit=1`
+    hands the relay): join for the conversation channel, hide historical
+    raw autopilot rows, chronological, capped at DAY_MESSAGES_LIMIT, and
+    `channel or "web"` exactly as the endpoint serializes it.
+    """
+    from app.db.models import Conversation, Message
+    from app.db.models.day_chat import DayChat
+
+    newest = (await db.execute(
+        select(DayChat)
+        .where(DayChat.user_id == user_id)
+        .order_by(DayChat.local_date.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if newest is None:
+        return None, []
+
+    result = await db.execute(
+        select(Message.role, Message.content, Conversation.channel)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Message.day_chat_id == newest.id,
+            Conversation.channel != "autopilot",
+        )
+        .order_by(Message.created_at.asc())
+        .limit(DAY_MESSAGES_LIMIT)
+    )
+    rows = [(role, content, channel or "web") for role, content, channel in result.all()]
+    return newest, rows
+
+
 async def _load_agent_name(db: AsyncSession, user_id: str) -> Optional[str]:
     """The tenant's copy of `agent_configs` (SHARED_TABLES).
 
@@ -463,78 +541,43 @@ async def build_voice_context(
             user_id[:8], len(agent_mems), len(user_mems),
         )
 
-    # ── 3. Today — the #488 fix, where the zone is actually known ─────
-    # `resolve_day_chat_id_for_now` → `get_or_create_day_chat` returns the
-    # row for the user's LOCAL today, so a voice-first morning cannot be
-    # handed yesterday's transcript. That guarantee holds ONLY while we
-    # know the zone.
-    #
-    # The trap, and it is the #488 error inverted: `resolve_local_date`
-    # falls back to UTC on an unparseable zone, and
-    # `resolve_day_chat_id_for_now` consults `User.timezone` only when
-    # `tz_override` is FALSY — never when it is present-but-invalid. So a
-    # user at 22:30 in Toronto whose zone we cannot resolve gets the UTC
-    # day (already tomorrow), which has no messages, and the session opens
-    # having forgotten everything they said today. The relay this replaces
-    # did NOT do that: with an unknown zone it left its date guard off and
-    # still loaded the newest existing day. Serving an empty "today" is
-    # strictly worse than serving a labelled real one.
-    #
-    # So: resolve the zone explicitly first. Known zone → today by
-    # construction. Unknown zone → fall back to the newest existing day
-    # chat, exactly as the relay did, and say so in `degraded` rather than
-    # reporting a bland empty day.
+    # ── 3. Today — the relay's day feed, reproduced byte for byte ─────
+    # Newest existing day chat, the date-guard header, the relay's line
+    # format (see the module docstring's D4 note: the flip criterion is
+    # fingerprint equality, so this leg mirrors the shipped relay rather
+    # than improving on it). The zone decides only the LABELLING: with a
+    # resolvable zone and a transcript that is not from the user's local
+    # today, the header names its real date; with no zone it makes no
+    # date claim. #488 — a previous day narrated as today — stays fixed
+    # in both cases.
     day_date: Optional[str] = None
     day_text = ""
     tz_effective = await _resolve_effective_tz(db, user_id, tz_name)
+    if not tz_effective:
+        # Operator signal only — the prompt itself simply carries no
+        # date-labelled header. Not `degraded="day"`: the transcript IS
+        # served.
+        degraded.append("day_timezone")
+        logger.warning(
+            "[voice_ctx] no resolvable timezone for %s — day block kept, "
+            "date labelling disabled", user_id[:8],
+        )
     try:
-        from app.db.models.day_chat import DayChat
-        from app.agent.day_context_loader import load_day_context
+        from zoneinfo import ZoneInfo
 
-        day_chat_id = None
-        if tz_effective:
-            from app.db.message_helpers import resolve_day_chat_id_for_now
+        from app.config import settings as _settings
 
-            day_chat_id = await resolve_day_chat_id_for_now(
-                db, user_id, tz_override=tz_effective, utc_now=now_utc,
-            )
-        else:
-            # No resolvable zone anywhere. Do not invent a UTC "today".
-            degraded.append("day_timezone")
-            logger.warning(
-                "[voice_ctx] no resolvable timezone for %s — falling back to "
-                "the newest existing day chat rather than a UTC today",
-                user_id[:8],
-            )
-            newest = (await db.execute(
-                select(DayChat)
-                .where(DayChat.user_id == user_id)
-                .order_by(DayChat.local_date.desc())
-                .limit(1)
-            )).scalar_one_or_none()
-            day_chat_id = newest.id if newest is not None else None
-
-        if day_chat_id:
-            dc = (await db.execute(
-                select(DayChat).where(DayChat.id == day_chat_id)
-            )).scalar_one_or_none()
-            if dc is not None and dc.local_date is not None:
-                day_date = dc.local_date.isoformat()
-
-            # Annotate the transcript's clock times in the zone the day chat
-            # was actually bucketed in, so the model never reads a UTC number
-            # as "your time" (day_context_loader._format_time).
-            day_context = await load_day_context(
-                db, day_chat_id, calling_channel="voice",
-                tz_name=tz_effective or (dc.timezone if dc is not None else None),
-            )
-            day_text = render_day_history(day_context)
+        newest, rows = await _load_newest_day(db, user_id)
+        if newest is not None and newest.local_date is not None:
+            day_date = newest.local_date.isoformat()
+        local_today = None
+        if tz_effective and getattr(_settings, "voice_day_context_date_guard", True):
+            local_today = now_utc.astimezone(ZoneInfo(tz_effective)).strftime("%Y-%m-%d")
+        day_text = render_day_history(rows, day_date, local_today)
     except Exception as exc:
-        # The one leg that used to sit outside a try/except, in a function
-        # whose contract is "it never raises". `load_day_context` resolves a
-        # model, runs joins and elides tool results; under the relay a raise
-        # here means a Realtime session opened with NO instructions at all —
-        # the exact 2026-07-31 shape `degraded` exists to prevent.
+        # A raise here under the relay meant a Realtime session opened
+        # with NO instructions at all — the exact 2026-07-31 shape
+        # `degraded` exists to prevent.
         logger.warning("[voice_ctx] day leg failed for %s: %s", user_id[:8], exc)
         degraded.append("day")
 

@@ -124,6 +124,19 @@ def _v2_active() -> bool:
     return settings.voice_realtime_v2 if v is None else v
 
 
+def _agent_ctx_enabled_for(user_id: str) -> bool:
+    """Serve the agent-built voice context: global flag OR per-user canary.
+
+    The allowlist is the W-6 flip's canary path — `voice_context_from_agent`
+    is a platform-process global, so without this a "canary flip" would be
+    a fleet flip with a reassuring name.
+    """
+    if settings.voice_context_from_agent:
+        return True
+    raw = settings.voice_context_from_agent_user_ids or ""
+    return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
 # Warm-reopen context cache: user_id → (instructions, tools, monotonic_ts).
 # Single-worker deployment (intentional — singleton reconcilers), so an
 # in-process dict is correct. A reopen within the TTL puts the FULL personal
@@ -320,15 +333,18 @@ def _tool_activity(func_name: str, arguments: dict) -> tuple:
     return title, detail
 
 
-def _local_today_str(tz_name: Optional[str]) -> str:
+def _local_today_str(tz_name: Optional[str], now_utc: Optional[datetime] = None) -> str:
     """The user's LOCAL calendar date as ``YYYY-MM-DD``.
 
     The same day boundary DayChat buckets on (day_chat_resolver) and the
     same fallback rule as `_same_local_day` above: unknown or invalid tz
     degrades to UTC rather than raising. Reads this module's `datetime`
-    so the frozen-clock test helper applies here too.
+    so the frozen-clock test helper applies here too. `now_utc` lets the
+    caller share one instant across the legacy and agent builders (W-6
+    shadow: a date tick between the two builds must not read as a
+    divergence).
     """
-    now = datetime.now(timezone.utc)
+    now = now_utc or datetime.now(timezone.utc)
     if tz_name:
         try:
             from zoneinfo import ZoneInfo
@@ -363,7 +379,9 @@ def _day_history_header(total: int, day_date: Optional[str], local_today: Option
 
 
 # ── Build system instructions from Identity + Memory ──────────────────
-async def build_realtime_instructions(user_id: str, onboarding: bool = False) -> str:
+async def build_realtime_instructions(
+    user_id: str, onboarding: bool = False, now_utc: Optional[datetime] = None
+) -> str:
     """Build system instructions for the Realtime API session.
 
     Reads ALL personal data (identities, memories, history) from the user's VPS
@@ -376,8 +394,13 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
     turn cost more for the same experience. Identity docs are never trimmed
     (they ARE the persona); memories keep their head (highest priority first),
     day history keeps its tail (newest messages).
+
+    `now_utc` freezes the clock line; `_instructions_step` passes the same
+    instant to the agent builder so the W-6 shadow never reads a minute
+    tick between the two builds as a divergence.
     """
     sections = []
+    _now_utc = now_utc or datetime.now(timezone.utc)
     _budget = settings.voice_realtime_instructions_budget_chars if _v2_active() else 0
 
     vps = await _get_vps_info(user_id)
@@ -501,7 +524,7 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
                 await _get_user_tz_name(user_id)
                 if settings.voice_day_context_date_guard else None
             )
-            _local_today = _local_today_str(_tz_name) if _tz_name else None
+            _local_today = _local_today_str(_tz_name, _now_utc) if _tz_name else None
 
             # Use the day-chats list endpoint to find today's actual date key
             # (handles timezone correctly — the agent resolves local_date)
@@ -614,7 +637,7 @@ async def build_realtime_instructions(user_id: str, onboarding: bool = False) ->
         )
 
     # 3. Voice-specific instructions
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_str = _now_utc.strftime("%Y-%m-%d %H:%M UTC")
     sections.append(
         "# Voice Conversation Mode\n"
         "You are in a LIVE VOICE conversation. Follow these rules:\n"
@@ -2004,6 +2027,48 @@ async def _finalize_onboarding(user_id: str) -> str:
                 except Exception as e:
                     logger.warning("[REALTIME] Failed to save Identity %s: %s", id_type, e)
 
+                # TENANT copy — the agent-side assembler (W-6) and text chat
+                # read `identities` from the tenant DB; a persona written
+                # only to the platform copy dies with the legacy builder.
+                # Upsert via the agent's own identity router (mounted since
+                # test_agent_serves_identity). Deactivate-then-create, not
+                # delete: `_vps_api` speaks GET/POST only, and keeping the
+                # old row inactive preserves history on a re-onboarding.
+                try:
+                    existing = await _vps_api(
+                        agent_url, agent_api_key, "GET", "/api/identity",
+                        params={"active_only": "true"},
+                    )
+                    ex_rows = (
+                        existing.get("identities", [])
+                        if isinstance(existing, dict) else (existing or [])
+                    )
+                    for row in ex_rows:
+                        if isinstance(row, dict) and row.get("identity_type") == id_type and row.get("id"):
+                            await _vps_api(
+                                agent_url, agent_api_key, "POST",
+                                f"/api/identity/{row['id']}/deactivate",
+                            )
+                    created = await _vps_api(
+                        agent_url, agent_api_key, "POST", "/api/identity",
+                        json_body={
+                            "identity_type": id_type,
+                            "name": id_name,
+                            "content": id_content,
+                            "priority": id_priority,
+                            "is_active": True,
+                        },
+                    )
+                    if created is None:
+                        logger.warning(
+                            "[REALTIME] tenant Identity %s write returned no row for %s",
+                            id_type, user_id[:8],
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[REALTIME] Failed to save tenant Identity %s: %s", id_type, e
+                    )
+
             logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
 
         return (
@@ -2568,7 +2633,7 @@ async def realtime_voice_ws(
                 logger.exception("[REALTIME] Failed to create fresh DB session")
                 return None
 
-    async def _agent_voice_context() -> Optional[str]:
+    async def _agent_voice_context(now_utc: Optional[datetime] = None) -> Optional[str]:
         """Ask the tenant's own agent to assemble the instructions (G-19a).
 
         Returns None on ANY failure so the caller falls back to the legacy
@@ -2583,6 +2648,10 @@ async def realtime_voice_ws(
             "onboarding": onboarding,
             "budget_chars": settings.voice_realtime_instructions_budget_chars if _v2_active() else 0,
             "tz_name": await _get_user_tz_name(user_id),
+            # One instant for both builders — the shadow must never read a
+            # minute tick between the legacy build and this call as a
+            # section divergence.
+            "now": (now_utc or datetime.now(timezone.utc)).isoformat(),
         }
         data = await _vps_api(
             agent_url, agent_api_key, "POST",
@@ -2625,9 +2694,12 @@ async def realtime_voice_ws(
         return out
 
     async def _instructions_step() -> Optional[str]:
+        _ctx_now = datetime.now(timezone.utc)
         legacy: Optional[str] = None
         try:
-            legacy = await build_realtime_instructions(user_id, onboarding=onboarding)
+            legacy = await build_realtime_instructions(
+                user_id, onboarding=onboarding, now_utc=_ctx_now
+            )
             logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(legacy), onboarding)
         except Exception:
             logger.exception("[REALTIME] Failed to build instructions")
@@ -2635,14 +2707,14 @@ async def realtime_voice_ws(
         # Serve the agent's version only when explicitly enabled; otherwise
         # the agent call is a SHADOW — compared and logged, never served —
         # so the two can be shown to agree on real traffic first.
-        want_agent = settings.voice_context_from_agent
+        want_agent = _agent_ctx_enabled_for(user_id)
         want_shadow = settings.voice_context_shadow and not want_agent
         if not (want_agent or want_shadow):
             return legacy
 
         agent_instr = None
         try:
-            agent_instr = await _agent_voice_context()
+            agent_instr = await _agent_voice_context(now_utc=_ctx_now)
         except Exception:
             logger.exception("[REALTIME] agent voice-context call failed")
 

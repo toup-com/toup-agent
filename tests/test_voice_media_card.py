@@ -183,25 +183,55 @@ def test_identity_is_read_from_the_platform_db_not_the_agent():
     """Every voice session ran with NO persona for as long as this call existed.
 
     The relay fetched `GET /api/identity` from the user's AGENT container, but
-    the identity router is mounted only in platform_main and the agent has no
-    such table — so it 404'd, `_vps_api` folded that into None, and an empty
-    result was indistinguishable from a user who simply has no identity. The
-    relay already runs inside the platform process; the rows are right there.
+    the identity router was then mounted only in platform_main — so it 404'd,
+    `_vps_api` folded that into None, and an empty result was
+    indistinguishable from a user who simply has no identity. The relay
+    already runs inside the platform process; the rows are right there.
     (Verified against prod: the founder has an active `soul` row, 523 chars,
     priority 100, that had never once reached a voice prompt.)
+
+    Since the closeout run the agent DOES serve /api/identity
+    (test_agent_serves_identity) and `_finalize_onboarding` deliberately
+    dual-writes the TENANT copy through it — the agent-side assembler and
+    text chat read `identities` from the tenant DB (the W-6 1,525-char gap).
+    So the pin is now targeted, not a module-wide literal ban: the persona
+    READ path stays local to the platform DB; only the onboarding
+    dual-WRITE may talk to the agent, and only non-fatally.
     """
     import inspect
     from app.api import ws_realtime
 
     src = inspect.getsource(ws_realtime)
     assert "_load_identities_local" in src
-    # The doomed HTTP call must not come back.
-    assert '"GET", "/api/identity"' not in src, (
-        "identity must not be fetched from the agent — it 404s there by design"
+    # The doomed HTTP call must not come back on the READ path: outside
+    # the onboarding dual-write, no identity fetch from the agent.
+    finalize_src = inspect.getsource(ws_realtime._finalize_onboarding)
+    src_without_finalize = src.replace(finalize_src, "")
+    assert '"GET", "/api/identity"' not in src_without_finalize, (
+        "identity must not be FETCHED from the agent outside the "
+        "onboarding dual-write — the persona read path is "
+        "_load_identities_local, against the platform DB"
+    )
+    # The dual-write itself must be non-fatal: a tenant write failure logs
+    # a warning and never breaks onboarding finalize.
+    assert '"GET", "/api/identity"' in finalize_src, (
+        "the tenant dual-write left _finalize_onboarding — if it moved, "
+        "move this pin with it; if it was deleted, the agent-side "
+        "assembler is reading identities nothing writes anymore"
+    )
+    assert "Failed to save tenant Identity" in finalize_src, (
+        "the tenant identity write must stay wrapped so its failure "
+        "cannot break onboarding"
     )
     fn = inspect.getsource(ws_realtime._load_identities_local)
     assert "Identity" in fn and "is_active" in fn, (
         "must read active Identity rows from the platform DB"
+    )
+    # Call syntax, not the bare name — the docstring narrates the old
+    # _vps_api failure mode and must stay allowed to.
+    assert "_vps_api(" not in fn, (
+        "the persona loader must never fall back to fetching identity "
+        "over HTTP from the agent"
     )
 
 
