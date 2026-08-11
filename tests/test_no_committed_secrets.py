@@ -226,6 +226,28 @@ def test_blank_line_after_banner_still_binds_per_key(tmp_path):
     )
 
 
+def test_truncated_banner_end_block_binds_path_scoped(tmp_path):
+    """A truncated BEGIN+END block (headers but no body) used to bind to
+    the constant END line — one digest for the shape repo-wide, so one
+    acknowledged degenerate fixture would have exempted it everywhere.
+    No key material can hide in the class (a real body line binds per-key
+    first), but the acknowledgement must stay file-local."""
+    from scripts.scan_secrets import scan_text
+
+    block = (
+        f"{_PEM_BANNER.replace('BEGIN ', 'BEGIN RSA ')}\n"
+        "Proc-Type: 4,ENCRYPTED\n\n"
+        f"{_PEM_BANNER.replace('BEGIN ', 'END RSA ')}\n"
+    )
+    a = [f for f in scan_text(block, "one.md") if f.pattern == "private-key-block"]
+    b = [f for f in scan_text(block, "two.md") if f.pattern == "private-key-block"]
+    assert a and b
+    assert a[0].digest != b[0].digest, (
+        "two body-less BEGIN+END blocks in different files share a digest — "
+        "the binding stopped at the constant END line, not the sentinel"
+    )
+
+
 def test_all_uppercase_and_digit_secrets_are_caught():
     """Round 2 pinned BOTH opacity lookaheads case-sensitive, which forced
     the value to contain a real LOWERCASE letter — so all-uppercase+digit

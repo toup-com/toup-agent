@@ -288,7 +288,11 @@ def _constant_match_binding(lines: list[str], lineno: int, tail: str, path: str)
 
     A banner with no body at all binds to a path-scoped sentinel, so an
     acknowledgement of a body-less fixture can never reach beyond its own
-    file.
+    file. The walk stops at an ``-----END`` line for the same reason: a
+    truncated ``BEGIN``+``END`` block used to bind to the constant END
+    line, one digest for the shape repo-wide (round 4). No key material
+    can hide in that class — any real body line binds per-key first —
+    but the sentinel keeps even the degenerate acknowledgement file-local.
     """
     if tail and not _PEM_HEADER_LINE.match(tail):
         return tail
@@ -296,6 +300,8 @@ def _constant_match_binding(lines: list[str], lineno: int, tail: str, path: str)
         stripped = follow.strip()
         if not stripped or _PEM_HEADER_LINE.match(stripped):
             continue
+        if stripped.startswith("-----END"):
+            break
         return stripped
     return f"<no-body:{path}>"
 
