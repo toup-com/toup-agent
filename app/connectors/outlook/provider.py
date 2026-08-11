@@ -227,8 +227,13 @@ class OutlookProvider(BaseConnectorProvider):
         # "best-effort revoke at provider" step doesn't branch.
         await microsoft_revoke(access_token)
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
-        return await microsoft_refresh(refresh_token)
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
+        return await microsoft_refresh(refresh_token, scopes=scopes)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         """Cheap probe — GET /me/messageRules (which 200s with []

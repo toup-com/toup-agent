@@ -924,7 +924,12 @@ class JiraProvider(BaseConnectorProvider):
         """
         return None
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         return await jira_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:

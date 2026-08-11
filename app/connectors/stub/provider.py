@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 from app.connectors.base import (
     BaseConnectorProvider,
@@ -50,7 +50,12 @@ class StubProvider(BaseConnectorProvider):
         # the "revoke fails" path monkey-patch this method to raise.
         return None
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         return RefreshResult(
             access_token=f"stub_refreshed_access_for_{refresh_token[:8]}",
             refresh_token=refresh_token,

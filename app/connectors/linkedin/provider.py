@@ -350,7 +350,12 @@ class LinkedInProvider(BaseConnectorProvider):
         # out at LinkedIn's side per the configured lifetime.
         return None
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         return await linkedin_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:

@@ -85,7 +85,7 @@ def _write_provider(
             async def revoke(self, user_id):
                 return None
 
-            async def refresh(self, refresh_token):
+            async def refresh(self, refresh_token, *, scopes=None):
                 return RefreshResult(access_token="x")
 
             async def health_probe(self, ctx):

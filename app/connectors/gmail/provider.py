@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Optional
 
 from app.connectors._google_base import (
     _GoogleConnectorError,
@@ -254,7 +254,12 @@ class GmailProvider(BaseConnectorProvider):
     async def revoke(self, user_id, access_token, refresh_token=None):
         await google_revoke(access_token)
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         return await google_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:

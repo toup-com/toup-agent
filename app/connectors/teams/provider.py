@@ -467,8 +467,13 @@ class TeamsProvider(BaseConnectorProvider):
         # Microsoft ever ships one.
         await microsoft_revoke(access_token)
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
-        return await microsoft_refresh(refresh_token)
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
+        return await microsoft_refresh(refresh_token, scopes=scopes)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
         """Cheapest authenticated round-trip this connector has: one chat,

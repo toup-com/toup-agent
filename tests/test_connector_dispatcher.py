@@ -120,7 +120,11 @@ class _ScriptedProvider(BaseConnectorProvider):
     async def revoke(self, user_id, access_token, refresh_token=None):
         return None
 
-    async def refresh(self, refresh_token):
+    async def refresh(self, refresh_token, *, scopes=None):
+        # `scopes` is the identity's granted set. Recorded rather than
+        # ignored so a caller that stops passing it is visible here too,
+        # not only in test_microsoft_refresh_reasserts_granted_scopes.
+        self.last_refresh_scopes = scopes
         self.refresh_call_count += 1
         if self._refresh_delay_s:
             await asyncio.sleep(self._refresh_delay_s)

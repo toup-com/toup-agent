@@ -376,7 +376,12 @@ class GitHubProvider(BaseConnectorProvider):
                 # Logged at the dispatcher level via the vault.
                 pass
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         # Per manifest `refresh: false` — should never be called.
         # Defensive raise so a misconfiguration is loud.
         raise RefreshFailed(

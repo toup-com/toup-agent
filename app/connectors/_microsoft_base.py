@@ -102,13 +102,73 @@ class _MicrosoftConnectorError(Exception):
         self.result = result
 
 
-async def microsoft_refresh(refresh_token: str) -> RefreshResult:
+def _refresh_scope_param(scopes: Optional[list[str]]) -> str:
+    """Build the `scope` value for Entra's refresh grant.
+
+    This function exists because of a production incident. The original
+    code sent the literal `"offline_access"`, with a comment asserting
+    that Graph "echoes back the union of granted scopes". It does not.
+    Entra rejects a scope set that names no RESOURCE with
+
+        AADSTS70011: The provided request must include a 'scope' input
+        parameter.
+
+    so every Microsoft access token died at its one-hour expiry and the
+    identity went `reauth_required` with no way back — silently, because
+    a refresh runs on the dispatcher's timer and not in front of a user.
+    Verified against the connector_events trail on 2026-08-08 (Outlook,
+    two occurrences, one per connect).
+
+    Two rules encoded here:
+
+    - **The scopes come from the IDENTITY, never the manifest.** Entra
+      will only reissue scopes the user already consented to, so a
+      manifest that grows a scope after someone connects would break
+      every existing identity's refresh at once — turning an additive
+      change into a fleet-wide disconnect.
+    - **`offline_access` is always re-appended.** Entra does NOT echo it
+      in the granted `scope` response (confirmed: the stored list for a
+      working Outlook identity is `profile openid email Mail.Read
+      Mail.Send User.Read`), so round-tripping the stored list alone
+      drops it — and without it Entra returns no rotating refresh_token,
+      which converts a recoverable one-hour bug into a permanent one at
+      the refresh token's own expiry.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in scopes or []:
+        s = raw.strip()
+        if not s or s == "offline_access" or s in seen:
+            continue
+        seen.add(s)
+        ordered.append(s)
+    if not ordered:
+        # No resource scope to assert. Sending `offline_access` alone is
+        # the exact shape Entra rejects, so fail loudly here instead of
+        # spending a round-trip to be told so.
+        raise RefreshFailed(
+            "microsoft refresh has no granted resource scopes to re-assert "
+            "— identity.scopes_json is empty, so the token cannot be "
+            "refreshed and the user must reconnect"
+        )
+    ordered.append("offline_access")
+    return " ".join(ordered)
+
+
+async def microsoft_refresh(
+    refresh_token: str,
+    *,
+    scopes: Optional[list[str]] = None,
+) -> RefreshResult:
     """Exchange a refresh_token for a fresh access_token.
 
     Microsoft's v2 token endpoint accepts `grant_type=refresh_token`
     with `client_id` + `client_secret` + `refresh_token`. The response
     INCLUDES a fresh `refresh_token` (unlike Google) which we persist
     so the rotation chain stays valid past the original token's TTL.
+
+    `scopes` is the identity's granted set — see `_refresh_scope_param`
+    for why it is required and why it is not the manifest's.
     """
     app_cfg = await get_provider_app_async("microsoft")
     if app_cfg is None:
@@ -124,14 +184,7 @@ async def microsoft_refresh(refresh_token: str) -> RefreshResult:
             "client_secret": app_cfg.client_secret,
             "refresh_token": refresh_token,
             "grant_type": "refresh_token",
-            # Microsoft requires the scope set to be re-asserted
-            # on refresh, otherwise the new access_token loses
-            # scopes that were on the original. We pass the
-            # special "offline_access" sentinel so Graph keeps
-            # the rotating refresh_token without the caller
-            # needing to know the original scope set. Graph
-            # actually echoes back the union of granted scopes.
-            "scope": "offline_access",
+            "scope": _refresh_scope_param(scopes),
         },
     )
     if resp.status_code in (400, 401):

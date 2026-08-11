@@ -66,7 +66,7 @@ class _ConfigurableProvider(BaseConnectorProvider):
     async def revoke(self, user_id, access_token, refresh_token=None):
         return None
 
-    async def refresh(self, refresh_token):
+    async def refresh(self, refresh_token, *, scopes=None):
         return RefreshResult(
             access_token="a", refresh_token=refresh_token,
             expires_at=datetime.utcnow() + timedelta(hours=1),

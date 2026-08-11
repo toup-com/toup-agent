@@ -206,9 +206,34 @@ class BaseConnectorProvider(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         """Exchange a refresh_token for a fresh access_token.
-        Raise RefreshFailed if the refresh is unrecoverable."""
+        Raise RefreshFailed if the refresh is unrecoverable.
+
+        `scopes` is the scope set the identity was ACTUALLY granted
+        (`connector_identities.scopes_json`), not the manifest's — the
+        dispatcher passes it on every call. Most providers ignore it:
+        Google, GitHub, Notion, Slack and Jira all reissue the original
+        grant when `scope` is absent.
+
+        Microsoft does not, which is why this parameter exists. Entra's
+        refresh grant rejects a scope set containing no resource scope
+        (AADSTS70011), so `microsoft_refresh` has to re-assert the real
+        list. It must come from the identity rather than the manifest:
+        Entra only issues scopes already consented, so a manifest that
+        gained a scope after a user connected would fail EVERY existing
+        identity's refresh at once.
+
+        Keyword-only and defaulted so a provider that doesn't care can
+        accept it without threading it anywhere — but it must be in the
+        signature, because the dispatcher always passes it.
+        `test_every_provider_accepts_the_granted_scopes` enforces that.
+        """
         ...
 
     @abc.abstractmethod

@@ -85,7 +85,7 @@ class _CountingProvider(BaseConnectorProvider):
     async def revoke(self, user_id, access_token, refresh_token=None):
         return None
 
-    async def refresh(self, refresh_token):
+    async def refresh(self, refresh_token, *, scopes=None):
         return RefreshResult(
             access_token="at2",
             refresh_token="rt2",

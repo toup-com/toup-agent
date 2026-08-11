@@ -777,7 +777,14 @@ async def _refresh_with_coalescing(
             return latest, None
 
         try:
-            new_tokens = await entry.provider.refresh(latest.refresh_token)
+            # `latest.scopes` is what the user actually consented to, and
+            # it is the identity's rather than the manifest's on purpose
+            # — Entra reissues only already-consented scopes, so feeding
+            # a grown manifest back would break every existing identity
+            # at once. See `_microsoft_base._refresh_scope_param`.
+            new_tokens = await entry.provider.refresh(
+                latest.refresh_token, scopes=latest.scopes,
+            )
         except RefreshFailed as e:
             await vault.mark_reauth_required(
                 db, latest.id, reason=f"provider.refresh raised RefreshFailed: {e}",

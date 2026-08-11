@@ -944,7 +944,12 @@ class SlackProvider(BaseConnectorProvider):
     async def revoke(self, user_id, access_token, refresh_token=None):
         await slack_revoke(access_token)
 
-    async def refresh(self, refresh_token: str) -> RefreshResult:
+    async def refresh(
+        self,
+        refresh_token: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> RefreshResult:
         return await slack_refresh(refresh_token)
 
     async def health_probe(self, ctx: ConnectorContext) -> HealthResult:
