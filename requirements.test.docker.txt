@@ -26,7 +26,7 @@ alembic==1.13.1
 # Embeddings & NLP — lazy-loaded; module imports only need numpy + tiktoken
 numpy>=1.26.0
 tiktoken>=0.5.0
-openai>=2.14.0  # PR-1: keep in lockstep with requirements.txt (cache params need SDK 2.x)
+openai==2.53.0  # ==, not >=: the fleet images run 2.53.0. The 2026-08 SDK 3.0.0 swapped the transport stack (httpx2) — an unpinned floor let it into every fresh CI venv, where transport-level test mocks missed and dummy keys hit the real API (401). CI must run what prod runs.
 
 # Auth & Security
 python-jose[cryptography]==3.3.0

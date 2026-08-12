@@ -95,6 +95,14 @@ def test_forwarded_flag_maps_to_a_real_settings_field(flag: str):
     # container on whatever value its last recreate baked in — and a fresh
     # spawn silently reverts to "*" (all families), un-gating the fleet.
     "AGENT_TOOL_FAMILIES",
+    # L-1/W-6 (Last Mile): the voice single-assembler flip machinery.
+    # These were MISSING from the list when the closeout set the canary
+    # allowlist on the bridge env — the value could never reach any
+    # container, so "canary allowlist live" was refuted by the Last Mile
+    # env audit. Without these names the fleet voice flip has no
+    # delivery path at all.
+    "VOICE_CONTEXT_FROM_AGENT",
+    "VOICE_CONTEXT_FROM_AGENT_USER_IDS",
 ])
 def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     """Dropping one of these from the bridge list is how a fleet silently
