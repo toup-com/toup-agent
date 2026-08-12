@@ -16,15 +16,26 @@ Two things worth knowing before editing:
     non-ASCII ("Q3 Pipeline", "Ventas 2026"). Interpolating one raw
     produces a URL that either 400s or, worse, silently addresses a
     different range. Every range goes through `_quote_range`.
-  - **`sheets__list_spreadsheets` is the odd one out.** Sheets has no
-    "list my spreadsheets" endpoint — enumeration is a Drive concern,
-    and it needs `drive.readonly`, which is RESTRICTED in Google's
-    verification policy and would drag the whole project into a CASA
-    assessment. So it stays in `scopes_optional` (never requested by
-    `oauth.py`, which only sends `oauth.scopes`), and this tool checks
-    the grant and returns `ConnectorScopeMissing` instead of burning a
-    round-trip on a 403 the agent can't interpret. Everything else here
-    works on a spreadsheet the user names, with `spreadsheets` alone.
+  - **There is no "list my spreadsheets" tool, and there must not be.**
+    Sheets has no such endpoint — enumeration is a Drive concern needing
+    `drive.readonly`, which is RESTRICTED in Google's verification policy
+    and would drag the whole project into a CASA assessment. That scope
+    is deliberately confined to `scopes_optional`, which `oauth.py` NEVER
+    requests (it sends `oauth.scopes` only), so no user has ever held it
+    or ever will under the current policy.
+
+    `sheets__list_spreadsheets` existed anyway until 2026-08-11. It was
+    advertised to the model, so the model reached for it whenever a user
+    named a sheet instead of pasting a link — and it could not once have
+    succeeded. Worse, its failure told the user to "reconnect Sheets and
+    approve the Drive file-listing permission", which the consent screen
+    will never offer: reconnecting showed identical scopes and failed
+    identically, forever.
+
+    So the tool is gone. A user who names a sheet gets asked for its URL,
+    which is a request they can actually satisfy. Do not re-add a tool
+    backed by a scope in `scopes_optional` without first moving that
+    scope into `scopes` — and note that moving THIS one means CASA.
 """
 
 from __future__ import annotations
@@ -47,7 +58,6 @@ from app.connectors.base import (
     ConnectorOk,
     ConnectorReauthRequired,
     ConnectorResult,
-    ConnectorScopeMissing,
     ConnectorToolError,
     HealthResult,
     RefreshResult,
@@ -56,13 +66,6 @@ from app.db.database import async_session_maker
 from app.services import connector_vault as _vault
 
 SHEETS_API = "https://sheets.googleapis.com/v4"
-DRIVE_API = "https://www.googleapis.com/drive/v3"
-
-SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
-
-# Scope needed to ENUMERATE spreadsheets (a Drive capability). Optional
-# by design — see the module docstring.
-DRIVE_LIST_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 # Capture the id out of a full Sheets URL. Tolerates the `/edit`,
 # `#gid=0` and `?usp=sharing` suffixes Google emits.
@@ -79,9 +82,8 @@ _VALUE_INPUT_OPTIONS = {"RAW", "USER_ENTERED"}
 
 
 async def _resolve_identity(user_id: str):
-    """Return the decrypted identity. We need the granted SCOPES as
-    well as the token, so this returns the whole struct rather than
-    just the access token like its siblings do."""
+    """Return the decrypted identity struct (not just the token) —
+    `health_probe` needs the access token off the same object."""
     async with async_session_maker() as db:
         ident = await _vault.get(db, user_id, "sheets")
     if ident is None or not ident.access_token:
@@ -130,13 +132,6 @@ def _quote_range(a1: str) -> str:
     return urllib.parse.quote(a1, safe="")
 
 
-def _drive_escape(s: str) -> str:
-    """Escape a literal for a Drive `q` string. Drive uses single-quoted
-    literals, so an apostrophe in a filename ("Nariman's budget") ends
-    the literal early and makes the rest of the query syntax."""
-    return s.replace("\\", "\\\\").replace("'", "\\'")
-
-
 def _coerce_rows(raw: Any) -> Optional[list[list[Any]]]:
     """Validate `values` is a 2D array. Returns None when it isn't.
 
@@ -177,13 +172,8 @@ class SheetsProvider(BaseConnectorProvider):
         except _GoogleConnectorError as e:
             return _retarget_reauth(e.result)
         access_token = ctx.access_token or ident.access_token
-        granted = set(ident.scopes or [])
 
         try:
-            if tool_name == "sheets__list_spreadsheets":
-                return await self._list_spreadsheets(
-                    tool_input, access_token, granted,
-                )
             if tool_name == "sheets__read_range":
                 return await self._read_range(tool_input, access_token)
             if tool_name == "sheets__append_rows":
@@ -204,46 +194,6 @@ class SheetsProvider(BaseConnectorProvider):
             return _retarget_reauth(e.result)
 
     # ── tools ──────────────────────────────────────────────────────
-
-    async def _list_spreadsheets(
-        self, tool_input: dict, access_token: str, granted: set[str],
-    ) -> ConnectorResult:
-        if DRIVE_LIST_SCOPE not in granted:
-            # Answered locally, not via a 403. The agent's contract for
-            # ConnectorScopeMissing is "ask the user to reconnect with
-            # the broader permission, or work from an id/URL they give
-            # you" — which is actionable. A raw 403 is not.
-            return ConnectorScopeMissing(required_scope=DRIVE_LIST_SCOPE)
-
-        clauses = [f"mimeType='{SPREADSHEET_MIME}'", "trashed=false"]
-        name_query = (tool_input.get("query") or "").strip()
-        if name_query:
-            clauses.append(f"name contains '{_drive_escape(name_query)}'")
-
-        max_results = max(1, min(int(tool_input.get("max_results", 20) or 20), 50))
-        body = await google_request(
-            "GET",
-            f"{DRIVE_API}/files",
-            access_token=access_token,
-            params={
-                "q": " and ".join(clauses),
-                "pageSize": max_results,
-                "orderBy": "modifiedTime desc",
-                "fields": "files(id,name,modifiedTime,webViewLink)",
-            },
-            scope_hint=DRIVE_LIST_SCOPE,
-        )
-        return ConnectorOk(content=json.dumps({
-            "spreadsheets": [
-                {
-                    "id": f.get("id"),
-                    "title": f.get("name"),
-                    "modified_at": f.get("modifiedTime"),
-                    "url": f.get("webViewLink") or _sheet_url(f.get("id", "")),
-                }
-                for f in body.get("files", [])
-            ],
-        }))
 
     async def _read_range(
         self, tool_input: dict, access_token: str,

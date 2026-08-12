@@ -86,7 +86,14 @@ tools:
       deny: []
 
   - name: calendar__check_availability
-    description: Return free/busy intervals for a list of calendars across a time window.
+    # Derived from events.list on the primary calendar, not /freeBusy —
+    # freebusy.query does not accept `calendar.events`, the only scope
+    # this connector requests. See provider.py for the full note.
+    # `calendars` was removed rather than ignored: reading a calendar
+    # other than primary needs `calendar.readonly`, which is never
+    # granted, so accepting the argument promised something the
+    # connector cannot do.
+    description: Return busy intervals on your primary calendar across a time window.
     input_schema:
       type: object
       properties:
@@ -94,10 +101,6 @@ tools:
           type: string
         time_max:
           type: string
-        calendars:
-          type: array
-          items: { type: string }
-          description: Calendar ids; defaults to primary.
       required: [time_min, time_max]
     mutates: false
     elevation: false

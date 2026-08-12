@@ -19,9 +19,17 @@ oauth:
   # drive.readonly is RESTRICTED in Google's verification policy and
   # would force the entire app through CASA security assessment
   # ($15k–$75k, months of work). It's only needed for
-  # sheets__list_spreadsheets; everything that operates on a known
-  # spreadsheet ID works with `spreadsheets` alone. Kept optional so
-  # power users can grant it explicitly to enable listing.
+  # listing spreadsheets by NAME; everything that operates on a known
+  # spreadsheet ID works with `spreadsheets` alone.
+  #
+  # These stay recorded but back no tool. `sheets__list_spreadsheets`
+  # was REMOVED on 2026-08-11: `_build_authorize_url` sends
+  # `oauth.scopes` only, so `scopes_optional` is never requested and no
+  # user has ever held drive.readonly. The tool was therefore offered to
+  # the model and could not once have succeeded — it failed, and told
+  # the user to reconnect and approve a permission the consent screen
+  # will never show. Do not re-add a tool backed by a scope listed here
+  # unless it also moves into `scopes`.
   scopes_optional:
     - https://www.googleapis.com/auth/drive.readonly
     - https://www.googleapis.com/auth/spreadsheets.readonly
@@ -34,31 +42,12 @@ scope_descriptions:
   https://www.googleapis.com/auth/spreadsheets.readonly: Read-only access if you don't want the agent writing.
 
 health:
-  probe: sheets__list_spreadsheets
+  # Registry-lint only — the probe that actually runs is
+  # SheetsProvider.health_probe, which hits spreadsheets.get on an
+  # impossible id. This field just has to name a real tool.
+  probe: sheets__read_range
 
 tools:
-  - name: sheets__list_spreadsheets
-    description: List Google Sheets the user owns or has access to. Requires the optional `drive.readonly` scope; if the user hasn't granted it, this tool returns a `ConnectorScopeMissing` result and the agent should ask them to reconnect Sheets with the broader permission, or work with a spreadsheet ID/URL the user provides directly.
-    input_schema:
-      type: object
-      properties:
-        query:
-          type: string
-          description: Free-text filter on the spreadsheet name.
-        max_results:
-          type: integer
-          minimum: 1
-          maximum: 50
-          default: 20
-      required: []
-    mutates: false
-    elevation: false
-    output_redaction: []
-    pii: low
-    channel_policy:
-      default: allow
-      deny: []
-
   - name: sheets__read_range
     description: Read a range of cells from a sheet. Returns a 2D array of values.
     input_schema:

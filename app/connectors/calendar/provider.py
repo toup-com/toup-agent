@@ -142,20 +142,61 @@ class CalendarProvider(BaseConnectorProvider):
                         message="time_min/time_max required",
                         retryable=False,
                     )
-                cals = tool_input.get("calendars") or ["primary"]
-                body = {
+                # Busy blocks are derived from events.list, NOT from
+                # /freeBusy. freebusy.query does not accept
+                # `calendar.events` — Google's reference lists only
+                # calendar, calendar.readonly, calendar.freebusy and
+                # calendar.events.freebusy. This connector requests
+                # `calendar.events` and nothing else (calendar.readonly
+                # is in `scopes_optional`, which `_build_authorize_url`
+                # never sends), so the old /freeBusy call 403'd for
+                # EVERY user, always — a tool that shipped and could not
+                # once have succeeded.
+                #
+                # events.list on `calendar.events` returns the same
+                # information: `singleEvents` expands recurrences, so
+                # each item's start/end IS a busy block. Deriving it
+                # here keeps availability working without adding a
+                # scope to the consent screen — which would otherwise
+                # mean re-doing the Google verification submission.
+                params = {
                     "timeMin": tmin,
                     "timeMax": tmax,
-                    "items": [{"id": c} for c in cals],
+                    "singleEvents": "true",
+                    "orderBy": "startTime",
+                    "maxResults": "250",
                 }
                 result = await google_request(
-                    "POST",
-                    f"{CAL_API_BASE}/freeBusy",
+                    "GET",
+                    f"{CAL_API_BASE}/calendars/primary/events",
                     access_token=access_token,
-                    json_body=body,
+                    params=params,
                     scope_hint="calendar.events",
                 )
-                return ConnectorOk(content=json.dumps(result))
+                busy = []
+                for ev in (result.get("items") or []):
+                    # `transparent` means "free" on the user's calendar
+                    # (Google's own wording for events that don't block
+                    # time). Cancelled events linger in the list when
+                    # syncToken-style reads are used; neither is busy.
+                    if ev.get("transparency") == "transparent":
+                        continue
+                    if ev.get("status") == "cancelled":
+                        continue
+                    start = (ev.get("start") or {})
+                    end = (ev.get("end") or {})
+                    # All-day events carry `date`; timed ones `dateTime`.
+                    s = start.get("dateTime") or start.get("date")
+                    e = end.get("dateTime") or end.get("date")
+                    if s and e:
+                        busy.append({"start": s, "end": e})
+                return ConnectorOk(content=json.dumps({
+                    # Same envelope freebusy.query returned, so any
+                    # caller that already parsed this keeps working.
+                    "calendars": {"primary": {"busy": busy}},
+                    "timeMin": tmin,
+                    "timeMax": tmax,
+                }))
 
             if tool_name == "calendar__delete_event":
                 eid = tool_input.get("event_id")

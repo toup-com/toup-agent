@@ -281,12 +281,6 @@ def test_range_is_percent_encoded_as_one_path_segment():
     assert "/" not in sheets_mod._quote_range("a/b!A1")
 
 
-def test_drive_query_literal_is_escaped():
-    """An apostrophe in a filename ends Drive's single-quoted literal
-    early and the rest of the name becomes query syntax."""
-    assert sheets_mod._drive_escape("Nariman's budget") == "Nariman\\'s budget"
-
-
 @pytest.mark.parametrize("raw,expect", [
     ([["a", "b"]], [["a", "b"]]),
     (["a", "b"], [["a", "b"]]),          # flat row lifted, not written as a column
@@ -298,26 +292,15 @@ def test_row_coercion(raw, expect):
     assert sheets_mod._coerce_rows(raw) == expect
 
 
-@pytest.mark.asyncio
-async def test_sheets_list_without_drive_scope_is_scope_missing(fake_google, monkeypatch):
-    """`drive.readonly` is RESTRICTED (it would drag the project into a
-    CASA assessment) so it stays optional and nobody holds it. The tool
-    must answer with something the agent can act on, and must not spend
-    a round-trip discovering a 403 it can't interpret."""
-    client = fake_google(_Resp(200))
-    monkeypatch.setattr(
-        sheets_mod, "_resolve_identity",
-        _async_return(_identity(["https://www.googleapis.com/auth/spreadsheets"])),
-    )
-    res = await SheetsProvider().execute(
-        "sheets__list_spreadsheets", {}, ConnectorContext(
-            user_id="u1", channel="web", request_id="r",
-        ),
-    )
-    assert isinstance(res, ConnectorScopeMissing)
-    assert res.required_scope == sheets_mod.DRIVE_LIST_SCOPE
-    assert client.calls == [], "must not call Drive without the scope"
-
+# `test_sheets_list_without_drive_scope_is_scope_missing` and
+# `test_drive_query_literal_is_escaped` were removed on 2026-08-11 with
+# `sheets__list_spreadsheets` itself. Answering ConnectorScopeMissing was
+# a correct response to an impossible situation: `drive.readonly` sits in
+# `scopes_optional`, which `_build_authorize_url` never sends, so the
+# tool could not once have succeeded and told users to grant a permission
+# the consent screen will never show. The reachability rule it was
+# standing in for is now enforced for every connector by
+# tests/test_no_tool_needs_an_unrequested_scope.py.
 
 @pytest.mark.asyncio
 async def test_sheets_append_inserts_rows_rather_than_overwriting(fake_google, monkeypatch):
