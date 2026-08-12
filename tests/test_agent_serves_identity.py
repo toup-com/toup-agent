@@ -69,6 +69,15 @@ def _routes_of(entrypoint: str, run_mode: str) -> list[str]:
         "ENCRYPTION_KEY": "test-32-byte-encryption-key--x12",
         "DATABASE_URL": "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
     }
+    # The hermetic env must still let the interpreter's own loader work:
+    # setup-python's tool-cache CPython resolves libpython via
+    # LD_LIBRARY_PATH, so dropping it makes the subprocess die with exit
+    # 127 ("libpython3.12.so.1.0: cannot open shared object file") before
+    # any Python runs — hosted images ldconfig the tool cache, self-hosted
+    # runners do not. A loader path can't decide any assertion here; it
+    # only decides whether the interpreter starts.
+    if "LD_LIBRARY_PATH" in os.environ:
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
     code = (
         f"import {entrypoint} as m, json;"
         f"print(json.dumps(sorted({{r.path for r in m.app.routes}})))"
