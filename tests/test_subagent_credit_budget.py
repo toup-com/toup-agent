@@ -223,7 +223,22 @@ async def _seed_user(db, user_id: str):
         await db.commit()
 
 
-async def _wait_for_completion(job_id: str, *, timeout: float = 5.0):
+# Wall-clock ceilings in this file are SCAFFOLDING, not assertions. Every
+# test here asserts WHAT happens — outcome, credit_spent,
+# credit_budget_allocated, the announce-back row — and none asserts HOW
+# FAST. They were 5s (poll) and 10s (the job's own timeout), which is a
+# measurement of the host: the self-hosted runners share the box with the
+# 58-container agent fleet, and at load average 9-14 this file failed on
+# THREE different tests across THREE unrelated PRs (#601, #604, #609),
+# each time on a PR whose diff cannot reach it. Raising the ceilings
+# removes the host dependency and keeps every behavioural assertion
+# exactly as it was; a genuinely hung job still fails, just not a merely
+# slow one.
+_JOB_TIMEOUT_S = 120
+_POLL_CEILING_S = 60.0
+
+
+async def _wait_for_completion(job_id: str, *, timeout: float = _POLL_CEILING_S):
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
     from sqlalchemy import select
@@ -258,7 +273,7 @@ async def test_run_under_budget_completes_normally(enable_spawning, patch_writer
     ))
     result = await spawn_subagent(
         user_id=uid, task="cheap task", label="L", model=None,
-        timeout_seconds=10, parent_job_id=None,
+        timeout_seconds=_JOB_TIMEOUT_S, parent_job_id=None,
         channel="web", telegram_chat_id=None,
         agent_runner=runner, credit_budget=1.00,
     )
@@ -290,7 +305,7 @@ async def test_run_over_budget_terminates_with_budget_exhausted(
     ))
     result = await spawn_subagent(
         user_id=uid, task="costly task", label="L", model=None,
-        timeout_seconds=10, parent_job_id=None,
+        timeout_seconds=_JOB_TIMEOUT_S, parent_job_id=None,
         channel="web", telegram_chat_id=None,
         agent_runner=runner, credit_budget=0.01,
     )
@@ -325,7 +340,7 @@ async def test_no_budget_set_skips_enforcement(enable_spawning, patch_writer):
     ))
     result = await spawn_subagent(
         user_id=uid, task="big task", label="L", model=None,
-        timeout_seconds=10, parent_job_id=None,
+        timeout_seconds=_JOB_TIMEOUT_S, parent_job_id=None,
         channel="web", telegram_chat_id=None,
         agent_runner=runner,  # credit_budget defaults to None
     )
@@ -355,7 +370,7 @@ async def test_unknown_model_does_not_trip_budget(enable_spawning, patch_writer)
     ))
     result = await spawn_subagent(
         user_id=uid, task="t", label="L", model=None,
-        timeout_seconds=10, parent_job_id=None,
+        timeout_seconds=_JOB_TIMEOUT_S, parent_job_id=None,
         channel="web", telegram_chat_id=None,
         agent_runner=runner, credit_budget=0.01,
     )
@@ -383,7 +398,7 @@ async def test_credit_budget_propagates_to_config_json(enable_spawning, patch_wr
     runner = FakeAgentRunner(response=FakeAgentResponse(text="ok"))
     result = await spawn_subagent(
         user_id=uid, task="t", label="L", model=None,
-        timeout_seconds=10, parent_job_id=None,
+        timeout_seconds=_JOB_TIMEOUT_S, parent_job_id=None,
         channel="web", telegram_chat_id=None,
         agent_runner=runner, credit_budget=0.50,
     )
