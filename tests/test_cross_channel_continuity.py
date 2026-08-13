@@ -101,11 +101,26 @@ class TestSystemChannelUniqueIndex:
     def test_runner_routes_system_channels_through_resolver(self):
         """The blind Conversation insert must NOT be reachable for
         indexed system channels — they route through the canonical
-        resolver (reuse + IntegrityError recovery) instead."""
+        resolver (reuse + IntegrityError recovery) instead.
+
+        This asserted the LITERAL tuple until 2026-08-13, when Admin
+        Dispatch added a fifth indexed channel and the runner's private copy
+        became an import of `conversation_resolver.INDEXED_SYSTEM_CHANNELS`.
+        Pinning the literal was the weaker test: it passed while the runner
+        held its own copy, which is exactly the drift that would leave a new
+        system channel governed by the index but not routed through the
+        resolver. Assert the BINDING instead — one definition, three
+        consumers (the resolver, this runner branch, and the index predicate
+        in database.py, which the admin-dispatch suite pins separately).
+        """
         seg = _RUNNER[_RUNNER.index("async def _get_or_create_session("):]
         seg = seg[:seg.index("async def _build_system_prompt(")]
         assert "resolve_or_create_day_conversation" in seg
-        assert '_INDEXED_SYSTEM_CHANNELS = ("routine", "trigger", "api", "digest")' in seg
+        assert "_INDEXED_SYSTEM_CHANNELS = INDEXED_SYSTEM_CHANNELS" in seg, (
+            "the runner must USE the canonical tuple, not restate it"
+        )
+        from app.agent.conversation_resolver import INDEXED_SYSTEM_CHANNELS
+        assert set(INDEXED_SYSTEM_CHANNELS) >= {"routine", "trigger", "api", "digest"}
         # the guarded return must appear before the blind insert
         assert seg.index("return conv, False") < seg.index("session = Conversation(")
 
@@ -119,12 +134,17 @@ class TestSystemChannelUniqueIndex:
         Control: NULL day_chat_id (the pre-PR2 NameError state) evades the
         index — which is why main never crashed."""
         import sqlite3
+        from app.agent.conversation_resolver import INDEXED_SYSTEM_CHANNELS
+        # Predicate DERIVED, not retyped: this is a demonstration of the real
+        # index, and a hand-copied IN-list would keep demonstrating the 2026
+        # predicate long after the shipped one grew (it has, twice).
+        _in = ",".join(f"'{c}'" for c in INDEXED_SYSTEM_CHANNELS)
         c = sqlite3.connect(":memory:")
         c.execute("CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id TEXT, "
                   "day_chat_id TEXT, channel TEXT, is_active INTEGER)")
         c.execute("CREATE UNIQUE INDEX ix_conversations_system_channel_per_day "
                   "ON conversations (user_id, day_chat_id, channel) "
-                  "WHERE channel IN ('routine','trigger','api','digest') AND is_active = 1")
+                  f"WHERE channel IN ({_in}) AND is_active = 1")
         c.execute("INSERT INTO conversations VALUES ('c1','u1','d1','routine',1)")
         # blind 2nd insert (pre-fix runner path) -> collision
         import pytest

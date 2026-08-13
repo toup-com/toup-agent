@@ -1779,6 +1779,15 @@ try:
 except ImportError as _e:
     print(f"⚠️ notify_deliver router not loaded: {_e}", flush=True)
 
+# Admin Dispatch (operator → user) — the platform's fan-out worker POSTs
+# /api/internal/admin-notice per recipient. The chat row must be written
+# here: `messages` is AGENT_ONLY and broadcast_to_user is in-process.
+try:
+    from app.api.admin_notice import router as admin_notice_router
+    app.include_router(admin_notice_router, prefix=settings.api_prefix)
+except ImportError as _e:
+    print(f"⚠️ admin_notice router not loaded: {_e}", flush=True)
+
 # Autopilot approvals (Autopilot PR7) — the durable ask-the-user store;
 # Mission Control + push deep links decide through the platform proxy.
 try:

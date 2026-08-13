@@ -51,7 +51,7 @@ from app.db.models import (
     NotificationQueue,
     PushDevice,
     User,
-    NOTIFY_KIND_MISSION_STARTED,
+    NOTIFY_KIND_ANNOUNCEMENT,
     NOTIFY_KIND_NEEDS_APPROVAL,
     NOTIFY_KIND_NEEDS_INPUT,
     NOTIFY_KIND_PROGRESS,
@@ -74,11 +74,20 @@ _STUCK_CLAIM_MAX_AGE = timedelta(minutes=10)
 _RECEIPT_GIVE_UP_AGE = timedelta(hours=24)
 
 # Kinds that block a mission bypass the daily cap — the user asked to
-# be interrupted for exactly these.
-_CAP_BYPASS_KINDS = {NOTIFY_KIND_NEEDS_INPUT, NOTIFY_KIND_NEEDS_APPROVAL}
+# be interrupted for exactly these. Announcements bypass it too: an
+# operator message is rare, unrecallable and usually the reason the
+# user needs to hear from us at all — it must not be eaten by cap
+# slot #11 behind ten of the agent's own pushes.
+_CAP_BYPASS_KINDS = {
+    NOTIFY_KIND_NEEDS_INPUT,
+    NOTIFY_KIND_NEEDS_APPROVAL,
+    NOTIFY_KIND_ANNOUNCEMENT,
+}
 
 # Kinds worth escalating out-of-band when no push device can be
-# reached. progress/digest never escalate.
+# reached. progress/digest never escalate, and `announcement` is
+# deliberately ABSENT: one admin broadcast would fan the same text out
+# to every user's Telegram/WhatsApp.
 _FALLBACK_KINDS = {
     NOTIFY_KIND_NEEDS_INPUT,
     NOTIFY_KIND_NEEDS_APPROVAL,
@@ -185,9 +194,12 @@ def evaluate_policy(
     # the other producer families declare themselves via data.kind
     # (chat_turn / reminder / routine / job) and are never suppressed by
     # it — pre-2026-07-17 one toggle silently killed chat answers and
-    # reminders too.
+    # reminders too. An operator announcement declares data.kind too,
+    # but is excluded by EVENT KIND as well: it is not the agent acting,
+    # so a producer that forgets the data key must still not let the
+    # user's autopilot toggle silence the operator.
     if (
-        row.event_kind != "generic"
+        row.event_kind not in ("generic", NOTIFY_KIND_ANNOUNCEMENT)
         and data.get("kind") in (None, "mission")
         and not prefs.get("autopilot_push", True)
     ):
@@ -502,13 +514,15 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         )
         return "deferred"
 
-    # Live Activity lane, mission_started rows: their ONLY surface is
-    # the push-to-start (the banner alert rides inside it) — an Expo
-    # alert or Telegram message saying "mission started" would be
-    # noise on top of the agent's own chat confirmation. Transient
-    # APNs errors follow the normal retry backoff; a user with no
-    # registered device terminates quietly instead of retry-looping.
-    if row.event_kind == NOTIFY_KIND_MISSION_STARTED:
+    # Live Activity lane, card-opening rows (mission_started and admin
+    # announcements): their ONLY surface is the push-to-start (the
+    # banner alert rides inside it) — an Expo alert or Telegram message
+    # saying "mission started" would be noise on top of the agent's own
+    # chat confirmation, and an announcement already lands as its own
+    # chat card written by the fan-out. Transient APNs errors follow
+    # the normal retry backoff; a user with no registered device
+    # terminates quietly instead of retry-looping to nobody.
+    if row.event_kind in live_activity_service._START_EVENT_KINDS:
         la = await live_activity_service.handle_notification_row(db, row, now)
         la = la or {"status": "skipped", "reason": "no_mission_id"}
         if la.get("delivered"):

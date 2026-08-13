@@ -39,6 +39,7 @@ from app.db.models import (
     AgentConfig,
     KNOWN_NOTIFY_KINDS,
     KNOWN_NQ_PRIORITIES,
+    NOTIFY_KIND_ANNOUNCEMENT,
     NQ_PRIORITY_DEFAULT,
     NotificationQueue,
 )
@@ -73,6 +74,15 @@ class AgentNotifyRequest(BaseModel):
         if v not in KNOWN_NOTIFY_KINDS:
             raise ValueError(
                 f"unknown event_kind {v!r}; known: {sorted(KNOWN_NOTIFY_KINDS)}"
+            )
+        if v == NOTIFY_KIND_ANNOUNCEMENT:
+            # Operator → user, and this route authenticates a TENANT
+            # key — so anything arriving here is a user's own agent
+            # asking to speak as Toup on the operator's card (brand orb,
+            # 'from Toup' copy). The platform enqueues announcements
+            # itself, in the admin-dispatch fan-out; ingest never does.
+            raise ValueError(
+                f"event_kind {v!r} is platform-authored; agents may not enqueue it"
             )
         return v
 

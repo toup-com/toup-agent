@@ -47,6 +47,10 @@ NOTIFY_KIND_MISSION_FAILED = "mission_failed"
 NOTIFY_KIND_PROGRESS = "progress"                # Live Activity update only, never an OS alert push
 NOTIFY_KIND_DIGEST = "digest"                    # batched, low priority
 NOTIFY_KIND_GENERIC = "generic"                  # non-Autopilot producers
+# Operator → user (admin dispatch): the only PLATFORM-authored alert
+# kind. Every other kind describes something the user's own agent is
+# doing, so the tenant ingest route (agent_notify) rejects this one.
+NOTIFY_KIND_ANNOUNCEMENT = "announcement"
 
 KNOWN_NOTIFY_KINDS: set[str] = {
     NOTIFY_KIND_NEEDS_INPUT,
@@ -57,6 +61,7 @@ KNOWN_NOTIFY_KINDS: set[str] = {
     NOTIFY_KIND_PROGRESS,
     NOTIFY_KIND_DIGEST,
     NOTIFY_KIND_GENERIC,
+    NOTIFY_KIND_ANNOUNCEMENT,
 }
 
 # ── Queue statuses ────────────────────────────────────────────────

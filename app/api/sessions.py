@@ -758,6 +758,14 @@ def _message_to_response(
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
         pending_action=msg_metadata.get("pending_action") if msg_metadata else None,
+        # Operator notice (admin dispatch). The clients fall back from
+        # /api/day-chats/.../messages to these session routes whenever
+        # day-chats fails, so a field emitted by only one serializer
+        # vanishes on the fallback and the notice arrives as a plain
+        # assistant bubble owned by the agent — exactly what the
+        # feature exists to prevent. api/day_chats.py and
+        # api/messages_recover.py carry the same key.
+        admin_notice=msg_metadata.get("admin_notice") if msg_metadata else None,
         attachments=attachments_list,
         channel=(
             (conversation_channels or {}).get(message.conversation_id)

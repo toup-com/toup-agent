@@ -47,6 +47,8 @@ KNOWN_CHANNELS = frozenset({
     "autopilot",  # autonomous mission tick
     "subagent",  # spawned child run
     "api",  # developer API (/v1/chat, chat.py API path) — first-class
+    "admin",  # operator → user notice (Admin Dispatch) — never a turn's channel,
+              # but every serializer resolves the channel of the row
     "agent_task",  # apps.py agent-task runner (internal stamp)
     "health_probe",  # connector_health_probe (internal stamp)
 })

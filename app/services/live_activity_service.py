@@ -6,6 +6,10 @@ Activity pushes:
 
     mission_started   → push-to-start on every registered device
                         (banner alert rides in the start payload)
+    announcement      → push-to-start too (operator → user, admin
+                        dispatch): one card, the brand orb color
+                        instead of the agent's, and no follow-up —
+                        the row IS the whole lifecycle
     progress          → content-state update, priority 5 (unbudgeted);
                         if the card is gone (preempted / device reboot)
                         it is SILENTLY re-started — self-healing
@@ -57,10 +61,10 @@ and the widget animates the bar on-device with zero pushes.
 Alarm-class terminal rows send ``content-state.fired`` instead of any
 progress — the widget renders a ringing presentation, never a bar.
 
-REMINDER WINS (founder rule): a chat-turn card must never displace or
-orphan a live ``reminder:*`` countdown — enforced in the
-mission_started branch, the restart-if-missing lane, AND
-``_preempt_device`` itself. When the app reports that a device alarm
+REMINDER WINS (founder rule): a chat-turn card — or an admin
+announcement — must never displace or orphan a live ``reminder:*``
+countdown; enforced in the start branch, the restart-if-missing lane,
+AND ``_preempt_device`` itself. When the app reports that a device alarm
 (AlarmKit) owns a reminder's fire (``alarm_owned_at``), the fire lane
 stays quiet on that device: no loud restart, no rings — AlarmKit is
 already ringing through silent/Focus.
@@ -84,6 +88,7 @@ from app.config import settings
 from app.db.models import (
     LA_ENDED, LA_STARTED,
     AgentConfig, LiveActivity, LiveActivityDevice, NotificationQueue,
+    NOTIFY_KIND_ANNOUNCEMENT,
     NOTIFY_KIND_MISSION_COMPLETED, NOTIFY_KIND_MISSION_FAILED,
     NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_NEEDS_APPROVAL,
     NOTIFY_KIND_NEEDS_INPUT, NOTIFY_KIND_PROGRESS,
@@ -100,7 +105,23 @@ LIVE_ACTIVITY_KINDS = {
     NOTIFY_KIND_NEEDS_APPROVAL,
     NOTIFY_KIND_MISSION_COMPLETED,
     NOTIFY_KIND_MISSION_FAILED,
+    NOTIFY_KIND_ANNOUNCEMENT,
 }
+
+# Kinds whose row OPENS a card (push-to-start) instead of updating one.
+# An operator announcement has no lifecycle to narrate — its single row
+# is the whole card — so it takes the same branch a mission's first row
+# does.
+_START_EVENT_KINDS = {NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_ANNOUNCEMENT}
+
+# Mission-id prefixes whose card must never end a live ``reminder:``
+# countdown to make room for itself (see REMINDER WINS above).
+_NEVER_PREEMPT_REMINDER_PREFIXES = ("chatturn:", "admin:")
+
+# An admin announcement is NOT from the user's agent, so its card must
+# not wear the agent's orb color — the Toup brand hue disowns it on the
+# lock screen the same way AdminNoticeCard does in chat.
+_ADMIN_ORB_COLOR = "#7C6BF5"
 
 
 # Alert kinds that restart a missing card before delivering (mirrors
@@ -277,6 +298,11 @@ async def _enqueue_next_ring(
     db.add(NotificationQueue(
         id=str(uuid.uuid4()),
         user_id=row.user_id,
+        # Note this re-stamps an agent-authored data_json as 'platform'.
+        # It cannot launder a data.deep_link past _send_start's source
+        # check, because ring 2+ rows are excluded from the restart lane by
+        # `_realert_seq(row) == 1` and so never reach _send_start. If that
+        # gate ever moves, this stamp has to move with it.
         source="platform",
         event_kind=row.event_kind,
         title=row.title,
@@ -410,17 +436,19 @@ async def _preempt_device(
             continue
         if (
             la.mission_id.startswith("reminder:")
-            and keep_mission_id.startswith("chatturn:")
+            and keep_mission_id.startswith(_NEVER_PREEMPT_REMINDER_PREFIXES)
         ):
             # REMINDER WINS, enforced at the preempt itself (2026-07-22
             # incident: the Answer-ready restart force-ended the live
             # countdown row here; the end push no-op'd on-device, the
             # platform lost track of the visible card, and the fire had
             # to restart a bare 0% card). A chat-turn card must never
-            # kill a user-scheduled countdown — the callers' yield
-            # guards make this path unreachable for chat turns, and if
-            # a future caller slips through we keep the countdown row
-            # and accept shared-token ambiguity as the lesser evil.
+            # kill a user-scheduled countdown, and neither may an admin
+            # announcement (same founder rule — an operator message is
+            # not more urgent than the alarm the user set) — the
+            # callers' yield guards make this path unreachable for both,
+            # and if a future caller slips through we keep the countdown
+            # row and accept shared-token ambiguity as the lesser evil.
             logger.info(
                 "live-activity preempt: refusing to end %s for %s",
                 la.mission_id, keep_mission_id,
@@ -476,12 +504,37 @@ async def _send_start(
 
     progress = _progress_fraction(row)
     data = row.data_json or {}
-    # Card-tap target: chat turns land in the conversation where the
-    # answer lives; everything else keeps Mission Control. The mission
-    # id rides as a query param so the app can ACK the tap (end the
-    # card everywhere + stop re-alerts for this mission).
-    base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
-    deep_link = f"{base_link}?mission={mission_id}"
+    # Card-tap target. A producer-supplied data.deep_link is honored ONLY
+    # from a PLATFORM row carrying a toup:// URL — the admin dispatch
+    # fan-out is the one producer, and its links already carry their own
+    # ?mission=. Both halves are load-bearing: POST /api/agent/notify
+    # writes source='agent' and copies any scalar data key verbatim from a
+    # caller holding a TENANT X-Agent-Key, so without this a compromised
+    # container could aim the user's own lock-screen card at any URL iOS
+    # will open. Every other case falls through to the platform-computed
+    # link, which is also the fail-closed direction: the column defaults to
+    # 'agent' and an unflushed row reads None. Chat turns land in the
+    # conversation where the answer lives, everything else keeps Mission
+    # Control; the mission id rides as a query param so the app can ACK the
+    # tap (end the card everywhere + stop re-alerts for this mission).
+    explicit_link = data.get("deep_link")
+    if (
+        row.source == "platform"
+        and isinstance(explicit_link, str)
+        and explicit_link.startswith("toup://")
+    ):
+        deep_link = explicit_link
+    else:
+        if explicit_link:
+            # Either a platform producer emitted a non-toup:// link (a bug)
+            # or a tenant tried to choose the tap target (an attack) — both
+            # are worth one line on the trail; neither changes the outcome.
+            logger.info(
+                "live-activity: ignoring data.deep_link on a %s row (mission %s)",
+                row.source, mission_id,
+            )
+        base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
+        deep_link = f"{base_link}?mission={mission_id}"
     timer_ms = _timer_end_ms(row)
     # INSTANT-OPEN seed (2026-07-23): reminder cards carry the reminder
     # text + fire instant on the tap URL so the app can render the
@@ -522,6 +575,12 @@ async def _send_start(
     # Producer subtitle override (e.g. reminder countdowns carry the
     # reminder text); non-silent starts keep the legacy 'Starting…'.
     subtitle_override = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
+    if subtitle_override is None and row.event_kind == NOTIFY_KIND_ANNOUNCEMENT:
+        # An announcement narrates no work: the operator's message IS
+        # the card and it rides on row.body (the admin fan-out builds
+        # data_json without a subtitle). 'Starting…' under an operator's
+        # title would be a lie.
+        subtitle_override = row.body or row.title
     timer_type = data.get("timer_type")
     # An alarm-class terminal row restarting its card IS the fire
     # moment: the fresh card renders the ringing presentation, never a
@@ -544,7 +603,10 @@ async def _send_start(
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
-        orb_color=await _user_orb_color(db, row.user_id),
+        orb_color=(
+            _ADMIN_ORB_COLOR if row.event_kind == NOTIFY_KIND_ANNOUNCEMENT
+            else await _user_orb_color(db, row.user_id)
+        ),
         stale_date=stale_ts,
         fired=fired,
     )
@@ -665,7 +727,7 @@ async def handle_notification_row(
     delivered = False
     errored = False
 
-    if row.event_kind == NOTIFY_KIND_MISSION_STARTED:
+    if row.event_kind in _START_EVENT_KINDS:
         # data.silent → card appears without a banner (reminder
         # countdown arms: the user just got chat confirmation — the
         # card IS the feedback).
@@ -674,13 +736,13 @@ async def handle_notification_row(
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
         # Belt-and-braces: key on the mission prefix too, so a future
-        # chatturn producer that forgets data.kind still yields (the
-        # _preempt_device refusal keys on the prefix — a kind-less
+        # chatturn/admin producer that forgets data.kind still yields
+        # (the _preempt_device refusal keys on the prefix — a kind-less
         # chatturn start would otherwise insert-race the partial unique
         # index forever).
-        is_chat_turn = (
-            (row.data_json or {}).get("kind") == "chat_turn"
-            or mission_id.startswith("chatturn:")
+        yields_to_reminder = (
+            (row.data_json or {}).get("kind") in ("chat_turn", "announcement")
+            or mission_id.startswith(_NEVER_PREEMPT_REMINDER_PREFIXES)
         )
         for device in devices:
             started = await _started_rows_for_device(db, device.id)
@@ -689,7 +751,7 @@ async def handle_notification_row(
                 # start push would spawn a duplicate card on screen.
                 per_device[device.id] = {"status": "skipped", "reason": "already_started"}
                 continue
-            if is_chat_turn and any(
+            if yields_to_reminder and any(
                 la.mission_id.startswith("reminder:") for la in started
             ):
                 # REMINDER WINS (founder rule 2026-07-20): a working
@@ -697,7 +759,10 @@ async def handle_notification_row(
                 # the preempt end rides the shared token, routinely
                 # no-ops on-device, and the fire's restart then stacks
                 # a duplicate card. The answer still arrives as its
-                # own banner; only the ambient working card yields.
+                # own banner; only the ambient working card yields. An
+                # operator announcement yields for the same reason: it
+                # is not more urgent than the alarm the user set, and
+                # it also lands as a chat card the user keeps.
                 per_device[device.id] = {"status": "skipped", "reason": "yields_to_reminder"}
                 continue
             result = await _send_start(db, device, row, mission_id, now, silent=start_silent)

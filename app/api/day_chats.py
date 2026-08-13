@@ -13,7 +13,7 @@ from typing import Optional, List, Tuple
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, and_, func, distinct, update
+from sqlalchemy import select, and_, or_, func, distinct, update
 from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,6 +99,31 @@ def _serialize_media(msg: Message) -> Optional[dict]:
         return None
     media = parsed.get("media")
     return media if isinstance(media, dict) else None
+
+
+def _serialize_admin_notice(msg: Message) -> Optional[dict]:
+    """Extract the operator notice persisted in metadata_json by
+    app/agent/admin_message_writer.py. Shape: {dispatch_id, mode,
+    title, sender_name, sent_at}; the prose is Message.content.
+
+    This same field is emitted by api/sessions.py and
+    api/messages_recover.py — the clients fall back from this endpoint
+    to those, so a notice serialized on only one path disappears on the
+    fallback and the card renders as a bare assistant bubble from the
+    agent, which is the one thing the feature exists to prevent.
+    """
+    import json as _json
+    raw = getattr(msg, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        parsed = _json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    notice = parsed.get("admin_notice")
+    return notice if isinstance(notice, dict) else None
 
 
 def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
@@ -452,6 +477,7 @@ async def get_day_chat_messages(
                 "conversation_id": m.conversation_id,
                 "attachments": _serialize_attachments(m),
                 "media": _serialize_media(m),
+                "admin_notice": _serialize_admin_notice(m),
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
@@ -468,7 +494,25 @@ async def get_day_chat_messages(
             select(Message, Conversation.channel)
             .join(Conversation, Message.conversation_id == Conversation.id)
             .where(
-                Message.day_chat_id == dc.id,
+                or_(
+                    Message.day_chat_id == dc.id,
+                    # Admin-dispatch notices are the ONE row type whose
+                    # Message.day_chat_id is deliberately NULL: the agent's
+                    # context loader selects WHERE Message.day_chat_id = :id,
+                    # and an operator's message must never enter the agent's
+                    # history (see app/agent/admin_message_writer.py). The
+                    # CONVERSATION still carries the day, so the day is read
+                    # off it here. Without this arm the notice is written,
+                    # broadcast, rendered live — and then gone on reload,
+                    # because this fast path is what every client fetches.
+                    # The three other readers (this route's no-DayChat
+                    # fallback, /sessions/by-date, /messages/since) all scan
+                    # by Conversation and already include it.
+                    and_(
+                        Conversation.channel == "admin",
+                        Conversation.day_chat_id == dc.id,
+                    ),
+                ),
                 # Hide historical raw autopilot tick rows (see the
                 # fallback path above); mission outcomes arrive as
                 # channel='routine' and still render.
@@ -500,6 +544,7 @@ async def get_day_chat_messages(
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
+            "admin_notice": _serialize_admin_notice(msg),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),

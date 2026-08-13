@@ -223,6 +223,16 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # for the same reason as Expo tokens above.
     "live_activity_devices",
     "live_activities",
+    # Operator→user announcements. The dispatch + its per-recipient
+    # ledger are platform bookkeeping, and the admin↔user thread is a
+    # conversation with the OPERATOR, not agent data: the agent must
+    # never read it, and the panel reads every user's replies without
+    # fanning out to N containers. The only thing that reaches a tenant
+    # DB is the chat card itself, written over HTTP by the fan-out
+    # worker (and with day_chat_id NULL, so the agent cannot see it).
+    "admin_dispatches",
+    "admin_dispatch_targets",
+    "admin_thread_messages",
 }
 
 SHARED_TABLES: set[str] = {

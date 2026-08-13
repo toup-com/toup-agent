@@ -289,7 +289,17 @@ class Settings(BaseSettings):
     # Activity timer at reminder creation for near-term one-shots.
     # Producer-side kill switch, independent of the LA lane switch above.
     reminder_countdown_live_activity_enabled: bool = True
-    
+
+    # Admin dispatch (operator→user announcements). Producer-side kill
+    # switch: with it off the admin routes refuse a new send, and nothing
+    # new enters the announcement lane. In-flight dispatches are unaffected
+    # — a broadcast already fanned out is unrecallable either way.
+    admin_dispatch_enabled: bool = True
+    # The name on the card, in place of the agent's. The whole feature
+    # rests on the user seeing that this is NOT their agent talking, so
+    # this is operator-owned copy, not a per-dispatch afterthought.
+    admin_dispatch_sender_name: str = "Toup"
+
     # Telegram Bot
     telegram_bot_token: Optional[str] = None  # Set via TELEGRAM_BOT_TOKEN env var
     telegram_allowed_user_ids: list[int] = []  # Restrict to specific Telegram user IDs

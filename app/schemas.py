@@ -797,6 +797,13 @@ class ChatMessageResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     # Media metadata (YouTube/Netflix cards)
     media: Optional[dict] = None
+    # Operator notice (admin dispatch): {dispatch_id, mode, title,
+    # sender_name, sent_at}. Declared here or it is dropped — this
+    # model ignores undeclared keys, and the mobile client falls back
+    # to the session routes whenever /api/day-chats fails, so a notice
+    # missing from THIS serializer arrives on the fallback path as a
+    # plain assistant bubble owned by the agent.
+    admin_notice: Optional[dict] = None
     # A staged `elevation: true` connector call awaiting the user's
     # confirmation ({action_id, tool_name, summary, payload, ...}).
     # Sent so the card re-renders on reload — an approval prompt that

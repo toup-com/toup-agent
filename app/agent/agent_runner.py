@@ -291,6 +291,12 @@ CHANNEL_GUIDANCE = {
         "you accomplished, surfacing data you extracted, or asking when you genuinely need user input."
     ),
     "vibecoding":"User is inside the Vibecoding IDE workspace watching you code live. See the Vibecoding rules later in the prompt.",
+    "admin": (
+        "Operator channel (Admin Dispatch) — the Toup team wrote a notice directly to the user. "
+        "You are not a party to it: the rows are written by the platform, they are kept out of your "
+        "day context on purpose, and no turn should ever run here. If one somehow does, answer the "
+        "user's own words and never speak for the operator."
+    ),
     "trigger": (
         "Unattended background turn — an email trigger fired; the user is NOT present and nothing "
         "interactive can render. Output plain text / minimal markdown suitable for a chat card and "
@@ -3403,7 +3409,7 @@ class AgentRunner:
 
         # System-driven channels are governed by the partial unique index
         # ix_conversations_system_channel_per_day (user_id, day_chat_id,
-        # channel) WHERE channel IN ('routine','trigger','api','digest').
+        # channel), whose predicate is built from INDEXED_SYSTEM_CHANNELS.
         # PR-2 fixed the client_tz NameError that had been writing
         # day_chat_id=NULL on runner-created rows — but NULLs are distinct
         # in a unique index, so that NULL was silently EVADING this index.
@@ -3415,6 +3421,7 @@ class AgentRunner:
         # same helper routines/triggers message-writers already use, so the
         # runner and the message-writer stop fighting over the row.
         from app.agent.conversation_resolver import (
+            INDEXED_SYSTEM_CHANNELS,
             resolve_or_create_day_conversation as _resolve_day_conv,
         )
         # force_new is deliberately a NO-OP for these channels: channel and
@@ -3423,7 +3430,12 @@ class AgentRunner:
         # partial unique index rejects (a 2nd active row per (user, day,
         # channel) is impossible). The resolver returns the day's existing
         # thread instead of crashing the turn.
-        _INDEXED_SYSTEM_CHANNELS = ("routine", "trigger", "api", "digest")
+        #
+        # Imported rather than re-listed: this branch and the index predicate
+        # in app.db.database.init_db must name the same channels, and as two
+        # literals they drifted. Bound to the local name the guard below (and
+        # the day-dedup regression test) reads.
+        _INDEXED_SYSTEM_CHANNELS = INDEXED_SYSTEM_CHANNELS
         if _channel in _INDEXED_SYSTEM_CHANNELS and _day_chat_id is not None:
             conv = await _resolve_day_conv(
                 db, user_id=user_id, day_chat_id=_day_chat_id, channel=_channel,

@@ -39,11 +39,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 
-# Channels with strict (user_id, day_chat_id, channel) uniqueness. Mirror
-# the partial unique index predicate in `app.db.database.init_db`. Add a
+# The channels the partial unique index actually covers, and the ONE place
+# its predicate is written: `app.db.database.init_db` builds the index's
+# `channel IN (...)` list from this tuple and `agent_runner` gates its
+# runner-side branch on it. Three hand-copied literals is what let them
+# drift apart in the first place.
+#
+# `subagent` is deliberately NOT here even though it is a system channel:
+# sub-agents finish concurrently, so a tenant can already hold two active
+# subagent rows for one day, and CREATE UNIQUE INDEX would fail on them —
+# taking the index down for every other channel with it. Admitting it needs
+# a dedupe pass first.
+INDEXED_SYSTEM_CHANNELS: tuple[str, ...] = (
+    "routine", "trigger", "api", "digest",
+    "admin",  # operator → user notice (Admin Dispatch)
+)
+
+# Channels with strict (user_id, day_chat_id, channel) uniqueness. Add a
 # channel here only if it's system-driven (push-style, not a user UI
-# thread) — see Reading A in the bug-sweep doc.
-SYSTEM_CHANNELS: frozenset[str] = frozenset({"routine", "trigger", "api", "digest", "subagent"})
+# thread) — see Reading A in the bug-sweep doc. For a member outside
+# INDEXED_SYSTEM_CHANNELS the dedupe is advisory: the SELECT below still
+# reuses the day's row, but the IntegrityError→re-SELECT race recovery can
+# never fire because nothing rejects the second insert.
+SYSTEM_CHANNELS: frozenset[str] = frozenset(INDEXED_SYSTEM_CHANNELS) | {"subagent"}
 
 
 async def resolve_or_create_day_conversation(

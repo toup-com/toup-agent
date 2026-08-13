@@ -402,6 +402,13 @@ async def init_db():
     # to this run_mode. Trying to ALTER a non-existent table just silently fails
     # in the try/except below.
 
+    # The system-channel partial unique index further down names its channels;
+    # it reads them from the resolver that depends on it rather than keeping a
+    # second copy here. Imported inside init_db — this module is on everyone's
+    # import path and app.agent.conversation_resolver must not become part of it.
+    from app.agent.conversation_resolver import INDEXED_SYSTEM_CHANNELS
+    _system_channel_sql = ", ".join(f"'{_c}'" for _c in INDEXED_SYSTEM_CHANNELS)
+
     _alter_statements = [
         # ── Users ──
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP",
@@ -885,13 +892,24 @@ async def init_db():
         "ON memories USING gin (search_vector)",
         # Bug sweep 2026-05-13 / Ticket 1: enforce Reading-A invariant —
         # one Conversation per (user, day, channel) for system channels.
-        # Predicate matches SYSTEM_CHANNELS in
-        # app.agent.conversation_resolver. Partial-on-is_active so soft-
-        # deleted (post-merge) rows from the cleanup script don't block
-        # future inserts.
-        "CREATE UNIQUE INDEX IF NOT EXISTS ix_conversations_system_channel_per_day "
+        # The predicate is BUILT from conversation_resolver's
+        # INDEXED_SYSTEM_CHANNELS (see _system_channel_sql above), so the
+        # resolver's IntegrityError→re-SELECT recovery and the constraint
+        # that has to fire it can no longer disagree. Partial-on-is_active
+        # so soft-deleted (post-merge) rows from the cleanup script don't
+        # block future inserts.
+        #
+        # Drop first, and CREATE without IF NOT EXISTS, because both of
+        # those skip on the index NAME: editing the predicate in place
+        # would never reach a tenant that already has the index — Postgres
+        # skips the CREATE, and ddl_plan skips the statement before
+        # Postgres even sees it. Same drop+recreate shape as
+        # uq_routines_one_per_kind above; keep the two adjacent, the gap
+        # between them is the only moment the invariant is unenforced.
+        "DROP INDEX IF EXISTS ix_conversations_system_channel_per_day",
+        "CREATE UNIQUE INDEX ix_conversations_system_channel_per_day "
         "ON conversations (user_id, day_chat_id, channel) "
-        "WHERE channel IN ('routine', 'trigger', 'api', 'digest') AND is_active = TRUE",
+        f"WHERE channel IN ({_system_channel_sql}) AND is_active = TRUE",
         # ── Support agent: Phase-0 diagnosis-quality grade (alembic 066) ──
         # Mirrored here per the READ-FIRST rule: the platform-api boots via
         # init_db, and the Dockerfile CMD runs `alembic upgrade head` only
