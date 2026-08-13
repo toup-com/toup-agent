@@ -79,3 +79,8 @@ yt-dlp>=2025.5.22
 # get past YouTube's datacenter-IP bot challenge — the free alternative to a
 # residential proxy. Inert unless BGUTIL_POT_BASE_URL is set; see media_proxy.py.
 bgutil-ytdlp-pot-provider
+
+# PyJWT — distinct from python-jose (`jose`). apple_auth.py and apns_push.py
+# import it at module level via the app.main import graph. Kept in sync with
+# requirements.test.docker.txt.
+pyjwt[crypto]>=2.8.0

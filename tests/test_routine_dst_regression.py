@@ -93,25 +93,34 @@ def test_dst_spring_forward_2026_03_08_skips_nonexistent_local_time():
     )
 
 
-def test_dst_fall_back_2026_11_01_apscheduler_emits_two_fires_idempotency_prevents_dup_delivery():
+def test_dst_fall_back_2026_11_01_fires_once_on_the_repeated_hour():
     """On 2026-11-01 in America/Toronto, 01:30 occurs twice (01:30 EDT
-    at UTC 05:30 and 01:30 EST at UTC 06:30).
+    at UTC 05:30 and 01:30 EST at UTC 06:30). A daily routine must run
+    ONCE that day, not twice because the clock repeated an hour.
 
-    PINNED BEHAVIOUR (verified against apscheduler 3.10.4 + ZoneInfo):
-      • APScheduler emits BOTH fires — one at 01:30 EDT, one at 01:30 EST.
-      • Both carry scheduled_for_local_date = 2026-11-01.
-      • The UNIQUE constraint on
-        `routine_runs(routine_id, scheduled_for_local_date)` is what
-        prevents the user from getting a duplicate briefing.
+    This test used to assert the opposite — two fires, both dated
+    2026-11-01, with the `routine_runs` UNIQUE saving the user from a
+    duplicate briefing — and it was green, because CI floored
+    `apscheduler>=3.10` and resolved 3.11.x while every deployed image
+    and the platform pinned ==3.10.4. It was pinning a library
+    production has never run, and its "verified against apscheduler
+    3.10.4" attribution was false: the environment that verified it had
+    silently drifted.
 
-    If a future apscheduler version *changes* its fall-back semantics
-    (e.g., starts emitting only one fire), this test fires loud — we'd
-    need to revisit the idempotency contract.
+    Measured on both versions, same trigger, same instants:
 
-    Production-side guarantee is therefore:
-      `idempotency_collision` log line at runner.py:531 catches the second
-      fire and exits silently. Verified separately in
-      test_idempotency_collision_on_second_fire_same_day.
+        3.10.4  n1 2026-11-01T05:30Z (Nov 1)  n2 2026-11-02T06:30Z (Nov 2)  -> 1 fire
+        3.11.3  n1 2026-11-01T05:30Z (Nov 1)  n2 2026-11-01T06:30Z (Nov 1)  -> 2 fires
+
+    So the version production runs already does the right thing, and the
+    idempotency UNIQUE is a second line of defence rather than the only
+    one. All five requirements files and both CI install lists now pin
+    ==3.10.4, which is what makes this assertion meaningful.
+
+    If a future upgrade reintroduces the second fire, this goes red
+    before the upgrade ships — and the decision to accept a duplicate
+    fire (masked by idempotency) becomes explicit instead of arriving on
+    the first Sunday in November.
     """
     tz = ZoneInfo("America/Toronto")
     trigger = _parse_cron_5("30 01 * * *", tz)
@@ -123,19 +132,21 @@ def test_dst_fall_back_2026_11_01_apscheduler_emits_two_fires_idempotency_preven
     n1_utc = n1.astimezone(timezone.utc)
     n2_utc = n2.astimezone(timezone.utc)
 
-    # Pinned UTC instants — pre-fold (EDT) and post-fold (EST).
     assert n1_utc == datetime(2026, 11, 1, 5, 30, 0, tzinfo=timezone.utc), (
         f"fall-back first fire: got {n1_utc.isoformat()}, expected "
         "2026-11-01T05:30:00+00:00 (01:30 EDT, pre-fold)."
     )
-    assert n2_utc == datetime(2026, 11, 1, 6, 30, 0, tzinfo=timezone.utc), (
-        f"fall-back second fire: got {n2_utc.isoformat()}, expected "
-        "2026-11-01T06:30:00+00:00 (01:30 EST, post-fold)."
+    assert n2_utc == datetime(2026, 11, 2, 6, 30, 0, tzinfo=timezone.utc), (
+        f"fall-back next fire: got {n2_utc.isoformat()}, expected "
+        "2026-11-02T06:30:00+00:00 — the NEXT day. Getting "
+        "2026-11-01T06:30Z means the repeated hour fired a second time, "
+        "which is apscheduler 3.11.x semantics; check the pin."
     )
-    # Both fires share the local date — the idempotency UNIQUE is what
-    # turns "two fires" into "one delivery."
-    assert n1.astimezone(tz).date() == n2.astimezone(tz).date() == \
-        datetime(2026, 11, 1).date()
+    # Exactly one fire carries the fold date.
+    fold_date = datetime(2026, 11, 1).date()
+    assert [n.astimezone(tz).date() for n in (n1, n2)].count(fold_date) == 1, (
+        "a daily routine fired twice on the day the clock repeated an hour"
+    )
 
 
 def test_dst_phoenix_no_dst_fires_at_constant_utc_offset_year_round():
@@ -198,4 +209,36 @@ def test_dst_watchdog_does_not_trip_on_correct_apscheduler():
         f"DST watchdog tripped {drift_total} times during startup — "
         "APScheduler diverged from croniter+ZoneInfo. CRITICAL log line "
         "carries the routine_id and the two next-fire timestamps."
+    )
+
+
+def test_apscheduler_version_is_the_one_production_actually_runs():
+    """CI floored `apscheduler>=3.10` and resolved 3.11.3, while every
+    deployed image and the platform pinned ==3.10.4 — so CI was green on
+    fold semantics production has never executed.
+
+    The two differ, proven live by swapping only the apscheduler version
+    on the VPS: across the DST fall-back fold 3.10.4 emits ONE fire (n2
+    lands on the next day) and 3.11.x emits TWO.
+
+    The pin closes the gap toward PRODUCTION, not away from it, for two
+    reasons. One fire is the behaviour a user wants — a daily routine
+    should run once, not twice because the clock repeated an hour — so
+    3.10.4 is the correct semantics and 3.11.x is the regression that
+    only the `routine_runs` idempotency UNIQUE would have masked. And a
+    GA hardening run has no business changing production's scheduler
+    behaviour to fix a CI configuration mistake.
+
+    MUTATION: let either install list float back to a `>=` floor → this
+    resolves 3.11.x → red here, loudly, instead of a mystery fold
+    failure months later on the first Sunday in November."""
+    import apscheduler
+
+    parts = tuple(int(p) for p in apscheduler.__version__.split(".")[:3])
+    assert parts == (3, 10, 4), (
+        f"apscheduler {apscheduler.__version__} is not what production "
+        f"runs (3.10.4, probed on the fleet and in "
+        f"requirements.platform.txt). CI must test what production runs; "
+        f"if this is a deliberate upgrade, re-verify the fall-back fold "
+        f"fire count live before changing this pin."
     )

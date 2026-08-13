@@ -66,3 +66,9 @@ aiofiles==23.2.1
 
 # WebSocket client (for agent tunnel proxy — may be module-level imported)
 websockets>=12.0
+
+# PyJWT — distinct from python-jose (`jose`). apple_auth.py and apns_push.py
+# import it at module level, and the monolith app.main import graph reaches
+# both, so the test stack cannot boot without it. requirements.txt and
+# requirements.platform.txt already carry it; the docker files had drifted.
+pyjwt[crypto]>=2.8.0
