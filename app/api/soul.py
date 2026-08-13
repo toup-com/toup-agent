@@ -81,6 +81,13 @@ async def save_soul(
     db: AsyncSession = Depends(get_db),
 ):
     """Save soul config → compile → update Identity record."""
+    # Read the id BEFORE the try. `current_user` is a live ORM instance, and
+    # after `db.rollback()` its attributes are expired — touching one issues
+    # lazy IO from a sync context and raises MissingGreenlet, so the handler
+    # written to REPORT the failure raised its own exception on top of it.
+    # That is what turned this into a bare "Internal Server Error" with the
+    # real cause (an aware datetime into a naive column) buried.
+    user_id = current_user.id
     try:
         return await _save_soul_impl(req, current_user, db)
     except HTTPException:
@@ -91,7 +98,7 @@ async def save_soul(
         # Re-raise as an explicit 500 with the underlying exception type +
         # truncated message so the user (and Railway logs) see what broke.
         await db.rollback()
-        logger.exception("[SOUL] save failed for user %s", current_user.id)
+        logger.exception("[SOUL] save failed for user %s", user_id)
         raise HTTPException(500, f"{type(e).__name__}: {str(e)[:300]}")
 
 
@@ -292,7 +299,15 @@ async def _save_soul_impl(
                 "Your agent couldn't be updated, so nothing was saved. "
                 "Please try again in a moment.",
             )
-        config.vps_soul_synced_at = datetime.now(timezone.utc)
+        # NAIVE UTC. `soul_configs.vps_soul_synced_at` is `DateTime` without
+        # `timezone=True`, i.e. TIMESTAMP WITHOUT TIME ZONE, and asyncpg
+        # refuses an aware value for one ("can't subtract offset-naive and
+        # offset-aware datetimes"). This was the ONLY aware write in the file
+        # — every other timestamp here is `datetime.utcnow()` — and because
+        # the commit below is the single commit on this path, it did not just
+        # lose a timestamp: it failed the INSERT of the whole soul_configs
+        # row, so "Save & Apply" 500'd and saved nothing.
+        config.vps_soul_synced_at = datetime.utcnow()
 
     await db.commit()
 
