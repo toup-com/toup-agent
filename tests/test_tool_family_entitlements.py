@@ -59,8 +59,23 @@ from app.config import settings
 # If this test fails, the default wire tools array moved. That is a new
 # provider cache lineage for EVERY tenant on merge; do not "update the
 # golden" without deciding that is what you want.
+# MOVED DELIBERATELY 2026-08-13 (was 34e3979c…366739f, captured @ 1b80d28e).
+# `generate_docx` / `generate_xlsx` descriptions now disclaim Google Docs and
+# Sheets. The tools array is otherwise unchanged — still 60 definitions, no
+# tool added, removed or reordered; only two description strings differ.
+#
+# Accepting the new lineage was the point of the change, not a side effect.
+# `generate_docx` described itself as "use when the user wants an editable
+# document", which is precisely what someone asking for a Google Doc wants, so
+# the model created a real Doc AND stapled a stray .docx beside it. The routing
+# guidance added to `_build_system_prompt` in #603 was present and un-gated on
+# the running image and lost anyway: a tool description is read at the moment of
+# choosing, a system-prompt bullet is thousands of tokens away.
+#
+# Cost accepted: one prompt-cache re-warm per tenant on merge. See
+# tests/test_generate_tools_disclaim_google.py for the behaviour this buys.
 MAIN_CORE_TOOLS_SHA256 = (
-    "34e3979c32c6e3c8b3fcde8e0c0a48145b4b3c59e389d2b6d79564580366739f"
+    "caad2af59c3ce73d2c99fe5e6db53f7175785dcfaeafb2d8c93e3ecaf93f656b"
 )
 MAIN_CORE_TOOLS_COUNT = 60
 

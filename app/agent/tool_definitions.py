@@ -1782,8 +1782,12 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
         {
             "name": "generate_docx",
             "description": (
-                "Produce a Word (.docx) document from structured content blocks. "
-                "Use when the user wants an editable document (vs. a read-only PDF)."
+                "Produce a Word (.docx) FILE IN THIS CHAT from structured content blocks. "
+                "Use when the user wants an editable file to download (vs. a read-only PDF). "
+                "NOT for a Google Doc: if they said 'Google Doc', 'in my Drive', or gave a "
+                "docs.google.com link, use `docs__create` / `drive__create_doc` instead — and "
+                "do NOT also call this tool. A .docx is not a Google Doc, it never appears in "
+                "their Drive, and attaching one beside a real Doc reads as a broken duplicate."
             ),
             "input_schema": {
                 "type": "object",
@@ -1798,8 +1802,12 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
         {
             "name": "generate_xlsx",
             "description": (
-                "Produce an Excel (.xlsx) workbook with one or more sheets. "
-                "Use for tabular data — expense summaries, datasets, schedules."
+                "Produce an Excel (.xlsx) FILE IN THIS CHAT with one or more sheets. "
+                "Use for tabular data the user wants to download — expense summaries, "
+                "datasets, schedules. NOT for a Google Sheet: if they said 'Google Sheet', "
+                "'in my Drive', or gave a docs.google.com link, use "
+                "`sheets__create_spreadsheet` / `sheets__append_rows` instead — and do NOT "
+                "also call this tool. An .xlsx never appears in their Drive."
             ),
             "input_schema": {
                 "type": "object",
