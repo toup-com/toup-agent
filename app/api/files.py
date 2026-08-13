@@ -57,7 +57,36 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
     return None
 
 
-async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dict):
+# Read timeout for a plain byte-for-byte file proxy. The agent is already
+# holding the bytes; anything slower than this is a dead socket.
+_PROXY_READ_S = 15.0
+
+# ...but a DOCX/PPTX preview is not a file read. The agent shells out to
+# LibreOffice and converts to PDF before the first byte exists, and that
+# conversion is measured in SECONDS, not milliseconds:
+#
+#   cached                    0.2 s
+#   warm convert              3.3 s
+#   cold convert             10.3 s   <- measured 2026-08-13, real user file
+#
+# Against the 15 s read budget that is a 1.45x margin on a path whose own
+# docstring advertises "~3-8s (LibreOffice cold start)". Any load on the
+# agent pushes a first-view preview over the line, and the client sees a
+# dead request it renders as "Missing PDF <url>" — which names the file
+# and so reads as corruption rather than a timeout. Every generated
+# document is a cold convert exactly once, so this lands on first view,
+# which is the only view that matters.
+_PREVIEW_READ_S = 90.0
+
+
+async def _proxy_file(
+    agent_url: str,
+    agent_api_key: str,
+    path: str,
+    params: dict,
+    *,
+    read_timeout: float = _PROXY_READ_S,
+):
     """Open a streaming GET to the agent's files endpoint and return an
     (content_iter, headers, status) tuple. Caller wraps into StreamingResponse.
 
@@ -78,7 +107,7 @@ async def _proxy_file(agent_url: str, agent_api_key: str, path: str, params: dic
         "GET", url,
         headers={"X-Agent-Key": agent_api_key},
         params=params,
-        timeout=httpx.Timeout(connect=5.0, read=15.0, write=5.0, pool=5.0),
+        timeout=httpx.Timeout(connect=5.0, read=read_timeout, write=5.0, pool=5.0),
     )
     resp = await client.send(req, stream=True)
     if resp.status_code >= 400:
@@ -258,7 +287,8 @@ async def preview_file(
         if not proxy:
             raise HTTPException(status_code=404, detail="No active agent for user")
         content_iter, headers, status = await _proxy_file(
-            proxy[0], proxy[1], f"{message_id}/{attachment_id}/preview", {"format": format}
+            proxy[0], proxy[1], f"{message_id}/{attachment_id}/preview", {"format": format},
+            read_timeout=_PREVIEW_READ_S,
         )
         return StreamingResponse(content_iter, status_code=status,
                                  media_type=headers.get("content-type", "text/html"),

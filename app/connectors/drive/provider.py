@@ -41,6 +41,30 @@ from app.services import connector_vault as _vault
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DOCS_API = "https://docs.googleapis.com/v1"
 
+# Every read this connector performs is bounded by `drive.file`, which is
+# PER-FILE: `files.list` returns only what this app created or the user
+# explicitly picked, and `files.get` 404s on everything else. Google's
+# own wording — "Per-file access to files created or opened by the app".
+#
+# That makes an empty list ambiguous in the one direction that matters.
+# On 2026-08-12 a user asked to add a row to their expenses sheet; the
+# agent called drive__list_files twice, got `{"files": []}` both times,
+# and answered "I couldn't find an Expenses spreadsheet in the connected
+# Drive". The sheet existed. The agent simply cannot see it, and nothing
+# in the payload said so — an Ok result carrying a false negative, which
+# the model then stated to the user as fact.
+#
+# So the constraint travels WITH the data, on every call. It costs a few
+# tokens; the alternative is the agent confidently denying the existence
+# of the user's files. A non-empty list needs it just as much: showing 2
+# app-created files out of 50 as "your Drive" is the same lie, quieter.
+_SCOPE_NOTE = (
+    "Only files this agent created, or that the user explicitly picked, are "
+    "visible under the drive.file scope. The user's own files CANNOT be "
+    "listed or searched here. If what they asked for is not in this list, "
+    "ask them to paste its link — never tell them the file does not exist."
+)
+
 
 async def _resolve_token(user_id: str) -> str:
     async with async_session_maker() as db:
@@ -87,6 +111,8 @@ class DriveProvider(BaseConnectorProvider):
                     params=params,
                     scope_hint="drive.file",
                 )
+                result["scope"] = "drive.file"
+                result["note"] = _SCOPE_NOTE
                 return ConnectorOk(content=json.dumps(result))
 
             if tool_name == "drive__get_file_text":
@@ -94,13 +120,37 @@ class DriveProvider(BaseConnectorProvider):
                 if not fid:
                     return ConnectorToolError(message="file_id required", retryable=False)
                 # Step 1: metadata fetch to learn mimeType.
-                meta = await google_request(
-                    "GET",
-                    f"{DRIVE_API}/files/{fid}",
-                    access_token=access_token,
-                    params={"fields": "id,name,mimeType,size"},
-                    scope_hint="drive.file",
-                )
+                #
+                # A 404 here almost never means "no such file" — under
+                # drive.file, Google returns 404 for every file this app
+                # did not create, which is most of the user's Drive. The
+                # raw message ("File not found: <id>") reads as deletion
+                # and the agent repeats it as fact. Say what it means.
+                try:
+                    meta = await google_request(
+                        "GET",
+                        f"{DRIVE_API}/files/{fid}",
+                        access_token=access_token,
+                        params={"fields": "id,name,mimeType,size"},
+                        scope_hint="drive.file",
+                    )
+                except _GoogleConnectorError as e:
+                    inner = e.result
+                    msg = getattr(inner, "message", "") or ""
+                    if msg.startswith("404"):
+                        return ConnectorToolError(
+                            message=(
+                                f"Drive returned 404 for file {fid}. Under the "
+                                f"drive.file scope this agent can only open files "
+                                f"it created or the user explicitly picked, so this "
+                                f"almost certainly means NO ACCESS, not that the "
+                                f"file is missing. Do not tell the user it does not "
+                                f"exist — ask them to share the link, or to open it "
+                                f"once with this app."
+                            ),
+                            retryable=False,
+                        )
+                    raise
                 mime = meta.get("mimeType", "")
                 # Google native types need export to text/plain.
                 if mime.startswith("application/vnd.google-apps."):

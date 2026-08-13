@@ -15,7 +15,9 @@ need weasyprint) can skip installing Pango/Cairo.
 
 from __future__ import annotations
 
+import asyncio
 import io
+import logging
 import os
 import uuid
 from dataclasses import dataclass, asdict
@@ -24,6 +26,11 @@ from typing import Any, Dict, List, Optional
 
 from app.services.file_storage import get_storage_backend
 
+
+logger = logging.getLogger(__name__)
+
+# Strong refs to in-flight preview warms — see _prewarm_preview.
+_PREWARM_TASKS: set[asyncio.Task] = set()
 
 MIME_PDF = "application/pdf"
 MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -58,12 +65,51 @@ def _safe_filename(name: str, default_ext: str) -> str:
     return name
 
 
+def _prewarm_preview(storage_key: str, mime_type: str) -> None:
+    """Start the DOCX/PPTX -> PDF conversion now, not on first view.
+
+    The preview pane converts through LibreOffice, and that conversion was
+    measured at 10.3 s cold (3.3 s warm, 0.2 s cached) on a real user file
+    on 2026-08-13. Every generated document is cold exactly once — on the
+    view that immediately follows generation, which is the view the user
+    always takes. So the one time it matters is the one time it is slow.
+
+    Doing it here costs nothing the user waits for: the agent has just
+    written the bytes and is still composing its reply, so the conversion
+    overlaps with the rest of the turn and the pane opens from cache.
+
+    Fire-and-forget by design. A failure here must never fail the tool
+    call that produced the document — the preview route still converts on
+    demand, and the user gets a file either way.
+    """
+    if mime_type not in (MIME_DOCX, MIME_PPTX):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _run() -> None:
+        try:
+            from app.services.doc_preview import render_to_pdf
+            await render_to_pdf(storage_key)
+        except Exception as e:  # never surface — this is pure latency work
+            logger.debug("preview prewarm skipped for %s: %s", storage_key, e)
+
+    task = loop.create_task(_run())
+    # Hold a reference; a bare create_task can be garbage-collected
+    # mid-flight, which would silently drop the warm we just scheduled.
+    _PREWARM_TASKS.add(task)
+    task.add_done_callback(_PREWARM_TASKS.discard)
+
+
 async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) -> Attachment:
     """Write bytes to storage under {user_scope}/{uuid}_{filename} and return an Attachment."""
     att_id = uuid.uuid4().hex
     key = f"{user_scope}/{att_id}_{filename}" if user_scope else f"{att_id}_{filename}"
     backend = get_storage_backend()
     await backend.put(key, data)
+    _prewarm_preview(key, mime_type)
     return Attachment(
         id=att_id,
         filename=filename,

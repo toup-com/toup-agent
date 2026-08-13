@@ -2,7 +2,7 @@
 manifest_version: 1
 id: drive
 name: Google Drive
-short_description: Find files, read text content, and create new docs in your Drive.
+short_description: Create docs in your Drive, and read the files you share with it.
 icon: cloud
 docs_url: https://developers.google.com/drive/api/v3/reference
 status: stable
@@ -26,7 +26,12 @@ health:
 
 tools:
   - name: drive__list_files
-    description: List Drive files matching an optional query string (Drive search syntax).
+    description: >-
+      List ONLY the Drive files this agent created, or that the user explicitly
+      picked for it. This is NOT a search of the user's Drive — the drive.file
+      scope cannot see their other files, so an empty result means "not visible
+      to me", never "does not exist". To reach a file the user already owns, ask
+      them to paste its link instead.
     input_schema:
       type: object
       properties:
@@ -48,7 +53,11 @@ tools:
       deny: []
 
   - name: drive__get_file_text
-    description: Fetch the text content of a Drive file by id. Works for plain text, Google Docs (exported as plain text), and PDFs (Drive returns indexed text).
+    description: >-
+      Fetch the text of a Drive file by id. Works for plain text, Google Docs
+      (exported as plain text) and PDFs. Limited to files this agent created or
+      the user explicitly picked; anything else returns 404 for lack of access,
+      not because it is missing.
     input_schema:
       type: object
       properties:
