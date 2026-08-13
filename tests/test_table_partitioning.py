@@ -7,7 +7,23 @@ the categorization, this test fails and tells them exactly what to do.
 """
 
 import pytest
-from app.db.models.base import Base, AGENT_ONLY_TABLES, PLATFORM_ONLY_TABLES, SHARED_TABLES
+from app.db.models.base import (
+    Base,
+    AGENT_ONLY_TABLES,
+    PLATFORM_ONLY_TABLES,
+    SHARED_TABLES,
+    SHARED_COLUMN_AUTHORITY,
+)
+
+
+def _shared_column_keys() -> set[str]:
+    """Every '<table>.<column>' of every SHARED table, from live metadata."""
+    return {
+        f"{table.name}.{column.name}"
+        for table in Base.metadata.sorted_tables
+        if table.name in SHARED_TABLES
+        for column in table.columns
+    }
 
 
 def test_every_table_is_categorized():
@@ -67,3 +83,64 @@ def test_shared_tables_are_correct():
     """
     assert "users" in SHARED_TABLES
     assert "agent_configs" in SHARED_TABLES
+
+
+# ── L-1b: shared-column authority map ─────────────────────────────────
+#
+# A shared table's column is TWO columns — a platform copy and a tenant
+# copy — and twice a writer updated one while the reader read the other
+# (users.timezone 2026-08-10, agent_configs.agent_name 2026-08-11).
+# These tests force every shared column to carry an explicit authority
+# declaration in base.py, so the next such column cannot land unnoticed.
+
+
+def test_every_shared_column_has_an_authority_entry():
+    """Every column of every SHARED table must be declared in
+    SHARED_COLUMN_AUTHORITY."""
+    missing = sorted(_shared_column_keys() - set(SHARED_COLUMN_AUTHORITY))
+    assert not missing, (
+        f"new shared column(s) {missing} — add a SHARED_COLUMN_AUTHORITY entry in "
+        f"app/db/models/base.py declaring which database owns each one. A shared "
+        f"table exists in BOTH the platform DB and every tenant DB, so a column "
+        f"without a declared owner is one writer away from the users.timezone / "
+        f"agent_configs.agent_name class of silent split (written in one database, "
+        f"read from the other). Declare authority "
+        f"('platform' | 'tenant' | 'both-synced' | 'immutable-after-create'), the "
+        f"write_paths you grepped, the sync mechanism (or 'none'), and a one-line note."
+    )
+
+
+def test_no_phantom_authority_entries():
+    """Every key in SHARED_COLUMN_AUTHORITY must be a real shared
+    table.column — catches renames, deletions and tables leaving
+    SHARED_TABLES."""
+    phantom = sorted(set(SHARED_COLUMN_AUTHORITY) - _shared_column_keys())
+    assert not phantom, (
+        f"SHARED_COLUMN_AUTHORITY declares column(s) that no shared table has: "
+        f"{phantom}. Either the column was renamed/removed (update the map key in "
+        f"app/db/models/base.py) or its table is no longer in SHARED_TABLES (move "
+        f"or delete the entries)."
+    )
+
+
+def test_authority_values_are_well_formed():
+    """Each entry must carry a valid authority enum, non-empty note,
+    write_paths list, and a sync declaration."""
+    allowed = {"platform", "tenant", "both-synced", "immutable-after-create"}
+    for key, entry in SHARED_COLUMN_AUTHORITY.items():
+        assert isinstance(entry, dict), f"{key}: entry must be a dict, got {type(entry).__name__}"
+        assert entry.get("authority") in allowed, (
+            f"{key}: authority {entry.get('authority')!r} not in {sorted(allowed)}"
+        )
+        write_paths = entry.get("write_paths")
+        assert isinstance(write_paths, list) and write_paths and all(
+            isinstance(p, str) and p.strip() for p in write_paths
+        ), f"{key}: write_paths must be a non-empty list of non-empty strings"
+        sync = entry.get("sync")
+        assert isinstance(sync, str) and sync.strip(), (
+            f"{key}: sync must name the cross-DB mechanism, or be 'none'"
+        )
+        note = entry.get("note")
+        assert isinstance(note, str) and note.strip(), (
+            f"{key}: note must be a non-empty one-liner explaining why this authority"
+        )

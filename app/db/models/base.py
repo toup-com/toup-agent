@@ -251,3 +251,718 @@ SHARED_TABLES: set[str] = {
     # single side is precisely the mistake that took `agent_configs` down.
     "extension_devices",
 }
+
+
+# ── Shared-column authority map (L-1b) ────────────────────────────────
+#
+# A SHARED table exists in BOTH databases, which means every one of its
+# columns is TWO columns: a platform copy and a tenant copy. Twice now a
+# writer updated one copy while the reader read the other, silently:
+#
+#   * users.timezone (2026-08-10, #488 class): chat wrote the TENANT
+#     copy, voice read the PLATFORM copy → 23 active users' "today"
+#     computed in UTC.
+#   * agent_configs.agent_name (2026-08-11): the Soul page wrote the
+#     PLATFORM copy, text chat + the W-6 assembler read the TENANT copy
+#     → agents named at bind were nameless in chat.
+#
+# This map makes the decision explicit and CI-enforced: every column of
+# every SHARED table must declare which database owns its value. Adding
+# a column to a shared table without an entry here fails
+# tests/test_table_partitioning.py with instructions.
+#
+# authority values:
+#   "platform"               — the platform DB copy is the truth; the
+#                              tenant copy is empty/stub/dead unless a
+#                              named sync delivers it.
+#   "tenant"                 — the tenant DB copy is the truth; the
+#                              platform copy is stub/self-healed/dead.
+#   "both-synced"            — both sides legitimately write their own
+#                              copy. Either the named sync converges
+#                              them, or (sync="none") the value is
+#                              row-local bookkeeping where divergence is
+#                              expected — see the note.
+#   "immutable-after-create" — set at row INSERT and never mutated;
+#                              cross-DB equality holds by construction
+#                              (or is explicitly N/A — see note).
+#
+# write_paths are short human pointers ("<code path> (platform|tenant)"),
+# not exhaustive call graphs — enough to find the writer with one grep.
+# sync names the mechanism that moves the value across the seam, or
+# "none". NEVER put a secret or a live value in this map.
+# ──────────────────────────────────────────────────────────────────────
+
+_CFG_PATCH = "agent-setup config PATCH (app/api/agent_setup.py update_config, platform)"
+_BRIDGE_ENV = "bridge env push (update_container_env → container process env; tenant column stays empty)"
+_BYOK_NOTE = (
+    "secret is platform-vaulted; never written tenant-side (see SHARED_TABLES "
+    "note) — the agent receives it via container env, and agent-side direct "
+    "reads of the tenant row fall back when empty"
+)
+_DEAD_TENANT = "dead on tenant — no tenant-side writer (grep 2026-08-12)"
+
+SHARED_COLUMN_AUTHORITY: dict[str, dict] = {
+    # ── users ─────────────────────────────────────────────────────────
+    "users.id": {
+        "authority": "immutable-after-create",
+        "write_paths": [
+            "platform signup/oauth (app/services/auth_service.py)",
+            "tenant stub create (auth.get_current_user agent-mode, ws_chat stub, /admin/bind owner upsert)",
+        ],
+        "sync": "none",
+        "note": "primary key = the user uuid on both sides; it is the cross-DB join key and never mutates",
+    },
+    "users.email": {
+        "authority": "platform",
+        "write_paths": [
+            "platform signup/oauth (auth_service, app/api/auth.py)",
+            "soul-sync owner upsert (app/api/soul.py sync_soul receiver, tenant)",
+            "/admin/bind owner upsert (app/api/admin_pool.py, tenant)",
+        ],
+        "sync": "soul-sync owner upsert + bind payload",
+        "note": "platform is identity authority; tenant boots with an @agent.local stub healed on bind/soul save",
+    },
+    "users.hashed_password": {
+        "authority": "platform",
+        "write_paths": ["auth_service signup + change_password (platform)"],
+        "sync": "none",
+        "note": "tenant stub rows carry an empty string; login exists only on the platform — " + _DEAD_TENANT,
+    },
+    "users.name": {
+        "authority": "platform",
+        "write_paths": [
+            "PATCH /auth/profile (platform)",
+            "admin users update (app/api/admin/users.py, platform)",
+            "soul-sync owner upsert (tenant)",
+            "/admin/bind owner upsert (tenant)",
+        ],
+        "sync": "soul-sync owner upsert + bind payload",
+        "note": "platform authority; tenant stub 'Agent Owner' is healed on bind/soul save (the 'Hey Agent Owner' fix)",
+    },
+    "users.password_changed_at": {
+        "authority": "platform",
+        "write_paths": ["auth_service change_password (platform)"],
+        "sync": "none",
+        "note": "token-revocation cutoff, read platform-side only; " + _DEAD_TENANT,
+    },
+    "users.role": {
+        "authority": "platform",
+        "write_paths": [
+            "admin users role update (platform)",
+            "invite accept (app/api/admin/users.py, platform)",
+        ],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "users.created_at": {
+        "authority": "immutable-after-create",
+        "write_paths": ["row INSERT on either side"],
+        "sync": "none",
+        "note": "row-local: platform signup time vs tenant stub-create time legitimately differ — never compare across DBs",
+    },
+    "users.updated_at": {
+        "authority": "both-synced",
+        "write_paths": ["every local UPDATE on either side"],
+        "sync": "none",
+        "note": "ORM bookkeeping — each database stamps its own copy on local writes; divergence expected, exclude from drift probes",
+    },
+    "users.is_active": {
+        "authority": "platform",
+        "write_paths": ["admin users update (platform)"],
+        "sync": "none",
+        "note": "enforced at platform auth; tenant copy defaults True and " + _DEAD_TENANT,
+    },
+    "users.stripe_customer_id": {
+        "authority": "platform",
+        "write_paths": ["app/api/billing.py customer create (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "users.timezone": {
+        "authority": "tenant",
+        "write_paths": [
+            "chat WS tz persist (app/api/ws_chat.py ~2880, tenant)",
+            "routines skill tz heal (app/agent/skills/builtins/routines, tenant)",
+            "PATCH /auth/profile Intl capture (platform)",
+            "POST /auth/timezone-from-coords (platform)",
+            "admin users update (platform)",
+            "voice-relay NULL-fill (ws_realtime._persist_user_tz — local DB on either surface)",
+        ],
+        "sync": "voice-relay NULL-fill + boot-time Intl PATCH (added 2026-08-10)",
+        "note": "THE 2026-08-10 defect column (#488 class): chat wrote tenant while voice read platform → 23 active "
+                "users' day computed in UTC. Tenant copy is authoritative (chat is the high-frequency writer); the "
+                "platform copy self-heals from device tz when NULL",
+    },
+    "users.email_verified_at": {
+        "authority": "platform",
+        "write_paths": [
+            "app/api/email_verification.py verify (platform)",
+            "auth_service oauth signup (platform)",
+        ],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "users.email_verification_token": {
+        "authority": "platform",
+        "write_paths": ["app/api/email_verification.py issue/clear (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "users.email_verification_sent_at": {
+        "authority": "platform",
+        "write_paths": ["app/api/email_verification.py issue (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "users.apple_refresh_token": {
+        "authority": "platform",
+        "write_paths": ["app/api/auth.py apple oauth (platform, stored encrypted)"],
+        "sync": "none",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "users.apple_sub": {
+        "authority": "platform",
+        "write_paths": ["app/api/auth.py + auth_service apple oauth (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "users.notification_preferences": {
+        "authority": "platform",
+        "write_paths": [
+            "app/api/account.py notification prefs + DND (platform)",
+            "app/api/extension.py memory-optout (BOTH-mounted router — writes whichever DB is local)",
+        ],
+        "sync": "none",
+        "note": "platform copy is the truth (notification_dispatcher reads PLATFORM); the extension memory-optout "
+                "write on a tenant surface lands tenant-side — known hazard, audit target",
+    },
+    "users.is_canary": {
+        "authority": "platform",
+        "write_paths": ["operator SQL only — no code writer (grep 2026-08-12)"],
+        "sync": "none",
+        "note": "read by rollout_service canary selection; " + _DEAD_TENANT,
+    },
+    # ── agent_configs ─────────────────────────────────────────────────
+    "agent_configs.id": {
+        "authority": "immutable-after-create",
+        "write_paths": [
+            "platform row create (checkout/toup_code/agent_setup _get_or_create_config)",
+            "tenant row create (/admin/bind identity reset, soul-sync receiver — fresh uuid)",
+        ],
+        "sync": "none",
+        "note": "NOT a cross-DB join key: the tenant row is materialized with its OWN uuid — probes must join on user_id",
+    },
+    "agent_configs.user_id": {
+        "authority": "immutable-after-create",
+        "write_paths": ["same row-create paths as agent_configs.id"],
+        "sync": "none",
+        "note": "the cross-DB join key for this table",
+    },
+    "agent_configs.hosting_mode": {
+        "authority": "platform",
+        "write_paths": [
+            "signup priming (app/api/auth.py)",
+            _CFG_PATCH,
+            "app/api/vps.py (platform)",
+        ],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.ssh_host": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py + provisioning services (hostinger/aws/hetzner, platform)"],
+        "sync": "none",
+        "note": "self-hosted VPS provisioning state; " + _DEAD_TENANT,
+    },
+    "agent_configs.ssh_port": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py + provisioning services (platform)"],
+        "sync": "none",
+        "note": "self-hosted VPS provisioning state; " + _DEAD_TENANT,
+    },
+    "agent_configs.ssh_user": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py + provisioning services (platform)"],
+        "sync": "none",
+        "note": "self-hosted VPS provisioning state; " + _DEAD_TENANT,
+    },
+    "agent_configs.ssh_password": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py + provisioning services (platform)"],
+        "sync": "none",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "agent_configs.ssh_key": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py + provisioning services (platform)"],
+        "sync": "none",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "agent_configs.target_os": {
+        "authority": "platform",
+        "write_paths": ["app/api/vps.py (platform)"],
+        "sync": "none",
+        "note": "self-hosted VPS provisioning state; " + _DEAD_TENANT,
+    },
+    "agent_configs.llm_mode": {
+        "authority": "platform",
+        "write_paths": [
+            "billing bundle webhook (app/api/billing.py, platform)",
+            "free_tier_activation (platform)",
+            _CFG_PATCH,
+        ],
+        "sync": _BRIDGE_ENV,
+        "note": "platform decides billing mode; the agent learns it from container env, not the tenant column",
+    },
+    "agent_configs.llm_mode_pre_v2": {
+        "authority": "platform",
+        "write_paths": ["no live writer found (grep 2026-08-12)"],
+        "sync": "none",
+        "note": "legacy snapshot from the llm-mode v2 migration; no live writer found (grep 2026-08-12); default platform",
+    },
+    "agent_configs.openai_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.anthropic_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.google_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.mistral_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.groq_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE + " (groq is NOT in the bridge body whitelist — env delivery unverified, audit target)",
+    },
+    "agent_configs.xai_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.deepseek_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.agent_name": {
+        "authority": "platform",
+        "write_paths": [
+            "PUT /api/soul save (app/api/soul.py, platform)",
+            _CFG_PATCH,
+            "/admin/bind identity reset (app/api/admin_pool.py, tenant — from bind payload)",
+            "PUT /api/soul/sync receiver (app/api/soul.py, tenant)",
+        ],
+        "sync": "soul-sync write-through",
+        "note": "THE 2026-08-11 defect column: Soul page wrote platform, chat + W-6 assembler read tenant → "
+                "nameless agents. Platform Soul save is authoritative; _sync_soul_to_vps pushes it through "
+                "PUT /api/soul/sync (PR #599 makes that write-through fail-closed)",
+    },
+    "agent_configs.agent_model": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "model config is platform-owned (and FROZEN); the agent reads AGENT_MODEL from container env — "
+                "the tenant column is dead (the D-2 fossil was a stale container env var, not this column)",
+    },
+    "agent_configs.app_builder_planner_model": {
+        "authority": "platform",
+        "write_paths": ["no live writer found (grep 2026-08-12)"],
+        "sync": "none",
+        "note": "model overrides come from env-level settings via model_resolver, not this column; default platform",
+    },
+    "agent_configs.app_builder_builder_model": {
+        "authority": "platform",
+        "write_paths": ["no live writer found (grep 2026-08-12)"],
+        "sync": "none",
+        "note": "model overrides come from env-level settings via model_resolver, not this column; default platform",
+    },
+    "agent_configs.preferred_provider": {
+        "authority": "platform",
+        "write_paths": ["agent-setup provider endpoint (app/api/agent_setup.py:1455, platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.bundle_stripe_subscription_id": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_status": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "scheduled_tasks bundle jobs (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_started_at": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_current_period_end": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "scheduled_tasks renewal (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_cancelled_at": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "scheduled_tasks cancel-grace job (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.llm_token_hash": {
+        "authority": "platform",
+        "write_paths": [
+            "billing/vps token mint (platform)",
+            "free_tier_activation (platform)",
+            "llm_proxy + search_proxy self-heal (platform)",
+        ],
+        "sync": "none",
+        "note": "hash of the TOUP_TOKEN the proxy validates; the token itself reaches the agent via bind env; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_anthropic_budget_cents": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "free_tier_activation (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_openai_budget_cents": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "free_tier_activation (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_anthropic_daily_cap_cents": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_period_start": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "scheduled_tasks renewal (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_period_end": {
+        "authority": "platform",
+        "write_paths": ["billing bundle webhook (platform)", "scheduled_tasks renewal (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_openai_project_id": {
+        "authority": "platform",
+        "write_paths": ["free_tier_activation / billing project provisioning (platform)"],
+        "sync": "none",
+        "note": "billing is platform-only; " + _DEAD_TENANT,
+    },
+    "agent_configs.bundle_openai_api_key": {
+        "authority": "platform",
+        "write_paths": ["free_tier_activation / billing project provisioning (platform)"],
+        "sync": "none",
+        "note": "platform-held credential (per-user OpenAI project key); " + _DEAD_TENANT,
+    },
+    "agent_configs.telegram_bot_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "channel " + _BYOK_NOTE,
+    },
+    "agent_configs.discord_bot_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "channel " + _BYOK_NOTE,
+    },
+    "agent_configs.slack_bot_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "channel " + _BYOK_NOTE,
+    },
+    "agent_configs.slack_app_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "channel " + _BYOK_NOTE,
+    },
+    "agent_configs.whatsapp_phone_number_id": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "WhatsApp Cloud API config; " + _BYOK_NOTE,
+    },
+    "agent_configs.whatsapp_access_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "WhatsApp Cloud API " + _BYOK_NOTE,
+    },
+    "agent_configs.whatsapp_verify_token": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "WhatsApp Cloud API " + _BYOK_NOTE,
+    },
+    "agent_configs.whatsapp_app_secret": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "WhatsApp Cloud API " + _BYOK_NOTE,
+    },
+    "agent_configs.whatsapp_connected_at": {
+        "authority": "tenant",
+        "write_paths": [
+            "first inbound Cloud API webhook (app/agent/channels/whatsapp_channel.py:271, tenant)",
+        ],
+        "sync": "none",
+        "note": "LIVE SPLIT of the class this map exists to catch (flagged 2026-08-12, Cloud API mode only): the "
+                "tenant writes it, but agent_setup's status response reads the PLATFORM copy, which has NO writer "
+                "— platform-side 'connected' state can never flip. Audit target",
+    },
+    "agent_configs.whatsapp_mode": {
+        "authority": "platform",
+        "write_paths": [
+            "signup priming (app/api/auth.py)",
+            "agent-setup qr-start/pair-code (platform)",
+            _CFG_PATCH,
+        ],
+        "sync": _BRIDGE_ENV,
+        "note": "platform picks the mode and pushes it to the container env; tenant column receive-only/dead",
+    },
+    "agent_configs.whatsapp_self_e164": {
+        "authority": "platform",
+        "write_paths": ["agent-setup qr-status writeback from agent snapshot (platform)"],
+        "sync": _BRIDGE_ENV,
+        "note": "platform persists the sidecar-reported linked number; the agent's truth is the sidecar session, not the tenant column",
+    },
+    "agent_configs.whatsapp_baileys_allowlist": {
+        "authority": "platform",
+        "write_paths": [
+            "agent-setup pair-code pre-seed + qr-status post-link seed (platform)",
+            _CFG_PATCH,
+        ],
+        "sync": _BRIDGE_ENV,
+        "note": "enforced by the sidecar from env; tenant column receive-only/dead",
+    },
+    "agent_configs.whatsapp_session_status": {
+        "authority": "platform",
+        "write_paths": ["agent-setup qr-start/pair-code/qr-status writeback (platform)"],
+        "sync": "none",
+        "note": "platform-side UI cache of the sidecar-reported session state; " + _DEAD_TENANT,
+    },
+    "agent_configs.claude_code_oauth_token": {
+        "authority": "platform",
+        "write_paths": ["toup-code token save (app/api/toup_code.py:168, platform)"],
+        "sync": "none",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "agent_configs.openai_codex_token": {
+        "authority": "platform",
+        "write_paths": ["toup-code token save (app/api/toup_code.py:168, platform)"],
+        "sync": "none",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "agent_configs.brave_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.elevenlabs_api_key": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": _BRIDGE_ENV,
+        "note": "BYOK " + _BYOK_NOTE,
+    },
+    "agent_configs.agent_api_key": {
+        "authority": "platform",
+        "write_paths": [
+            "agent-setup register (platform)",
+            "agent_key_rotation service (platform)",
+            "app/api/vps.py + pool_service (platform)",
+        ],
+        "sync": "delivered to the agent process via bind env (AGENT_API_KEY), not via the tenant column",
+        "note": "platform-held credential; " + _DEAD_TENANT,
+    },
+    "agent_configs.agent_url": {
+        "authority": "platform",
+        "write_paths": ["agent-setup register (platform)", "vps/docker_host provisioning (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.deploy_status": {
+        "authority": "platform",
+        "write_paths": ["vps/docker_host provisioning (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.deploy_log": {
+        "authority": "platform",
+        "write_paths": ["vps/docker_host provisioning (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.setup_completed": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": "none",
+        "note": "onboarding UI state; " + _DEAD_TENANT,
+    },
+    "agent_configs.setup_step": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": "none",
+        "note": "onboarding UI state; " + _DEAD_TENANT,
+    },
+    "agent_configs.setup_type": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": "none",
+        "note": "onboarding UI state; " + _DEAD_TENANT,
+    },
+    "agent_configs.onboarding_completed": {
+        "authority": "platform",
+        "write_paths": [
+            "PUT /api/soul save + agent-setup register (platform)",
+            _CFG_PATCH,
+            "PUT /api/soul/sync receiver (tenant)",
+        ],
+        "sync": "soul-sync write-through (carried in agent_config_updates on the onboarding-completing save)",
+        "note": "platform owns onboarding state; tenant copy receive-only",
+    },
+    "agent_configs.agent_color": {
+        "authority": "platform",
+        "write_paths": [
+            "PUT /api/soul save (platform)",
+            _CFG_PATCH,
+            "/admin/bind identity reset (tenant — from bind payload)",
+            "PUT /api/soul/sync receiver (tenant)",
+        ],
+        "sync": "soul-sync write-through",
+        "note": "same authority + write-through as agent_name (PR #599 fail-closed); also pushed as container env for the orb",
+    },
+    "agent_configs.disabled_tools": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": "none",
+        "note": "SUSPECTED LIVE SPLIT (flagged 2026-08-12): written platform-side only, but agent_runner.py:1334 and "
+                "ws_realtime.py:2793 read the TENANT copy (empty) — per-user tool disables may not apply in tenant "
+                "chat. Not in the bridge body whitelist either. Audit target",
+    },
+    "agent_configs.subagent_spawning_enabled": {
+        "authority": "platform",
+        "write_paths": ["admin users toggle (app/api/admin/users.py:1542, platform)"],
+        "sync": "none",
+        "note": "admin toggle; agent-side enforcement reads env-level settings — tenant column dead",
+    },
+    "agent_configs.connect_token": {
+        "authority": "platform",
+        "write_paths": [
+            "billing bundle webhook (platform)",
+            "agent-setup generate_connect_token (platform)",
+            "vps/pool_service/free_tier_activation (platform)",
+        ],
+        "sync": _BRIDGE_ENV,
+        "note": "terminal-agent pairing credential, validated platform-side (ws_agent_tunnel); " + _DEAD_TENANT,
+    },
+    "agent_configs.db_mode": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH, "app/api/vps.py (platform)"],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.supabase_url": {
+        "authority": "platform",
+        "write_paths": [_CFG_PATCH],
+        "sync": "none",
+        "note": _DEAD_TENANT,
+    },
+    "agent_configs.created_at": {
+        "authority": "immutable-after-create",
+        "write_paths": ["row INSERT on either side"],
+        "sync": "none",
+        "note": "row-local; platform row and tenant row are created at different times by design — never compare",
+    },
+    "agent_configs.updated_at": {
+        "authority": "both-synced",
+        "write_paths": ["every local UPDATE on either side"],
+        "sync": "none",
+        "note": "ORM bookkeeping — each database stamps its own copy; divergence expected, exclude from drift probes",
+    },
+    # ── extension_devices ─────────────────────────────────────────────
+    # Rows are SURFACE-LOCAL: a device pairs against exactly one surface
+    # and its row lives in that surface's DB (the module docstring says
+    # rows persist on the platform DB — tenant-side /ws/extension
+    # heartbeats reach the platform over HTTP). The same row never
+    # exists in both DBs, so cross-DB value drift is structurally N/A;
+    # the declared authority names where rows are EXPECTED to live.
+    "extension_devices.id": {
+        "authority": "immutable-after-create",
+        "write_paths": ["_record_pairing / legacy-row materialize (app/api/extension.py, both-mounted)"],
+        "sync": "none",
+        "note": "surface-local row uuid; rows are not mirrored across DBs",
+    },
+    "extension_devices.user_id": {
+        "authority": "immutable-after-create",
+        "write_paths": ["_record_pairing (extension.py, both-mounted)"],
+        "sync": "none",
+        "note": "owner of the paired device; set once at pairing",
+    },
+    "extension_devices.device_name": {
+        "authority": "platform",
+        "write_paths": ["_record_pairing pair-approve/pair-issue (extension.py — JWT-authed, runs platform-side)"],
+        "sync": "none",
+        "note": "pairing endpoints require platform JWT auth, so rows land in the platform DB",
+    },
+    "extension_devices.extension_version": {
+        "authority": "platform",
+        "write_paths": ["_record_pairing (extension.py, platform-side in practice)"],
+        "sync": "none",
+        "note": "set at pairing; same surface-local reasoning as device_name",
+    },
+    "extension_devices.token_jti": {
+        "authority": "immutable-after-create",
+        "write_paths": ["_record_pairing (extension.py)"],
+        "sync": "none",
+        "note": "token id (not the token) — set at pairing, used for revoke matching",
+    },
+    "extension_devices.paired_at": {
+        "authority": "immutable-after-create",
+        "write_paths": ["_record_pairing (extension.py)"],
+        "sync": "none",
+        "note": "set once at pairing",
+    },
+    "extension_devices.last_seen_at": {
+        "authority": "platform",
+        "write_paths": ["_touch_last_seen heartbeat upsert (extension.py — tenant WS heartbeats arrive over HTTP)"],
+        "sync": "none",
+        "note": "heartbeat freshness for the settings page, which reads the platform DB",
+    },
+    "extension_devices.revoked_at": {
+        "authority": "platform",
+        "write_paths": ["device revoke endpoints (extension.py:858/867, platform-side)"],
+        "sync": "none",
+        "note": "revocation must be visible to the settings page (platform reader)",
+    },
+}
