@@ -41,6 +41,18 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
     Platform forwards GET /api/files/* to the agent via X-Agent-Key, mirroring
     the stats / dashboard proxy patterns.
     """
+    # NOTE the failure modes below are deliberately distinguishable.
+    #
+    # This function used to end `except Exception: pass` / `return None`,
+    # and the caller turns None into 404 "No active agent for user". So an
+    # import error, a DB blip, a decrypt failure and a genuinely absent
+    # agent all produced the SAME 404 — a user with a healthy, running
+    # agent was told the file did not exist, and nothing was logged.
+    #
+    # That cost a long hunt on 2026-08-13: the agent was measured serving
+    # the exact requested file as a valid PDF in 4.7 s while the platform
+    # answered 404 in 579 ms, i.e. without ever asking it. Every layer
+    # looked healthy because the only layer that had failed said nothing.
     try:
         from app.db.models import AgentConfig  # noqa — may not exist on agent DBs
         result = await db.execute(
@@ -50,11 +62,31 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
             )
         )
         row = result.first()
-        if row and row.agent_url and row.agent_api_key:
-            return (row.agent_url, row.agent_api_key)
     except Exception:
-        pass
-    return None
+        # An error here is NOT "you have no agent" — it is our fault, and
+        # it must be visible. Still returns None (the caller's contract is
+        # unchanged and a file read must not 500), but never silently.
+        logger.exception(
+            "[files] agent proxy lookup FAILED for user=%s — "
+            "the caller will report 404 'no active agent', which is wrong",
+            user_id,
+        )
+        return None
+
+    if row is None:
+        logger.warning(
+            "[files] no AgentConfig row with deploy_status='active' for "
+            "user=%s — file proxying is impossible until one exists", user_id,
+        )
+        return None
+    if not row.agent_url or not row.agent_api_key:
+        logger.warning(
+            "[files] AgentConfig for user=%s is active but incomplete "
+            "(url=%s, key=%s) — cannot proxy",
+            user_id, bool(row.agent_url), bool(row.agent_api_key),
+        )
+        return None
+    return (row.agent_url, row.agent_api_key)
 
 
 # Read timeout for a plain byte-for-byte file proxy. The agent is already
@@ -138,29 +170,52 @@ async def _get_user_for_file(
     token: Optional[str],
     db: AsyncSession,
 ):
-    """Auth for file endpoints. Accepts JWT via:
+    """Auth for file endpoints, in EXPLICIT-BEFORE-AMBIENT order:
       1) Authorization: Bearer <token> header (standard)
-      2) hex_sso_token cookie (SSO, same-origin)
-      3) ?token=<jwt> query param — required for <iframe src> / <img src>
-         embeds that can't set headers.
+      2) ?token=<jwt> query param — required for <iframe src> / <img src>
+         embeds that cannot set headers.
+      3) hex_sso_token cookie (SSO, same-origin)
       4) X-Agent-Key header (platform proxy mode, reused from auth.py).
+
+    The cookie is LAST of the three user credentials, and that ordering is
+    load-bearing.
+
+    A cookie is per-DOMAIN, so toup.ai holds exactly one `hex_sso_token`:
+    whichever account signed in most recently. The bearer token and the
+    `?token=` param are per-REQUEST and name the account the client
+    actually means. Anyone with two accounts — a personal one and a
+    demo/review one is the ordinary case — therefore has a browser where
+    those two disagree, and the sidebar happily shows the localStorage
+    identity while the cookie says someone else.
+
+    With the cookie ranked second, such a request resolved to the WRONG
+    user, the platform proxied to that user's agent, and the file was
+    genuinely not there. The result is a fast, confident 404 on a file
+    that exists — measured 2026-08-13 at 579 ms while the correct agent
+    served the same file as a valid PDF. It reads as data loss.
+
+    Explicit beats ambient: if the caller took the trouble to name a
+    credential, honour it. The cookie stays as the fallback for embeds
+    that carry nothing else.
     """
     user_id: Optional[str] = None
 
-    # Bearer header
+    # 1. Bearer header — the most explicit credential there is.
     auth_header = request.headers.get("authorization", "") if request else ""
     if auth_header.lower().startswith("bearer "):
         user_id = decode_access_token(auth_header[7:])
 
-    # SSO cookie
+    # 2. Query param. Still explicit: the client put this account's token
+    #    in the URL on purpose, so it outranks whatever cookie happens to
+    #    be lying around for this domain.
+    if not user_id and token:
+        user_id = decode_access_token(token)
+
+    # 3. SSO cookie — ambient, and only trusted when nothing was named.
     if not user_id and request is not None:
         cookie_tok = request.cookies.get(SSO_COOKIE_NAME)
         if cookie_tok:
             user_id = decode_access_token(cookie_tok)
-
-    # Query param (for embeds)
-    if not user_id and token:
-        user_id = decode_access_token(token)
 
     # Agent-mode fallback
     if not user_id and request is not None:
