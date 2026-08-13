@@ -513,6 +513,8 @@ async def test_voice_context_soul_hoist_and_no_soul_default(voice_tables):
         f"# Core Identity\n{SOUL_TEXT}\n\n# About the User\n{PROFILE_TEXT}"
     )
     assert soulless.sections["identity"] == IDENTITY_GOLDEN_NO_SOUL
+    # No tenant name → the platform default name, NOT the nameless anchor
+    # (W-6 fleet run: legacy reads the platform row, which says "Agent").
     assert soulless.sections["identity_anchor"] == ANCHOR_GOLDEN_VOICE_UNNAMED
 
 
@@ -672,6 +674,8 @@ async def test_voice_context_degraded_names_every_empty_leg(voice_tables):
     assert ctx.sections["identity"].startswith(
         "# Core Identity\nYou are the user's personal agent"
     )
+    # A bare tenant still wears the platform default name (W-6 fleet run:
+    # a NULL tenant agent_name IS the platform's "Agent").
     assert ctx.sections["identity_anchor"] == ANCHOR_GOLDEN_VOICE_UNNAMED
     # The channel document is unconditional — never degraded away.
     assert ctx.sections["voice_mode"].startswith("# Voice Conversation Mode")
@@ -908,6 +912,227 @@ async def test_divergence_class_soulless_default_persona_is_pinned(voice_tables)
         )
 
     assert ctx.sections["identity"] == f"# Core Identity\n{DEFAULT_SOUL_CONTENT}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 3c. W-6 fleet parity run (2026-08-12) — the fallback classes. Four
+#     divergence classes came out of the 45-tenant field-faithful run;
+#     the live evidence (chars/digest) in each docstring is quoted
+#     through the shadow's `_section_fingerprints` lens: sections are
+#     split on "\n\n# ", so every section EXCEPT the first loses its
+#     leading "# " before (len, sha256[:8]) is taken.
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _shadow_fingerprint(block: str) -> tuple:
+    """One section through the relay shadow's exact math (ws_realtime
+    `_section_fingerprints`): strip, then (len, sha256 hex[:8])."""
+    import hashlib
+
+    b = block.strip()
+    return len(b), hashlib.sha256(b.encode("utf-8")).hexdigest()[:8]
+
+
+@pytest.mark.asyncio
+async def test_a_nameless_tenant_is_rendered_nameless_not_defaulted(voice_tables):
+    """The anchor renders what the TENANT row says, including nothing.
+
+    An earlier version of this fix defaulted an empty tenant name to
+    "Agent" so the assembler would match what legacy renders, on the
+    premise that the platform holds "Agent" for every never-renamed
+    agent. Measured against production that premise is false for 5 of
+    45 bound tenants, whose PLATFORM `agent_name` is itself NULL. Four
+    of those five already AGREE with legacy today — both sides render
+    the nameless anchor — so the default would have broken four
+    matching tenants and, after the flip, made their agents announce
+    "Your name is Agent" to users who never named one. That is the same
+    outcome the agent_name backfill was explicitly forbidden from
+    producing in data.
+
+    MUTATION: restore `_tenant_agent_name or DEFAULT_AGENT_NAME` → every
+    empty shape renders the NAMED anchor → red.
+    """
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+    from app.db.models import AgentConfig
+    from app.db.models.user import User
+
+    shapes = {
+        "no-agent-config-row": None,
+        "empty-string": "",
+        "whitespace-only": "   ",
+        "real-name-control": AGENT_NAME,
+    }
+    ids = {shape: str(uuid.uuid4()) for shape in shapes}
+    async with async_session_maker() as db:
+        for shape, name in shapes.items():
+            uid = ids[shape]
+            db.add(User(
+                id=uid, email=f"g19a-name-{uuid.uuid4().hex[:8]}@example.com",
+                hashed_password="x", name="W6", timezone=TORONTO,
+            ))
+            if name is not None:
+                db.add(AgentConfig(user_id=uid, agent_name=name))
+        await db.commit()
+
+    anchors = {}
+    async with async_session_maker() as db:
+        for shape, uid in ids.items():
+            ctx = await build_voice_context(
+                db, uid, tz_name=TORONTO, now_utc=FROZEN_UTC,
+            )
+            anchors[shape] = ctx.sections["identity_anchor"]
+
+    for shape in ("no-agent-config-row", "empty-string", "whitespace-only"):
+        assert anchors[shape] == ANCHOR_GOLDEN_VOICE_UNNAMED, (
+            f"a tenant with {shape} must render the NAMELESS anchor — "
+            "claiming a name the user never chose is worse than "
+            "diverging from a legacy builder that does"
+        )
+    assert anchors["real-name-control"] == ANCHOR_GOLDEN_VOICE_NAMED
+
+
+@pytest.mark.asyncio
+async def test_divergence_class_duplicate_soul_rows_render_core_identity_once(voice_tables):
+    """W-6 live divergence, duplicate-soul class (tenant 03cbc72f): a
+    double-write race (two concurrent soul syncs, each finding no
+    existing row) left TWO identical active soul rows 15ms apart in the
+    tenant DB, and the assembler emitted "# Core Identity" once per row.
+    The legacy builder reads the PLATFORM copy, which the upsert keeps
+    single (save_soul / sync_soul: scalar_one_or_none + update-in-place),
+    so it renders the section ONCE. The assembler keeps the row that
+    upsert would own — highest priority, then OLDEST created_at — and
+    drops the clones; with drifted contents the oldest row (the one
+    later platform upserts update in place) still wins,
+    deterministically."""
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+    from app.db.models import Identity
+    from app.db.models.user import User
+
+    def _soul_row(uid, content, ts, name="Agent Soul"):
+        return Identity(
+            id=str(uuid.uuid4()), user_id=uid, identity_type="soul",
+            name=name, content=content, priority=100, is_active=True,
+            created_at=ts, updated_at=ts,
+        )
+
+    twin_id = str(uuid.uuid4())
+    drift_id = str(uuid.uuid4())
+    t0 = datetime(2026, 8, 3, 12, 0, 0)
+    t1 = datetime(2026, 8, 3, 12, 0, 0, 15000)  # 15ms later — the race
+    async with async_session_maker() as db:
+        for uid in (twin_id, drift_id):
+            db.add(User(
+                id=uid, email=f"g19a-dup-{uuid.uuid4().hex[:8]}@example.com",
+                hashed_password="x", name="Dup", timezone=TORONTO,
+            ))
+            db.add(Identity(
+                id=str(uuid.uuid4()), user_id=uid, identity_type="user_profile",
+                name="user_profile", content=PROFILE_TEXT, priority=90,
+                is_active=True, created_at=t0, updated_at=t0,
+            ))
+        db.add(_soul_row(twin_id, SOUL_TEXT, t0))
+        db.add(_soul_row(twin_id, SOUL_TEXT, t1))
+        db.add(_soul_row(drift_id, SOUL_TEXT, t0))
+        db.add(_soul_row(drift_id, "A drifted clone.", t1))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        twins = await build_voice_context(
+            db, twin_id, tz_name=TORONTO, now_utc=FROZEN_UTC)
+        drifted = await build_voice_context(
+            db, drift_id, tz_name=TORONTO, now_utc=FROZEN_UTC)
+
+    for ctx in (twins, drifted):
+        assert ctx.sections["identity"].count("# Core Identity") == 1, (
+            "duplicate active soul rows must render ONE Core Identity "
+            "section — legacy's platform copy is upsert-single"
+        )
+    assert twins.sections["identity"] == (
+        f"# Core Identity\n{SOUL_TEXT}\n\n# About the User\n{PROFILE_TEXT}"
+    )
+    assert drifted.sections["identity"] == (
+        f"# Core Identity\n{SOUL_TEXT}\n\n# About the User\n{PROFILE_TEXT}"
+    ), "the OLDEST soul row is the one the platform upsert owns"
+
+
+@pytest.mark.asyncio
+async def test_seeded_platform_defaults_render_byte_identical_to_legacy(voice_tables):
+    """W-6 live divergences "Behavioral Guidelines" (tenants a8176b1d,
+    fc1c53c3 — legacy 1242 chars / 847d31db) and "Core Identity"
+    (a8176b1d — legacy 1158 / c93d5d3b): DIAGNOSIS pin. Legacy has no
+    template fallback for either section — ws_realtime renders whatever
+    active Identity rows its DB holds; those "defaults" are the
+    `_seed_default_identities` rows every signup puts in the PLATFORM DB,
+    never delivered to the tenant (the identities split;
+    scripts/backfill_tenant_identities.py copies them verbatim). Fed the
+    SAME rows — the real seeder — the assembler's bytes ARE the live
+    legacy fingerprints, so the verbatim backfill restores parity by
+    construction and no code fallback is needed (or safe: see the
+    founder test below)."""
+    from sqlalchemy import select
+
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+    from app.db.models import Identity
+    from app.db.models.user import User
+    from app.services.auth_service import _seed_default_identities
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(
+            id=user_id, email=f"g19a-seed-{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password="x", name="Seeded", timezone=TORONTO,
+        ))
+        await db.flush()
+        await _seed_default_identities(db, user_id)
+        await db.commit()
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(Identity).where(Identity.user_id == user_id)
+        )).scalars().all()
+        by_type = {r.identity_type: r.content for r in rows}
+        ctx = await build_voice_context(
+            db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
+        )
+
+    soul, instr = by_type["soul"], by_type["agent_instructions"]
+    assert ctx.sections["identity"] == (
+        f"# Core Identity\n{soul}\n\n# Behavioral Guidelines\n{instr}"
+    ), "same rows in, legacy's bytes out — the divergence is the DATA"
+
+    # The live run's evidence digests: Core Identity leads the prompt
+    # (first section keeps its "# "); Behavioral Guidelines is mid-text.
+    assert _shadow_fingerprint(f"# Core Identity\n{soul}") == (1158, "c93d5d3b")
+    assert _shadow_fingerprint(f"Behavioral Guidelines\n{instr}") == (1242, "847d31db")
+
+
+@pytest.mark.asyncio
+async def test_no_tenant_instructions_row_emits_no_behavioral_guidelines(voice_tables):
+    """The founder's condition, mirrored exactly: legacy emits Behavioral
+    Guidelines IFF an active agent_instructions row exists in the DB it
+    reads — the founder has none platform-side and matched at the
+    closeout with NO section on either side. So: no tenant row → no
+    section. A code-level default (the tempting "fix" for the class
+    above) would emit one here and flip that matching session to a
+    mismatch."""
+    from app.db import async_session_maker
+    from app.agent.voice_context import build_voice_context
+
+    user_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        await _seed(db, user_id, rows=[("soul", SOUL_TEXT, 100)],
+                    agent_name=AGENT_NAME)
+
+    async with async_session_maker() as db:
+        ctx = await build_voice_context(
+            db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
+        )
+
+    assert "# Behavioral Guidelines" not in ctx.instructions
+    assert ctx.sections["identity"] == f"# Core Identity\n{SOUL_TEXT}"
 
 
 def test_flip_allowlist_serves_agent_context_per_user():

@@ -404,6 +404,107 @@ def _day_history_header(total: int, day_date: Optional[str], local_today: Option
     )
 
 
+# ── The W-6 shadow's judgement ────────────────────────────────────────
+# Module level on purpose: this decides whether the agent assembler is
+# allowed to replace the legacy builder, and the offline parity harness
+# (`scripts/w6_parity_harness.py`) imports it rather than reimplementing
+# it — a comparator that exists in two copies eventually judges by two
+# different rules.
+
+
+def _voice_blocks(text: str) -> list:
+    """`[(header, block)]` in document order, every block carrying its
+    `# ` marker.
+
+    `split("\\n\\n# ")` consumes the marker on every block except the
+    first, so the original fingerprints measured section 0 over two more
+    characters than every other section — which is the only reason a
+    duplicated FIRST section ever showed up (as a phantom 2-char content
+    difference). Normalising the marker back on removes that asymmetry.
+    """
+    out = []
+    for i, block in enumerate((text or "").split("\n\n# ")):
+        block = block.strip()
+        if not block:
+            continue
+        if i:
+            block = "# " + block
+        header = block.split("\n", 1)[0].lstrip("# ").strip()[:40]
+        out.append((header, block))
+    return out
+
+
+def voice_section_fingerprints(text: str) -> dict:
+    """`{section header: (chars, 8-hex hash)}` — counts and digests only.
+
+    Never the content: this goes in a log line, and the sections are the
+    user's persona, brains and day transcript.
+
+    A header seen more than once is suffixed `#2`, `#3`, … so a
+    duplicated section cannot collapse into its twin and vanish from the
+    comparison. `[A,B,B]` against `[A,B]` used to compare EQUAL across a
+    whole missing section.
+    """
+    import hashlib
+
+    out = {}
+    for header, block in _voice_blocks(text):
+        key, n = header, 1
+        while key in out:
+            n += 1
+            key = f"{header}#{n}"
+        out[key] = (
+            len(block),
+            hashlib.sha256(block.encode("utf-8")).hexdigest()[:8],
+        )
+    return out
+
+
+def voice_section_order(text: str) -> list:
+    """Section headers in the order they appear — template titles only,
+    duplicates included."""
+    return [header for header, _ in _voice_blocks(text)]
+
+
+def compare_voice_contexts(agent_text: str, legacy_text: str) -> dict:
+    """What the shadow reports, in one importable place.
+
+    `match` is CONTENT equality: the same sections, duplicates included,
+    with the same bytes in each. It deliberately does NOT include section
+    ORDER — the agent assembler puts `identity_anchor` at index 1, where
+    the text channel's runner puts it, rather than after the whole day
+    transcript (`agent/voice_context.VOICE_SECTION_ORDER`, "Drift D2": a
+    white-label guard the model reads 20k characters after the persona is
+    a guard the model has already contradicted). That reorder is an
+    intended improvement, so a comparator that failed on it would block
+    the flip on a fix.
+
+    Order must never be INVISIBLE either — an unintended reorder would
+    otherwise read exactly like no change at all, which is how the
+    intended one passed unremarked for a week. `order_match` and both
+    sequences ride alongside the verdict so the flip is decided by
+    someone who can see the difference.
+
+    Everything returned is a header, a length or a digest. No section
+    body ever leaves the process.
+    """
+    a_fp, l_fp = voice_section_fingerprints(agent_text), voice_section_fingerprints(legacy_text)
+    a_order, l_order = voice_section_order(agent_text), voice_section_order(legacy_text)
+
+    same = sorted(k for k in a_fp if k in l_fp and a_fp[k][1] == l_fp[k][1])
+    differs = sorted(set(a_fp) ^ set(l_fp)) + sorted(
+        k for k in a_fp if k in l_fp and a_fp[k][1] != l_fp[k][1]
+    )
+    return {
+        "match": bool(agent_text and legacy_text) and not differs,
+        "same": same,
+        "differs": differs,
+        "order_match": a_order == l_order,
+        "agent_order": a_order,
+        "legacy_order": l_order,
+    }
+
+
 # ── Build system instructions from Identity + Memory ──────────────────
 async def build_realtime_instructions(
     user_id: str, onboarding: bool = False, now_utc: Optional[datetime] = None
@@ -2700,24 +2801,6 @@ async def realtime_voice_ws(
         )
         return instr
 
-    def _section_fingerprints(text: str) -> dict:
-        """`{section header: (chars, 8-hex hash)}` — counts and digests only.
-
-        Never the content: this goes in a log line, and the sections are the
-        user's persona, brains and day transcript.
-        """
-        import hashlib
-        out = {}
-        for block in (text or "").split("\n\n# "):
-            block = block.strip()
-            if not block:
-                continue
-            head = block.split("\n", 1)[0].lstrip("# ").strip()[:40]
-            out[head] = (
-                len(block),
-                hashlib.sha256(block.encode("utf-8")).hexdigest()[:8],
-            )
-        return out
 
     async def _instructions_step() -> Optional[str]:
         _ctx_now = datetime.now(timezone.utc)
@@ -2746,17 +2829,25 @@ async def realtime_voice_ws(
 
         if want_shadow:
             if agent_instr and legacy:
-                a, l = _section_fingerprints(agent_instr), _section_fingerprints(legacy)
-                same = sorted(k for k in a if k in l and a[k][1] == l[k][1])
-                diff = sorted(set(a) ^ set(l)) + sorted(
-                    k for k in a if k in l and a[k][1] != l[k][1]
-                )
+                cmp_ = compare_voice_contexts(agent_instr, legacy)
                 logger.info(
-                    "[REALTIME] ctx_shadow match=%s agent_chars=%d legacy_chars=%d "
-                    "same=%s differs=%s",
-                    not diff, len(agent_instr), len(legacy),
-                    ",".join(same) or "-", ",".join(diff) or "-",
+                    "[REALTIME] ctx_shadow match=%s order_match=%s "
+                    "agent_chars=%d legacy_chars=%d same=%s differs=%s",
+                    cmp_["match"], cmp_["order_match"],
+                    len(agent_instr), len(legacy),
+                    ",".join(cmp_["same"]) or "-",
+                    ",".join(cmp_["differs"]) or "-",
                 )
+                if not cmp_["order_match"]:
+                    # Sections carry the same bytes in a different sequence.
+                    # Expected today (Drift D2 moves identity_anchor to the
+                    # runner's position); logged every time so that an
+                    # UNexpected reorder can never arrive silently.
+                    logger.info(
+                        "[REALTIME] ctx_shadow order agent=%s legacy=%s",
+                        " > ".join(cmp_["agent_order"]),
+                        " > ".join(cmp_["legacy_order"]),
+                    )
             else:
                 logger.info(
                     "[REALTIME] ctx_shadow unavailable agent=%s legacy=%s",

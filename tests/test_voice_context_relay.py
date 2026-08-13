@@ -130,41 +130,40 @@ def test_agent_failure_falls_back_rather_than_returning_nothing():
 
 def test_shadow_log_carries_fingerprints_not_content():
     """The sections being compared are the user's persona, both brains and
-    the day transcript. The log line gets counts and digests."""
-    import app.api.ws_realtime as rt
+    the day transcript. The log line gets counts and digests.
 
-    src = inspect.getsource(rt)
-    start = src.index("def _section_fingerprints(")
-    end = src.index("\n    async def _instructions_step", start)
-    body = src[start:end]
+    The comparator moved to module level on 2026-08-12 (so the offline
+    parity harness imports the same judge the shadow uses instead of
+    keeping a second copy), which is why this reads the real function
+    object rather than the enclosing handler's source.
+    """
+    from app.api.ws_realtime import voice_section_fingerprints
 
+    body = inspect.getsource(voice_section_fingerprints)
     assert "hashlib" in body and "hexdigest()[:8]" in body, (
         "fingerprints must be short digests"
     )
-    # The function must never put a block's text into its output.
-    assert "out[head] = (" in body
-    assert "block)" not in body.split("out[head] = (")[1].split("\n")[0], (
-        "raw block text reached the fingerprint output"
+    # The property, asserted on the OUTPUT rather than on a source line:
+    # nothing a section contains may reach what gets logged.
+    out = voice_section_fingerprints(
+        "# Core Identity\nsecret persona text\n\n# User Brain\nsecret fact"
     )
+    assert "secret persona text" not in repr(out), "raw block text reached the output"
+    assert "secret fact" not in repr(out), "raw block text reached the output"
+    assert all(
+        isinstance(chars, int) and len(digest) == 8
+        for chars, digest in out.values()
+    ), out
 
 
 def test_section_fingerprints_is_stable_and_content_free():
-    """Compile the shipped helper straight from the file's AST and run it.
+    """The shipped helper itself — no longer recompiled out of the AST.
 
-    Extracting by string-slicing and re-indenting was how the first attempt
-    broke; the AST already knows exactly where the function is.
+    It used to be nested inside the websocket handler, so the only way to
+    reach it was to lift it out of the file's AST and exec it. It is
+    module level now, so this imports the actual object the shadow runs.
     """
-    tree = ast.parse(_WS_REALTIME.read_text())
-    fn = None
-    for n in ast.walk(tree):
-        if isinstance(n, ast.FunctionDef) and n.name == "_section_fingerprints":
-            fn = n
-            break
-    assert fn is not None, "_section_fingerprints not found"
-
-    ns: dict = {}
-    exec(compile(ast.Module(body=[fn], type_ignores=[]), "<fp>", "exec"), ns)  # noqa: S102
-    fp = ns["_section_fingerprints"]
+    from app.api.ws_realtime import voice_section_fingerprints as fp
 
     text = "# Core Identity\nsecret persona text\n\n# User Brain\nsecret fact"
     out = fp(text)
@@ -176,3 +175,19 @@ def test_section_fingerprints_is_stable_and_content_free():
         "the fingerprint output contains section content"
     )
     assert fp(text) == out, "fingerprints are not stable across calls"
+
+
+def test_every_section_is_measured_by_the_same_ruler():
+    """`split("\\n\\n# ")` eats the `# ` marker on every block but the
+    first, so section 0 used to be counted and hashed over two more
+    characters than an identical copy of itself. That asymmetry is the
+    only reason a duplicated FIRST section was ever caught, and it made
+    section 0's char count in every shadow log line two too many."""
+    from app.api.ws_realtime import voice_section_fingerprints as fp
+
+    first_then_second = fp("# Same Header\nbody\n\n# Other\nx")["Same Header"]
+    second_position = fp("# Other\nx\n\n# Same Header\nbody")["Same Header"]
+    assert first_then_second == second_position, (
+        "the same section fingerprints differently depending on where it "
+        f"sits: {first_then_second} vs {second_position}"
+    )

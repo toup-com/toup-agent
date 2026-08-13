@@ -340,13 +340,45 @@ def render_onboarding() -> str:
 
 async def _load_identities(db: AsyncSession, user_id: str) -> List[Any]:
     from app.db.models import Identity
+    from app.db.models.enums import IdentityType
 
     result = await db.execute(
         select(Identity)
         .where(Identity.user_id == user_id, Identity.is_active.is_(True))
         .order_by(Identity.priority.desc())
     )
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+
+    # Duplicate ACTIVE soul rows: a double-write race (two concurrent
+    # soul syncs, each finding no existing row) can leave more than one —
+    # live on tenant 03cbc72f, two identical "Agent Soul" rows 15ms
+    # apart, rendered as TWO "# Core Identity" sections. The legacy
+    # builder reads the PLATFORM copy, which its upsert keeps single
+    # (save_soul / sync_soul: scalar_one_or_none + update-in-place), so
+    # it renders the section once. Keep the row that upsert would own —
+    # highest priority, then OLDEST created_at (later upserts update the
+    # original row in place; only race clones come after it) — and drop
+    # the rest. Read-only: the clones stay in the DB for the operator.
+    souls = [r for r in rows if r.identity_type == IdentityType.SOUL.value]
+    if len(souls) > 1:
+        keep = sorted(
+            souls,
+            key=lambda r: (
+                -(r.priority or 0),
+                r.created_at or datetime.max,
+                str(r.id or ""),
+            ),
+        )[0]
+        logger.warning(
+            "[voice_ctx] %d duplicate active soul rows for %s — rendering "
+            "the oldest, a double-write race left the rest",
+            len(souls), user_id[:8],
+        )
+        rows = [
+            r for r in rows
+            if r.identity_type != IdentityType.SOUL.value or r is keep
+        ]
+    return rows
 
 
 async def _resolve_effective_tz(
@@ -497,6 +529,24 @@ async def build_voice_context(
     if not has_soul:
         logger.warning("[voice_ctx] no soul document for %s — default persona", user_id[:8])
 
+    # Render exactly what the TENANT row says, including nothing.
+    #
+    # An earlier version of this file defaulted an empty tenant name to
+    # "Agent" to match what legacy renders, on the premise that the
+    # platform holds "Agent" for every never-renamed agent. Measured
+    # against production, that premise is false for 5 of the 45 bound
+    # tenants, whose PLATFORM agent_name is itself NULL — they never
+    # saved the Soul page at all. Four of those five already agree with
+    # legacy today (both sides render the nameless anchor), and the
+    # default would have broken all four AND made their agents announce
+    # "Your name is Agent" after the flip, to a user who never named one.
+    #
+    # The remaining divergence — platform "Agent", tenant NULL, on three
+    # tenants — is left INTENDED rather than matched. Legacy tells those
+    # users their agent is called "Agent"; the flip stops it. Matching
+    # legacy there would mean reproducing a stub name in voice, which is
+    # the same outcome the agent_name backfill was explicitly forbidden
+    # from producing in data.
     sections["identity_anchor"] = render_identity_anchor(
         await _load_agent_name(db, user_id), fmt="voice"
     )
