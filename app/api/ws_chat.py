@@ -33,6 +33,7 @@ import uuid
 from datetime import datetime
 import sys
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2763,6 +2764,28 @@ async def ws_chat(
                 # the Chrome extension sidepanel sends "client_tz" (audit
                 # A2-7 — it silently fell back to DB User.timezone before).
                 client_tz = msg.get("tz") or msg.get("client_tz")
+                # Validate before ANY of it is believed. This value is persisted
+                # to User.timezone below and also drives day-chat bucketing
+                # (`tz_override`) and the agent's sense of local time — and the
+                # only check it ever had was `len < 50`, while the REST profile
+                # route has always resolved it through ZoneInfo and 400'd a bad
+                # name. So an unresolvable string could be stored and then read
+                # back by `credit_service._local_day_iso` from inside
+                # `try_charge`, raising ZoneInfoNotFoundError out of a charge and
+                # failing the turn. Dropping it here restores the documented
+                # fallback (NULL ⇒ UTC) for every consumer at once.
+                if client_tz is not None:
+                    if (not isinstance(client_tz, str)) or len(client_tz) >= 50:
+                        client_tz = None
+                    else:
+                        try:
+                            ZoneInfo(client_tz)
+                        except (ZoneInfoNotFoundError, ValueError):
+                            logger.warning(
+                                "[WS] ignoring unresolvable client timezone %r for %s",
+                                client_tz[:64], user_id[:8],
+                            )
+                            client_tz = None
                 force_new_session = bool(msg.get("force_new"))  # Skip session reuse (New Thread in app workspace)
                 # system_action: true when a structured action (e.g. customize_app) triggers
                 # an agent turn without a real user message. Skip presave + user message save.
@@ -2866,7 +2889,9 @@ async def ws_chat(
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
                 # If timezone changes from one real value to another, queue a re-bucket.
-                if client_tz and isinstance(client_tz, str) and len(client_tz) < 50:
+                # Shape and resolvability were both settled at parse time, so a
+                # truthy client_tz here is a name zoneinfo can load.
+                if client_tz:
                     try:
                         from app.db.database import async_session_maker as _tz_sm
                         from app.db.models import User

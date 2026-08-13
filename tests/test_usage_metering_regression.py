@@ -36,7 +36,7 @@ The fix splits one policy in two: the cap gates ADMISSION of new work
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -879,3 +879,281 @@ def test_web_fetch_cache_probe_symbol_exists():
     # it misses forever and every cached page bills as a fresh fetch.
     reader._PAGE_CACHE.set(reader.page_cache_key("https://a/b", 100), "X")
     assert reader.page_cache_get("https://a/b", 100) == "X"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# When the daily cap lifts — the field that was never sent
+#
+# The mobile Usage screen has consumed `message.daily_reset_at` since it was
+# written and gated its entire "Daily limit" row on the value being present.
+# No deploy ever sent one, so the row was not degraded — it was absent, for
+# every user on every build. Free is the ONLY plan carrying a daily cap, so
+# the single tier the meter exists for is exactly the one that could never
+# see it, which is also why the gap survived every test on a paid account.
+#
+# The instant is computed from the SAME anchor the roll actually tests, so a
+# screen and a refusal cannot quote different times for one user.
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def _with_cap(uid: str, cap: str = "15", anchor: str | None = None,
+                    tz: str | None = None) -> None:
+    """Give a balance a daily cap, and optionally an anchor + a user timezone."""
+    from app.db import async_session_maker, CreditBalance, User
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, uid)
+        b.message_credits_daily_cap = Decimal(cap)
+        if anchor is not None:
+            b.day_anchor_local_date = anchor
+        if tz is not None:
+            u = await db.get(User, uid)
+            u.timezone = tz
+        await db.commit()
+
+
+async def test_status_route_actually_serialises_daily_reset_at(client, auth_headers, test_user_id):
+    """The regression, asserted where it lived: in the RESPONSE BODY.
+
+    `BucketStatus` declared remaining / monthly / used_today / daily_cap and
+    nothing else, so the field the client waits for never crossed the wire. A
+    service-level assertion cannot see that — only the serialised body can.
+    """
+    await _grant_via_balance(test_user_id)
+    await _with_cap(test_user_id, tz="America/Toronto")
+
+    res = await client.get("/api/credits/status", headers=auth_headers)
+    assert res.status_code == 200, res.text
+    msg = res.json()["message"]
+
+    assert "daily_reset_at" in msg, (
+        "the client gates its Daily limit meter on this key; without it the "
+        "row is dead for every user on every build"
+    )
+    assert msg["daily_reset_at"] is not None
+    assert msg["has_daily_limit"] is True
+    assert msg["daily_cap"] == 15.0
+    # The integration bucket has no per-day counter in the schema, so its
+    # answer is null — the same distinction has_daily_limit already draws.
+    assert res.json()["integration"]["daily_reset_at"] is None
+
+
+async def test_no_daily_cap_means_no_reset_instant(client, auth_headers, test_user_id):
+    """Paid tiers carry no daily cap. Null means "no daily dimension", not
+    "we failed to compute it" — a client rendering a countdown to a limit that
+    does not exist is worse than rendering nothing."""
+    await _grant_via_balance(test_user_id)
+    from app.db import async_session_maker, CreditBalance
+    async with async_session_maker() as db:
+        b = await db.get(CreditBalance, test_user_id)
+        b.message_credits_daily_cap = None
+        await db.commit()
+
+    res = await client.get("/api/credits/status", headers=auth_headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["message"]["daily_reset_at"] is None
+    assert res.json()["message"]["has_daily_limit"] is False
+
+
+async def test_the_reported_instant_is_when_the_counter_actually_rolls():
+    """The binding invariant: at the reported instant the day the gate tests
+    has advanced past the anchor, and one second earlier it has not.
+
+    This is what stops the screen and the gate drifting apart. Quoting a time
+    the counter does not move at is the same class of defect as quoting no time
+    at all — the user plans around it and is refused anyway.
+    """
+    from app.db import async_session_maker
+    from app.services.credit_service import credit_service, _local_day_iso
+
+    uid = await _mk_user("rollover-truth@example.com")
+    await _grant_via_balance(uid)
+    anchor = datetime.utcnow().date().isoformat()
+    await _with_cap(uid, anchor=anchor, tz="America/Toronto")
+
+    async with async_session_maker() as db:
+        view = await credit_service.get_balance_view(db, uid)
+
+    at = view.daily_reset_at
+    assert at is not None
+    assert _local_day_iso("America/Toronto", at) > anchor, (
+        "at the reported instant the counter must be rolled"
+    )
+    assert _local_day_iso("America/Toronto", at - timedelta(seconds=1)) <= anchor, (
+        "one second earlier it must not be — otherwise we are quoting a time "
+        "later than the cap actually lifts"
+    )
+
+
+async def test_the_reported_instant_honours_an_anchor_AHEAD_of_today():
+    """The same invariant, driven through `get_balance_view` with the awkward
+    row — because the pure function being right proves nothing about the caller
+    passing it what it needs.
+
+    Dropping the anchor argument at the call site is invisible to every
+    function-level test here and to `tsc`-equivalents everywhere: the endpoint
+    still answers, still returns a plausible timestamp, and is wrong by 24
+    hours for exactly the users the forward-only rule exists to protect.
+    """
+    from app.db import async_session_maker
+    from app.services.credit_service import credit_service, _local_day_iso
+
+    uid = await _mk_user("anchor-ahead-view@example.com")
+    await _grant_via_balance(uid)
+    tz = "America/Toronto"
+    # An anchor a day AHEAD of the local date: what a UTC-seeded signup leaves
+    # behind for a user west of UTC until the app first reports a timezone.
+    local_today = _local_day_iso(tz)
+    anchor = (datetime.fromisoformat(local_today).date() + timedelta(days=1)).isoformat()
+    await _with_cap(uid, anchor=anchor, tz=tz)
+
+    async with async_session_maker() as db:
+        view = await credit_service.get_balance_view(db, uid)
+
+    at = view.daily_reset_at
+    assert at is not None
+    assert _local_day_iso(tz, at - timedelta(seconds=1)) == anchor, (
+        "the instant must be the end of the ANCHOR's day, not of today — "
+        "next-local-midnight here promises capacity a full day early"
+    )
+    assert _local_day_iso(tz, at) > anchor
+
+
+async def test_the_reported_instant_is_never_in_the_past():
+    """A STALE anchor is the ordinary overnight state: the counter has
+    effectively rolled (`_effective_used_today` already reads 0) but nothing has
+    written the new anchor yet, because only a charge does that and there is no
+    daily cron.
+
+    Naming `anchor + 1 day` without clamping to today would answer with an
+    instant that has already passed — a countdown that starts negative on the
+    first screen a user opens in the morning.
+    """
+    from app.db import async_session_maker
+    from app.services.credit_service import credit_service
+
+    uid = await _mk_user("stale-anchor-instant@example.com")
+    await _grant_via_balance(uid)
+    yesterday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+    await _with_cap(uid, anchor=yesterday, tz="America/Toronto")
+
+    async with async_session_maker() as db:
+        view = await credit_service.get_balance_view(db, uid)
+        # The counter has rolled for display...
+        assert Decimal(view.message_credits_used_today) == Decimal("0")
+
+    # ...so the next roll is the one AFTER today, and it is in the future.
+    assert view.daily_reset_at > datetime.now(timezone.utc)
+
+
+async def test_an_anchor_ahead_of_today_is_a_full_day_later_than_next_midnight():
+    """The case the anchor rule exists for, and the one a naive "next local
+    midnight" gets wrong by 24 hours.
+
+    The anchor is seeded from the UTC date at signup, so a user west of UTC can
+    carry an anchor a day AHEAD of their local date until the app reports a
+    timezone. `_reset_daily_if_needed` is forward-only and will not roll until
+    the local day passes THE ANCHOR, so next-local-midnight promises capacity
+    that is still a day away — wrong in the direction that matters.
+
+    Measured: Toronto at 22:30 local with a UTC-seeded anchor rolls at
+    2026-08-14T04:00Z; next-local-midnight answers 2026-08-13T04:00Z.
+    """
+    from app.services.credit_exhausted import _daily_rollover_utc
+
+    now = datetime(2026, 8, 13, 2, 30, tzinfo=timezone.utc)   # 22:30 Aug 12 Toronto
+    naive = _daily_rollover_utc("America/Toronto", now)
+    anchored = _daily_rollover_utc("America/Toronto", now, "2026-08-13")
+
+    assert (anchored - naive) == timedelta(hours=24)
+    assert anchored == datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
+
+    # And it really is when the day passes the anchor — proven by walking the
+    # clock rather than by restating the formula.
+    from app.services.credit_service import _local_day_iso
+    t = now
+    while _local_day_iso("America/Toronto", t) <= "2026-08-13":
+        t += timedelta(minutes=1)
+    assert t == anchored
+
+
+async def test_an_anchor_of_today_is_simply_the_next_local_midnight():
+    """The ordinary case must be untouched by the anchor argument — otherwise
+    the fix for the rare case is a regression for everybody else."""
+    from app.services.credit_exhausted import _daily_rollover_utc
+
+    now = datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc)    # 12:00 Toronto
+    assert (_daily_rollover_utc("America/Toronto", now)
+            == _daily_rollover_utc("America/Toronto", now, "2026-08-13")
+            == datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc))
+
+
+async def test_half_hour_offset_and_dst_at_midnight_zones():
+    """Tehran is +3:30 and Santiago springs forward AT midnight, so local
+    00:00 does not exist there on that date. The reported instant must still be
+    the FIRST instant of the target local day in both."""
+    from app.services.credit_exhausted import _daily_rollover_utc
+    from app.services.credit_service import _local_day_iso
+
+    for tz, now, expect_day in (
+        ("Asia/Tehran", datetime(2026, 8, 13, 16, 0, tzinfo=timezone.utc), "2026-08-14"),
+        ("America/Santiago", datetime(2026, 9, 5, 20, 0, tzinfo=timezone.utc), "2026-09-06"),
+    ):
+        at = _daily_rollover_utc(tz, now)
+        assert _local_day_iso(tz, at) == expect_day, tz
+        assert _local_day_iso(tz, at - timedelta(seconds=1)) < expect_day, tz
+
+
+async def test_an_unresolvable_timezone_does_not_break_the_status_read(client, auth_headers, test_user_id):
+    """User.timezone is client-reported and the chat WS persisted it with only
+    a length check, so an unresolvable name could be sitting in the column
+    already. Resolving it with a bare ZoneInfo would raise
+    ZoneInfoNotFoundError out of /credits/status — 500ing the one screen whose
+    job is to explain the limit the user just hit."""
+    await _grant_via_balance(test_user_id)
+    await _with_cap(test_user_id, tz="Mars/Olympus")
+
+    res = await client.get("/api/credits/status", headers=auth_headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["message"]["daily_reset_at"] is not None, (
+        "a junk timezone must degrade to the documented UTC fallback, not to "
+        "a missing answer"
+    )
+
+
+async def test_an_unresolvable_timezone_does_not_fail_a_charge(credit_flags):
+    """The same value is read by `_local_day_iso` from inside `try_charge`, so
+    before the fallback a bad timezone string turned every one of that user's
+    turns into a failed charge."""
+    from app.db import async_session_maker
+    from app.db.models import BUCKET_MESSAGE
+    from app.services.credit_service import credit_service
+
+    credit_flags(credit_enforcement_enabled=True)
+    uid = await _mk_user("junk-tz-charge@example.com")
+    await _grant_via_balance(uid)
+    await _with_cap(uid, tz="Not/AZone")
+
+    async with async_session_maker() as db:
+        res = await credit_service.try_charge(
+            db, uid, "chat_message", BUCKET_MESSAGE, Decimal("1.0"),
+            idempotency_key=str(uuid.uuid4()),
+        )
+        await db.commit()
+    assert res.success is True
+
+
+def test_ws_chat_refuses_to_store_an_unresolvable_timezone():
+    """The value only ever reached the column through the chat WS, which
+    checked `len < 50` and nothing else while the REST profile route had always
+    resolved it through ZoneInfo and 400'd a bad name. Validating at the parse
+    site protects the persist AND the two other consumers that read the same
+    variable (day-chat bucketing, the agent's sense of local time)."""
+    import inspect
+    from app.api import ws_chat
+
+    src = inspect.getsource(ws_chat)
+    head = src.split('client_tz = msg.get("tz")', 1)[1][:1400]
+    assert "ZoneInfo(client_tz)" in head, (
+        "the parsed client timezone must be resolved before anything believes it"
+    )
+    assert "client_tz = None" in head, "an unresolvable name must be dropped, not stored"

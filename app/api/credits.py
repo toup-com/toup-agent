@@ -81,6 +81,23 @@ class BucketStatus(BaseModel):
     used_today: Optional[float] = None
     daily_cap: Optional[float] = None
     has_daily_limit: bool = False
+    # UTC instant the daily counter next rolls; null when the bucket has no
+    # daily dimension.
+    #
+    # This field is why the mobile Usage screen's "Daily limit" meter has never
+    # rendered for anybody. It has consumed `daily_reset_at` since it was
+    # written and gated the whole row on the value being present — and no
+    # deploy has ever sent one, so the row was not degraded, it was absent.
+    # Free is the ONLY plan carrying a daily cap, so the single tier the meter
+    # exists for is exactly the one that could never see it, which is also why
+    # the gap survived every test on a paid account.
+    #
+    # It must come from the server: the counter rolls at the boundary of
+    # User.timezone, NULL for most accounts, in which case the backend rolls at
+    # UTC midnight — 8pm in Toronto. A device using its own midnight is wrong by
+    # the whole UTC offset, in the direction that promises capacity the user
+    # does not have yet.
+    daily_reset_at: Optional[datetime] = None
     # Credits consumed this PERIOD = monthly - remaining, computed server-side.
     # The endpoint used to return no "used" figure at all, so every client
     # re-derived it — and the two mobile screens derived it differently (one
@@ -171,6 +188,7 @@ async def get_credit_status(
             daily_cap=(float(view.message_credits_daily_cap)
                        if view.message_credits_daily_cap is not None else None),
             has_daily_limit=view.message_credits_daily_cap is not None,
+            daily_reset_at=view.daily_reset_at,
             # `remaining` is plan + purchased, so subtracting it from the plan's
             # monthly allotment would under-report usage for anyone holding IAP
             # credits. Bought credits are not part of the period allowance.

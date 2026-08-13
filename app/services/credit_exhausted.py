@@ -35,11 +35,15 @@ exactly here.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from decimal import Decimal
 from typing import Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+logger = logging.getLogger(__name__)
 
 
 # Reason codes — match credit_service.REASON_* constants so callers
@@ -202,18 +206,96 @@ def format_message_text(
     )
 
 
-def _next_local_midnight_utc(user_timezone: Optional[str], now: datetime) -> datetime:
-    """Compute the UTC instant of the user's next local midnight.
+# Bounded: a client reporting a different malformed zone on every message must
+# not grow this without limit. Past the bound we stop deduplicating and the
+# repeated lines are themselves the signal.
+_WARNED_ZONES: set[str] = set()
+_WARNED_ZONES_MAX = 64
 
-    Daily caps reset at the user's stored timezone boundary, falling
-    back to UTC. DST transitions handled by zoneinfo.
+
+def _zone(user_timezone: Optional[str]) -> tzinfo:
+    """Resolve a stored timezone name to a zone, falling back to UTC.
+
+    ``User.timezone`` is client-reported and only the REST profile route
+    validates it (``auth.py`` calls ``ZoneInfo`` and 400s a bad value); the chat
+    WS persists whatever the client sent after checking ``len < 50`` and nothing
+    else. So an unresolvable name can reach this module, and every caller here
+    is on a path that must not fail because of one: ``_local_day_iso`` runs
+    inside ``try_charge``, where raising turns a bad timezone string into a
+    failed turn, and ``get_balance_view`` serves ``/credits/status``, where
+    raising 500s the one screen whose job is to explain the limit just hit.
+
+    UTC is the same fallback a NULL timezone already gets, so a bad value
+    degrades to the documented default instead of to an outage — but it is
+    logged once per distinct value per process, because silently treating
+    ``Mars/Olympus`` as UTC would hide a real client bug for as long as it ran.
+
+    Returns ``datetime.timezone.utc`` rather than ``ZoneInfo("UTC")`` on the
+    fallback so the recovery path cannot itself raise on a host with no tzdata.
     """
-    tz = ZoneInfo(user_timezone) if user_timezone else ZoneInfo("UTC")
-    local_now = now.astimezone(tz)
-    next_local = (local_now + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0,
-    )
-    return next_local.astimezone(timezone.utc)
+    if not user_timezone:
+        return timezone.utc
+    try:
+        return ZoneInfo(user_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        if user_timezone not in _WARNED_ZONES:
+            if len(_WARNED_ZONES) < _WARNED_ZONES_MAX:
+                _WARNED_ZONES.add(user_timezone)
+            logger.warning(
+                "[CREDITS] unresolvable stored timezone %r — treating as UTC",
+                user_timezone[:64],
+            )
+        return timezone.utc
+
+
+def _daily_rollover_utc(
+    user_timezone: Optional[str],
+    now: datetime,
+    anchor_local_date: Optional[str] = None,
+) -> datetime:
+    """The UTC instant at which the daily counter next rolls.
+
+    No clock rolls it. ``credit_service._reset_daily_if_needed`` zeroes the
+    counter on the first charge whose local day is strictly GREATER than
+    ``credit_balances.day_anchor_local_date``, and ``_effective_used_today``
+    applies the identical rule for readers. So the moment the cap lifts is the
+    first instant of the local day *after that anchor* — not simply "tomorrow".
+
+    The two coincide whenever the anchor is today, and diverge in exactly the
+    case the anchor rule was written for: the anchor is seeded from the UTC date
+    at signup, so for a user west of UTC it can sit a day AHEAD of their local
+    date until the app reports a timezone. "Next local midnight" is then wrong
+    by a full 24 hours, in the direction that promises capacity the user does
+    not have. Measured, not reasoned — Toronto at 22:30 local with a UTC-seeded
+    anchor rolls at 2026-08-14T04:00Z; next-local-midnight answers
+    2026-08-13T04:00Z.
+
+    ``anchor_local_date`` is optional because the agent-side reporter renders
+    the out-of-credits copy from a cached snapshot with no balance row in it.
+    Omitting it yields the next local midnight, which is the same answer for
+    every user whose anchor is today. One function either way, so the two
+    surfaces cannot quote roll times that disagree for the same user.
+    """
+    tz = _zone(user_timezone)
+    today = now.astimezone(tz).date()
+    last_counted = today
+    if anchor_local_date:
+        try:
+            # Forward only, matching _reset_daily_if_needed: an anchor ahead of
+            # today is legitimate and the day it names is the one still being
+            # counted, so it — not today — is what the next day follows.
+            last_counted = max(date.fromisoformat(anchor_local_date), today)
+        except ValueError:
+            # A malformed anchor is not worth failing a status read over; the
+            # ordinary rule is the safe reading.
+            last_counted = today
+    nxt = last_counted + timedelta(days=1)
+    # Building the local date at 00:00 and converting is exact even where local
+    # midnight does not exist: on a zone that springs forward AT midnight
+    # (Santiago, Havana, Beirut) zoneinfo maps 00:00 onto the post-transition
+    # offset, and the resulting instant is verifiably the first of that local
+    # day — one second earlier still reads as the previous date.
+    return datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz).astimezone(timezone.utc)
 
 
 def build_exhausted_response(
@@ -251,7 +333,7 @@ def build_exhausted_response(
 
     daily_reset_at: Optional[datetime] = None
     if has_daily_cap and reason in (REASON_DAILY_CAP_EXCEEDED, REASON_INSUFFICIENT_MESSAGE):
-        daily_reset_at = _next_local_midnight_utc(user_timezone, now)
+        daily_reset_at = _daily_rollover_utc(user_timezone, now)
 
     message = format_message_text(
         reason=reason,

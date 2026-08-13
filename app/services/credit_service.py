@@ -41,10 +41,9 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -63,6 +62,12 @@ from app.db.models import (
     SubscriptionPlan, User,
 )
 from app.services.email_canonical import canonical_email_hash
+# The day boundary has exactly one implementation, and it lives in
+# credit_exhausted because that module is a stdlib-only leaf — this direction
+# cannot cycle. Both the gate that rolls the counter and every surface that
+# says WHEN it rolls must read the same rule, or the screen and the refusal
+# quote different times for the same user.
+from app.services.credit_exhausted import _daily_rollover_utc, _zone
 from app.services.abuse_metrics import emit as _emit, hp as _hp, uidp as _uidp
 
 
@@ -310,6 +315,17 @@ class BalanceView:
     plan_source: Optional[str] = None
     subscription_product_id: Optional[str] = None
     subscription_renews_at: Optional[datetime] = None
+    # UTC instant the DAILY counter next rolls. None when the plan has no daily
+    # dimension — the same distinction message_credits_daily_cap already draws.
+    #
+    # It has to come from here because the client cannot derive it. The counter
+    # rolls at the boundary of User.timezone, which is NULL for most accounts
+    # (the app only reports one on first chat connect), and the backend then
+    # rolls the day at UTC midnight — 8pm in Toronto, not local midnight. A
+    # phone rendering "resets at midnight" off its own clock is wrong by the
+    # user's whole UTC offset, in the direction that promises capacity that is
+    # not there yet.
+    daily_reset_at: Optional[datetime] = None
 
 
 REASON_INSUFFICIENT_MESSAGE = "insufficient_message_credits"
@@ -610,11 +626,14 @@ def _email_verification_required(user) -> bool:
 
 
 def _local_day_iso(user_timezone: Optional[str], now: Optional[datetime] = None) -> str:
-    tz = ZoneInfo(user_timezone) if user_timezone else ZoneInfo("UTC")
+    # Resolved through _zone, not bare ZoneInfo: this runs inside try_charge, so
+    # an unresolvable stored timezone used to raise ZoneInfoNotFoundError from
+    # under the charge and fail the turn. See _zone for how one gets stored.
+    tz = _zone(user_timezone)
     if now is None:
         now = datetime.now(tz)
     elif now.tzinfo is None:
-        now = now.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+        now = now.replace(tzinfo=timezone.utc).astimezone(tz)
     else:
         now = now.astimezone(tz)
     return now.date().isoformat()
@@ -1131,6 +1150,24 @@ class CreditService:
         # user is shown and the number the gate judges are the same number.
         used_today = await self._effective_used_today(db, balance, user_id)
 
+        # When the cap lifts. Computed from the SAME anchor the roll actually
+        # tests, so the instant on screen is the instant the counter moves
+        # rather than an approximation of it. Only when there is a cap to lift.
+        #
+        # `db.get(User, …)` is an identity-map hit — `_effective_used_today`
+        # loaded the row a line ago — so this costs no query. A NULL anchor
+        # (legacy rows predating the column) yields the next local midnight,
+        # which is the safe direction: the next charge rolls the counter
+        # immediately, i.e. sooner than we promised, never later.
+        daily_reset_at: Optional[datetime] = None
+        if balance.message_credits_daily_cap is not None:
+            _user = await db.get(User, user_id)
+            daily_reset_at = _daily_rollover_utc(
+                getattr(_user, "timezone", None) if _user else None,
+                datetime.now(timezone.utc),
+                getattr(balance, "day_anchor_local_date", None),
+            )
+
         # Map the stored plan_source to the mobile contract:
         #   apple            → 'iap'
         #   stripe/NULL paid → 'web'
@@ -1178,6 +1215,7 @@ class CreditService:
             plan_source=mapped_source,
             subscription_product_id=sub_product_id,
             subscription_renews_at=sub_renews_at,
+            daily_reset_at=daily_reset_at,
         )
 
     async def try_charge(

@@ -105,6 +105,12 @@ def _build_test_app() -> FastAPI:
     # surface).
     from app.api.live_activity_devices import router as live_activity_devices_router
     app.include_router(live_activity_devices_router, prefix=settings.api_prefix)
+    # Mounted so test_usage_metering_regression can assert the SHAPE of
+    # /api/credits/status. The daily-meter outage was precisely a field the
+    # service computed and the route never serialised, which no service-level
+    # test can see — the response body has to be the thing under assertion.
+    from app.api.credits import router as credits_router
+    app.include_router(credits_router, prefix=settings.api_prefix)
     return app
 
 
