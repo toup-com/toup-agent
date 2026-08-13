@@ -669,6 +669,10 @@ class ToolExecutor:
         # agent_runner drains this after each tool call to emit WS events, and
         # at assistant-message persistence to set Message.attachments. Cleared there.
         self.pending_attachments: List[Dict[str, Any]] = []
+        # Google doc/sheet CREATION tools that succeeded in this run. Read by
+        # `_tool_generate_docx` / `_tool_generate_xlsx` to refuse a duplicate
+        # local file. Cleared alongside pending_attachments in agent_runner.
+        self.google_docs_created_this_run: set = set()
 
     # ── Per-call ContextVar-backed state (Phase 8) ──────────────
     #
@@ -906,6 +910,16 @@ class ToolExecutor:
             # `_meter_web_tool` states ("a metering outage must not turn into a
             # failed search"); it just has to hold one frame earlier, because
             # the attribute lookup itself happens out here.
+            # Record a SUCCESSFUL Google doc/sheet creation for this run, so the
+            # generate_* handlers can refuse a duplicate local file. Same single
+            # dispatch point as the metering below, for the same reason: the
+            # alternative is repeating it in every connector handler.
+            if (
+                tool_name in self._GOOGLE_DOC_CREATORS
+                and not (isinstance(result, str) and result.startswith("ERROR:"))
+            ):
+                self.google_docs_created_this_run.add(tool_name)
+
             try:
                 await self._meter_flat_tool(tool_name, result)
             except Exception:
@@ -1791,6 +1805,14 @@ class ToolExecutor:
     # family are NOT here because no price has ever been set for them —
     # inventing one is a pricing decision, not a bug fix. They are listed in
     # docs/credits/coverage.md as an open decision.
+    # Google tools that CREATE a document the user will see in their Drive.
+    # Creation only — `docs__append_text` / `sheets__append_rows` write into a
+    # doc the user already has, which is not a reason to refuse a separate
+    # download they may genuinely have asked for.
+    _DOC_CREATORS: frozenset = frozenset({"docs__create", "drive__create_doc"})
+    _SHEET_CREATORS: frozenset = frozenset({"sheets__create_spreadsheet"})
+    _GOOGLE_DOC_CREATORS: frozenset = _DOC_CREATORS | _SHEET_CREATORS
+
     _FLAT_FEE_TOOLS: Dict[str, str] = {
         "browser_action": "browser_action",
         "browser_screenshot": "browser_screenshot",
@@ -2732,6 +2754,8 @@ class ToolExecutor:
         return await self._register_attachment(att)
 
     async def _tool_generate_docx(self, inp: Dict[str, Any]) -> str:
+        if self.google_docs_created_this_run & self._DOC_CREATORS:
+            return self._refuse_duplicate("docx", "Google Doc")
         from app.agent.doc_generators import gen_docx
         try:
             att = await gen_docx(
@@ -2745,7 +2769,25 @@ class ToolExecutor:
             return f"ERROR: {type(exc).__name__}: {exc}"
         return await self._register_attachment(att)
 
+    def _refuse_duplicate(self, ext: str, google_name: str) -> str:
+        """Decline a local file that would sit beside a real Google doc.
+
+        Not an ERROR: — nothing failed, and the `ERROR:` prefix is a contract
+        (`_meter_flat_tool` reads it to decide a call did no billable work, and
+        the model treats it as something to retry). This is a completed refusal
+        the model must READ and act on, so it says what to do instead.
+        """
+        return (
+            f"SKIPPED: a real {google_name} was already created in this turn, so no "
+            f".{ext} was generated. A .{ext} is a file in this chat — it is NOT in the "
+            f"user's Drive, and attaching one beside the {google_name} gives them a "
+            f"broken duplicate of the thing they asked for. Reply with the "
+            f"{google_name} link only; do not mention this file."
+        )
+
     async def _tool_generate_xlsx(self, inp: Dict[str, Any]) -> str:
+        if self.google_docs_created_this_run & self._SHEET_CREATORS:
+            return self._refuse_duplicate("xlsx", "Google Sheet")
         from app.agent.doc_generators import gen_xlsx
         try:
             att = await gen_xlsx(

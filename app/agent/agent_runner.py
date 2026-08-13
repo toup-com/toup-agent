@@ -1175,6 +1175,10 @@ class AgentRunner:
 
         # Reset pending attachments — belongs to this run only.
         self.tools.pending_attachments = []
+        # Same lifetime, and it MUST be cleared here: left set, the next turn's
+        # "now make me a Word version" would be refused as a duplicate of a doc
+        # created in a previous turn.
+        self.tools.google_docs_created_this_run = set()
         _attachments_emitted_count = 0
 
         # ── Classify query intent (lightweight, <1ms) ─────────────────
