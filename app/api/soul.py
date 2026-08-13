@@ -6,6 +6,7 @@ PUT  /api/soul  → save/update soul config → compiles → updates Identity re
 PUT  /api/soul/sync  → agent-side endpoint to receive soul sync from platform
 """
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -236,6 +237,51 @@ async def _save_soul_impl(
         updated_at=saved_at,
     )
 
+    # ── Fail-closed write-through for BOUND tenants (Last Mile L-1) ──
+    # The tenant copy of agent_configs.agent_name is what text chat and
+    # the voice assembler actually read; a rename that reaches only the
+    # platform copy is silent drift — the defect that blanked agent names
+    # across the tenant fleet. For a bound tenant the tenant write
+    # happens BEFORE the platform commit and its failure fails the save:
+    # nothing is saved anywhere, and the user retries. (Bounded
+    # transaction hold: ≤2 HTTP attempts on a rare, user-initiated path —
+    # the rename contract outweighs the low-frequency connection hold.)
+    if agent_cfg and agent_cfg.agent_url and agent_cfg.agent_api_key:
+        _sync_kwargs = dict(
+            agent_url=agent_cfg.agent_url,
+            agent_api_key=agent_cfg.agent_api_key,
+            user_id=current_user.id,
+            name=req.name,
+            compiled_text=compiled_text,
+            deactivate_agent_soul_memories=True,
+            agent_config_updates={
+                "onboarding_completed": True,
+                "agent_name": req.name,
+                "agent_color": req.color,
+            } if onboarding_just_completed else {
+                "agent_name": req.name,
+                "agent_color": req.color,
+            },
+            # Correct the owner identity in the same sync that sets the
+            # agent name — fixes "Hey Agent Owner" on the pool-claim path
+            # even when the bridge doesn't forward user_name to /admin/bind.
+            owner_name=getattr(current_user, "name", None),
+            owner_email=getattr(current_user, "email", None),
+        )
+        vps_synced = await _sync_soul_to_vps(**_sync_kwargs)
+        if not vps_synced:
+            # One brief retry rides out a blue-green drain (~10s).
+            await asyncio.sleep(2)
+            vps_synced = await _sync_soul_to_vps(**_sync_kwargs)
+        if not vps_synced:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Your agent couldn't be updated, so nothing was saved. "
+                "Please try again in a moment.",
+            )
+        config.vps_soul_synced_at = datetime.now(timezone.utc)
+
     await db.commit()
 
     # ── Pre-warm managed container (Phase 1, gated by feature flag) ──
@@ -253,45 +299,6 @@ async def _save_soul_impl(
                 "[SOUL] prewarm schedule failed for user %s: %s",
                 str(current_user.id)[:8], e,
             )
-
-    # ── VPS sync (invisible to user) ──
-    if agent_cfg and agent_cfg.agent_url and agent_cfg.agent_api_key:
-        try:
-            vps_synced = await _sync_soul_to_vps(
-                agent_url=agent_cfg.agent_url,
-                agent_api_key=agent_cfg.agent_api_key,
-                user_id=current_user.id,
-                name=req.name,
-                compiled_text=compiled_text,
-                deactivate_agent_soul_memories=True,
-                agent_config_updates={
-                    "onboarding_completed": True,
-                    "agent_name": req.name,
-                    "agent_color": req.color,
-                } if onboarding_just_completed else {
-                    "agent_name": req.name,
-                    "agent_color": req.color,
-                },
-                # Correct the owner identity in the same sync that sets the
-                # agent name — fixes "Hey Agent Owner" on the pool-claim path
-                # even when the bridge doesn't forward user_name to /admin/bind.
-                owner_name=getattr(current_user, "name", None),
-                owner_email=getattr(current_user, "email", None),
-            )
-            if vps_synced:
-                # Best-effort timestamp update — failure here doesn't
-                # invalidate the save, so swallow any DB error rather
-                # than letting it 500 a successful save.
-                try:
-                    config.vps_soul_synced_at = datetime.now(timezone.utc)
-                    await db.commit()
-                except Exception as inner:
-                    logger.warning(
-                        "[SOUL] vps_soul_synced_at update skipped: %s",
-                        type(inner).__name__,
-                    )
-        except Exception as e:
-            logger.error(f"[SOUL] VPS sync failed for user {current_user.id}: {e}")
 
     return response_payload
 
@@ -479,7 +486,15 @@ async def sync_soul(
                             f"with {list(valid.keys())}"
                         )
         except Exception as e:
-            logger.warning(f"[SOUL] Failed to update AgentConfig on VPS (table may not exist): {e}")
+            # Report, don't swallow: the sender's fail-closed rename
+            # contract (Last Mile L-1) has to SEE this failure — a
+            # warn-and-200 receiver turns a failed tenant write into
+            # silent drift. The savepoint has already rolled back;
+            # raising skips the endpoint's commit, so the identity and
+            # memory sections roll back too and the sync stays atomic
+            # on the receiver.
+            logger.error(f"[SOUL] agent_config update failed on VPS: {e}")
+            raise HTTPException(502, "agent_config update failed on tenant")
 
     # 4. Upsert the owner User row's real name/email. A (re)provisioned
     #    container boots with a stub User(name="Agent Owner") and the

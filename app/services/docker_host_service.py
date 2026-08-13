@@ -1172,7 +1172,12 @@ async def _sync_soul_after_start(
     from app.db.database import async_session_maker
     from app.db.models import SoulConfig
 
-    for _ in range(10):
+    # Heavy tenants (WhatsApp sidecar + Telegram + workspace restore)
+    # take ~2 minutes to answer /agent/health; the old 30s gate made this
+    # push — the only tenant-side carrier of onboarding-chosen agent
+    # names — silently skip exactly those tenants (L-1, GA ledger).
+    _attempts = max(1, settings.soul_sync_health_timeout_s // 3)
+    for _ in range(_attempts):
         await asyncio.sleep(3)
         try:
             async with _httpx.AsyncClient(timeout=5) as client:
@@ -1182,7 +1187,11 @@ async def _sync_soul_after_start(
         except Exception:
             continue
     else:
-        logger.warning("[SOUL] container not healthy after 30s for %s", user_id[:8])
+        logger.warning(
+            "[SOUL] container not healthy after %ss for %s — soul/name "
+            "seed NOT delivered",
+            settings.soul_sync_health_timeout_s, user_id[:8],
+        )
         return
 
     try:

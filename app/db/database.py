@@ -438,6 +438,17 @@ async def init_db():
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS apple_sub VARCHAR(255)",
         # ── Agent configs ──
         "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS llm_mode VARCHAR(20) DEFAULT 'manual'",
+        # L-1 (Last Mile): tenant agent_configs tables created by old
+        # snapshots carry NOT NULL on agent_model; the ORM says
+        # nullable=True. The soul-sync receiver's row-CREATE (which
+        # writes only identity fields — it must never invent a model,
+        # R-6) hit `NotNullViolationError: agent_model` on every tenant
+        # without a pre-existing row, was swallowed by the old
+        # warn-and-200, and the agent_name backfill silently no-opped
+        # for exactly those tenants. Live evidence: toup-agent-3134fece
+        # container log, 2026-08-12. DROP NOT NULL converges the tenant
+        # schema to the ORM's contract at next boot.
+        "ALTER TABLE agent_configs ALTER COLUMN agent_model DROP NOT NULL",
         # Mig 057 (onboarding-v2 PR 2) — backfill column preserves the
         # pre-v2 llm_mode value so the migration is reversible. Per the
         # READ FIRST memory: any alembic column added on a shared

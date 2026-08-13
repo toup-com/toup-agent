@@ -1491,11 +1491,21 @@ class Settings(BaseSettings):
     #
     # NOTE: rotating a heavy tenant still drops that tenant's live
     # WS/channel sessions for the ~2-minute recreate — an operator-aware
-    # window, not an unattended action. `_sync_soul_after_start`'s own
-    # 30s health wait (docker_host_service.py) is the same class of
-    # too-short gate and should move to the same readiness model.
+    # window, not an unattended action.
     agent_key_rotation_verify_timeout_s: int = 180
     agent_key_rotation_verify_retry_interval_s: float = 2.0
+
+    # How long `_sync_soul_after_start` waits for a (re)provisioned
+    # container to answer /agent/health before pushing the soul + agent
+    # name. This push is the ONLY carrier of the tenant-side agent_name
+    # for users who named their agent during onboarding (before a
+    # container existed) — the old hardcoded 30s gate silently gave up on
+    # every heavy boot, which is how agent_configs.agent_name went NULL
+    # across the tenant fleet (GA ledger, Last Mile L-1). Same readiness
+    # model as agent_key_rotation_verify_timeout_s above: the poll
+    # early-exits on the first 200, so the cap only matters for slow or
+    # dead containers.
+    soul_sync_health_timeout_s: int = 180
 
     # ── Connector OAuth (T1d) ────────────────────────────────
     # Default ON since the T1d staging soak passed and the connector
