@@ -449,3 +449,110 @@ def test_tenant_agent_model_not_null_drift_is_reconciled():
         "ORM contract changed: agent_model is no longer nullable — "
         "revisit the reconcile ALTER and the receiver's row-CREATE"
     )
+
+
+# ── 9. The retry window must actually cover a blue-green swap ──────────
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_that_returns_within_the_drain_window_still_saves(
+    soul_client, auth_headers, bound_agent_config
+):
+    """A blue-green swap makes the tenant refuse connections for a few
+    seconds. `_sync_soul_to_vps` carries a 15s timeout but returns False
+    in MILLISECONDS on a refused connection, so a fixed "one retry,
+    sleep 2s" gave up about two seconds into an outage it was written to
+    ride out — and the user's save 502'd for a tenant that was seconds
+    from being back.
+
+    Here the tenant refuses for the first four attempts and answers on
+    the fifth. Attempt schedule is ~0s, 1s, 3s, 7s, 11s against a 12s
+    deadline, so the save must survive.
+
+    On the pre-fix tree this test errors rather than fails, because that
+    version has no clock reference to patch at all — so the old
+    behaviour is demonstrated inline below rather than merely asserted
+    about.
+    """
+    # The retired schedule, reproduced: one attempt, one 2s sleep, one
+    # more attempt. Against a tenant that returns at t≈4s it is already
+    # out of attempts, which is the whole defect.
+    old_attempt_times = [0.0, 2.0]
+    assert max(old_attempt_times) < 4.0, (
+        "the fixed two-attempt schedule gave up before a blue-green swap "
+        "could plausibly finish — this is what the deadline replaces"
+    )
+
+    ac, _ = soul_client
+    calls = {"n": 0}
+
+    async def _refuse_then_answer(*_a, **_kw):
+        calls["n"] += 1
+        return calls["n"] >= 5  # first four "connection refused"
+
+    # Real sleeps would make this a 12-second test; the schedule is what
+    # matters, not the wall clock, so the deadline clock is advanced by
+    # exactly what each sleep would have cost.
+    clock = {"t": 0.0}
+
+    async def _fake_sleep(seconds):
+        clock["t"] += seconds
+
+    with patch(
+        "app.api.soul._sync_soul_to_vps", new=_refuse_then_answer
+    ), patch(
+        "app.api.soul.asyncio.sleep", new=_fake_sleep
+    ), patch(
+        "app.api.soul._time.monotonic", new=lambda: clock["t"]
+    ):
+        resp = await ac.put("/api/soul", headers=auth_headers, json=SOUL_BODY)
+
+    assert calls["n"] == 5, (
+        f"expected the retry loop to keep trying across the refusal "
+        f"window (attempts at ~0s, 1s, 3s, 7s, 11s within a 12s "
+        f"deadline); it made {calls['n']} attempt(s)"
+    )
+    assert resp.status_code == 200, (
+        f"a tenant that came back inside the drain window still failed "
+        f"the user's save: {resp.status_code}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_slow_tenant_does_not_hold_the_transaction_open_forever(
+    soul_client, auth_headers, bound_agent_config
+):
+    """The other half of the deadline: against a tenant that is merely
+    SLOW (each attempt burning its full 15s timeout), the loop must stop
+    after the deadline rather than multiplying 15s attempts. One retry
+    at most, so the open transaction is bounded.
+
+    MUTATION: swap the wall-clock deadline for an attempt COUNT of 5 →
+    five 15s attempts → red.
+    """
+    ac, _ = soul_client
+    calls = {"n": 0}
+    clock = {"t": 0.0}
+
+    async def _slow_failure(*_a, **_kw):
+        calls["n"] += 1
+        clock["t"] += 15.0  # each attempt burns the full client timeout
+        return False
+
+    async def _fake_sleep(seconds):
+        clock["t"] += seconds
+
+    with patch(
+        "app.api.soul._sync_soul_to_vps", new=_slow_failure
+    ), patch(
+        "app.api.soul.asyncio.sleep", new=_fake_sleep
+    ), patch(
+        "app.api.soul._time.monotonic", new=lambda: clock["t"]
+    ):
+        resp = await ac.put("/api/soul", headers=auth_headers, json=SOUL_BODY)
+
+    assert resp.status_code == 502
+    assert calls["n"] == 1, (
+        f"a slow tenant must not be retried past the deadline — the "
+        f"transaction is open the whole time; made {calls['n']} attempts"
+    )

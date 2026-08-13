@@ -8,6 +8,7 @@ PUT  /api/soul/sync  → agent-side endpoint to receive soul sync from platform
 
 import asyncio
 import logging
+import time as _time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -268,10 +269,21 @@ async def _save_soul_impl(
             owner_name=getattr(current_user, "name", None),
             owner_email=getattr(current_user, "email", None),
         )
+        # Retry to a WALL-CLOCK deadline rather than a fixed attempt
+        # count. `_sync_soul_to_vps` carries a 15s timeout but returns
+        # False in milliseconds when the connection is refused — which is
+        # exactly what a blue-green swap looks like from here. A fixed
+        # "one retry, sleep 2s" therefore gave up ~2s into an outage it
+        # was written to ride out, while still being able to run for 30s
+        # against a merely slow agent. A deadline inverts both: many
+        # cheap attempts across a refusal window, at most one retry
+        # against a slow one.
+        _deadline_s, _delay = 12.0, 1.0
+        _t0 = _time.monotonic()
         vps_synced = await _sync_soul_to_vps(**_sync_kwargs)
-        if not vps_synced:
-            # One brief retry rides out a blue-green drain (~10s).
-            await asyncio.sleep(2)
+        while not vps_synced and (_time.monotonic() - _t0) < _deadline_s:
+            await asyncio.sleep(_delay)
+            _delay = min(_delay * 2, 4.0)
             vps_synced = await _sync_soul_to_vps(**_sync_kwargs)
         if not vps_synced:
             await db.rollback()
