@@ -72,3 +72,11 @@ websockets>=12.0
 # both, so the test stack cannot boot without it. requirements.txt and
 # requirements.platform.txt already carry it; the docker files had drifted.
 pyjwt[crypto]>=2.8.0
+
+# IANA tz database incl. backward-compat links (US/Pacific, Etc/*). The
+# python:3.12-slim base ships Debian tzdata WITHOUT the legacy links
+# (split into tzdata-legacy), so ZoneInfo("US/Pacific") raised inside
+# agent containers — a live user's local date silently fell back to UTC
+# (routines idempotency, voice day labels). zoneinfo falls back to this
+# package per-key, so it heals every image without touching user rows.
+tzdata==2026.3

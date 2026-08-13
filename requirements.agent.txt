@@ -97,3 +97,11 @@ ytmusicapi>=1.10.0
 # their real local time. Bundles its own metadata — no system tzdata or
 # network needed.
 phonenumbers>=8.13.0
+
+# IANA tz database incl. backward-compat links (US/Pacific, Etc/*). The
+# python:3.12-slim base ships Debian tzdata WITHOUT the legacy links
+# (split into tzdata-legacy), so ZoneInfo("US/Pacific") raised inside
+# agent containers — a live user's local date silently fell back to UTC
+# (routines idempotency, voice day labels). zoneinfo falls back to this
+# package per-key, so it heals every image without touching user rows.
+tzdata==2026.3
