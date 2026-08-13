@@ -19,7 +19,7 @@ from app.schemas import (
 )
 from app.services import (
     authenticate_user, create_user, get_user_by_email,
-    get_user_by_id, create_access_token, decode_access_token,
+    get_user_by_id, create_access_token, decode_access_token, decode_platform_jwt,
     verify_password, change_user_password,
 )
 from app.services.session_tracker import record_login_session_async
@@ -239,7 +239,7 @@ async def get_current_user(
     # per-session table lets users sign out one device at a time.
     if token and getattr(user, 'password_changed_at', None):
         try:
-            payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+            payload = decode_platform_jwt(token)
             token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
             if token_iat < user.password_changed_at:
                 raise HTTPException(
@@ -254,9 +254,7 @@ async def get_current_user(
     # before the session-row commit lands in the read connection.
     if token:
         try:
-            payload = jwt.decode(
-                token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
-            )
+            payload = decode_platform_jwt(token)
             jti = payload.get("jti")
             token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
             if jti:
@@ -1455,7 +1453,7 @@ async def validate_token(request: Request, body: Optional[ValidateRequest] = Non
     # Token revocation check
     if getattr(user, 'password_changed_at', None):
         try:
-            payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+            payload = decode_platform_jwt(token)
             token_iat = datetime.utcfromtimestamp(payload.get("iat", 0))
             if token_iat < user.password_changed_at:
                 return ValidateResponse(valid=False)
@@ -1487,7 +1485,7 @@ async def sso_exchange(body: SSOExchangeRequest, request: Request, response: Res
     # password or signed this device out — defeating both invalidation levers
     # and re-rollable before each expiry = effectively permanent access.
     try:
-        _sso_payload = jwt.decode(body.token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        _sso_payload = decode_platform_jwt(body.token)
     except JWTError:
         _sso_payload = {}
     _sso_iat = datetime.utcfromtimestamp(_sso_payload.get("iat", 0))
@@ -1527,9 +1525,7 @@ async def logout_user(request: Request, response: Response, db: AsyncSession = D
     )
     if token:
         try:
-            payload = jwt.decode(
-                token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
-            )
+            payload = decode_platform_jwt(token)
             jti = payload.get("jti")
             if jti:
                 result = await db.execute(

@@ -37,6 +37,7 @@ import uuid
 
 from fastapi import HTTPException, status
 from jose import jwt, JWTError
+from app.services.auth_service import decode_platform_jwt
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -156,11 +157,7 @@ async def verify_sensitive_action_token(
         _raise_invalid("missing token")
 
     try:
-        payload = jwt.decode(
-            token,
-            settings.jwt_secret,
-            algorithms=[settings.jwt_algorithm],
-        )
+        payload = decode_platform_jwt(token)
     except JWTError as e:
         _raise_invalid(f"token decode failed: {e!s}")
 

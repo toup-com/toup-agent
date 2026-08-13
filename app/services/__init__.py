@@ -2,7 +2,7 @@ from app.services.embedding_service import EmbeddingService, get_embedding_servi
 from app.services.memory_extractor import MemoryExtractor, get_memory_extractor, ExtractedMemory, ExtractedEntity
 from app.services.auth_service import (
     verify_password, get_password_hash, create_access_token,
-    decode_access_token, authenticate_user, create_user,
+    decode_access_token, decode_platform_jwt, authenticate_user, create_user,
     get_user_by_id, get_user_by_email, change_user_password,
 )
 from app.services.memory_service import MemoryService
@@ -21,6 +21,7 @@ __all__ = [
     "get_password_hash",
     "create_access_token",
     "decode_access_token",
+    "decode_platform_jwt",
     "authenticate_user",
     "create_user",
     "get_user_by_id",

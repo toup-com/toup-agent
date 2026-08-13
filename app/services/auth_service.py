@@ -75,6 +75,38 @@ def create_access_token(user_id: str) -> str:
     return encoded_jwt
 
 
+def decode_platform_jwt(token: str) -> dict:
+    """jwt.decode against {jwt_secret, jwt_secret_previous} (L-3).
+
+    THE one decode path for platform-minted JWTs. Signing is always
+    new-only (create_access_token above); during a rotation the platform
+    sets JWT_SECRET=<new> + JWT_SECRET_PREVIOUS=<old> so tokens minted
+    before the flip stay valid until they expire or the previous is
+    cleared. Every revocation check that runs AFTER decode
+    (password_changed_at vs iat, jti) sees the same payload shape
+    regardless of which secret verified — old-secret tokens are NOT
+    exempt from revocation, which is the regression trap a per-site
+    single-secret decode would open (a site that catches JWTError and
+    `pass`es would silently skip its check for old-secret tokens).
+
+    Raises JWTError (the last one) when no configured secret verifies.
+    An empty jwt_secret_previous is never tried.
+    """
+    secrets_to_try = [settings.jwt_secret]
+    if settings.jwt_secret_previous:
+        secrets_to_try.append(settings.jwt_secret_previous)
+    last_err: Optional[JWTError] = None
+    for _secret in secrets_to_try:
+        try:
+            return jwt.decode(
+                token, _secret, algorithms=[settings.jwt_algorithm]
+            )
+        except JWTError as e:
+            last_err = e
+    assert last_err is not None
+    raise last_err
+
+
 def decode_access_token(token: str) -> Optional[str]:
     """Decode a JWT token and return the user ID.
 
@@ -87,11 +119,7 @@ def decode_access_token(token: str) -> Optional[str]:
     the preview/chat proxies validate scoped tokens via decode_preview_token.
     """
     try:
-        payload = jwt.decode(
-            token,
-            settings.jwt_secret,
-            algorithms=[settings.jwt_algorithm]
-        )
+        payload = decode_platform_jwt(token)
         scope = payload.get("scope")
         if scope is not None and scope != "full":
             return None
@@ -135,8 +163,7 @@ def decode_preview_token(token: str, app_id: str) -> Optional[str]:
     never by general auth. A full account token (no scope) is intentionally
     NOT accepted here; callers fall back to decode_access_token for those."""
     try:
-        payload = jwt.decode(
-            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        payload = decode_platform_jwt(token)
     except JWTError:
         return None
     if payload.get("scope") != "app_preview":

@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     
     # Auth
     jwt_secret: str = "toup-dev-secret-change-in-production"
+    # L-3 dual-accept: during a JWT rotation, verification tries
+    # {jwt_secret, jwt_secret_previous} while SIGNING stays new-only —
+    # tokens minted before the flip stay valid until expiry or until the
+    # previous is cleared. Every post-decode revocation check
+    # (password_changed_at vs iat, jti) applies to old-secret tokens
+    # identically. Clear after the rotation window.
+    jwt_secret_previous: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24 * 7  # 1 week
     # App-preview iframe token: short-lived + app-scoped (round 12). It rides in
@@ -1870,6 +1877,10 @@ class Settings(BaseSettings):
 
     # ── Rollout pipeline (Phase 3) ────────────────────────────────
     rollout_secret: str = ""                # Shared secret CI → platform webhook (X-Rollout-Secret)
+    # L-3 dual-accept: during a rotation the webhook verifies against
+    # {rollout_secret, rollout_secret_previous}. Set previous=<old> while
+    # rotating, clear it when no sender still holds the old value.
+    rollout_secret_previous: str = ""
     # Hard cap (NOT target) on canary observation duration. The observe
     # loop is signal-based: it exits as soon as boot gate + stability hold
     # pass (~90s on healthy code). This setting is the upper bound — set

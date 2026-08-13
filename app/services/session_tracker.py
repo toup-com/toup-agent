@@ -28,6 +28,7 @@ from typing import Optional
 
 from fastapi import Request
 from jose import jwt, JWTError
+from app.services.auth_service import decode_platform_jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -117,9 +118,7 @@ def _decode_jti(token: str) -> Optional[str]:
     minted server-side so we know it's valid, this is just claim
     extraction."""
     try:
-        payload = jwt.decode(
-            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
-        )
+        payload = decode_platform_jwt(token)
         return payload.get("jti")
     except JWTError:
         return None

@@ -101,12 +101,26 @@ class RolloutDetailResp(RolloutSummaryResp):
 def _verify_rollout_secret(header_value: Optional[str]) -> None:
     """Constant-time comparison of X-Rollout-Secret header vs settings.
     Raises 401 on mismatch.
+
+    DUAL-ACCEPT (L-3): during a rotation the header is verified against
+    {current, previous}. That removes the mismatch window that could 401
+    an in-flight build's rollout-notify (the 08-10 deploy-path outage
+    class): set ROLLOUT_SECRET_PREVIOUS=<old> + ROLLOUT_SECRET=<new> on
+    the platform, update the GitHub secret, then clear the previous once
+    no sender still holds the old value. Empty strings are NEVER
+    acceptable comparands — an unset previous must not turn a missing
+    header into a pass.
     """
-    expected = settings.rollout_secret or ""
-    if not expected:
+    candidates = [
+        s for s in (settings.rollout_secret, settings.rollout_secret_previous)
+        if s
+    ]
+    if not candidates:
         # Misconfigured — block rather than allow everything
         raise HTTPException(503, "ROLLOUT_SECRET not configured on platform")
-    if not header_value or not hmac.compare_digest(header_value, expected):
+    if not header_value or not any(
+        hmac.compare_digest(header_value, c) for c in candidates
+    ):
         raise HTTPException(401, "invalid X-Rollout-Secret")
 
 
