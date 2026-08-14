@@ -452,6 +452,18 @@ SHARED_COLUMN_AUTHORITY: dict[str, dict] = {
         "sync": "none",
         "note": "read by rollout_service canary selection; " + _DEAD_TENANT,
     },
+    "users.first_media_played_at": {
+        "authority": "platform",
+        "write_paths": [
+            "POST /api/account/media-played (app/api/account.py, platform — the only writer)",
+            "alembic 086 legacy backfill (platform)",
+        ],
+        "sync": "none",
+        "note": "write-once monotonic latch (COALESCE) behind the progressively-disclosed Media nav "
+                "entry; read by GET /auth/me. The agent never reads or writes it — " + _DEAD_TENANT
+                + " — but the column must exist tenant-side because the ORM model declares it "
+                  "(init_db _alter_statements carries the mirror)",
+    },
     # ── agent_configs ─────────────────────────────────────────────────
     "agent_configs.id": {
         "authority": "immutable-after-create",

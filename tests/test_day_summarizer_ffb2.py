@@ -275,20 +275,14 @@ async def _make_engine():
         "sqlite+aiosqlite://", connect_args={"check_same_thread": False},
     )
     async with engine.begin() as conn:
+        # `users` comes FROM THE ORM MODEL, never from a copy of it — the copy
+        # that used to live here had already drifted (it was missing
+        # `notification_preferences`) and went red the moment the model gained
+        # `first_media_played_at` (migration 086). A hand-written schema is a
+        # second source of truth nothing keeps in sync. Same fix as
+        # test_reply_history.py and the others that hit this before.
+        await conn.run_sync(User.__table__.create, checkfirst=True)
         for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255), name VARCHAR(255),
-                password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                email_verified_at TIMESTAMP,
-                email_verification_token VARCHAR(255),
-                email_verification_sent_at TIMESTAMP,
-                apple_refresh_token TEXT, apple_sub VARCHAR(255),
-                is_canary BOOLEAN DEFAULT 0
-            )""",
             """CREATE TABLE IF NOT EXISTS day_chats (
                 id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
                 local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',

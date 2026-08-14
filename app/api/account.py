@@ -23,13 +23,13 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, update
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
 from app.db import get_db
-from app.db.models import ApiKey, Routine, UserSession
+from app.db.models import ApiKey, Routine, User, UserSession
 from app.db.models.user import DEFAULT_NOTIFICATION_PREFERENCES
 
 logger = logging.getLogger(__name__)
@@ -224,6 +224,57 @@ async def update_preferences(
         await _try_sync_briefing_routine(db, current_user.id, bool(body.morning_briefing))
 
     return NotificationPreferences(**current)
+
+
+# =====================================================================
+# First media play — the progressive-disclosure latch
+# =====================================================================
+
+
+class MediaPlayedResponse(BaseModel):
+    """The stamped instant. Always the FIRST one, never this call's."""
+
+    first_media_played_at: Optional[datetime] = None
+
+
+@router.post("/media-played", response_model=MediaPlayedResponse)
+async def report_media_played(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> MediaPlayedResponse:
+    """Record that this account has now heard media play at least once.
+
+    Called by a client the moment its PLAYER reports sound — not when a
+    track is queued, resolved, or attempted. The mobile app's single call
+    site is `commitNowPlaying` in `src/shared/trackPlayer.ts`, the store
+    the app already treats as "the one truth for what is audible".
+
+    Write-once and monotonic, enforced HERE rather than by the caller: the
+    `IS NULL` predicate is what makes a replayed or racing report update
+    zero rows, so a client bug, an offline retry queue draining twice, or
+    two devices reporting at once can never move the instant. Idempotent by
+    construction, so the client may retry freely — which it does, since the
+    UI never waits on this call.
+
+    The only path back to NULL is the account-deletion cascade.
+    """
+    now = datetime.utcnow()
+    await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.first_media_played_at.is_(None))
+        .values(first_media_played_at=now)
+    )
+    await db.commit()
+    # Re-read rather than returning `now`: on every call after the first the
+    # UPDATE matches no row, and the honest answer is the ORIGINAL instant.
+    # Read by column against the id, not off `current_user` — that object may
+    # belong to a different session and would answer from its identity map.
+    stamped = (
+        await db.execute(
+            select(User.first_media_played_at).where(User.id == current_user.id)
+        )
+    ).scalar_one_or_none()
+    return MediaPlayedResponse(first_media_played_at=stamped)
 
 
 # =====================================================================

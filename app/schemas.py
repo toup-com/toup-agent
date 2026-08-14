@@ -74,6 +74,12 @@ class UserResponse(BaseModel):
     # frontend can render the verify-your-email banner without a second
     # round trip.
     email_verified_at: Optional[datetime] = None
+    # First time this account heard media play (migration 086). NULL = never.
+    # Surfaced here rather than on its own endpoint because /auth/me is the
+    # payload every client already fetches at boot and caches — so the
+    # progressively-disclosed Media nav entry costs no extra cold-start round
+    # trip and is correct in the first frame, from cache, offline.
+    first_media_played_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

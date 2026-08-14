@@ -54,21 +54,14 @@ async def _make_engine():
         connect_args={"check_same_thread": False},
     )
     async with engine.begin() as conn:
+        # `users` comes FROM THE ORM MODEL, never from a copy of it. The copy
+        # that used to live here went red the moment the model gained
+        # `first_media_played_at` (migration 086), because the ORM insert below
+        # emits every mapped column. A hand-written schema is a second source
+        # of truth nothing keeps in sync; the tables below stay raw because
+        # they are seeded by raw SQL, not by the ORM.
+        await conn.run_sync(User.__table__.create, checkfirst=True)
         for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255), name VARCHAR(255),
-                password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                email_verified_at TIMESTAMP,
-                email_verification_token VARCHAR(64),
-                email_verification_sent_at TIMESTAMP,
-                apple_refresh_token TEXT, apple_sub VARCHAR(255),
-                notification_preferences TEXT,
-                is_canary BOOLEAN DEFAULT 0
-            )""",
             """CREATE TABLE IF NOT EXISTS identities (
                 id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
                 identity_type VARCHAR(30), name VARCHAR(255), content TEXT,

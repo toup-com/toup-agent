@@ -36,19 +36,21 @@ should_inject_today_so_far = _dcl_mod.should_inject_today_so_far
 async def _make_engine():
     engine = create_async_engine("sqlite+aiosqlite://", connect_args={"check_same_thread": False})
     async with engine.begin() as conn:
+        # `users` is built FROM THE ORM MODEL, never from a copy of it. This was
+        # a hand-written `CREATE TABLE users (...)` and it drifted the moment
+        # the model gained `first_media_played_at` (migration 086): every ORM
+        # insert in this file started failing on a column the table had never
+        # heard of. A hand-written schema is a second source of truth nothing
+        # keeps in sync, and it always breaks somewhere else entirely —
+        # whenever someone adds a column. Same fix as test_reply_history.py,
+        # test_recent_days_service.py and test_ws_tz_persistence.py.
+        #
+        # Only `users` moves: the tables below are inserted into by raw SQL
+        # here, so their hand-written shape is what this file is testing
+        # against, and `create_all` on some of them would compile a pgvector
+        # column that sqlite cannot take.
+        await conn.run_sync(User.__table__.create, checkfirst=True)
         for stmt in [
-            """CREATE TABLE IF NOT EXISTS users (
-                id VARCHAR(36) PRIMARY KEY, email VARCHAR(255) UNIQUE,
-                hashed_password VARCHAR(255),
-                name VARCHAR(255), password_changed_at TIMESTAMP,
-                role VARCHAR(20) DEFAULT 'beta_user', created_at TIMESTAMP,
-                updated_at TIMESTAMP, is_active BOOLEAN DEFAULT 1,
-                stripe_customer_id VARCHAR(255), timezone VARCHAR(50),
-                email_verified_at TIMESTAMP, email_verification_token VARCHAR(255),
-                email_verification_sent_at TIMESTAMP, apple_refresh_token TEXT,
-                apple_sub VARCHAR(255), notification_preferences TEXT,
-                is_canary BOOLEAN DEFAULT 0
-            )""",
             """CREATE TABLE IF NOT EXISTS day_chats (
                 id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36) REFERENCES users(id),
                 local_date DATE NOT NULL, timezone VARCHAR(50) DEFAULT 'UTC',

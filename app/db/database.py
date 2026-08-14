@@ -419,6 +419,12 @@ async def init_db():
         # interpreted as DEFAULT_NOTIFICATION_PREFERENCES by the
         # account preferences endpoint.
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_preferences JSONB",
+        # Mig 086. First time this account heard media play. Platform owns the
+        # value (SHARED_COLUMN_AUTHORITY), but the column still has to EXIST
+        # tenant-side: the ORM model declares it, so without this every agent
+        # query that loads a User row 500s against a pre-086 tenant DB — the
+        # same failure mode the email-verification block below documents.
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_media_played_at TIMESTAMP",
         # Email verification (alembic 055). Mirrored here because the
         # agent's boot path runs init_db() but NOT alembic upgrade —
         # without these ALTERs, every endpoint that loads a User row

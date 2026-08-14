@@ -121,6 +121,16 @@ class User(Base):
     # user carries is_canary=True at a time.
     is_canary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # First time this account heard media play through a Toup client — the
+    # instant the player reported sound, not the instant something was queued
+    # or a page was opened. NULL = never. Write-once and monotonic: the only
+    # writer (POST /api/account/media-played) stamps it with COALESCE, so a
+    # replayed report cannot move it and nothing but account deletion clears
+    # it. Progressive disclosure of the "Media" nav entry reads it; it is
+    # deliberately a timestamp rather than a boolean so "when did this user
+    # first play something" stays answerable. Migration 086.
+    first_media_played_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Relationships
     memories: Mapped[List["Memory"]] = relationship("Memory", back_populates="user")
     conversations: Mapped[List["Conversation"]] = relationship("Conversation", back_populates="user")
