@@ -41,8 +41,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.config import settings
+from app.services.credit_exhausted import (
+    REASON_DAILY_CAP_EXCEEDED,
+    REASON_EMAIL_NOT_VERIFIED,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _reset_phrase(when) -> str:
+    """"in 3h 20m" / "tomorrow" — never a raw UTC timestamp.
+
+    Returns a deliberately vague "soon" when the timestamp is missing rather
+    than omitting the clause: "it resets" with no when is the sentence that
+    makes a user think the limit is permanent.
+    """
+    if when is None:
+        return "soon"
+    try:
+        from datetime import datetime, timezone as _tz
+        now = datetime.now(_tz.utc)
+        w = when if when.tzinfo else when.replace(tzinfo=_tz.utc)
+        secs = max(0, int((w - now).total_seconds()))
+    except Exception:  # noqa: BLE001 — copy must never raise
+        return "soon"
+    if secs < 3600:
+        return f"in {max(1, secs // 60)} minutes"
+    if secs < 86_400:
+        h, m = divmod(secs // 60, 60)
+        return f"in {h}h {m}m"
+    d = secs // 86_400
+    return f"in {d} day{'s' if d != 1 else ''}"
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -50,6 +79,35 @@ def _friendly_error(exc: Exception) -> str:
     name = type(exc).__name__
     msg = str(exc)
     msg_lower = msg.lower()
+
+    # ── Structured credit exhaustion — BEFORE any keyword matching ───────
+    # `OutOfCreditsError` already knows exactly why it fired and when the
+    # user gets more; it carries an `ExhaustedResponse`. Its str() is
+    # "out_of_credits:<reason>:<bucket>", which contains "credit", so the
+    # generic bucket below used to swallow it and tell a user with 84.90
+    # credits remaining that they were OUT of credits. They were not: they
+    # hit the free tier's DAILY cap of 15, which resets tonight. Sending
+    # them to buy credits they already own is the worst possible answer —
+    # it reads as the product upselling instead of explaining.
+    _resp = getattr(exc, "response", None)
+    _reason = getattr(_resp, "reason", None)
+    if _reason:
+        if _reason == REASON_DAILY_CAP_EXCEEDED:
+            when = _reset_phrase(getattr(_resp, "daily_reset_at", None))
+            return (
+                f"You've used today's message limit on the "
+                f"{getattr(_resp, 'plan_display_name', '') or 'free'} plan. "
+                f"It resets {when} — your remaining credits are untouched. "
+                f"Upgrade if you'd rather not wait."
+            )
+        if _reason == REASON_EMAIL_NOT_VERIFIED:
+            return "Please verify your email to keep chatting — check your inbox for the link."
+        # Genuinely out: the balance itself is empty.
+        when = _reset_phrase(getattr(_resp, "monthly_reset_at", None))
+        return (
+            f"You're out of Toup credits. They refill {when} — "
+            f"open Credits to top up or upgrade your plan and keep going."
+        )
 
     # ── Anthropic Claude subscription quota exhausted (CLI OAuth tokens) ──
     # Example: "You're out of extra usage. Add more at claude.ai/settings/usage..."
