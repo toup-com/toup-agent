@@ -2490,3 +2490,64 @@ async def test_reminder_card_deeplink_carries_seed_params(monkeypatch):
     ))
     url2 = sent[0]["payload"]["aps"]["attributes"]["deepLinkUrl"]
     assert "rtext" not in url2 and "rat" not in url2
+
+
+@pytest.mark.asyncio
+async def test_announcement_start_carries_no_progress_surface(monkeypatch):
+    """An operator's message must reach the Dynamic Island with NO
+    percentage and NO bar.
+
+    Both client surfaces bind a PRESENT optional
+    (`else if let progress = contentState.progress`), so a substituted 0.0
+    does not read as "no progress" — it reads as zero percent, and renders
+    `Text("0%")` (LiveActivityWidget.swift:407) beside an empty
+    `ProgressView` (:430, LiveActivityView.swift:253). Founder report
+    2026-08-13: an operator's message under a progress bar for a job that
+    does not exist. `nil` renders neither, so the assertion is on the KEY
+    being absent, not on its value.
+    """
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="announcement", source="platform",
+        title="A word from the team", body="We shipped something.",
+        # Exactly what admin_dispatch_worker._ensure_notification writes:
+        # no `progress` key anywhere in it.
+        data_json={"mission_id": "admin:d-1", "dispatch_id": "d-1",
+                   "mode": "once", "kind": "announcement",
+                   "deep_link": "toup://chat?mission=admin:d-1"},
+    ))
+    cs = sent[0]["payload"]["aps"]["content-state"]
+    assert "progress" not in cs, (
+        "an announcement narrates no work — a 0.0 here is rendered as '0%' "
+        f"and an empty bar, not as absent. Got: {cs}"
+    )
+    assert "timerEndDateInMilliseconds" not in cs
+    # The operator's words ARE the card: the subtitle override must survive.
+    assert cs["subtitle"] == "We shipped something."
+
+
+@pytest.mark.asyncio
+async def test_non_announcement_start_still_carries_zero_progress(monkeypatch):
+    """The companion, and the reason this pair is worth two tests: the fix
+    must be SCOPED.
+
+    A mission genuinely starting at zero percent is a true statement and its
+    bar is wanted — so `progress: 0.0` has to survive here. Without this
+    test, deleting the substitution outright would leave the announcement
+    test green while silently removing every start-of-mission bar.
+    """
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    user_id = await _mk_user()
+    await _mk_la_device(user_id)
+
+    await _claim_and_dispatch(await _enqueue(
+        user_id, event_kind="mission_started", title="Working",
+        data_json={"mission_id": "m-zero", "mission_title": "Working"},
+    ))
+    cs = sent[0]["payload"]["aps"]["content-state"]
+    assert cs.get("progress") == 0.0

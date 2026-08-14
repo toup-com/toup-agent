@@ -596,7 +596,38 @@ async def _send_start(
         title=_mission_title(row),
         subtitle=(row.body or "Working…")[:120] if silent
                  else (subtitle_override or "Starting…")[:120],
-        progress=progress if progress is not None else 0.0,
+        # An announcement narrates NO WORK, so it must carry no progress at
+        # all — not "no progress yet". The client treats these as bound
+        # optionals (`else if let progress = contentState.progress`), so a
+        # substituted 0.0 does not read as absent, it reads as zero percent:
+        # LiveActivityWidget.swift:407 renders Text("0%") in the Dynamic
+        # Island and :430 / LiveActivityView.swift:253 render an empty
+        # ProgressView. `nil` renders neither. That is the founder's
+        # 2026-08-13 report — an operator's message under a progress bar for
+        # a job that does not exist.
+        #
+        # The substitution stays for every other kind, where a start really
+        # is at zero percent, and the `fired` flag below is the same escape
+        # already built for alarm rows (see its comment, and the identical
+        # 2026-07-22 repro).
+        # An announcement narrates NO WORK, so it must carry no progress at
+        # all — not "no progress yet". The client treats these as bound
+        # optionals (`else if let progress = contentState.progress`), so a
+        # substituted 0.0 does not read as absent, it reads as zero percent:
+        # LiveActivityWidget.swift:407 renders Text("0%") in the Dynamic
+        # Island and :430 / LiveActivityView.swift:253 render an empty
+        # ProgressView. `nil` renders neither. That is the founder's
+        # 2026-08-13 report — an operator's message under a progress bar for
+        # a job that does not exist.
+        #
+        # The substitution stays for every other kind, where a start really
+        # is at zero percent, and the `fired` flag below is the same escape
+        # already built for alarm rows (see its comment, and the identical
+        # 2026-07-22 repro).
+        progress=(
+            None if row.event_kind == NOTIFY_KIND_ANNOUNCEMENT
+            else (progress if progress is not None else 0.0)
+        ),
         timer_end_ms=timer_ms,
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
