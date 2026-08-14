@@ -167,6 +167,11 @@ def test_system_channels_carries_all_known_system_surfaces():
     from app.agent.conversation_resolver import SYSTEM_CHANNELS
     assert SYSTEM_CHANNELS == frozenset({
         "routine", "trigger", "api", "digest", "subagent",
+        # Admin Dispatch. An operator notice is push-style and system-driven —
+        # it belongs to Reading A exactly as the four above do — and it was
+        # added to INDEXED_SYSTEM_CHANNELS without this pin following it, which
+        # is the pin doing its job rather than a reason to loosen it.
+        "admin",
     })
 
 
