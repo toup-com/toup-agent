@@ -1814,6 +1814,19 @@ class Settings(BaseSettings):
     # user_id mod 100 in feature_flags.py.
     onboarding_v2_rollout_pct: int = 0
 
+    # `web.mobile_shell_rollout_pct` (0-100) gates the mobile web shell — the
+    # off-canvas drawer, full-bleed content, 16px inputs and 44px targets that
+    # make toup.ai in a phone browser a port of the app rather than the desktop
+    # layout squeezed into 390px. Same storage model as the flag above: this is
+    # the fresh-deploy floor, `platform_settings` is the runtime override, and
+    # a user's bucket is stable across the ramp.
+    #
+    # DEFAULT 0 IS DELIBERATE and is the whole kill switch. The frontend reads
+    # an absent or false value as "today's shell", so a backend that has not
+    # deployed this key yet, a failed fetch and a user outside the cohort all
+    # resolve the same way. See frontend/src/shared/mobileShell.ts.
+    web_mobile_shell_rollout_pct: int = 0
+
     # ── Provisioning bridge (Phase 3, replaces SSH-as-root) ───────
     # mTLS-secured FastAPI service on the VPS. Platform talks to it with a
     # client cert; bridge does all docker / PG lifecycle work.

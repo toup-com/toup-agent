@@ -62,8 +62,13 @@ async def get_feature_flags(
     if not seed and request.client:
         seed = request.client.host or None
 
-    onboarding_v2 = await feature_flags.is_onboarding_v2_enabled(db, seed=seed)
-    return {"onboarding_v2": bool(onboarding_v2)}
+    # EVERY registered flag, not just onboarding_v2. A client cannot tell a
+    # missing key from a disabled one — `mobileShell.ts` reads an absent
+    # `web_mobile_shell` as off — so a readout that names only one flag is a
+    # readout that silently pins every other flag to false no matter what the
+    # admin toggle says. Adding a flag to `feature_flags.FLAGS` is all it takes
+    # to appear here.
+    return await feature_flags.all_flags_for(db, seed=seed)
 
 
 # ── Auth: frontend event emission ────────────────────────────────────
@@ -205,4 +210,85 @@ async def put_onboarding_v2(
     )
     return OnboardingV2Snapshot(
         rollout_pct=pct, env_default_pct=_s.onboarding_v2_rollout_pct,
+    )
+
+
+# ── Admin: any registered flag ───────────────────────────────────────
+#
+# The two routes above are `onboarding-v2` in the PATH, so every new flag needed
+# its own pair. These take the flag NAME instead. The hyphenated routes stay:
+# the admin panel calls them and the shapes are identical, so they cost nothing
+# to keep and breaking a deployed console to save a handler is a bad trade.
+#
+# Declared AFTER the static ones — FastAPI matches in declaration order, so a
+# `/{flag}` above them would swallow `/onboarding-v2` and answer it generically.
+
+
+class FlagSnapshot(BaseModel):
+    flag: str
+    rollout_pct: int
+    env_default_pct: int
+
+
+class FlagUpdate(BaseModel):
+    rollout_pct: int = Field(..., ge=0, le=100)
+
+
+def _known_flag(flag: str) -> str:
+    if flag not in feature_flags.FLAGS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"unknown feature flag {flag!r}; known: {sorted(feature_flags.FLAGS)}",
+        )
+    return flag
+
+
+@admin_router.get("", response_model=list[FlagSnapshot])
+async def list_feature_flags(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> list[FlagSnapshot]:
+    from app.config import settings as _s
+    return [
+        FlagSnapshot(
+            flag=name,
+            rollout_pct=await feature_flags.get_rollout_pct(db, name),
+            env_default_pct=int(getattr(_s, spec.env_attr, 0) or 0),
+        )
+        for name, spec in feature_flags.FLAGS.items()
+    ]
+
+
+@admin_router.get("/flag/{flag}", response_model=FlagSnapshot)
+async def get_feature_flag(
+    flag: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> FlagSnapshot:
+    from app.config import settings as _s
+    _known_flag(flag)
+    return FlagSnapshot(
+        flag=flag,
+        rollout_pct=await feature_flags.get_rollout_pct(db, flag),
+        env_default_pct=int(getattr(_s, feature_flags.FLAGS[flag].env_attr, 0) or 0),
+    )
+
+
+@admin_router.put("/flag/{flag}", response_model=FlagSnapshot)
+async def put_feature_flag(
+    flag: str,
+    body: FlagUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> FlagSnapshot:
+    from app.config import settings as _s
+    _known_flag(flag)
+    pct = await feature_flags.set_rollout_pct(db, flag, body.rollout_pct)
+    logger.info(
+        "admin.feature_flag.%s changed_pct=%d by_admin=%s", flag, pct, admin.id,
+    )
+    return FlagSnapshot(
+        flag=flag,
+        rollout_pct=pct,
+        env_default_pct=int(getattr(_s, feature_flags.FLAGS[flag].env_attr, 0) or 0),
     )
