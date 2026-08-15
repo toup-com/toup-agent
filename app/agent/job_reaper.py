@@ -34,6 +34,13 @@ STALE_AFTER = timedelta(minutes=30)
 SWEEP_INTERVAL_S = 600
 _BOOT_DELAY_S = 120
 
+#: How long a job may sit parked on a confirmation card before it is closed.
+#: Must EXCEED the card's own TTL (`_PENDING_ACTION_TTL_HOURS` = 24 in
+#: connector_dispatcher) or the job dies while the card is still tappable —
+#: the user approves, the mail goes out, and the job is already cancelled.
+#: The hour of slack is for clock skew between the two processes.
+PARKED_ON_CARD_STALE_AFTER = timedelta(hours=25)
+
 
 async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
     """Fail every stalled job; returns how many were reaped."""
@@ -136,7 +143,88 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             )
         except Exception:  # noqa: BLE001
             pass
-    return len(reaped)
+    return len(reaped) + await sweep_expired_card_parks(now)
+
+
+async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:
+    """Close jobs parked on a confirmation card the user never answered.
+
+    `waiting_on_user` is otherwise an IMMORTAL state — the stalled sweep
+    above only selects queued/running, and the turn-end finalizer only
+    touches running. That was tolerable while the status was rare (a
+    trigger hitting an out-of-credits error), and it stops being tolerable
+    now that ending a turn on a confirmation card parks a job every time.
+    A row stuck at "Waiting on you" forever, pointing at a card that
+    expired a week ago, is the same lie as "Failed" wearing a nicer word.
+
+    Deliberately narrow: ONLY `awaiting_confirmation` parks, matched on
+    `error_class`. Jobs parked for credits or connector auth are cleared by
+    the user fixing the underlying thing and have never had a timeout —
+    giving them one here would be an unrelated behaviour change smuggled
+    into a copy fix.
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import BuildJob
+
+    from app.agent.job_status import (
+        ERR_AWAITING_CONFIRMATION, STATUS_CANCELLED, STATUS_WAITING_ON_USER,
+    )
+
+    now = now or datetime.utcnow()
+    cutoff = now - PARKED_ON_CARD_STALE_AFTER
+
+    async with async_session_maker() as db:
+        rows = list((await db.execute(
+            select(BuildJob).where(
+                BuildJob.status == STATUS_WAITING_ON_USER,
+                BuildJob.error_class == ERR_AWAITING_CONFIRMATION,
+                BuildJob.created_at < cutoff,
+            )
+        )).scalars().all())
+        if not rows:
+            return 0
+        closed: list[tuple[str, str, str]] = []
+        for job in rows:
+            job.status = STATUS_CANCELLED
+            job.completed_at = now
+            job.user_message = (
+                "The approval request expired before it was confirmed, so "
+                "nothing was sent. Ask me to prepare it again."
+            )
+            job.technical_detail = (
+                "Parked on a confirmation card for longer than "
+                f"{int(PARKED_ON_CARD_STALE_AFTER.total_seconds() // 3600)}h."
+            )
+            closed.append((job.id, job.title or "", job.user_id))
+        await db.commit()
+
+    for job_id, title, user_id in closed:
+        logger.info(
+            "[job_reaper] closed expired card-park %s (%s)", job_id[:8], title[:60]
+        )
+        try:
+            from app.api.ws_chat import broadcast_to_user
+
+            await broadcast_to_user(user_id, {
+                "type": "job_update", "job_id": job_id,
+                "name": title, "status": STATUS_CANCELLED,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from app.agent.subagent_orchestrator import _notify_job_event
+
+            # notify_job_needs_user KEPT this Live Activity alive on purpose,
+            # so only a terminal notification ends it now.
+            await _notify_job_event(
+                job_id=job_id, label=title, kind="mission_failed",
+                title=f"Expired: {(title or 'background task')[:150]}",
+                body="The approval request expired. Nothing was sent.",
+                dismiss_after_s=600, dedup_suffix="card-expired", urgent=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return len(closed)
 
 
 async def stalled_jobs_sweep_loop() -> None:

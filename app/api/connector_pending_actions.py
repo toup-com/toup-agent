@@ -55,6 +55,56 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/connectors", tags=["Connectors"])
 
+#: Short by design. This hop is a courtesy update to a progress surface —
+#: the send already happened, and the user is looking at the card, not at
+#: Mission Control. Blocking their approve response on a slow tenant agent
+#: would trade the thing they care about for the thing they don't.
+_RESUME_TIMEOUT_S = 5.0
+
+
+async def _resume_job_for_action(
+    db: AsyncSession, *, user_id: str, action_id: str, outcome: str,
+    detail: Optional[str] = None,
+) -> None:
+    """Tell the tenant agent this card is decided, so the job it parked
+    can terminalise.
+
+    A job that parks on a confirmation card (`waiting_on_user`) has no
+    other closer: the stalled-job reaper only sweeps queued/running and
+    the turn-end finalizer only touches running. Without this call the
+    honest "Waiting on you" becomes a permanent one, which is a quieter
+    version of the same lie — the user approves, the mail goes out, and
+    Mission Control still says they need to do something.
+
+    Best-effort by contract. The card's own status is the record of what
+    happened; a tenant agent that is asleep, mid-rollout or unreachable
+    must never turn a successful send into a 5xx on the approve request.
+    """
+    from app.api.apps_proxy import _get_agent
+    from app.services.agent_http import get_agent_http_client
+
+    try:
+        agent = await _get_agent(user_id, db)
+        if not agent:
+            return
+        agent_url, agent_key = agent[0], agent[1]
+        client = get_agent_http_client()
+        resp = await client.post(
+            f"{agent_url.rstrip('/')}/api/agent/jobs/resolve-pending-action",
+            json={"action_id": action_id, "outcome": outcome, "detail": detail},
+            headers={"X-Agent-Key": agent_key},
+            timeout=_RESUME_TIMEOUT_S,
+        )
+        if resp.status_code >= 400:
+            logger.warning(
+                "[pending_actions] job resume returned %s for action=%s",
+                resp.status_code, action_id,
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[pending_actions] job resume failed for action=%s: %s", action_id, e,
+        )
+
 
 # ─── Schemas ─────────────────────────────────────────────────────────
 
@@ -496,6 +546,16 @@ async def approve_pending_action(
     )
     await db.commit()
 
+    # AFTER the commit: the card's own row is the record of what happened,
+    # and it must be durable before anything downstream is told about it.
+    await _resume_job_for_action(
+        db, user_id=user_id, action_id=row.id, outcome=outcome_status,
+        detail=(
+            None if outcome_status == "executed"
+            else str(result_payload.get("message") or "")[:200] or None
+        ),
+    )
+
     refreshed = await _load_owned_or_404(db, action_id, user_id)
     return _to_out(refreshed)
 
@@ -539,6 +599,12 @@ async def reject_pending_action(
     logger.info(
         "[pending_actions] rejected id=%s tool=%s user=%s",
         row.id, row.tool_name, user_id[:8],
+    )
+    # A rejected card unblocks its job too — cancelled, not failed. The
+    # user made a decision; nothing broke. Left out, saying "no" would
+    # leave the job parked on a card that no longer exists.
+    await _resume_job_for_action(
+        db, user_id=user_id, action_id=row.id, outcome="rejected",
     )
     refreshed = await _load_owned_or_404(db, action_id, user_id)
     return _to_out(refreshed)

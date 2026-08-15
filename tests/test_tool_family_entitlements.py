@@ -74,8 +74,26 @@ from app.config import settings
 #
 # Cost accepted: one prompt-cache re-warm per tenant on merge. See
 # tests/test_generate_tools_disclaim_google.py for the behaviour this buys.
+#
+# MOVED AGAIN, DELIBERATELY, 2026-08-13 (was caad2af5…3f656b). `update_job`'s
+# status enum gained `waiting_on_user` and `create_job`'s CONTRACT sentence no
+# longer offers "mark it 'failed'" as the exit for work that is blocked. Still
+# 60 definitions; no tool added, removed or reordered.
+#
+# This one HAD to be a wire change. The old enum was
+# ["running","completed","failed"], so a model whose job was blocked behind a
+# confirmation card had no legal value meaning "waiting" — it picked `failed`,
+# and the user got a red job card sitting directly beside the card asking them
+# to approve something. `waiting_on_user`, `PARKED_STATUSES`, the amber "Waiting
+# on you" chip on web and the non-failure branch in the mobile JobDetailScreen
+# all already existed; the enum was the only thing standing between them and
+# the model. An input_schema is not advisory — it is the set of values the
+# provider will let the model emit — so no prompt could have reached this.
+#
+# Cost accepted a second time: one more prompt-cache re-warm per tenant. See
+# tests/test_a_blocked_job_is_not_a_failed_job.py.
 MAIN_CORE_TOOLS_SHA256 = (
-    "caad2af59c3ce73d2c99fe5e6db53f7175785dcfaeafb2d8c93e3ecaf93f656b"
+    "0039fbdc16d8b3cb179fd1163f23e540ac0b4dd7715519e8c4eadba645a473cb"
 )
 MAIN_CORE_TOOLS_COUNT = 60
 

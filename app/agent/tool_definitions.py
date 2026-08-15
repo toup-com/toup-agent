@@ -1628,12 +1628,17 @@ def get_extended_tools():
                 "call update_job as you complete each one. CONTRACT — never end your "
                 "reply while a job you created is still 'running': before finishing, "
                 "either (a) complete the work and mark it 'completed', (b) mark it "
-                "'failed' with an error_message, or (c) hand the remaining work to "
-                "spawn or start_mission so something actually continues it. A job left "
-                "'running' when your turn ends freezes every progress surface and is "
-                "auto-failed as stalled after 30 minutes. Never create a job for work "
-                "you are handing to start_mission — the mission appears as its own "
-                "tracked task in Mission Control."
+                "'waiting_on_user' if you are BLOCKED ON THE USER — a confirmation "
+                "card they must approve, a connector they must reconnect, a question "
+                "only they can answer, (c) mark it 'failed' with an error_message if "
+                "the work genuinely broke, or (d) hand the remaining work to spawn or "
+                "start_mission so something actually continues it. Waiting on someone "
+                "is NOT failing: 'failed' next to a card asking them to approve "
+                "something tells them the app is broken at the exact moment it is "
+                "working correctly. A job left 'running' when your turn ends freezes "
+                "every progress surface and is closed as stalled after 30 minutes. "
+                "Never create a job for work you are handing to start_mission — the "
+                "mission appears as its own tracked task in Mission Control."
             ),
             "input_schema": {
                 "type": "object",
@@ -1671,8 +1676,16 @@ def get_extended_tools():
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["running", "completed", "failed"],
-                        "description": "New overall job status.",
+                        "enum": [
+                            "running", "completed", "waiting_on_user", "failed",
+                        ],
+                        "description": (
+                            "New overall job status. Use 'waiting_on_user' — never "
+                            "'failed' — when the job is blocked on something only the "
+                            "user can do (approve a confirmation card, reconnect an "
+                            "app, answer a question). It keeps the job alive and shows "
+                            "them what to do; 'failed' tells them it broke."
+                        ),
                     },
                     "current_step": {
                         "type": "integer",

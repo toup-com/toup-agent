@@ -49,9 +49,12 @@ _BACKEND = Path(__file__).resolve().parent.parent
 class _Tools:
     """Stands in for ToolExecutor's per-turn created-job ledger."""
 
-    def __init__(self, ids=()):
+    def __init__(self, ids=(), staged=()):
         self._ids = tuple(ids)
         self.takes = 0
+        # Confirmation cards this turn staged. The sweep reads this to decide
+        # whether an interrupted turn's jobs are dead or merely parked.
+        self.staged_pending_action_ids = list(staged)
 
     def take_created_job_ids(self):
         self.takes += 1
@@ -70,9 +73,18 @@ def _runner(tools, inner):
     r.tools = tools
     r._run_inner = inner
     r.closed = []
+    r.closed_staged = []
 
-    async def _close(ids, user_id):
+    # This double's signature MUST track the real `_close_interrupted_jobs`.
+    # `_sweep_unclosed_created_jobs` wraps the call in a broad
+    # `except Exception` (cleanup must never mask the real error), so a
+    # signature mismatch does not raise — it is logged and swallowed, and
+    # every job is silently stranded. That is exactly how the
+    # `staged_action_id` parameter landed: four tests here went red with an
+    # empty `r.closed` and a TypeError buried in the captured log.
+    async def _close(ids, user_id, staged_action_id=None):
         r.closed.append((tuple(ids), user_id))
+        r.closed_staged.append(staged_action_id)
 
     r._close_interrupted_jobs = _close
     return r
@@ -105,6 +117,41 @@ async def test_cancelled_turn_still_closes_its_jobs():
     assert r.closed == [(("job-a", "job-b"), "u1")], (
         "a cancelled turn must terminalise the jobs it created — this is the "
         "voice path's normal ending, not an edge case"
+    )
+    assert r.closed_staged == [None], (
+        "no card was staged, so the sweep must not claim one — that would "
+        "park a genuinely dead job forever"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_holding_a_card_hands_the_action_id_over():
+    """A card outlives the turn that staged it: it sits in the chat for 24h
+    and stays tappable. So a turn cancelled while one is outstanding leaves
+    a job that is WAITING, not dead — and the sweep has to hand the action
+    id down so the resume path can match on it.
+
+    The id must be read here, synchronously, before the work is detached:
+    this sweep runs inside a `finally` usually reached *because* the task is
+    being cancelled, and an await would be skipped by that same condition.
+    """
+    tools = _Tools(["job-a"], staged=["act-42"])
+
+    async def inner(**kwargs):
+        await asyncio.sleep(3600)
+
+    r = _runner(tools, inner)
+    task = asyncio.create_task(r.run(user_message="hi", user_id="u1"))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _settle()
+
+    assert r.closed == [(("job-a",), "u1")]
+    assert r.closed_staged == ["act-42"], (
+        "the staged card's id never reached the close path, so the parked "
+        "job can never be resolved by an approval"
     )
 
 

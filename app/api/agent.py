@@ -635,3 +635,153 @@ async def get_runtime_flags(
             getattr(cfg, "subagent_spawning_enabled", False)
         ),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Resume a job parked on a confirmation card
+# ─────────────────────────────────────────────────────────────────────
+
+
+class ResolvePendingActionRequest(BaseModel):
+    #: The `connector_pending_actions.id` the user just decided on.
+    action_id: str
+    #: Terminal state of that card: executed | failed | rejected | expired.
+    outcome: str
+    #: Optional one-line reason, shown to the user on the non-happy paths.
+    detail: Optional[str] = None
+
+
+class ResolvePendingActionResponse(BaseModel):
+    resolved: int
+    status: Optional[str] = None
+
+
+#: Card outcome → the job's terminal status. `executed` is the one that
+#: turns the job green, which is the whole point: the work the job
+#: narrates is not finished until the staged call actually runs.
+_ACTION_OUTCOME_TO_JOB_STATUS = {
+    "executed": "completed",
+    "failed": "failed",
+    "rejected": "cancelled",
+    "expired": "cancelled",
+}
+
+
+@router.post("/jobs/resolve-pending-action", response_model=ResolvePendingActionResponse)
+async def resolve_job_for_pending_action(
+    body: ResolvePendingActionRequest,
+    request: Request,
+) -> ResolvePendingActionResponse:
+    """Close the job that was parked waiting on this confirmation card.
+
+    Why this exists at all: `build_jobs` is an AGENT_ONLY table, but the
+    card is approved against the PLATFORM (`connector_pending_actions`
+    is PLATFORM_ONLY, and the platform is what actually executes the
+    staged call). So the one process that learns the user approved
+    cannot reach the one row that has to change. This endpoint is that
+    hop, and it is the reason parking a job is safe: without a resume
+    path, `waiting_on_user` is an immortal state — the reaper only
+    sweeps queued/running, and the turn-end finalizer only touches
+    running — and a job stuck at "Waiting on you" forever is just a
+    quieter version of the lie this whole change removes.
+
+    Matched on the agent side rather than by a `job_id` carried on the
+    platform row, because the agent already knows both ids at park time
+    and the platform does not. That keeps the linkage to one nullable
+    key inside an existing JSON column instead of a migration on a
+    shared table plus a new MCP header.
+
+    Idempotent: only rows still in `waiting_on_user` are touched, so a
+    retried delivery is a no-op that reports `resolved=0`.
+    """
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key",
+        )
+
+    new_status = _ACTION_OUTCOME_TO_JOB_STATUS.get(body.outcome)
+    if new_status is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown outcome {body.outcome!r}",
+        )
+
+    from datetime import datetime as _dt
+
+    from app.agent.job_status import ERR_TOOL_FAILURE, STATUS_WAITING_ON_USER
+    from app.db.database import async_session_maker
+    from app.db.models import BuildJob
+
+    resolved: list[tuple[str, str, str]] = []
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(BuildJob).where(BuildJob.status == STATUS_WAITING_ON_USER)
+        )).scalars().all()
+        for job in rows:
+            cfg = job.config_json or {}
+            if not isinstance(cfg, dict):
+                continue
+            if cfg.get("pending_action_id") != body.action_id:
+                continue
+            job.status = new_status
+            job.completed_at = _dt.utcnow()
+            # The park stamped `awaiting_confirmation` copy on these two.
+            # Leaving it behind would render "Waiting for you to approve
+            # this" underneath a job the client now draws as Done.
+            #
+            # `tool_failure` ONLY for the outcome that actually failed. A
+            # rejected or expired card cancelled the job; nothing broke, and
+            # stamping a failure class on a decision the user made is the
+            # same category error this whole change is about.
+            job.error_class = (
+                ERR_TOOL_FAILURE if new_status == "failed" else None
+            )
+            job.user_message = (
+                None if new_status == "completed"
+                else (body.detail or "This wasn't approved, so nothing was sent.")
+            )
+            resolved.append((job.id, job.title or "", job.user_id))
+        if resolved:
+            await db.commit()
+
+    for job_id, title, user_id in resolved:
+        try:
+            from app.api.ws_chat import broadcast_to_user
+
+            await broadcast_to_user(user_id, {
+                "type": "job_update", "job_id": job_id,
+                "name": title, "status": new_status,
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        # The Live Activity is still ALIVE — `notify_job_needs_user`
+        # deliberately kept it that way — so a terminal notification is the
+        # only thing that ends it. A DB write never touches the card.
+        try:
+            from app.agent.subagent_orchestrator import _notify_job_event
+
+            if new_status == "completed":
+                await _notify_job_event(
+                    job_id=job_id, label=title, kind="mission_completed",
+                    title=f"✅ Done: {(title or 'background task')[:150]}",
+                    body="Approved and sent.", progress=100,
+                    dismiss_after_s=900, dedup_suffix="completed",
+                )
+            else:
+                await _notify_job_event(
+                    job_id=job_id, label=title, kind="mission_failed",
+                    title=f"Stopped: {(title or 'background task')[:150]}",
+                    body=(body.detail or "This wasn't approved, so nothing was sent.")[:300],
+                    dismiss_after_s=600, dedup_suffix="resolved", urgent=False,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return ResolvePendingActionResponse(
+        resolved=len(resolved),
+        status=new_status if resolved else None,
+    )

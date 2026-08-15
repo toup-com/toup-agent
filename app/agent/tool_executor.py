@@ -673,6 +673,16 @@ class ToolExecutor:
         # `_tool_generate_docx` / `_tool_generate_xlsx` to refuse a duplicate
         # local file. Cleared alongside pending_attachments in agent_runner.
         self.google_docs_created_this_run: set = set()
+        # `action_id`s this run staged behind a confirmation card. A job that
+        # ends its turn with one of these outstanding is WAITING, not failed.
+        #
+        # Deliberately NOT `_last_pending_action`: `_save_messages` captures
+        # and CLEARS that attribute, and it runs BEFORE the turn-end job
+        # finalizer — so a finalizer reading it would always see None and the
+        # guard would be dead code that still looked correct. Same
+        # consumed-before-read trap as `_last_media`. This list is written
+        # once and cleared only at turn start.
+        self.staged_pending_action_ids: List[str] = []
 
     # ── Per-call ContextVar-backed state (Phase 8) ──────────────
     #
@@ -1033,6 +1043,9 @@ class ToolExecutor:
                     "status": "pending",
                 }
                 self._last_pending_action = card
+                # Separate, unconsumed record for the job finalizer — see the
+                # field's docstring for why it can't just read the above.
+                self.staged_pending_action_ids.append(str(action_id))
                 # Live render, so the card is on screen the moment the
                 # turn's text lands rather than after a refresh. The
                 # metadata_json write above is the DURABLE path — this
@@ -6133,6 +6146,25 @@ class ToolExecutor:
         error_message = inp.get("error_message")
         user_id = self._current_user_id
 
+        # A job blocked behind a confirmation card is WAITING, not failed —
+        # and this coercion is what makes that true regardless of what the
+        # model chose. Widening `update_job`'s enum and rewriting
+        # `create_job`'s contract (both done) is persuasion; a model that
+        # reads "the tool said NOT DONE YET" and reaches for 'failed' is
+        # behaving reasonably, and the user still ends up staring at a red
+        # job beside a card asking them to approve something. This is the one
+        # write point every status change goes through, so the guard lives
+        # here rather than in a prompt.
+        _staged = list(getattr(self, "staged_pending_action_ids", []) or [])
+        if new_status == "failed" and _staged:
+            logger.info(
+                "[job] coerced failed -> waiting_on_user for job=%s "
+                "(%d card(s) awaiting approval this turn)",
+                job_id[:8], len(_staged),
+            )
+            new_status = "waiting_on_user"
+            error_message = None
+
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
             if not job:
@@ -6168,6 +6200,23 @@ class ToolExecutor:
                     s["status"] = "done"
                 job.steps_json = _json.dumps(steps)
                 completed_count = len(steps)
+            elif new_status == "waiting_on_user":
+                # NOT terminal: `completed_at` is what the clients read as
+                # "this is over", and stamping it would put a parked job in
+                # History (History is terminal-only) while it is still live.
+                job.completed_at = None
+                from app.agent.job_status import awaiting_confirmation
+                _v = awaiting_confirmation()
+                job.error_class = _v.error_class
+                job.user_message = _v.user_message
+                # Which card is holding this job. Read on the resume path so
+                # approving the card can close the exact job it blocked —
+                # without it the platform can see an approval land and have no
+                # way to know which parked job it just unblocked.
+                if _staged:
+                    _cfg = dict(job.config_json or {})
+                    _cfg["pending_action_id"] = _staged[-1]
+                    job.config_json = _cfg
 
             # Heartbeat row — the stalled-job reaper keys "signs of
             # life" on newest job_events.ts, so every update must
@@ -6223,6 +6272,20 @@ class ToolExecutor:
                 title=f"⚠️ Didn't finish: {(job.title or 'background task')[:150]}",
                 body=(error_message or "The task hit an error.")[:300],
                 dedup_suffix="failed",
+            )
+        elif job.status == "waiting_on_user":
+            # `needs_approval`, never `mission_failed`: that kind alerts and
+            # then sends `event=end`, which TEARS DOWN the Live Activity. The
+            # job is not over — it resumes the moment the card is answered —
+            # so the card has to survive to be the thing the user acts on.
+            from app.agent.subagent_orchestrator import notify_job_needs_user
+            await notify_job_needs_user(
+                job_id=job_id, label=job.title,
+                summary=(
+                    job.user_message or "Waiting for you to approve this."
+                ),
+                action_type="permission",
+                cta_label="Open the chat to approve",
             )
         else:
             await _notify_job_event(

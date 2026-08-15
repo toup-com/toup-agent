@@ -101,6 +101,11 @@ ERR_INFRA_INTERRUPTED = "infra_interrupted"
 #: A job created by the `create_job` tool is narration for work the model
 #: does inline, so when the turn dies nothing else will ever advance it.
 ERR_TURN_INTERRUPTED = "turn_interrupted"
+#: The agent staged an action behind a confirmation card and is waiting for
+#: the user to approve it. NOT a failure — the pipeline did exactly what it
+#: was designed to do, and the job resumes the moment the card is answered.
+#: Pairs with ``STATUS_WAITING_ON_USER``; see `awaiting_confirmation()`.
+ERR_AWAITING_CONFIRMATION = "awaiting_confirmation"
 ERR_INFRA_UNRECOVERABLE = "infra_unrecoverable"
 ERR_CREDITS_TOUP = "credits_toup"
 ERR_CREDITS_UPSTREAM = "credits_upstream"
@@ -164,6 +169,31 @@ def turn_interrupted() -> ErrorClassification:
         "This stopped when the conversation ended before it finished. "
         "You can run it again.",
         DISPOSITION_TERMINAL,
+    )
+
+
+def awaiting_confirmation() -> ErrorClassification:
+    """The verdict for a job parked on a confirmation card the user must
+    approve.
+
+    An accessor, not a `classify()` rule, for the same reason as
+    `turn_interrupted()` — and for a sharper one here: there is no error
+    text to match. Nothing went wrong. The agent drafted something, the
+    platform staged it, and a card is sitting in the chat.
+
+    Before this existed the model had exactly three exits from a job it had
+    created (`update_job`'s enum was running/completed/failed, and
+    `create_job`'s contract spelled out "mark it failed" as the escape
+    hatch), so a turn that ended on a card ended on a RED job. The user was
+    being told the work broke at the precise moment they were being asked to
+    approve it — the card and the job card, side by side, contradicting each
+    other. `waiting_on_user` and its whole client presentation already
+    existed; only the vocabulary to reach it was missing.
+    """
+    return ErrorClassification(
+        ERR_AWAITING_CONFIRMATION,
+        "Waiting for you to approve this in the chat.",
+        DISPOSITION_NEEDS_USER, required_action="approve_action",
     )
 
 

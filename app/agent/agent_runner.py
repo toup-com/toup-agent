@@ -974,29 +974,54 @@ class AgentRunner:
                     "leaving them to the reaper", len(ids),
                 )
                 return
-            _spawn_bg(self._close_interrupted_jobs(tuple(ids), user_id))
+            # A card staged this turn outlives the turn — it sits in the chat
+            # for 24h and is still tappable. So "the turn died" is not the
+            # whole story and `cancelled` is the wrong word: the job is
+            # waiting on a human, exactly as if the turn had ended cleanly.
+            # Reading an attribute is safe here; awaiting is not.
+            staged = list(
+                getattr(self.tools, "staged_pending_action_ids", []) or []
+            )
+            _spawn_bg(self._close_interrupted_jobs(
+                tuple(ids), user_id, staged_action_id=staged[-1] if staged else None,
+            ))
         except Exception:  # noqa: BLE001 — cleanup must never mask the real error
             logger.exception("[job-finalize] sweep failed")
 
-    async def _close_interrupted_jobs(self, job_ids: tuple, user_id: str) -> None:
+    async def _close_interrupted_jobs(
+        self, job_ids: tuple, user_id: str,
+        staged_action_id: Optional[str] = None,
+    ) -> None:
         """Terminalise abandoned inline jobs and CLOSE their phone cards.
 
         Status is `cancelled`, not `failed`: the turn was cut short, which is
         not the same as the work failing, and "Failed" on a task the agent
         answered out loud is exactly the lie this pipeline exists to remove.
+
+        UNLESS the turn staged a confirmation card before it died, in which
+        case the job is parked, not dead. Observed on a founder's account
+        2026-08-14: "Schedule verification call" was closed `cancelled` /
+        `turn_interrupted` at 00:51:12 while its `calendar__create_event`
+        card — staged four seconds later — was still `pending` an hour on.
+        Approving that card creates the event, so the job had not been
+        cancelled by anything; it was waiting, and `cancelled` renders inside
+        the clients' `isFailed` branch just like `failed` does.
         """
         from sqlalchemy import update as _upd
         from app.agent.job_status import (
-            ERR_TURN_INTERRUPTED, STATUS_CANCELLED, STATUS_RUNNING,
+            ERR_AWAITING_CONFIRMATION, ERR_TURN_INTERRUPTED, STATUS_CANCELLED,
+            STATUS_RUNNING, STATUS_WAITING_ON_USER, awaiting_confirmation,
             turn_interrupted,
         )
         from app.db.database import async_session_maker
         from app.db.models import BuildJob as _BJ
 
+        parked = staged_action_id is not None
         # NOT `classify(ERR_TURN_INTERRUPTED)` — classify() matches error TEXT
         # against the rule table, and the bare class name matches nothing, so
         # that would silently hand back the `unknown` copy.
-        msg = turn_interrupted().user_message
+        verdict = awaiting_confirmation() if parked else turn_interrupted()
+        msg = verdict.user_message
         closed: List[tuple] = []
         try:
             _now = datetime.utcnow()
@@ -1009,14 +1034,35 @@ class AgentRunner:
                         _upd(_BJ)
                         .where(_BJ.id == jid, _BJ.user_id == user_id,
                                _BJ.status == STATUS_RUNNING)
-                        .values(status=STATUS_CANCELLED, completed_at=_now,
-                                error_class=ERR_TURN_INTERRUPTED,
-                                user_message=msg)
+                        .values(
+                            status=(
+                                STATUS_WAITING_ON_USER if parked
+                                else STATUS_CANCELLED
+                            ),
+                            # A parked job is NOT over — stamping completed_at
+                            # files it under History, the terminal-only tab.
+                            completed_at=None if parked else _now,
+                            error_class=(
+                                ERR_AWAITING_CONFIRMATION if parked
+                                else ERR_TURN_INTERRUPTED
+                            ),
+                            user_message=msg,
+                        )
                         .returning(_BJ.id, _BJ.title)
                     )
                     row = res.first()
                     if row:
                         closed.append((row[0], row[1] or ""))
+                if closed and parked:
+                    # The resume path matches on this, so a job parked by the
+                    # interrupted path is closable by an approval just like one
+                    # parked by the clean path.
+                    for jid, _ in closed:
+                        pj = await db.get(_BJ, jid)
+                        if pj is not None:
+                            cfg = dict(pj.config_json or {})
+                            cfg["pending_action_id"] = staged_action_id
+                            pj.config_json = cfg
                 await db.commit()
         except Exception:  # noqa: BLE001
             logger.exception("[job-finalize] could not close interrupted jobs")
@@ -1028,8 +1074,10 @@ class AgentRunner:
             try:
                 from app.api.ws_chat import broadcast_to_user
                 await broadcast_to_user(user_id, {
-                    "type": "job_update", "job_id": jid,
-                    "name": title, "status": STATUS_CANCELLED,
+                    "type": "job_update", "job_id": jid, "name": title,
+                    "status": (
+                        STATUS_WAITING_ON_USER if parked else STATUS_CANCELLED
+                    ),
                 })
             except Exception:  # noqa: BLE001
                 pass
@@ -1038,8 +1086,23 @@ class AgentRunner:
             # terminal lane besides `mission_completed` (KNOWN_NOTIFY_KINDS is
             # a closed enum validated at ingest), so the kind stays but the
             # copy tells the truth instead of shouting failure.
+            #
+            # A parked job takes the opposite lane: `needs_approval` alerts
+            # WITHOUT `event=end`, so the card survives to be the thing the
+            # user taps. Ending it here would delete the only prompt that
+            # would ever get the job unblocked.
             try:
-                from app.agent.subagent_orchestrator import _notify_job_event
+                from app.agent.subagent_orchestrator import (
+                    _notify_job_event, notify_job_needs_user,
+                )
+                if parked:
+                    await notify_job_needs_user(
+                        job_id=jid, label=title,
+                        summary=msg or "Waiting for you to approve this.",
+                        action_type="permission",
+                        cta_label="Open the chat to approve",
+                    )
+                    continue
                 await _notify_job_event(
                     job_id=jid, label=title, kind="mission_failed",
                     title=f"Stopped: {(title or 'background task')[:150]}",
@@ -1179,6 +1242,9 @@ class AgentRunner:
         # "now make me a Word version" would be refused as a duplicate of a doc
         # created in a previous turn.
         self.tools.google_docs_created_this_run = set()
+        # Same lifetime again: a card the user approved (or ignored) two turns
+        # ago must not park this turn's job.
+        self.tools.staged_pending_action_ids = []
         _attachments_emitted_count = 0
 
         # ── Classify query intent (lightweight, <1ms) ─────────────────
@@ -3034,14 +3100,41 @@ class AgentRunner:
             try:
                 from sqlalchemy import update as _upd_cj
                 from app.db.models import BuildJob as _CJ
+                from app.agent.job_status import (
+                    ERR_AWAITING_CONFIRMATION, awaiting_confirmation,
+                )
 
                 # Reaching this line means run() completed normally — an
                 # exception would have propagated long before. So these jobs
                 # are 'completed', full stop. An earlier version keyed this on
                 # `final_text` being non-empty, which mislabelled legitimate
                 # tool-only / attachment-only turns as failures.
+                #
+                # ONE exception, and it is the reverse lie: a turn that ended
+                # by staging a confirmation card did NOT finish the work. The
+                # email was not sent. Closing that job green is worse than
+                # closing it red, because the user walks away believing
+                # something went out while the draft is still sitting in a
+                # card. Park it instead — `waiting_on_user` is non-terminal by
+                # design, and the resume path closes it when the card is
+                # answered.
+                _staged_actions = list(
+                    getattr(self.tools, "staged_pending_action_ids", []) or []
+                )
+                _park = bool(_staged_actions)
                 _now = datetime.utcnow()
                 _closed: List[tuple] = []
+                _values = (
+                    dict(status="waiting_on_user", completed_at=None,
+                         error_class=ERR_AWAITING_CONFIRMATION,
+                         user_message=awaiting_confirmation().user_message,
+                         total_tokens=total_input + total_output,
+                         model=model_used)
+                    if _park else
+                    dict(status="completed", completed_at=_now,
+                         total_tokens=total_input + total_output,
+                         model=model_used)
+                )
                 async with async_session_maker() as _cdb:
                     # Guarded UPDATE rather than SELECT-then-mutate: `update_job`
                     # or the reaper may drive a row terminal while we work, and
@@ -3053,14 +3146,22 @@ class AgentRunner:
                             .where(_CJ.id == _jid,
                                    _CJ.user_id == user_id,
                                    _CJ.status == "running")
-                            .values(status="completed", completed_at=_now,
-                                    total_tokens=total_input + total_output,
-                                    model=model_used)
+                            .values(**_values)
                             .returning(_CJ.id, _CJ.title)
                         )
                         _row = _res.first()
                         if _row:
                             _closed.append((_row[0], _row[1] or ""))
+                    if _closed and _park:
+                        # Which card holds each job — the resume path matches on
+                        # this. Written in the same transaction as the status so
+                        # a parked job can never exist without its action id.
+                        for _jid, _ in _closed:
+                            _pj = await _cdb.get(_CJ, _jid)
+                            if _pj is not None:
+                                _pcfg = dict(_pj.config_json or {})
+                                _pcfg["pending_action_id"] = _staged_actions[-1]
+                                _pj.config_json = _pcfg
                     if _closed:
                         await _cdb.commit()
 
@@ -3068,10 +3169,25 @@ class AgentRunner:
                 # turn cancellation would strand the card on the phone with no
                 # reaper left to end it (we just took that backstop away).
                 if _closed:
-                    from app.agent.subagent_orchestrator import _notify_job_event
+                    from app.agent.subagent_orchestrator import (
+                        _notify_job_event, notify_job_needs_user,
+                    )
 
                     async def _end_cards() -> None:
                         for _jid, _jtitle in _closed:
+                            if _park:
+                                # Keeps the activity ALIVE (see
+                                # notify_job_needs_user) — the job resumes on
+                                # approval, so ending the card here would
+                                # delete the user's only prompt to act.
+                                await notify_job_needs_user(
+                                    job_id=_jid, label=_jtitle,
+                                    summary=awaiting_confirmation().user_message
+                                    or "Waiting for you to approve this.",
+                                    action_type="permission",
+                                    cta_label="Open the chat to approve",
+                                )
+                                continue
                             await _notify_job_event(
                                 job_id=_jid, label=_jtitle, kind="mission_completed",
                                 title=f"✅ Done: {(_jtitle or 'background task')[:150]}",
