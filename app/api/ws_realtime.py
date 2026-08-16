@@ -1156,6 +1156,9 @@ class _InnerToolRelay:
         self._ws = websocket
         self._outer = outer_call_id
         self._open: dict = {}        # inner call_id → row call_id
+        # A row opened from `tool.intent`, waiting for the `tool.start` that
+        # names its arguments: (tool_name, row call_id). At most one.
+        self._pending: Optional[tuple] = None
         self._rows = 0
         self.alive = True
 
@@ -1179,20 +1182,59 @@ class _InnerToolRelay:
     async def on_event(self, ev: dict) -> bool:
         t = ev.get("type")
         if t == "tool.intent":
-            # Legacy coarse flag only — keeps the orb docked, opens no row.
-            return await self._send({"type": "state", "state": "tool_use"})
+            # `tool.intent` fires at the model's tool_use_start — BEFORE the
+            # arguments have finished streaming, so it carries a name but no
+            # call_id. It used to set the coarse `tool_use` flag and open no
+            # row, which meant every step appeared only once its arguments had
+            # streamed: a second or two of "something is happening, we won't
+            # say what" per step, on a surface whose whole job is to say what.
+            #
+            # So it opens a PROVISIONAL row now, named but detail-less, and the
+            # matching `tool.start` adopts the same call_id — which the client
+            # already handles, because re-arrival of a known call_id is an
+            # UPDATE there, not a duplicate.
+            name = str(ev.get("name", ""))[:64]
+            if not name or self._pending or self._rows >= _INNER_MAX_ROWS:
+                # One provisional row at a time. A model that opens two tool_use
+                # blocks before either one's arguments land would otherwise have
+                # its second step adopt the first's row. Falling back to the
+                # coarse flag costs the head start, never correctness.
+                return await self._send({"type": "state", "state": "tool_use"})
+            cid = self._cid(f"intent{self._rows}")
+            self._pending = (name, cid)
+            self._rows += 1
+            title, _ = _tool_activity(name, {})
+            return await self._send({
+                "type": "tool_call.started",
+                "call_id": cid, "parent_call_id": self._outer,
+                "name": name, "title": title, "detail": "",
+            })
         if t == "tool.start":
-            if self._rows >= _INNER_MAX_ROWS:
-                return True
             inner = str(ev.get("call_id", ""))
             name = str(ev.get("name", ""))[:64]
             args = ev.get("args") if isinstance(ev.get("args"), dict) else {}
             title, detail = _tool_activity(name, args)
-            self._rows += 1
-            self._open[inner] = self._cid(inner)
+            # Adopt the provisional row only when it is unambiguously the same
+            # step: same tool, and nothing else outstanding.
+            pending = self._pending
+            self._pending = None
+            if pending and pending[0] == name:
+                cid = pending[1]
+            else:
+                if pending:
+                    # Claimed a row we are not going to fill — close it rather
+                    # than leave the phone with a spinner that never resolves.
+                    await self._send({"type": "tool_call.completed", "call_id": pending[1],
+                                      "parent_call_id": self._outer, "name": pending[0],
+                                      "ok": False, "result_preview": ""})
+                if self._rows >= _INNER_MAX_ROWS:
+                    return True
+                self._rows += 1
+                cid = self._cid(inner)
+            self._open[inner] = cid
             return await self._send({
                 "type": "tool_call.started",
-                "call_id": self._cid(inner),
+                "call_id": cid,
                 "parent_call_id": self._outer,
                 "name": name, "title": title,
                 "detail": str(detail)[:_INNER_DETAIL_MAX],
@@ -1227,6 +1269,13 @@ class _InnerToolRelay:
 
     async def close_open(self) -> None:
         """Fail every still-running row so the phone never leaves a spinner."""
+        if self._pending:
+            # A turn that ends between tool_use_start and the arguments landing
+            # leaves this row open; it is a spinner like any other.
+            await self._send({"type": "tool_call.completed", "call_id": self._pending[1],
+                              "parent_call_id": self._outer, "name": self._pending[0],
+                              "ok": False, "result_preview": ""})
+            self._pending = None
         for cid in list(self._open.values()):
             await self._send({"type": "tool_call.completed", "call_id": cid,
                               "parent_call_id": self._outer, "name": "",
