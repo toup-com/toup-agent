@@ -23,6 +23,9 @@ What each test is actually defending — these are behaviours, not lines:
   6. The tenant ingest route may not author one.
   8. The read receipt is the only one in the system: it is recorded even
      when the agent is unreachable, and only ``once`` proxies a retract.
+     It is also exactly-once per target — the CAS on ``read_at IS NULL`` is
+     the only thing licensing the blind ``read_count + 1`` — and it is
+     scoped to the reader, so a stranger's ack moves nobody's counters.
   9. A broadcast drips, or it starves the reminder lane behind it (D8).
  10. Two replicas fan out the same dispatch; the CAS means each target is
      delivered exactly once.
@@ -120,12 +123,19 @@ async def _mk_user(*, role: str = "user", created_at: datetime | None = None) ->
     return user_id
 
 
-async def _mk_agent(user_id: str, url: str = "https://agent.example") -> str:
+async def _mk_agent(
+    user_id: str,
+    url: str = "https://agent.example",
+    deploy_status: str = "active",
+) -> str:
+    """`deploy_status` is a parameter because "no agent" and "the agent is not
+    reachable right now" are different facts that `agent_proxy_info` collapses
+    into one None — and the retract path has to tell them apart."""
     key = f"tk-{uuid.uuid4().hex}"
     async with async_session_maker() as db:
         db.add(AgentConfig(
             user_id=user_id, agent_api_key=key, agent_url=url,
-            deploy_status="active",
+            deploy_status=deploy_status,
         ))
         await db.commit()
     return key
@@ -673,8 +683,15 @@ async def test_agent_notify_rejects_announcement(client, test_user_id):
 # ── 8. The read receipt, and the `once` retract ───────────────────
 
 
-async def _seed_delivered(mode: str, user_id: str) -> str:
-    """One dispatch + one delivered target for `user_id`."""
+async def _seed_delivered(
+    mode: str, user_id: str, chat_status: str = "delivered",
+) -> str:
+    """One dispatch + one target for `user_id`.
+
+    `chat_status` is a parameter because it is the ONLY record of whether a
+    tenant row was ever written, and the retract path has to read it to tell
+    "no agent" from "the agent is unreachable right now".
+    """
     dispatch_id = str(uuid.uuid4())
     async with async_session_maker() as db:
         db.add(AdminDispatch(
@@ -685,12 +702,24 @@ async def _seed_delivered(mode: str, user_id: str) -> str:
         ))
         db.add(AdminDispatchTarget(
             id=str(uuid.uuid4()), dispatch_id=dispatch_id, user_id=user_id,
-            state="done", chat_status="delivered", attempts=1,
+            state="done", chat_status=chat_status, attempts=1,
             notification_id=str(uuid.uuid4()),
             created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
         ))
         await db.commit()
     return dispatch_id
+
+
+async def _receipt(dispatch_id: str) -> tuple[datetime | None, int]:
+    """(target.read_at, dispatch.read_count) — the whole read ledger for a
+    single-target dispatch, read back through a fresh session."""
+    async with async_session_maker() as db:
+        target = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+        dispatch = await db.get(AdminDispatch, dispatch_id)
+        return target.read_at, dispatch.read_count
 
 
 @pytest.mark.asyncio
@@ -791,6 +820,171 @@ async def test_read_receipt_of_a_notice_that_is_not_yours_is_404(dispatch_client
 
     res = await client.post(f"/api/notices/{dispatch_id}/read")
     assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["once", "persistent"])
+async def test_a_second_read_receipt_moves_nothing(dispatch_client, monkeypatch, mode):
+    """Exactly-once per target, which is what makes `read_count` mean anything.
+
+    A repeat ack is the ORDINARY case, not an edge one: the web card posts a
+    receipt from its mount effect for every `persistent` notice it draws
+    (AdminNoticeCard.tsx), so every reload of the thread acks again, and a
+    user reading on two devices acks twice regardless of mode. The CAS on
+    `read_at IS NULL` is the only thing standing between that and a
+    `read_count` that climbs past `target_count` — the increment beneath it
+    is blind.
+    """
+    client, app = dispatch_client
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(user_id)
+    dispatch_id = await _seed_delivered(mode, user_id)
+
+    hops: list[dict] = []
+
+    async def _fake_proxy(agent_url, agent_api_key, path, method="GET", **kw):
+        hops.append({"path": path, "json": kw.get("json_body")})
+        return {"deleted": 1, "ws_count": 0}
+
+    monkeypatch.setattr("app.api.notices.proxy_to_agent", _fake_proxy)
+
+    res = await client.post(f"/api/notices/{dispatch_id}/read")
+    assert res.status_code == 204, res.text
+    first_read_at, first_count = await _receipt(dispatch_id)
+    assert first_read_at is not None, "the first ack is the receipt"
+    assert first_count == 1
+    hops_after_first = len(hops)
+
+    # utcnow() carries microseconds, so a re-stamp would be visible here.
+    await asyncio.sleep(0.01)
+
+    res = await client.post(f"/api/notices/{dispatch_id}/read")
+    assert res.status_code == 204, res.text
+    second_read_at, second_count = await _receipt(dispatch_id)
+    assert second_read_at == first_read_at, "read_at is when they FIRST read it"
+    assert second_count == 1, "the blind increment is licensed by the CAS, and only by it"
+    # A `once` card the agent has already deleted must not be deleted again:
+    # `chat_status == 'retracted'` is what closes that hop off.
+    assert len(hops) == hops_after_first, hops
+
+
+@pytest.mark.asyncio
+async def test_a_second_read_retries_a_retract_that_failed(dispatch_client, monkeypatch):
+    """The one thing a second ack DOES do, and the reason the route cannot be
+    made idempotent by returning early on `read_at IS NOT NULL`.
+
+    While the hop has not landed, `chat_status` is still 'delivered' and the
+    card is still in the user's chat — so the next read has to try again. The
+    receipt itself stays exactly-once across both attempts.
+    """
+    client, app = dispatch_client
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(user_id)
+    dispatch_id = await _seed_delivered("once", user_id)
+
+    attempts: list[str] = []
+
+    async def _boom(agent_url, agent_api_key, path, method="GET", **kw):
+        attempts.append(path)
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("app.api.notices.proxy_to_agent", _boom)
+
+    assert (await client.post(f"/api/notices/{dispatch_id}/read")).status_code == 204
+    read_at, count = await _receipt(dispatch_id)
+    assert read_at is not None and count == 1
+
+    async def _ok(agent_url, agent_api_key, path, method="GET", **kw):
+        attempts.append(path)
+        return {"deleted": 1, "ws_count": 0}
+
+    monkeypatch.setattr("app.api.notices.proxy_to_agent", _ok)
+
+    assert (await client.post(f"/api/notices/{dispatch_id}/read")).status_code == 204
+    assert attempts == ["internal/admin-notice/retract"] * 2, attempts
+
+    retried_read_at, retried_count = await _receipt(dispatch_id)
+    assert retried_read_at == read_at
+    assert retried_count == 1
+    async with async_session_maker() as db:
+        target = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+        assert target.chat_status == "retracted"
+
+
+@pytest.mark.asyncio
+async def test_the_receipt_is_committed_before_the_hop_not_after_it(
+    dispatch_client, monkeypatch,
+):
+    """What actually protects the receipt is the commit ORDER, not the
+    `except Exception` around the hop — and only a BaseException tells the two
+    apart, because that handler catches everything else.
+
+    The case is real: the phone posts "Got it" and the user backgrounds the app,
+    so the ASGI task is cancelled mid-retract. Commit the receipt after the hop
+    instead and the session closes unflushed — the next history fetch re-serves
+    the notice and the card the user just dismissed is back (B6).
+    """
+    client, app = dispatch_client
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(user_id)
+    dispatch_id = await _seed_delivered("once", user_id)
+
+    async def _cancelled(*a, **kw):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("app.api.notices.proxy_to_agent", _cancelled)
+
+    with pytest.raises(asyncio.CancelledError):
+        await client.post(f"/api/notices/{dispatch_id}/read")
+
+    read_at, count = await _receipt(dispatch_id)
+    assert read_at is not None, "the receipt outlives a hop that never returned"
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stranger_ack_moves_nobody_elses_counters(dispatch_client, monkeypatch):
+    """The 404 is not the whole assertion — what it must also do is nothing.
+
+    Two dispatches, two users, neither a target of the other's. The lookup is
+    scoped by BOTH `dispatch_id` and `user_id`, so dropping either half is a
+    cross-tenant write: on one, a stranger stamps the owner's receipt and
+    retracts the owner's card; on the other, they credit their own unrelated
+    notice against the id in the URL.
+    """
+    client, app = dispatch_client
+    owner = await _mk_user()
+    stranger = await _mk_user()
+    await _mk_agent(stranger)
+    owner_dispatch = await _seed_delivered("once", owner)
+    stranger_dispatch = await _seed_delivered("once", stranger)
+
+    # Recorded, not raised: the route's retract guard is a bare
+    # `except Exception`, so an AssertionError thrown in here would be
+    # swallowed into `last_error` and the test would pass through the bug.
+    hops: list[str] = []
+
+    async def _record(agent_url, agent_api_key, path, method="GET", **kw):
+        hops.append(path)
+        return {"deleted": 1, "ws_count": 0}
+
+    monkeypatch.setattr("app.api.notices.proxy_to_agent", _record)
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(stranger)
+    res = await client.post(f"/api/notices/{owner_dispatch}/read")
+    assert res.status_code == 404, res.text
+    assert hops == [], "a rejected ack must not reach anyone's agent"
+
+    assert await _receipt(owner_dispatch) == (None, 0), "the owner has not read it"
+    assert await _receipt(stranger_dispatch) == (None, 0), (
+        "and the stranger has not read their own by asking for someone else's"
+    )
 
 
 # ── 9. Broadcast drip (D8) ────────────────────────────────────────
@@ -1155,3 +1349,90 @@ def test_dispatch_tables_are_platform_only():
         assert t in PLATFORM_ONLY_TABLES, f"{t} must be PLATFORM_ONLY"
         assert t not in AGENT_ONLY_TABLES
         assert t not in SHARED_TABLES
+
+
+@pytest.mark.asyncio
+async def test_a_delivered_once_card_records_a_deferred_retract_when_the_agent_is_down(
+    dispatch_client,
+):
+    """"No agent" and "the agent is unreachable right now" are different facts,
+    and only one of them means there is nothing to do.
+
+    `agent_proxy_info` returns None for BOTH — it requires
+    `deploy_status == 'active'`, so a container that is redeploying or wedged
+    fails that test while its `messages` row sits there intact. The route used
+    to return silently on either, justified by "there is no tenant row to
+    delete", which is false in the second case: the card IS on screen, the
+    receipt has just been committed, and the `once` notice therefore stays
+    visible permanently. That is B6, reintroduced through the recovery path
+    rather than the delivery one.
+
+    The receipt must still stand — an unreachable agent must not cost the user
+    their read, or the notice is re-served forever — so what is asserted is
+    that read_at is set AND the un-retracted card is recorded rather than
+    forgotten.
+    """
+    client, app = dispatch_client
+    recipient = await _mk_user()
+    # NOT 'active': the container exists and holds the row, it simply cannot
+    # be reached this second.
+    await _mk_agent(recipient, url="https://tenant-down.example",
+                    deploy_status="deploying")
+    app.dependency_overrides[get_current_user] = lambda: _principal(recipient)
+
+    dispatch_id = await _seed_delivered("once", recipient)
+    assert (await client.post(f"/api/notices/{dispatch_id}/read")).status_code == 204
+
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+
+    assert row.read_at is not None, (
+        "the receipt must survive an unreachable agent, or the notice is "
+        "re-served to the user forever"
+    )
+    assert row.chat_status == "delivered", (
+        "nothing confirmed the delete, so the card must NOT be recorded as "
+        "retracted"
+    )
+    assert row.last_error and "retract" in row.last_error.lower(), (
+        "a delivered card that could not be retracted was forgotten silently "
+        f"— last_error={row.last_error!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_never_delivered_card_records_nothing_when_the_agent_is_down(
+    dispatch_client,
+):
+    """The companion, and the reason the branch tests `chat_status` rather than
+    just "was the proxy missing".
+
+    A recipient whose container was down at FAN-OUT time carries `no_agent` and
+    has no row anywhere, so there is genuinely nothing to retract and nothing
+    to report. Without this, "record an error whenever the proxy is missing"
+    would pass the test above while filling the operator's panel with failures
+    for recipients who never had a card.
+    """
+    client, app = dispatch_client
+    recipient = await _mk_user()
+    await _mk_agent(recipient, url="https://tenant-down.example",
+                    deploy_status="deploying")
+    app.dependency_overrides[get_current_user] = lambda: _principal(recipient)
+
+    dispatch_id = await _seed_delivered("once", recipient, chat_status="no_agent")
+    assert (await client.post(f"/api/notices/{dispatch_id}/read")).status_code == 204
+
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+
+    assert row.read_at is not None
+    assert row.last_error is None, (
+        "nothing was ever written for this recipient, so there is nothing to "
+        f"report — last_error={row.last_error!r}"
+    )

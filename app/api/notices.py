@@ -39,6 +39,7 @@ from app.db.models import (
     AdminDispatch,
     AdminDispatchTarget,
     AdminThreadMessage,
+    CHAT_DELIVERED,
     CHAT_RETRACTED,
     DISPATCH_MODE_ONCE,
     TARGET_DONE,
@@ -265,8 +266,38 @@ async def mark_notice_read(
 
     info = await agent_proxy_info(current_user.id, db)
     if info is None:
-        # No active agent — there is no tenant row to delete, so there is
-        # nothing to retry either.
+        # "No agent" and "the agent is not reachable right now" are DIFFERENT
+        # facts and only one of them means there is nothing to do.
+        # `agent_proxy_info` returns None for BOTH: it requires
+        # `deploy_status == 'active'`, and a container that is redeploying
+        # ('deploying') or wedged ('error') fails that test while its
+        # `messages` row sits there perfectly intact.
+        #
+        # The original comment here — "there is no tenant row to delete, so
+        # there is nothing to retry either" — is true only in the first case.
+        # In the second the card IS in the user's chat, the receipt has just
+        # been committed above, and returning silently leaves a `once` notice
+        # on screen permanently: exactly B6, reintroduced through the recovery
+        # path rather than the delivery one.
+        #
+        # `chat_status` is what tells them apart, because it records whether a
+        # row was ever written. Only 'delivered' means one exists.
+        if chat_status == CHAT_DELIVERED:
+            await db.execute(
+                sa_update(AdminDispatchTarget)
+                .where(AdminDispatchTarget.id == target_id)
+                .values(last_error=(
+                    "retract deferred: the agent was unreachable "
+                    "(deploy_status is not 'active') while a delivered card "
+                    "still needs retracting — press Retry once it is back"
+                ))
+            )
+            await db.commit()
+            logger.warning(
+                "[notices] retract of %s for %s deferred — agent not active, "
+                "but chat_status=delivered so the card is still on screen",
+                dispatch_id[:8], current_user.id[:8],
+            )
         return
     agent_url, agent_api_key = info
     try:
