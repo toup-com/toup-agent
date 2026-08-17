@@ -63,6 +63,7 @@ from app.db.models import (
     DISPATCH_AUDIENCE_USER,
     DISPATCH_QUEUED,
     PE_DISPATCH_CREATED,
+    PE_DISPATCH_DELETED,
     PE_ENTITY_DISPATCH,
     TARGET_DONE,
     TARGET_FAILED,
@@ -308,6 +309,12 @@ class AdminThreadSummaryOut(BaseModel):
     # opposite of the one thing an operator scans this column for: who is
     # waiting on whom.
     last_direction: Optional[str] = None
+    # How many rows the USER can still see, and when the last one stopped being
+    # visible. Together these are "this conversation has been removed from their
+    # chat" — a thread-level fact with no thread-level row, derived rather than
+    # stored (see delete_thread for why there is no admin_threads table).
+    user_visible_total: int = 0
+    retracted_at: Optional[str] = None
 
 
 class ThreadUserOut(BaseModel):
@@ -665,6 +672,21 @@ async def list_threads(
                 ),
                 else_=0,
             )), 0).label("unread_in"),
+            func.coalesce(func.sum(case(
+                (
+                    AdminThreadMessage.hidden_from_user_at.is_(None)
+                    & AdminThreadMessage.deleted_at.is_(None),
+                    1,
+                ),
+                else_=0,
+            )), 0).label("user_visible"),
+            # MAX over both stamps: `everyone` sets only `deleted_at`, so
+            # reading `hidden_from_user_at` alone would date a fully-removed
+            # conversation as never removed.
+            func.max(func.coalesce(
+                AdminThreadMessage.hidden_from_user_at,
+                AdminThreadMessage.deleted_at,
+            )).label("hidden_at"),
         )
         .group_by(AdminThreadMessage.user_id)
         .order_by(func.max(AdminThreadMessage.created_at).desc())
@@ -746,6 +768,15 @@ async def list_threads(
             last_direction=last_row.get(r.user_id, (None, None))[1],
             unread_in=int(r.unread_in or 0),
             total=int(r.total or 0),
+            user_visible_total=int(r.user_visible or 0),
+            # Only when NOTHING is left for them. A conversation with three of
+            # ten messages removed is not a removed conversation, and badging it
+            # as one would make every ordinary unsend look like a wipe.
+            retracted_at=(
+                _utc_iso(r.hidden_at)
+                if int(r.total or 0) > 0 and int(r.user_visible or 0) == 0
+                else None
+            ),
         )
         for r in agg_rows
     ]
@@ -786,6 +817,14 @@ async def get_thread(
         .limit(limit)
     )).scalars().all()
 
+    visible = sum(
+        1 for m in rows
+        if m.hidden_from_user_at is None and m.deleted_at is None
+    )
+    stamps = [m.hidden_from_user_at or m.deleted_at for m in rows
+              if (m.hidden_from_user_at or m.deleted_at)]
+    hidden_at = max(stamps) if stamps else None
+
     return {
         "user": ThreadUserOut(id=user.id, email=user.email, name=user.name),
         "messages": [thread_message_out(m) for m in reversed(rows)],
@@ -796,6 +835,8 @@ async def get_thread(
             1 for m in rows
             if m.direction == THREAD_IN and m.admin_read_at is None
         ),
+        "user_visible_total": visible,
+        "retracted_at": _utc_iso(hidden_at) if rows and visible == 0 else None,
     }
 
 
@@ -1080,12 +1121,23 @@ async def retry_dispatch(
 # turn and the reply above it stops making sense.
 DELETED_BODY = "This message was deleted."
 
+# ── Deletion scopes ──────────────────────────────────────────────────
+# One vocabulary at BOTH levels (a single message, and a whole conversation),
+# because they are the same act at two granularities. Naming them differently
+# is how one feature comes to read as two.
+#
+#   user_side  gone for THEM, kept and marked for the operator.
+#   everyone   gone for both; a tombstone remains so the thread does not
+#              silently lose a turn.
+SCOPE_USER_SIDE = "user_side"
+SCOPE_EVERYONE = "everyone"
+
 
 @router.delete("/threads/{user_id}/messages/{message_id}", status_code=200)
 async def delete_thread_message(
     user_id: str,
     message_id: str,
-    scope: str = Query(default="theirs", pattern="^(theirs|both)$"),
+    scope: str = Query(default=SCOPE_USER_SIDE, pattern="^(user_side|everyone)$"),
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1094,12 +1146,12 @@ async def delete_thread_message(
     Two scopes, because "delete" means two different things and an operator has
     to be able to say which:
 
-      theirs  the message stops being visible to the person it was sent to.
-              The operator's thread keeps it, marked. This is almost always
-              what is wanted: unsend the words, keep the record.
-      both    nobody sees the words. The body is replaced with a tombstone and
-              the row survives, so the conversation does not lose a turn and
-              whatever was said next still has something to follow.
+      user_side  the message stops being visible to the person it was sent
+                 to. The operator's thread keeps it, marked. This is almost
+                 always what is wanted: unsend the words, keep the record.
+      everyone   nobody sees the words. The body is replaced with a tombstone
+                 and the row survives, so the conversation does not lose a turn
+                 and whatever was said next still has something to follow.
 
     NEITHER hard-deletes. A thread is a conversation between two people and one
     of them cannot un-remember it, so pretending the row never existed is a
@@ -1129,7 +1181,7 @@ async def delete_thread_message(
         raise HTTPException(404, "Message not found in this thread")
 
     now = datetime.utcnow()
-    if scope == "both":
+    if scope == SCOPE_EVERYONE:
         # Idempotent: deleting an already-deleted message must not overwrite
         # the tombstone with a second one, nor re-stamp who did it.
         if row.deleted_at is None:
@@ -1146,6 +1198,148 @@ async def delete_thread_message(
     logger.info("[admin-dispatch] thread message %s deleted (%s) by %s",
                 message_id[:8], scope, admin.id[:8])
     return resp
+
+
+@router.delete("/threads/{user_id}", status_code=200)
+async def delete_thread(
+    user_id: str,
+    scope: str = Query(default=SCOPE_USER_SIDE, pattern="^(user_side|everyone)$"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Take back a WHOLE conversation — from them, or from both sides.
+
+    The same two scopes as a single message (see ``delete_thread_message``),
+    applied to every row at once. Deliberately built on the columns migration
+    092 already added rather than on a new ``admin_threads`` table:
+
+    A thread-level fact looks like it needs a thread-level row, and it does not.
+    "Removed from their side" is exactly "every message is hidden from them",
+    and STARTING AGAIN afterwards falls out for free — the operator's next
+    message carries no stamp, so the user sees a conversation with one message
+    in it while the operator keeps the whole history, marked. A `thread_id`
+    would buy generation identity that nothing here asks for, at the cost of a
+    migration, a backfill, and a uniqueness rule to keep two "active" threads
+    from existing at once.
+
+    THE CHAT CARDS GO TOO, and that is the half a naive implementation misses.
+    A persistent dispatch leaves a card in the user's chat as well as a row in
+    this thread; stamping only the thread would clear the conversation while
+    the card that started it sat in their chat with a Reply action pointing at
+    a thread that is no longer there. Retraction reuses the SAME tenant hop a
+    `once` notice makes when its reader acks it — no second pipeline.
+
+    Best-effort per dispatch and NOT transactional across them: one unreachable
+    tenant must not cost the operator the rest of the removal. The counts come
+    back so the answer is "3 of 4 cards", never a bare "done".
+    """
+    if not (await db.execute(
+        select(User.id).where(User.id == user_id)
+    )).scalar_one_or_none():
+        raise HTTPException(404, "User not found")
+
+    now = datetime.utcnow()
+
+    # Which rows this act still has anything to say about. Idempotent by
+    # construction: a second press matches nothing and reports 0 rather than
+    # re-stamping a timestamp and losing when the first removal happened.
+    if scope == SCOPE_EVERYONE:
+        target = AdminThreadMessage.deleted_at.is_(None)
+    else:
+        target = and_(
+            AdminThreadMessage.hidden_from_user_at.is_(None),
+            AdminThreadMessage.deleted_at.is_(None),
+        )
+
+    rows = (await db.execute(
+        select(AdminThreadMessage).where(
+            AdminThreadMessage.user_id == user_id, target,
+        )
+    )).scalars().all()
+
+    # The dispatches whose CARDS have to come back, collected before the bodies
+    # are cleared — `dispatch_id` survives the tombstone, but reading it after
+    # the fact would depend on that and it should not have to.
+    dispatch_ids = {m.dispatch_id for m in rows if m.dispatch_id}
+
+    for m in rows:
+        if scope == SCOPE_EVERYONE:
+            m.deleted_at = now
+            m.deleted_by_user_id = admin.id
+            m.body = DELETED_BODY
+        else:
+            m.hidden_from_user_at = now
+            m.deleted_by_user_id = admin.id
+
+    # Committed BEFORE the hops, same ordering as revoke_dispatch: the
+    # operator's intent is a fact the moment they press the button, and a crash
+    # halfway through must leave the conversation removed with some cards still
+    # to collect — not a thread that looks untouched while half its cards are
+    # gone.
+    await db.commit()
+
+    revoked, failed = 0, 0
+    for dispatch_id in sorted(dispatch_ids):
+        target_row = (await db.execute(
+            select(AdminDispatchTarget.id).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id,
+                AdminDispatchTarget.user_id == user_id,
+                AdminDispatchTarget.chat_status == CHAT_DELIVERED,
+            )
+        )).scalar_one_or_none()
+        if target_row is None:
+            # No card was ever delivered for this one (`no_agent`), or it has
+            # already been taken back. Nothing to retract, and not a failure.
+            continue
+        info = await agent_proxy_info(user_id, db)
+        if info is None:
+            failed += 1
+            continue
+        agent_url, agent_api_key = info
+        try:
+            await proxy_to_agent(
+                agent_url, agent_api_key, "internal/admin-notice/retract", "POST",
+                json_body={"user_id": user_id, "dispatch_id": dispatch_id},
+            )
+        except Exception as e:  # noqa: BLE001 — recorded on the target
+            failed += 1
+            await db.execute(
+                sa_update(AdminDispatchTarget)
+                .where(AdminDispatchTarget.id == target_row)
+                .values(last_error=f"thread delete retract failed: {type(e).__name__}: {e}"[:500],
+                        updated_at=now)
+            )
+            continue
+        revoked += 1
+        await db.execute(
+            sa_update(AdminDispatchTarget)
+            .where(AdminDispatchTarget.id == target_row)
+            .values(chat_status=CHAT_RETRACTED, last_error=None, updated_at=now)
+        )
+    await db.commit()
+
+    # dedupe_key=None: an operator may legitimately remove a conversation, let
+    # it build up again and remove it again, and each is a separate fact. This
+    # is the same reason the screenshot signal carries none.
+    await emit_product_event(
+        PE_DISPATCH_DELETED,
+        user_id=user_id,
+        actor_user_id=admin.id,
+        entity_type="admin_thread",
+        entity_id=user_id,
+        payload={"scope": scope, "messages": len(rows),
+                 "cards_retracted": revoked, "cards_failed": failed},
+        dedupe_key=None,
+    )
+
+    logger.info("[admin-dispatch] thread for %s deleted (%s) by %s: %d rows, %d cards, %d failed",
+                user_id[:8], scope, admin.id[:8], len(rows), revoked, failed)
+    return {
+        "scope": scope,
+        "messages": len(rows),
+        "cards_retracted": revoked,
+        "cards_failed": failed,
+    }
 
 
 @router.post("/{dispatch_id}/revoke")

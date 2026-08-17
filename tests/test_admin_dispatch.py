@@ -53,7 +53,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, update as sa_update
 
-from app.api.admin.dispatch import router as dispatch_router
+from app.api.admin.dispatch import DELETED_BODY, router as dispatch_router
 from app.api.auth import get_current_user
 from app.api.notices import router as notices_router
 from app.config import settings
@@ -2180,7 +2180,7 @@ async def _mk_thread_msg(user_id: str, direction: str, body: str) -> str:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scope", ["theirs", "both"])
+@pytest.mark.parametrize("scope", ["user_side", "everyone"])
 async def test_a_deleted_message_leaves_the_users_thread(dispatch_client, scope):
     """Either scope removes it from what the USER can see."""
     client, app = dispatch_client
@@ -2209,8 +2209,8 @@ async def test_a_deleted_message_leaves_the_users_thread(dispatch_client, scope)
 async def test_theirs_keeps_the_operators_copy_and_both_keeps_the_turn(dispatch_client):
     """The asymmetry IS the feature.
 
-    `theirs` unsends the words and keeps the record — the state an operator
-    needs most at exactly the moment they are undoing something. `both` clears
+    `user_side` unsends the words and keeps the record — the state an operator
+    needs most at exactly the moment they are undoing something. `everyone` clears
     the body but keeps the row, so the reply that follows it still has
     something to follow.
     """
@@ -2222,8 +2222,8 @@ async def test_theirs_keeps_the_operators_copy_and_both_keeps_the_turn(dispatch_
     a = await _mk_thread_msg(user_id, "out", "hide from them")
     b = await _mk_thread_msg(user_id, "out", "gone for everyone")
 
-    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{a}?scope=theirs")
-    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{b}?scope=both")
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{a}?scope=user_side")
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{b}?scope=everyone")
 
     res = await client.get(f"/api/admin/dispatch/threads/{user_id}")
     assert res.status_code == 200, res.text
@@ -2252,7 +2252,7 @@ async def test_an_operator_may_delete_a_users_own_reply(dispatch_client):
 
     app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
     res = await client.delete(
-        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=everyone")
     assert res.status_code == 200, res.text
 
     async with async_session_maker() as db:
@@ -2272,7 +2272,7 @@ async def test_a_message_from_another_users_thread_is_404(dispatch_client):
 
     app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
     res = await client.delete(
-        f"/api/admin/dispatch/threads/{stranger}/messages/{mid}?scope=both")
+        f"/api/admin/dispatch/threads/{stranger}/messages/{mid}?scope=everyone")
     assert res.status_code == 404, res.text
 
     async with async_session_maker() as db:
@@ -2290,14 +2290,14 @@ async def test_deleting_twice_does_not_overwrite_the_first_record(dispatch_clien
     mid = await _mk_thread_msg(user_id, "out", "x")
 
     app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
-    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=everyone")
     async with async_session_maker() as db:
         first = await db.get(AdminThreadMessage, mid)
         stamp, who, body = first.deleted_at, first.deleted_by_user_id, first.body
 
     app.dependency_overrides[get_current_user] = lambda: _principal(other, role="admin")
     res = await client.delete(
-        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=everyone")
     assert res.status_code == 200, res.text
 
     async with async_session_maker() as db:
@@ -2691,3 +2691,242 @@ async def test_a_malformed_cursor_is_rejected_not_ignored(dispatch_client):
 
     res = await client.get("/api/admin/dispatch/threads?cursor=not-a-date")
     assert res.status_code == 422, res.text
+
+
+# ── Unit 2: deleting a whole conversation ─────────────────────────
+#
+# The scopes are the same two a single message has, applied to every row. What
+# these defend is the half a naive implementation misses: a persistent dispatch
+# leaves a CARD in the user's chat as well as a row in the thread, and clearing
+# only the thread leaves that card sitting there with a Reply action pointing
+# at a conversation that is no longer there.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["user_side", "everyone"])
+async def test_deleting_a_conversation_clears_it_for_the_user(dispatch_client, scope):
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "first"), ("in", "reply"), ("out", "second")])
+
+    res = await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{user}?scope={scope}")
+    assert res.status_code == 200, res.text
+    assert res.json()["messages"] == 3
+
+    # The USER's own read of their thread is empty either way.
+    app.dependency_overrides[get_current_user] = lambda: _principal(user, role="user")
+    theirs = (await client.get("/api/notices/thread")).json()
+    assert theirs["messages"] == [], theirs
+    state = (await client.get("/api/notices/state")).json()
+    assert state["has_thread"] is False, "the drawer row must go with the thread"
+
+
+@pytest.mark.asyncio
+async def test_user_side_keeps_the_operators_copy_and_everyone_does_not(dispatch_client):
+    """The whole reason there are two scopes. `user_side` is an unsend that
+    keeps the record — which is what an operator almost always wants, and is
+    exactly what they need most at the moment they are undoing something."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    kept = await _mk_user()
+    gone = await _mk_user()
+    await _seed_thread(kept, [("out", "the operator still sees this")])
+    await _seed_thread(gone, [("out", "nobody sees this")])
+
+    await client.request("DELETE", f"/api/admin/dispatch/threads/{kept}?scope=user_side")
+    await client.request("DELETE", f"/api/admin/dispatch/threads/{gone}?scope=everyone")
+
+    kept_body = (await client.get(f"/api/admin/dispatch/threads/{kept}")).json()
+    assert [m["body"] for m in kept_body["messages"]] == ["the operator still sees this"]
+    assert kept_body["retracted_at"] is not None
+    assert kept_body["user_visible_total"] == 0
+
+    gone_body = (await client.get(f"/api/admin/dispatch/threads/{gone}")).json()
+    assert [m["body"] for m in gone_body["messages"]] == [DELETED_BODY], (
+        "an `everyone` delete must clear the words for the operator too"
+    )
+    # ...but the turn survives, so the conversation does not silently lose one.
+    assert len(gone_body["messages"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_conversation_pulls_the_chat_cards_too(dispatch_client, monkeypatch):
+    """The defect this exists for: clear the thread, leave the card.
+
+    A persistent dispatch writes BOTH a thread row and a card in the user's
+    chat. Removing only the thread leaves that card in place carrying a Reply
+    action that opens a conversation which is no longer there.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _mk_agent(user)
+    dispatch_id = await _seed_delivered("persistent", user)
+    await _seed_thread(user, [("out", "from the dispatch")])
+    async with async_session_maker() as db:
+        await db.execute(
+            sa_update(AdminThreadMessage)
+            .where(AdminThreadMessage.user_id == user)
+            .values(dispatch_id=dispatch_id)
+        )
+        await db.commit()
+
+    hops: list[dict] = []
+
+    async def _fake_proxy(url, key, path, method, json_body=None, **kw):
+        hops.append({"path": path, "body": json_body})
+        return {"ok": True}
+
+    monkeypatch.setattr("app.api.admin.dispatch.proxy_to_agent", _fake_proxy)
+
+    res = await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{user}?scope=user_side")
+    assert res.status_code == 200, res.text
+    assert res.json()["cards_retracted"] == 1, res.json()
+
+    assert [h["path"] for h in hops] == ["internal/admin-notice/retract"], hops
+    assert hops[0]["body"] == {"user_id": user, "dispatch_id": dispatch_id}
+
+    async with async_session_maker() as db:
+        chat_status = (await db.execute(
+            select(AdminDispatchTarget.chat_status).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id,
+                AdminDispatchTarget.user_id == user,
+            )
+        )).scalar_one()
+    assert chat_status == "retracted"
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_tenant_is_counted_not_swallowed(dispatch_client, monkeypatch):
+    """"3 of 4 cards" is a different sentence from "done", and the operator has
+    to be told which one happened. The thread rows are removed regardless — one
+    dead container must not cost them the rest of the removal."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _mk_agent(user)
+    dispatch_id = await _seed_delivered("persistent", user)
+    await _seed_thread(user, [("out", "hello")])
+    async with async_session_maker() as db:
+        await db.execute(
+            sa_update(AdminThreadMessage)
+            .where(AdminThreadMessage.user_id == user)
+            .values(dispatch_id=dispatch_id)
+        )
+        await db.commit()
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("tenant is down")
+
+    monkeypatch.setattr("app.api.admin.dispatch.proxy_to_agent", _boom)
+
+    body = (await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{user}?scope=user_side")).json()
+    assert body["cards_failed"] == 1 and body["cards_retracted"] == 0, body
+    assert body["messages"] == 1, "the thread rows come out even when a card cannot"
+
+    async with async_session_maker() as db:
+        err = (await db.execute(
+            select(AdminDispatchTarget.last_error).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalar_one()
+    assert err and "retract failed" in err, err
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_conversation_twice_does_not_move_the_date(dispatch_client):
+    """Idempotent by construction — the second press matches no rows. Re-
+    stamping would lose WHEN the conversation was actually removed, which is
+    the only question anyone asks afterwards."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "one"), ("out", "two")])
+
+    first = (await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{user}?scope=user_side")).json()
+    assert first["messages"] == 2
+    stamped = (await client.get(f"/api/admin/dispatch/threads/{user}")).json()["retracted_at"]
+
+    second = (await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{user}?scope=user_side")).json()
+    assert second["messages"] == 0, "a second removal has nothing left to remove"
+    again = (await client.get(f"/api/admin/dispatch/threads/{user}")).json()["retracted_at"]
+    assert again == stamped, "the removal date moved on a repeat press"
+
+
+@pytest.mark.asyncio
+async def test_the_operator_can_start_the_conversation_again(dispatch_client):
+    """§3.3's "Start new conversation", and the reason no admin_threads table
+    was needed for it: the next message simply carries no stamp."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "old business"), ("in", "old reply")])
+    await client.request("DELETE", f"/api/admin/dispatch/threads/{user}?scope=user_side")
+
+    res = await client.post(f"/api/admin/dispatch/threads/{user}",
+                            json={"body": "a fresh start"})
+    assert res.status_code == 201, res.text
+
+    # The operator keeps everything, and the thread is no longer "removed".
+    mine = (await client.get(f"/api/admin/dispatch/threads/{user}")).json()
+    assert len(mine["messages"]) == 3
+    assert mine["retracted_at"] is None
+    assert mine["user_visible_total"] == 1
+
+    # The USER sees exactly the new one.
+    app.dependency_overrides[get_current_user] = lambda: _principal(user, role="user")
+    theirs = (await client.get("/api/notices/thread")).json()
+    assert [m["body"] for m in theirs["messages"]] == ["a fresh start"]
+
+
+@pytest.mark.asyncio
+async def test_a_partly_deleted_conversation_is_not_a_removed_one(dispatch_client):
+    """`retracted_at` is set only when NOTHING is left for them. Otherwise an
+    ordinary one-message unsend would badge the whole conversation as wiped."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "keep me"), ("out", "unsend me")])
+    mine = (await client.get(f"/api/admin/dispatch/threads/{user}")).json()
+    doomed = mine["messages"][1]["id"]
+
+    await client.request(
+        "DELETE",
+        f"/api/admin/dispatch/threads/{user}/messages/{doomed}?scope=user_side")
+
+    after = (await client.get(f"/api/admin/dispatch/threads/{user}")).json()
+    assert after["retracted_at"] is None, "one unsend is not a removed conversation"
+    assert after["user_visible_total"] == 1
+
+    listed = (await client.get("/api/admin/dispatch/threads")).json()["threads"]
+    row = next(t for t in listed if t["user_id"] == user)
+    assert row["retracted_at"] is None and row["user_visible_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_conversation_for_a_stranger_is_404(dispatch_client):
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    res = await client.request(
+        "DELETE", f"/api/admin/dispatch/threads/{uuid.uuid4()}?scope=user_side")
+    assert res.status_code == 404, res.text
