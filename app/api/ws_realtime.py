@@ -160,9 +160,12 @@ def _base_voice_instructions() -> str:
         "- Respond naturally and conversationally; keep replies to 1-3 sentences "
         "unless the user asks for detail.\n"
         "- No markdown, lists, or formatting — spoken prose only.\n"
-        "- Match the user's language. The user may mix English product names "
-        "(Grok, ChatGPT, Claude, Gemini…) into another language mid-sentence — "
-        "hear those as English names, and if a name came through garbled, ask "
+        "- REPLY LANGUAGE: answer in the language the user JUST SPOKE, turn by "
+        "turn, even for a two-word turn. Farsi in, Farsi out — every time. This "
+        "prompt being in English is never a reason to reply in English. The "
+        "user may mix English product names (Grok, ChatGPT, Claude, Gemini…) "
+        "into another language mid-sentence — hear those as English names "
+        "without switching languages, and if a name came through garbled, ask "
         "one short question instead of acting on a guess.\n"
         "- Your personalized memory and tools are still loading for the first "
         "seconds of this call; if the user asks something personal before they "
@@ -777,7 +780,13 @@ async def build_realtime_instructions(
         "- Do NOT use markdown, code blocks, bullet points, or any text formatting.\n"
         "- Do NOT say 'here is a list' or read structured data verbatim.\n"
         "- Use natural speech patterns: contractions, casual phrasing.\n"
-        "- Match the user's language. Speak EVERY language with a natural, NATIVE "
+        "- REPLY LANGUAGE — the rule that outranks everything else here: answer "
+        "in the language the user JUST SPOKE, turn by turn, even for a two-word "
+        "turn. Farsi in, Farsi out — every time. These instructions, your "
+        "memories, and the context above being written in English is NEVER a "
+        "reason to reply in English; English brand names inside a foreign "
+        "sentence do not make it an English sentence.\n"
+        "- Speak EVERY language with a natural, NATIVE "
         "accent and native pronunciation — never a foreign or English-accented one.\n"
         "- When the user speaks Persian/Farsi, reply in fluent, natural Farsi with a "
         "native Tehrani accent, pronouncing every Persian sound correctly (خ، غ، ق، ژ, "
@@ -2292,6 +2301,22 @@ def realtime_url() -> str:
     return f"wss://api.openai.com/v1/realtime?model={realtime_model()}"
 
 
+# ── Reply-language directive ──────────────────────────────────────────
+# The static REPLY LANGUAGE rule is advisory to a model whose entire context
+# is English, and on 2026-08-17 a short Farsi turn still came back in English.
+# The user transcript is ground truth for what was just spoken, so a script
+# flip re-issues session.update with a one-line directive appended. Names only
+# for scripts detect_script_language can return; a Latin-script turn CLEARS
+# the directive instead (Latin alone cannot tell English from Spanish, and the
+# static rule already covers it).
+_REPLY_LANG_NAMES = {
+    "fa": "Persian (Farsi)",
+    "zh": "Mandarin Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+}
+
+
 # ── Transcription language hint ───────────────────────────────────────
 # Whisper re-detects the language of EVERY utterance independently, and on a
 # short one carrying an English proper noun it reliably guesses wrong: measured
@@ -3334,6 +3359,8 @@ async def realtime_voice_ws(
     if _cache_hit:
         full_context_applied.set()
 
+    applied_ctx: dict = {"instr": None, "tools": None, "language": None, "directive": None}
+
     async def _apply_full_context() -> None:
         # shield(): a timeout here abandons the wait, not the underlying
         # build — a late result still lands in the cache path below on the
@@ -3362,6 +3389,12 @@ async def realtime_voice_ws(
             )
         except Exception as e:
             logger.warning("[REALTIME] Full-context session.update failed: %s", e)
+        else:
+            # What the live session is actually running with — the reply-language
+            # reinforcement rebuilds its session.update from exactly this.
+            applied_ctx["instr"] = final_instr
+            applied_ctx["tools"] = tools
+            applied_ctx["language"] = language
         finally:
             full_context_applied.set()
 
@@ -3834,6 +3867,35 @@ async def realtime_voice_ws(
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save user transcript")
                         last_user_text = user_text
+                        # ── Reply-language reinforcement (see _REPLY_LANG_NAMES) ──
+                        # Usually lands AFTER the in-flight response started —
+                        # transcription is a side-channel and loses that race —
+                        # so this makes the NEXT turn deterministic rather than
+                        # rescuing this one. Fires only on a state CHANGE.
+                        if applied_ctx["instr"]:
+                            code = detect_script_language(user_text, min_share=0.5, min_chars=3)
+                            latin_letters = sum(1 for c in user_text if c.isascii() and c.isalpha())
+                            want = (
+                                code if code in _REPLY_LANG_NAMES
+                                else None if latin_letters >= 8
+                                else applied_ctx["directive"]
+                            )
+                            if want != applied_ctx["directive"]:
+                                try:
+                                    instr2 = applied_ctx["instr"]
+                                    if want:
+                                        lang_name = _REPLY_LANG_NAMES[want]
+                                        instr2 += (
+                                            "\n\n# Current speech language\n"
+                                            f"The user is speaking {lang_name} right now. "
+                                            f"Reply in {lang_name}."
+                                        )
+                                    await openai_ws.send(json.dumps(_session_config(
+                                        instr2, applied_ctx["tools"], applied_ctx["language"])))
+                                    applied_ctx["directive"] = want
+                                    logger.info("[REALTIME] Reply-language directive -> %s", want or "cleared")
+                                except Exception:
+                                    logger.warning("[REALTIME] Reply-language session.update failed")
 
                 # ── VAD: user started speaking (barge-in) ──
                 elif etype == "input_audio_buffer.speech_started":
