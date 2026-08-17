@@ -117,7 +117,7 @@ async def _make_engine():
                     metadata_json TEXT,
                     embedding_json TEXT,
                     embedding BLOB
-                )
+                , origin VARCHAR(16))
             """)
         ))
         await conn.run_sync(lambda c: c.execute(

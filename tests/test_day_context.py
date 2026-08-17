@@ -83,7 +83,7 @@ async def _make_engine():
                 memories_retrieved_json TEXT, processing_time_ms INTEGER,
                 reply_to_message_id VARCHAR(50), attachments TEXT,
                 metadata_json TEXT, embedding_json TEXT, embedding BLOB
-            )""",
+            , origin VARCHAR(16))""",
             """CREATE TABLE IF NOT EXISTS migration_status (
                 migration_name VARCHAR(100) PRIMARY KEY, status VARCHAR(20) DEFAULT 'not_started',
                 started_at TIMESTAMP, completed_at TIMESTAMP, progress_json TEXT, error_message TEXT

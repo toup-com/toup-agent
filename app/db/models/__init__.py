@@ -59,6 +59,18 @@ from .soul_config import SoulConfig
 # Platform (VPS, invites, billing)
 from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, SearchEvent, PlatformSetting
 
+# Product-funnel telemetry (platform-only). The event NAMES are exported
+# beside the model so a producer never has to spell one by hand.
+from .platform import (
+    ProductEvent,
+    PE_DISPATCH_CREATED, PE_DISPATCH_SENT, PE_DISPATCH_DELIVERED,
+    PE_DISPATCH_VIEWED, PE_DISPATCH_READ, PE_DISPATCH_REPLIED,
+    PE_DISPATCH_REVOKED, PE_DISPATCH_DELETED,
+    PE_DISPATCH_SCREENSHOT_DETECTED,
+    DISPATCH_PRODUCT_EVENTS,
+    PE_ENTITY_DISPATCH, PE_ENTITY_THREAD_MESSAGE,
+)
+
 # Maintenance / support agent (platform-only — admin maintenance system)
 from .support import SupportIssue, SupportIssueEvent, SupportAttachment
 
@@ -98,6 +110,8 @@ from .admin_dispatch import (
     CHAT_PENDING, CHAT_DELIVERED, CHAT_NO_AGENT, CHAT_FAILED, CHAT_RETRACTED,
     CHAT_STATUSES,
     THREAD_OUT, THREAD_IN, THREAD_DIRECTIONS,
+    ORIGIN_ADMIN, ORIGIN_AGENT, ORIGIN_SYSTEM, MESSAGE_ORIGINS,
+    ORIGINS_EXCLUDED_FROM_CONTEXT,
 )
 
 # iOS Live Activities (platform-only — Autopilot phone surface)
@@ -201,6 +215,14 @@ __all__ = [
     "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",
     "SoulConfig",
     "VPSPlan", "VPSInstance", "ManagedContainer", "Invite", "LLMBundleAllocation", "LLMUsageRecord", "LLMProxyEvent", "SearchEvent", "PlatformSetting",
+    # Product-funnel telemetry
+    "ProductEvent",
+    "PE_DISPATCH_CREATED", "PE_DISPATCH_SENT", "PE_DISPATCH_DELIVERED",
+    "PE_DISPATCH_VIEWED", "PE_DISPATCH_READ", "PE_DISPATCH_REPLIED",
+    "PE_DISPATCH_REVOKED", "PE_DISPATCH_DELETED",
+    "PE_DISPATCH_SCREENSHOT_DETECTED",
+    "DISPATCH_PRODUCT_EVENTS",
+    "PE_ENTITY_DISPATCH", "PE_ENTITY_THREAD_MESSAGE",
     "Rollout", "RolloutAttempt",
     "ROLLOUT_STATUSES", "ROLLOUT_ATTEMPT_STATUSES", "ROLLOUT_TRIGGERS",
     "StreamingCredential", "CredentialAccessLog",
@@ -258,6 +280,8 @@ __all__ = [
     "CHAT_PENDING", "CHAT_DELIVERED", "CHAT_NO_AGENT", "CHAT_FAILED",
     "CHAT_RETRACTED", "CHAT_STATUSES",
     "THREAD_OUT", "THREAD_IN", "THREAD_DIRECTIONS",
+    "ORIGIN_ADMIN", "ORIGIN_AGENT", "ORIGIN_SYSTEM", "MESSAGE_ORIGINS",
+    "ORIGINS_EXCLUDED_FROM_CONTEXT",
     # iOS Live Activities (Autopilot phone surface)
     "LiveActivityDevice", "LiveActivity",
     "LA_STARTED", "LA_ENDED", "LA_FAILED",

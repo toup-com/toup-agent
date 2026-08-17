@@ -15,7 +15,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.tool_elision import elide_tool_results
@@ -106,6 +106,7 @@ async def load_day_context(
         }
     """
     from app.db.models import Message, Conversation
+    from app.db.models.admin_dispatch import ORIGINS_EXCLUDED_FROM_CONTEXT
     from app.db.models.day_chat import DayChat
 
     if not model:
@@ -142,6 +143,29 @@ async def load_day_context(
         select(Message, Conversation.channel)
         .join(Conversation, Message.conversation_id == Conversation.id)
         .where(Message.day_chat_id == day_chat_id)
+        # An operator's words must never become instructions the model reads.
+        # This is the R2 prompt-injection boundary and it is deliberately a
+        # SECOND, independent guard: an admin notice is also written with
+        # `day_chat_id = NULL`, so the predicate above already misses it.
+        #
+        # Both are kept because they fail differently. The NULL-day trick is
+        # structural — nothing can accidentally re-include the row — but it
+        # cannot survive agent-initiated contact, which needs a REAL day so
+        # the agent's own proactive message appears in its context. The
+        # moment that ships, the structural guard stops covering this case
+        # and only this predicate does. Writing it now means the boundary is
+        # already correct when that happens, rather than being the thing
+        # someone has to remember.
+        #
+        # `IS NULL` is part of the test on purpose: every pre-existing row
+        # predates the column, and a bare `!= 'admin'` is FALSE for NULL in
+        # SQL — which would silently drop the entire history of every user.
+        .where(
+            or_(
+                Message.origin.is_(None),
+                Message.origin.notin_(list(ORIGINS_EXCLUDED_FROM_CONTEXT)),
+            )
+        )
         # W2.4(a): id tiebreaker — equal-microsecond inserts otherwise leave
         # the order DB-dependent between loads, and a retroactive reorder of
         # already-serialized history rewrites the cached prompt prefix.

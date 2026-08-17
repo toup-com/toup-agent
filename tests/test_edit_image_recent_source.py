@@ -58,7 +58,7 @@ async def _make_engine():
                 metadata_json TEXT, embedding_json TEXT, embedding BLOB,
                 channel VARCHAR(50), source VARCHAR(50),
                 reply_to_message_id VARCHAR(50), attachments TEXT
-            )""",
+            , origin VARCHAR(16))""",
         ]:
             await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
     return engine

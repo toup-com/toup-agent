@@ -23,10 +23,11 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, select, update as sa_update
+from sqlalchemy import and_, func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
@@ -42,10 +43,15 @@ from app.db.models import (
     CHAT_DELIVERED,
     CHAT_RETRACTED,
     DISPATCH_MODE_ONCE,
+    PE_DISPATCH_READ,
+    PE_DISPATCH_REPLIED,
+    PE_ENTITY_DISPATCH,
+    PE_ENTITY_THREAD_MESSAGE,
     TARGET_DONE,
     THREAD_IN,
     THREAD_OUT,
 )
+from app.services.product_events import emit_product_event
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +70,37 @@ class NoticeReplyRequest(BaseModel):
         return v
 
 
+class ScreenshotReport(BaseModel):
+    """What the client saw, not what it did about it.
+
+    `surface` is where the screenshot happened — the Admin thread, or a chat
+    card. `dispatch_id` is present only for a card.
+    """
+    surface: str = Field(pattern="^(thread|notice)$")
+    dispatch_id: Optional[str] = Field(default=None, max_length=36)
+
+
 class NoticeStateOut(BaseModel):
     unread_notices: int
     thread_unread: int
     has_thread: bool
+
+
+def _visible_to_user():
+    """Rows the USER may see. One definition, four call sites.
+
+    A deleted message that still counted toward `thread_unread` would badge a
+    thread whose new content the user cannot find — so the two state counters,
+    the page and its unread total all read through this.
+
+    `IS NULL` on both, never `!= <ts>`: in SQL a comparison against NULL is
+    NULL, not TRUE, so a bare inequality would drop every row written before
+    migration 092 — i.e. the entire history of every thread.
+    """
+    return and_(
+        AdminThreadMessage.hidden_from_user_at.is_(None),
+        AdminThreadMessage.deleted_at.is_(None),
+    )
 
 
 @router.get("/state", response_model=NoticeStateOut)
@@ -106,6 +139,10 @@ async def get_notice_state(
     thread_total = (await db.execute(
         select(func.count()).select_from(AdminThreadMessage).where(
             AdminThreadMessage.user_id == current_user.id,
+            # `has_thread` drives whether the Admin row EXISTS in the drawer.
+            # An operator who deletes the only message in a thread has removed
+            # the reason for the row, so it goes too.
+            _visible_to_user(),
         )
     )).scalar_one()
 
@@ -114,6 +151,7 @@ async def get_notice_state(
             AdminThreadMessage.user_id == current_user.id,
             AdminThreadMessage.direction == THREAD_OUT,
             AdminThreadMessage.read_at.is_(None),
+            _visible_to_user(),
         )
     )).scalar_one()
 
@@ -139,7 +177,7 @@ async def get_thread(
     the page — the badge must not shrink because the page was short."""
     rows = (await db.execute(
         select(AdminThreadMessage)
-        .where(AdminThreadMessage.user_id == current_user.id)
+        .where(AdminThreadMessage.user_id == current_user.id, _visible_to_user())
         .order_by(AdminThreadMessage.created_at.desc())
         .limit(limit)
     )).scalars().all()
@@ -149,6 +187,7 @@ async def get_thread(
             AdminThreadMessage.user_id == current_user.id,
             AdminThreadMessage.direction == THREAD_OUT,
             AdminThreadMessage.read_at.is_(None),
+            _visible_to_user(),
         )
     )).scalar_one()
 
@@ -181,6 +220,29 @@ async def reply_to_admin(
     # Build the response BEFORE commit — pgbouncer txn-mode rule.
     resp = {"message": thread_message_out(msg)}
     await db.commit()
+
+    # `dispatch_replied` is the RECIPIENT answering, and only that. The
+    # operator's follow-up (`admin/dispatch.py::reply_in_thread`) writes an
+    # `out` row and deliberately emits nothing: counting both directions
+    # would make the reply rate — the one number that says whether a
+    # persistent dispatch started a conversation — rise every time the
+    # operator talked to themselves.
+    #
+    # The entity is the thread MESSAGE, not a dispatch: a user reply carries
+    # `dispatch_id=None` (the thread outlives the dispatch that opened it),
+    # so there is no dispatch id to point at.
+    await emit_product_event(
+        PE_DISPATCH_REPLIED,
+        user_id=current_user.id,
+            actor_user_id=current_user.id,
+        entity_type=PE_ENTITY_THREAD_MESSAGE,
+        entity_id=msg.id,
+        # Length, never the words: this row is read by operator analytics and
+        # the reply is the user's own private message to a human.
+        payload={"direction": THREAD_IN, "body_chars": len(msg.body or "")},
+        dedupe_key=f"{PE_DISPATCH_REPLIED}:{msg.id}",
+        occurred_at=msg.created_at,
+    )
     return resp
 
 
@@ -261,6 +323,26 @@ async def mark_notice_read(
     needs_retract = mode == DISPATCH_MODE_ONCE and chat_status != CHAT_RETRACTED
     await db.commit()
 
+    # ORDER: after the commit that persists `read_at` (a receipt a rollback
+    # erased is not a read), and ABOVE the `needs_retract` early return —
+    # below it, only `once` notices would ever be counted as read and the
+    # whole persistent half of the funnel would silently report zero.
+    #
+    # Gated on the CAS: `claimed` is 0 for a second "Got it" on the same
+    # notice, which is not a second read. The dedupe key says the same thing
+    # structurally, so the metric survives someone removing the gate.
+    if claimed > 0:
+        await emit_product_event(
+            PE_DISPATCH_READ,
+            user_id=current_user.id,
+                actor_user_id=current_user.id,
+            entity_type=PE_ENTITY_DISPATCH,
+            entity_id=dispatch_id,
+            payload={"mode": mode},
+            dedupe_key=f"{PE_DISPATCH_READ}:{dispatch_id}:{current_user.id}",
+            occurred_at=now,
+        )
+
     if not needs_retract:
         return
 
@@ -325,3 +407,60 @@ async def mark_notice_read(
         .values(chat_status=CHAT_RETRACTED, updated_at=datetime.utcnow())
     )
     await db.commit()
+
+
+# ── Screenshot signal ────────────────────────────────────────────────
+
+@router.post("/screenshot", status_code=status.HTTP_204_NO_CONTENT)
+async def report_screenshot(
+    body: ScreenshotReport,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record that this user screenshotted an operator message.
+
+    ⚠️ THIS IS DETECTION, NOT PREVENTION, AND THE DIFFERENCE IS THE WHOLE
+    POINT. On iOS a screenshot cannot be blocked by any documented API — the
+    system notifies the app AFTER the image is already in the camera roll.
+    Android is genuinely different: `FLAG_SECURE` stops the capture, so on
+    Android this route should almost never fire, and a report FROM Android is
+    itself a signal worth reading (a rooted device, or the flag not applied).
+
+    Nothing here is a security control. Someone can photograph the screen with
+    a second phone, and WhatsApp — which does block screenshots, for View Once
+    media only — says exactly that in its own help text. What this buys is an
+    operator knowing a message left the app.
+
+    Best-effort by construction: `emit_product_event` never raises, and this
+    returns 204 regardless. A client whose report fails must not retry into a
+    loop, and a user must never see an error because their own screenshot
+    could not be logged.
+    """
+    from app.db.models.platform import PE_DISPATCH_SCREENSHOT_DETECTED
+    from app.services.product_events import emit_product_event
+
+    # try/except HERE rather than trusting the helper's own promise. The
+    # docstring above says this route cannot fail the user; a claim that
+    # depends on a distant module continuing to swallow is a claim this file
+    # does not actually enforce. Proven by a test that makes the helper raise.
+    try:
+        await emit_product_event(
+            PE_DISPATCH_SCREENSHOT_DETECTED,
+            user_id=current_user.id,
+        # The SUBJECT and the ACTOR are the same person here, and that is the
+        # unusual case worth stating: every other dispatch event has an
+        # operator acting on a user.
+            actor_user_id=current_user.id,
+            entity_type="dispatch" if body.dispatch_id else "thread",
+            entity_id=body.dispatch_id or current_user.id,
+            payload={"surface": body.surface},
+        # NO dedupe key. A second screenshot is a second screenshot — that is
+        # precisely the number an operator wants. Every other event in this
+        # table dedupes on a fact that can only happen once; this one cannot.
+            dedupe_key=None,
+        )
+    except Exception as e:  # noqa: BLE001 — telemetry must never reach the user
+        logger.warning("[notices] screenshot report not recorded: %s", e)
+        return
+    logger.info("[notices] screenshot reported by %s on %s",
+                current_user.id[:8], body.surface)

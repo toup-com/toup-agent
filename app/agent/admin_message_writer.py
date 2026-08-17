@@ -31,6 +31,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models.admin_dispatch import ORIGIN_ADMIN
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +151,12 @@ async def write_admin_notice(
         content=content,
         channel="admin",
         source="admin_dispatch",
+        # The party this is FROM, and the predicate `load_day_context` now
+        # excludes on. Belt-and-braces with the NULL day above, on purpose:
+        # that one is structural but cannot survive agent-initiated contact
+        # (which needs a real day), and this one is the guard that will still
+        # be standing afterwards. Neither is redundant with the other.
+        origin=ORIGIN_ADMIN,
         metadata_json=json.dumps({"admin_notice": dict(notice)}),
     )
     try:

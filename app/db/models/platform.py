@@ -2,10 +2,14 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Float, Integer, Boolean, ForeignKey, Index, Numeric
+from sqlalchemy import (
+    String, Text, DateTime, Float, Integer, Boolean, ForeignKey, Index, Numeric,
+    JSON, UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 
 from .base import Base
@@ -332,4 +336,132 @@ class PlatformSetting(Base):
     # blocked, and must not delete the setting. (mig 060)
     updated_by_user_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+
+
+# ── Product events ────────────────────────────────────────────────────
+#
+# The names are constants and not free strings because the producers are
+# spread across three modules today and four of the nine have no producer
+# at all yet (see below): a typo in a string literal is a metric that
+# silently reads zero forever, and "which spelling did we ship?" is not a
+# question a later PR should have to answer by grepping.
+#
+# WHICH OF THESE ARE LIVE (2026-08-13):
+#   emitted today — CREATED, SENT, DELIVERED, READ, REPLIED
+#   no producer   — VIEWED, REVOKED, DELETED, SCREENSHOT_DETECTED
+#
+# The four dark ones are declared deliberately. VIEWED is distinct from
+# READ by design (D4: read is an explicit ack, never a render) and needs a
+# client-side viewport rule that neither client ships. Revoke, delete and
+# screenshot detection are whole capabilities that do not exist yet. In
+# particular REVOKED is NOT the `once` retraction that fires on read —
+# that is the automatic end of a `once` card's life, not an operator
+# recalling a message, and emitting it here would make the recall metric
+# read one-per-read forever.
+PE_DISPATCH_CREATED = "dispatch_created"
+PE_DISPATCH_SENT = "dispatch_sent"
+PE_DISPATCH_DELIVERED = "dispatch_delivered"
+PE_DISPATCH_VIEWED = "dispatch_viewed"
+PE_DISPATCH_READ = "dispatch_read"
+PE_DISPATCH_REPLIED = "dispatch_replied"
+PE_DISPATCH_REVOKED = "dispatch_revoked"
+PE_DISPATCH_DELETED = "dispatch_deleted"
+PE_DISPATCH_SCREENSHOT_DETECTED = "dispatch_screenshot_detected"
+
+DISPATCH_PRODUCT_EVENTS: set[str] = {
+    PE_DISPATCH_CREATED,
+    PE_DISPATCH_SENT,
+    PE_DISPATCH_DELIVERED,
+    PE_DISPATCH_VIEWED,
+    PE_DISPATCH_READ,
+    PE_DISPATCH_REPLIED,
+    PE_DISPATCH_REVOKED,
+    PE_DISPATCH_DELETED,
+    PE_DISPATCH_SCREENSHOT_DETECTED,
+}
+
+# Values for ProductEvent.entity_type.
+PE_ENTITY_DISPATCH = "admin_dispatch"
+PE_ENTITY_THREAD_MESSAGE = "admin_thread_message"
+
+
+class ProductEvent(Base):
+    """One row per product fact worth counting. Append-only, never read on
+    a hot path.
+
+    Deliberately generic rather than `dispatch_events`: the questions it
+    answers ("of the messages we sent, how many were read, and how long
+    did that take") are funnel questions, and a funnel that has to UNION
+    one table per feature stops being asked. Admin Dispatch is the first
+    producer, not the only intended one — hence `event` as a string rather
+    than an enum column, and `entity_type`+`entity_id` rather than
+    `dispatch_id`.
+
+    NOT folded into an existing table on purpose. `admin_dispatch_targets`
+    is the delivery LEDGER — it holds current state per recipient, is
+    UPDATEd in place, and has exactly one row per (dispatch, user), so it
+    can say a notice was read but never when it was delivered, nor that it
+    was delivered twice because a retry upgraded it. `credit_ledger` is an
+    immutable billing audit trail and this path spends no credits (R3).
+
+    `user_id` is the SUBJECT (whose experience this describes) and
+    `actor_user_id` the ACTOR (who did it). They differ exactly where it
+    matters: `dispatch_created` has an operator actor and — for a
+    broadcast — no subject at all, which is why `user_id` is nullable.
+
+    ON DELETE SET NULL on both, so a deleted account takes its identity
+    out of the series without taking the counts with it (a funnel whose
+    denominator shrinks retroactively is worse than useless). A NULL
+    `user_id` therefore means "no subject" OR "subject deleted"; the event
+    name disambiguates, since `dispatch_read` always has one and
+    `dispatch_created` for a broadcast never does.
+    """
+
+    __tablename__ = "product_events"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    event: Mapped[str] = mapped_column(String(48), nullable=False)
+    user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    actor_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    entity_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    entity_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Scalars only, and never message text: this table is read by operator
+    # analytics, and the whole point of the admin↔user thread living on the
+    # platform is that its CONTENT stays out of everything else.
+    payload_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"), nullable=True,
+    )
+    # The retry guard. The fan-out is idempotent by construction, which means
+    # a retry legitimately re-walks every target — so "insert one row per
+    # delivery" would count one recipient N times after N Retry presses. A
+    # deterministic key per FACT plus the UNIQUE below makes the second write
+    # a no-op. NULL (multiple NULLs are allowed on both backends) means "every
+    # occurrence is its own fact", which is right for a repeatable action.
+    dedupe_key: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_product_events_dedupe"),
+        # The reason the table exists: one event's rate over a window
+        # ("dispatch_read last 7 days"). Every funnel query is this shape.
+        Index("ix_product_events_event_created", "event", "created_at"),
+        # The per-dispatch timeline the operator panel wants: everything
+        # that happened to THIS message, all nine event names at once.
+        Index("ix_product_events_entity", "entity_type", "entity_id"),
+        # Support's question, the other way round: what has this account
+        # been sent and what did they do with it.
+        Index("ix_product_events_user_created", "user_id", "created_at"),
+        # Deliberately NO bare index on created_at. Every INSERT pays for
+        # every index and this table takes one row per RECIPIENT of a
+        # broadcast; the only query that would want it is age-based pruning,
+        # which is an occasional ops action that can afford a scan.
     )

@@ -165,6 +165,11 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # of the gateway is that the tenant container no longer sees the upstream
     # call, so it has nothing to write here.
     "search_events",
+    # Product-funnel telemetry (Admin Dispatch is the first producer).
+    # Platform-only: every producer is a platform route or the fan-out
+    # worker, and the rows describe operator↔user activity the agent must
+    # never see (D2) — the same stance as admin_dispatches below.
+    "product_events",
     # Streaming credentials (platform stores, agent fetches via API)
     "streaming_credentials",
     "credential_access_log",

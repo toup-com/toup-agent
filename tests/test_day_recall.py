@@ -197,7 +197,7 @@ async def _make_recall_engine():
                 tokens_completion INTEGER DEFAULT 0, model_used VARCHAR(100),
                 memories_retrieved_json TEXT, processing_time_ms INTEGER,
                 metadata_json TEXT
-            )
+            , origin VARCHAR(16))
         """)))
     return engine
 

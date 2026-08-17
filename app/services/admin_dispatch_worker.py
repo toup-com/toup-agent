@@ -30,6 +30,11 @@ audience query (a preview that can disagree with the send is how a
 ``build_reply_notification`` enqueues the alert for an admin's thread
 reply on this same ``announcement`` lane.
 
+One further entry point belongs to neither: ``sweep_stalled_dispatches``
+is called on the notification dispatcher's tick, and is the only thing
+that can ever terminate a dispatch whose worker died without running a
+line of its own error handling.
+
 IDEMPOTENT BY CONSTRUCTION: every write is keyed on something derived
 from (dispatch_id, user_id) — the thread row's uuid5 id, the queue
 row's ``idempotency_key``, and the agent's own uuid5 message id
@@ -67,17 +72,23 @@ from app.db.models import (
     DISPATCH_AUDIENCE_ALL,
     DISPATCH_FAILED,
     DISPATCH_MODE_PERSISTENT,
+    DISPATCH_QUEUED,
     DISPATCH_SENDING,
     DISPATCH_SENT,
     NOTIFY_KIND_ANNOUNCEMENT,
     NQ_PRIORITY_DEFAULT,
     NQ_PRIORITY_HIGH,
+    PE_DISPATCH_DELIVERED,
+    PE_DISPATCH_SENT,
+    PE_ENTITY_DISPATCH,
     TARGET_DONE,
     TARGET_FAILED,
     TARGET_PENDING,
     TARGET_SENDING,
     THREAD_OUT,
 )
+from app.services.product_events import emit_product_event
+from app.services import dispatch_tones
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +104,39 @@ _DRIP_GAP_SEC = 30
 # under the shared client's 30s default so a wedged tenant can't hold
 # the whole fan-out.
 _AGENT_HOP_TIMEOUT_S = 15.0
+
+# How long a dispatch may read `sending` with NOTHING moving before
+# `sweep_stalled_dispatches` calls the fan-out dead.
+#
+# The clock is RESET BY PROGRESS (see the function), so this number has
+# to exceed the longest gap between two consecutive target writes on a
+# HEALTHY fan-out — not the length of a whole broadcast. That gap is one
+# target's delivery, bounded by the agent hop's own cap (15s above);
+# before the first target exists it is the audience enumeration plus the
+# bulk target INSERT, which is the one step that scales with the user
+# base (and degrades to per-row inserts when two replicas race). The drip
+# does NOT enter the bound: `_drip_at` stamps `scheduled_for` on the
+# notification row, it never sleeps the fan-out.
+#
+# 30 minutes is twice `_STUCK_CLAIM_MAX_AGE` (api/admin/dispatch.py) and
+# 120x the hop cap. The 2x is deliberate but it is NOT an ordering
+# guarantee, and an earlier version of this comment claimed it was: the
+# per-target reclaim only ever runs inside the POST retry route, i.e. when
+# a HUMAN presses Retry. Nothing schedules it. So the honest statement is
+# that a stuck target becomes reclaimable well before the sweep can call
+# the whole fan-out dead — leaving an operator who is watching a full
+# window to act with the narrower tool first — not that anything runs in
+# that order on its own.
+_STALL_MAX_AGE = timedelta(minutes=30)
+
+# Read by the operator in the panel, so it names the REMEDY: a stalled
+# dispatch is fully recoverable and nothing else on the row says so.
+_STALL_REASON = (
+    "Fan-out stalled: no delivery progress for "
+    f"{int(_STALL_MAX_AGE.total_seconds() // 60)} minutes, so the worker is gone "
+    "(redeploy, OOM, or a lost replica). Nothing further will send on its own — "
+    "press Retry to re-queue every unfinished recipient."
+)
 
 
 class _Recipient(NamedTuple):
@@ -138,6 +182,7 @@ class _DispatchSpec(NamedTuple):
     title: str
     body: str
     urgent: bool
+    tone: str
     created_by_user_id: Optional[str]
     created_at: datetime
 
@@ -153,6 +198,9 @@ def _snapshot(dispatch: AdminDispatch) -> _DispatchSpec:
         title=dispatch.title or "",
         body=dispatch.body or "",
         urgent=bool(dispatch.urgent),
+        # Normalised at snapshot time so every target of one broadcast gets the
+        # same tone even if the catalogue is trimmed mid-fan-out.
+        tone=dispatch_tones.normalize(dispatch.tone),
         created_by_user_id=dispatch.created_by_user_id,
         created_at=dispatch.created_at or datetime.utcnow(),
     )
@@ -170,6 +218,7 @@ def preview_spec(audience: str, target_user_id: Optional[str] = None) -> _Dispat
     return _DispatchSpec(
         id="", mode="", audience=audience, target_user_id=target_user_id,
         sender_name="", title="", body="", urgent=False,
+        tone=dispatch_tones.TONE_DEFAULT,
         created_by_user_id=None, created_at=datetime.utcnow(),
     )
 
@@ -212,7 +261,11 @@ async def run_dispatch_fanout(dispatch_id: str) -> Dict[str, Any]:
         await db.execute(
             update(AdminDispatch)
             .where(AdminDispatch.id == dispatch_id)
-            .values(status=DISPATCH_SENDING, completed_at=None)
+            # `last_error` is cleared here and nowhere else on the happy
+            # path: this attempt owns the row's failure story, and a
+            # retry that inherited the stall sweeper's reason would
+            # report a dead worker on a dispatch that has just delivered.
+            .values(status=DISPATCH_SENDING, completed_at=None, last_error=None)
         )
         await db.commit()
 
@@ -246,7 +299,7 @@ async def run_dispatch_fanout(dispatch_id: str) -> Dict[str, Any]:
                         chat_message_id=None, notification_id=None,
                         last_error=f"{type(e).__name__}: {e}"[:500],
                     )
-        except Exception:
+        except Exception as e:  # noqa: BLE001 — recorded on the row, then re-raised
             # `admin_dispatches.status='failed'` means the FAN-OUT died —
             # per-target outcomes live in the target ledger and never
             # reach here. Record it and re-raise: nothing awaits this in
@@ -257,13 +310,50 @@ async def run_dispatch_fanout(dispatch_id: str) -> Dict[str, Any]:
             await db.execute(
                 update(AdminDispatch)
                 .where(AdminDispatch.id == dispatch_id)
-                .values(status=DISPATCH_FAILED, completed_at=datetime.utcnow())
+                .values(
+                    status=DISPATCH_FAILED,
+                    completed_at=datetime.utcnow(),
+                    # The other writer of this column is the stall sweeper.
+                    # A crash we DID catch must not render as the blank
+                    # "Failed" the sweeper exists to stop.
+                    last_error=f"Fan-out failed: {type(e).__name__}: {e}"[:500],
+                )
             )
             await db.commit()
             raise
 
         summary = await _reconcile(db, dispatch_id)
         summary.update({"dispatch_id": dispatch_id, "claimed": claimed})
+        if summary["status"] == DISPATCH_SENT:
+            # "Every target is terminal" — the moment `_reconcile` settles the
+            # status is the moment the fact becomes true, and it is the only
+            # place that settles it. Emitted here rather than inside
+            # `_reconcile` because the spec (mode, audience) is in scope here
+            # and `_reconcile` is bookkeeping over ids alone.
+            #
+            # ONE row per dispatch, forever: the other replica reconciles the
+            # same dispatch and every Retry press settles it again, and "how
+            # many dispatches finished" must not climb with the number of
+            # times an operator pressed a button. The counts below are a
+            # snapshot for convenience — the target ledger stays the
+            # authority, and after a retry it will disagree with this row.
+            await emit_product_event(
+                PE_DISPATCH_SENT,
+                user_id=dispatch.target_user_id,
+                actor_user_id=dispatch.created_by_user_id,
+                entity_type=PE_ENTITY_DISPATCH,
+                entity_id=dispatch_id,
+                payload={
+                    "mode": dispatch.mode,
+                    "audience": dispatch.audience,
+                    "target_count": summary["target_count"],
+                    "delivered_count": summary["delivered_count"],
+                    "chat_delivered_count": summary["chat_delivered_count"],
+                    "no_agent_count": summary["no_agent_count"],
+                    "failed_count": summary["failed_count"],
+                },
+                dedupe_key=f"{PE_DISPATCH_SENT}:{dispatch_id}",
+            )
         # `no_agent` is logged beside `delivered` on purpose: it is the
         # half-delivery (banner, no chat card) that a single "delivered"
         # number used to hide, and the one thing a retry can still fix.
@@ -475,6 +565,7 @@ async def _deliver_one(
             chat_message_id=None, notification_id=notification_id,
             last_error=None,
         )
+        await _emit_delivered(dispatch, rec.user_id, CHAT_NO_AGENT, notification_id)
         return
 
     chat_message_id, last_error = await _agent_hop(
@@ -487,6 +578,51 @@ async def _deliver_one(
         chat_message_id=chat_message_id,
         notification_id=notification_id,
         last_error=last_error,
+    )
+    if last_error is None:
+        await _emit_delivered(dispatch, rec.user_id, CHAT_DELIVERED, notification_id)
+
+
+async def _emit_delivered(
+    dispatch: _DispatchSpec,
+    user_id: str,
+    chat_status: str,
+    notification_id: Optional[str],
+) -> None:
+    """One recipient was reached. Emitted AFTER `_finish_target` commits, so
+    the row can never describe a delivery the ledger does not agree with.
+
+    `chat_status` is part of the dedupe key, and that is the whole retry
+    story. A Retry press re-walks targets — three classes of them
+    (`admin/dispatch.py::retry_dispatch`) — so a key of (dispatch, user)
+    alone would make "recipients reached" climb every time an operator
+    pressed the button. With the outcome in the key, a retry that lands the
+    SAME outcome writes nothing, while the one case that is genuinely a
+    second delivery — `no_agent` upgraded to `delivered` once the tenant
+    container came back — is recorded as the second fact it is.
+
+    So: recipients reached is `COUNT(DISTINCT user_id)`; deliveries is
+    `COUNT(*)`; the two differ exactly by the upgrades, which is the number
+    a Retry button is judged on.
+    """
+    await emit_product_event(
+        PE_DISPATCH_DELIVERED,
+        user_id=user_id,
+        # No actor: nobody DID this. The operator's act was `dispatch_created`;
+        # this is the platform reaching one recipient, possibly minutes later
+        # down the drip.
+        actor_user_id=None,
+        entity_type=PE_ENTITY_DISPATCH,
+        entity_id=dispatch.id,
+        payload={
+            "mode": dispatch.mode,
+            "audience": dispatch.audience,
+            "chat_status": chat_status,
+            # The half-delivery this pair exists to name: a recipient with no
+            # live agent container gets the banner and no chat card.
+            "notified": notification_id is not None,
+        },
+        dedupe_key=f"{PE_DISPATCH_DELIVERED}:{dispatch.id}:{user_id}:{chat_status}",
     )
 
 
@@ -565,6 +701,12 @@ async def _ensure_notification(
                 else f"toup://chat?mission=admin:{dispatch.id}"
             ),
             "urgent": dispatch.urgent,
+            # NOT `data.sound` — that key is the ALARM-CLASS marker
+            # (`live_activity_service._is_alarm_row`), and setting it would
+            # turn every toned dispatch into a three-ring reminder alarm.
+            # The delivery lane reads `tone` and resolves the filename
+            # itself.
+            "tone": dispatch.tone,
         },
         priority=NQ_PRIORITY_HIGH if dispatch.urgent else NQ_PRIORITY_DEFAULT,
         scheduled_for=_drip_at(index, now),
@@ -833,6 +975,70 @@ async def summarize_targets(db: AsyncSession, dispatch_id: str) -> Dict[str, int
     }
 
 
+async def sweep_stalled_dispatches(db: AsyncSession, now: datetime) -> int:
+    """Move dispatches whose fan-out died to a terminal `failed`, with a
+    reason. Returns how many were swept.
+
+    `run_dispatch_fanout` writes `sending` at the top and only its own
+    `except` writes `failed`, so a worker that is OOM-killed, redeployed
+    or loses its replica writes NEITHER — the row reads `sending`
+    forever, and the panel tells the operator a message is on its way
+    that nothing is carrying. `_STUCK_CLAIM_MAX_AGE` reclaims stuck
+    TARGETS but only when a human presses Retry; nothing swept the parent.
+
+    Replica-safe by this module's one primitive: the UPDATE is a status
+    CAS (`WHERE status='sending'`), so both replicas may run it
+    concurrently and exactly one wins each row. No FOR UPDATE SKIP LOCKED
+    — no precedent in this repo and sqlite cannot model it.
+
+    `created_at` is the parent row's ONLY clock, and alone it would sweep
+    a retried old dispatch the instant its new fan-out set `sending`. The
+    NOT IN over recently-touched targets is what turns the test into
+    "nothing has moved": any live progress — a target being claimed or
+    finished, or a retry resetting one — holds the dispatch out of the
+    sweep, which is also why `_STALL_MAX_AGE` only has to cover one
+    target's delivery rather than a whole broadcast.
+
+    Targets are deliberately NOT terminated here. `status='failed'` on
+    the parent means the fan-out died; per-target outcomes are the
+    ledger's to state, and this sweep learned nothing about any
+    individual recipient.
+    """
+    cutoff = now - _STALL_MAX_AGE
+    moving = (
+        select(AdminDispatchTarget.dispatch_id)
+        .where(AdminDispatchTarget.updated_at >= cutoff)
+    )
+    result = await db.execute(
+        update(AdminDispatch)
+        .where(
+            # BOTH pre-terminal states, not just `sending`. A fan-out can die
+            # before it writes `sending` at all: `create_dispatch` and the
+            # retry route both commit `queued` and THEN `await
+            # spawn_dispatch_fanout()`, which is a bare `asyncio.create_task`
+            # in the API process. A redeploy in that window — the very
+            # scenario this sweep exists for — or a throw inside
+            # `run_dispatch_fanout` before its status UPDATE lands leaves the
+            # row `queued` forever with nobody walking it. Sweeping only
+            # `sending` fixed the second half of the failure and left the
+            # first, which is worse: it looks fixed.
+            AdminDispatch.status.in_([DISPATCH_QUEUED, DISPATCH_SENDING]),
+            AdminDispatch.created_at < cutoff,
+            AdminDispatch.id.notin_(moving),
+        )
+        .values(status=DISPATCH_FAILED, completed_at=now, last_error=_STALL_REASON)
+    )
+    await db.commit()
+
+    swept = int(result.rowcount or 0)
+    if swept:
+        logger.warning(
+            "[admin_dispatch] swept %d stalled dispatch(es) to failed — "
+            "no target progress in %s", swept, _STALL_MAX_AGE,
+        )
+    return swept
+
+
 async def _reconcile(db: AsyncSession, dispatch_id: str) -> Dict[str, Any]:
     """Recompute the parent's counters from the target rows and settle
     its status.
@@ -855,6 +1061,15 @@ async def _reconcile(db: AsyncSession, dispatch_id: str) -> Dict[str, Any]:
         "delivered_count": counts["delivered_count"],
         "read_count": counts["read_count"],
         "failed_count": counts["failed_count"],
+        # Cleared here, and this is the same one-row-two-vintages defect the
+        # Sent list had. The sweep can declare a fan-out dead that is in fact
+        # alive — its clock cannot see the window before the first target
+        # exists — and that worker then finishes normally and lands here. With
+        # `last_error` left alone the row rendered `sent`, every counter
+        # correct, carrying a red "the worker is gone, press Retry" for a
+        # delivery that had already completed. Whoever writes the outcome owns
+        # every field that describes it.
+        "last_error": None,
     }
     if unfinished:
         # The other replica still holds targets — it runs this same

@@ -64,7 +64,7 @@ async def _make_engine():
                 tokens_completion INTEGER, model_used VARCHAR(50),
                 memories_retrieved_json TEXT, processing_time_ms INTEGER,
                 metadata_json TEXT, embedding_json TEXT, embedding BLOB
-            )""",
+            , origin VARCHAR(16))""",
         ]:
             await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
     return engine

@@ -110,6 +110,29 @@ class Message(Base):
     # here lets SQLAlchemy actually read/write it.
     source: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
+    # WHO the message is FROM, as a party — not which surface produced it
+    # (`channel`) and not which feature (`source`). NULL means the ordinary
+    # case: the user and their agent talking. 'admin' means a human operator
+    # wrote it and the agent must never see it.
+    #
+    # This is a SECURITY BOUNDARY, not a rendering hint: `load_day_context`
+    # excludes 'admin' rows from the assembled LLM context, so an operator's
+    # words can never become instructions the agent reads. A real column
+    # rather than a `metadata_json` key precisely because it is a filter
+    # predicate — a security check that has to reach into JSON is one that
+    # eventually gets written differently in two places.
+    #
+    # 'agent' is reserved and deliberately unused today: an agent-initiated
+    # proactive message belongs in context, so it must be able to ride this
+    # same delivery path by writing a DIFFERENT origin and nothing else (see
+    # docs/AGENT_INITIATED_CONTACT.md). That is why the exclusion filters on
+    # the VALUE and never on "was this row written by the dispatch path".
+    #
+    # DB column added by `init_db()` ALTER (agent DBs have no alembic — see
+    # database.py `_alter_statements`); the ORM declaration here is what lets
+    # SQLAlchemy read and write it.
+    origin: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
+
     role: Mapped[str] = mapped_column(String(20))  # "user", "assistant", "system", "job"
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

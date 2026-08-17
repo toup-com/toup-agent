@@ -138,7 +138,7 @@ _MESSAGES_DDL = """
         metadata_json TEXT,
         embedding_json TEXT,
         embedding BLOB
-    )
+    , origin VARCHAR(16))
 """
 
 

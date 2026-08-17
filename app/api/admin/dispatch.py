@@ -13,8 +13,9 @@ Routes (mounted at settings.api_prefix, e.g. /api):
   GET  /admin/dispatch/{id}               — one dispatch + per-target delivery
   POST /admin/dispatch/{id}/retry         — re-queue everything unfinished
   GET  /admin/dispatch/threads            — users with an Admin thread
-  GET  /admin/dispatch/threads/{user_id}  — one thread (marks it admin-read)
+  GET  /admin/dispatch/threads/{user_id}  — one thread (read-only)
   POST /admin/dispatch/threads/{user_id}  — reply into a thread
+  POST /admin/dispatch/threads/{id}/read  — mark the user's replies admin-read
 
 EVERY route here takes ``Depends(require_admin)``. The ``/api/admin/`` prefix is
 a naming convention, not a guard — ``app/api/admin/system.py`` is mounted under
@@ -48,6 +49,7 @@ from sqlalchemy import and_, case, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.admin.deps import require_admin
+from app.api.tenant_proxy import agent_proxy_info, proxy_to_agent
 from app.config import settings
 from app.db import get_db, User
 from app.db.models import (
@@ -60,6 +62,8 @@ from app.db.models import (
     DISPATCH_AUDIENCE_ALL,
     DISPATCH_AUDIENCE_USER,
     DISPATCH_QUEUED,
+    PE_DISPATCH_CREATED,
+    PE_ENTITY_DISPATCH,
     TARGET_DONE,
     TARGET_FAILED,
     TARGET_PENDING,
@@ -67,6 +71,7 @@ from app.db.models import (
     THREAD_IN,
     THREAD_OUT,
 )
+from app.services import dispatch_tones
 from app.services.admin_dispatch_worker import (
     build_reply_notification,
     count_recipients,
@@ -74,6 +79,7 @@ from app.services.admin_dispatch_worker import (
     spawn_dispatch_fanout,
     summarize_targets,
 )
+from app.services.product_events import emit_product_event
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +129,30 @@ def _require_enabled() -> None:
         )
 
 
+def broadcast_allowed() -> bool:
+    """G-DISPATCH-BROADCAST. Default OFF — see ``config.py``."""
+    return bool(getattr(settings, "dispatch_broadcast_enabled", False))
+
+
+def _require_broadcast_allowed() -> None:
+    """Refuse ``audience='all'`` unless the flag is deliberately on.
+
+    Deliberately raised BEFORE the confirmation-word check, and deliberately
+    without naming that word. The two messages are read by an operator who has
+    just been stopped, and "send confirm='BROADCAST' to proceed" reads as an
+    instruction for getting past the thing that stopped them — which is exactly
+    wrong when the answer is that this deployment may not broadcast at all.
+    """
+    if not broadcast_allowed():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Broadcast to every account is disabled on this deployment. "
+                "Send to a single user, or see docs/DISPATCH_BROADCAST.md."
+            ),
+        )
+
+
 # ── Requests ─────────────────────────────────────────────────────────
 
 class DispatchCreate(BaseModel):
@@ -134,6 +164,25 @@ class DispatchCreate(BaseModel):
     urgent: bool = False
     sender_name: Optional[str] = Field(default=None, max_length=80)
     confirm: Optional[str] = Field(default=None, max_length=40)
+    # A catalogue id from `app/services/dispatch_tones.py`. Omitted = the
+    # system default.
+    tone: Optional[str] = Field(default=None, max_length=32)
+
+    @field_validator("tone")
+    @classmethod
+    def _tone_in_catalogue(cls, v: Optional[str]) -> Optional[str]:
+        """422 rather than a silent fallback to the default.
+
+        The read path collapses an unknown id (`dispatch_tones.normalize`),
+        which is right for a row whose tone was later retired — but on the
+        WRITE path a quiet collapse means an operator picks Knock, sees it
+        accepted, and the recipient gets the default. Every failure in this
+        area is already inaudible; this one at least can be loud.
+        """
+        v = (v or "").strip() or None
+        if not dispatch_tones.is_valid(v):
+            raise ValueError(f"unknown tone (expected one of: {', '.join(sorted(dispatch_tones.TONE_IDS))})")
+        return v
 
     @field_validator("title", "body")
     @classmethod
@@ -182,6 +231,9 @@ class AdminDispatchOut(BaseModel):
     title: str
     body: str
     urgent: bool
+    # Always a live catalogue id — never NULL, never a retired one (see
+    # `_dispatch_out`), so the panel can render it without a fallback.
+    tone: str
     status: str
     target_count: int
     # "Notified" — at least one surface landed on a target that did not fail.
@@ -194,9 +246,18 @@ class AdminDispatchOut(BaseModel):
     no_agent_count: int
     read_count: int
     failed_count: int
+    # Why the dispatch-level status is `failed`. The per-target `last_error`
+    # cannot answer it for the commonest failure — a worker that died before
+    # materialising a single target row.
+    last_error: Optional[str]
     created_at: Optional[str]
     completed_at: Optional[str]
     created_by_email: Optional[str]
+    # Recall audit (migration 091). `revoked_at` set is what makes the panel
+    # render this dispatch as recalled; the email is resolved like the
+    # creator's so the record names a person, not a uuid.
+    revoked_at: Optional[str] = None
+    revoked_by_email: Optional[str] = None
 
 
 class AdminDispatchTargetOut(BaseModel):
@@ -228,6 +289,10 @@ class AdminThreadMessageOut(BaseModel):
     # hardcoded "Toup", web showed none) and the same operator appeared to the
     # user as two different parties.
     sender_name: Optional[str]
+    # Deletion state (migration 092). Both null on a live message. Optional so
+    # a replica predating the migration still validates.
+    hidden_from_user_at: Optional[str] = None
+    deleted_at: Optional[str] = None
 
 
 class AdminThreadSummaryOut(BaseModel):
@@ -238,6 +303,11 @@ class AdminThreadSummaryOut(BaseModel):
     last_body: Optional[str]
     unread_in: int
     total: int
+    # Who spoke last. The sidebar prefixes the operator's own words with "You: "
+    # — without this the list reads as if the user said everything, which is the
+    # opposite of the one thing an operator scans this column for: who is
+    # waiting on whom.
+    last_direction: Optional[str] = None
 
 
 class ThreadUserOut(BaseModel):
@@ -251,6 +321,11 @@ class DispatchPreviewOut(BaseModel):
     audience: str
     recipient_count: int
     with_agent_count: int
+    # G-DISPATCH-BROADCAST, reported rather than assumed. The compose form must
+    # not carry its own copy of this: a client-side constant says "disabled"
+    # while the API happily accepts the send, and the first person to find out
+    # is every user on the platform.
+    broadcast_enabled: bool = False
 
 
 def thread_message_out(m: AdminThreadMessage) -> AdminThreadMessageOut:
@@ -271,6 +346,12 @@ def thread_message_out(m: AdminThreadMessage) -> AdminThreadMessageOut:
             if m.direction == THREAD_OUT
             else None
         ),
+        # The OPERATOR's view keeps deleted rows and marks them. Hiding them
+        # here would mean an operator who deletes a message loses the record
+        # that they sent it — which is the moment that record matters most.
+        # The user's view filters them out entirely (`notices.py`).
+        hidden_from_user_at=_utc_iso(getattr(m, "hidden_from_user_at", None)),
+        deleted_at=_utc_iso(getattr(m, "deleted_at", None)),
     )
 
 
@@ -280,6 +361,10 @@ def _dispatch_out(
     target_email: Optional[str],
     created_by_email: Optional[str],
     ledger: Optional[Dict[str, int]] = None,
+    # Defaulted, unlike the two above: only the routes that already resolve
+    # emails pass it, and a recall is rare enough that the list route should
+    # not grow a third id into its `_emails_for` batch for every row.
+    revoked_by_email: Optional[str] = None,
 ) -> AdminDispatchOut:
     """Serialise a dispatch, preferring the TARGET LEDGER over the parent's
     cached counters wherever the caller could afford to read it.
@@ -303,6 +388,11 @@ def _dispatch_out(
         title=d.title,
         body=d.body,
         urgent=bool(d.urgent),
+        # NULL is every row written before 088; a retired id is one written
+        # before the catalogue was trimmed. Both mean "the system default"
+        # to the recipient, so both say so here rather than making each
+        # reader re-derive it.
+        tone=dispatch_tones.normalize(d.tone),
         status=d.status,
         target_count=int(ledger.get("target_count", d.target_count or 0)),
         delivered_count=int(ledger.get("delivered_count", d.delivered_count or 0)),
@@ -310,22 +400,32 @@ def _dispatch_out(
         no_agent_count=int(ledger.get("no_agent_count", 0)),
         read_count=int(ledger.get("read_count", d.read_count or 0)),
         failed_count=int(ledger.get("failed_count", d.failed_count or 0)),
+        last_error=d.last_error,
         created_at=_utc_iso(d.created_at),
         completed_at=_utc_iso(d.completed_at),
         created_by_email=created_by_email,
+        revoked_at=_utc_iso(getattr(d, "revoked_at", None)),
+        revoked_by_email=revoked_by_email,
     )
 
 
 async def _ledger_subset(db: AsyncSession, dispatch_ids: List[str]) -> Dict[str, Dict[str, int]]:
-    """``{dispatch_id: {chat_delivered_count, no_agent_count, read_count}}`` in
-    ONE query, for the list view.
+    """Every count ``summarize_targets`` defines, off the target ledger, in ONE
+    query — for the list view.
 
     ``summarize_targets`` is the definition of record and the detail route uses
     it directly, but it is seven scalar reads for ONE dispatch — 1400
-    round-trips across a 200-row list. Only the three trivially-stable
-    predicates are restated here; ``delivered_count`` and ``failed_count``
-    deliberately are NOT (delivered is not a ``chat_status`` test) and keep
-    coming from the reconciled columns.
+    round-trips across a 200-row list. So the predicates are restated here, and
+    they mirror it EXACTLY (a FAILED target is never also delivered; a
+    `retracted` card still landed).
+
+    Every counter or none: this used to recompute only the three
+    ``chat_status``-shaped ones and leave ``target_count`` /
+    ``delivered_count`` / ``failed_count`` on the parent's cached columns,
+    which only the fan-out's ``_reconcile`` writes. One row then carried two
+    vintages — a live ``read_count`` beside a stale ``0/0`` for a dispatch that
+    had already delivered — and the operator reads ``0/0`` as "nothing was
+    sent".
     """
     ids = [i for i in dispatch_ids if i]
     if not ids:
@@ -337,21 +437,37 @@ async def _ledger_subset(db: AsyncSession, dispatch_ids: List[str]) -> Dict[str,
     rows = (await db.execute(
         select(
             AdminDispatchTarget.dispatch_id,
+            func.count(),
+            # NOT a plain `chat_status` test: `notification_id` is non-null
+            # whether or not the agent hop after it succeeded, so without the
+            # state gate a broadcast that reached hundreds of banners and no
+            # chats reports itself fully delivered.
+            _sum(and_(
+                AdminDispatchTarget.state != TARGET_FAILED,
+                or_(
+                    AdminDispatchTarget.chat_status == CHAT_DELIVERED,
+                    AdminDispatchTarget.notification_id.isnot(None),
+                ),
+            )),
             # `retracted` counts as landed — it is what a `once` card BECOMES
             # once the user reads it, so excluding it would make "In chat" fall
             # as the dispatch succeeds. Mirrors summarize_targets.
             _sum(AdminDispatchTarget.chat_status.in_([CHAT_DELIVERED, CHAT_RETRACTED])),
             _sum(AdminDispatchTarget.chat_status == CHAT_NO_AGENT),
             _sum(AdminDispatchTarget.read_at.isnot(None)),
+            _sum(AdminDispatchTarget.state == TARGET_FAILED),
         )
         .where(AdminDispatchTarget.dispatch_id.in_(ids))
         .group_by(AdminDispatchTarget.dispatch_id)
     )).all()
     return {
         r[0]: {
-            "chat_delivered_count": int(r[1] or 0),
-            "no_agent_count": int(r[2] or 0),
-            "read_count": int(r[3] or 0),
+            "target_count": int(r[1] or 0),
+            "delivered_count": int(r[2] or 0),
+            "chat_delivered_count": int(r[3] or 0),
+            "no_agent_count": int(r[4] or 0),
+            "read_count": int(r[5] or 0),
+            "failed_count": int(r[6] or 0),
         }
         for r in rows
     }
@@ -379,11 +495,17 @@ async def create_dispatch(
     """Queue a dispatch and hand it to the fan-out worker."""
     _require_enabled()
 
-    if body.audience == DISPATCH_AUDIENCE_ALL and body.confirm != BROADCAST_CONFIRM:
-        raise HTTPException(
-            status_code=400,
-            detail=f"A broadcast is unrecallable — send confirm='{BROADCAST_CONFIRM}' to proceed.",
-        )
+    if body.audience == DISPATCH_AUDIENCE_ALL:
+        # Flag first, word second. The flag is the rail; the word is only a
+        # deliberation prompt for a deployment that is already allowed to
+        # broadcast. Reversing these two leaks the word to a caller who may
+        # not use it either way.
+        _require_broadcast_allowed()
+        if body.confirm != BROADCAST_CONFIRM:
+            raise HTTPException(
+                status_code=400,
+                detail=f"A broadcast is unrecallable — send confirm='{BROADCAST_CONFIRM}' to proceed.",
+            )
 
     target_email: Optional[str] = None
     if body.audience == DISPATCH_AUDIENCE_USER:
@@ -406,6 +528,7 @@ async def create_dispatch(
         title=body.title,
         body=body.body,
         urgent=bool(body.urgent),
+        tone=body.tone,
         status=DISPATCH_QUEUED,
         created_at=datetime.utcnow(),
     )
@@ -419,6 +542,29 @@ async def create_dispatch(
     )}
     await db.commit()
 
+    # AFTER the commit (the fact is "a dispatch row exists", and before the
+    # commit it might not) and BEFORE the spawn: `emit_product_event` awaits
+    # IO, so a fan-out task created first could deliver — and record its
+    # `dispatch_delivered` rows — while this one is still in flight, putting
+    # the funnel's first step after its second.
+    #
+    # `user_id` is None for a broadcast: there is no single subject. The
+    # operator is the ACTOR either way.
+    await emit_product_event(
+        PE_DISPATCH_CREATED,
+        user_id=dispatch.target_user_id,
+        actor_user_id=admin.id,
+        entity_type=PE_ENTITY_DISPATCH,
+        entity_id=dispatch.id,
+        payload={
+            "mode": dispatch.mode,
+            "audience": dispatch.audience,
+            "urgent": bool(dispatch.urgent),
+        },
+        dedupe_key=f"{PE_DISPATCH_CREATED}:{dispatch.id}",
+        occurred_at=dispatch.created_at,
+    )
+
     # AFTER the commit: the worker opens its own session and would not see an
     # uncommitted row. The await only creates the task — the fan-out itself
     # (N agent hops) does not run on this request.
@@ -426,6 +572,24 @@ async def create_dispatch(
     logger.info("[admin-dispatch] %s queued: mode=%s audience=%s by %s",
                 dispatch.id[:8], dispatch.mode, dispatch.audience, admin.id[:8])
     return resp
+
+
+@router.get("/tones")
+async def list_tones(_admin: User = Depends(require_admin)) -> Dict[str, object]:
+    """The tone catalogue the picker renders.
+
+    Served rather than duplicated in the panel so the list an operator can
+    choose from and the list `create_dispatch` validates against are the same
+    object. A second literal in TypeScript is how a panel comes to offer a
+    tone the app does not bundle — and the symptom on device is the system
+    default playing, which is indistinguishable from a correct default.
+
+    Declared ABOVE ``/{dispatch_id}`` so the literal path wins the match (same
+    ordering rule as ``/threads`` and ``/preview``). Not gated by
+    ``_require_enabled``: it produces nothing, and a picker that 503s while
+    the kill switch is on would make the composer unreadable for no gain.
+    """
+    return {"tones": dispatch_tones.catalogue(), "default": dispatch_tones.TONE_DEFAULT}
 
 
 @router.get("/preview", response_model=DispatchPreviewOut)
@@ -461,6 +625,7 @@ async def preview_recipients(
         audience=audience,
         recipient_count=int(recipient_count),
         with_agent_count=int(with_agent_count),
+        broadcast_enabled=broadcast_allowed(),
     )
 
 
@@ -471,11 +636,23 @@ async def preview_recipients(
 @router.get("/threads")
 async def list_threads(
     limit: int = Query(default=200, ge=1, le=500),
+    query: Optional[str] = Query(default=None, max_length=200),
+    cursor: Optional[str] = Query(default=None, max_length=40),
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Every user with an Admin thread, newest activity first."""
-    agg_rows = (await db.execute(
+    """Every user with an Admin thread, newest activity first.
+
+    ``query`` searches the person AND what was said — email, name, and message
+    bodies — because an operator looking for a conversation remembers one or the
+    other and cannot know which field will hit.
+
+    ``cursor`` is the ``last_message_at`` of the last row you were given, and the
+    page is strictly older than it. Keyset, not OFFSET: this is a GROUP BY over
+    every message in the system, so an offset scan re-aggregates the whole table
+    to skip rows it already computed.
+    """
+    agg = (
         select(
             AdminThreadMessage.user_id,
             func.count().label("total"),
@@ -492,44 +669,91 @@ async def list_threads(
         .group_by(AdminThreadMessage.user_id)
         .order_by(func.max(AdminThreadMessage.created_at).desc())
         .limit(limit)
-    )).all()
+    )
+
+    q = (query or "").strip()
+    if q:
+        like = f"%{q}%"
+        # Two ways in, unioned as a user-id set. The body arm is a separate
+        # subquery rather than a WHERE on the aggregate: filtering the rows being
+        # grouped would make `total` count only the MATCHING messages, so a
+        # search for one word would rewrite every conversation's length.
+        by_body = select(AdminThreadMessage.user_id).where(
+            AdminThreadMessage.body.ilike(like)
+        )
+        by_person = select(User.id).where(
+            or_(User.email.ilike(like), User.name.ilike(like))
+        )
+        agg = agg.having(
+            or_(
+                AdminThreadMessage.user_id.in_(by_body),
+                AdminThreadMessage.user_id.in_(by_person),
+            )
+        )
+
+    if cursor:
+        # A bad cursor is the client's bug, and silently serving page 1 forever
+        # is an infinite scroll that never advances. Say so.
+        try:
+            cursor_dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(422, "cursor must be an ISO-8601 timestamp")
+        if cursor_dt.tzinfo is not None:
+            cursor_dt = cursor_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        agg = agg.having(func.max(AdminThreadMessage.created_at) < cursor_dt)
+
+    agg_rows = (await db.execute(agg)).all()
 
     if not agg_rows:
-        return {"threads": []}
+        return {"threads": [], "next_cursor": None}
 
     # Last body per user in ONE query — a persistent broadcast gives every user
     # a thread, so a per-user follow-up read is an N+1 over the whole user base.
+    # Scoped to the page's ids: unscoped it re-aggregated every message in the
+    # system to decorate at most `limit` rows.
+    page_ids = [r.user_id for r in agg_rows]
     latest = (
         select(
             AdminThreadMessage.user_id.label("user_id"),
             func.max(AdminThreadMessage.created_at).label("last_at"),
         )
+        .where(AdminThreadMessage.user_id.in_(page_ids))
         .group_by(AdminThreadMessage.user_id)
         .subquery()
     )
     body_rows = (await db.execute(
-        select(AdminThreadMessage.user_id, AdminThreadMessage.body)
+        select(
+            AdminThreadMessage.user_id,
+            AdminThreadMessage.body,
+            AdminThreadMessage.direction,
+        )
         .join(
             latest,
             (AdminThreadMessage.user_id == latest.c.user_id)
             & (AdminThreadMessage.created_at == latest.c.last_at),
         )
     )).all()
-    last_body = {r.user_id: r.body for r in body_rows}
+    last_row = {r.user_id: (r.body, r.direction) for r in body_rows}
 
-    users = await _emails_for(db, {r.user_id for r in agg_rows})
-    return {"threads": [
+    users = await _emails_for(db, set(page_ids))
+    threads = [
         AdminThreadSummaryOut(
             user_id=r.user_id,
             email=users.get(r.user_id, (None, None))[0],
             name=users.get(r.user_id, (None, None))[1],
             last_message_at=_utc_iso(r.last_at),
-            last_body=last_body.get(r.user_id),
+            last_body=last_row.get(r.user_id, (None, None))[0],
+            last_direction=last_row.get(r.user_id, (None, None))[1],
             unread_in=int(r.unread_in or 0),
             total=int(r.total or 0),
         )
         for r in agg_rows
-    ]}
+    ]
+    # Only when the page was FULL. A short page is the end of the list, and
+    # handing back a cursor there makes the client fetch one empty page per
+    # scroll forever.
+    next_cursor = threads[-1].last_message_at if len(agg_rows) >= limit else None
+    return {"threads": threads, "next_cursor": next_cursor}
 
 
 @router.get("/threads/{user_id}")
@@ -539,7 +763,18 @@ async def get_thread(
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """One user's Admin thread, oldest→newest. Marks the user's replies read."""
+    """One user's Admin thread, oldest→newest. READ-ONLY.
+
+    This used to stamp `admin_read_at` on every unread reply as a side effect,
+    which was survivable only while a human pressing a row was the sole caller.
+    The console now polls the open thread every few seconds, so the side effect
+    would clear the operator's reply queue while the window was blurred and
+    nobody had read anything — and `admin_read_at` is the only record that a
+    reply was ever seen, so there is nothing to recover it from.
+
+    Marking read is `POST /threads/{user_id}/read`, which the client calls only
+    when the thread is open AND the document has focus.
+    """
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user:
         raise HTTPException(404, "User not found")
@@ -551,6 +786,37 @@ async def get_thread(
         .limit(limit)
     )).scalars().all()
 
+    return {
+        "user": ThreadUserOut(id=user.id, email=user.email, name=user.name),
+        "messages": [thread_message_out(m) for m in reversed(rows)],
+        # The count the sidebar badge and the "New messages" divider both key
+        # off. Derived here rather than recomputed client-side from `messages`,
+        # which is one page and would under-report a long thread.
+        "unread_in": sum(
+            1 for m in rows
+            if m.direction == THREAD_IN and m.admin_read_at is None
+        ),
+    }
+
+
+@router.post("/threads/{user_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+async def mark_thread_admin_read(
+    user_id: str,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record that an operator has actually looked at this user's replies.
+
+    Split out of the GET above (see its docstring). Blind UPDATE with no
+    prior SELECT: two admins opening the same thread on two replicas race, and
+    stamping a timestamp onto rows that already carry one is a no-op by the
+    `IS NULL` predicate rather than a conflict to resolve.
+    """
+    if not (await db.execute(
+        select(User.id).where(User.id == user_id)
+    )).scalar_one_or_none():
+        raise HTTPException(404, "User not found")
+
     await db.execute(
         sa_update(AdminThreadMessage)
         .where(
@@ -560,14 +826,7 @@ async def get_thread(
         )
         .values(admin_read_at=datetime.utcnow())
     )
-
-    # Build the response BEFORE commit — pgbouncer txn-mode rule.
-    resp = {
-        "user": ThreadUserOut(id=user.id, email=user.email, name=user.name),
-        "messages": [thread_message_out(m) for m in reversed(rows)],
-    }
     await db.commit()
-    return resp
 
 
 @router.post("/threads/{user_id}", status_code=201)
@@ -655,15 +914,22 @@ async def list_dispatches(
         {d.target_user_id for d in rows} | {d.created_by_user_id for d in rows},
     )
     ledgers = await _ledger_subset(db, [d.id for d in rows])
-    return {"dispatches": [
-        _dispatch_out(
-            d,
-            target_email=users.get(d.target_user_id, (None, None))[0],
-            created_by_email=users.get(d.created_by_user_id, (None, None))[0],
-            ledger=ledgers.get(d.id),
-        )
-        for d in rows
-    ]}
+    return {
+        "dispatches": [
+            _dispatch_out(
+                d,
+                target_email=users.get(d.target_user_id, (None, None))[0],
+                created_by_email=users.get(d.created_by_user_id, (None, None))[0],
+                ledger=ledgers.get(d.id),
+            )
+            for d in rows
+        ],
+        # Reported here as well as on /preview because the compose form loads
+        # this on mount and /preview only when 'Everyone' is already selected.
+        # An option that is going to be refused has to read as unavailable
+        # BEFORE it is clicked, not after a round-trip.
+        "broadcast_enabled": broadcast_allowed(),
+    }
 
 
 @router.get("/{dispatch_id}")
@@ -787,6 +1053,10 @@ async def retry_dispatch(
     dispatch.failed_count = 0
     dispatch.status = DISPATCH_QUEUED
     dispatch.completed_at = None
+    # The re-spawned fan-out clears this too, but not before this response is
+    # built — and a row that reads `Queued` under "the worker is gone" is the
+    # panel contradicting itself at the exact moment the operator acted on it.
+    dispatch.last_error = None
 
     users = await _emails_for(db, {dispatch.target_user_id, dispatch.created_by_user_id})
     ledger = await summarize_targets(db, dispatch_id)
@@ -803,3 +1073,192 @@ async def retry_dispatch(
 
     await spawn_dispatch_fanout(dispatch_id)
     return resp
+
+
+# The tombstone body. A `both` delete clears the text — the point is that the
+# words are gone — but the ROW stays, so the thread does not silently lose a
+# turn and the reply above it stops making sense.
+DELETED_BODY = "This message was deleted."
+
+
+@router.delete("/threads/{user_id}/messages/{message_id}", status_code=200)
+async def delete_thread_message(
+    user_id: str,
+    message_id: str,
+    scope: str = Query(default="theirs", pattern="^(theirs|both)$"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Take a thread message back — from THEM, or from both sides.
+
+    Two scopes, because "delete" means two different things and an operator has
+    to be able to say which:
+
+      theirs  the message stops being visible to the person it was sent to.
+              The operator's thread keeps it, marked. This is almost always
+              what is wanted: unsend the words, keep the record.
+      both    nobody sees the words. The body is replaced with a tombstone and
+              the row survives, so the conversation does not lose a turn and
+              whatever was said next still has something to follow.
+
+    NEITHER hard-deletes. A thread is a conversation between two people and one
+    of them cannot un-remember it, so pretending the row never existed is a
+    story the database tells and reality does not. Keeping the row is also what
+    preserves the operator's own audit trail — needed most precisely when a
+    message was sent by mistake.
+
+    An operator may delete EITHER direction. Removing a user's own reply is a
+    real need (someone pastes a password into a support thread) and the
+    asymmetry would be arbitrary.
+
+    NOT gated on ``_require_enabled``: that switch stops new dispatches being
+    composed. A kill switch that also prevented taking back what already went
+    out would be exactly backwards.
+    """
+    row = (await db.execute(
+        select(AdminThreadMessage).where(
+            AdminThreadMessage.id == message_id,
+            # Scoped to the user whose thread this is, not just the id: a
+            # message id is a uuid, but the route reads as "this user's
+            # thread" and a mismatch should 404 rather than silently reach
+            # into someone else's conversation.
+            AdminThreadMessage.user_id == user_id,
+        )
+    )).scalars().first()
+    if row is None:
+        raise HTTPException(404, "Message not found in this thread")
+
+    now = datetime.utcnow()
+    if scope == "both":
+        # Idempotent: deleting an already-deleted message must not overwrite
+        # the tombstone with a second one, nor re-stamp who did it.
+        if row.deleted_at is None:
+            row.deleted_at = now
+            row.deleted_by_user_id = admin.id
+            row.body = DELETED_BODY
+    else:
+        if row.hidden_from_user_at is None:
+            row.hidden_from_user_at = now
+            row.deleted_by_user_id = admin.id
+
+    resp = {"message": thread_message_out(row), "scope": scope}
+    await db.commit()
+    logger.info("[admin-dispatch] thread message %s deleted (%s) by %s",
+                message_id[:8], scope, admin.id[:8])
+    return resp
+
+
+@router.post("/{dispatch_id}/revoke")
+async def revoke_dispatch(
+    dispatch_id: str,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Recall the CARD from every recipient's chat. The notification stands.
+
+    This is the honest half of "unrecallable". Two surfaces were always
+    delivered and they are recallable to different degrees:
+
+      • the in-chat card — a row in the tenant's DB and a live WS frame, both
+        of which we own and can take back at any time, for either mode;
+      • the notification — already on a lock screen. Nothing un-sends it, and
+        this route does not pretend to.
+
+    The compose form used to flatten both into "Cannot be recalled", which is
+    the wrong half to believe: an operator who has just sent the wrong body to
+    everyone assumes there is nothing to be done and does nothing, when the
+    thing most people will actually re-read — the card sitting in their chat —
+    could have been gone in seconds.
+
+    Mechanically this is the SAME tenant hop a `once` notice already makes when
+    its reader acks it (`notices.py::mark_notice_read` →
+    `POST /internal/admin-notice/retract`), applied to every target and driven
+    by the operator instead of the reader. No new delivery path — R4, and the
+    v2 brief's "no second pipeline".
+
+    Best-effort PER TARGET, and deliberately not transactional across them: a
+    thousand-recipient broadcast must not lose 999 recalls because one tenant
+    container is down. Failures are recorded on the target and the count comes
+    back, so the operator learns "930 of 1000" rather than "done".
+    """
+    _require_enabled()
+    dispatch = await db.get(AdminDispatch, dispatch_id)
+    if not dispatch:
+        raise HTTPException(404, "Dispatch not found")
+
+    # Only the targets that HAVE a card. `no_agent` never got one written, and
+    # `retracted` already gave theirs up — re-hopping either is a round trip
+    # per recipient for a row we know is not there.
+    rows = (await db.execute(
+        select(AdminDispatchTarget.id, AdminDispatchTarget.user_id)
+        .where(
+            AdminDispatchTarget.dispatch_id == dispatch_id,
+            AdminDispatchTarget.chat_status == CHAT_DELIVERED,
+        )
+    )).all()
+
+    # Stamp the audit BEFORE the hops. They take a round trip each and the
+    # operator's intent is a fact the moment they press the button — a crash
+    # halfway through must leave "this was recalled at 02:41 by X", not a
+    # dispatch that looks untouched while half its cards are gone.
+    now = datetime.utcnow()
+    dispatch.revoked_at = now
+    dispatch.revoked_by_user_id = _admin.id
+    await db.commit()
+
+    revoked = 0
+    failed: List[str] = []
+    for target_id, user_id in rows:
+        info = await agent_proxy_info(user_id, db)
+        if info is None:
+            # No reachable agent. The card is still in their tenant DB, so
+            # this is NOT a recall — record it and let a later press retry.
+            failed.append(user_id)
+            await db.execute(
+                sa_update(AdminDispatchTarget)
+                .where(AdminDispatchTarget.id == target_id)
+                .values(last_error="revoke: agent unreachable", updated_at=now)
+            )
+            continue
+        agent_url, agent_api_key = info
+        try:
+            await proxy_to_agent(
+                agent_url, agent_api_key, "internal/admin-notice/retract", "POST",
+                json_body={"user_id": user_id, "dispatch_id": dispatch_id},
+            )
+        except Exception as e:  # noqa: BLE001 — recorded on the target
+            failed.append(user_id)
+            await db.execute(
+                sa_update(AdminDispatchTarget)
+                .where(AdminDispatchTarget.id == target_id)
+                .values(last_error=f"revoke failed: {type(e).__name__}: {e}"[:500],
+                        updated_at=now)
+            )
+            continue
+        revoked += 1
+        await db.execute(
+            sa_update(AdminDispatchTarget)
+            .where(AdminDispatchTarget.id == target_id)
+            .values(chat_status=CHAT_RETRACTED, last_error=None, updated_at=now)
+        )
+
+    await db.commit()
+    logger.info("[admin-dispatch] %s revoked by %s: %d/%d cards, %d failed",
+                dispatch_id[:8], _admin.id[:8], revoked, len(rows), len(failed))
+
+    users = await _emails_for(db, {
+        dispatch.target_user_id, dispatch.created_by_user_id, dispatch.revoked_by_user_id,
+    })
+    ledger = await summarize_targets(db, dispatch_id)
+    return {
+        "dispatch": _dispatch_out(
+            dispatch,
+            target_email=users.get(dispatch.target_user_id, (None, None))[0],
+            created_by_email=users.get(dispatch.created_by_user_id, (None, None))[0],
+            ledger=ledger,
+            revoked_by_email=users.get(dispatch.revoked_by_user_id, (None, None))[0],
+        ),
+        "revoked": revoked,
+        "eligible": len(rows),
+        "failed": len(failed),
+    }

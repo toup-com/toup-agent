@@ -790,3 +790,130 @@ async def test_agent_context_cannot_see_the_notice(owner_id, monkeypatch):
         (m.get("channel") == "admin") or (m.get("source") == "admin_dispatch")
         for m in ctx["raw_messages"]
     ), ctx["raw_messages"]
+
+
+# ── 8b. the boundary that survives agent-initiated contact (R2 / §5) ──
+#
+# The test above passes on the NULL day_chat_id ALONE — it cannot tell whether
+# the origin filter works, because the row it writes would be excluded either
+# way. That is fine as a pin on today's behaviour and useless as a pin on
+# tomorrow's: agent-initiated contact needs a REAL day so the agent's own
+# proactive message appears in its context, and on that day the structural
+# guard stops covering this case and only `Message.origin` does.
+#
+# So these three write rows WITH a real day_chat_id, which is the only way to
+# observe the origin predicate at all.
+
+
+async def _write_with_origin(
+    user_id: str, day_chat_id: str, content: str, origin,
+) -> str:
+    """An assistant row in TODAY's day chat, carrying an explicit origin.
+
+    Deliberately not `_write` (the production writer), which always sets
+    day_chat_id=None — that is the very guard we are trying to look past.
+    """
+    from app.db import async_session_maker
+    from app.db.models import Conversation, Message
+
+    conv_id = str(uuid.uuid4())
+    msg_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(Conversation(
+            id=conv_id, user_id=user_id, day_chat_id=day_chat_id,
+            channel="web", title="Web",
+        ))
+        db.add(Message(
+            id=msg_id, conversation_id=conv_id, day_chat_id=day_chat_id,
+            role="assistant", content=content, channel="web", origin=origin,
+        ))
+        await db.commit()
+    return msg_id
+
+
+@pytest.mark.asyncio
+async def test_admin_origin_is_excluded_even_with_a_real_day_chat(owner_id):
+    """R2, on the predicate that will still be standing later.
+
+    An `origin='admin'` row sitting in the day chat like any other message
+    must not reach the model. If this fails, an operator's words are
+    instructions — prompt injection with a human author.
+    """
+    from app.agent.day_context_loader import load_day_context
+    from app.db import async_session_maker
+    from app.db.models import ORIGIN_ADMIN
+
+    day_chat_id = await _today_day_chat_id(owner_id)
+    await _write_ordinary_message(owner_id, day_chat_id, "ORDINARY-SENTINEL")
+    await _write_with_origin(
+        owner_id, day_chat_id, "ADMIN-ORIGIN-SENTINEL", ORIGIN_ADMIN,
+    )
+
+    async with async_session_maker() as db:
+        ctx = await load_day_context(db, day_chat_id)
+
+    blob = json.dumps(ctx["messages"]) + json.dumps(ctx["raw_messages"])
+    assert "ORDINARY-SENTINEL" in blob, (
+        "sanity: the control must be visible, or this passes for the wrong reason"
+    )
+    assert "ADMIN-ORIGIN-SENTINEL" not in blob, (
+        "an origin='admin' row reached the agent's context. The NULL-day guard "
+        "does NOT cover this row — day_chat_id is set — so the origin predicate "
+        "in load_day_context is the only thing standing here."
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_admin_origin_would_pass_the_filter(owner_id):
+    """The companion the brief asks for, and it is not ceremony.
+
+    Without it, `WHERE false` would pass the test above. More to the point:
+    an agent-initiated proactive message is the agent's OWN prior utterance,
+    so excluding it makes the agent contradict itself a turn later. The
+    boundary has to be narrow, and this is what pins the narrowness.
+    """
+    from app.agent.day_context_loader import load_day_context
+    from app.db import async_session_maker
+    from app.db.models import ORIGIN_AGENT
+
+    day_chat_id = await _today_day_chat_id(owner_id)
+    await _write_with_origin(
+        owner_id, day_chat_id, "AGENT-ORIGIN-SENTINEL", ORIGIN_AGENT,
+    )
+
+    async with async_session_maker() as db:
+        ctx = await load_day_context(db, day_chat_id)
+
+    blob = json.dumps(ctx["messages"]) + json.dumps(ctx["raw_messages"])
+    assert "AGENT-ORIGIN-SENTINEL" in blob, (
+        "origin='agent' was filtered out. The exclusion must name the admin "
+        "party specifically — an agent's own proactive message belongs in its "
+        "context, and this is the extension point §5 exists to protect."
+    )
+
+
+@pytest.mark.asyncio
+async def test_null_origin_rows_still_reach_context(owner_id):
+    """Every message written before this column existed has origin NULL, and
+    in SQL `origin != 'admin'` is NULL — not TRUE — for those rows.
+
+    A bare inequality would therefore drop the ENTIRE history of every user
+    on the deploy that added the column, silently, with the agent simply
+    losing its memory of the day. That is why the predicate is written as
+    `origin IS NULL OR origin NOT IN (...)`, and this is the test that fails
+    if someone simplifies it.
+    """
+    from app.agent.day_context_loader import load_day_context
+    from app.db import async_session_maker
+
+    day_chat_id = await _today_day_chat_id(owner_id)
+    await _write_with_origin(owner_id, day_chat_id, "LEGACY-NULL-SENTINEL", None)
+
+    async with async_session_maker() as db:
+        ctx = await load_day_context(db, day_chat_id)
+
+    blob = json.dumps(ctx["messages"]) + json.dumps(ctx["raw_messages"])
+    assert "LEGACY-NULL-SENTINEL" in blob, (
+        "a NULL-origin row was excluded — that is every message predating the "
+        "column, i.e. all existing history. Check the IS NULL arm."
+    )

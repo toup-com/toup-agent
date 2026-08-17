@@ -731,6 +731,18 @@ async def init_db():
         # `messages.channel` already exists (added by the time-channel-fix PR
         # above) and routine writes will set it to "routine".
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source VARCHAR(50)",
+        # Who the message is FROM as a PARTY — 'admin' for an operator notice
+        # (Admin Dispatch), NULL for the ordinary user↔agent case. This is the
+        # predicate `load_day_context` uses to keep an operator's words out of
+        # the assembled LLM context, so it is a security boundary and not a
+        # rendering hint. Indexed because that filter runs on every turn.
+        #
+        # Belongs HERE and not in alembic: `messages` is AGENT_ONLY, agent DBs
+        # self-heal their columns through this list, and a tenant that has
+        # never seen the column must acquire it on the next boot rather than
+        # failing every INSERT that names it.
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS origin VARCHAR(16)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_origin ON messages (origin)",
         # Routines generalised from email-only → arbitrary scheduled agent
         # tasks (2026-05-12). `name` is user-visible; `prompt_text` is the
         # NL prompt for `kind='agent_task'`. Nullable for existing rows.

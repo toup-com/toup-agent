@@ -295,6 +295,24 @@ class Settings(BaseSettings):
     # new enters the announcement lane. In-flight dispatches are unaffected
     # — a broadcast already fanned out is unrecallable either way.
     admin_dispatch_enabled: bool = True
+    # G-DISPATCH-BROADCAST. Separate from the switch above and DEFAULT OFF:
+    # that one asks "may operators send at all", this one asks "may a single
+    # click reach every account on the platform". They are different blast
+    # radii and must not share a flag.
+    #
+    # Until this is deliberately turned on, `audience='all'` is refused by
+    # the API. What guarded it before was a typed confirmation word, which is
+    # a speed bump inside the session that is already authenticated as an
+    # admin — it cannot stop the mistake it exists for, because the operator
+    # types it as part of the same intent that was wrong. A flag is out of
+    # band: flipping it is a deploy, by a different person, at a different
+    # time, with a record.
+    #
+    # Flip procedure is in docs/DISPATCH_BROADCAST.md — do not set this from
+    # a local .env and do not set it "just to test": a broadcast is
+    # unrecallable, so testing it IS sending it. Fan-out is exercised against
+    # a seeded cohort of real-but-internal accounts instead.
+    dispatch_broadcast_enabled: bool = False
     # The name on the card, in place of the agent's. The whole feature
     # rests on the user seeing that this is NOT their agent talking, so
     # this is operator-owned copy, not a per-dispatch afterthought.

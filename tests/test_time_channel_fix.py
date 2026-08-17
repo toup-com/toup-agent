@@ -216,7 +216,7 @@ async def test_message_channel_column_nullable_and_backfillable():
         ))
         await conn.execute(text(
             "CREATE TABLE messages (id VARCHAR(50) PRIMARY KEY, "
-            "conversation_id VARCHAR(36), channel VARCHAR(50), content TEXT)"
+            "conversation_id VARCHAR(36), channel VARCHAR(50), content TEXT, origin VARCHAR(16))"
         ))
         await conn.execute(text(
             "INSERT INTO conversations (id, channel) VALUES ('c1', 'mobile'), ('c2', NULL)"

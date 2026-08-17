@@ -51,7 +51,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import func, select, update as sa_update
 
 from app.api.admin.dispatch import router as dispatch_router
 from app.api.auth import get_current_user
@@ -73,6 +73,43 @@ from app.db.models import (
 
 
 BACKEND = Path(__file__).resolve().parent.parent
+
+
+# ── RUN_MODE precondition ─────────────────────────────────────────
+#
+# This suite is the PLATFORM half, and CI runs it under the job-level
+# RUN_MODE=platform (.github/workflows/test-backend.yml). Under `monolith` —
+# which is the DEFAULT, and therefore what a local `pytest` gets — the whole
+# retract path silently changes shape: `tenant_proxy.serving_locally()` is true
+# for monolith, so `agent_proxy_info` returns None for every user and every
+# test that proxies to a tenant fails.
+#
+# Those failures look exactly like real defects. On 2026-08-15 four of them
+# were reported as "main is red, verified by running it", used as a quality
+# baseline across five PRs, and cited as evidence for a defect that the tests
+# were not in fact demonstrating. CI was green throughout and was correct.
+#
+# So this is a hard failure, not a skip: a skip would let the same local run
+# report "29 passed" and still say nothing about the routes that matter.
+def _require_platform_run_mode() -> None:
+    from app.config import settings
+    mode = (settings.run_mode or "").strip().lower()
+    if mode != "platform":
+        raise RuntimeError(
+            f"test_admin_dispatch.py needs RUN_MODE=platform (got {mode!r}).\n"
+            "\n"
+            "Under 'monolith' or 'agent', tenant_proxy.serving_locally() is true, so\n"
+            "agent_proxy_info() returns None for every user and the retract/read-ack\n"
+            "tests fail for a reason that has nothing to do with the code under test.\n"
+            "\n"
+            "    RUN_MODE=platform pytest tests/test_admin_dispatch.py\n"
+            "\n"
+            "This is the exact invocation CI uses (test-backend.yml, 'Admin Dispatch\n"
+            "suite — platform half')."
+        )
+
+
+_require_platform_run_mode()
 
 
 # ── Harness ───────────────────────────────────────────────────────
@@ -236,7 +273,11 @@ async def test_admin_reaches_the_same_routes(dispatch_client):
 
     res = await client.get("/api/admin/dispatch")
     assert res.status_code == 200, res.text
-    assert res.json() == {"dispatches": []}
+    # Exact, not a subset — see this test's docstring. `broadcast_enabled` is
+    # part of the shape now: the compose form must read the rail off the SERVER
+    # rather than carrying its own copy, which would say "disabled" while the
+    # API happily accepted the send.
+    assert res.json() == {"dispatches": [], "broadcast_enabled": False}
 
 
 # ── 2. The broadcast confirmation gate ────────────────────────────
@@ -247,6 +288,13 @@ async def test_broadcast_requires_the_typed_confirmation(dispatch_client, monkey
     client, app = dispatch_client
     admin = await _mk_user(role="admin")
     app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    # G-DISPATCH-BROADCAST on, because this test is about the CONFIRMATION WORD
+    # and the flag is checked first. The rail's own default-off behaviour is
+    # covered by test_broadcast_is_refused_by_default_even_with_the_right_word;
+    # leaving it off here would silently turn this into a second copy of that
+    # test while its name went on promising something else.
+    monkeypatch.setattr(settings, "dispatch_broadcast_enabled", True, raising=False)
 
     spawned: list[str] = []
 
@@ -348,6 +396,11 @@ async def test_single_user_dispatch_writes_target_queue_row_and_agent_hop(
             "deep_link": f"toup://notices?mission=admin:{dispatch_id}",
             "cap_exempt": True,
             "urgent": False,
+            # The operator's chosen notification sound, as a catalogue id.
+            # Deliberately NOT under the key `sound` — that one marks a row
+            # ALARM-CLASS in live_activity_service and would re-ring this
+            # announcement three times (test_dispatch_tone.py pins it).
+            "tone": "default",
         }
         # mission_id rides in a 64-char Live Activity attribute.
         assert len(nq.data_json["mission_id"]) <= 64
@@ -1436,3 +1489,1205 @@ async def test_a_never_delivered_card_records_nothing_when_the_agent_is_down(
         "nothing was ever written for this recipient, so there is nothing to "
         f"report — last_error={row.last_error!r}"
     )
+
+
+# ── R3: an operator's message costs the recipient nothing ────────────
+
+
+@pytest.mark.asyncio
+async def test_a_full_dispatch_moves_no_credit_and_writes_no_ledger_row(
+    dispatch_client, monkeypatch,
+):
+    """R3, asserted rather than assumed.
+
+    An operator's message is not the user's spend. It runs no agent turn —
+    `_agent_hop` POSTs to `/internal/admin-notice`, which writes one row and
+    broadcasts — so there is no inference to bill and nothing to meter. That
+    is TRUE TODAY BY CONSTRUCTION, which is exactly why it needs a test: the
+    property is invisible in the code (it is the absence of a call), so the
+    first person to route a dispatch through anything that thinks would break
+    it with nothing turning red.
+
+    Every credit surface is snapshotted around a complete delivery: the live
+    balance in all four of its buckets, the daily counter, and the ledger row
+    count. Nothing may move.
+    """
+    from decimal import Decimal
+    from app.db.models import CreditBalance, CreditLedger
+
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    recipient = await _mk_user()
+    await _mk_agent(recipient, url="https://tenant-r3.example")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    spy = _AgentSpy()
+    _patch_agent_http(monkeypatch, spy)
+
+    now = datetime.utcnow()
+    async with async_session_maker() as db:
+        db.add(CreditBalance(
+            user_id=recipient, plan_id="free",
+            message_credits_remaining=Decimal("100.00"),
+            integration_credits_remaining=Decimal("50.00"),
+            message_credits_used_today=Decimal("7.00"),
+            purchased_credits_remaining=Decimal("25.00"),
+            day_anchor_local_date=now.date().isoformat(),
+            period_start=now, period_end=now + timedelta(days=30),
+        ))
+        await db.commit()
+
+    async def _snapshot():
+        async with async_session_maker() as db:
+            bal = await db.get(CreditBalance, recipient)
+            ledger = (await db.execute(
+                select(func.count()).select_from(CreditLedger)
+                .where(CreditLedger.user_id == recipient)
+            )).scalar_one()
+            return (
+                bal.message_credits_remaining,
+                bal.integration_credits_remaining,
+                bal.message_credits_used_today,
+                bal.purchased_credits_remaining,
+                int(ledger or 0),
+            )
+
+    before = await _snapshot()
+
+    created = await client.post("/api/admin/dispatch", json={
+        "mode": "once", "audience": "user", "target_user_id": recipient,
+        "title": "Scheduled maintenance", "body": "We are moving some things.",
+    })
+    assert created.status_code == 201, created.text
+    dispatch_id = created.json()["dispatch"]["id"]
+
+    from app.services import admin_dispatch_worker as w
+    summary = await w.run_dispatch_fanout(dispatch_id)
+    assert summary["status"] == "sent", summary
+    # Precondition: this must be a REAL delivery, or "nothing was billed" is
+    # only true because nothing happened.
+    assert summary["delivered_count"] == 1, summary
+    assert spy.calls, "the agent hop never ran — the zero-cost claim would be vacuous"
+
+    # And the read, which is the other half of the lifecycle.
+    app.dependency_overrides[get_current_user] = lambda: _principal(recipient)
+    assert (await client.post(f"/api/notices/{dispatch_id}/read")).status_code == 204
+
+    after = await _snapshot()
+    assert after == before, (
+        "an operator's message charged the recipient. "
+        f"before={before} after={after} — R3 says a dispatch is free to the "
+        "user in every bucket, and that the delivery path runs no inference."
+    )
+
+
+def test_the_delivery_path_calls_nothing_that_thinks():
+    """The structural half of R3, and the one that survives a refactor.
+
+    The test above proves no credit MOVED. This proves there is nothing on the
+    path that could move one: the fan-out module must not reach for an LLM, a
+    credit debit, or a turn runner. A future edit that routes a dispatch
+    through the agent would still pass the balance assertion whenever the model
+    happened to be stubbed out — this one fails on the import.
+    """
+    src = Path(__file__).resolve().parents[1] / "app" / "services" / "admin_dispatch_worker.py"
+    text = src.read_text()
+    tree = ast.parse(text)
+
+    reached: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            reached.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            reached.add(node.module)
+
+    forbidden = (
+        "app.agent.orchestrator", "app.agent.turn", "app.services.llm",
+        "app.services.credit", "app.services.credits", "app.llm",
+        "anthropic", "openai",
+    )
+    hits = sorted(m for m in reached if any(m.startswith(f) for f in forbidden))
+    assert not hits, (
+        f"the admin-dispatch fan-out imports {hits}. R3: an operator's message "
+        "must trigger no inference and consume no credits — the delivery path "
+        "writes a row and sends a notification, and nothing on it may think."
+    )
+
+
+async def _mk_dispatch(dispatch_id: str, **overrides) -> None:
+    """A dispatch row with the cached counters the fan-out leaves at 0 until
+    `_reconcile` runs — which is exactly the state B2a is about."""
+    fields = dict(
+        id=dispatch_id, created_by_user_id=None, mode="once", audience="user",
+        sender_name="Toup", title="t", body="b", urgent=False,
+        status="sending", created_at=datetime.utcnow(),
+    )
+    fields.update(overrides)
+    async with async_session_maker() as db:
+        db.add(AdminDispatch(**fields))
+        await db.commit()
+
+
+async def _mk_target(dispatch_id: str, user_id: str, **overrides) -> str:
+    target_id = str(uuid.uuid4())
+    fields = dict(
+        id=target_id, dispatch_id=dispatch_id, user_id=user_id,
+        state="done", chat_status="delivered", attempts=1,
+        created_at=datetime.utcnow(), updated_at=datetime.utcnow(),
+    )
+    fields.update(overrides)
+    async with async_session_maker() as db:
+        db.add(AdminDispatchTarget(**fields))
+        await db.commit()
+    return target_id
+
+
+@pytest.mark.asyncio
+async def test_sent_list_row_carries_one_vintage_not_two(dispatch_client):
+    """The list recomputed read_count from the ledger but took target_count and
+    delivered_count from the parent's cached columns, which only `_reconcile`
+    writes. So a dispatch that had already delivered rendered a live Read
+    beside a stale 0/0 — and an operator reads 0/0 as "nothing was sent".
+
+    The list and the detail route describe the same dispatch, so they must
+    agree field for field."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    recipient = await _mk_user()
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(dispatch_id, target_user_id=recipient)
+    await _mk_target(
+        dispatch_id, recipient,
+        notification_id=str(uuid.uuid4()), read_at=datetime.utcnow(),
+    )
+
+    listed = await client.get("/api/admin/dispatch")
+    assert listed.status_code == 200, listed.text
+    row = next(d for d in listed.json()["dispatches"] if d["id"] == dispatch_id)
+
+    detail = await client.get(f"/api/admin/dispatch/{dispatch_id}")
+    assert detail.status_code == 200, detail.text
+    one = detail.json()["dispatch"]
+
+    # The parent's cached columns are still 0 — that is the whole premise.
+    async with async_session_maker() as db:
+        parent = await db.get(AdminDispatch, dispatch_id)
+        assert parent.target_count == 0 and parent.delivered_count == 0
+
+    assert row["target_count"] == 1, (
+        f"the list must recompute target_count from the ledger, got {row}"
+    )
+    assert row["delivered_count"] == 1, row
+    for key in ("target_count", "delivered_count", "chat_delivered_count",
+                "no_agent_count", "read_count", "failed_count"):
+        assert row[key] == one[key], (
+            f"list and detail disagree on {key}: {row[key]} vs {one[key]}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_list_mirrors_the_delivered_predicate_exactly(dispatch_client):
+    """`delivered` is NOT a plain chat_status test — `notification_id` is
+    non-null whether or not the agent hop after it succeeded. A FAILED target
+    is never also delivered, or a broadcast that reached hundreds of banners
+    and no chats reports itself fully delivered."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    recipient = await _mk_user()
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(dispatch_id, target_user_id=recipient)
+    # Notified, then the agent hop failed: the banner row exists, the send did not.
+    await _mk_target(
+        dispatch_id, recipient, state="failed", chat_status="failed",
+        notification_id=str(uuid.uuid4()), last_error="agent 503",
+    )
+
+    row = next(
+        d for d in (await client.get("/api/admin/dispatch")).json()["dispatches"]
+        if d["id"] == dispatch_id
+    )
+    one = (await client.get(f"/api/admin/dispatch/{dispatch_id}")).json()["dispatch"]
+
+    assert row["delivered_count"] == 0, (
+        f"a failed target is never delivered, got {row}"
+    )
+    assert row["failed_count"] == 1, row
+    assert row["target_count"] == 1, row
+    assert (row["delivered_count"], row["failed_count"]) == (
+        one["delivered_count"], one["failed_count"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_with_no_targets_still_reads_zero(dispatch_client):
+    """The GROUP BY returns no row for a dispatch that has no targets, so the
+    fallback to the stored columns has to stay — this is the honest 0/0."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(dispatch_id, audience="all", status="queued")
+
+    row = next(
+        d for d in (await client.get("/api/admin/dispatch")).json()["dispatches"]
+        if d["id"] == dispatch_id
+    )
+    assert (row["target_count"], row["delivered_count"], row["read_count"]) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_dispatch_is_swept_to_failed_with_a_visible_reason(
+    dispatch_client,
+):
+    """`run_dispatch_fanout` writes `sending` at the top and only its own
+    `except` writes `failed`. A worker that is OOM-killed or redeployed runs
+    NEITHER — and it typically dies before materialising a single target, so
+    there is no per-target `last_error` to explain it either. The row read
+    `sending` forever and the panel told the operator a message was on its way
+    that nothing was carrying."""
+    from app.services import admin_dispatch_worker as w
+
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    now = datetime.utcnow()
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(
+        dispatch_id, audience="all", status="sending",
+        created_at=now - w._STALL_MAX_AGE - timedelta(minutes=1),
+    )
+
+    async with async_session_maker() as db:
+        assert await w.sweep_stalled_dispatches(db, now) == 1
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.status == "failed", "a stall must reach a TERMINAL state"
+        assert row.completed_at is not None
+        assert row.last_error, "a swept dispatch with no reason is still a mystery"
+        # The remedy has to be in the string: a stalled dispatch is fully
+        # recoverable and nothing else on the row says so.
+        assert "Retry" in row.last_error, row.last_error
+
+    # …and the panel can actually read it, on both routes.
+    listed = next(
+        d for d in (await client.get("/api/admin/dispatch")).json()["dispatches"]
+        if d["id"] == dispatch_id
+    )
+    detail = (await client.get(f"/api/admin/dispatch/{dispatch_id}")).json()["dispatch"]
+    assert listed["last_error"] == detail["last_error"] == row.last_error
+    assert listed["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_spares_a_young_dispatch_and_a_moving_one():
+    """Two ways to be alive. The age test alone would sweep a broadcast still
+    walking its targets, and — because `created_at` is the parent row's only
+    clock — a RETRIED old dispatch the instant its new fan-out set `sending`.
+    Progress on any target is what holds a dispatch out of the sweep."""
+    from app.services import admin_dispatch_worker as w
+
+    now = datetime.utcnow()
+    user_id = await _mk_user()
+
+    young = str(uuid.uuid4())
+    await _mk_dispatch(young, status="sending", created_at=now - timedelta(minutes=1))
+
+    # Created long ago — a retry of an old dispatch looks exactly like this —
+    # but a target moved a moment ago, so the fan-out is demonstrably alive.
+    moving = str(uuid.uuid4())
+    await _mk_dispatch(
+        moving, status="sending",
+        created_at=now - w._STALL_MAX_AGE - timedelta(hours=4),
+    )
+    await _mk_target(
+        moving, user_id, state="sending", chat_status="pending",
+        updated_at=now - timedelta(seconds=5),
+    )
+
+    async with async_session_maker() as db:
+        assert await w.sweep_stalled_dispatches(db, now) == 0
+
+    async with async_session_maker() as db:
+        for did in (young, moving):
+            row = await db.get(AdminDispatch, did)
+            assert row.status == "sending", f"{did} was swept while alive"
+            assert row.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_is_a_status_cas_and_leaves_terminal_rows_alone():
+    """Both Railway replicas run this with no leader election, so the UPDATE's
+    `WHERE status='sending'` is the whole defence: the loser sees rowcount=0.
+    A dispatch that already settled must never be reopened."""
+    from app.services import admin_dispatch_worker as w
+
+    now = datetime.utcnow()
+    old = now - w._STALL_MAX_AGE - timedelta(minutes=1)
+
+    stalled = str(uuid.uuid4())
+    await _mk_dispatch(stalled, status="sending", created_at=old)
+    settled = str(uuid.uuid4())
+    await _mk_dispatch(settled, status="sent", created_at=old)
+
+    async def _sweep():
+        async with async_session_maker() as db:
+            return await w.sweep_stalled_dispatches(db, now)
+
+    a, b = await asyncio.gather(_sweep(), _sweep())
+    assert sorted((a, b)) == [0, 1], (
+        f"exactly one replica may claim a stalled row, got {(a, b)}"
+    )
+
+    async with async_session_maker() as db:
+        assert (await db.get(AdminDispatch, stalled)).status == "failed"
+        done = await db.get(AdminDispatch, settled)
+        assert done.status == "sent" and done.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_the_stall_sweep_runs_on_the_notification_tick(monkeypatch):
+    """The sweep is only a fix if something calls it. It rides the notification
+    dispatch loop — the platform's one periodic task that provably runs
+    (APScheduler was found dead on this deployment on 2026-07-10, which is why
+    that loop exists at all) — so this drives the real tick, not the sweep."""
+    from app.services import admin_dispatch_worker as w
+    from app.services.notification_dispatcher import run_notification_dispatch
+
+    monkeypatch.setattr(settings, "notification_dispatch_enabled", True)
+
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(
+        dispatch_id, status="sending",
+        created_at=datetime.utcnow() - w._STALL_MAX_AGE - timedelta(minutes=1),
+    )
+
+    await run_notification_dispatch()
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.status == "failed", (
+            "nothing sweeps automatically — the tick must call the sweep"
+        )
+        assert row.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_re_run_fanout_clears_the_stall_reason(dispatch_client, monkeypatch):
+    """`last_error` is this attempt's story. A retry that inherited the
+    sweeper's reason would report a dead worker on a dispatch that has just
+    delivered — the same one-row-two-vintages defect as B2a, in prose."""
+    from app.services import admin_dispatch_worker as w
+
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    recipient = await _mk_user()
+    await _mk_agent(recipient, url="https://tenant-9.example")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    _patch_agent_http(monkeypatch, _AgentSpy())
+
+    now = datetime.utcnow()
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(
+        dispatch_id, audience="user", target_user_id=recipient, status="sending",
+        created_at=now - w._STALL_MAX_AGE - timedelta(minutes=1),
+    )
+
+    async with async_session_maker() as db:
+        assert await w.sweep_stalled_dispatches(db, now) == 1
+
+    summary = await w.run_dispatch_fanout(dispatch_id)
+    assert summary["status"] == "sent", summary
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.last_error is None, (
+            f"a delivered dispatch still blames a dead worker: {row.last_error}"
+        )
+
+    detail = (await client.get(f"/api/admin/dispatch/{dispatch_id}")).json()["dispatch"]
+    assert detail["last_error"] is None and detail["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_a_stall_reason_left_on_a_fanout_that_was_alive():
+    """The sweep can be WRONG, and this is what happens next.
+
+    Its clock cannot see the window before the first target exists, so a
+    genuinely-alive fan-out can be declared dead — and that worker then
+    finishes normally and lands in `_reconcile`, not in the re-run path.
+    `run_dispatch_fanout` clears `last_error` at its top, so the existing
+    re-run test passes while this ordering stays broken: the row settles to
+    `sent`, every counter correct, still carrying "the worker is gone, press
+    Retry" for a delivery that completed.
+
+    Whoever writes the outcome owns every field that describes it.
+    """
+    from app.services import admin_dispatch_worker as w
+
+    now = datetime.utcnow()
+    recipient = await _mk_user()
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(
+        dispatch_id, audience="user", target_user_id=recipient, status="sending",
+        created_at=now - w._STALL_MAX_AGE - timedelta(minutes=1),
+    )
+    async with async_session_maker() as db:
+        assert await w.sweep_stalled_dispatches(db, now) == 1
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.last_error, "precondition: the sweep must have stamped a reason"
+
+    # The still-live worker delivers its one target and reconciles. NOT
+    # run_dispatch_fanout — that clears at the top and would hide the defect.
+    await _mk_target(dispatch_id, recipient, state="done", chat_status="delivered")
+    async with async_session_maker() as db:
+        summary = await w._reconcile(db, dispatch_id)
+    assert summary["status"] == "sent", summary
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.last_error is None, (
+            f"a delivered dispatch still blames a dead worker: {row.last_error}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_also_terminates_a_dispatch_that_died_while_queued():
+    """B2b was only half-fixed by sweeping `sending`.
+
+    Both producers commit `status='queued'` and THEN await
+    `spawn_dispatch_fanout`, which is a bare `asyncio.create_task` in the API
+    process. A redeploy in that window — the exact scenario the sweep exists
+    for — or a throw inside `run_dispatch_fanout` before its status UPDATE
+    lands, leaves the row `queued` forever with nobody walking it.
+
+    Sweeping only `sending` fixes the second half and leaves the first, which
+    is worse than not fixing it: the panel looks like it now reports stalls.
+    """
+    from app.services import admin_dispatch_worker as w
+
+    now = datetime.utcnow()
+    recipient = await _mk_user()
+    dispatch_id = str(uuid.uuid4())
+    await _mk_dispatch(
+        dispatch_id, audience="user", target_user_id=recipient, status="queued",
+        created_at=now - w._STALL_MAX_AGE - timedelta(minutes=1),
+    )
+
+    async with async_session_maker() as db:
+        assert await w.sweep_stalled_dispatches(db, now) == 1
+        row = await db.get(AdminDispatch, dispatch_id)
+        assert row.status == "failed"
+        assert row.completed_at is not None
+        assert "Retry" in (row.last_error or ""), row.last_error
+
+
+@pytest.mark.asyncio
+async def test_the_stall_sweep_survives_the_notification_kill_switch(monkeypatch):
+    """The sweep must NOT share `notification_dispatch_enabled`.
+
+    It first sat below that early return, justified by "with notification
+    dispatch off an announcement reaches nobody anyway". That is false: the
+    fan-out writes the chat card itself over HTTP (`_agent_hop`) and the
+    persistent thread row itself (`_ensure_thread_row`), and neither touches
+    this queue. So with the switch off, dispatches keep delivering and keep
+    stalling — and the one thing that reports a dead fan-out would be the one
+    thing switched off. A kill switch for SENDING is not a kill switch for
+    BOOKKEEPING.
+    """
+    from app.services import notification_dispatcher as nd
+
+    calls: list = []
+
+    async def _spy(db, now):
+        calls.append(now)
+        return 0
+
+    monkeypatch.setattr(
+        nd.admin_dispatch_worker, "sweep_stalled_dispatches", _spy,
+    )
+    monkeypatch.setattr(nd.settings, "notification_dispatch_enabled", False)
+
+    out = await nd.run_notification_dispatch()
+    assert out == {"claimed": 0}, out
+    assert calls, (
+        "the stall sweep did not run with notification dispatch disabled — "
+        "a dispatch that stalls while the switch is off can never be reported"
+    )
+
+
+def _stub_agent_resolution(monkeypatch, *, url="https://agent.example", key="tk-test"):
+    """Make tenant RESOLUTION succeed, so a revoke test measures revoke.
+
+    `agent_proxy_info` answers None in this harness — the same seam whose
+    ambiguity (`None` means both "no agent" and "agent redeploying") is the
+    defect #637 fixes, and the reason two read-receipt tests are red on main
+    today. Leaving it unstubbed here would make every revoke assertion pass or
+    fail for a reason that has nothing to do with revoking.
+    """
+    async def _info(user_id, db):
+        return (url, key)
+    monkeypatch.setattr("app.api.admin.dispatch.agent_proxy_info", _info)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["once", "persistent"])
+async def test_revoke_pulls_the_card_for_either_mode(dispatch_client, monkeypatch, mode):
+    """`once` already retracted itself on read; recall must work for BOTH.
+
+    A persistent dispatch is the one an operator most needs back — it is the
+    mode that STAYS in the chat — and it is exactly the mode the read path
+    never retracts.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    dispatch_id = await _seed_delivered(mode, user_id)
+
+    proxied: list[dict] = []
+
+    async def _fake_proxy(agent_url, agent_api_key, path, method="GET", **kw):
+        proxied.append({"path": path, "method": method, "json": kw.get("json_body")})
+        return {"deleted": 1, "ws_count": 0}
+
+    monkeypatch.setattr("app.api.admin.dispatch.proxy_to_agent", _fake_proxy)
+    _stub_agent_resolution(monkeypatch)
+
+    res = await client.post(f"/api/admin/dispatch/{dispatch_id}/revoke")
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["revoked"] == 1 and payload["failed"] == 0, payload
+
+    # The SAME tenant route the read path uses — no second pipeline.
+    assert len(proxied) == 1, proxied
+    assert proxied[0]["path"] == "internal/admin-notice/retract"
+    assert proxied[0]["json"] == {"user_id": user_id, "dispatch_id": dispatch_id}
+
+    async with async_session_maker() as db:
+        d = await db.get(AdminDispatch, dispatch_id)
+        assert d.revoked_at is not None
+        assert d.revoked_by_user_id == admin, "a recall records WHO, not just that"
+        t = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+        assert t.chat_status == "retracted"
+
+
+@pytest.mark.asyncio
+async def test_a_revoke_that_cannot_reach_an_agent_is_not_counted_as_one(
+    dispatch_client, monkeypatch,
+):
+    """The card is still sitting in that tenant's DB, so this is not a recall.
+
+    The whole value of the number this route returns is that an operator can
+    tell "930 of 1000" from "done". Counting an unreachable tenant as revoked
+    would make the reassuring answer the wrong one, which is the one failure
+    mode a recall cannot afford.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    dispatch_id = await _seed_delivered("persistent", user_id)
+
+    async def _boom(*a, **kw):
+        raise RuntimeError("tenant down")
+
+    monkeypatch.setattr("app.api.admin.dispatch.proxy_to_agent", _boom)
+    _stub_agent_resolution(monkeypatch)
+
+    res = await client.post(f"/api/admin/dispatch/{dispatch_id}/revoke")
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["revoked"] == 0 and payload["failed"] == 1
+
+    async with async_session_maker() as db:
+        t = (await db.execute(
+            select(AdminDispatchTarget).where(
+                AdminDispatchTarget.dispatch_id == dispatch_id)
+        )).scalars().one()
+        assert t.chat_status == "delivered", "the card is still there; do not claim otherwise"
+        assert t.last_error and "revoke" in t.last_error
+
+        # ...but the operator's INTENT is recorded regardless, so a retry
+        # after the tenant recovers is a retry, not a fresh decision.
+        d = await db.get(AdminDispatch, dispatch_id)
+        assert d.revoked_at is not None
+
+
+@pytest.mark.asyncio
+async def test_revoke_never_touches_the_notification(dispatch_client, monkeypatch):
+    """R-of-record: a recall pulls the CARD. Nothing un-sends a push.
+
+    If someone later wires this route into the notification queue, this fails —
+    which is the point. Promising an operator that a lock-screen banner can be
+    taken back is a worse lie than the one this feature exists to fix.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    await _mk_agent(user_id)
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    dispatch_id = await _seed_delivered("once", user_id)
+
+    async def _fake_proxy(*a, **kw):
+        return {"deleted": 1, "ws_count": 0}
+
+    monkeypatch.setattr("app.api.admin.dispatch.proxy_to_agent", _fake_proxy)
+    _stub_agent_resolution(monkeypatch)
+
+    async with async_session_maker() as db:
+        before = (await db.execute(
+            select(func.count()).select_from(NotificationQueue)
+        )).scalar_one()
+
+    res = await client.post(f"/api/admin/dispatch/{dispatch_id}/revoke")
+    assert res.status_code == 200, res.text
+
+    async with async_session_maker() as db:
+        after = (await db.execute(
+            select(func.count()).select_from(NotificationQueue)
+        )).scalar_one()
+    assert after == before, "a recall must not write, cancel or amend a notification row"
+
+
+# ── 15. Deleting from the thread ──────────────────────────────────
+#
+# The operator could send into a thread and never take anything back. These
+# pin the two scopes, and — more importantly — that the OPERATOR keeps the
+# record while the USER stops seeing it.
+
+
+async def _mk_thread_msg(user_id: str, direction: str, body: str) -> str:
+    mid = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(AdminThreadMessage(
+            id=mid, user_id=user_id, dispatch_id=None, direction=direction,
+            body=body, author_admin_id=None, sender_name="Toup",
+            created_at=datetime.utcnow(),
+        ))
+        await db.commit()
+    return mid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["theirs", "both"])
+async def test_a_deleted_message_leaves_the_users_thread(dispatch_client, scope):
+    """Either scope removes it from what the USER can see."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    mid = await _mk_thread_msg(user_id, "out", "sent by mistake")
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    res = await client.delete(
+        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope={scope}")
+    assert res.status_code == 200, res.text
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(user_id)
+    thread = await client.get("/api/notices/thread")
+    assert thread.status_code == 200, thread.text
+    assert [m["id"] for m in thread.json()["messages"]] == []
+
+    # ...and it stops badging. A thread badged for content the user cannot
+    # find is worse than the message itself.
+    state = await client.get("/api/notices/state")
+    assert state.json()["thread_unread"] == 0
+    assert state.json()["has_thread"] is False
+
+
+@pytest.mark.asyncio
+async def test_theirs_keeps_the_operators_copy_and_both_keeps_the_turn(dispatch_client):
+    """The asymmetry IS the feature.
+
+    `theirs` unsends the words and keeps the record — the state an operator
+    needs most at exactly the moment they are undoing something. `both` clears
+    the body but keeps the row, so the reply that follows it still has
+    something to follow.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    a = await _mk_thread_msg(user_id, "out", "hide from them")
+    b = await _mk_thread_msg(user_id, "out", "gone for everyone")
+
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{a}?scope=theirs")
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{b}?scope=both")
+
+    res = await client.get(f"/api/admin/dispatch/threads/{user_id}")
+    assert res.status_code == 200, res.text
+    by_id = {m["id"]: m for m in res.json()["messages"]}
+
+    assert by_id[a]["body"] == "hide from them", "theirs must not destroy the operator's copy"
+    assert by_id[a]["hidden_from_user_at"] and not by_id[a]["deleted_at"]
+
+    assert by_id[b]["body"] == "This message was deleted.", "both clears the words"
+    assert by_id[b]["deleted_at"]
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminThreadMessage, b)
+        assert row is not None, "both must leave a tombstone, never a hard delete"
+        assert row.deleted_by_user_id == admin
+
+
+@pytest.mark.asyncio
+async def test_an_operator_may_delete_a_users_own_reply(dispatch_client):
+    """Someone pastes a password into a support thread. The asymmetry of
+    'operators may only delete their own words' would be arbitrary here."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    mid = await _mk_thread_msg(user_id, "in", "my password is hunter2")
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    res = await client.delete(
+        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+    assert res.status_code == 200, res.text
+
+    async with async_session_maker() as db:
+        row = await db.get(AdminThreadMessage, mid)
+        assert row.body == "This message was deleted."
+
+
+@pytest.mark.asyncio
+async def test_a_message_from_another_users_thread_is_404(dispatch_client):
+    """Scoped to the thread, not just the id. The route reads as "this user's
+    thread" and a mismatch must not silently reach into someone else's."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    owner = await _mk_user()
+    stranger = await _mk_user()
+    mid = await _mk_thread_msg(owner, "out", "not yours")
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    res = await client.delete(
+        f"/api/admin/dispatch/threads/{stranger}/messages/{mid}?scope=both")
+    assert res.status_code == 404, res.text
+
+    async with async_session_maker() as db:
+        assert (await db.get(AdminThreadMessage, mid)).body == "not yours"
+
+
+@pytest.mark.asyncio
+async def test_deleting_twice_does_not_overwrite_the_first_record(dispatch_client):
+    """Idempotent. A second press must not re-stamp who did it, nor replace
+    the tombstone with a tombstone of the tombstone."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    other = await _mk_user(role="admin")
+    user_id = await _mk_user()
+    mid = await _mk_thread_msg(user_id, "out", "x")
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    await client.delete(f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+    async with async_session_maker() as db:
+        first = await db.get(AdminThreadMessage, mid)
+        stamp, who, body = first.deleted_at, first.deleted_by_user_id, first.body
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(other, role="admin")
+    res = await client.delete(
+        f"/api/admin/dispatch/threads/{user_id}/messages/{mid}?scope=both")
+    assert res.status_code == 200, res.text
+
+    async with async_session_maker() as db:
+        again = await db.get(AdminThreadMessage, mid)
+        assert (again.deleted_at, again.deleted_by_user_id, again.body) == (stamp, who, body)
+
+
+@pytest.mark.asyncio
+async def test_broadcast_is_refused_by_default_even_with_the_right_word(
+    dispatch_client, monkeypatch,
+):
+    """The default deployment may not broadcast. No flag set, correct word."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    spawned: list[str] = []
+
+    async def _fake_spawn(dispatch_id: str):
+        spawned.append(dispatch_id)
+
+    monkeypatch.setattr("app.api.admin.dispatch.spawn_dispatch_fanout", _fake_spawn)
+
+    res = await client.post(
+        "/api/admin/dispatch", json=_compose(audience="all", confirm="BROADCAST"),
+    )
+    assert res.status_code == 403, res.text
+    assert not spawned, "a flag-disabled broadcast must not reach the fan-out"
+    async with async_session_maker() as db:
+        assert (await db.execute(select(AdminDispatch))).scalars().all() == [], \
+            "nothing may be persisted by a refused broadcast"
+
+    # The refusal must not hand the caller a way through. An operator who has
+    # just been stopped reads "send confirm='BROADCAST' to proceed" as the way
+    # past the thing that stopped them, and here it is not — the word does not
+    # unlock this. Asserted on the INSTRUCTION, not on the bare token: the
+    # message legitimately names docs/DISPATCH_BROADCAST.md, and a substring
+    # test for "BROADCAST" fails on the filename while proving nothing about
+    # the hazard. (It did, which is how this comment came to exist.)
+    detail = res.json().get("detail", "")
+    assert "confirm=" not in detail and "to proceed" not in detail, \
+        f"the 403 must not offer the confirmation word as a workaround: {detail!r}"
+
+
+@pytest.mark.asyncio
+async def test_the_flag_is_checked_before_the_confirmation_word(
+    dispatch_client, monkeypatch,
+):
+    """ORDER, not just presence — the two checks must fire in this sequence.
+
+    Flag off AND no confirmation word: both gates would refuse, so the status
+    code is the only thing that says which ran first. It has to be the flag's
+    403. With the checks reversed the caller gets the word's 400, whose body
+    reads "send confirm='BROADCAST' to proceed" — telling an operator how to
+    do the thing this deployment forbids, and sending them round the loop to
+    a refusal they could have been given once.
+
+    Written because the reversed ordering passed every other test in this
+    section: they all supply the correct word, so the guard fires either way
+    and the sequence is invisible to them.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    monkeypatch.setattr(settings, "dispatch_broadcast_enabled", False, raising=False)
+
+    res = await client.post("/api/admin/dispatch", json=_compose(audience="all"))
+    assert res.status_code == 403, (
+        f"flag must be evaluated before the confirmation word; got {res.status_code}: {res.text}"
+    )
+    detail = res.json().get("detail", "")
+    assert "confirm=" not in detail and "to proceed" not in detail, \
+        f"a flag-refused broadcast must not be told how to type past it: {detail!r}"
+
+
+@pytest.mark.asyncio
+async def test_the_flag_is_off_in_the_shipped_defaults():
+    """Pins the DEFAULT, not the runtime value.
+
+    The route test above monkeypatches, so it would keep passing if someone
+    flipped the default to True and left the code alone. This is the assertion
+    that notices.
+    """
+    from app.config import Settings
+    assert Settings.model_fields["dispatch_broadcast_enabled"].default is False
+
+
+@pytest.mark.asyncio
+async def test_a_single_user_send_is_untouched_by_the_broadcast_flag(
+    dispatch_client, monkeypatch,
+):
+    """The rail is about blast radius, not about the feature.
+
+    Guards the obvious over-correction: gating `create_dispatch` as a whole
+    would take the one audience this deployment IS meant to use down with it.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    target = await _mk_user()
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    spawned: list[str] = []
+
+    async def _fake_spawn(dispatch_id: str):
+        spawned.append(dispatch_id)
+
+    monkeypatch.setattr("app.api.admin.dispatch.spawn_dispatch_fanout", _fake_spawn)
+    monkeypatch.setattr(settings, "dispatch_broadcast_enabled", False, raising=False)
+
+    res = await client.post(
+        "/api/admin/dispatch",
+        json=_compose(audience="user", target_user_id=target),
+    )
+    assert res.status_code == 201, res.text
+    assert len(spawned) == 1
+
+
+@pytest.mark.asyncio
+async def test_both_read_surfaces_report_the_flag(dispatch_client, monkeypatch):
+    """The compose form must not carry its own copy of the flag.
+
+    Two surfaces because they are read at different moments: the list on mount
+    (before 'Everyone' can be clicked) and the preview after. A client constant
+    that disagrees with the deployment is either a dead button or a broadcast
+    the operator believed was impossible.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    for flag in (False, True):
+        monkeypatch.setattr(settings, "dispatch_broadcast_enabled", flag, raising=False)
+
+        listed = await client.get("/api/admin/dispatch")
+        assert listed.status_code == 200, listed.text
+        assert listed.json()["broadcast_enabled"] is flag
+
+        prev = await client.get("/api/admin/dispatch/preview?audience=all")
+        assert prev.status_code == 200, prev.text
+        assert prev.json()["broadcast_enabled"] is flag
+
+
+async def _seed_thread(user_id: str, rows: list[tuple[str, str]],
+                       *, base: datetime | None = None) -> list[str]:
+    """Write (direction, body) pairs into one user's thread, oldest first.
+
+    Timestamps are explicit and one minute apart: `created_at` orders every
+    query under test, and rows written in the same tick sort arbitrarily, which
+    makes an ordering assertion pass or fail on machine speed.
+    """
+    from app.db.models import AdminThreadMessage
+
+    start = base or (datetime.utcnow() - timedelta(hours=1))
+    ids = []
+    async with async_session_maker() as db:
+        for i, (direction, body) in enumerate(rows):
+            mid = str(uuid.uuid4())
+            ids.append(mid)
+            db.add(AdminThreadMessage(
+                id=mid,
+                user_id=user_id,
+                direction=direction,
+                body=body,
+                created_at=start + timedelta(minutes=i),
+                sender_name="Toup" if direction == "out" else None,
+            ))
+        await db.commit()
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_reading_a_thread_does_not_mark_it_read(dispatch_client):
+    """F6. The console polls the open thread every few seconds; if GET stamped
+    `admin_read_at`, a background refresh would clear the operator's reply
+    queue with the window blurred and nobody looking. `admin_read_at` is the
+    ONLY record that a reply was seen, so there is nothing to recover it from.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "Are you there?"), ("in", "Yes — what's up?")])
+
+    res = await client.get(f"/api/admin/dispatch/threads/{user}")
+    assert res.status_code == 200, res.text
+    assert res.json()["unread_in"] == 1
+
+    # The whole point: read it as many times as a poller would.
+    for _ in range(3):
+        await client.get(f"/api/admin/dispatch/threads/{user}")
+
+    from app.db.models import AdminThreadMessage
+    async with async_session_maker() as db:
+        still_unread = (await db.execute(
+            select(func.count()).select_from(AdminThreadMessage).where(
+                AdminThreadMessage.user_id == user,
+                AdminThreadMessage.direction == "in",
+                AdminThreadMessage.admin_read_at.is_(None),
+            )
+        )).scalar_one()
+    assert still_unread == 1, (
+        "GET marked the thread read — a poll would clear the reply queue"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_explicit_read_route_marks_only_inbound_rows(dispatch_client):
+    """Counterpart: 'never marks read' would also pass the test above.
+
+    Only `in` rows carry `admin_read_at`. Stamping `out` rows would corrupt the
+    USER's unread count, which reads the same column family from the other side.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("out", "Ping"), ("in", "Pong"), ("in", "Still here")])
+
+    res = await client.post(f"/api/admin/dispatch/threads/{user}/read")
+    assert res.status_code == 204, res.text
+
+    from app.db.models import AdminThreadMessage
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AdminThreadMessage.direction, AdminThreadMessage.admin_read_at)
+            .where(AdminThreadMessage.user_id == user)
+        )).all()
+
+    by_dir = {}
+    for direction, stamp in rows:
+        by_dir.setdefault(direction, []).append(stamp)
+    assert all(s is not None for s in by_dir["in"]), "inbound rows were not marked"
+    assert all(s is None for s in by_dir["out"]), (
+        "outbound rows were stamped — that column belongs to the user's side"
+    )
+
+    assert (await client.get(
+        f"/api/admin/dispatch/threads/{user}"
+    )).json()["unread_in"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_route_is_idempotent_and_404s_for_a_stranger(dispatch_client):
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [("in", "hello")])
+
+    assert (await client.post(f"/api/admin/dispatch/threads/{user}/read")).status_code == 204
+    assert (await client.post(f"/api/admin/dispatch/threads/{user}/read")).status_code == 204
+
+    res = await client.post(f"/api/admin/dispatch/threads/{uuid.uuid4()}/read")
+    assert res.status_code == 404, res.text
+
+
+@pytest.mark.asyncio
+async def test_thread_list_reports_who_spoke_last(dispatch_client):
+    """The sidebar prefixes the operator's own words with 'You: '. Without a
+    direction on the summary every row reads as if the user said it, which
+    inverts the one thing the column is scanned for."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    waiting = await _mk_user()   # user spoke last — needs an answer
+    answered = await _mk_user()  # operator spoke last
+    await _seed_thread(waiting, [("out", "Hi"), ("in", "I have a question")])
+    await _seed_thread(answered, [("in", "A question"), ("out", "Here is the answer")])
+
+    rows = (await client.get("/api/admin/dispatch/threads")).json()["threads"]
+    by_id = {r["user_id"]: r for r in rows}
+
+    assert by_id[waiting]["last_direction"] == "in"
+    assert by_id[waiting]["last_body"] == "I have a question"
+    assert by_id[answered]["last_direction"] == "out"
+    assert by_id[answered]["last_body"] == "Here is the answer"
+
+
+@pytest.mark.asyncio
+async def test_thread_search_matches_person_and_content(dispatch_client):
+    """An operator remembers the person or the words, never reliably which."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    alice = await _mk_user()
+    bob = await _mk_user()
+    async with async_session_maker() as db:
+        await db.execute(sa_update(User).where(User.id == alice).values(
+            name="Alice Nakamura", email="alice@example.com"))
+        await db.execute(sa_update(User).where(User.id == bob).values(
+            name="Bob Silva", email="bob@example.com"))
+        await db.commit()
+
+    await _seed_thread(alice, [("in", "my invoice is wrong")])
+    await _seed_thread(bob, [("in", "cannot log in")])
+
+    def ids(payload):
+        return {t["user_id"] for t in payload["threads"]}
+
+    by_name = (await client.get("/api/admin/dispatch/threads?query=nakamura")).json()
+    assert ids(by_name) == {alice}, "name search missed"
+
+    by_email = (await client.get("/api/admin/dispatch/threads?query=bob@")).json()
+    assert ids(by_email) == {bob}, "email search missed"
+
+    by_body = (await client.get("/api/admin/dispatch/threads?query=invoice")).json()
+    assert ids(by_body) == {alice}, "message-body search missed"
+
+    assert ids((await client.get(
+        "/api/admin/dispatch/threads?query=zzzznomatch")).json()) == set()
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_rewrite_the_conversation_length(dispatch_client):
+    """`total` counts the THREAD, not the matches.
+
+    Filtering the rows being grouped is the obvious implementation and it makes
+    a two-word search report a 40-message conversation as having 1 message.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    user = await _mk_user()
+    await _seed_thread(user, [
+        ("out", "Welcome aboard"),
+        ("in", "thanks"),
+        ("in", "one question about billing"),
+        ("out", "happy to help"),
+    ])
+
+    hit = (await client.get(
+        "/api/admin/dispatch/threads?query=billing")).json()["threads"]
+    assert len(hit) == 1
+    assert hit[0]["total"] == 4, (
+        f"search rewrote the thread length to {hit[0]['total']} — it must count "
+        "every message, not the matching ones"
+    )
+
+
+@pytest.mark.asyncio
+async def test_thread_list_pages_by_keyset(dispatch_client):
+    """Cursor paging, and no cursor on a short page — a cursor at the end of
+    the list makes the client fetch one empty page per scroll forever."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    base = datetime.utcnow() - timedelta(days=1)
+    users = []
+    for i in range(5):
+        u = await _mk_user()
+        users.append(u)
+        await _seed_thread(u, [("in", f"message {i}")],
+                           base=base + timedelta(hours=i))
+
+    page1 = (await client.get("/api/admin/dispatch/threads?limit=2")).json()
+    assert len(page1["threads"]) == 2
+    assert page1["next_cursor"] is not None
+
+    page2 = (await client.get(
+        f"/api/admin/dispatch/threads?limit=2&cursor={page1['next_cursor']}"
+    )).json()
+    assert len(page2["threads"]) == 2
+
+    seen = [t["user_id"] for t in page1["threads"] + page2["threads"]]
+    assert len(set(seen)) == 4, f"pages overlapped: {seen}"
+    # Newest first, and strictly descending across the page boundary.
+    stamps = [t["last_message_at"] for t in page1["threads"] + page2["threads"]]
+    assert stamps == sorted(stamps, reverse=True), stamps
+
+    last = (await client.get(
+        f"/api/admin/dispatch/threads?limit=2&cursor={page2['next_cursor']}"
+    )).json()
+    assert len(last["threads"]) == 1
+    assert last["next_cursor"] is None, "a short page must end the scroll"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_cursor_is_rejected_not_ignored(dispatch_client):
+    """Swallowing it serves page 1 forever, which reads as a list that will not
+    scroll rather than as the client bug it is."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    res = await client.get("/api/admin/dispatch/threads?cursor=not-a-date")
+    assert res.status_code == 422, res.text

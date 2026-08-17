@@ -307,7 +307,7 @@ async def _make_engine():
                 id VARCHAR(50) PRIMARY KEY, conversation_id VARCHAR(36),
                 day_chat_id VARCHAR(36), role VARCHAR(20), content TEXT,
                 created_at TIMESTAMP
-            )""",
+            , origin VARCHAR(16))""",
         ]:
             await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))
     return engine

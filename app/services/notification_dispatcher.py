@@ -61,7 +61,7 @@ from app.db.models import (
     NQ_SENT,
     NQ_SUPPRESSED,
 )
-from app.services import expo_push, live_activity_service
+from app.services import admin_dispatch_worker, expo_push, live_activity_service
 
 logger = logging.getLogger(__name__)
 
@@ -738,9 +738,31 @@ async def notification_dispatch_loop() -> None:
 async def run_notification_dispatch() -> Dict[str, int]:
     """Dispatcher tick — registered in scheduled_tasks.setup_scheduler.
     Safe to run on every replica concurrently (per-row CAS)."""
+    now = _utcnow()
+    # Admin-dispatch stall sweep, ABOVE the kill switch on purpose.
+    #
+    # It rides this loop because this is the platform's one periodic task that
+    # provably runs — APScheduler was found dead on this deployment on
+    # 2026-07-10, which is why the loop exists at all — and because the sweep
+    # is a status CAS, so it is safe on both replicas.
+    #
+    # But it must NOT share `notification_dispatch_enabled`. The first version
+    # sat below the early return and justified it with "with notification
+    # dispatch off an announcement reaches nobody anyway", which is false: the
+    # fan-out writes the chat card itself over HTTP (`_agent_hop`) and the
+    # persistent thread row itself (`_ensure_thread_row`), and neither goes
+    # near this queue. So with the switch off, dispatches keep delivering and
+    # keep stalling — and the sweep that is supposed to tell the operator a
+    # fan-out died would be the one thing switched off. A kill switch for
+    # sending is not a kill switch for bookkeeping.
+    try:
+        async with async_session_maker() as db:
+            await admin_dispatch_worker.sweep_stalled_dispatches(db, now)
+    except Exception:  # noqa: BLE001 — a sweep must never stall the tick
+        logger.exception("admin dispatch stall sweep failed")
+
     if not settings.notification_dispatch_enabled:
         return {"claimed": 0}
-    now = _utcnow()
     stats: Dict[str, int] = {"claimed": 0}
     async with async_session_maker() as db:
         await _requeue_stuck(db, now)

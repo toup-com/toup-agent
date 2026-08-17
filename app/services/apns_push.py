@@ -21,6 +21,11 @@ as the update token; we therefore never depend on the app waking up to
 report a per-activity token (when it does report one, we use it).
 
 The whole payload (attributes + content-state) must stay under 4KB.
+
+Alert SOUND is not a free field here — see ``ACTIVITY_KIT_SOUND``. Every
+builder in this module emits a liveactivity payload, and a named sound on
+one of those is silence on device. Producers pass the tone they chose;
+this module drops the name.
 """
 from __future__ import annotations
 
@@ -53,6 +58,22 @@ _PROGRESS_TINT = "#3B82F6"
 
 _jwt_cache: Dict[str, Any] = {"token": None, "issued_at": 0.0}
 _clients: Dict[str, httpx.AsyncClient] = {}
+
+# The ONLY sound value an ActivityKit alert may carry. Every builder in
+# this module produces a ``apns-push-type: liveactivity`` payload, and
+# iOS has never honoured a custom named sound on one — the result is
+# TOTAL SILENCE, not a fallback (verified on the founder's device
+# 2026-07-20/21 with the file present in both the app and the
+# widget-extension bundles; Apple forums 718659, unanswered since Oct
+# 2022; every production payload ever verified audible uses "default").
+#
+# So a producer may choose a tone, and this module decides whether the
+# wire is allowed to carry the name. Putting the enforcement here rather
+# than at each call site is the point: a lane that CAN honour a name
+# (a standard ``apns-push-type: alert`` push) is a different builder,
+# and until one exists nothing can accidentally silence a card by
+# "wiring the picker up properly".
+ACTIVITY_KIT_SOUND = "default"
 
 
 class ApnsNotConfigured(RuntimeError):
@@ -194,16 +215,26 @@ def _valid_hex_color(value: Optional[str]) -> bool:
 
 def _alert(
     alert_title: Optional[str], alert_body: Optional[str],
-    sound: Optional[str] = None,
+    requested_sound: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``sound``: a bundled file name ('toup_alarm.caf') for alarm-class
-    alerts (reminder fires); anything falsy keeps the system default.
-    iOS silently falls back to default when the file is missing."""
+    """Build the alert configuration for an ActivityKit payload.
+
+    ``requested_sound`` is the bundled file name the PRODUCER chose (the
+    operator's dispatch tone, a reminder's alarm tone). It is recorded and
+    then deliberately NOT put on the wire — see ``ACTIVITY_KIT_SOUND``.
+    Callers pass what they want rather than pre-flattening it to
+    "default", so the rule lives in exactly one place and the payload
+    tests can assert it directly.
+    """
     if not alert_title:
         return None
     alert: Dict[str, Any] = {
         "title": alert_title[:120],
-        "sound": (sound or "default")[:64],
+        # requested_sound is intentionally unused here. A name lands as
+        # silence; "default" is the loudest thing an ActivityKit alert can
+        # be, so a chosen tone DEGRADES to the system tone rather than to
+        # nothing.
+        "sound": ACTIVITY_KIT_SOUND,
     }
     if alert_body:
         alert["body"] = alert_body[:400]

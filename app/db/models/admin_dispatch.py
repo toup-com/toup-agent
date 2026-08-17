@@ -88,6 +88,34 @@ THREAD_IN = "in"    # user → admin
 THREAD_DIRECTIONS: set[str] = {THREAD_OUT, THREAD_IN}
 
 
+# ── Message origin — WHO the message is from, as a party ──────────
+# Not the surface it arrived on (`Message.channel`) and not the feature that
+# produced it (`Message.source`). Three parties can push a message the user
+# did not ask for, and they differ in exactly one way that matters:
+#
+#   admin   a human operator. NEVER enters agent context — an operator's
+#           words reaching the model is prompt injection with a human author.
+#   agent   the user's own agent, proactively. BELONGS in context: it is the
+#           agent's own prior utterance, and hiding it makes the agent
+#           contradict itself. Reserved; nothing writes it yet.
+#   system  the platform speaking about itself (billing, incidents).
+#
+# The exclusion in `day_context_loader` filters on ORIGIN_ADMIN specifically
+# and never on "did the dispatch path write this". That distinction is the
+# whole reason this vocabulary exists: agent-initiated contact is meant to
+# reuse the same write → fan-out → notify → ack → revoke path by writing a
+# different value here and changing nothing else.
+ORIGIN_ADMIN = "admin"
+ORIGIN_AGENT = "agent"
+ORIGIN_SYSTEM = "system"
+MESSAGE_ORIGINS: set[str] = {ORIGIN_ADMIN, ORIGIN_AGENT, ORIGIN_SYSTEM}
+
+# The origins whose rows must never reach an LLM. A set, not a bare
+# `!= 'admin'`, so adding a future non-model-visible party is one edit here
+# rather than a grep for every comparison.
+ORIGINS_EXCLUDED_FROM_CONTEXT: frozenset[str] = frozenset({ORIGIN_ADMIN})
+
+
 def _default_sender_name() -> str:
     """Deferred settings read — see base.py::_get_embedding_dim for why.
 
@@ -127,6 +155,15 @@ class AdminDispatch(Base):
     mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default=DISPATCH_MODE_ONCE,
     )
+    # The party this send is from. Every row written today is 'admin'; the
+    # column exists so the delivery path (write → fan-out → notify → ack →
+    # revoke) is origin-AGNOSTIC before anything else needs it. A future
+    # agent-initiated message is meant to be one row with a different value
+    # here and no new code — which is only true if identity, badge and copy
+    # are already driven by this field rather than hardcoded to the operator.
+    origin: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=ORIGIN_ADMIN, index=True,
+    )
     audience: Mapped[str] = mapped_column(
         String(16), nullable=False, default=DISPATCH_AUDIENCE_USER,
     )
@@ -145,6 +182,12 @@ class AdminDispatch(Base):
     # Bypasses quiet hours and the daily cap. Operator judgement, recorded
     # per dispatch rather than inferred from the copy.
     urgent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # A catalogue id from `app/services/dispatch_tones.py`, never a
+    # filename — the file a given id maps to is a property of the app
+    # build, and a row that stored `toup_ping.caf` would outlive the
+    # release that bundled it. NULL is the pre-088 history and every
+    # reader collapses it to the system default.
+    tone: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default=DISPATCH_QUEUED, index=True,
@@ -154,11 +197,34 @@ class AdminDispatch(Base):
     delivered_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     read_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Why THIS ROW reads `failed` — a fan-out-level fact, never a per-target
+    # one (those live on `admin_dispatch_targets.last_error`). The stall
+    # sweeper is the reason it has to be persisted at all: a worker that was
+    # OOM-killed or redeployed runs none of its own error handling, so there
+    # are no target rows and no exception text, and "Failed" with no reason is
+    # what the operator was left staring at. Cleared at the top of every
+    # fan-out so a retry cannot inherit the previous attempt's reason.
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow,
     )
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # ── Recall (migration 091) ───────────────────────────────────────
+    # A recall is an ACT BY A PERSON, and the question afterwards is always
+    # "who, and when" — which a boolean answers neither of.
+    #
+    # It removes the CARD from every recipient's chat. It cannot un-send the
+    # NOTIFICATION: nothing takes a delivered push off a lock screen. The two
+    # halves of "sent" are recallable to different degrees and the compose copy
+    # now says so instead of flattening both into "cannot be recalled".
+    #
+    # `revoked_by_user_id` is a plain String, not a CASCADE foreign key, for
+    # the same reason `created_by_user_id` is: an operator's account being
+    # deleted must not erase the record that they recalled a broadcast.
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
 
 class AdminDispatchTarget(Base):
@@ -273,6 +339,30 @@ class AdminThreadMessage(Base):
     )
     read_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     admin_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # ── Deletion (migration 092) ─────────────────────────────────────
+    #
+    # TWO stamps, because "delete" means two different things and an operator
+    # has to be able to say which:
+    #
+    #   hidden_from_user_at — gone for THEM, still in the operator's thread,
+    #     marked. This is the one an operator almost always wants: the message
+    #     stops being visible to the person it was sent to, and the record of
+    #     having sent it survives.
+    #   deleted_at — gone for BOTH. The body is cleared, and a tombstone row
+    #     remains so the thread does not silently lose a turn.
+    #
+    # NEITHER is a hard DELETE. A thread is a conversation between two people
+    # and one of them cannot un-remember it; removing the row outright would
+    # also renumber nothing but silently drop the operator's own audit trail,
+    # which is the thing most needed when a message was sent by mistake.
+    #
+    # `deleted_at` set implies the user cannot see it either — the read filter
+    # is `hidden_from_user_at IS NULL AND deleted_at IS NULL`, so `both` does
+    # not need to set the first one as well.
+    hidden_from_user_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deleted_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     __table_args__ = (
         # Both readers page the same way: one user's thread, newest last.

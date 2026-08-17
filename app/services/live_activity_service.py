@@ -36,7 +36,10 @@ Activity pushes:
                         the card. Alert sounds are ALWAYS the system
                         default tone — iOS has never honored a named
                         sound on a Live Activity push alert (silence,
-                        not fallback).
+                        not fallback). That holds for an operator's
+                        chosen dispatch tone too: this lane resolves
+                        `data.tone` to a file name and `apns_push`
+                        drops it (`ACTIVITY_KIT_SOUND`).
 
 ONE ACTIVITY PER DEVICE — the load-bearing correctness rule. Apple
 leaves the behavior of multiple concurrent activities sharing one
@@ -93,7 +96,7 @@ from app.db.models import (
     NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_NEEDS_APPROVAL,
     NOTIFY_KIND_NEEDS_INPUT, NOTIFY_KIND_PROGRESS,
 )
-from app.services import apns_push
+from app.services import apns_push, dispatch_tones
 
 logger = logging.getLogger(__name__)
 
@@ -638,6 +641,12 @@ async def _send_start(
         timer_end_ms=timer_ms,
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
+        # The operator's chosen dispatch tone, resolved to the file name the
+        # app bundles. `apns_push` drops the name on every ActivityKit
+        # payload (a name there is silence, not a fallback — see the
+        # alarm-class note below), so what this actually buys is ONE place
+        # that knows how `data.tone` becomes an APNs sound value.
+        alert_sound=dispatch_tones.apns_sound(data.get("tone")),
         timestamp=int(now.timestamp()),
         deep_link=deep_link,
         timer_type=timer_type if timer_type in ("circular", "digital") else None,
