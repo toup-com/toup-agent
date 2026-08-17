@@ -44,7 +44,10 @@ from app.config import settings
 from app.services.credit_exhausted import (
     REASON_DAILY_CAP_EXCEEDED,
     REASON_EMAIL_NOT_VERIFIED,
+    OutOfCreditsError,
+    response_to_stream_event,
 )
+from app.services import credit_reporter
 
 logger = logging.getLogger(__name__)
 
@@ -4178,9 +4181,32 @@ async def ws_chat(
                                 await _err_db.commit()
                         except Exception as _save_err:
                             logger.warning(f"[WS] Failed to save partial response: {_save_err}")
-                    # Show user-friendly error instead of raw exception
+                    # Show user-friendly error instead of raw exception.
+                    # A CREDIT boundary is not an error — the runner's typed
+                    # path (OutOfCreditsError) renders the card and never
+                    # reaches here, but a RAW proxy/provider billing rejection
+                    # (an APIError whose text merely contains "credit"/
+                    # "billing") used to land in this handler and ship
+                    # "Error: You're out of Toup credits…" as an agent bubble
+                    # with no door to the fix (founder device, 2026-08-17).
+                    # Convert it to the same structured frame the typed path
+                    # sends, rebuilt from the live credit state; only when the
+                    # reporter cannot confirm exhaustion does it stay an error.
                     user_msg = _friendly_error(e)
-                    await _safe_send({"type": "error", "message": user_msg})
+                    _credit_frame = None
+                    try:
+                        if isinstance(e, OutOfCreditsError):
+                            _credit_frame = response_to_stream_event(e.response)
+                        elif "out of Toup credits" in user_msg:
+                            _resp = credit_reporter.get_state().build_exhausted_response()
+                            if _resp is not None:
+                                _credit_frame = response_to_stream_event(_resp)
+                    except Exception:  # noqa: BLE001
+                        _credit_frame = None
+                    if _credit_frame is not None:
+                        await _safe_send(_credit_frame)
+                    else:
+                        await _safe_send({"type": "error", "message": user_msg})
                 finally:
                     # However this turn ended — answer, error, user stop,
                     # cancellation — it is no longer in flight. Retire the
