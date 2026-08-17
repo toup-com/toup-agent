@@ -54,6 +54,7 @@ from app.config import settings
 from app.db import get_db, User
 from app.db.models import (
     AdminDispatch,
+    AgentConfig,
     AdminDispatchTarget,
     AdminThreadMessage,
     CHAT_DELIVERED,
@@ -639,6 +640,66 @@ async def preview_recipients(
 # ── Threads ──────────────────────────────────────────────────────────
 # Declared ABOVE /{dispatch_id} so the literal path wins the match (same
 # ordering rule as support.py's /corpus).
+
+class RecipientOut(BaseModel):
+    """A candidate recipient, and nothing else.
+
+    Deliberately NOT ``GET /admin/users``: that route dumps every account with
+    two aggregate subqueries (memory counts, session counts) attached, and the
+    compose form was calling it on every page load to render the entire user
+    base as a wall of chips. At 46 accounts that is merely unscannable; the
+    subqueries are what make it a problem at 10,000.
+    """
+    id: str
+    email: Optional[str]
+    name: Optional[str]
+    has_agent: bool
+
+
+@router.get("/recipients", response_model=List[RecipientOut])
+async def search_recipients(
+    query: str = Query(default="", max_length=200),
+    limit: int = Query(default=8, ge=1, le=25),
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Type-ahead for the compose form.
+
+    An EMPTY query returns nothing, on purpose. The whole point of this route is
+    that the recipient list is not something to browse — a picker that shows the
+    entire user base before you have typed is the chip wall with extra steps.
+
+    ``has_agent`` rides along because it is the one fact that changes what
+    sending will do: a user with no reachable container still gets the
+    notification, but no in-chat card. That belongs beside the name at the
+    moment of choosing, not in a preview count afterwards.
+    """
+    q = query.strip()
+    if not q:
+        return []
+
+    like = f"%{q}%"
+    rows = (await db.execute(
+        select(User.id, User.email, User.name, AgentConfig.agent_url)
+        .outerjoin(AgentConfig, AgentConfig.user_id == User.id)
+        .where(or_(
+            User.email.ilike(like),
+            User.name.ilike(like),
+            # An operator pasting a user id from a log or a support ticket is a
+            # real path in, and it is exact rather than fuzzy.
+            User.id == q,
+        ))
+        # Deterministic, so the same query does not reshuffle under the cursor
+        # between keystrokes.
+        .order_by(User.email.asc())
+        .limit(limit)
+    )).all()
+
+    return [
+        RecipientOut(id=r.id, email=r.email, name=r.name, has_agent=bool(r.agent_url))
+        for r in rows
+    ]
+
 
 @router.get("/threads")
 async def list_threads(

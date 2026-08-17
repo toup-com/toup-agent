@@ -2930,3 +2930,94 @@ async def test_deleting_a_conversation_for_a_stranger_is_404(dispatch_client):
     res = await client.request(
         "DELETE", f"/api/admin/dispatch/threads/{uuid.uuid4()}?scope=user_side")
     assert res.status_code == 404, res.text
+
+
+# ── Unit 3: the recipient picker ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_empty_query_returns_nobody(dispatch_client):
+    """The whole reason this route exists. The compose form used to render the
+    entire user base as chips before a single key was pressed; a picker that
+    does the same on an empty query is that wall with extra steps."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    await _mk_user()
+    await _mk_user()
+
+    assert (await client.get("/api/admin/dispatch/recipients")).json() == []
+    assert (await client.get("/api/admin/dispatch/recipients?query=%20%20")).json() == []
+
+
+@pytest.mark.asyncio
+async def test_recipients_match_email_name_and_exact_id(dispatch_client):
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    target = await _mk_user()
+    other = await _mk_user()
+    async with async_session_maker() as db:
+        await db.execute(sa_update(User).where(User.id == target).values(
+            name="Parasto Fahimi", email="parasto@example.com"))
+        await db.execute(sa_update(User).where(User.id == other).values(
+            name="Someone Else", email="else@example.com"))
+        await db.commit()
+
+    def ids(res):
+        return {u["id"] for u in res.json()}
+
+    assert ids(await client.get("/api/admin/dispatch/recipients?query=parasto@")) == {target}
+    assert ids(await client.get("/api/admin/dispatch/recipients?query=fahimi")) == {target}
+    # Pasting an id out of a log or a support ticket is a real path in.
+    assert ids(await client.get(f"/api/admin/dispatch/recipients?query={target}")) == {target}
+    assert ids(await client.get("/api/admin/dispatch/recipients?query=nobodyhere")) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_recipient_says_whether_a_card_can_reach_them(dispatch_client):
+    """`has_agent` changes what sending DOES — a user with no reachable
+    container still gets the notification but no in-chat card. That belongs
+    beside the name while choosing, not in a count afterwards."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    with_agent = await _mk_user()
+    await _mk_agent(with_agent)
+    without = await _mk_user()
+    async with async_session_maker() as db:
+        await db.execute(sa_update(User).where(User.id == with_agent).values(
+            email="haz@agentsearch.test"))
+        await db.execute(sa_update(User).where(User.id == without).values(
+            email="noz@agentsearch.test"))
+        await db.commit()
+
+    rows = (await client.get(
+        "/api/admin/dispatch/recipients?query=agentsearch.test")).json()
+    by_id = {r["id"]: r for r in rows}
+    assert by_id[with_agent]["has_agent"] is True
+    assert by_id[without]["has_agent"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_picker_is_capped_and_ordered(dispatch_client):
+    """Unbounded, one broad query returns the whole user base down a dropdown.
+    Ordered, because a list that reshuffles between keystrokes is unusable."""
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    for i in range(12):
+        u = await _mk_user()
+        async with async_session_maker() as db:
+            await db.execute(sa_update(User).where(User.id == u).values(
+                email=f"cap{i:02d}@capped.test"))
+            await db.commit()
+
+    rows = (await client.get(
+        "/api/admin/dispatch/recipients?query=capped.test&limit=5")).json()
+    assert len(rows) == 5
+    emails = [r["email"] for r in rows]
+    assert emails == sorted(emails), emails
