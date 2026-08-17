@@ -286,14 +286,18 @@ async def report_activity_token(
     per-activity token, updates for that activity stop relying on the
     input-push-token fallback.
 
-    ADOPTION (chat turns only): the app can start a turn card LOCALLY
-    while foregrounded — the platform never pushed a start, so no
-    LiveActivity row exists and every later platform update/end for
-    that turn would terminate ``no_active_activity``. When no started
-    row matches and the mission is a chat turn (``chatturn:`` prefix),
-    create the row here so the platform can drive the locally-started
-    card. Other mission kinds do NOT adopt — their cards are always
-    platform-started."""
+    ADOPTION (chat turns and voice calls): the app can start a card
+    LOCALLY while foregrounded — the platform never pushed a start, so
+    no LiveActivity row exists and every later platform update/end for
+    that card would terminate ``no_active_activity``. When no started
+    row matches and the mission is a chat turn (``chatturn:`` prefix)
+    or a live voice call (``voice:`` prefix), create the row here so
+    the platform can drive the locally-started card. The voice case is
+    what lets ws_realtime END the island card when the client dies —
+    the 2026-08-16 force-quit left "Listening…" on the Lock Screen
+    indefinitely precisely because this endpoint dropped the voice
+    card's token on the floor. Other mission kinds do NOT adopt —
+    their cards are always platform-started."""
     user_id = current_user.id
     now = datetime.utcnow()
     result = await db.execute(
@@ -312,7 +316,8 @@ async def report_activity_token(
         await db.commit()
         return {"ok": True, "updated": updated}
 
-    if not body.mission_id.startswith("chatturn:"):
+    if not (body.mission_id.startswith("chatturn:")
+            or body.mission_id.startswith("voice:")):
         return {"ok": True, "updated": 0}
 
     # Adopt: bind the locally-started turn card to the caller's most
@@ -330,19 +335,24 @@ async def report_activity_token(
     if device is None:
         return {"ok": True, "updated": 0}
 
-    # ONE-ACTIVITY-PER-DEVICE bookkeeping (and the partial unique
-    # index): the locally-started card is now THE card on this device —
-    # force-end any other started rows in DB. No pushes: a preempt end
-    # here would race the card the user is looking at; stale platform
-    # cards self-heal on their next progress tick.
-    await db.execute(
-        update(LiveActivity)
-        .where(
-            LiveActivity.device_id == device.id,
-            LiveActivity.status == LA_STARTED,
+    # ONE-ACTIVITY-PER-DEVICE bookkeeping — for CHAT TURNS. A voice call is
+    # not a card in that rotation: it coexists with whatever card the device
+    # is showing (ActivityKit runs several activities side by side, and the
+    # only DB constraint is UNIQUE(device_id, mission_id)), so adopting one
+    # must not force-end a live reminder countdown's row (review finding,
+    # 2026-08-16). Chat-turn adoption keeps the old semantics: the
+    # locally-started card is now THE card on this device. No pushes either
+    # way: a preempt end here would race the card the user is looking at;
+    # stale platform cards self-heal on their next progress tick.
+    if not body.mission_id.startswith("voice:"):
+        await db.execute(
+            update(LiveActivity)
+            .where(
+                LiveActivity.device_id == device.id,
+                LiveActivity.status == LA_STARTED,
+            )
+            .values(status=LA_ENDED, ended_at=now, updated_at=now)
         )
-        .values(status=LA_ENDED, ended_at=now, updated_at=now)
-    )
 
     # UNIQUE (device_id, mission_id): revive an earlier ended row for
     # this turn if one exists, else insert fresh.

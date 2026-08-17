@@ -44,6 +44,7 @@ import contextvars
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -2440,6 +2441,40 @@ async def resolve_voice_language(user_id: str) -> Optional[str]:
     return code
 
 
+# ── Which realtime session currently OWNS a user's voice presence ────────
+# user_id → session nonce, single-worker in-process (the deployment is
+# deliberately one worker; same rule as the warm-reopen context cache above).
+# A silent app reconnect opens the NEW session before (or moments after) the
+# OLD one's finally runs, and without this the old teardown's Live Activity
+# end killed the island card of the call the user was still on (review
+# finding, 2026-08-16). The finally only ends the card if it is still the
+# owner after a short grace — a clean client 'stop' skips the grace, because
+# an ended call has no successor coming.
+_voice_session_owner: dict = {}
+_VOICE_LA_END_GRACE_S = 6.0
+_deferred_la_tasks: set = set()
+
+
+def _defer_voice_la_end(user_id: str, mission_id, nonce: str, immediate: bool) -> None:
+    async def _run():
+        try:
+            if not immediate:
+                await asyncio.sleep(_VOICE_LA_END_GRACE_S)
+                if _voice_session_owner.get(user_id) != nonce:
+                    return  # a reconnect superseded us — the card is theirs now
+            from app.services.live_activity_service import end_voice_activities
+            await asyncio.wait_for(end_voice_activities(user_id, mission_id), timeout=10.0)
+        except Exception:  # noqa: BLE001
+            logger.warning("[REALTIME] voice LA end failed for %s", user_id[:8])
+        finally:
+            if _voice_session_owner.get(user_id) == nonce:
+                _voice_session_owner.pop(user_id, None)
+
+    t = asyncio.create_task(_run())
+    _deferred_la_tasks.add(t)
+    t.add_done_callback(_deferred_la_tasks.discard)
+
+
 class _ResponseGate:
     """ONE response at a time, by construction.
 
@@ -3378,6 +3413,18 @@ async def realtime_voice_ws(
     # One response at a time, by construction — see _ResponseGate.
     _resp_gate = _ResponseGate(lambda payload: openai_ws.send(payload))
 
+    # The app-reported Live Activity mission for THIS call (config frame).
+    # A dict so both relay loops close over one slot.
+    voice_activity_mission: dict = {"id": None}
+    # This session now owns the user's voice presence; a reconnect that opens
+    # a newer session takes the ownership with it, and the finally checks
+    # before ending the island card (see _defer_voice_la_end).
+    _session_nonce = str(uuid.uuid4())
+    _voice_session_owner[user_id] = _session_nonce
+    # A clean client 'stop' means the call ENDED — no successor is coming and
+    # the card should die immediately, no grace.
+    got_stop: dict = {"v": False}
+
     async def safe_response_create() -> None:
         await _resp_gate.create()
 
@@ -3472,6 +3519,15 @@ async def realtime_voice_ws(
                     # resolves the user's day in UTC.
                     if msg.get("tz"):
                         await _apply_client_tz(user_id, msg.get("tz"))
+
+                    # The call's Live Activity mission ("voice:<uuid>"),
+                    # minted app-side. Held so the finally can END the
+                    # island card when this socket dies — force-quit runs
+                    # no app code, so the relay is the only party left who
+                    # knows the call is over.
+                    _va = msg.get("voice_activity")
+                    if isinstance(_va, str) and _va.startswith("voice:"):
+                        voice_activity_mission["id"] = _va[:64]
 
                     # Client can also pass session_id via config
                     if "session_id" in msg and msg["session_id"] and not db_session_id:
@@ -3619,6 +3675,7 @@ async def realtime_voice_ws(
                             pass
 
                 elif msg_type == "stop":
+                    got_stop["v"] = True
                     break
 
         except WebSocketDisconnect:
@@ -4010,13 +4067,33 @@ async def realtime_voice_ws(
                 pass
 
     # ── Run both relay tasks ──────────────────────────────────
+    # FIRST_COMPLETED, not gather: on a force-quit, client_to_openai returns
+    # immediately (WebSocketDisconnect) but openai_to_client blocks on
+    # `async for raw_msg in openai_ws` — and an idle Listening session has no
+    # OpenAI event coming to unblock it, so a gather() held the finally (and
+    # with it the mic-session close and the Live Activity end) until OpenAI's
+    # own idle timeout. The recording's island claimed "Listening…" for as
+    # long as anyone watched; teardown must start the moment either side dies.
+    _t_client = asyncio.create_task(client_to_openai())
+    _t_openai = asyncio.create_task(openai_to_client())
     try:
-        await asyncio.gather(
-            client_to_openai(),
-            openai_to_client(),
-            return_exceptions=True,
-        )
+        await asyncio.wait({_t_client, _t_openai}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        # The surviving sibling gets a short grace before the cancel: on a
+        # clean 'stop' the openai side may be mid-way through persisting the
+        # final assistant message, and an immediate cancel() lost that last
+        # row from history (review finding). Bounded, so an idle blocked
+        # reader still cannot hold teardown hostage.
+        _pending = [t for t in (_t_client, _t_openai) if not t.done()]
+        if _pending:
+            await asyncio.wait(_pending, timeout=3.0)
+        for _t in (_t_client, _t_openai):
+            if not _t.done():
+                _t.cancel()
+                try:
+                    await _t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
         logger.info("[REALTIME] Session ended for user %s", user_id[:8])
         _cancel_bg()
         # Before the sockets go: these charges are for audio OpenAI has already
@@ -4030,3 +4107,11 @@ async def realtime_voice_ws(
             await websocket.close()
         except Exception:
             pass
+        # The island/Lock-Screen card must not outlive the CALL — but a
+        # silent reconnect is the same call on a new socket, so the end runs
+        # detached, after a grace, and only if no newer session has taken
+        # ownership of the user's voice presence. A clean 'stop' skips the
+        # grace: the user ended the call, and no successor is coming.
+        _defer_voice_la_end(
+            user_id, voice_activity_mission["id"], _session_nonce, got_stop["v"],
+        )

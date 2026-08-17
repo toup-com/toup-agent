@@ -434,6 +434,13 @@ async def _preempt_device(
     for la in await _started_rows_for_device(db, device.id):
         if la.mission_id == keep_mission_id:
             continue
+        if la.mission_id.startswith("voice:"):
+            # A LIVE CALL is not a card in the rotation — ActivityKit runs
+            # multiple activities side by side, and a mission/reminder start
+            # must never end the island presence of a conversation in
+            # progress (review finding, 2026-08-16). The call's own enders
+            # (relay disconnect, staleDate, app reconcile) retire it.
+            continue
         if (
             la.mission_id.startswith("reminder:")
             and keep_mission_id.startswith(_NEVER_PREEMPT_REMINDER_PREFIXES)
@@ -1117,3 +1124,71 @@ async def handle_notification_row(
     if restarted:
         frag["restarted"] = True
     return frag
+
+
+# ── Voice call cards ─────────────────────────────────────────────────────
+# The voice Live Activity is LOCALLY started by the app (voiceActivity.ios.ts,
+# mission "voice:<uuid>") and its per-activity token reaches us through the
+# same report_activity_token adoption path chat turns use. This is the other
+# half of that contract: when the realtime session dies — force-quit is the
+# one that matters, because no app code runs — ws_realtime's finally calls
+# this, and the island/Lock-Screen card ends within seconds instead of
+# claiming "Listening…" for up to Apple's 8-hour cap (2026-08-16 recording B).
+
+async def end_voice_activities(user_id: str, mission_id: Optional[str]) -> int:
+    """End the started card(s) of ONE voice call: APNs end push (best-effort)
+    + the DB end (the invariant). ``mission_id`` is REQUIRED in effect — a
+    session that never identified its card (every web voice session, older
+    app builds) ends nothing. The earlier fallback swept every ``voice:`` row
+    for the user, which meant a web session's close killed the island card of
+    a live PHONE call (review finding, 2026-08-16); a card that never got an
+    identified end still degrades via its staleDate and the app reconcile.
+
+    Opens its own session: the caller is a websocket finally block, not a
+    request with a Depends(db)."""
+    from app.db.database import async_session_maker
+
+    if not mission_id or not mission_id.startswith("voice:"):
+        return 0
+    now = datetime.utcnow()
+    ended = 0
+    async with async_session_maker() as db:
+        q = (
+            select(LiveActivity, LiveActivityDevice)
+            .join(LiveActivityDevice, LiveActivity.device_id == LiveActivityDevice.id)
+            .where(
+                LiveActivity.user_id == user_id,
+                LiveActivity.mission_id == mission_id,
+                LiveActivity.status == LA_STARTED,
+            )
+        )
+        rows = (await db.execute(q)).all()
+        for la, device in rows:
+            if not la.mission_id.startswith("voice:"):
+                continue  # a narrowed mission_id must still be a voice card
+            token = la.activity_push_token or device.push_to_start_token
+            if token and apns_push.apns_configured():
+                payload = apns_push.build_end_payload(
+                    title="Call ended",
+                    dismissal_date=int(now.timestamp()) - 1,
+                    timestamp=int(now.timestamp()),
+                )
+                # Best-effort, same rule as the ack path: the DB end below is
+                # the invariant; the push just clears the screen faster than
+                # staleness would.
+                try:
+                    await apns_push.send_live_activity(
+                        token, payload,
+                        environment=device.apns_environment or "development",
+                        priority=10,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("voice LA end push failed for %s", la.mission_id)
+            la.status = LA_ENDED
+            la.ended_at = now
+            la.updated_at = now
+            ended += 1
+        if ended:
+            await db.commit()
+            logger.info("voice LA end: %d card(s) for user %s", ended, user_id[:8])
+    return ended

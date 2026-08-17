@@ -2551,3 +2551,183 @@ async def test_non_announcement_start_still_carries_zero_progress(monkeypatch):
     ))
     cs = sent[0]["payload"]["aps"]["content-state"]
     assert cs.get("progress") == 0.0
+
+
+# ── voice call cards: adoption + the disconnect ender ─────────────────
+# The 2026-08-16 force-quit repro: the app dies with the island claiming
+# "Listening…", no app code left to end it. The platform must (a) HOLD a
+# routable token for the locally-started voice card — adoption — and
+# (b) end it from ws_realtime's disconnect path — end_voice_activities.
+
+
+@pytest.mark.asyncio
+async def test_activity_token_adopts_voice_call(client, auth_headers, test_user_id):
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c7" * 32, "environment": "production",
+              "install_id": "install-voice-1"},
+        headers=auth_headers,
+    )
+    resp = await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "voice:adopt1234", "activity_push_token": "fa" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("adopted") is True
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "voice:adopt1234")
+        )).scalars().one()
+        assert la.status == LA_STARTED
+        assert la.activity_push_token == "fa" * 32
+
+
+@pytest.mark.asyncio
+async def test_end_voice_activities_pushes_end_and_ends_the_row(
+    monkeypatch, client, auth_headers, test_user_id,
+):
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c8" * 32, "environment": "production",
+              "install_id": "install-voice-2"},
+        headers=auth_headers,
+    )
+    await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "voice:endme5678", "activity_push_token": "fb" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+
+    # The disconnect path names the call it is ending — a session that
+    # cannot name its card ends nothing (a web session's close must not
+    # kill the phone's live call card).
+    assert await las.end_voice_activities(test_user_id, None) == 0
+    ended = await las.end_voice_activities(test_user_id, "voice:endme5678")
+    assert ended == 1
+    assert len(sent) == 1
+    assert sent[0]["token"] == "fb" * 32
+    assert sent[0]["payload"]["aps"]["event"] == "end"
+    # Immediate dismissal: the card leaves the Lock Screen now, not at
+    # the system's leisurely default.
+    assert sent[0]["payload"]["aps"]["dismissal-date"] <= int(datetime.utcnow().timestamp())
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "voice:endme5678")
+        )).scalars().one()
+        assert la.status == LA_ENDED
+
+    # Idempotent: a second end finds nothing.
+    assert await las.end_voice_activities(test_user_id, "voice:endme5678") == 0
+
+
+@pytest.mark.asyncio
+async def test_voice_sweep_never_touches_chat_turn_cards(
+    monkeypatch, client, auth_headers, test_user_id,
+):
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "c9" * 32, "environment": "production",
+              "install_id": "install-voice-3"},
+        headers=auth_headers,
+    )
+    await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "chatturn:bystander1", "activity_push_token": "fc" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+
+    assert await las.end_voice_activities(test_user_id, "chatturn:bystander1") == 0
+    assert sent == []
+
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "chatturn:bystander1")
+        )).scalars().one()
+        assert la.status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_voice_adoption_leaves_other_cards_running(
+    client, auth_headers, test_user_id,
+):
+    """A voice call COEXISTS: adopting its card must not force-end a live
+    reminder countdown's row (the chat-turn one-per-device semantics do not
+    apply to a call)."""
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "ca" * 32, "environment": "production",
+              "install_id": "install-voice-4"},
+        headers=auth_headers,
+    )
+    # A countdown card is live on the device (adopted via the chat-turn path
+    # would end others, so plant it directly).
+    await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "chatturn:preexisting", "activity_push_token": "fd" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "voice:coexist1", "activity_push_token": "fe" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        chat = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "chatturn:preexisting")
+        )).scalars().one()
+        voice = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "voice:coexist1")
+        )).scalars().one()
+        assert chat.status == LA_STARTED   # the call did not evict the turn card
+        assert voice.status == LA_STARTED
+
+
+@pytest.mark.asyncio
+async def test_preempt_never_ends_a_voice_card(monkeypatch, client, auth_headers, test_user_id):
+    """A mission/reminder start on the device must not end the island
+    presence of a call in progress."""
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": "cb" * 32, "environment": "production",
+              "install_id": "install-voice-5"},
+        headers=auth_headers,
+    )
+    await client.post(
+        "/api/devices/live-activity/activity-token",
+        json={"mission_id": "voice:precious1", "activity_push_token": "ff" * 32,
+              "source": "local_start"},
+        headers=auth_headers,
+    )
+    from app.db import async_session_maker
+    async with async_session_maker() as db:
+        device = (await db.execute(
+            select(LiveActivityDevice).where(
+                LiveActivityDevice.install_id == "install-voice-5")
+        )).scalars().one()
+        preempted = await las._preempt_device(
+            db, device, "mission-new-start", datetime.utcnow())
+        await db.commit()
+        assert preempted == 0
+        voice = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == "voice:precious1")
+        )).scalars().one()
+        assert voice.status == LA_STARTED
+    assert sent == []   # and no end push went anywhere near it
