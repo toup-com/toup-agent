@@ -293,6 +293,9 @@ async def test_a_broadcast_created_event_has_no_subject(dispatch_client, monkeyp
     admin_id = await _mk_user(role="admin")
     await _mk_user()
     app.dependency_overrides[get_current_user] = lambda: _principal(admin_id, role="admin")
+    # G-DISPATCH-BROADCAST defaults OFF; this test is about the event's
+    # subject, not the kill switch, so turn it on explicitly.
+    monkeypatch.setattr(settings, "dispatch_broadcast_enabled", True, raising=False)
 
     res = await client.post("/api/admin/dispatch", json={
         "mode": "once", "audience": "all", "confirm": "BROADCAST",
