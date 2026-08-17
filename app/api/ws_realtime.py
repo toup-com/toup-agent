@@ -2428,6 +2428,127 @@ async def resolve_voice_language(user_id: str) -> Optional[str]:
     return code
 
 
+class _ResponseGate:
+    """ONE response at a time, by construction.
+
+    The API rejects a `response.create` that lands while another response is
+    active — "Conversation already has an active response in progress" — and
+    this file used to have FOUR unguarded senders racing the VAD's own
+    auto-created responses (tool continuation, inject_text, onboarding greet,
+    screen-share first frame). The tool continuation is the reliable
+    reproducer: a `think` turn holds the reader loop for seconds-to-tens of
+    seconds, the user speaks meanwhile, semantic_vad (V1's server_vad too — it
+    auto-creates by default) opens a response for the new utterance, and the
+    continuation fires into it. On 2026-08-16 that error string reached a phone
+    verbatim, the client treated it as terminal, and the session wedged.
+
+    Semantics:
+    - `create()` is the only sender. While a response is active it records the
+      intent instead of sending — dropping it would eat the spoken half of a
+      tool turn, because nothing else will ever ask for that reply.
+    - `active` flips True on `response.created` (VAD- and relay-created alike)
+      and optimistically inside `create()` (the send is a suspension point; the
+      echo may not return before a second caller checks).
+    - It flips False ONLY on `response.done`, which the API emits for every
+      terminal status — completed, cancelled, failed, incomplete — so a
+      deferred continuation can never strand.
+    - `on_conflict()` is the self-heal for the one unwinnable ordering: our
+      create raced a response whose `response.created` was still queued unread
+      (the reader was blocked in a tool call). The API's error tells us it IS
+      active; the intent stands and replays on the next done.
+
+    Module-level (not a closure) so tests can pin this machine without a
+    socket — same rule as `build_session_config`.
+    """
+
+    def __init__(self, send) -> None:
+        self._send = send            # async fn taking the serialized frame
+        self._lock = asyncio.Lock()
+        self.active = False
+        self.deferred = False
+
+    async def create(self) -> None:
+        async with self._lock:
+            if self.active:
+                self.deferred = True
+                return
+            self.active = True
+            await self._send(json.dumps({"type": "response.create"}))
+
+    def on_created(self) -> None:
+        self.active = True
+
+    async def on_done(self) -> bool:
+        """Clear the active flag; report whether a deferred create wants to
+        replay. The caller replays via `create()` AFTER finishing its own
+        response.done bookkeeping, so the replayed response opens clean."""
+        async with self._lock:
+            self.active = False
+            want, self.deferred = self.deferred, False
+            return want
+
+    def on_conflict(self) -> None:
+        self.active = True
+        self.deferred = True
+
+
+# Benign edges of normal turn-taking: a cancel that lost the race to
+# response.done, a VAD commit on an empty buffer, a truncate on an
+# already-finished item. Nothing is wrong and nothing needs the user.
+_BENIGN_ERROR_CODES = frozenset((
+    "response_cancel_not_active",
+    "input_audio_buffer_commit_empty",
+    "item_truncate_audio_end_ms_too_large",
+))
+
+# The SESSION itself is dead — reconnecting is the only fix.
+_FATAL_ERROR_STEMS = ("session_expired", "invalid_api_key", "auth",
+                      "session_not_found", "invalid_session")
+
+
+def classify_realtime_error(code: str, message: str) -> Optional[dict]:
+    """Map an upstream error event to the frame the client receives — or None
+    for the classes the user must never hear about.
+
+    Raw upstream text NEVER crosses the WS boundary. On 2026-08-16
+    "Conversation already has an active response in progress: resp_EDWtl…"
+    reached a phone verbatim as the on-screen headline. The upstream message is
+    for our logs; the client gets a `code` (to localize) and a `recoverable`
+    bit (stay in the call vs tear down). Billing keeps its dedicated copy —
+    the platform's OpenAI billing page is not the user's to visit, and must
+    never be linked.
+
+    Module-level so tests can pin every class without a socket.
+    """
+    code = code or ""
+    if code in _BENIGN_ERROR_CODES:
+        return None
+    billing_keywords = ["insufficient_quota", "billing", "exceeded", "rate_limit",
+                        "quota", "payment", "credit", "balance", "plan"]
+    is_billing = (
+        code in ("insufficient_quota", "billing_hard_limit_reached",
+                 "rate_limit_exceeded", "budget_exceeded")
+        or any(kw in message.lower() for kw in billing_keywords)
+    )
+    if is_billing:
+        return {
+            "type": "error",
+            "code": "billing",
+            "message": ("Voice is temporarily unavailable while we top "
+                        "up capacity. Please try again shortly."),
+            "billing": True,
+        }
+    fatal = any(stem in code for stem in _FATAL_ERROR_STEMS)
+    return {
+        "type": "error",
+        "code": code or "voice_error",
+        "recoverable": not fatal,
+        "message": ("Voice is unavailable right now. Please try again."
+                    if fatal else
+                    "That didn't go through — I'm still listening."),
+    }
+
+
 def build_session_config(
     instr: str, tools: list, voice: str, language: Optional[str] = None,
 ) -> dict:
@@ -3033,7 +3154,9 @@ async def realtime_voice_ws(
         is_billing = any(kw in err_str for kw in ["quota", "billing", "rate_limit", "402", "429", "credit", "balance"])
         error_payload: dict = {
             "type": "error",
-            "message": f"Failed to connect to OpenAI Realtime API: {e}",
+            "code": "connect_failed",
+            "recoverable": False,
+            "message": "Couldn't reach the voice engine. Tap to retry.",
         }
         if is_billing:
             # Platform-side capacity/credit problem. NEVER surface the
@@ -3079,7 +3202,13 @@ async def realtime_voice_ws(
     except Exception as e:
         _cancel_bg()
         logger.exception("[REALTIME] Failed to configure session")
-        await websocket.send_json({"type": "error", "message": str(e)})
+        # The exception text is ours to read in the logs, never the user's.
+        await websocket.send_json({
+            "type": "error",
+            "code": "session_setup_failed",
+            "recoverable": False,
+            "message": "Couldn't set up the voice session. Tap to retry.",
+        })
         await openai_ws.close()
         await websocket.close()
         return
@@ -3194,6 +3323,12 @@ async def realtime_voice_ws(
     speech_stopped_at: dict = {"t": 0.0}
     first_audio_of_response: dict = {"pending": False}
 
+    # One response at a time, by construction — see _ResponseGate.
+    _resp_gate = _ResponseGate(lambda payload: openai_ws.send(payload))
+
+    async def safe_response_create() -> None:
+        await _resp_gate.create()
+
     screen_sharing_active = False
     first_frame_sent = False
     last_vision_call_time = 0.0
@@ -3242,7 +3377,7 @@ async def realtime_voice_ws(
 
             # Only trigger a response on the first frame so agent acknowledges
             if is_first:
-                await openai_ws.send(json.dumps({"type": "response.create"}))
+                await safe_response_create()
 
             last_vision_call_time = time.monotonic()
             logger.info("[REALTIME] Screen vision analysis sent (%d chars)", len(description))
@@ -3334,7 +3469,7 @@ async def realtime_voice_ws(
                             except asyncio.TimeoutError:
                                 logger.warning("[REALTIME] Onboarding greet fired without full context (timeout)")
                             try:
-                                await openai_ws.send(json.dumps({"type": "response.create"}))
+                                await safe_response_create()
                                 logger.info("[REALTIME] Onboarding: client audio ready, triggered greeting")
                             except Exception:
                                 pass
@@ -3353,7 +3488,7 @@ async def realtime_voice_ws(
                                 "content": [{"type": "input_text", "text": inject_content}],
                             },
                         }))
-                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                        await safe_response_create()
                         logger.info("[REALTIME] Injected text: %s", inject_content[:60])
 
                 elif msg_type == "now_playing":
@@ -3417,6 +3552,20 @@ async def realtime_voice_ws(
                                 last_audio_item["id"], audio_end_ms,
                             )
 
+                elif msg_type == "interrupt":
+                    # Explicit client barge-in: the user tapped the orb (or the
+                    # client cut playback for its own reasons). The VAD can only
+                    # cancel what it can hear, and a tap is silent — without
+                    # this the model keeps generating a reply nobody is playing,
+                    # and the next turn queues behind it. response.cancel on an
+                    # already-finished response answers response_cancel_not_active,
+                    # which the error branch swallows as benign.
+                    if _resp_gate.active:
+                        try:
+                            await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                        except Exception:
+                            pass
+
                 elif msg_type == "stop":
                     break
 
@@ -3453,6 +3602,12 @@ async def realtime_voice_ws(
                     await websocket.send_json({
                         "type": "audio_delta",
                         "data": event.get("delta", ""),
+                        # Which assistant item this audio belongs to. The
+                        # client's played-ms clock is per-TURN; truncation is
+                        # per-ITEM (a tool turn voices two items: pre-amble,
+                        # then answer). Naming the item lets the client report
+                        # a barge-in position the truncate can actually use.
+                        "item": event.get("item_id"),
                     })
 
                 # ── Assistant text transcript (partial; GA: response.output_audio_transcript.delta) ──
@@ -3467,6 +3622,7 @@ async def realtime_voice_ws(
 
                 # ── Response complete ──
                 elif etype == "response.done":
+                    _replay = await _resp_gate.on_done()
                     response = event.get("response", {})
 
                     _meter_t = _maybe_meter_response(user_id, response, using_platform_key)
@@ -3536,6 +3692,14 @@ async def realtime_voice_ws(
 
                     await websocket.send_json({"type": "state", "state": "listening"})
 
+                    # A continuation that was deferred because THIS response was
+                    # active runs now. (If a VAD response was also queued behind
+                    # us, the create below collides, the error handler re-queues
+                    # it, and the next response.done replays it — self-healing
+                    # by construction, invisible to the user.)
+                    if _replay:
+                        await safe_response_create()
+
                 # ── User speech transcript ──
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript", "")
@@ -3576,6 +3740,7 @@ async def realtime_voice_ws(
 
                 # ── Response started → speaking ──
                 elif etype == "response.created":
+                    _resp_gate.on_created()
                     await websocket.send_json({"type": "state", "state": "speaking"})
 
                 # ── Function call completed → execute tool ──
@@ -3717,58 +3882,61 @@ async def realtime_voice_ws(
                             },
                         }))
 
-                        # Tell OpenAI to continue
-                        await openai_ws.send(json.dumps({
-                            "type": "response.create",
-                        }))
+                        # Ask for the spoken reply. By the time a tool result is
+                        # ready, THIS response (the function-call one) is already
+                        # done and its response.done is queued unread behind us —
+                        # and if the user spoke during the tool run, the VAD has
+                        # opened a response of its own. safe_response_create
+                        # defers the continuation past whatever is active instead
+                        # of colliding with it.
+                        await safe_response_create()
 
                 # ── Errors from OpenAI ──
+                # THREE classes, and raw API text never crosses the WS boundary.
+                # On 2026-08-16 "Conversation already has an active response in
+                # progress: resp_EDWtl…" reached a phone verbatim, the client
+                # treated it as terminal, and the session wedged with the mic
+                # off. The message string is for our logs; the client gets a
+                # `code` (to localize) and a `recoverable` bit (to decide
+                # whether to stay in the call).
                 elif etype == "error":
                     error_obj = event.get("error", {})
                     error_msg = error_obj.get("message", "Unknown OpenAI error")
-                    error_code = error_obj.get("code", "")
+                    error_code = error_obj.get("code", "") or ""
                     logger.error("[REALTIME] OpenAI error: %s (code=%s)", error_msg, error_code)
 
-                    # Detect billing / quota errors
-                    billing_keywords = ["insufficient_quota", "billing", "exceeded", "rate_limit",
-                                        "quota", "payment", "credit", "balance", "plan"]
-                    is_billing = (
-                        error_code in ("insufficient_quota", "billing_hard_limit_reached",
-                                       "rate_limit_exceeded", "budget_exceeded")
-                        or any(kw in error_msg.lower() for kw in billing_keywords)
-                    )
+                    # Conversation-state race the relay itself resolves: our
+                    # deferred continuation collided with a VAD-created
+                    # response. Re-queue it for the next response.done and tell
+                    # the user NOTHING — the session is healthy.
+                    if error_code == "conversation_already_has_active_response":
+                        _resp_gate.on_conflict()
+                        continue
 
-                    if is_billing:
-                        # See above: the platform's OpenAI billing page is not
-                        # the user's to visit, and must never be linked.
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": (
-                                "Voice is temporarily unavailable while we top "
-                                "up capacity. Please try again shortly."
-                            ),
-                            "billing": True,
-                        })
-                    else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": error_msg,
-                        })
+                    payload = classify_realtime_error(error_code, error_msg)
+                    if payload is None:
+                        continue
+                    await websocket.send_json(payload)
 
                 # ── Session events (log only) ──
                 elif etype in ("session.created", "session.updated"):
                     logger.info("[REALTIME] %s", etype)
 
         except websockets.ConnectionClosed as e:
+            # Same boundary rule as classify_realtime_error: the close reason
+            # is upstream text, and it goes to our logs, never to the screen.
             logger.warning("[REALTIME] OpenAI WS closed: code=%s reason=%s", e.code, e.reason)
             reason = str(e.reason or e).lower()
             is_billing = any(kw in reason for kw in ["quota", "billing", "rate_limit", "credit", "balance", "exceeded"])
             error_payload: dict = {
                 "type": "error",
-                "message": f"OpenAI connection closed: {e.reason or e}",
+                "code": "connection_closed",
+                "recoverable": False,
+                "message": "The voice connection dropped. Tap to reconnect.",
             }
             if is_billing or e.code in (4002, 4003):
                 error_payload["billing"] = True
+                error_payload["code"] = "billing"
                 error_payload["message"] = (
                     "Voice is temporarily unavailable while we top up "
                     "capacity. Please try again shortly."
@@ -3780,7 +3948,12 @@ async def realtime_voice_ws(
         except Exception as e:
             logger.warning("[REALTIME] openai_to_client error: %s", e)
             try:
-                await websocket.send_json({"type": "error", "message": str(e)})
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "relay_error",
+                    "recoverable": False,
+                    "message": "Voice hit a snag. Tap to reconnect.",
+                })
             except Exception:
                 pass
 
