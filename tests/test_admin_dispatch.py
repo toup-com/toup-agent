@@ -2936,18 +2936,30 @@ async def test_deleting_a_conversation_for_a_stranger_is_404(dispatch_client):
 
 
 @pytest.mark.asyncio
-async def test_an_empty_query_returns_nobody(dispatch_client):
-    """The whole reason this route exists. The compose form used to render the
-    entire user base as chips before a single key was pressed; a picker that
-    does the same on an empty query is that wall with extra steps."""
+async def test_a_blank_query_browses_rather_than_refusing(dispatch_client):
+    """SUPERSEDES ``test_an_empty_query_returns_nobody`` (reversed 2026-08-17).
+
+    That test asserted `[] == GET /recipients`, on the reasoning that the
+    compose form used to render the entire user base as chips and a picker doing
+    the same on focus is that wall with extra steps.
+
+    The reasoning survives; the conclusion does not. The wall's defects were that
+    it rendered EVERY account, unlabelled, through a route with two aggregate
+    subqueries per row. A capped, labelled, cheap list is none of those — and the
+    rule it produced only helped an operator who already knew the address, which
+    is not the common case.
+
+    Whitespace still counts as blank: `?query=%20%20` browses, it does not search
+    for two spaces.
+    """
     client, app = dispatch_client
     admin = await _mk_user(role="admin")
     app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
     await _mk_user()
     await _mk_user()
 
-    assert (await client.get("/api/admin/dispatch/recipients")).json() == []
-    assert (await client.get("/api/admin/dispatch/recipients?query=%20%20")).json() == []
+    assert (await client.get("/api/admin/dispatch/recipients")).json() != []
+    assert (await client.get("/api/admin/dispatch/recipients?query=%20%20")).json() != []
 
 
 @pytest.mark.asyncio
@@ -3021,3 +3033,58 @@ async def test_the_picker_is_capped_and_ordered(dispatch_client):
     assert len(rows) == 5
     emails = [r["email"] for r in rows]
     assert emails == sorted(emails), emails
+
+
+@pytest.mark.asyncio
+async def test_recipients_browses_on_an_empty_query_and_narrows_on_a_typed_one(dispatch_client):
+    """REVERSED 2026-08-17, at the founder's request.
+
+    This route used to answer an empty query with `[]`, on the reasoning that
+    the recipient list is not something to browse. That is right for a chip wall
+    of 10,000 and wrong for an operator who knows the person but not the
+    address: an empty box that answers nothing is a dead end, not a discipline.
+
+    Newest-first, to match the admin Users list (users.py:212) — the same people
+    in the same order in both places.
+
+    The old rule WAS pinned, by ``test_an_empty_query_returns_nobody`` directly
+    above — now rewritten as its counterpart rather than deleted, so the reversal
+    is legible instead of looking like coverage that quietly went missing. This
+    test pins the new behaviour in both directions, so "browse" cannot become
+    "return everything" and "search" cannot stop filtering.
+    """
+    client, app = dispatch_client
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+
+    base = datetime.utcnow() - timedelta(days=10)
+    ids = [await _mk_user(created_at=base + timedelta(days=i)) for i in range(3)]
+
+    res = await client.get("/api/admin/dispatch/recipients")
+    assert res.status_code == 200, res.text
+    browsed = res.json()
+    assert browsed, "an empty query must BROWSE, not return []"
+
+    returned = [r["id"] for r in browsed]
+    # Newest first — assert on our own rows' relative order, since the fixture DB
+    # carries other users from sibling tests and an absolute index would be a
+    # test that fails when a neighbour is added.
+    positions = [returned.index(u) for u in ids if u in returned]
+    assert positions == sorted(positions, reverse=True), (
+        f"expected newest-first; our users landed at {positions}"
+    )
+
+    # The cap is real, and it is what keeps "browse" honest at 10,000 accounts.
+    capped = await client.get("/api/admin/dispatch/recipients", params={"limit": 2})
+    assert len(capped.json()) == 2, capped.text
+
+    # And a typed query still narrows rather than browsing.
+    async with async_session_maker() as db:
+        target = (await db.execute(select(User).where(User.id == ids[0]))).scalar_one()
+        email = target.email
+    hit = await client.get("/api/admin/dispatch/recipients", params={"query": email})
+    assert [r["id"] for r in hit.json()] == [ids[0]], hit.text
+
+    miss = await client.get(
+        "/api/admin/dispatch/recipients", params={"query": "zzz-no-such-account-zzz"})
+    assert miss.json() == [], miss.text

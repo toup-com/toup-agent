@@ -659,15 +659,26 @@ class RecipientOut(BaseModel):
 @router.get("/recipients", response_model=List[RecipientOut])
 async def search_recipients(
     query: str = Query(default="", max_length=200),
-    limit: int = Query(default=8, ge=1, le=25),
+    limit: int = Query(default=8, ge=1, le=50),
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Type-ahead for the compose form.
+    """Recipient picker for the compose form — browse OR search.
 
-    An EMPTY query returns nothing, on purpose. The whole point of this route is
-    that the recipient list is not something to browse — a picker that shows the
-    entire user base before you have typed is the chip wall with extra steps.
+    **An empty query returns the most recent accounts.** This is a reversal, at
+    the founder's request (2026-08-17), and the original reasoning is worth
+    keeping because it is right at a different scale: this route replaced a wall
+    of every account rendered as chips, and returning the whole user base before
+    a keystroke is that wall with extra steps.
+
+    What that argument missed is that it only holds if the operator already knows
+    the address. They usually do not — they know "the person who wrote in this
+    morning". With 47 accounts, an empty box that answers nothing is a dead end,
+    not a discipline. So: browse by default, narrow by typing, and the cap keeps
+    it honest at 10,000.
+
+    Ordered newest-first to match the admin Users list (users.py:212), so the
+    same people appear in the same order in both places.
 
     ``has_agent`` rides along because it is the one fact that changes what
     sending will do: a user with no reachable container still gets the
@@ -675,25 +686,26 @@ async def search_recipients(
     moment of choosing, not in a preview count afterwards.
     """
     q = query.strip()
-    if not q:
-        return []
 
-    like = f"%{q}%"
-    rows = (await db.execute(
+    stmt = (
         select(User.id, User.email, User.name, AgentConfig.agent_url)
         .outerjoin(AgentConfig, AgentConfig.user_id == User.id)
-        .where(or_(
+    )
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(or_(
             User.email.ilike(like),
             User.name.ilike(like),
             # An operator pasting a user id from a log or a support ticket is a
             # real path in, and it is exact rather than fuzzy.
             User.id == q,
-        ))
         # Deterministic, so the same query does not reshuffle under the cursor
         # between keystrokes.
-        .order_by(User.email.asc())
-        .limit(limit)
-    )).all()
+        )).order_by(User.email.asc())
+    else:
+        stmt = stmt.order_by(User.created_at.desc())
+
+    rows = (await db.execute(stmt.limit(limit))).all()
 
     return [
         RecipientOut(id=r.id, email=r.email, name=r.name, has_agent=bool(r.agent_url))
