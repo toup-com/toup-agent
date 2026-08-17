@@ -25,6 +25,7 @@ Authentication:
   Or send as first message: { "type": "auth", "token": "JWT_TOKEN" }
 """
 
+import ast
 import asyncio
 import json
 import logging
@@ -75,6 +76,41 @@ def _reset_phrase(when) -> str:
         return f"in {h}h {m}m"
     d = secs // 86_400
     return f"in {d} day{'s' if d != 1 else ''}"
+
+
+def _extract_out_of_credits_detail(text: str) -> Optional[dict]:
+    """The llm-proxy 402 body (response_to_http_detail) as it survives inside a
+    stringified exception — JSON or python-repr, wrapped in arbitrary prose.
+    Returns the detail dict when it is recognizably the out_of_credits shape,
+    else None. Never raises."""
+    idx = text.find("out_of_credits")
+    if idx == -1:
+        return None
+    start = text.rfind("{", 0, idx)
+    while start != -1:
+        depth = 0
+        for end in range(start, min(len(text), start + 4000)):
+            ch = text[end]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    blob = text[start:end + 1]
+                    for loads in (json.loads, ast.literal_eval):
+                        try:
+                            d = loads(blob)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if isinstance(d, dict):
+                            if d.get("error") == "out_of_credits" and "reason" in d:
+                                return d
+                            inner = d.get("detail")
+                            if isinstance(inner, dict) and inner.get("error") == "out_of_credits":
+                                return inner
+                    break
+        start = text.rfind("{", 0, start)
+    return None
 
 
 def _friendly_error(exc: Exception) -> str:
@@ -4198,9 +4234,23 @@ async def ws_chat(
                         if isinstance(e, OutOfCreditsError):
                             _credit_frame = response_to_stream_event(e.response)
                         elif "out of Toup credits" in user_msg:
-                            _resp = credit_reporter.get_state().build_exhausted_response()
-                            if _resp is not None:
-                                _credit_frame = response_to_stream_event(_resp)
+                            # Layer 1: the proxy's 402 body rides inside the
+                            # stringified exception — the exact payload, free.
+                            _detail = _extract_out_of_credits_detail(str(e))
+                            if _detail is not None:
+                                _credit_frame = {"type": "credit_exhausted", **_detail}
+                            else:
+                                # Layer 2: warm in-process state.
+                                _resp = credit_reporter.get_state().build_exhausted_response()
+                                if _resp is None:
+                                    # Layer 3: a container rolled seconds ago has a
+                                    # COLD CreditState (the founder hit exactly this
+                                    # two minutes after a fleet roll) — ask the
+                                    # platform, which also warms the state.
+                                    await credit_reporter.check_balance_remote(user_id=user_id)
+                                    _resp = credit_reporter.get_state().build_exhausted_response()
+                                if _resp is not None:
+                                    _credit_frame = response_to_stream_event(_resp)
                     except Exception:  # noqa: BLE001
                         _credit_frame = None
                     if _credit_frame is not None:

@@ -35,9 +35,34 @@ def test_claude_subscription_exhaustion_is_not_card_eligible():
 
 def test_backstop_converts_before_the_error_frame():
     src = inspect.getsource(ws_chat)
-    block = src.split("user_msg = _friendly_error(e)")[1][:1600]
+    block = src.split("user_msg = _friendly_error(e)")[1][:3200]
     # typed first, then the live-state rebuild, and only then the error frame
     assert block.index("isinstance(e, OutOfCreditsError)") < block.index('"out of Toup credits" in user_msg')
     assert block.index("build_exhausted_response()") < block.index('{"type": "error", "message": user_msg}')
     # the card frame is the structured event, not hand-rolled json
     assert "response_to_stream_event" in block
+
+
+def test_detail_extractor_reads_json_and_repr_and_rejects_garbage():
+    from app.api.ws_chat import _extract_out_of_credits_detail as ex
+    detail = {"error": "out_of_credits", "reason": "insufficient_message_credits",
+              "bucket": "message", "monthly_reset_at": "2026-09-05T00:00:00Z"}
+    import json
+    # JSON body inside prose (the httpx/openai style)
+    assert ex(f"Error code: 402 - {json.dumps({'detail': detail})}".replace("'", '"'))["reason"] == "insufficient_message_credits"
+    # python-repr (str(dict)) style
+    assert ex(f"apologies: {str(detail)} and more")["reason"] == "insufficient_message_credits"
+    # bare detail without wrapper
+    assert ex(json.dumps(detail))["error"] == "out_of_credits"
+    # mentions the phrase but carries no payload
+    assert ex("upstream said out_of_credits but nothing else") is None
+    assert ex("no credits mentioned here") is None
+
+
+def test_cold_state_falls_back_to_remote_preflight_in_order():
+    import inspect
+    from app.api import ws_chat
+    src = inspect.getsource(ws_chat)
+    block = src.split('_extract_out_of_credits_detail(str(e))')[1][:1200]
+    assert block.index('build_exhausted_response()') < block.index('check_balance_remote')
+    assert 'check_balance_remote(user_id=user_id)' in block
