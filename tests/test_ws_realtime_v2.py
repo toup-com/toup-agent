@@ -61,6 +61,7 @@ def test_v2_session_config(v2_on):
     assert td["interrupt_response"] is True
     assert session["audio"]["input"]["transcription"] == {
         "model": settings.voice_realtime_transcription_model,
+        "prompt": rt.transcription_prompt(None),
     }
     assert session["audio"]["input"]["noise_reduction"] == {"type": "far_field"}
     assert session["truncation"] == {"type": "retention_ratio", "retention_ratio": 0.8}
@@ -312,9 +313,23 @@ def test_language_absent_when_unknown_v1_and_v2(v2_off):
     assert rt.build_session_config("I", [], "coral", None)["session"] == v1
 
 
-def test_language_present_when_known(v2_on):
+def test_language_rides_the_prompt_on_v2_never_the_pin(v2_on):
+    """The V2 transcriber gets the session language as a PROMPT, never as a
+    `language` pin. Measured 2026-08-16 (scripts/eval_voice_transcription.py):
+    a fa pin on gpt-4o-transcribe TRANSLATED an English utterance into Farsi,
+    while the Farsi bias prompt recovered code-switched product names 9/9."""
     tr = rt.build_session_config("I", [], "marin", "fa")["session"]["audio"]["input"]["transcription"]
-    assert tr == {"model": settings.voice_realtime_transcription_model, "language": "fa"}
+    assert "language" not in tr
+    assert tr["model"] == settings.voice_realtime_transcription_model
+    assert "فارسی" in tr["prompt"]          # the fa prompt, in Farsi
+    assert "Grok" in tr["prompt"]           # bias terms present
+
+
+def test_v2_prompt_is_english_when_language_unknown(v2_on):
+    tr = rt.build_session_config("I", [], "marin", None)["session"]["audio"]["input"]["transcription"]
+    assert "language" not in tr
+    assert "فارسی" not in tr["prompt"]
+    assert "Grok" in tr["prompt"]
 
 
 def test_language_pins_on_v1_whisper_too(v2_off):

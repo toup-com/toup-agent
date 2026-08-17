@@ -159,7 +159,10 @@ def _base_voice_instructions() -> str:
         "- Respond naturally and conversationally; keep replies to 1-3 sentences "
         "unless the user asks for detail.\n"
         "- No markdown, lists, or formatting — spoken prose only.\n"
-        "- Match the user's language.\n"
+        "- Match the user's language. The user may mix English product names "
+        "(Grok, ChatGPT, Claude, Gemini…) into another language mid-sentence — "
+        "hear those as English names, and if a name came through garbled, ask "
+        "one short question instead of acting on a guess.\n"
         "- Your personalized memory and tools are still loading for the first "
         "seconds of this call; if the user asks something personal before they "
         "arrive, say you're just waking up — never guess.\n"
@@ -780,6 +783,15 @@ async def build_realtime_instructions(
         "and the tapped ر) exactly as a native speaker from Tehran would — NOT with an "
         "English accent. In Persian: «فارسی را کاملاً روان و طبیعی صحبت کن، با لهجهٔ "
         "بومیِ تهرانی و تلفّظِ درستِ فارسی، بدون هیچ لهجهٔ خارجی یا انگلیسی.»\n"
+        "- The user may CODE-SWITCH mid-sentence: Persian speech with English product "
+        "and brand names embedded (Grok, ChatGPT, Claude, Gemini, xAI, YouTube, "
+        "Spotify…). When a word sounds foreign to the sentence's language, consider "
+        "an English name FIRST, not a rare native word.\n"
+        "- If you only half-caught a name or the request sounded garbled, ask ONE "
+        "short clarifying question BEFORE acting on it — never research, explain, or "
+        "answer at length from a low-confidence hearing. A user who said 'Grok bot' "
+        "once got a lecture about rock music from exactly this mistake; asking "
+        "'Grok — the xAI one?' costs two seconds and is always the better trade.\n"
         "- Everything you already know about the user and about yourself is "
         "provided ABOVE in this prompt — your identity, the user's profile, your "
         "memories, and today's conversation. Answer questions about the user's "
@@ -2549,6 +2561,36 @@ def classify_realtime_error(code: str, message: str) -> Optional[dict]:
     }
 
 
+# Product nouns a voice session actually says, in the Latin spellings the rest
+# of the pipeline (the agent, the UI, memory extraction) needs back. Measured
+# 2026-08-16 by scripts/eval_voice_transcription.py: WITHOUT this prompt,
+# gpt-4o-transcribe Persianizes every one of them («گرواک‌بات», «کلاد»,
+# «جمینای») — 5/9 keyword recovery; WITH it, 9/9, including the exact sentence
+# the day's recording garbled into «گروه که ایلان ماسک».
+_TRANSCRIPTION_BIAS_TERMS = (
+    "Toup, Grok, ChatGPT, GPT, Claude, Gemini, xAI, OpenAI, Anthropic, "
+    "YouTube, Spotify, WhatsApp, Telegram"
+)
+
+
+def transcription_prompt(language: Optional[str]) -> str:
+    """The transcription side-channel's bias prompt.
+
+    Written in the SESSION's language: a Farsi prompt tells the model the
+    audio is colloquial Persian with English terms mixed in — which is what
+    code-switching is, and what a hard `language` pin cannot express (a pin
+    forces one language and came back with English utterances TRANSLATED into
+    Farsi in the eval). Keep the term list in sync with
+    scripts/eval_voice_transcription.py, which is the regression harness.
+    """
+    if language == "fa":
+        return (
+            "گفت‌وگوی کاربر با یک دستیار هوشمند. فارسی محاوره‌ای، همراه با "
+            f"نام‌ها و اصطلاح‌های انگلیسی مانند {_TRANSCRIPTION_BIAS_TERMS}."
+        )
+    return f"A user talking to an AI assistant. May mention: {_TRANSCRIPTION_BIAS_TERMS}."
+
+
 def build_session_config(
     instr: str, tools: list, voice: str, language: Optional[str] = None,
 ) -> dict:
@@ -2567,7 +2609,17 @@ def build_session_config(
             "create_response": True,
             "interrupt_response": True,
         }
-        transcription = {"model": settings.voice_realtime_transcription_model}
+        # NO `language` pin on the V2 transcriber, deliberately. The pin was
+        # whisper-1 medicine (it re-detects per utterance; the pin stopped
+        # Persian audio coming back as Arabic script). On gpt-4o-transcribe
+        # the same pin TRANSLATES: an English utterance in a fa-pinned
+        # session came back rendered in Farsi (eval, en-only · pin=fa). The
+        # session language rides the prompt instead, which biases without
+        # forbidding.
+        transcription = {
+            "model": settings.voice_realtime_transcription_model,
+            "prompt": transcription_prompt(language),
+        }
     else:
         turn_detection = {
             "type": "server_vad",
@@ -2576,8 +2628,8 @@ def build_session_config(
             "silence_duration_ms": 700,
         }
         transcription = {"model": "whisper-1"}
-    if language:
-        transcription["language"] = language
+        if language:
+            transcription["language"] = language
     session: dict = {
         "type": "realtime",
         "output_modalities": ["audio"],

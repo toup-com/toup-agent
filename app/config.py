@@ -796,7 +796,17 @@ class Settings(BaseSettings):
     # global flag is on OR its user_id is listed here.
     voice_realtime_v2_user_ids: str = ""
     voice_realtime_model: str = "gpt-realtime-2.1"
-    voice_realtime_transcription_model: str = "gpt-realtime-whisper"
+    # gpt-4o-transcribe, measured — not assumed. 2026-08-16, after a session
+    # transcribed "grok bot" six different wrong ways and every downstream
+    # consumer (UI, session history that think() loads, memory extraction)
+    # inherited the garble: scripts/eval_voice_transcription.py scored
+    # gpt-4o-transcribe + bias prompt 9/9 on Farsi–English code-switching
+    # (whisper-1 pinned: 6/9), and the previous default here,
+    # "gpt-realtime-whisper", is rejected by the transcriptions API outright —
+    # what prod actually ran under that name garbled the founder's session.
+    # The prompt (ws_realtime.transcription_prompt) is load-bearing: bare
+    # gpt-4o-transcribe Persianizes product names and scored 5/9.
+    voice_realtime_transcription_model: str = "gpt-4o-transcribe"
     # Character budget for the personalized parts of the instructions blob
     # (memories + day history; identity docs are never trimmed). ~4 chars per
     # token ⇒ 24k chars ≈ 6k tokens, leaving headroom under OpenAI's
