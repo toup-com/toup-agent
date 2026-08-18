@@ -2740,6 +2740,26 @@ class ToolExecutor:
         that didn't match the on-disk placement.
         """
         d = att.to_dict() if hasattr(att, "to_dict") else dict(att)
+        # Never attach a failed/empty artifact. The generators refuse empty
+        # CONTENT before persisting (EmptyDocumentError); this is the last
+        # line for every other path that reaches here (convert_document,
+        # image/file persistence) — a zero-byte file is a failure that
+        # happened to return, not a document.
+        try:
+            size = int(d.get("size_bytes") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            logger.warning(
+                "[DOCGEN] refusing to attach empty artifact %s (%s bytes)",
+                d.get("filename"), d.get("size_bytes"),
+            )
+            return (
+                f"ERROR: EmptyDocumentError: the generated file "
+                f"{d.get('filename', '')!r} is empty (0 bytes) — nothing was "
+                f"attached. Generate it again with real content, or answer "
+                f"in chat."
+            )
         self.pending_attachments.append(d)
         return (
             f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']}) "
@@ -2750,6 +2770,25 @@ class ToolExecutor:
 
     def _user_scope(self) -> str:
         return getattr(self, "_user_id", "") or "shared"
+
+    @staticmethod
+    def _docgen_error(tool: str, exc: BaseException) -> str:
+        """One ERROR: string for every generate_* failure.
+
+        `EmptyDocumentError` is the model calling with nothing to render
+        (the x.pdf stub, 2026-08-18) — a warning without a traceback, and
+        the generator's own message, which tells the model what was NOT
+        done and what to do instead. Everything else is a real failure
+        and keeps the full traceback. The `ERROR:` prefix is load-bearing:
+        `_meter_flat_tool` skips billing on it, and `_register_attachment`
+        was never reached, so nothing is attached.
+        """
+        from app.agent.doc_generators import EmptyDocumentError
+        if isinstance(exc, EmptyDocumentError):
+            logger.warning("[DOCGEN] %s refused: %s", tool, exc)
+        else:
+            logger.exception("%s failed", tool)
+        return f"ERROR: {type(exc).__name__}: {exc}"
 
     async def _tool_generate_pdf(self, inp: Dict[str, Any]) -> str:
         from app.agent.doc_generators import gen_pdf
@@ -2762,8 +2801,7 @@ class ToolExecutor:
                 cover_page=bool(inp.get("cover_page", False)),
             )
         except Exception as exc:
-            logger.exception("generate_pdf failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_pdf", exc)
         return await self._register_attachment(att)
 
     async def _tool_generate_docx(self, inp: Dict[str, Any]) -> str:
@@ -2778,8 +2816,7 @@ class ToolExecutor:
                 title=inp.get("title"),
             )
         except Exception as exc:
-            logger.exception("generate_docx failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_docx", exc)
         return await self._register_attachment(att)
 
     def _refuse_duplicate(self, ext: str, google_name: str) -> str:
@@ -2809,8 +2846,7 @@ class ToolExecutor:
                 user_scope=self._user_scope(),
             )
         except Exception as exc:
-            logger.exception("generate_xlsx failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_xlsx", exc)
         return await self._register_attachment(att)
 
     async def _tool_generate_pptx(self, inp: Dict[str, Any]) -> str:
@@ -2822,8 +2858,7 @@ class ToolExecutor:
                 user_scope=self._user_scope(),
             )
         except Exception as exc:
-            logger.exception("generate_pptx failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_pptx", exc)
         return await self._register_attachment(att)
 
     async def _tool_generate_markdown(self, inp: Dict[str, Any]) -> str:
@@ -2835,8 +2870,7 @@ class ToolExecutor:
                 user_scope=self._user_scope(),
             )
         except Exception as exc:
-            logger.exception("generate_markdown failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_markdown", exc)
         return await self._register_attachment(att)
 
     async def _tool_convert_document(self, inp: Dict[str, Any]) -> str:
@@ -2903,8 +2937,7 @@ class ToolExecutor:
                 user_scope=self._user_scope(),
             )
         except Exception as exc:
-            logger.exception("generate_html_to_pdf failed")
-            return f"ERROR: {type(exc).__name__}: {exc}"
+            return self._docgen_error("generate_html_to_pdf", exc)
         return await self._register_attachment(att)
 
     # ------------------------------------------------------------------

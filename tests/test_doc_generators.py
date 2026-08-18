@@ -173,8 +173,11 @@ def test_tool_dispatch_and_pending_attachments():
         with _with_tmp_workspace() as tmp:
             te = ToolExecutor(workspace=tmp)
             te._user_id = "u1"
+            # A descriptive filename is kept verbatim (a one-letter stem
+            # like "r.pdf" is a placeholder and gets renamed — see
+            # test_docgen_empty_and_placeholder.py).
             r = await te.execute("generate_pdf", {
-                "filename": "r.pdf",
+                "filename": "release-notes.pdf",
                 "content": [{"type": "paragraph", "text": "hi"}],
             })
             assert not r.startswith("ERROR:"), r
@@ -183,7 +186,7 @@ def test_tool_dispatch_and_pending_attachments():
             assert att["mime_type"] == "application/pdf"
             assert att["id"]
             assert att["storage_path"].startswith("u1/")
-            assert att["storage_path"].endswith("_r.pdf")
+            assert att["storage_path"].endswith("_release-notes.pdf")
     asyncio.run(run())
 
 

@@ -15,6 +15,12 @@ Categories:
   - "agent"     → Agent management tools (spawn, process, session)
   - "full"      → All tools (unclear, complex, multi-intent)
 
+Two orthogonal merges ride on top of the category:
+  - every work intent carries TOOLS_WORK_TRACKING (create_job/update_job/
+    start_mission) because the decision rules mandate them first;
+  - TOOLS_DOCGEN (generate_pdf & co.) is added only when
+    `has_document_intent` sees an explicit format/artifact word.
+
 Performance target: <1ms. No regex compilation at call time (all pre-compiled).
 """
 
@@ -54,34 +60,78 @@ TOOLS_RECALL: FrozenSet[str] = frozenset({
     "recall_day",
 })
 
-# Document generation — PDF/DOCX/XLSX/PPTX/Markdown exports. Exposed in
-# EVERY work intent because a "make me a PDF of X" ask classifies by X's
-# vocabulary, not by the export format: the behavioral-suite prompt
-# "Make me a one-page PDF summarizing the water cycle" scored code
-# (make…page) on canary 533354ce (2026-07-28), generate_pdf was filtered
-# out, and the model satisfied the ask with the only file tool it was
-# offered — writing into the workspace ROOT, invisible to the document
-# pane, which only reads generated/. Same failure class as the
-# routines__remind incident below. The runtime gate
-# (settings.feature_doc_generation) still applies at tool registration,
-# so visibility here bypasses nothing.
+# Document generation — PDF/DOCX/XLSX/PPTX/Markdown exports. NOT merged
+# into the base work intents any more: it rides on `has_document_intent`
+# (below), which fires on an explicit format/artifact word ("PDF",
+# "spreadsheet", "slide deck", "report", "export"…) whatever the subject
+# vocabulary classifies to. History, both directions:
+#
+#   * 2026-07-28 (canary 533354ce, #371): "Make me a one-page PDF
+#     summarizing the water cycle" scored code (make…page), generate_pdf
+#     was filtered out, and the model wrote the PDF into the workspace
+#     ROOT with write_file — invisible to the document pane. The fix
+#     then was to merge TOOLS_DOCGEN into EVERY work intent.
+#   * 2026-08-18 (founder, iOS): "Can you search for me the latest ai
+#     news and give me the 5 most important one in this mounth" — a pure
+#     search-and-summarize ask — opened with
+#     `generate_pdf({"filename": "x", "content": []})` and shipped a
+#     952-byte empty x.pdf. Root cause is the create_job gap fixed by
+#     TOOLS_WORK_TRACKING below, but with the export tools in every
+#     work intent they were the tools the constrained decode snapped
+#     to, and there is no reason a research ask should be OFFERED an
+#     exporter on turn 1 at all.
+#
+# `has_document_intent` keeps the first incident fixed (every phrasing
+# it pinned still exposes the tools — see test_docgen_path_normalize)
+# while a search/summarize/question turn no longer carries seven export
+# tools it was never going to use legitimately. Turn 1 is the only turn
+# this gates: after any tool call both layouts open the full set, so a
+# "research X, then write it up" plan still reaches generate_pdf on the
+# iteration that needs it. The runtime gate (settings.feature_doc_generation
+# + the tenant entitlement) still applies at tool registration, so
+# visibility here bypasses nothing.
 TOOLS_DOCGEN: FrozenSet[str] = frozenset({
     "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",
     "generate_markdown", "generate_html_to_pdf", "convert_document",
 })
 
+# Work tracking — the progress-card tools the platform-knowledge decision
+# rules MANDATE for any do-something ask: "research / build / fix /
+# produce … → call `create_job` FIRST, then `update_job`", and "'while I'm
+# away' → call `start_mission`". Until 2026-08-18 no intent set carried
+# them, so on every non-full intent the prompt told the model to open
+# with a tool the gate forbade. Under the legacy layout that was merely
+# unhelpful (the tool was absent from the array; the model went on to
+# web_search). Under the prefix-stable layout the gate is an OpenAI
+# `tool_choice: allowed_tools` restriction over the FULL wire array — the
+# model can SEE create_job and the prompt says call it first, so the
+# constrained decode snapped to the next allowed name in wire order
+# (create_job, update_job, save_streaming_credential, generate_pdf, …)
+# and filled the required args with placeholders. Measured on the
+# founder's tenant, 2026-08-17/18: two web-intent turns, both opened
+# with `generate_pdf({"filename": "x", "content": []})`, then create_job
+# on iteration 2 exactly as the prompt asked. Prompts are advisory;
+# tool-list omission is hard (prompt_profile.py) — the allowed set has
+# to include everything the decision rules name, or the model invents
+# a call to satisfy the grammar. Voice/trigger/subagent/autopilot still
+# lose these through their disabled sets, which are applied to the
+# array before intent gating and subtracted from the allowed names.
+TOOLS_WORK_TRACKING: FrozenSet[str] = frozenset({
+    "create_job", "update_job", "start_mission",
+})
+
 TOOLS_MEMORY: FrozenSet[str] = frozenset({
     "memory_search", "memory_store", "memory_delete",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_WEB: FrozenSet[str] = frozenset({
     "web_search", "web_fetch", "browser",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_MEDIA: FrozenSet[str] = frozenset({
     "send_file", "send_photo", "analyze_image", "generate_image", "edit_image",
     "tts", "play_media", "tts_prefs", "canvas",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_CODE: FrozenSet[str] = frozenset({
     "exec", "pty_exec", "read_file", "write_file", "edit_file",
@@ -95,16 +145,16 @@ TOOLS_CODE: FrozenSet[str] = frozenset({
     # those asks classified media and exposed generate_image/edit_image;
     # without this merge the code intent would hide both on turn 1 — the
     # exact tool-hiding failure class of #310/routines__remind/A6-3 and
-    # of this file's TOOLS_DOCGEN merge above. Runtime gates still apply
+    # of this file's has_document_intent gate. Runtime gates still apply
     # at tool registration, so visibility here bypasses nothing.
     "generate_image", "edit_image",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_AGENT: FrozenSet[str] = frozenset({
     "spawn", "process", "sessions_list", "sessions_history",
     "sessions_send", "session_status", "agents_list", "lanes_status",
     "thread",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_ADMIN: FrozenSet[str] = frozenset({
     "cron", "config_reload", "doctor", "moderate", "poll",
@@ -121,9 +171,10 @@ TOOLS_SCHEDULING: FrozenSet[str] = frozenset({
     "routines__create", "routines__remind", "routines__list",
     "routines__update", "routines__delete", "routines__run_now",
     # A "while I'm away, keep me updated" ask can read as scheduling —
-    # keep the mission hand-off reachable from this intent.
+    # keep the mission hand-off reachable from this intent (also in
+    # TOOLS_WORK_TRACKING; listed here so the intent reads complete).
     "start_mission",
-}) | TOOLS_RECALL | TOOLS_DOCGEN
+}) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 # Composite sets for multi-intent categories
 TOOLS_CODE_FULL: FrozenSet[str] = TOOLS_CODE | TOOLS_WEB | TOOLS_MEMORY | TOOLS_ADMIN
@@ -383,6 +434,57 @@ _SCHEDULING_PATTERNS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Document intent — the user names a FILE they want to keep, share, or
+# edit. This is the only turn-1 gate on TOOLS_DOCGEN (see the note on that
+# set). Deliberately generous on the artifact side — a hidden exporter
+# is the #371 failure (the model improvises with write_file) — and
+# deliberately silent on subject vocabulary: "search the latest AI news
+# and give me the 5 most important" names no artifact, and must not
+# match. Three alternations:
+#   1. Export formats — pdf, docx/word doc, xlsx/excel/spreadsheet/
+#      workbook/csv, pptx/powerpoint/slides/slide deck/presentation,
+#      markdown/.md.
+#   2. Artifact nouns the user expects as a file — document/file/report/
+#      invoice/… — with a make/write/create/generate/draft/prepare/put
+#      together/export/turn-into verb somewhere before them, so "the
+#      report said" and "any file will do" don't fire.
+#   3. Export verbs on their own — export / download(able) / printable /
+#      save as / as a file / attach(ment).
+# Follow-ups after an offer ("yes please, PDF") reach here too: a
+# format word skips the greeting shortcuts in classify_query_intent.
+_DOCUMENT_INTENT_RE = re.compile(
+    r'\b(?:pdfs?|docx?|word\s+(?:doc(?:ument)?|file)s?|xlsx?|excel|spreadsheets?'
+    r'|workbooks?|csv|pptx?|powerpoint|slides?|slide\s*decks?|decks?'
+    r'|presentations?|markdown)\b'
+    r'|\.md\b'
+    r'|\b(?:make|write|create|generate|draft|prepare|produce|build|compile'
+    r'|put\s+together|turn\s+(?:this|that|it)\s+into|convert|export|give\s+me'
+    r'|send\s+me|i\s+(?:need|want))\b(?:\s+\S+){0,6}?\s+'
+    r'(?:documents?|files?|reports?|invoices?|receipts?|contracts?|proposals?'
+    r'|memos?|letters?|resumes?|cvs?|one[\s-]?pagers?|handouts?'
+    r'|worksheets?|templates?|write[\s-]?ups?|whitepapers?|summar(?:y|ies)\s+(?:document|file|pdf))\b'
+    r'|\b(?:export|download(?:able)?|printable|save\s+(?:\S+\s+){0,3}?as|as\s+a\s+file'
+    r'|in\s+a\s+file|attach(?:ment|ed)?)\b',
+    re.IGNORECASE,
+)
+
+
+def has_document_intent(message: str) -> bool:
+    """True when the message names a file/export the user wants — the gate
+    that puts TOOLS_DOCGEN into the turn-1 allowed set. Pure regex, no LLM,
+    <0.1ms; see _DOCUMENT_INTENT_RE for what counts."""
+    if not message:
+        return False
+    return bool(_DOCUMENT_INTENT_RE.search(message))
+
+
+def with_document_tools(intent: QueryIntent) -> QueryIntent:
+    """Merge the export tools onto an intent (turn-1 allowed set only)."""
+    if intent.category == "full":
+        return intent
+    return replace(intent, tool_names=frozenset(intent.tool_names) | TOOLS_DOCGEN)
+
+
 # Short but meaningful messages that should NOT be classified as greetings
 _SHORT_BUT_MEANINGFUL_RE = re.compile(
     r'\b(?:delete|remove|cancel|stop|abort|undo|redo|reset|clear|wipe)\b'
@@ -512,6 +614,16 @@ def classify_query_intent(message: str) -> QueryIntent:
     # Remove trailing punctuation/emoji for matching
     clean = normalized.rstrip("!?.,;:) \t\n")
 
+    # Document intent is orthogonal to the category — "make me a PDF of X"
+    # classifies by X — so it is decided once here and merged onto
+    # whatever category wins below. It also disqualifies the greeting
+    # shortcuts: "yes pdf please" (first word a greeting, ≤4 words) is a
+    # follow-up accepting an offered export, not a greeting.
+    _doc = has_document_intent(normalized)
+
+    def _finish(intent: QueryIntent) -> QueryIntent:
+        return with_document_tools(intent) if _doc else intent
+
     # 1. Emoji-only messages
     if _EMOJI_ONLY_RE.match(stripped):
         return INTENT_GREETING
@@ -523,12 +635,12 @@ def classify_query_intent(message: str) -> QueryIntent:
     # 2b. First word is a known greeting and message is short (≤4 words)
     #     Catches "سلام چطوری", "hi how are you", "hola que tal", etc.
     first_word = clean.split()[0] if clean else ""
-    if first_word in _GREETING_EXACT and len(clean.split()) <= 4:
+    if first_word in _GREETING_EXACT and len(clean.split()) <= 4 and not _doc:
         return INTENT_GREETING
 
     # 3. Short greeting prefix match — but check for meaningful content first
     word_count = len(stripped.split())
-    if word_count <= 5:
+    if word_count <= 5 and not _doc:
         # Check if it's actually meaningful despite being short
         if _SHORT_BUT_MEANINGFUL_RE.search(normalized):
             pass  # Fall through to intent detection
@@ -627,11 +739,13 @@ def classify_query_intent(message: str) -> QueryIntent:
                     "agent": INTENT_AGENT,
                     "scheduling": INTENT_SCHEDULING,
                 }
-                return intent_map[cat]
+                return _finish(intent_map[cat])
 
     # 9. Short messages with no tool indicators → question (no tools needed)
+    #    A short ask that names a file ("as a word doc please") keeps the
+    #    question category but carries the export tools.
     if word_count <= 8 and max_score == 0:
-        return INTENT_QUESTION
+        return _finish(INTENT_QUESTION)
 
     # 10. Default: full toolset for anything complex or ambiguous
     return INTENT_FULL

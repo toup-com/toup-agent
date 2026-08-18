@@ -19,10 +19,12 @@ import asyncio
 import io
 import logging
 import os
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from app.services.file_storage import get_storage_backend
 
@@ -31,6 +33,30 @@ logger = logging.getLogger(__name__)
 
 # Strong refs to in-flight preview warms — see _prewarm_preview.
 _PREWARM_TASKS: set[asyncio.Task] = set()
+
+
+class EmptyDocumentError(ValueError):
+    """A generator was asked to build a document with nothing in it.
+
+    Raised BEFORE anything is persisted, so an empty call leaves no file on
+    disk and nothing to attach. Founder incident 2026-08-18: the model
+    opened a research turn with `generate_pdf({"filename": "x", "content":
+    []})` — reportlab happily built a 952-byte PDF containing only the page
+    footer, `_persist` stored it, `_register_attachment` attached it, and
+    the user received an empty `x.pdf` they never asked for. The message
+    is written for the model that reads the tool result: it says what was
+    NOT done and what to do instead, so a stub call ends in a correction,
+    not a fabricated "here's your file".
+    """
+
+    def __init__(self, tool: str, what: str):
+        super().__init__(
+            f"{tool} was called with no {what} — nothing was created or "
+            f"attached. If the user asked for a document, call again with "
+            f"the real content; if they did not, answer in chat instead."
+        )
+        self.tool = tool
+
 
 MIME_PDF = "application/pdf"
 MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -103,6 +129,149 @@ def _prewarm_preview(storage_key: str, mime_type: str) -> None:
     task.add_done_callback(_PREWARM_TASKS.discard)
 
 
+# ── Meaningful filenames ─────────────────────────────────────────
+#
+# The system prompt asks for descriptive filenames ("march-expenses.xlsx,
+# not file.xlsx") but nothing enforced it: `generate_pdf(filename="x")`
+# shipped as `x.pdf` (2026-08-18). A placeholder stem is replaced by the
+# best available hint — the document title, its first heading / sheet /
+# slide title, the first line of prose — and, failing all of those, a
+# dated `document-YYYY-MM-DD` name. A descriptive stem the model chose is
+# always kept verbatim.
+
+# Stems that carry no information. Matched case-insensitively against the
+# basename without extension. A single character or an all-digit stem is a
+# placeholder too (see _is_placeholder_stem). Two-letter stems are NOT
+# blanket-rejected — "cv", "q3", "ai" are real names — only the ones
+# listed here.
+_PLACEHOLDER_STEMS = frozenset({
+    "x", "xx", "xxx", "yy", "zz", "aa", "ab", "abc", "asdf", "test", "testing",
+    "tmp", "temp", "file", "files", "doc", "docs", "document", "documents",
+    "untitled", "new", "output", "out", "result", "results", "generated",
+    "attachment", "download", "foo", "bar", "baz", "placeholder", "sample",
+    "example", "none", "null", "undefined", "unnamed", "noname", "default",
+    "pdf", "docx", "xlsx", "pptx", "md", "markdown", "txt", "html",
+    "sheet", "sheet1", "workbook", "book", "book1", "slides", "deck",
+    "presentation", "spreadsheet", "export", "data",
+})
+
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _is_placeholder_stem(stem: str) -> bool:
+    s = (stem or "").strip().lower()
+    if len(s) <= 1:
+        return True
+    if s.isdigit():
+        return True
+    # "file1", "test2", "document (3)", "untitled-1" — a placeholder with a
+    # counter or decoration is still a placeholder.
+    core = _SLUG_STRIP_RE.sub("", s).rstrip("0123456789")
+    return s in _PLACEHOLDER_STEMS or core in _PLACEHOLDER_STEMS
+
+
+def _slugify(text: Any, max_len: int = 60) -> str:
+    """'March 2026 — Expenses & Totals' → 'march-2026-expenses-totals'.
+    ASCII-folds accents; anything non-alphanumeric becomes a hyphen; the
+    result is trimmed at a hyphen boundary so a long title never ends in a
+    truncated word. Returns '' when nothing survives (e.g. all-CJK input —
+    the caller falls back to the dated name rather than transliterating)."""
+    if text is None:
+        return ""
+    s = str(text)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = _SLUG_STRIP_RE.sub("-", s.lower()).strip("-")
+    if len(s) > max_len:
+        s = s[:max_len].rsplit("-", 1)[0] or s[:max_len]
+    return s.strip("-")
+
+
+def _first_words(text: Any, n: int = 6) -> str:
+    """First ``n`` words of a block of prose, for a filename hint."""
+    words = str(text or "").split()
+    return " ".join(words[:n])
+
+
+def _derive_filename(
+    requested: Optional[str],
+    default_ext: str,
+    *,
+    title: Optional[str] = None,
+    hints: Iterable[Any] = (),
+) -> str:
+    """The filename a generator should persist under.
+
+    ``requested`` (the model's `filename` arg) wins whenever its stem is
+    descriptive. Otherwise the first non-empty slug from ``title`` then
+    ``hints`` (in order) is used, and if none yields a slug the file is
+    named ``document-YYYY-MM-DD``. Always returns a safe basename with
+    ``default_ext``.
+    """
+    safe = _safe_filename(requested or "", default_ext)
+    stem = os.path.splitext(safe)[0]
+    if not _is_placeholder_stem(stem):
+        return safe
+    for candidate in (title, *hints):
+        slug = _slugify(candidate)
+        if slug and not _is_placeholder_stem(slug):
+            return f"{slug}{default_ext}"
+    return f"document-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}{default_ext}"
+
+
+# ── Empty-content detection ──────────────────────────────────────
+
+
+def _block_has_content(block: Any) -> bool:
+    """True if a structured block would put something visible on the page.
+    A `page_break` never counts; a table needs at least one header or row;
+    a list needs an item; an image needs a path that exists."""
+    if not isinstance(block, dict):
+        return bool(str(block or "").strip())
+    btype = block.get("type", "paragraph")
+    if btype in ("heading", "paragraph"):
+        return bool(str(block.get("text", "") or "").strip())
+    if btype == "table":
+        headers = [h for h in (block.get("headers") or []) if str(h or "").strip()]
+        rows = [r for r in (block.get("rows") or []) if r]
+        return bool(headers or rows)
+    if btype in ("bullet_list", "numbered_list"):
+        return any(str(i or "").strip() for i in (block.get("items") or []))
+    if btype == "image":
+        path = block.get("path", "")
+        return bool(path) and os.path.isfile(path)
+    if btype == "page_break":
+        return False
+    # Unknown block type — count it if it carries any text.
+    return bool(str(block.get("text", "") or "").strip())
+
+
+def _blocks_have_content(content: Any) -> bool:
+    return any(_block_has_content(b) for b in _iter_blocks(content))
+
+
+def _first_block_text(content: Any, *, kinds: tuple = ("heading",)) -> str:
+    """Text of the first block of one of ``kinds`` (filename hint)."""
+    for block in _iter_blocks(content):
+        if isinstance(block, dict) and block.get("type", "paragraph") in kinds:
+            text = str(block.get("text", "") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _first_prose(content: Any) -> str:
+    return _first_words(_first_block_text(content, kinds=("paragraph",)))
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_HTML_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+
+
+def _html_text(html: str) -> str:
+    return _HTML_TAG_RE.sub(" ", html or "").strip()
+
+
 async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) -> Attachment:
     """Write bytes to storage under {user_scope}/{uuid}_{filename} and return an Attachment."""
     att_id = uuid.uuid4().hex
@@ -153,7 +322,16 @@ async def gen_pdf(
     from reportlab.lib import colors  # type: ignore
     from reportlab.lib.units import inch  # type: ignore
 
-    filename = _safe_filename(filename, ".pdf")
+    # Refuse before touching reportlab: an empty story still builds a
+    # valid 952-byte PDF (page footer only), which is exactly what shipped
+    # as x.pdf. A cover page with a title but no body is still empty.
+    if not _blocks_have_content(content):
+        raise EmptyDocumentError("generate_pdf", "content blocks")
+    filename = _derive_filename(
+        filename, ".pdf",
+        title=title,
+        hints=(_first_block_text(content), _first_prose(content)),
+    )
     buf = io.BytesIO()
 
     def _on_page(canvas, doc):
@@ -233,7 +411,13 @@ async def gen_docx(
     from docx import Document  # type: ignore
     from docx.shared import Inches  # type: ignore
 
-    filename = _safe_filename(filename, ".docx")
+    if not _blocks_have_content(content):
+        raise EmptyDocumentError("generate_docx", "content blocks")
+    filename = _derive_filename(
+        filename, ".docx",
+        title=title,
+        hints=(_first_block_text(content), _first_prose(content)),
+    )
     doc = Document()
 
     if title:
@@ -290,12 +474,22 @@ async def gen_xlsx(
     from openpyxl.styles import Font, PatternFill  # type: ignore
     from openpyxl.utils import get_column_letter  # type: ignore
 
-    filename = _safe_filename(filename, ".xlsx")
+    sheets = [s for s in (sheets or []) if isinstance(s, dict)]
+    if not any(
+        [h for h in (s.get("headers") or []) if str(h or "").strip()]
+        or [r for r in (s.get("rows") or []) if r]
+        for s in sheets
+    ):
+        raise EmptyDocumentError("generate_xlsx", "sheet data (no headers, no rows)")
+    filename = _derive_filename(
+        filename, ".xlsx",
+        hints=(
+            next((s.get("name") for s in sheets if s.get("name")), None),
+            " ".join(str(h) for h in (sheets[0].get("headers") or [])[:4]),
+        ),
+    )
     wb = Workbook()
     wb.remove(wb.active)  # Drop the default sheet
-
-    if not sheets:
-        sheets = [{"name": "Sheet1", "headers": [], "rows": []}]
 
     for sheet_def in sheets:
         name = str(sheet_def.get("name", "Sheet"))[:31] or "Sheet"
@@ -342,10 +536,25 @@ async def gen_pptx(
     from pptx import Presentation  # type: ignore
     from pptx.util import Inches, Pt  # type: ignore
 
-    filename = _safe_filename(filename, ".pptx")
+    slides = [s for s in (slides or []) if isinstance(s, dict)]
+
+    def _slide_has_content(s: Dict[str, Any]) -> bool:
+        if str(s.get("title", "") or "").strip() or str(s.get("subtitle", "") or "").strip():
+            return True
+        if any(str(b or "").strip() for b in (s.get("bullets") or [])):
+            return True
+        path = s.get("path", "")
+        return bool(path) and os.path.isfile(path)
+
+    if not any(_slide_has_content(s) for s in slides):
+        raise EmptyDocumentError("generate_pptx", "slides")
+    filename = _derive_filename(
+        filename, ".pptx",
+        hints=(next((s.get("title") for s in slides if str(s.get("title", "") or "").strip()), None),),
+    )
     prs = Presentation()
 
-    for slide_def in slides or []:
+    for slide_def in slides:
         stype = slide_def.get("type", "content")
         if stype == "title":
             layout = prs.slide_layouts[0]
@@ -388,14 +597,31 @@ async def gen_pptx(
 # ── Markdown (plain write) ────────────────────────────────────────
 
 async def gen_markdown(content: str, filename: str, *, user_scope: str) -> Attachment:
-    filename = _safe_filename(filename, ".md")
-    data = (content or "").encode("utf-8")
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
+    if not text.strip():
+        raise EmptyDocumentError("generate_markdown", "content")
+    # Hint: the first ATX heading, else the first non-blank line.
+    first_heading = next(
+        (ln.lstrip("#").strip() for ln in text.splitlines()
+         if ln.lstrip().startswith("#") and ln.lstrip("#").strip()),
+        "",
+    )
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    filename = _derive_filename(
+        filename, ".md", hints=(first_heading, _first_words(first_line)),
+    )
+    data = text.encode("utf-8")
     return await _persist(data, filename, MIME_MD, user_scope)
 
 
 # ── HTML → PDF via weasyprint (agent-side only) ───────────────────
 
 async def gen_html_to_pdf(html: str, filename: str, *, user_scope: str) -> Attachment:
+    # Empty check first — a missing weasyprint must not mask a stub call,
+    # and a stub call must not be reported as a missing renderer.
+    html = html if isinstance(html, str) else ("" if html is None else str(html))
+    if not _html_text(html):
+        raise EmptyDocumentError("generate_html_to_pdf", "html content")
     try:
         from weasyprint import HTML  # type: ignore
     except ImportError as e:
@@ -405,7 +631,16 @@ async def gen_html_to_pdf(html: str, filename: str, *, user_scope: str) -> Attac
             "Use generate_pdf with structured content instead."
         ) from e
 
-    filename = _safe_filename(filename, ".pdf")
+    _t = _HTML_TITLE_RE.search(html)
+    _h = _HTML_H1_RE.search(html)
+    filename = _derive_filename(
+        filename, ".pdf",
+        title=_html_text(_t.group(1)) if _t else None,
+        hints=(
+            _html_text(_h.group(1)) if _h else None,
+            _first_words(_html_text(html)),
+        ),
+    )
     buf = io.BytesIO()
     # SSRF/LFI guard (audit-2026 re-audit round 9): WeasyPrint's DEFAULT
     # url_fetcher resolves file:// and http(s) URLs embedded in the (possibly

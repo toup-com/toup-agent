@@ -7,7 +7,9 @@ the document pane look. Two-pronged root cause, both pinned here:
 1. EXPOSURE — "Make me a one-page PDF summarizing the water cycle"
    classified as code intent (make…page) and the generate_* tools were
    filtered out, so the model satisfied the ask with write_file/exec.
-   Pins: TOOLS_DOCGEN merged into every work intent, format-word
+   Pins: TOOLS_DOCGEN exposed whenever the message names a document
+   (has_document_intent — originally "merged into every work intent",
+   narrowed 2026-08-18 after the unrequested x.pdf incident), format-word
    classification for short asks.
 2. PLACEMENT — write_file resolved relative paths against the workspace
    root with no document routing. Pins: doc-extension write_file targets
@@ -122,12 +124,27 @@ def test_compound_doc_image_asks_keep_image_tools():
         assert "edit_image" in exposed, f"{msg!r} → {intent.category} hides edit_image"
 
 
-def test_docgen_tools_in_every_work_intent():
+def test_docgen_tools_ride_on_document_intent_not_category():
     """A doc ask classifies by its SUBJECT vocabulary, not the export
-    format — every work intent must carry the docgen set."""
+    format — so the docgen set used to be merged into every work intent.
+    Since 2026-08-18 (the unrequested x.pdf incident, see
+    test_query_intent_docgen_gate.py) it rides on has_document_intent
+    instead: the BASE intents no longer carry it, and any category the
+    subject vocabulary picks gets it merged when a format/artifact word
+    is present. Both halves pinned here."""
     for intent in (INTENT_CODE, INTENT_WEB, INTENT_MEDIA, INTENT_MEMORY,
                    INTENT_SCHEDULING, INTENT_AGENT):
-        assert TOOLS_DOCGEN <= intent.tool_names, intent.category
+        assert not (TOOLS_DOCGEN & intent.tool_names), intent.category
+    # Subject vocabulary → memory / web / media / scheduling; the export
+    # word still exposes the tools on top of whatever category wins.
+    for msg in (
+        "make a PDF of what we discussed yesterday",
+        "search the web for the top 5 AI stories and export them as a spreadsheet",
+        "make me a slide deck with photos from my trip",
+        "every morning send me a PDF briefing",
+    ):
+        intent = classify_query_intent(msg)
+        assert TOOLS_DOCGEN <= intent.tool_names, f"{msg!r} → {intent.category}"
 
 
 # ── Prong 2a: write_file doc-extension normalization ──────────────
@@ -357,14 +374,16 @@ def test_exec_sweep_exempts_session_workspace():
 def test_generate_markdown_normalizes_every_model_path_shape():
     """Bare, absolute, nested, and traversal filenames all land as a flat
     basename under {root}/generated/{scope}/ — with generated/ absent at
-    the start of each call."""
+    the start of each call. (Descriptive stems throughout — a one-letter
+    stem is a placeholder and would be renamed from the content; see
+    test_docgen_empty_and_placeholder.py.)"""
     async def run():
         for supplied, expect in [
             ("notes.md", "notes.md"),
-            ("/etc/x.md", "x.md"),
-            ("a/b/c.md", "c.md"),
-            ("../../etc/x", "x.md"),
-            ("..\\..\\etc\\x", "x.md"),
+            ("/etc/plan.md", "plan.md"),
+            ("a/b/agenda.md", "agenda.md"),
+            ("../../etc/plan", "plan.md"),
+            ("..\\..\\etc\\plan", "plan.md"),
         ]:
             with _with_tmp_workspace() as tmp:
                 assert not os.path.isdir(os.path.join(tmp, "generated"))

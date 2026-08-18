@@ -18,7 +18,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse, HTMLResponse, Response
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,6 +116,7 @@ async def _proxy_file(
     agent_api_key: str,
     path: str,
     params: dict,
+    accept: Optional[str] = None,
     *,
     read_timeout: float = _PROXY_READ_S,
 ):
@@ -127,6 +128,11 @@ async def _proxy_file(
     makes the browser wait on bytes that will never arrive (this showed up
     as ~60s downloads for 37 KB files). FastAPI emits chunked transfer
     encoding when content-length is absent, which matches the iterator.
+
+    ``accept`` is the caller's Accept header, forwarded so the agent's
+    preview route can tell a browser/WebView navigation (wants an HTML
+    fallback page) from a fetch() (wants JSON). Without it httpx sends
+    `*/*` and every client would get JSON.
     """
     url = f"{agent_url.rstrip('/')}/api/files/{path}"
     # TKT-LAT-007 (wave 3): shared agent_http client. Streaming response
@@ -135,17 +141,38 @@ async def _proxy_file(
     from app.services.agent_http import get_agent_http_client
 
     client = get_agent_http_client()
+    headers = {"X-Agent-Key": agent_api_key}
+    if accept:
+        headers["Accept"] = accept
     req = client.build_request(
         "GET", url,
-        headers={"X-Agent-Key": agent_api_key},
+        headers=headers,
         params=params,
         timeout=httpx.Timeout(connect=5.0, read=read_timeout, write=5.0, pool=5.0),
     )
     resp = await client.send(req, stream=True)
     if resp.status_code >= 400:
+        # Pass the agent's error through VERBATIM — status, content-type and
+        # body. This used to re-raise as HTTPException(detail=<body text>),
+        # which took the agent's `{"detail":"No preview for application/pdf"}`
+        # and wrapped it once more into
+        # `{"detail":"{\"detail\":\"No preview for application/pdf\"}"}` —
+        # the double-encoded blob the iOS WebView painted on a black screen
+        # (2026-08-18). The agent already speaks the right shape (JSON for
+        # API callers, an HTML fallback page for a browser/WebView asking
+        # for text/html); the platform's only job is to relay it.
         body = await resp.aread()
         await resp.aclose()
-        raise HTTPException(status_code=resp.status_code, detail=body.decode(errors="replace")[:500])
+        err_headers = {}
+        for h in ("content-type", "cache-control"):
+            v = resp.headers.get(h)
+            if v:
+                err_headers[h] = v
+
+        async def _one():
+            yield body
+
+        return _one(), err_headers, resp.status_code
 
     async def _iter():
         try:
@@ -324,11 +351,21 @@ async def preview_file(
 ):
     """Server-side render for the DocumentViewer pane.
 
+    PDF / images → the file itself, `Content-Disposition: inline`, so an
+                  <iframe>/WebView renders it natively. (Until 2026-08-18
+                  these fell through to the 415 below even though
+                  ws_chat.py / day_chats.py advertise a preview_url for
+                  them — the iOS attachment card opened that URL in a
+                  WebView and painted the JSON error body.)
     DOCX / PPTX → PDF via LibreOffice headless (cached). Browser renders
                   the PDF natively in an <iframe>, matching Slack /
                   Dropbox / Google Drive faithfulness.
     XLSX        → HTML tables (one per sheet) via openpyxl.
-    Other       → 415 (client should use /download).
+    Other       → 415. A caller that accepts text/html (browser, WebView
+                  iframe) gets a small self-contained "Preview unavailable
+                  · Download" page; everyone else gets a structured JSON
+                  error with the download_url in it. Either way the client
+                  should use /download.
 
     First DOCX/PPTX preview for a given file takes ~3-8s (LibreOffice
     cold start); subsequent requests are near-instant from the cache
@@ -343,6 +380,7 @@ async def preview_file(
             raise HTTPException(status_code=404, detail="No active agent for user")
         content_iter, headers, status = await _proxy_file(
             proxy[0], proxy[1], f"{message_id}/{attachment_id}/preview", {"format": format},
+            accept=request.headers.get("accept") if request else None,
             read_timeout=_PREVIEW_READ_S,
         )
         return StreamingResponse(content_iter, status_code=status,
@@ -355,6 +393,28 @@ async def preview_file(
     backend = get_storage_backend()
     if not key or not backend.exists(key):
         raise HTTPException(status_code=410, detail="File unavailable")
+
+    filename = att.get("filename") or "document"
+
+    # ── PDF / images → the bytes themselves, inline ───────────────
+    # A PDF IS its own preview: every browser and WKWebView renders
+    # application/pdf natively. Same for images. `inline` (not
+    # `attachment`) is what makes an <iframe src=…> display rather than
+    # download.
+    if mime == "application/pdf" or mime.startswith("image/"):
+        return StreamingResponse(
+            stream_file(key),
+            media_type=mime,
+            headers={
+                "Content-Length": str(backend.size(key)),
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "Cache-Control": "private, max-age=3600",
+                # Nothing on this route is user-authored markup, but a
+                # served image/PDF must never be sniffed into something
+                # executable.
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     # ── DOCX / PPTX → PDF via LibreOffice ────────────────────────
     # Production-grade faithful rendering. Cached per file.
@@ -443,4 +503,88 @@ async def preview_file(
     # (PPTX is now handled by the LibreOffice PDF path above; legacy 204
     # fallback removed.)
 
-    raise HTTPException(status_code=415, detail=f"No preview for {mime}")
+    return _preview_unavailable(request, message_id, attachment_id, att, token)
+
+
+def _preview_unavailable(
+    request: Request,
+    message_id: str,
+    attachment_id: str,
+    att: dict,
+    token: Optional[str],
+) -> Response:
+    """415 for a type this endpoint cannot render — in the shape the caller
+    can actually use.
+
+    A browser / WebView navigation (Accept: text/html) gets a tiny
+    self-contained page: filename, "Preview unavailable", a Download
+    button. It carries the same `?token=` the caller used, because an
+    <iframe>/WebView cannot send headers and that token is how it got
+    here. An API caller (fetch/XHR, Accept */* or application/json) gets a
+    structured JSON error with the download_url — no HTML in a JSON body,
+    no JSON in a page.
+
+    Before 2026-08-18 this was `HTTPException(415, "No preview for
+    <mime>")` — fine for fetch(), but painted verbatim as
+    `{"detail":"…"}` (and, via the platform proxy, double-encoded) by any
+    client that rendered the response as a page.
+    """
+    import html as _html
+    from urllib.parse import quote
+
+    mime = att.get("mime_type", "") or "application/octet-stream"
+    filename = att.get("filename") or "document"
+    size = int(att.get("size_bytes") or 0)
+    download_url = f"{settings.api_prefix}/files/{message_id}/{attachment_id}"
+    accept = (request.headers.get("accept") or "").lower() if request else ""
+    wants_html = "text/html" in accept
+
+    if not wants_html:
+        return JSONResponse(
+            status_code=415,
+            content={
+                "detail": f"Preview unavailable for {mime}",
+                "code": "preview_unavailable",
+                "mime_type": mime,
+                "filename": filename,
+                "size_bytes": size,
+                "download_url": download_url,
+            },
+        )
+
+    href = download_url + (f"?token={quote(token)}" if token else "")
+    page = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{_html.escape(filename)}</title>"
+        "<style>"
+        "html,body{height:100%;margin:0}"
+        "body{display:flex;align-items:center;justify-content:center;"
+        "font-family:-apple-system,system-ui,'Segoe UI',Roboto,sans-serif;"
+        "background:#0f0f12;color:#e6e6ea;text-align:center;padding:24px;box-sizing:border-box}"
+        "@media (prefers-color-scheme: light){body{background:#f6f6f8;color:#1a1a1f}}"
+        ".card{max-width:360px}"
+        "h1{font-size:15px;font-weight:600;margin:0 0 6px;word-break:break-all}"
+        "p{font-size:13px;opacity:.7;margin:0 0 18px}"
+        "a{display:inline-block;padding:10px 18px;border-radius:10px;"
+        "background:#6d5efc;color:#fff;text-decoration:none;font-size:14px;font-weight:600}"
+        "</style></head><body><div class='card'>"
+        f"<h1>{_html.escape(filename)}</h1>"
+        f"<p>Preview unavailable · {_html.escape(mime)}"
+        f"{' · ' + _fmt_bytes(size) if size else ''}</p>"
+        f"<a href=\"{_html.escape(href, quote=True)}\" download=\"{_html.escape(filename, quote=True)}\">Download</a>"
+        "</div></body></html>"
+    )
+    return HTMLResponse(
+        content=page,
+        status_code=415,
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+def _fmt_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
