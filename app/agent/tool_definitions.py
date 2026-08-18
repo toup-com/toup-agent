@@ -262,15 +262,27 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "web_search",
             "description": (
-                "Search the web; returns ranked results as title + URL + snippet "
-                "(no page bodies). Reason over the snippets FIRST — they often "
-                "answer the question outright. When a task needs several angles "
-                "(comparisons, multi-part questions), issue MULTIPLE web_search "
-                "calls in the SAME turn — they run concurrently — instead of "
-                "searching, waiting, then searching again. Only web_fetch a "
-                "result when its snippet is insufficient. Keep it lean — a "
-                "few well-chosen queries beat a dozen near-duplicate ones; do "
-                "NOT re-search the same thing with slight rewordings."
+                "Search the web; returns ranked results as title + published "
+                "date + URL + verbatim snippet (no page bodies). Reason over the "
+                "snippets FIRST — they often answer the question outright. When a "
+                "task needs several angles (comparisons, multi-part questions), "
+                "issue MULTIPLE web_search calls in the SAME turn — they run "
+                "concurrently — instead of searching, waiting, then searching "
+                "again. Only web_fetch a result when its snippet is insufficient. "
+                "Keep it lean — a few well-chosen queries beat a dozen "
+                "near-duplicate ones; do NOT re-search the same thing with slight "
+                "rewordings.\n"
+                "FRESHNESS: queries about anything that changes over time — "
+                "latest/newest/current/most capable/price/release/version/who "
+                "holds a role — are automatically date-filtered and each result "
+                "shows its published date; results older than 18 months are "
+                "dropped for those queries. For 'newest/latest X' start with a "
+                "NEUTRAL discovery query (e.g. 'anthropic new model'), NOT a "
+                "site:-restricted one — a site: query ranks by the site's own "
+                "relevance, not by date, and hides newer pages. Then confirm on "
+                "the official domain. Prefer the newest dated result from an "
+                "official source; two agreeing sources or say you could not "
+                "verify. Never assume a name you remember is still the newest."
             ),
             "input_schema": {
                 "type": "object",

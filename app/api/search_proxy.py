@@ -58,12 +58,28 @@ from app.config import settings
 from app.db.database import get_db
 from app.db.models import AgentConfig, SearchEvent
 from app.services.credit_service import CreditService, FLAT_FEES
+from app.websearch import freshness as _fresh
+from app.websearch.render import brave_news_to_dicts, brave_web_to_dicts
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/search", tags=["search-gateway"])
 
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_NEWS_ENDPOINT = "https://api.search.brave.com/res/v1/news/search"
+
+# F7 counters — process-local, surfaced on /search/health. Not a metric
+# system; enough to answer "is the freshness ladder ever widening" and "how
+# often does the stale filter bite" without a schema change.
+_COUNTERS: dict[str, int] = {
+    "recent_queries": 0,
+    "evergreen_queries": 0,
+    "freshness_widened": 0,       # pm → py (or → none) because the page was thin
+    "stale_dropped": 0,           # results removed by the 18-month filter
+    "news_blended": 0,            # requests that merged news results
+    "site_discovery": 0,          # site:-anchored recency queries that also ran neutral
+    "brave_calls": 0,             # upstream HTTP calls, all endpoints
+}
 
 # Tier names are a shared vocabulary with the agent's ladder
 # (tool_executor._tool_web_search) and with the admin panel. Do not rename one
@@ -77,6 +93,9 @@ ST_ERROR = "error"           # upstream failed; the agent falls to a lower tier
 
 # Per-user daily Brave ceiling.
 RSN_USER_DAILY_CAP = "user_daily_cap"
+# Recency query whose every dated result was older than the stale cutoff. The
+# agent must NOT fall through to undated tiers on this one — see search_web.
+RSN_ALL_STALE = "all_stale"
 
 # degraded_reason values that mean the request never reached Brave and so
 # consumed none of its quota. This module PRODUCES every one of them, so it
@@ -317,6 +336,11 @@ class SearchRequest(BaseModel):
     country: Optional[str] = Field(None, max_length=2)
     # Which surface asked. Telemetry only — never trusted for authorization.
     channel: Optional[str] = Field(None, max_length=20)
+    # "recent" | "evergreen" — the agent's own verdict from the shared
+    # classifier. Optional and advisory: absent (older agent images) or
+    # unrecognised → the gateway classifies the query itself, so every tenant
+    # gets freshness-aware search from the platform deploy alone.
+    freshness_class: Optional[str] = Field(None, max_length=12)
 
 
 class SearchResult(BaseModel):
@@ -327,6 +351,15 @@ class SearchResult(BaseModel):
     # wire because they are why the agent can often answer WITHOUT a slow
     # web_fetch — dropping them here would quietly raise the fetch count.
     extra_snippets: list[str] = Field(default_factory=list)
+    # Brave's page date, both shapes, verbatim: `page_age` is ISO
+    # ("2026-07-24T00:00:00"), `age` is human ("3 weeks ago", "July 9, 2026").
+    # These were dropped on the wire before the 2026-08-18 incident, which is
+    # how a 2023 blog post and a last-week announcement looked identical to
+    # the model. Optional so older agents ignore them.
+    age: Optional[str] = None
+    page_age: Optional[str] = None
+    # "web" | "news" — which Brave index produced it.
+    source: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
@@ -338,6 +371,13 @@ class SearchResponse(BaseModel):
     served: bool
     degraded_reason: Optional[str] = None
     latency_ms: int = 0
+    # Freshness policy that was applied — echoed so the agent can log it,
+    # render it in the result header and pick the cache TTL. All optional.
+    freshness_class: Optional[str] = None
+    freshness_applied: Optional[str] = None     # "pm" | "py" | None
+    dropped_stale: int = 0
+    news_count: int = 0
+    brave_calls: int = 0
 
 
 def _query_hash(query: str) -> str:
@@ -536,32 +576,21 @@ async def search_web(
             return degraded(RSN_USER_DAILY_CAP)
 
     started = time.monotonic()
-    params = {"q": body.query, "count": body.count, "extra_snippets": "true"}
-    if body.country:
-        params["country"] = body.country
+    plan = await _run_brave_plan(body, key)
+    latency = int((time.monotonic() - started) * 1000)
+    remaining = plan.remaining
 
-    try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            resp = await client.get(
-                BRAVE_ENDPOINT,
-                params=params,
-                headers={"Accept": "application/json", "X-Subscription-Token": key},
-            )
-    except Exception as exc:
-        latency = int((time.monotonic() - started) * 1000)
+    if plan.outcome == "upstream_error":
         await _record(
             db, user_id=user_id, tier=TIER_BRAVE, engine="brave", status=ST_ERROR,
             degraded_reason="upstream_error", latency_ms=latency, result_count=0,
-            channel=body.channel, query_sha256=qhash, brave_remaining=None,
+            channel=body.channel, query_sha256=qhash, brave_remaining=remaining,
         )
         await db.commit()
-        logger.warning("[search-gw] upstream error user=%s: %s", user_id, exc)
+        logger.warning("[search-gw] upstream error user=%s: %s", user_id, plan.error)
         return degraded("upstream_error")
 
-    latency = int((time.monotonic() - started) * 1000)
-    remaining = _fleet.observe(resp.headers)
-
-    if resp.status_code == 429:
+    if plan.outcome == "http_429":
         _fleet.trip(getattr(settings, "brave_cooldown_s", 30.0))
         await _record(
             db, user_id=user_id, tier=TIER_BRAVE, engine="brave", status=ST_THROTTLED,
@@ -572,43 +601,47 @@ async def search_web(
         logger.warning("[search-gw] Brave 429 — breaker tripped for the whole fleet")
         return degraded("http_429")
 
-    if resp.status_code >= 400:
-        await _record(
-            db, user_id=user_id, tier=TIER_BRAVE, engine="brave", status=ST_ERROR,
-            degraded_reason="upstream_error", latency_ms=latency, result_count=0,
-            channel=body.channel, query_sha256=qhash, brave_remaining=remaining,
-        )
-        await db.commit()
-        logger.warning("[search-gw] Brave HTTP %d user=%s", resp.status_code, user_id)
-        return degraded("upstream_error")
-
-    try:
-        payload = resp.json()
-    except ValueError:
-        payload = {}
-    web = (payload.get("web") or {}).get("results") or []
-
     results = [
         SearchResult(
-            title=(r.get("title") or "").strip(),
-            url=(r.get("url") or "").strip(),
-            description=(r.get("description") or "").strip(),
+            title=r["title"],
+            url=r["url"],
+            description=r["description"],
             extra_snippets=[x for x in (r.get("extra_snippets") or [])[:4] if x],
+            age=(str(r["age"]) if r.get("age") else None),
+            page_age=(str(r["page_age"]) if r.get("page_age") else None),
+            source=r.get("source"),
         )
-        for r in web[: body.count]
-        if r.get("url")
+        for r in plan.results
     ]
 
     if not results:
         # An empty page is not an error, but it is not a served search either —
         # the agent should try a lower tier rather than tell the user nothing
         # exists. Recorded so the rate of it is visible.
+        #
+        # EXCEPT when the page was non-empty and the stale filter removed all
+        # of it: then "nothing fresh exists" IS the answer, and falling to the
+        # undated scrape/browser tiers would re-serve the very pages just
+        # withheld. `all_stale` tells the agent to say so instead of guessing.
+        _reason = RSN_ALL_STALE if plan.dropped_stale else "empty_result"
         await _record(
             db, user_id=user_id, tier=TIER_BRAVE, engine="brave", status=ST_ERROR,
-            degraded_reason="empty_result", latency_ms=latency, result_count=0,
+            degraded_reason=_reason, latency_ms=latency, result_count=0,
             channel=body.channel, query_sha256=qhash, brave_remaining=remaining,
         )
         await db.commit()
+        if _reason == RSN_ALL_STALE:
+            logger.info(
+                "[search-gw] all_stale user=%s class=%s dropped=%d — nothing newer than %d days",
+                user_id[:8], plan.freshness_class, plan.dropped_stale,
+                int(getattr(settings, "search_stale_max_days", 548) or 548),
+            )
+            resp = degraded(RSN_ALL_STALE)
+            resp.freshness_class = plan.freshness_class
+            resp.freshness_applied = plan.freshness_applied
+            resp.dropped_stale = plan.dropped_stale
+            resp.brave_calls = plan.brave_calls
+            return resp
         return degraded("empty_result")
 
     event = SearchEvent(
@@ -632,10 +665,251 @@ async def search_web(
         logger.exception("[search-gw] commit FAILED user=%s — search served, usage lost", user_id)
         await db.rollback()
 
+    # F7: one structured line per served search — what Brave was asked, what
+    # the model will be shown, and how old it is. This is the line to grep
+    # when an answer is stale.
+    _oldest, _newest, _undated = _fresh.date_span(plan.results)
+    logger.info(
+        "[search-gw] served user=%s class=%s freshness=%s ladder=%s brave_calls=%d "
+        "web=%d news_found=%d news_merged=%d discovery=%d dropped_stale=%d n=%d "
+        "oldest=%s newest=%s undated=%d latency_ms=%d remaining=%s reasons=%s",
+        user_id[:8], plan.freshness_class, plan.freshness_applied,
+        ">".join(str(a) for a in plan.attempts), plan.brave_calls,
+        plan.web_count, plan.news_found, plan.news_count, plan.discovery_count, plan.dropped_stale,
+        len(results), _oldest, _newest, _undated, latency, remaining,
+        ",".join(plan.reasons),
+    )
+
     return SearchResponse(
         results=results, tier=TIER_BRAVE, engine="brave",
         served=True, degraded_reason=None, latency_ms=latency,
+        freshness_class=plan.freshness_class,
+        freshness_applied=plan.freshness_applied,
+        dropped_stale=plan.dropped_stale,
+        news_count=plan.news_count,
+        brave_calls=plan.brave_calls,
     )
+
+
+# ── Upstream plan ────────────────────────────────────────────────────
+
+
+class _Plan:
+    """Outcome of one logical search against Brave (possibly several calls)."""
+
+    __slots__ = (
+        "outcome", "error", "results", "remaining", "freshness_class",
+        "freshness_applied", "attempts", "reasons", "brave_calls",
+        "web_count", "news_count", "discovery_count", "dropped_stale",
+        "news_found",
+    )
+
+    def __init__(self) -> None:
+        self.outcome = "ok"            # ok | upstream_error | http_429
+        self.error: Optional[str] = None
+        self.results: list[dict] = []
+        self.remaining: Optional[int] = None
+        self.freshness_class: str = _fresh.EVERGREEN
+        self.freshness_applied: Optional[str] = None
+        self.attempts: list = []
+        self.reasons: list[str] = []
+        self.brave_calls = 0
+        self.web_count = 0
+        self.news_count = 0          # news results in the MERGED page (on the wire)
+        self.news_found = 0          # news results Brave returned (log only)
+        self.discovery_count = 0
+        self.dropped_stale = 0
+
+
+class _BraveHTTPError(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__(f"brave http {status}")
+        self.status = status
+
+
+async def _brave_get(client: httpx.AsyncClient, key: str, endpoint: str, params: dict, plan: _Plan) -> dict:
+    """One upstream call. Records fleet headroom from the response headers,
+    raises ``_BraveHTTPError`` on any 4xx/5xx (429 included) so the caller can
+    map it, and returns the decoded JSON (``{}`` on a malformed body)."""
+    plan.brave_calls += 1
+    _COUNTERS["brave_calls"] += 1
+    resp = await client.get(
+        endpoint, params=params,
+        headers={"Accept": "application/json", "X-Subscription-Token": key},
+    )
+    seen = _fleet.observe(resp.headers)
+    if seen is not None:
+        plan.remaining = seen
+    if resp.status_code >= 400:
+        raise _BraveHTTPError(resp.status_code)
+    try:
+        return resp.json()
+    except ValueError:
+        return {}
+
+
+async def _run_brave_plan(body: SearchRequest, key: str) -> _Plan:
+    """Decide the freshness policy for ``body.query`` and execute it.
+
+    Evergreen: exactly the pre-incident single call (no ``freshness``), plus
+    the page dates that were always in the payload and never forwarded.
+
+    Recency: web call with ``freshness`` from the ladder (pm first), and —
+    concurrently, so wall-clock is one round trip — the News index and, for a
+    ``site:``-anchored query, the neutral discovery form. If the freshness-
+    filtered web page is thin (< ``search_freshness_min_results``) the window
+    widens (py, then none) sequentially. Then the 18-month stale filter and a
+    round-robin merge so each index's top hits survive the cap.
+
+    Failure semantics are unchanged from the single-call version: the PRIMARY
+    web call decides — a 429 trips the breaker, any other error degrades.
+    Auxiliary calls (news / discovery / a widening attempt) that fail are
+    dropped silently and logged; they can only add results, never take the
+    primary away.
+    """
+    plan = _Plan()
+    fresh_on = bool(getattr(settings, "search_freshness_enabled", True))
+    verdict = _fresh.classify(body.query)
+    supplied = _fresh.normalize_class(body.freshness_class)
+    klass = supplied or verdict.freshness_class
+    if not fresh_on:
+        klass = _fresh.EVERGREEN
+    plan.freshness_class = klass
+    plan.reasons = list(verdict.reasons) if not supplied else [f"agent:{supplied}"] + list(verdict.reasons)
+    is_recent = klass == _fresh.RECENT
+    _COUNTERS["recent_queries" if is_recent else "evergreen_queries"] += 1
+
+    ladder = list(verdict.ladder) if (is_recent and fresh_on) else [None]
+    if is_recent and supplied and not verdict.is_recent:
+        # The agent said recent, our patterns did not fire: honour the agent
+        # with the default ladder rather than no ladder.
+        ladder = list(_fresh.LADDER_DEFAULT)
+    plan.attempts = []
+
+    query = body.query
+    if is_recent and getattr(settings, "search_recency_append_year", False):
+        query = _fresh.with_year(query)
+
+    neutral_query: Optional[str] = None
+    if is_recent and getattr(settings, "search_site_discovery_enabled", True):
+        neutral, op = _fresh.split_site_operator(query)
+        if op and neutral and neutral.lower() != query.lower():
+            neutral_query = neutral
+
+    min_results = max(1, int(getattr(settings, "search_freshness_min_results", 3)))
+    news_on = is_recent and bool(getattr(settings, "search_news_blend_enabled", True))
+    news_count = max(1, int(getattr(settings, "search_news_count", 5)))
+    country = body.country
+
+    web_results: list[dict] = []
+    news_results: list[dict] = []
+    disc_results: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        first = ladder[0]
+        plan.attempts.append(first)
+
+        async def _web(freshness):
+            return await _brave_get(
+                client, key, BRAVE_ENDPOINT,
+                _fresh.brave_params(query, body.count, freshness, country=country), plan,
+            )
+
+        async def _news(freshness):
+            return await _brave_get(
+                client, key, BRAVE_NEWS_ENDPOINT,
+                _fresh.brave_params(query, news_count, freshness or _fresh.FRESH_MONTH, extra_snippets=False, country=country),
+                plan,
+            )
+
+        async def _disc(freshness):
+            return await _brave_get(
+                client, key, BRAVE_ENDPOINT,
+                _fresh.brave_params(neutral_query, body.count, freshness, country=country), plan,
+            )
+
+        tasks = [_web(first)]
+        if news_on:
+            tasks.append(_news(first))
+        if neutral_query:
+            tasks.append(_disc(first))
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        primary = gathered[0]
+        if isinstance(primary, _BraveHTTPError):
+            plan.outcome = "http_429" if primary.status == 429 else "upstream_error"
+            plan.error = str(primary)
+            return plan
+        if isinstance(primary, BaseException):
+            plan.outcome = "upstream_error"
+            plan.error = f"{type(primary).__name__}: {primary}"
+            return plan
+        web_results = brave_web_to_dicts(primary)
+        plan.freshness_applied = first
+
+        idx = 1
+        if news_on:
+            aux = gathered[idx]; idx += 1
+            if isinstance(aux, BaseException):
+                logger.info("[search-gw] news blend failed (ignored): %s", aux)
+            else:
+                news_results = brave_news_to_dicts(aux)
+        if neutral_query:
+            aux = gathered[idx]; idx += 1
+            if isinstance(aux, BaseException):
+                logger.info("[search-gw] site discovery failed (ignored): %s", aux)
+            else:
+                disc_results = brave_web_to_dicts(aux)
+                _COUNTERS["site_discovery"] += 1
+
+        # Widen the window while the filtered web page is thin. Only the web
+        # call is retried; the auxiliaries already ran at the narrow window.
+        for nxt in ladder[1:]:
+            if len(web_results) >= min_results:
+                break
+            plan.attempts.append(nxt)
+            _COUNTERS["freshness_widened"] += 1
+            try:
+                wider = brave_web_to_dicts(await _web(nxt))
+            except _BraveHTTPError as exc:
+                if exc.status == 429:
+                    # Do not throw away a served (if thin) page over a widening
+                    # attempt — but do trip the breaker so the fleet backs off.
+                    _fleet.trip(getattr(settings, "brave_cooldown_s", 30.0))
+                logger.info("[search-gw] freshness widen %s failed (ignored): %s", nxt, exc)
+                break
+            except Exception as exc:
+                logger.info("[search-gw] freshness widen %s failed (ignored): %s", nxt, exc)
+                break
+            if len(wider) > len(web_results):
+                web_results = wider
+                plan.freshness_applied = nxt
+
+    # Stale filter — recency only. Undated pages survive, labelled by the
+    # renderer; a page dated older than the cutoff is not evidence for
+    # "newest".
+    if is_recent and getattr(settings, "search_stale_filter_enabled", True):
+        max_days = int(getattr(settings, "search_stale_max_days", _fresh.DEFAULT_STALE_DAYS) or _fresh.DEFAULT_STALE_DAYS)
+        web_results, d1 = _fresh.filter_stale(web_results, max_age_days=max_days)
+        news_results, d2 = _fresh.filter_stale(news_results, max_age_days=max_days)
+        disc_results, d3 = _fresh.filter_stale(disc_results, max_age_days=max_days)
+        plan.dropped_stale = d1 + d2 + d3
+        _COUNTERS["stale_dropped"] += plan.dropped_stale
+
+    plan.web_count = len(web_results)
+    plan.news_found = len(news_results)
+    plan.discovery_count = len(disc_results)
+
+    if is_recent and (news_results or disc_results):
+        plan.results = _fresh.merge_results(
+            web_results, disc_results, news_results, limit=body.count, interleave=True,
+        )
+    else:
+        plan.results = _fresh.merge_results(web_results, limit=body.count, interleave=False)
+    plan.news_count = sum(1 for r in plan.results if r.get("source") == "news")
+    if plan.news_count:
+        _COUNTERS["news_blended"] += 1
+    return plan
 
 
 @router.get("/health")
@@ -666,4 +940,14 @@ async def search_health() -> dict:
         # nothing. Report the conjunction, not the switch.
         "user_daily_cap_enforcing": _cap_on,
         "user_daily_cap": _cap if _cap_on else None,
+        # Freshness policy posture + process-local counters (F7). The flags
+        # are reported so "is freshness on in prod" has an answer that is
+        # not an env-var reading.
+        "freshness_enabled": bool(getattr(settings, "search_freshness_enabled", True)),
+        "news_blend_enabled": bool(getattr(settings, "search_news_blend_enabled", True)),
+        "stale_filter_days": (
+            int(getattr(settings, "search_stale_max_days", 548))
+            if getattr(settings, "search_stale_filter_enabled", True) else None
+        ),
+        "counters": dict(_COUNTERS),
     }

@@ -108,6 +108,65 @@ PARALLEL_SAFE_TOOLS: frozenset = frozenset({
     "extension_research",
 })
 
+# Tools whose output is web EVIDENCE — a turn that ran any of these is one
+# where a URL in the answer that is not in tool output is a fabricated
+# citation, and the citation gate (settings.citation_gate_scope="web_turns")
+# rewrites it. Browser tools count: the model saw real pages.
+WEB_EVIDENCE_TOOLS: frozenset = frozenset({
+    "web_search", "web_fetch", "extension_search", "extension_read",
+    "extension_research", "browser", "browser_action", "browser_screenshot",
+})
+
+# F7 counters for the citation gate — process-local, logged; the agent has no
+# metrics endpoint for these yet, so the [citation-gate] log line is the
+# series and this is the running total for the process.
+_CITATION_GATE_COUNTERS: Dict[str, int] = {
+    "violations": 0,
+    "turns_with_violations": 0,
+    "turns_rewritten": 0,
+}
+
+
+def apply_citation_gate(
+    gate, final_text: str, *, used_web_tool: bool, user_id: str = "", channel: str = "",
+) -> str:
+    """Run the citation-integrity gate over a finished answer.
+
+    Violations are ALWAYS logged and counted (that is the measurement); the
+    answer is REWRITTEN only inside the configured scope:
+      * ``citation_gate_scope="web_turns"`` (default) — the turn used a
+        web/research tool, where a URL that is not in tool output is by
+        construction a fabricated citation (incident turn 3 cited two).
+      * ``"all"`` — every turn.
+    Never raises; on any internal error the answer is returned untouched.
+    """
+    try:
+        scope = str(getattr(settings, "citation_gate_scope", "web_turns") or "web_turns")
+        mode = str(getattr(settings, "citation_gate_mode", "mark") or "mark")
+        gr = gate.apply(final_text, mode=mode)
+        in_scope = (scope == "all") or (scope == "web_turns" and used_web_tool)
+        if gr.violations:
+            logger.warning(
+                "[citation-gate] user=%s channel=%s violations=%d checked=%d "
+                "grounded_urls=%d web_turn=%s enforced=%s mode=%s urls=%s",
+                (user_id or "")[:8], channel, len(gr.violations), gr.checked,
+                gate.size, used_web_tool, in_scope, mode,
+                [u[:120] for u in gr.violations[:8]],
+            )
+            _CITATION_GATE_COUNTERS["violations"] += len(gr.violations)
+            _CITATION_GATE_COUNTERS["turns_with_violations"] += 1
+            if in_scope:
+                _CITATION_GATE_COUNTERS["turns_rewritten"] += 1
+                return gr.text
+        elif gr.checked:
+            logger.info(
+                "[citation-gate] user=%s checked=%d grounded_urls=%d clean=true",
+                (user_id or "")[:8], gr.checked, gate.size,
+            )
+    except Exception:
+        logger.debug("[citation-gate] apply failed (answer left as-is)", exc_info=True)
+    return final_text
+
 
 # TKT-LAT-004: process-wide TTL cache for User.timezone is implemented
 # in app/agent/_user_tz_cache.py (kept config-free so unit tests don't
@@ -1954,6 +2013,34 @@ class AgentRunner:
         final_text = ""
         model_used = ""
 
+        # ── Citation-integrity gate (F5, incident 2026-08-18) ────────
+        # Every http(s) URL in the final answer must be one the model actually
+        # SAW this turn: a tool output, the user's own message, the earlier
+        # conversation, or a URL it passed to web_fetch. Seeded here from the
+        # assembled history; tool outputs are added as they arrive; applied to
+        # final_text below, BEFORE persistence and the `done` frame (both
+        # clients commit `done.text`, so a rewritten answer is what the user
+        # keeps even though the streamed preview showed the raw link).
+        _cite_gate = None
+        _turn_used_web_tool = False
+        if getattr(settings, "citation_gate_enabled", True):
+            try:
+                from app.websearch.citations import CitationGate as _CG
+                _cite_gate = _CG()
+                for _m in messages:
+                    _c = _m.get("content")
+                    if isinstance(_c, str):
+                        _cite_gate.add_text(_c)
+                    elif isinstance(_c, list):
+                        for _b in _c:
+                            if isinstance(_b, dict):
+                                _bt = _b.get("text") or _b.get("content")
+                                if isinstance(_bt, str):
+                                    _cite_gate.add_text(_bt)
+            except Exception:
+                logger.debug("[citation-gate] init failed (gate off this turn)", exc_info=True)
+                _cite_gate = None
+
         # Determine which model to use
         routing_decision: Optional[RoutingDecision] = None
         if self._session_model_override and model_override is None:
@@ -2708,6 +2795,19 @@ class AgentRunner:
                 logger.info(f"[PERF] tool_exec({tc['name']}): {_elapsed_ms:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
+                # Ground the citation gate: URLs the model was shown (any tool
+                # output) and URLs it fetched itself. A tool that errored
+                # still grounds nothing beyond its own text.
+                if _cite_gate is not None:
+                    try:
+                        _cite_gate.add_text(result if isinstance(result, str) else str(result))
+                        _u = (tc.get("input") or {}).get("url") if isinstance(tc.get("input"), dict) else None
+                        if isinstance(_u, str) and not (isinstance(result, str) and result.startswith("ERROR:")):
+                            _cite_gate.add_url(_u)
+                    except Exception:
+                        pass
+                if tc["name"] in WEB_EVIDENCE_TOOLS:
+                    _turn_used_web_tool = True
                 # Capture for the persisted ToolPillRow re-render. We
                 # cap summary at 2KB per record — the click-to-expand
                 # pill UI shows a popover, not a code editor; if you
@@ -2832,6 +2932,17 @@ class AgentRunner:
             # Max iterations reached
             if not final_text:
                 final_text = text_buf or "I've reached the maximum number of tool iterations. Here's what I have so far."
+
+        # ── Citation-integrity gate: apply ───────────────────────
+        # Violations are ALWAYS logged (that is the measurement); the answer
+        # is rewritten only inside the configured scope. `web_turns` = the
+        # turn used a web/research tool, where a URL not in tool output is by
+        # construction a fabricated citation (incident turn 3 cited two).
+        if _cite_gate is not None and final_text:
+            final_text = apply_citation_gate(
+                _cite_gate, final_text, used_web_tool=_turn_used_web_tool,
+                user_id=user_id, channel=channel,
+            )
 
         # ── Phase 3: Save to DB (short-lived session) ────────────
         t_phase3 = time.perf_counter()
@@ -4822,6 +4933,11 @@ class AgentRunner:
             f"- You can read and write files using `read_file` and `write_file` tools.",
             f"- When you create a report or document for the user, end your reply with a markdown link [Open <name>](toup://report?path=<workspace-relative-path>) so they can tap to open it (the write_file result includes the exact link).",
             f"- You can search the web using the `web_search` tool.",
+            # F6 (incident 2026-08-18): the model answered "newest Anthropic
+            # model" from a stale prior + a site:-anchored search and cited URLs
+            # it never saw. Static text — no per-turn bytes, prefix stays stable.
+            "- STALENESS RULE: your training knowledge of anything that changes over time — the newest/latest/current/most-capable model, product, version, price, release, ranking, or who holds a role — is OUT OF DATE relative to today's date above. Any such claim MUST come from THIS TURN's web_search/web_fetch results, never from memory. Every search result shows a `published:` date: prefer the NEWEST dated result from the OFFICIAL domain; when sources disagree, the official domain and the newer date win. If the thing you remember does not appear in this turn's results, do not assert it — search again with a NEUTRAL query (no site: operator) and confirm on the official site. Two agreeing sources, or say plainly that you could not verify.",
+            "- CITATIONS: link only to URLs that appear verbatim in this turn's tool results. Never compose, guess, or recall a URL. Unverified links are stripped and marked before the user sees them.",
             (
                 "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated')."
                 if _channel_safe == "voice" else

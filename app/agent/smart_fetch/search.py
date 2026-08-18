@@ -20,6 +20,7 @@ No browser, no headless Chrome, no Playwright — just httpx.
 import asyncio
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -330,30 +331,62 @@ async def _first_with_results(
 _NO_RESULTS = "No search results found across all engines."
 
 
-def cache_key(query: str, count: int) -> tuple:
+def cache_key(query: str, count: int, freshness_class: str = "evergreen") -> tuple:
     """Canonical cache key. Exported so callers that front this cache with
     their own earlier tier (see ``ToolExecutor._tool_web_search``) hash the
     query exactly the way ``toup_search`` does — a divergent key would make
-    the two tiers cache-miss each other forever."""
-    return (" ".join(query.split()).lower(), count)
+    the two tiers cache-miss each other forever.
+
+    The freshness class is part of the key (incident 2026-08-18, F2): a
+    recency-intent search is served with a Brave date filter and a short TTL,
+    an evergreen one without either, and the same words must never let one
+    be served as the other."""
+    return (" ".join(query.split()).lower(), count, freshness_class or "evergreen")
 
 
-def cache_get(query: str, count: int) -> Optional[str]:
-    """Read-through for callers ahead of this module in the fallback chain.
-    Returns None when caching is disabled or on a miss."""
+def _ttl_for(freshness_class: str) -> Optional[float]:
+    """Recency results live at most ``search_cache_recency_ttl_s`` (15 min);
+    evergreen keeps the cache-wide TTL. None → cache default."""
+    if (freshness_class or "evergreen") == "recent":
+        return float(min(settings.search_cache_recency_ttl_s, settings.search_cache_ttl_s * 4))
+    return None
+
+
+def cache_get_meta(query: str, count: int, freshness_class: str = "evergreen") -> Optional[tuple]:
+    """``(result, stored_at_epoch)`` or None. Read-through for callers ahead
+    of this module in the fallback chain."""
     if not settings.search_cache_enabled:
         return None
-    return _SEARCH_CACHE.get(cache_key(query, count))
+    if (freshness_class or "evergreen") == "recent" and getattr(settings, "search_cache_recency_bypass", False):
+        return None
+    hit = _SEARCH_CACHE.get(cache_key(query, count, freshness_class))
+    if hit is None:
+        return None
+    if isinstance(hit, tuple) and len(hit) == 2:
+        return hit
+    return (hit, None)   # legacy shape (raw string) — tolerated, never written now
 
 
-def cache_set(query: str, count: int, result: str) -> None:
+def cache_get(query: str, count: int, freshness_class: str = "evergreen") -> Optional[str]:
+    """Read-through for callers ahead of this module in the fallback chain.
+    Returns None when caching is disabled or on a miss."""
+    hit = cache_get_meta(query, count, freshness_class)
+    return hit[0] if hit else None
+
+
+def cache_set(query: str, count: int, result: str, freshness_class: str = "evergreen") -> None:
     """Store a result produced by an earlier tier. No-ops on empty/no-result
-    payloads so a transient outage can't be cached for 7 minutes."""
+    payloads so a transient outage can't be cached for 7 minutes. Recency
+    results get the short TTL (or are not stored at all when the bypass flag
+    is on)."""
     if not settings.search_cache_enabled:
         return
-    if not result or result.startswith("No search results"):
+    if not result or result.startswith("No search results") or result.strip() == "No results found.":
         return
-    _SEARCH_CACHE.set(cache_key(query, count), result)
+    fc = freshness_class or "evergreen"
+    if fc == "recent" and getattr(settings, "search_cache_recency_bypass", False):
+        return
+    _SEARCH_CACHE.set(cache_key(query, count, fc), (result, time.time()), ttl_s=_ttl_for(fc))
 
 
 async def _toup_search_sequential(query: str, count: int = 5) -> tuple[str, str]:
@@ -387,17 +420,22 @@ async def _toup_search_race(query: str, count: int = 5) -> tuple[str, str]:
     return _NO_RESULTS, ""
 
 
-async def toup_search_meta(query: str, count: int = 5) -> tuple[str, str, bool]:
+async def toup_search_meta(
+    query: str, count: int = 5, freshness_class: str = "evergreen",
+) -> tuple[str, str, bool]:
     """:func:`toup_search` plus provenance — returns
     ``(formatted, engine, cache_hit)``.
 
     ``engine`` is the winning engine's name ("duckduckgo", "mojeek", …) or ""
     when every engine came back empty. Callers use it to attribute usage to a
     concrete upstream; see the web-tool metering in ``tool_executor``.
+
+    ``freshness_class`` only selects the cache key/TTL here — the scrape
+    engines have no date filter of their own.
     """
-    cached = cache_get(query, count)
+    cached = cache_get(query, count, freshness_class)
     if cached is not None:
-        logger.info("[PERF] web_search cache=hit q=%r", query[:60])
+        logger.info("[PERF] web_search cache=hit q=%r class=%s", query[:60], freshness_class)
         return cached, "cache", True
 
     if settings.search_engine_race:
@@ -406,8 +444,8 @@ async def toup_search_meta(query: str, count: int = 5) -> tuple[str, str, bool]:
         result, engine = await _toup_search_sequential(query, count)
 
     if result and not result.startswith("No search results"):
-        cache_set(query, count, result)
-        logger.info("[PERF] web_search cache=miss q=%r engine=%s", query[:60], engine or "-")
+        cache_set(query, count, result, freshness_class)
+        logger.info("[PERF] web_search cache=miss q=%r engine=%s class=%s", query[:60], engine or "-", freshness_class)
     return result, engine, False
 
 

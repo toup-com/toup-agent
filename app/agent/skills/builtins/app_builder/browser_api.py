@@ -223,17 +223,23 @@ _BRAVE_EXTRACT_JS = """(count) => {
 }"""
 
 
-async def _brave_browser_search(query: str, count: int) -> List[Dict[str, str]]:
+async def _brave_browser_search(query: str, count: int, freshness: Optional[str] = None) -> List[Dict[str, str]]:
     """Search Brave (search.brave.com) via the headless browser — no API key.
 
     Brave's own index, reached through our own browser. Validated to return
     ~22 clean results headless where Google/Startpage CAPTCHA and DuckDuckGo's
     JS site renders empty. Never raises — returns [] on any failure.
+
+    ``freshness`` is Brave's time filter (``pd``/``pw``/``pm``/``py``), passed
+    as the web UI's ``tf=`` param so a recency-intent query on this last-resort
+    tier gets the same date filter the API tiers apply.
     """
     cleanup = None
     try:
         page, cleanup = await _get_page()
         url = f"https://search.brave.com/search?q={quote_plus(query)}&source=web"
+        if freshness in ("pd", "pw", "pm", "py"):
+            url += f"&tf={freshness}"
         await page.goto(url, wait_until="domcontentloaded", timeout=BRAVE_NAV_TIMEOUT_MS)
         await asyncio.sleep(1.2)  # let the result list paint
         results = await page.evaluate(_BRAVE_EXTRACT_JS, count)
@@ -248,7 +254,7 @@ async def _brave_browser_search(query: str, count: int) -> List[Dict[str, str]]:
             await cleanup()
 
 
-async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
+async def search(query: str, count: int = 5, freshness: Optional[str] = None) -> List[Dict[str, str]]:
     """Search the web with our own headless browser — no API key, no Google.
 
     Brave Search (browser-rendered) is primary; httpx DuckDuckGo-HTML is the
@@ -257,7 +263,11 @@ async def search(query: str, count: int = 5) -> List[Dict[str, str]]:
 
     Returns list of {title, url, snippet} dicts.
     """
-    results = await _brave_browser_search(query, count)
+    # Keyword only when set: existing callers/fakes use the 2-arg shape.
+    results = await (
+        _brave_browser_search(query, count, freshness=freshness) if freshness
+        else _brave_browser_search(query, count)
+    )
     if results:
         return results
     return await _ddg_html_search(query, count)
@@ -441,9 +451,9 @@ async def _ddg_html_search(query: str, count: int) -> List[Dict[str, str]]:
         return []
 
 
-async def search_formatted(query: str, count: int = 5) -> str:
+async def search_formatted(query: str, count: int = 5, freshness: Optional[str] = None) -> str:
     """Search and return results as a formatted string (for LLM consumption)."""
-    results = await search(query, count)
+    results = await (search(query, count, freshness=freshness) if freshness else search(query, count))
     if not results:
         return "No results found."
 

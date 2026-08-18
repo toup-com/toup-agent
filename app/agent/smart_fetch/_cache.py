@@ -37,8 +37,12 @@ class TTLCache:
         self._data.move_to_end(key)  # LRU: mark most-recently used
         return value
 
-    def set(self, key: Hashable, value: Any) -> None:
-        self._data[key] = (self._clock() + self.ttl_s, value)
+    def set(self, key: Hashable, value: Any, *, ttl_s: Optional[float] = None) -> None:
+        """Store ``value``. ``ttl_s`` overrides the cache-wide TTL for this
+        entry only — a recency-intent search result must expire long before an
+        evergreen one (see ``search.cache_set``)."""
+        ttl = self.ttl_s if ttl_s is None else float(ttl_s)
+        self._data[key] = (self._clock() + ttl, value)
         self._data.move_to_end(key)
         while len(self._data) > self.maxsize:
             self._data.popitem(last=False)  # evict least-recently used

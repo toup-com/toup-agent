@@ -130,6 +130,47 @@ def _brave_note_429() -> None:
 _brave_unconfigured_warned = False
 
 
+def _with_cache_line(block: str, status: str, stored_at: Optional[float] = None) -> str:
+    """Prepend the cache verdict to a search block (F2 metadata).
+
+    Cache status cannot live inside the cached bytes — a block stored as
+    "cache: miss" would read "miss" on every later hit — so it is added at
+    return time. It goes on its own line ABOVE the header, where the web
+    card's parser ignores it (only ``N. title`` lines start a result) and
+    the model still sees it.
+    """
+    if not block:
+        return block
+    if status == "hit":
+        if stored_at:
+            from datetime import datetime as _dt, timezone as _tz
+            _when = _dt.fromtimestamp(float(stored_at), _tz.utc)
+            _age_s = max(0, int(time.time() - float(stored_at)))
+            line = f"cache: hit (stored {_when.strftime('%H:%M')} UTC, {_age_s // 60} min ago)"
+        else:
+            line = "cache: hit"
+    else:
+        line = "cache: miss"
+    return f"{line}\n{block}"
+
+
+def _no_fresh_results(query: str) -> str:
+    """The block returned when a recency query found only stale pages.
+
+    Explicit on purpose: "No search results found." would send the model to
+    its priors; this tells it the state of the evidence so it can say it
+    could not verify. Not cached — the world may change in the next minute.
+    """
+    days = int(getattr(settings, "search_stale_max_days", 548) or 548)
+    return (
+        f'No results newer than {days // 30} months for "{" ".join(query.split())}" — '
+        "older pages were withheld because this looks like a question about the "
+        "present. Do not answer from memory: try one neutral rephrasing "
+        "(no site: operator), and if that also finds nothing recent, tell the "
+        "user you could not verify a current answer."
+    )
+
+
 def _warn_brave_unconfigured() -> None:
     global _brave_unconfigured_warned
     if _brave_unconfigured_warned:
@@ -1900,18 +1941,37 @@ class ToolExecutor:
 
         started = time.monotonic()
 
+        # ── Freshness class (incident 2026-08-18) ─────────────────────
+        # Decided ONCE per search, up front, because it steers every tier:
+        # the cache key + TTL (F2), the gateway's Brave `freshness` ladder
+        # and news blend (F1), the header the model reads (F3), and the log
+        # line (F7). The gateway re-derives it for older agent images that
+        # do not send it; when we do send it, ours wins.
+        from app.websearch import freshness as _fresh
+        if getattr(settings, "search_freshness_enabled", True):
+            _verdict = _fresh.classify(query)
+        else:
+            _verdict = _fresh.RecencyVerdict(_fresh.EVERGREEN)
+        fclass = _verdict.freshness_class
+
         # ── Tier 0: the shared result cache, consulted BEFORE the Brave API.
         # The cache used to live inside `toup_search` (tier 2), which meant a
         # configured Brave key bypassed it entirely and every repeat query
         # burned another paid API call. Hoisting the read here fronts all
-        # three tiers with one 7-minute cache; `smart_fetch.search.cache_key`
-        # keeps both call sites on an identical key. Cache hits are free —
-        # they are logged but never metered, because nothing left the box.
+        # three tiers with one cache; `smart_fetch.search.cache_key` keeps
+        # both call sites on an identical key. The key carries the freshness
+        # class and recency entries expire in ≤15 min (or bypass the cache),
+        # so an evergreen page can never be served for a "newest X" question.
+        # Cache hits are free — logged, never metered: nothing left the box.
         from app.agent.smart_fetch import search as _sf_search
-        cached = _sf_search.cache_get(query, count)
-        if cached is not None:
-            logger.info("[PERF] web_search cache=hit(tier0) q=%r", query[:60])
-            return cached
+        _hit = _sf_search.cache_get_meta(query, count, fclass)
+        if _hit is not None:
+            _cached, _stored_at = _hit
+            logger.info(
+                "[web_search] q=%r class=%s cache=hit tier=cache reasons=%s",
+                query[:60], fclass, ",".join(_verdict.reasons),
+            )
+            return _with_cache_line(_cached, "hit", _stored_at)
 
         # ── Tier 1: the PLATFORM SEARCH GATEWAY ─────────────────────────
         # We authenticate to our own platform with TOUP_TOKEN — the same
@@ -1933,14 +1993,26 @@ class ToolExecutor:
         # "I throttled, or upstream failed — use your own lower tiers". Only
         # that keeps a rate limit from becoming a missing answer.
         if _gateway_allowed():
-            gw = await self._gateway_search(query, count)
+            gw = await self._gateway_search(query, count, freshness_class=fclass)
             if gw is not None:
                 served, gw_result, gw_reason = gw
                 if served and gw_result:
-                    _sf_search.cache_set(query, count, gw_result)
+                    _sf_search.cache_set(query, count, gw_result, fclass)
+                    logger.info(
+                        "[web_search] q=%r class=%s cache=miss tier=search_gateway "
+                        "latency_ms=%d reasons=%s",
+                        query[:60], fclass, int((time.monotonic() - started) * 1000),
+                        ",".join(_verdict.reasons),
+                    )
                     # NOT metered here: search_proxy already wrote the row from
                     # its own observation. Metering both sides double-counts.
-                    return gw_result
+                    return _with_cache_line(gw_result, "miss")
+                if gw_reason == "all_stale":
+                    # Brave had pages, every dated one was older than the stale
+                    # cutoff. Falling to the undated scrape/browser tiers would
+                    # re-serve exactly those pages, so this is the answer.
+                    logger.info("[web_search] q=%r class=%s tier=search_gateway all_stale", query[:60], fclass)
+                    return _no_fresh_results(query)
                 _search_degraded(
                     skipped="search_gateway",
                     reason=gw_reason or "unserved", query=query,
@@ -1966,14 +2038,23 @@ class ToolExecutor:
                 _search_degraded(skipped="brave_api", reason=_why, query=query)
             else:
                 try:
-                    result = await self._brave_search_fallback(query, count)
+                    result = await self._brave_search_fallback(query, count, verdict=_verdict)
+                    if result and result.startswith("No results newer than"):
+                        # All stale (see _no_fresh_results): the answer, not a
+                        # miss — never cached, never metered as a served page,
+                        # never handed to the undated tiers.
+                        return result
                     if result and result.strip() != "No results found.":
-                        _sf_search.cache_set(query, count, result)
+                        _sf_search.cache_set(query, count, result, fclass)
                         await self._meter_web_tool(
                             "web_search", tier="brave_api", engine="brave",
                             started=started, query=query,
                         )
-                        return result
+                        logger.info(
+                            "[web_search] q=%r class=%s cache=miss tier=brave_api latency_ms=%d",
+                            query[:60], fclass, int((time.monotonic() - started) * 1000),
+                        )
+                        return _with_cache_line(result, "miss")
                     _search_degraded(skipped="brave_api", reason="empty_result", query=query)
                 except Exception as exc:
                     # A 429 means the ACCOUNT ceiling is hit — shared with
@@ -1994,7 +2075,7 @@ class ToolExecutor:
         # Secondary: multi-engine httpx scrape (free, no key) — fast when it works,
         # but search engines IP-block datacenters, so this often returns empty.
         try:
-            result, engine, cache_hit = await _sf_search.toup_search_meta(query, count)
+            result, engine, cache_hit = await _sf_search.toup_search_meta(query, count, fclass)
             if result and "No search results" not in result:
                 # We bill OUTBOUND calls, not memory reads. toup_search_meta has
                 # its own inner cache, so discarding cache_hit here metered a
@@ -2005,7 +2086,11 @@ class ToolExecutor:
                         "web_search", tier="httpx_race", engine=engine or "unknown",
                         started=started, query=query,
                     )
-                return result
+                logger.info(
+                    "[web_search] q=%r class=%s cache=%s tier=httpx_race engine=%s (undated tier)",
+                    query[:60], fclass, "hit" if cache_hit else "miss", engine or "-",
+                )
+                return _with_cache_line(result, "hit" if cache_hit else "miss")
             _search_degraded(skipped="httpx_race", reason="empty_or_blocked", query=query)
         except Exception as exc:
             _search_degraded(skipped="httpx_race", reason=f"error:{type(exc).__name__}", query=query)
@@ -2017,17 +2102,23 @@ class ToolExecutor:
         if settings.browser_search_enabled:
             try:
                 from app.agent.skills.builtins.app_builder.browser_api import search_formatted
-                result = await search_formatted(query, count)
+                # Same freshness ladder head as the API tiers (Brave web UI tf=).
+                _bf = _verdict.ladder[0] if _verdict.is_recent else None
+                result = await (search_formatted(query, count, freshness=_bf) if _bf else search_formatted(query, count))
                 # Exact-match the empty sentinel — a substring scan would wrongly
                 # discard a real result block whose title/snippet contains the
                 # phrase "no results".
                 if result and result.strip() != "No results found.":
-                    _sf_search.cache_set(query, count, result)
+                    _sf_search.cache_set(query, count, result, fclass)
                     await self._meter_web_tool(
                         "web_search", tier="browser_brave", engine="brave",
                         started=started, query=query,
                     )
-                    return result
+                    logger.info(
+                        "[web_search] q=%r class=%s cache=miss tier=browser_brave (undated tier)",
+                        query[:60], fclass,
+                    )
+                    return _with_cache_line(result, "miss")
                 _search_degraded(skipped="browser_brave", reason="empty_result", query=query)
             except Exception as exc:
                 _search_degraded(skipped="browser_brave", reason=f"error:{type(exc).__name__}", query=query)
@@ -2043,8 +2134,12 @@ class ToolExecutor:
         )
         return "No search results found."
 
-    async def _gateway_search(self, query: str, count: int):
+    async def _gateway_search(self, query: str, count: int, freshness_class: Optional[str] = None):
         """Ask the platform search gateway. Returns (served, text, reason) or None.
+
+        ``freshness_class`` ("recent" | "evergreen") is forwarded so the gateway
+        applies the matching Brave freshness ladder / news blend; the rendered
+        text carries every result's page date (see app/websearch/render.py).
 
         None means "not configured from here" — a different condition from "the
         gateway declined" — but the caller treats both the same way: fall to the
@@ -2086,6 +2181,8 @@ class ToolExecutor:
                         # raises inside a tier whose whole contract is "never
                         # deny an answer".
                         "channel": getattr(self, "_current_channel", None) or None,
+                        # Advisory; an older gateway ignores unknown fields.
+                        "freshness_class": freshness_class,
                     },
                     headers={
                         "Authorization": f"Bearer {token}",
@@ -2140,55 +2237,79 @@ class ToolExecutor:
         if not results:
             return (False, None, "empty_result")
 
-        lines = []
-        for i, r in enumerate(results[:count], 1):
-            lines.append(f"{i}. {r.get('title', '')}")
-            lines.append(f"   {r.get('url', '')}")
-            desc = r.get("description") or ""
-            if desc:
-                lines.append(f"   {desc}")
-            for snip in (r.get("extra_snippets") or [])[:3]:
-                if snip:
-                    lines.append(f"   {snip}")
-            lines.append("")
-        return (True, "\n".join(lines), None)
+        # Render with page dates + a freshness header (F3). The gateway's
+        # SearchResult already carries age/page_age/source; older gateways
+        # simply leave them absent and the renderer prints "date unknown".
+        from app.websearch.render import render_block
+        gw_class = data.get("freshness_class") or freshness_class
+        text = render_block(
+            [r for r in results[:count] if r.get("url")],
+            query=query,
+            freshness_class=gw_class,
+            freshness_applied=data.get("freshness_applied"),
+            dropped_stale=int(data.get("dropped_stale") or 0),
+            stale_days=int(getattr(settings, "search_stale_max_days", 548) or 548),
+            news_count=int(data.get("news_count") or 0),
+            tier="search gateway",
+        )
+        return (True, text, None)
 
-    async def _brave_search_fallback(self, query: str, count: int) -> str:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                # extra_snippets returns up to 5 extra passages pulled from each
-                # result page — enough context that the model can often answer
-                # WITHOUT a slow web_fetch, cutting the fetch count. Harmless on
-                # plans that don't support it (the field is just absent).
-                params={"q": query, "count": count, "extra_snippets": "true"},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": settings.brave_api_key,
-                },
+    async def _brave_search_fallback(self, query: str, count: int, verdict=None) -> str:
+        """Tier 1b — the container's own Brave key. Mirrors the gateway's
+        freshness policy in miniature: recency intent → ``freshness`` from the
+        ladder (pm → py → none) widening while the page is thin; results are
+        annotated with their page date and stale pages are dropped. No news
+        blend here (this tier exists only to keep search alive if the gateway
+        is down; a second endpoint doubles the blast radius of that outage)."""
+        from app.websearch import freshness as _fresh
+        from app.websearch.render import brave_web_to_dicts, render_block
+
+        if verdict is None:
+            verdict = (
+                _fresh.classify(query)
+                if getattr(settings, "search_freshness_enabled", True)
+                else _fresh.RecencyVerdict(_fresh.EVERGREEN)
             )
-            resp.raise_for_status()
-            data = resp.json()
+        ladder = list(verdict.ladder) if getattr(settings, "search_freshness_enabled", True) else [None]
+        min_results = max(1, int(getattr(settings, "search_freshness_min_results", 3)))
 
-        results = data.get("web", {}).get("results", [])
-        if not results:
-            return "No results found."
+        best: List[Dict[str, Any]] = []
+        applied: Optional[str] = None
+        async with httpx.AsyncClient(timeout=15) as client:
+            for i, fr in enumerate(ladder):
+                resp = await client.get(
+                    "https://api.search.brave.com/res/v1/web/search",
+                    # extra_snippets returns up to 5 extra passages pulled from
+                    # each result page — enough context that the model can often
+                    # answer WITHOUT a slow web_fetch. Harmless on plans that
+                    # don't support it (the field is just absent).
+                    params=_fresh.brave_params(query, count, fr),
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip",
+                        "X-Subscription-Token": settings.brave_api_key,
+                    },
+                )
+                resp.raise_for_status()
+                page = brave_web_to_dicts(resp.json())
+                if len(page) > len(best):
+                    best, applied = page, fr
+                if len(best) >= min_results:
+                    break
 
-        lines = []
-        for i, r in enumerate(results[:count], 1):
-            lines.append(f"{i}. {r.get('title', '')}")
-            lines.append(f"   {r.get('url', '')}")
-            desc = r.get("description", "") or ""
-            if desc:
-                lines.append(f"   {desc}")
-            # Surface the richer passages so snippet-first reasoning has more to
-            # work with before deciding to fetch.
-            for snip in (r.get("extra_snippets") or [])[:4]:
-                if snip:
-                    lines.append(f"   {snip}")
-            lines.append("")
-        return "\n".join(lines)
+        dropped = 0
+        if verdict.is_recent and getattr(settings, "search_stale_filter_enabled", True):
+            best, dropped = _fresh.filter_stale(
+                best, max_age_days=int(getattr(settings, "search_stale_max_days", 548) or 548),
+            )
+        if not best:
+            return _no_fresh_results(query) if dropped else "No results found."
+        return render_block(
+            best[:count], query=query, freshness_class=verdict.freshness_class,
+            freshness_applied=applied, dropped_stale=dropped,
+            stale_days=int(getattr(settings, "search_stale_max_days", 548) or 548),
+            tier="brave (container key)",
+        )
 
     async def _ddg_search_fallback(self, query: str, count: int) -> str:
         """Last-resort search via DuckDuckGo HTML (no API key, no browser)."""

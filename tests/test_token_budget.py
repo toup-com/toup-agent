@@ -39,6 +39,13 @@ def test_estimate_and_truncate():
 
 class _ExecStub:
     user_disabled_tools = frozenset()
+    # execute() consults these on the success path (doc-dedupe + flat-fee
+    # metering); a stub without them turns every call into "ERROR: AttributeError".
+    _GOOGLE_DOC_CREATORS = frozenset()
+    google_docs_created_this_run = set()
+
+    async def _meter_flat_tool(self, tool_name, result):
+        return None
 
     async def _tool_web_fetch(self, inp):
         return "word " * 6000   # ~30000 chars
@@ -53,6 +60,9 @@ class _ExecStub:
 def test_execute_token_budgets_web_fetch_once(monkeypatch):
     monkeypatch.setattr(TE.settings, "web_token_budget_enabled", True)
     monkeypatch.setattr(TE.settings, "fetch_token_budget", 1000)
+    # The untrusted-content fence wraps web output AFTER budgeting; this test
+    # is about the budget cut, so look inside the fence.
+    monkeypatch.setattr(TE.settings, "injection_fencing_v2", False)
     out = asyncio.run(ToolExecutor.execute(_ExecStub(), "web_fetch", {}))
     assert out.endswith("budget)"), "should use the token-budget marker"
     assert "[truncated," not in out, "must NOT also apply the byte cap (no double truncation)"
@@ -82,13 +92,22 @@ def test_web_fetch_reader_cap_is_gated(monkeypatch):
 
     monkeypatch.setattr("app.agent.smart_fetch.reader.toup_read_page", fake_read)
     monkeypatch.setattr(TE.settings, "fetch_token_budget", 1000)
+    # The SSRF guard runs before the reader and refuses non-public hosts, and
+    # the fetch cache would serve the second call — a real public URL and a
+    # cold cache keep both calls on the reader path this test measures.
+    monkeypatch.setattr("app.agent.smart_fetch.reader._assert_public_url", lambda u: None)
+    monkeypatch.setattr(TE.settings, "fetch_cache_enabled", False)
+    # A 4-char body looks JS-rendered to the reader heuristic and would launch
+    # the headless-browser fallback; keep this test on the httpx path.
+    monkeypatch.setattr(TE.settings, "browser_fetch_enabled", False)
+    _url = "https://example.com/page"
 
     monkeypatch.setattr(TE.settings, "web_token_budget_enabled", True)
-    asyncio.run(ToolExecutor._tool_web_fetch(_ExecStub(), {"url": "http://x", "max_chars": 5000}))
+    asyncio.run(ToolExecutor._tool_web_fetch(_ExecStub(), {"url": _url, "max_chars": 5000}))
     assert seen["mc"] == 6000, "budgeting on => generous reader cap (fetch_token_budget*6)"
 
     monkeypatch.setattr(TE.settings, "web_token_budget_enabled", False)
-    asyncio.run(ToolExecutor._tool_web_fetch(_ExecStub(), {"url": "http://x", "max_chars": 5000}))
+    asyncio.run(ToolExecutor._tool_web_fetch(_ExecStub(), {"url": _url, "max_chars": 5000}))
     assert seen["mc"] == 5000, "flag off => legacy per-request max_chars"
 
 

@@ -432,6 +432,57 @@ class Settings(BaseSettings):
     fetch_cache_ttl_s: int = 720           # 12 min
     fetch_cache_max: int = 256
 
+    # ── Web-search freshness / grounding (incident 2026-08-18) ───────
+    # docs/web-search/freshness-incident.md. Every knob is a kill-switch or a
+    # bound; the classifier + gateway policy live in app/websearch/ and are
+    # shared by the platform gateway (search_proxy.py) and the agent.
+    #
+    # search_freshness_enabled: classify recency intent and pass Brave
+    #   `freshness` (pm → py → none ladder), blend the News index, annotate
+    #   every result with its page date, and drop pages older than
+    #   `search_stale_max_days` for recency queries. Off → the pre-incident
+    #   {q,count,extra_snippets} call and undated results.
+    search_freshness_enabled: bool = True
+    # Below this many results on a freshness-filtered page, widen the window
+    # (pm → py → no filter). 3 = "a page with fewer than three hits is thin".
+    search_freshness_min_results: int = 3
+    # Recency queries also hit Brave's News endpoint and merge (dedup by URL,
+    # round-robin so each index's top hits survive the cap).
+    search_news_blend_enabled: bool = True
+    search_news_count: int = 5
+    # A `site:`-anchored recency query ALSO runs as a neutral discovery query
+    # (operator stripped) and the two are merged — the incident's
+    # `site:anthropic.com/news newest Claude model` could not surface a
+    # cross-source confirmation on its own. Costs one extra Brave call, only
+    # for that (rare) shape.
+    search_site_discovery_enabled: bool = True
+    # Pages older than this are dropped from recency-intent result pages
+    # (undated pages are kept and labelled "date unknown"). 18 months.
+    search_stale_filter_enabled: bool = True
+    search_stale_max_days: int = 548
+    # Append the current year to recency queries. MEASURED OFF: on the
+    # incident queries `+2026` demoted the official announcement (Opus 5
+    # #1 → #8 with freshness=pm) in favour of "best X 2026" listicles. Kept as
+    # an opt-in for query shapes where it helps.
+    search_recency_append_year: bool = False
+    # Cache policy by intent class: recency results live at most this long
+    # (15 min) or bypass the cache entirely; evergreen keeps search_cache_ttl_s.
+    # The cache key includes the freshness class so the two never collide.
+    search_cache_recency_ttl_s: int = 900
+    search_cache_recency_bypass: bool = False
+    # Citation-integrity gate (agent runner): every http(s) URL in the final
+    # answer must appear in this turn's tool outputs (or the user's own
+    # message / earlier conversation / a URL the model itself fetched).
+    # Violations are rewritten — mode "mark": `url (unverified)`, mode
+    # "strip": link removed — and counted. scope "web_turns" applies the
+    # rewrite only on turns that used a web/research tool (where fabricated
+    # citations happen); "all" applies it to every turn. Violations are
+    # LOGGED on every turn regardless of scope, so widening is a measured
+    # decision.
+    citation_gate_enabled: bool = True
+    citation_gate_mode: str = "mark"          # mark | strip
+    citation_gate_scope: str = "web_turns"    # web_turns | all
+
     # ── web_search / web_fetch metering ──────────────────────────
     # Until 2026-07 these two tools were the only priced-in-FLAT_FEES events
     # with no charge call site anywhere: `_flat_fee_for_tool`'s web_search /
@@ -583,7 +634,12 @@ class Settings(BaseSettings):
     # a multi-fetch turn can't flood the context. Off → legacy byte/char caps.
     web_token_budget_enabled: bool = True
     fetch_token_budget: int = 4000          # tokens per single web_fetch
-    search_token_budget: int = 2000         # tokens per web_search result block
+    # 3000, not 2000: the incident's result blocks were 8.9–11.4k chars against
+    # the 8k-char (2000-token) budget, so 2 of 8 results were silently cut on
+    # most searches. The renderer now caps each result (~300-char description,
+    # 2×200-char extra snippets), so ten results are ≈9k chars — inside 12k
+    # with headroom. The last result must never be the one that gets cut.
+    search_token_budget: int = 3000         # tokens per web_search result block
     web_turn_token_budget: int = 12000      # aggregate cap across one parallel web batch
     # Kill-switches (default on): the no-API-key headless-browser fallbacks.
     # browser_search → when the fast httpx engines return "No results", race
