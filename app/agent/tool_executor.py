@@ -357,6 +357,16 @@ _SESSION_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 _CREATED_JOB_IDS_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
     "tool_executor_created_job_ids", default=(),
 )
+# The assistant message id this turn's answer will be persisted under.
+# AgentRunner pre-mints it at run start (so generate_* attachments can
+# reference it before the row exists) and hands it to set_session_id();
+# create_job / update_job stamp it as the deep-link ``message_id`` on
+# every job push and Live Activity update (Round 3, item 3) — the phone
+# can open the conversation AND scroll to the answer without waiting for
+# the turn to end. Per-task like its siblings.
+_ASST_MESSAGE_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "tool_executor_asst_message_id", default=None,
+)
 # Inbound attachments (persisted dicts) the user sent with the current turn.
 # Lets edit_image reach "the photo I just sent" without re-decoding the WS
 # payload. Per-asyncio-task, like the other per-call context above.
@@ -5499,10 +5509,13 @@ class ToolExecutor:
         Writes to the ``_CHANNEL_CTX`` ContextVar."""
         _CHANNEL_CTX.set((channel or "").strip().lower() or None)
 
-    def set_session_id(self, session_id: Optional[str]):
+    def set_session_id(self, session_id: Optional[str], asst_message_id: Optional[str] = None):
         """Set the conversation this turn belongs to, and clear the per-turn
-        created-job list. Writes to the ``_SESSION_ID_CTX`` ContextVar."""
+        created-job list. Writes to the ``_SESSION_ID_CTX`` ContextVar.
+        ``asst_message_id`` (the runner's pre-minted answer id) is the
+        deep-link target every job push of this turn carries."""
         _SESSION_ID_CTX.set(session_id or None)
+        _ASST_MESSAGE_ID_CTX.set(asst_message_id or None)
         _CREATED_JOB_IDS_CTX.set(())
 
     def take_created_job_ids(self) -> tuple:
@@ -5511,6 +5524,18 @@ class ToolExecutor:
         ids = _CREATED_JOB_IDS_CTX.get()
         _CREATED_JOB_IDS_CTX.set(())
         return ids
+
+    def peek_created_job_ids(self) -> tuple:
+        """Job ids the `create_job` tool made during this turn — WITHOUT
+        resetting. `update_job` uses it to tell "a job of this turn" (whose
+        terminal card push belongs to the runner's finalizer, which knows
+        the answer text + message id) from an older job."""
+        return _CREATED_JOB_IDS_CTX.get()
+
+    def turn_deep_link(self) -> tuple:
+        """(chat_id, message_id) for this turn's pushes — the deep-link
+        payload (Round 3, item 3). Either may be None."""
+        return _SESSION_ID_CTX.get(), _ASST_MESSAGE_ID_CTX.get()
 
     def set_session_workspace(self, path: Optional[str]):
         """Set a per-session workspace override. Relative paths resolve against this.
@@ -6208,6 +6233,14 @@ class ToolExecutor:
                 "status": "pending",
             })
 
+        # Round 3 (item 1): the icon-system tag, derived from the title's
+        # intent words. Persisted in config_json (NOT the job_type COLUMN —
+        # that is the JobRunner handler discriminator) and carried on the
+        # tool response, every job_update frame and every phone push.
+        from app.agent.job_type import classify_job_type
+        job_type = classify_job_type(title, description)
+        chat_id, asst_message_id = self.turn_deep_link()
+
         # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
         # so the new columns are populated for agent-authored tasks.
         #   - source_kind='manual' — the agent chose to create this
@@ -6226,6 +6259,7 @@ class ToolExecutor:
             channel="agent_task",
             source_kind="manual",
             conversation_id=_SESSION_ID_CTX.get(),
+            config_json={"job_type": job_type},
         )
         job = await JobRunner().create_job(
             job_type="agent_task",
@@ -6247,16 +6281,20 @@ class ToolExecutor:
         _CREATED_JOB_IDS_CTX.set(_CREATED_JOB_IDS_CTX.get() + (job_id,))
 
         # Broadcast to frontend
+        first_step = step_labels[0] if step_labels else "Working..."
         try:
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
                 "type": "job_update",
                 "job_id": job_id,
+                "job_type": job_type,
                 "name": title,
                 "status": "running",
-                "step": step_labels[0] if step_labels else "Working...",
+                "step": first_step,
                 "total_steps": len(steps),
                 "completed_steps": 0,
+                "chat_id": chat_id,
+                "message_id": asst_message_id,
             })
         except Exception:
             pass
@@ -6264,7 +6302,10 @@ class ToolExecutor:
         # Phone surface: start the lock-screen/Dynamic-Island card via
         # the push lane (same contract as spawned jobs — the LA lane is
         # keyed on data.mission_id). Step counts give REAL discrete
-        # progress here, updated by _tool_update_job.
+        # progress here, updated by _tool_update_job. With a chat_id the
+        # card is the CONVERSATION's card (chatjob:<session>): a second job
+        # in the same chat refreshes it (refresh_if_started) instead of
+        # stacking or superseding a new one (Round 3, item 4).
         import time as _t_cj
         from app.agent.subagent_orchestrator import _notify_job_event
         await _notify_job_event(
@@ -6280,9 +6321,17 @@ class ToolExecutor:
             # job_reaper's 30-minute stall cutoff.
             timer_end_ms=int((_t_cj.time() + 1800) * 1000),
             dedup_suffix="started",
+            chat_id=chat_id, message_id=asst_message_id,
+            job_type=job_type,
+            step_name=first_step if step_labels else None,
+            steps_done=0, steps_total=len(steps),
+            refresh_if_started=bool(chat_id),
         )
 
-        return _json.dumps({"job_id": job_id, "title": title, "steps": len(steps)})
+        return _json.dumps({
+            "job_id": job_id, "title": title, "steps": len(steps),
+            "job_type": job_type,
+        })
 
     async def _tool_update_job(self, inp: Dict[str, Any]) -> str:
         """Update an existing job's status and steps."""
@@ -6389,6 +6438,24 @@ class ToolExecutor:
 
             await db.commit()
 
+        # Round 3: the icon tag + deep link ride every frame and push.
+        # chat_id = the job's own conversation (a job may be updated in a
+        # later turn — the ROW's conversation, not this turn's, keys its
+        # card); message_id = this turn's answer when the job is this
+        # turn's, else unknown.
+        from app.agent.job_type import classify_job_type, normalize_job_type
+        job_type = (
+            normalize_job_type((getattr(job, "config_json", None) or {}).get("job_type"))
+            or classify_job_type(job.title, getattr(job, "prompt", None))
+        )
+        _turn_chat_id, _turn_msg_id = self.turn_deep_link()
+        _this_turns_job = job_id in self.peek_created_job_ids()
+        chat_id = (
+            getattr(job, "conversation_id", None)
+            or (_turn_chat_id if _this_turns_job else None)
+        )
+        asst_message_id = _turn_msg_id if _this_turns_job else None
+
         # Broadcast
         current_label = ""
         try:
@@ -6399,11 +6466,14 @@ class ToolExecutor:
             await broadcast_to_user(user_id, {
                 "type": "job_update",
                 "job_id": job_id,
+                "job_type": job_type,
                 "name": job.title,
                 "status": job.status,
                 "step": current_label,
                 "total_steps": len(steps),
                 "completed_steps": completed_count,
+                "chat_id": chat_id,
+                "message_id": asst_message_id,
             })
         except Exception:
             pass
@@ -6411,21 +6481,45 @@ class ToolExecutor:
         # Phone surface: advance or end the Live Activity card. Step
         # counts give an honest discrete bar; the lane never moves it
         # backwards.
-        from app.agent.subagent_orchestrator import _notify_job_event
+        from app.agent.subagent_orchestrator import (
+            JOB_CARD_END_AFTER_S as _JOB_CARD_END_AFTER_S,
+            _notify_job_event,
+        )
         pct = int(completed_count / len(steps) * 100) if steps else None
-        if job.status == "completed":
+        _card = dict(
+            chat_id=chat_id, message_id=asst_message_id, job_type=job_type,
+            step_name=current_label or None,
+            steps_done=completed_count, steps_total=len(steps),
+        )
+        if job.status == "completed" and _this_turns_job:
+            # The model marks the job done BEFORE it writes the answer, so
+            # the answer text — and therefore the card's response preview —
+            # does not exist yet. The runner's turn-end finalizer owns the
+            # terminal push for this turn's jobs (it has final_text + the
+            # message id, and its cancel/exception path closes the card
+            # too). Here: a bannerless "finishing" state at 100% so the bar
+            # completes at the moment the work did. Priority low = APNs
+            # budget-free.
+            await _notify_job_event(
+                job_id=job_id, label=job.title, kind="progress",
+                title=f"Working on: {(job.title or 'background task')[:150]}",
+                body="Writing your answer…", progress=100, priority="low",
+                dedup_suffix="progress:done", **_card,
+            )
+        elif job.status == "completed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_completed",
                 title=f"✅ Done: {(job.title or 'background task')[:150]}",
                 body=current_label or "Finished.",
                 progress=100, dismiss_after_s=900, dedup_suffix="completed",
+                end_after_s=_JOB_CARD_END_AFTER_S, **_card,
             )
         elif job.status == "failed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_failed",
                 title=f"⚠️ Didn't finish: {(job.title or 'background task')[:150]}",
                 body=(error_message or "The task hit an error.")[:300],
-                dedup_suffix="failed",
+                dedup_suffix="failed", **_card,
             )
         elif job.status == "waiting_on_user":
             # `needs_approval`, never `mission_failed`: that kind alerts and
@@ -6440,6 +6534,7 @@ class ToolExecutor:
                 ),
                 action_type="permission",
                 cta_label="Open the chat to approve",
+                **_card,
             )
         else:
             await _notify_job_event(
@@ -6447,6 +6542,10 @@ class ToolExecutor:
                 title=f"Working on: {(job.title or 'background task')[:150]}",
                 body=current_label or None,
                 progress=pct, priority="low", dedup_suffix="progress",
+                **_card,
             )
 
-        return _json.dumps({"ok": True, "status": job.status, "completed_steps": completed_count})
+        return _json.dumps({
+            "ok": True, "status": job.status, "completed_steps": completed_count,
+            "job_type": job_type,
+        })

@@ -1111,29 +1111,62 @@ class AgentRunner:
                             ),
                             user_message=msg,
                         )
-                        .returning(_BJ.id, _BJ.title)
+                        .returning(_BJ.id, _BJ.title, _BJ.conversation_id,
+                                   _BJ.config_json)
                     )
                     row = res.first()
                     if row:
-                        closed.append((row[0], row[1] or ""))
+                        closed.append((row[0], row[1] or "", row[2],
+                                       row[3] if isinstance(row[3], dict) else {}))
                 if closed and parked:
                     # The resume path matches on this, so a job parked by the
                     # interrupted path is closable by an approval just like one
                     # parked by the clean path.
-                    for jid, _ in closed:
+                    for jid, _t, _c, _g in closed:
                         pj = await db.get(_BJ, jid)
                         if pj is not None:
                             cfg = dict(pj.config_json or {})
                             cfg["pending_action_id"] = staged_action_id
                             pj.config_json = cfg
                 await db.commit()
+                # Round 3: a job the model already marked `completed` mid-turn
+                # got only a 100% "writing your answer" card update — its
+                # terminal push was deferred to the happy-path finalizer, and
+                # the turn died before that ran. End those cards here (no
+                # preview: there is no answer), or they sit at 100% until the
+                # 30-minute stale-date dims them.
+                from sqlalchemy import select as _sel_done
+                _closed_ids = {c[0] for c in closed}
+                already_done = (await db.execute(
+                    _sel_done(_BJ.id, _BJ.title, _BJ.conversation_id, _BJ.config_json)
+                    .where(_BJ.id.in_(list(job_ids)), _BJ.user_id == user_id,
+                           _BJ.status == "completed")
+                )).all()
         except Exception:  # noqa: BLE001
             logger.exception("[job-finalize] could not close interrupted jobs")
             return
 
-        for jid, title in closed:
+        for jid, title, conv_id, cfg in already_done:
+            if jid in _closed_ids:
+                continue
+            try:
+                from app.agent.subagent_orchestrator import _notify_job_event
+                _cfg = cfg if isinstance(cfg, dict) else {}
+                await _notify_job_event(
+                    job_id=jid, label=title or "", kind="mission_completed",
+                    title=f"✅ Done: {(title or 'background task')[:150]}",
+                    body="Finished.", progress=100,
+                    dismiss_after_s=900, dedup_suffix="completed",
+                    chat_id=conv_id, job_type=_cfg.get("job_type"),
+                    step_name="Done", urgent=False,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        for jid, title, conv_id, cfg in closed:
             logger.info("[job-finalize] closed abandoned job %s (%s)",
                         jid[:8], title[:60])
+            _card = dict(chat_id=conv_id, job_type=cfg.get("job_type"))
             try:
                 from app.api.ws_chat import broadcast_to_user
                 await broadcast_to_user(user_id, {
@@ -1164,6 +1197,7 @@ class AgentRunner:
                         summary=msg or "Waiting for you to approve this.",
                         action_type="permission",
                         cta_label="Open the chat to approve",
+                        **_card,
                     )
                     continue
                 await _notify_job_event(
@@ -1172,7 +1206,7 @@ class AgentRunner:
                     body="The conversation ended before this finished. "
                          "Ask me to pick it up again.",
                     dismiss_after_s=600, dedup_suffix="turn-interrupted",
-                    urgent=False,
+                    urgent=False, **_card,
                 )
             except Exception:  # noqa: BLE001
                 pass
@@ -1447,8 +1481,10 @@ class AgentRunner:
                 logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
             # Stamp the conversation onto the tool context and reset the
             # per-turn created-job list. Must be here, not with the other
-            # set_* calls above: session_id is only resolved above.
-            self.tools.set_session_id(session_id)
+            # set_* calls above: session_id is only resolved above. The
+            # pre-minted answer id rides along so job pushes can deep-link
+            # to the reply before it exists (Round 3, item 3).
+            self.tools.set_session_id(session_id, asst_message_id)
 
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
@@ -1878,6 +1914,27 @@ class AgentRunner:
             if _tc_msg:
                 messages.append(_tc_msg)
                 _tc_tokens = estimate_tokens(_tc_msg["content"])
+        # Item 7 (incident 2026-08-18, the Fable 5 → "Opus 5 is the
+        # strongest" flip-flop): source-conflict rules for most-capable /
+        # newest claims. Same NON-CACHED slot as <turn_context> — after
+        # history, before the current user message, never persisted — so
+        # the system prompt's bytes (the cached prefix) do not change and
+        # no tenant's warm cache is invalidated. Own message, not folded
+        # into <turn_context>: that block is framed as reference DATA the
+        # model must not take instructions from. Gated to the turns where
+        # a superlative / recency question, a challenge to a prior answer,
+        # or a recent assistant claim makes them relevant.
+        try:
+            from app.agent.source_conflict import (
+                build_turn_rules_message, wants_source_conflict_rules,
+            )
+            if wants_source_conflict_rules(user_message, history):
+                _rules_msg = build_turn_rules_message()
+                messages.append(_rules_msg)
+                _tc_tokens += estimate_tokens(_rules_msg["content"])
+                logger.info("[AGENT] source_conflict_rules injected user=%s", user_id[:8])
+        except Exception:  # noqa: BLE001 — a rules gate must never break a turn
+            logger.debug("[AGENT] source_conflict gate failed", exc_info=True)
         if media_paths:
             content_blocks = self._build_media_content(user_message, media_paths)
             messages.append({"role": "user", "content": content_blocks})
@@ -3280,17 +3337,53 @@ class AgentRunner:
                     if _closed:
                         await _cdb.commit()
 
+                    # Round 3 (item 2): the terminal card push for EVERY
+                    # completed job of this turn is sent from HERE — the one
+                    # place that knows the answer text (→ the card's response
+                    # preview) and the message id (→ the deep link).
+                    # `update_job(completed)` mid-turn deliberately did NOT
+                    # end the card (it sent a bannerless 100% "writing your
+                    # answer" update); jobs the model left running were just
+                    # closed above. Failed / parked jobs keep the push the
+                    # tool already sent. Card content per job: title, icon
+                    # tag, m/m steps, its own conversation.
+                    _to_end: List[Dict[str, Any]] = []
+                    from sqlalchemy import select as _sel_cj
+                    _rows = (await _cdb.execute(
+                        _sel_cj(_CJ.id, _CJ.title, _CJ.status,
+                                _CJ.steps_json, _CJ.config_json,
+                                _CJ.conversation_id)
+                        .where(_CJ.id.in_(list(_created_job_ids)),
+                               _CJ.user_id == user_id)
+                    )).all()
+                    for _r in _rows:
+                        if _r[2] != "completed":
+                            continue
+                        try:
+                            _steps = json.loads(_r[3]) if _r[3] else []
+                        except (ValueError, TypeError):
+                            _steps = []
+                        _cfg = _r[4] if isinstance(_r[4], dict) else {}
+                        _to_end.append({
+                            "job_id": _r[0], "title": _r[1] or "",
+                            "steps_total": len(_steps),
+                            "job_type": _cfg.get("job_type"),
+                            "chat_id": _r[5] or session_id,
+                        })
+
                 # Shielded: the row is already terminal, so losing the push to a
                 # turn cancellation would strand the card on the phone with no
                 # reaper left to end it (we just took that backstop away).
-                if _closed:
+                if _closed or _to_end:
                     from app.agent.subagent_orchestrator import (
-                        _notify_job_event, notify_job_needs_user,
+                        JOB_CARD_END_AFTER_S, _notify_job_event,
+                        notify_job_needs_user,
                     )
+                    _preview = " ".join((final_text or "").split())[:100]
 
                     async def _end_cards() -> None:
-                        for _jid, _jtitle in _closed:
-                            if _park:
+                        if _park:
+                            for _jid, _jtitle in _closed:
                                 # Keeps the activity ALIVE (see
                                 # notify_job_needs_user) — the job resumes on
                                 # approval, so ending the card here would
@@ -3301,13 +3394,25 @@ class AgentRunner:
                                     or "Waiting for you to approve this.",
                                     action_type="permission",
                                     cta_label="Open the chat to approve",
+                                    chat_id=session_id, message_id=asst_message_id,
                                 )
-                                continue
+                        # Jobs the model already marked completed mid-turn
+                        # get their terminal push whether or not a sibling
+                        # was parked — their card is otherwise never ended.
+                        for _j in _to_end:
                             await _notify_job_event(
-                                job_id=_jid, label=_jtitle, kind="mission_completed",
-                                title=f"✅ Done: {(_jtitle or 'background task')[:150]}",
-                                body="Finished.", progress=100,
+                                job_id=_j["job_id"], label=_j["title"],
+                                kind="mission_completed",
+                                title=f"✅ Done: {(_j['title'] or 'background task')[:150]}",
+                                body=_preview or "Finished.", progress=100,
                                 dismiss_after_s=900, dedup_suffix="completed",
+                                chat_id=_j["chat_id"], message_id=asst_message_id,
+                                day_chat_id=_day_chat_id or None,
+                                job_type=_j["job_type"], step_name="Done",
+                                steps_done=_j["steps_total"],
+                                steps_total=_j["steps_total"],
+                                preview=_preview or None,
+                                end_after_s=JOB_CARD_END_AFTER_S,
                             )
 
                     await asyncio.shield(asyncio.create_task(_end_cards()))

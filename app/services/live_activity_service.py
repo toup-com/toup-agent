@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
@@ -119,7 +119,22 @@ _START_EVENT_KINDS = {NOTIFY_KIND_MISSION_STARTED, NOTIFY_KIND_ANNOUNCEMENT}
 
 # Mission-id prefixes whose card must never end a live ``reminder:``
 # countdown to make room for itself (see REMINDER WINS above).
-_NEVER_PREEMPT_REMINDER_PREFIXES = ("chatturn:", "admin:")
+# ``chatjob:`` (Round 3, 2026-08-18) is the per-CONVERSATION job card —
+# a job the agent creates inside a chat turn — and is a chat-turn card
+# in every sense the founder rule cares about.
+_NEVER_PREEMPT_REMINDER_PREFIXES = ("chatturn:", "chatjob:", "admin:")
+
+# Mission-id prefixes that are chat-turn cards for the yield rules
+# (start branch + restart lane): a working card that must not displace
+# a live countdown.
+_CHAT_TURN_PREFIXES = ("chatturn:", "chatjob:")
+
+
+def _is_chat_turn_mission(row: NotificationQueue, mission_id: str) -> bool:
+    return (
+        (row.data_json or {}).get("kind") == "chat_turn"
+        or mission_id.startswith(_CHAT_TURN_PREFIXES)
+    )
 
 # An admin announcement is NOT from the user's agent, so its card must
 # not wear the agent's orb color — the Toup brand hue disowns it on the
@@ -181,11 +196,19 @@ async def sweep_stale_activities(
     # 'started' after 30 min is a wedge (2026-07-18: an adopted row
     # for an already-answered turn squatted the one-per-device slot
     # for 8h and every reminder fire fought it).
+    # chatjob: rows (per-conversation job cards) age the same way — a
+    # create_job job is turn-bound (the runner's finalizer closes it at
+    # turn end, the reaper at 30 min), and a refresh for a NEW job on the
+    # same card re-stamps started_at, so the clock always measures the
+    # latest job.
     turn_stmt = (
         update(LiveActivity)
         .where(
             LiveActivity.status == LA_STARTED,
-            LiveActivity.mission_id.like("chatturn:%"),
+            or_(
+                LiveActivity.mission_id.like("chatturn:%"),
+                LiveActivity.mission_id.like("chatjob:%"),
+            ),
             LiveActivity.started_at < now - _TURN_ACTIVITY_MAX_AGE,
         )
         .values(status=LA_ENDED, ended_at=now, updated_at=now)
@@ -316,6 +339,221 @@ async def _enqueue_next_ring(
         idempotency_key=idem,
     ))
     return True
+
+
+# ── Round 3 (2026-08-18): card content + deep link from row data ──
+# Producers (the agent's _notify_job_event, ws_chat's chat-turn pushes)
+# put flat scalars on data_json; this lane maps them onto the Swift
+# content-state keys (see apns_push._extra_state) and the tap URL.
+
+_DEEP_LINK_ID_MAX = 64
+
+
+def _safe_id(value: Any) -> Optional[str]:
+    """An id we are willing to put on the wire: short, printable, no
+    whitespace. Anything else is dropped (never truncated into a
+    different id)."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or len(v) > _DEEP_LINK_ID_MAX or any(ch.isspace() for ch in v):
+        return None
+    return v
+
+
+def _row_extra_state(row: NotificationQueue) -> Dict[str, Any]:
+    """Content-state extras for this row (camelCase, whitelisted by
+    apns_push). ``percent`` mirrors ``data.progress`` so the widget's
+    n/m · NN% line needs no arithmetic; the lane's never-backwards clamp
+    re-syncs it from the fraction it actually sends."""
+    data = row.data_json or {}
+    out: Dict[str, Any] = {}
+    for src, dst in (("job_type", "jobType"), ("step_name", "stepName"),
+                     ("preview", "preview")):
+        v = data.get(src)
+        if isinstance(v, str) and v.strip():
+            out[dst] = v
+    for src, dst in (("steps_done", "stepsDone"), ("steps_total", "stepsTotal")):
+        v = data.get(src)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[dst] = int(v)
+    prog = data.get("progress")
+    if isinstance(prog, (int, float)) and not isinstance(prog, bool):
+        out["percent"] = max(0, min(100, int(prog)))
+    cid = _safe_id(data.get("chat_id"))
+    if cid:
+        out["chatId"] = cid
+    mid = _safe_id(data.get("message_id"))
+    if mid:
+        out["messageId"] = mid
+    return out
+
+
+def _deep_link_params(row: NotificationQueue) -> str:
+    """``&chat_id=…&message_id=…`` for the card's tap URL (attributes are
+    start-fixed, so this reflects the FIRST job on a conversation card;
+    the content-state copies are the live ones). Empty when unknown."""
+    data = row.data_json or {}
+    parts = []
+    cid = _safe_id(data.get("chat_id"))
+    if cid:
+        parts.append("chat_id=" + urllib.parse.quote(cid, safe=""))
+    mid = _safe_id(data.get("message_id"))
+    if mid:
+        parts.append("message_id=" + urllib.parse.quote(mid, safe=""))
+    return ("&" + "&".join(parts)) if parts else ""
+
+
+def _end_after_s(row: NotificationQueue) -> Optional[int]:
+    """Producer-requested linger of the COMPLETED state before the
+    ``event=end`` push (Round 3, item 2). Bounded 1..120s."""
+    raw = (row.data_json or {}).get("end_after_s")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    v = int(raw)
+    if v <= 0:
+        return None
+    return min(v, 120)
+
+
+def _deferred_end_idem(mission_id: str, row: NotificationQueue) -> str:
+    """Idempotency key of the chained end row for THIS terminal row —
+    per job (data.job_id) so two jobs finishing on one conversation card
+    book two distinct ends, and a partial-failure retry of the same row
+    books none twice."""
+    data = row.data_json or {}
+    tag = data.get("job_id") or row.dedup_key or row.id
+    return f"la-end:{mission_id}:{tag}"[:200]
+
+
+async def _enqueue_deferred_end(
+    db, row: NotificationQueue, mission_id: str, now: datetime, delay_s: int,
+) -> bool:
+    """Round 3 (item 2): the completed state has just been pushed as an
+    alerting update; book the ``event=end`` as its own queue row one
+    delay out instead of sending it now — the card keeps its ✓ + preview
+    in the Dynamic Island for a beat before retiring to the lock screen.
+    Same shape as ``_enqueue_next_ring``: LA-only, no Expo/agent
+    fan-out, idempotent per (mission, job), urgent so quiet hours never
+    hold a bannerless close, no dedup_key so the dedup window cannot
+    swallow it. ``end_only`` makes the lane skip the alerting update on
+    the follow-up; ``silent`` keeps the restart lane out of it (a card
+    that is already gone stays gone). The caller's end-of-lane commit
+    persists it. Effective delay = delay_s + up to one dispatcher tick."""
+    idem = _deferred_end_idem(mission_id, row)
+    existing = await db.execute(
+        select(NotificationQueue.id).where(
+            NotificationQueue.user_id == row.user_id,
+            NotificationQueue.idempotency_key == idem,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        return False
+    data = dict(row.data_json or {})
+    data.update({
+        "end_only": True,
+        "silent": True,
+        "la_only": True,
+        "no_agent_fallback": True,
+        "urgent": True,
+        "cap_exempt": True,
+    })
+    data.pop("end_after_s", None)
+    data.pop("refresh_if_started", None)
+    db.add(NotificationQueue(
+        id=str(uuid.uuid4()),
+        user_id=row.user_id,
+        source="platform",
+        event_kind=row.event_kind,
+        title=row.title,
+        body=row.body,
+        data_json=data,
+        priority=row.priority,
+        scheduled_for=now + timedelta(seconds=delay_s),
+        idempotency_key=idem,
+    ))
+    return True
+
+
+async def suppress_pending_ends(db, user_id: str, mission_id: str, now: datetime) -> int:
+    """Cancel the not-yet-fired deferred-end rows of a mission (a NEW job
+    took over the conversation card, or the user has seen the answer in
+    the app). Filters on the idempotency-key prefix — a plain string
+    column, portable across the JSONB prod column and sqlite tests."""
+    rows = (await db.execute(
+        select(NotificationQueue).where(
+            NotificationQueue.user_id == user_id,
+            NotificationQueue.status.in_(("queued", "sending")),
+            NotificationQueue.idempotency_key.like(f"la-end:{mission_id}:%"),
+        )
+    )).scalars().all()
+    n = 0
+    for r in rows:
+        r.status = "suppressed"
+        r.claimed_at = None
+        r.channels_json = {**(r.channels_json or {}),
+                           "policy": {"suppressed": "end_superseded"}}
+        n += 1
+    return n
+
+
+def _row_is_newer_than_card(row: NotificationQueue, la: LiveActivity) -> bool:
+    """True when this row was created AFTER the card was (re)started —
+    i.e. it is a NEW job on the conversation card, not an at-least-once
+    retry of the start that opened the card (whose success stamped
+    ``started_at`` at or after that row's ``created_at``). Compared
+    against ``started_at``, NOT ``updated_at``: progress rows of the new
+    job may have refreshed the card before its (loop-scheduled) start
+    row was processed, and they must not turn the start into a skip."""
+    created = getattr(row, "created_at", None)
+    started = la.started_at
+    if created is None or started is None:
+        return True
+    return created > started
+
+
+async def _refresh_started_card(
+    db, la: LiveActivity, device: LiveActivityDevice, row: NotificationQueue,
+    mission_id: str, now: datetime,
+) -> Dict[str, Any]:
+    """ONE CARD PER CONVERSATION (Round 3, item 4): a ``mission_started``
+    row for a mission whose card is already up on this device REFRESHES
+    the card with the new job's start state instead of skipping as an
+    at-least-once duplicate — same title/subtitle/timer/alert the start
+    would have carried, over the live activity's token. Progress resets
+    (a new job starts at zero: ``last_progress`` is cleared so the
+    never-backwards clamp does not pin it at the previous job's bar) and
+    the previous job's not-yet-fired deferred end is cancelled so it
+    cannot close the card out from under the new job."""
+    data = row.data_json or {}
+    timer_ms = _timer_end_ms(row)
+    progress = _progress_fraction(row)
+    subtitle_override = data.get("subtitle") if isinstance(data.get("subtitle"), str) else None
+    payload = apns_push.build_update_payload(
+        title=_mission_title(row),
+        subtitle=(subtitle_override or "Starting…")[:120],
+        progress=(progress if progress is not None else 0.0),
+        timer_end_ms=timer_ms,
+        alert_title=row.title,
+        alert_body=row.body,
+        alert_sound=dispatch_tones.apns_sound(data.get("tone")),
+        stale_date=(int(timer_ms / 1000) + 120 if timer_ms
+                    else int(now.timestamp()) + 1800),
+        timestamp=int(now.timestamp()),
+        extra=_row_extra_state(row),
+    )
+    result = await _send_to_activity(db, la, device, payload, priority=10, now=now)
+    if result["status"] == "ok":
+        # The new job's bar starts where its start row says (usually 0):
+        # the never-backwards clamp must not pin it at the previous job's
+        # last value.
+        la.last_progress = int((progress or 0.0) * 100)
+        la.started_at = now
+        cancelled = await suppress_pending_ends(db, row.user_id, mission_id, now)
+        result = {**result, "refreshed": True}
+        if cancelled:
+            result["ends_cancelled"] = cancelled
+    return result
 
 
 def _mission_title(row: NotificationQueue) -> str:
@@ -544,7 +782,12 @@ async def _send_start(
                 row.source, mission_id,
             )
         base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
-        deep_link = f"{base_link}?mission={mission_id}"
+        # Round 3 (item 3): the conversation + answer ids ride the tap URL
+        # too, so a tap can open the thread and scroll to the reply. The
+        # ids come from the same producer as the mission id and are
+        # validated as short opaque tokens (_safe_id) — no URL is ever
+        # taken from a tenant here.
+        deep_link = f"{base_link}?mission={mission_id}{_deep_link_params(row)}"
     timer_ms = _timer_end_ms(row)
     # INSTANT-OPEN seed (2026-07-23): reminder cards carry the reminder
     # text + fire instant on the tap URL so the app can render the
@@ -656,6 +899,7 @@ async def _send_start(
         ),
         stale_date=stale_ts,
         fired=fired,
+        extra=_row_extra_state(row),
     )
     status, reason, _env = await _send_with_env_selfheal(
         db, device, device.push_to_start_token, payload, priority=10,
@@ -793,7 +1037,23 @@ async def handle_notification_row(
         )
         for device in devices:
             started = await _started_rows_for_device(db, device.id)
-            if any(la.mission_id == mission_id for la in started):
+            _same = next((la for la in started if la.mission_id == mission_id), None)
+            if _same is not None:
+                if (
+                    (row.data_json or {}).get("refresh_if_started")
+                    and _row_is_newer_than_card(row, _same)
+                ):
+                    # A NEW job on the conversation's card (Round 3, item
+                    # 4): update the card the previous job left up. A row
+                    # older than the card's last push is the retry of the
+                    # start that opened it — that one still dedups.
+                    result = await _refresh_started_card(
+                        db, _same, device, row, mission_id, now,
+                    )
+                    per_device[device.id] = result
+                    delivered = delivered or result["status"] == "ok"
+                    errored = errored or result["status"] == "error"
+                    continue
                 # at-least-once retry after a partial failure — a second
                 # start push would spawn a duplicate card on screen.
                 per_device[device.id] = {"status": "skipped", "reason": "already_started"}
@@ -874,10 +1134,7 @@ async def handle_notification_row(
         devices = await _active_devices(db, row.user_id)
         if not devices:
             return {"status": "skipped", "reason": "no_live_activity_devices"}
-        is_chat_turn = (
-            (row.data_json or {}).get("kind") == "chat_turn"
-            or mission_id.startswith("chatturn:")
-        )
+        is_chat_turn = _is_chat_turn_mission(row, mission_id)
         for device in devices:
             if is_chat_turn and any(
                 la.mission_id.startswith("reminder:")
@@ -950,6 +1207,9 @@ async def handle_notification_row(
 
     progress = _progress_fraction(row)
     title = _mission_title(row)
+    # Round 3: icon tag, step n/m, percent, preview, deep-link ids ride
+    # every update/end (see apns_push._extra_state for the key contract).
+    extra_state = _row_extra_state(row)
 
     for la, device in activities:
         # Never move the on-screen bar backwards on reordered rows.
@@ -964,6 +1224,7 @@ async def handle_notification_row(
                 timer_end_ms=_timer_end_ms(row),
                 stale_date=int(now.timestamp()) + 1800,
                 timestamp=int(now.timestamp()),
+                extra=extra_state,
             )
             result = await _send_to_activity(
                 db, la, device, payload, priority=5, now=now,
@@ -977,6 +1238,7 @@ async def handle_notification_row(
                 alert_title=None if restart_loud else row.title,
                 alert_body=None if restart_loud else row.body,
                 timestamp=int(now.timestamp()),
+                extra=extra_state,
             )
             result = await _send_to_activity(
                 db, la, device, payload, priority=10, now=now,
@@ -1029,30 +1291,50 @@ async def handle_notification_row(
             # suppresses the remaining rings. Only the last ring
             # closes the card.
             _last_ring = _silent_end or _realert_seq(row) >= _alarm_rings(row)
+            # Round 3 (item 2): a producer may ask for the completed state
+            # to SHOW before the card ends (data.end_after_s) — the end
+            # then rides a chained queue row one delay out (see
+            # _enqueue_deferred_end); ``end_only`` marks that follow-up,
+            # which sends nothing but the end. Alarm-class rows keep
+            # their ring chain; silent ends have nothing to show.
+            _defer_s = _end_after_s(row)
+            _defer = (
+                _defer_s is not None and not _alarm and not _silent_end
+                and not _data.get("end_only")
+            )
             # The audible banner rides an alerting UPDATE (Apple's
             # documented alert surface — the end-event alert is
             # undocumented and proved unreliable on iOS 26), then a
             # bannerless end closes the card. Skip the update when the
             # loud restart already alerted, or the producer asked for
-            # silence.
+            # silence. With a deferred end after a loud restart the
+            # update still goes — bannerless — because the restart
+            # opened the card reading "Starting…", and that state would
+            # otherwise be what lingers.
             alerted = restart_loud
             upd_result: Optional[Dict[str, Any]] = None
-            if not _silent_end and not alerted:
+            if not _silent_end and (not alerted or _defer):
                 upd = apns_push.build_update_payload(
                     title=title, subtitle=final_subtitle,
                     progress=final_progress,
                     fired=_alarm,
-                    alert_title=row.title, alert_body=row.body,
+                    alert_title=None if alerted else row.title,
+                    alert_body=None if alerted else row.body,
                     timestamp=int(now.timestamp()),
+                    extra=extra_state,
                 )
                 upd_result = await _send_to_activity(
                     db, la, device, upd, priority=10, now=now,
                 )
-                alerted = upd_result["status"] == "ok"
+                alerted = alerted or upd_result["status"] == "ok"
             if not _last_ring:
                 # Loud restart counts as this ring's bang: the card is
                 # freshly started in fired state, nothing else to send.
                 result = upd_result or {"status": "ok", "reason": "restart_alerted"}
+            elif _defer:
+                booked = await _enqueue_deferred_end(db, row, mission_id, now, _defer_s)
+                result = upd_result or {"status": "ok", "reason": "restart_alerted"}
+                result = {**result, "end_deferred_s": _defer_s, "end_booked": booked}
             else:
                 payload = apns_push.build_end_payload(
                     title=title,
@@ -1069,6 +1351,7 @@ async def handle_notification_row(
                     dismissal_date=_dismissal_date(row, now)
                     or int(now.timestamp()) + 3600,
                     timestamp=int(now.timestamp()),
+                    extra=extra_state,
                 )
                 result = await _send_to_activity(
                     db, la, device, payload, priority=10, now=now, end=True,

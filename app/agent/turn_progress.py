@@ -84,6 +84,8 @@ class TurnProgressEmitter:
         route: str = "mission-control",
         min_interval_s: float = 8.0,
         gate: Optional[Callable[[], bool]] = None,
+        chat_id: Optional[str] = None,
+        message_id: Optional[str] = None,
     ) -> None:
         self.mission_id = mission_id
         self.mission_title = mission_title[:200]
@@ -92,6 +94,11 @@ class TurnProgressEmitter:
         self.route = route
         self.min_interval_s = min_interval_s
         self.gate = gate
+        # Round 3 (item 3): deep-link ids for the card's content-state.
+        # Both may be set later (`set_deep_link`) — ws_chat learns the
+        # session id after the emitter exists on first-message turns.
+        self.chat_id = chat_id
+        self.message_id = message_id
         self.tool_count = 0
         self.last_emitted_progress = self.base
         self._last_emit_ts = 0.0
@@ -105,6 +112,14 @@ class TurnProgressEmitter:
         # progress must stay strictly below it (only a real terminal
         # event closes the bar).
         return min(p, self.ceiling - 1)
+
+    def set_deep_link(self, chat_id: Optional[str] = None,
+                      message_id: Optional[str] = None) -> None:
+        """Attach/refresh the deep-link ids subsequent beacons carry."""
+        if chat_id:
+            self.chat_id = str(chat_id)[:64]
+        if message_id:
+            self.message_id = str(message_id)[:64]
 
     def force_next(self) -> None:
         """Reset the throttle so the next tool boundary emits
@@ -123,18 +138,24 @@ class TurnProgressEmitter:
         try:
             from app.services.agent_notify_client import notify
 
+            data = {
+                "mission_id": self.mission_id,
+                "mission_title": self.mission_title[:80],
+                "route": self.route,
+                "progress": progress,
+                # Refresh an existing card only — never start one.
+                "update_only": True,
+                "step_name": _subtitle_for(tool_name)[:80],
+            }
+            if self.chat_id:
+                data["chat_id"] = self.chat_id
+            if self.message_id:
+                data["message_id"] = self.message_id
             await notify(
                 event_kind="progress",
                 title=self.mission_title,
                 body=_subtitle_for(tool_name)[:300],
-                data={
-                    "mission_id": self.mission_id,
-                    "mission_title": self.mission_title[:80],
-                    "route": self.route,
-                    "progress": progress,
-                    # Refresh an existing card only — never start one.
-                    "update_only": True,
-                },
+                data=data,
                 priority="low",
                 dedup_key=f"{self.mission_id}:progress",
             )

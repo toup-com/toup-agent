@@ -339,7 +339,16 @@ class _CapturingDB:
         class _Res:
             @staticmethod
             def first():
-                return ("job-1", "Schedule verification call")
+                # (id, title, conversation_id, config_json) — the sweep's
+                # RETURNING shape since Round 3 (deep link + icon tag ride
+                # the closing pushes).
+                return ("job-1", "Schedule verification call", "sess-1", {})
+
+            @staticmethod
+            def all():
+                # The Round 3 follow-up SELECT for jobs already completed
+                # mid-turn: none in this scenario.
+                return []
 
         return _Res()
 

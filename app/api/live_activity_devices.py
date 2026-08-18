@@ -487,13 +487,35 @@ async def ack_live_activity(
                 return {"ok": True, "ended": 0, "suppressed": 0,
                         "pre_fire": True}
 
+    ended, suppressed = await _end_mission_seen(
+        db, user_id, body.mission_id, now, reason="acked",
+    )
+    await db.commit()
+    if ended or suppressed:
+        logger.info(
+            "live-activity ack: mission %s — ended %d cards, suppressed %d rows",
+            body.mission_id, ended, suppressed,
+        )
+    return {"ok": True, "ended": ended, "suppressed": suppressed}
+
+
+async def _end_mission_seen(
+    db: AsyncSession, user_id: str, mission_id: str, now: datetime, *,
+    reason: str,
+) -> tuple[int, int]:
+    """The SEEN core shared by the tap ack and the in-app seen signal:
+    end this mission's started cards on every device (immediate
+    dismissal, best-effort push, DB end is the invariant) and suppress
+    its still-pending completed/failed/progress rows so an already-seen
+    mission never re-alerts. Does NOT commit. Returns (ended,
+    suppressed)."""
     rows = (
         await db.execute(
             select(LiveActivity, LiveActivityDevice)
             .join(LiveActivityDevice, LiveActivity.device_id == LiveActivityDevice.id)
             .where(
                 LiveActivity.user_id == user_id,
-                LiveActivity.mission_id == body.mission_id,
+                LiveActivity.mission_id == mission_id,
                 LiveActivity.status == LA_STARTED,
             )
         )
@@ -539,7 +561,7 @@ async def ack_live_activity(
     suppressed = 0
     for row in pending:
         data = row.data_json or {}
-        if data.get("mission_id") != body.mission_id:
+        if data.get("mission_id") != mission_id:
             continue
         # Suppress only rows that are part of an in-progress alert:
         # already due, chained alarm rings (deliberately future-
@@ -550,7 +572,9 @@ async def ack_live_activity(
         # survive the ack and loud-restart minutes later). A fresh
         # FUTURE-scheduled ordinary row (attempts 0 — e.g. the next
         # fire of a daily reminder queued by an edit race) survives a
-        # tap that only meant 'I saw this one'.
+        # tap that only meant 'I saw this one'. Round 3's deferred end
+        # rows carry la_only and so count as rings: seen ends the card
+        # now, the booked end has nothing left to do.
         is_ring = bool(data.get("la_only")) or (
             isinstance(data.get("realert_seq"), int)
             and data["realert_seq"] >= 2
@@ -562,16 +586,60 @@ async def ack_live_activity(
         row.status = NQ_SUPPRESSED
         row.claimed_at = None
         row.channels_json = {**(row.channels_json or {}),
-                             "policy": {"suppressed": "acked"}}
+                             "policy": {"suppressed": reason}}
         suppressed += 1
+    return ended, suppressed
 
+
+class LiveActivitySeen(BaseModel):
+    """The app reports the user VIEWED a response in-app (Round 3,
+    item 5). ``chat_id`` names the conversation whose job card should
+    end (``chatjob:<chat_id>``); ``message_id`` is the response they saw
+    (recorded for the trail, not used to gate — seeing the thread is
+    seeing the answer); ``mission_id`` optionally names one more card to
+    end (the turn's ``chatturn:`` card, whose id the app got in its
+    status frames). Only chat-turn cards may be ended this way — never a
+    reminder countdown, which has its own ack semantics."""
+    chat_id: str = Field(..., min_length=1, max_length=64)
+    message_id: Optional[str] = Field(None, max_length=64)
+    mission_id: Optional[str] = Field(None, max_length=64)
+
+
+_SEEN_MISSION_PREFIXES = ("chatjob:", "chatturn:")
+
+
+@router.post("/seen")
+async def seen_live_activity(
+    body: LiveActivitySeen,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Dismiss signal (Round 3, item 5): the user viewed the response
+    in-app, so the conversation's Live Activity — the ``chatjob:`` card
+    every job of that chat shares — ends everywhere (immediate
+    dismissal) and its pending completed/progress/deferred-end rows are
+    suppressed. Idempotent; a chat with no card returns ended=0."""
+    user_id = current_user.id
+    now = datetime.utcnow()
+    missions = [f"chatjob:{body.chat_id.strip()}"[:64]]
+    if body.mission_id:
+        mid = body.mission_id.strip()
+        if mid.startswith(_SEEN_MISSION_PREFIXES) and mid not in missions:
+            missions.append(mid[:64])
+    ended = suppressed = 0
+    for mid in missions:
+        e, s = await _end_mission_seen(db, user_id, mid, now, reason="seen")
+        ended += e
+        suppressed += s
     await db.commit()
     if ended or suppressed:
         logger.info(
-            "live-activity ack: mission %s — ended %d cards, suppressed %d rows",
-            body.mission_id, ended, suppressed,
+            "live-activity seen: chat %s (message %s) — ended %d cards, "
+            "suppressed %d rows",
+            body.chat_id[:12], (body.message_id or "-")[:12], ended, suppressed,
         )
-    return {"ok": True, "ended": ended, "suppressed": suppressed}
+    return {"ok": True, "ended": ended, "suppressed": suppressed,
+            "missions": missions}
 
 
 class AlarmOwnedReport(BaseModel):

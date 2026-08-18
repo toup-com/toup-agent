@@ -171,16 +171,63 @@ async def send_live_activity(
 
 # ── Payload builders (pure — unit-tested against the Swift contract) ──
 
+# Round 3 (2026-08-18) content-state extras — every key OPTIONAL in the
+# Swift ContentState (default Codable ignores unknown keys, so widgets
+# built before this ship keep decoding). Names are camelCase like the
+# existing keys because Swift's synthesized Codable matches property
+# names byte-for-byte:
+#
+#   jobType     str   verify | search | write | compare | generic — icon
+#   stepName    str   the step being worked on ("Done" at completion)
+#   stepsDone   int   n of m
+#   stepsTotal  int   m
+#   percent     int   0-100 (the same value `progress` carries as 0-1;
+#                     explicit so the widget's "n/m · 40%" line needs no
+#                     arithmetic and no float formatting)
+#   preview     str   ≤120 chars of the answer, on completion only
+#   chatId      str   deep link: the conversation to open
+#   messageId   str   deep link: the assistant message to scroll to
+#
+# Value caps keep the whole payload inside Apple's 4KB LA budget with
+# every field populated (measured worst case ≈ 1.6KB).
+_EXTRA_STATE_STR = {"jobType": 16, "stepName": 80, "preview": 120,
+                    "chatId": 64, "messageId": 64}
+_EXTRA_STATE_INT = ("stepsDone", "stepsTotal", "percent")
+
+
+def _extra_state(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Whitelist + cap the Round 3 content-state keys. Anything else,
+    or a wrong type, is dropped — never passed through."""
+    out: Dict[str, Any] = {}
+    if not extra:
+        return out
+    for key, cap in _EXTRA_STATE_STR.items():
+        v = extra.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = " ".join(v.split())[:cap]
+    for key in _EXTRA_STATE_INT:
+        v = extra.get(key)
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            out[key] = max(0, int(v))
+    return out
+
+
 def _content_state(
     title: str,
     subtitle: Optional[str],
     progress: Optional[float],
     timer_end_ms: Optional[int] = None,
     fired: Optional[bool] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     state: Dict[str, Any] = {"title": title[:80]}
     if subtitle:
         state["subtitle"] = subtitle[:120]
+    # Round 3 extras ride every state — including fired ones, where the
+    # deep-link ids are still what a tap needs.
+    state.update(_extra_state(extra))
     # fired: alarm-class terminal state (reminder fires). The widget
     # renders a ringing presentation instead of any progress surface,
     # so fired cards carry NEITHER timer NOR progress — a fired
@@ -189,6 +236,7 @@ def _content_state(
     # old widgets ignore the extra key, old payloads decode nil.
     if fired:
         state["fired"] = True
+        state.pop("percent", None)
         return state
     # Timer wins over discrete progress: the widget renders
     # timerEndDateInMilliseconds as a bar that animates ON-DEVICE with
@@ -198,6 +246,11 @@ def _content_state(
         state["timerEndDateInMilliseconds"] = int(timer_end_ms)
     elif progress is not None:
         state["progress"] = max(0.0, min(1.0, float(progress)))
+        # Keep the two progress spellings consistent when the caller
+        # supplied both: the fraction is the one the lane clamps
+        # (never-backwards), so it is the source of truth.
+        if "percent" in state:
+            state["percent"] = int(round(state["progress"] * 100))
     return state
 
 
@@ -257,6 +310,7 @@ def build_start_payload(
     orb_color: Optional[str] = None,
     stale_date: Optional[int] = None,
     fired: Optional[bool] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Push-to-start payload. ``attributes.name`` carries the mission id —
     the app's onTokenReceived listener echoes it back so a reported
@@ -285,7 +339,7 @@ def build_start_payload(
             # Control).
             "deepLinkUrl": deep_link,
         },
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra),
     }
     # Compact Dynamic Island timer style — the widget decodes
     # attributes.timerType ('circular' default | 'digital' mm:ss).
@@ -335,11 +389,12 @@ def build_update_payload(
     stale_date: Optional[int] = None,
     timestamp: Optional[int] = None,
     fired: Optional[bool] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "update",
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra),
     }
     if stale_date:
         aps["stale-date"] = int(stale_date)
@@ -360,13 +415,14 @@ def build_end_payload(
     dismissal_date: Optional[int] = None,
     timestamp: Optional[int] = None,
     fired: Optional[bool] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """End payload. Without ``dismissal_date`` the finished card lingers
     on the lock screen (up to 4h) so the user sees the final state."""
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "end",
-        "content-state": _content_state(title, subtitle, progress, fired=fired),
+        "content-state": _content_state(title, subtitle, progress, fired=fired, extra=extra),
     }
     if dismissal_date:
         aps["dismissal-date"] = int(dismissal_date)

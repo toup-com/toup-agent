@@ -184,8 +184,21 @@ async def agent_notify(
     # tool-call rhythm. Best-effort inline dispatch; the status CAS is
     # the same primitive the dispatcher loop uses, so a concurrent
     # claim is impossible and any failure leaves the row queued for
-    # the normal loop. Alert kinds stay on the loop on purpose.
-    if body.event_kind == "progress" and settings.notification_progress_fastlane_enabled:
+    # the normal loop. Alert kinds stay on the loop on purpose — with
+    # ONE exception (Round 3, 2026-08-18): a conversation job card's
+    # start (`mission_started` + data.refresh_if_started). Its progress
+    # rows ARE fast-laned and would otherwise reach the card up to 30s
+    # before the start that is supposed to reset it for the new job
+    # (the never-backwards clamp would then pin the new job's bar at the
+    # previous job's 100%). Same kill switch, same CAS, same fallback.
+    _fast = settings.notification_progress_fastlane_enabled and (
+        body.event_kind == "progress"
+        or (
+            body.event_kind == "mission_started"
+            and bool((body.data or {}).get("refresh_if_started"))
+        )
+    )
+    if _fast:
         try:
             from datetime import datetime as _dt
 

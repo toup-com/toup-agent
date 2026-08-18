@@ -579,6 +579,31 @@ async def _run_child(
             )
 
 
+#: Live Activity mission-id prefix for jobs created inside a chat turn.
+#: ONE card per conversation (Round 3, item 4): every job the agent
+#: creates in the same chat targets ``chatjob:<session_id>`` so a second
+#: job UPDATES the live card instead of push-to-starting a new one (the
+#: LA lane's ``refresh_if_started`` handles the swap). Jobs with no
+#: conversation (dashboard/API-created, ephemeral routine turns) keep
+#: ``mission_id = job_id`` — the historic per-job card.
+CHAT_JOB_MISSION_PREFIX = "chatjob:"
+
+#: How long a finished job card shows its completed state (✓ + response
+#: preview, in the Dynamic Island) before the ``event=end`` push retires
+#: it to the lock screen (Round 3, item 2: "end after a brief delay").
+#: The LA lane realises it as a chained queue row on the dispatcher tick,
+#: so the effective delay is this + up to one tick (30s) — never a sleep
+#: inside a worker holding a DB connection.
+JOB_CARD_END_AFTER_S = 8
+
+
+def job_mission_id(job_id: str, chat_id: Optional[str]) -> str:
+    """The Live Activity mission id a job's pushes address."""
+    if chat_id:
+        return f"{CHAT_JOB_MISSION_PREFIX}{chat_id}"[:64]
+    return job_id
+
+
 async def _notify_job_event(
     *,
     job_id: str,
@@ -592,6 +617,21 @@ async def _notify_job_event(
     priority: str = "default",
     dedup_suffix: str,
     urgent: bool = True,
+    # Round 3 (2026-08-18): deep link + card content. All optional; all
+    # flat scalars (POST /api/agent/notify rejects nested values). See
+    # docs/design/round3-notifications.md for the wire contract.
+    chat_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    day_chat_id: Optional[str] = None,
+    job_type: Optional[str] = None,
+    step_name: Optional[str] = None,
+    steps_done: Optional[int] = None,
+    steps_total: Optional[int] = None,
+    preview: Optional[str] = None,
+    end_after_s: Optional[int] = None,
+    refresh_if_started: bool = False,
+    mission_id: Optional[str] = None,
+    route: Optional[str] = None,
 ) -> None:
     """Phone-surface lifecycle event for a spawned job: durable outbox →
     platform → APNs Live Activity (lock screen card + Dynamic Island),
@@ -600,16 +640,39 @@ async def _notify_job_event(
     and quiet hours must not defer the card. Callers pass urgent=False
     for spawns whose parent is a background surface (autopilot ticks):
     a 3am mission-tick spawn must NOT bypass quiet hours (2026-07-16).
+
+    Round 3 fields:
+      * ``chat_id`` / ``message_id`` — the deep-link payload every push
+        and every Live Activity update carries (item 3). ``chat_id`` is
+        the conversation (session) id; ``message_id`` the assistant
+        message the answer lands in (pre-minted by the runner, so it is
+        known mid-turn). When ``chat_id`` is set the card is keyed
+        ``chatjob:<chat_id>`` and routed to the chat (item 4).
+      * ``job_type`` / ``step_name`` / ``steps_done`` / ``steps_total`` /
+        ``preview`` — card content-state (item 2). ``progress`` stays the
+        0-100 percent the LA lane already renders.
+      * ``end_after_s`` — on a terminal kind, ask the LA lane to show the
+        completed state for this long before the ``event=end`` push (a
+        chained queue row; never an in-process sleep).
+      * ``refresh_if_started`` — on ``mission_started``, refresh a card
+        that is already up for this mission instead of skipping it as an
+        at-least-once duplicate (a NEW job on the conversation's card).
+      * ``mission_id`` / ``route`` — explicit overrides; derived from
+        ``chat_id`` when omitted.
+
     Best-effort by contract: a job must never fail on notification
     plumbing."""
     try:
         from app.services.agent_notify_client import notify
 
+        _mission = mission_id or job_mission_id(job_id, chat_id)
+        _route = route or ("chat" if chat_id else "mission-control")
         data: dict[str, Any] = {
-            "route": "mission-control",
-            "mission_id": job_id,
+            "route": _route,
+            "mission_id": _mission,
             "mission_title": (label or "Background task")[:80],
             "kind": "job",
+            "job_id": job_id,
             "urgent": urgent,
         }
         if progress is not None:
@@ -618,6 +681,26 @@ async def _notify_job_event(
             data["timer_end_ms"] = timer_end_ms
         if dismiss_after_s is not None:
             data["dismiss_after_s"] = dismiss_after_s
+        if chat_id:
+            data["chat_id"] = str(chat_id)[:64]
+        if message_id:
+            data["message_id"] = str(message_id)[:64]
+        if day_chat_id:
+            data["day_chat_id"] = str(day_chat_id)[:64]
+        if job_type:
+            data["job_type"] = str(job_type)[:16]
+        if step_name:
+            data["step_name"] = " ".join(str(step_name).split())[:80]
+        if steps_done is not None:
+            data["steps_done"] = int(steps_done)
+        if steps_total is not None:
+            data["steps_total"] = int(steps_total)
+        if preview:
+            data["preview"] = " ".join(str(preview).split())[:120]
+        if end_after_s is not None:
+            data["end_after_s"] = int(end_after_s)
+        if refresh_if_started:
+            data["refresh_if_started"] = True
         await notify(
             event_kind=kind,
             title=title[:200],
@@ -645,6 +728,7 @@ async def notify_job_needs_user(
     summary: str,
     action_type: str,
     cta_label: Optional[str] = None,
+    **card: Any,
 ) -> None:
     """Announce that a job has parked on the user (``waiting_on_user``).
 
@@ -671,6 +755,7 @@ async def notify_job_needs_user(
         # The user is being asked for something; this is the one class of
         # background event that legitimately interrupts.
         urgent=True,
+        **card,
     )
 
 
@@ -847,6 +932,12 @@ async def _finalize(
             body=(final_text or "")[:300], progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
             urgent=_urgent,
+            # Round 3: the summary message the child posted into the
+            # day chat is the deep-link target; a preview of it rides
+            # the card's final state.
+            message_id=msg_id,
+            preview=(final_text or "")[:120] or None,
+            step_name="Done",
         )
     elif outcome == "cancelled":
         await _notify_job_event(

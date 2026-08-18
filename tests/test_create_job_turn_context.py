@@ -189,3 +189,115 @@ async def test_guarded_update_refuses_to_reopen_a_terminal_job(tmp_path, test_us
         row = await db.get(BuildJob, job_id)
     assert row.status == "failed", "the concurrent terminal write must survive"
     assert row.error_message == "hit an error"
+
+
+# ── Round 3: the tag, the deep link, the deferred terminal push ─────────
+
+@pytest.mark.asyncio
+async def test_round3_create_and_update_job_pushes(tmp_path, test_user_id, monkeypatch):
+    """Behavioural: create_job → update_job(step 0) → update_job(completed),
+    asserting the DATABASE ROW and the notify DATA actually emitted.
+
+      * the icon tag lands in config_json and on both tool responses;
+      * every push targets the CONVERSATION's card (chatjob:<session>) with
+        the deep link (chat_id + the runner's pre-minted message id) and the
+        step counts;
+      * the start asks the LA lane to refresh a live card;
+      * `completed` on THIS turn's job is a 100% progress update, NOT the
+        terminal push — that belongs to the runner's finalizer, which has
+        the answer text.
+    """
+    from app.db import async_session_maker
+    from app.db.models import BuildJob
+    from app.services import agent_notify_client as anc
+
+    calls = []
+
+    async def fake_notify(**kw):
+        calls.append(kw)
+        return "row"
+
+    monkeypatch.setattr(anc, "notify", fake_notify)
+
+    async def _no_ws(*a, **k):
+        return 0
+    import app.api.ws_chat as wsc
+    monkeypatch.setattr(wsc, "broadcast_to_user", _no_ws)
+
+    te = _executor(tmp_path)
+    session_id = f"sess-{uuid.uuid4()}"
+    msg_id = f"msg-{uuid.uuid4()}"
+    te.set_session_id(session_id, msg_id)
+
+    res = await _create_job(te, test_user_id, "Verify Anthropic's newest model release")
+    assert res["job_type"] == "verify"
+    async with async_session_maker() as db:
+        row = await db.get(BuildJob, res["job_id"])
+    assert (row.config_json or {}).get("job_type") == "verify"
+    assert row.job_type == "agent_task", "the handler discriminator is untouched"
+
+    start = calls[-1]
+    assert start["event_kind"] == "mission_started"
+    d = start["data"]
+    assert d["mission_id"] == f"chatjob:{session_id}" and d["route"] == "chat"
+    assert d["chat_id"] == session_id and d["message_id"] == msg_id
+    assert d["job_type"] == "verify" and d["steps_total"] == 3 and d["steps_done"] == 0
+    assert d["step_name"] == "find the announcement"
+    assert d["refresh_if_started"] is True
+    assert d["job_id"] == res["job_id"]
+
+    out = json.loads(await te._tool_update_job({"job_id": res["job_id"], "current_step": 0}))
+    assert out["job_type"] == "verify" and out["completed_steps"] == 1
+    prog = calls[-1]
+    assert prog["event_kind"] == "progress"
+    assert prog["data"]["progress"] == 33 and prog["data"]["steps_done"] == 1
+    assert prog["data"]["step_name"] == "confirm the name"
+    assert prog["data"]["chat_id"] == session_id and prog["data"]["message_id"] == msg_id
+    assert prog["data"]["mission_id"] == f"chatjob:{session_id}"
+
+    out = json.loads(await te._tool_update_job({"job_id": res["job_id"], "status": "completed"}))
+    assert out["status"] == "completed"
+    done = calls[-1]
+    assert done["event_kind"] == "progress", (
+        "this turn's job: the terminal push is the finalizer's (it has the preview)"
+    )
+    assert done["data"]["progress"] == 100 and done["data"]["steps_done"] == 3
+    assert done["dedup_key"].endswith(":progress:done")
+    assert not any(c["event_kind"] == "mission_completed" for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_round3_update_of_an_older_job_still_ends_its_card(tmp_path, test_user_id, monkeypatch):
+    """A job that is NOT this turn's (the model remembered an id) keeps the
+    immediate terminal push — nobody else will end its card."""
+    from app.services import agent_notify_client as anc
+
+    calls = []
+
+    async def fake_notify(**kw):
+        calls.append(kw)
+
+    monkeypatch.setattr(anc, "notify", fake_notify)
+
+    async def _no_ws(*a, **k):
+        return 0
+    import app.api.ws_chat as wsc
+    monkeypatch.setattr(wsc, "broadcast_to_user", _no_ws)
+
+    te = _executor(tmp_path)
+    first_session = f"sess-{uuid.uuid4()}"
+    te.set_session_id(first_session, "m-1")
+    res = await _create_job(te, test_user_id, "Compare CRMs")
+    te.take_created_job_ids()            # the turn ended; a new turn begins
+    te.set_session_id(f"sess-{uuid.uuid4()}", "m-2")
+
+    await te._tool_update_job({"job_id": res["job_id"], "status": "completed"})
+    done = calls[-1]
+    assert done["event_kind"] == "mission_completed"
+    assert done["data"]["job_type"] == "compare"
+    assert done["data"]["end_after_s"] > 0
+    # Its OWN conversation keys the card — not the new turn's — and the new
+    # turn's answer id is not claimed as this job's.
+    assert done["data"]["mission_id"] == f"chatjob:{first_session}"
+    assert done["data"]["chat_id"] == first_session
+    assert "message_id" not in done["data"]

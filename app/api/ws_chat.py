@@ -3442,6 +3442,11 @@ async def ws_chat(
                     base_progress=5,
                     ceiling=90,
                     route="chat",
+                    # Round 3 (item 3): the conversation rides every beacon
+                    # so a backgrounded card can deep-link into the thread.
+                    # None on a first-message turn (the runner mints the
+                    # session); the answer push below always has it.
+                    chat_id=session_id,
                 )
 
                 # Stream callbacks
@@ -3861,19 +3866,23 @@ async def ws_chat(
                                 return
                             try:
                                 from app.services.agent_notify_client import notify
+                                _wc_data = {
+                                    "mission_id": _turn_mission_id,
+                                    "mission_title": _turn_title,
+                                    "subtitle": "Working on it…",
+                                    "route": "chat",
+                                    "kind": "chat_turn",
+                                    "urgent": True,
+                                    "timer_end_ms": int((time.time() + 120) * 1000),
+                                }
+                                if session_id:
+                                    # Round 3 (item 3): deep link.
+                                    _wc_data["chat_id"] = session_id
                                 await notify(
                                     event_kind="mission_started",
                                     title="Working on your answer",
                                     body=_user_text_preview or None,
-                                    data={
-                                        "mission_id": _turn_mission_id,
-                                        "mission_title": _turn_title,
-                                        "subtitle": "Working on it…",
-                                        "route": "chat",
-                                        "kind": "chat_turn",
-                                        "urgent": True,
-                                        "timer_end_ms": int((time.time() + 120) * 1000),
-                                    },
+                                    data=_wc_data,
                                     priority="default",
                                     dedup_key=f"{_turn_mission_id}:started",
                                 )
@@ -4098,10 +4107,19 @@ async def ws_chat(
                         }
                         if response.session_id:
                             _answer_data["session_id"] = response.session_id
+                            # Round 3 (item 3): the deep-link contract every
+                            # push carries is {chat_id, message_id};
+                            # session_id stays for older app builds.
+                            _answer_data["chat_id"] = response.session_id
                         if getattr(response, "day_chat_id", None):
                             _answer_data["day_chat_id"] = response.day_chat_id
                         if getattr(response, "asst_message_id", None):
                             _answer_data["message_id"] = response.asst_message_id
+                        _answer_data["preview"] = (
+                            " ".join((response.text or "").split())[:120] or None
+                        )
+                        if _answer_data["preview"] is None:
+                            _answer_data.pop("preview")
                         # REMINDER WINS at the source: when this turn
                         # created a reminder, its countdown card (armed
                         # by the routines API mid-turn) IS the
@@ -4185,18 +4203,21 @@ async def ws_chat(
                     if _turn_flags["client_gone"]:
                         try:
                             from app.services.agent_notify_client import notify
+                            _fail_data = {
+                                "mission_id": _turn_mission_id,
+                                "mission_title": _turn_title,
+                                "route": "chat",
+                                "kind": "chat_turn",
+                                "urgent": True,
+                                "dismiss_after_s": 900,
+                            }
+                            if session_id:
+                                _fail_data["chat_id"] = session_id
                             await notify(
                                 event_kind="mission_failed",
                                 title="Couldn't finish your answer",
                                 body="Something went wrong — open the app and ask again.",
-                                data={
-                                    "mission_id": _turn_mission_id,
-                                    "mission_title": _turn_title,
-                                    "route": "chat",
-                                    "kind": "chat_turn",
-                                    "urgent": True,
-                                    "dismiss_after_s": 900,
-                                },
+                                data=_fail_data,
                                 priority="high",
                                 dedup_key=f"{_turn_mission_id}:failed",
                             )
