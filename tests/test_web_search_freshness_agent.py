@@ -315,3 +315,15 @@ async def test_brave_fallback_all_stale_says_so(monkeypatch):
     ex = TE.ToolExecutor.__new__(TE.ToolExecutor)
     out = await ex._brave_search_fallback("anthropic newest model", 8)
     assert out.startswith("No results newer than 18 months")
+
+
+def test_voice_turns_strip_instead_of_mark(monkeypatch):
+    import app.agent.agent_runner as AR
+    from app.websearch.citations import CitationGate
+    monkeypatch.setattr(AR.settings, "citation_gate_scope", "web_turns", raising=False)
+    monkeypatch.setattr(AR.settings, "citation_gate_mode", "mark", raising=False)
+    g = CitationGate()
+    ans = "It is Opus 5, see [Anthropic](https://www.anthropic.com/news/claude-opus-5)."
+    out = AR.apply_citation_gate(g, ans, used_web_tool=True, user_id="u", channel="voice")
+    assert out == "It is Opus 5, see Anthropic (unverified)."
+    assert "https://" not in out

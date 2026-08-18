@@ -143,6 +143,10 @@ def apply_citation_gate(
     try:
         scope = str(getattr(settings, "citation_gate_scope", "web_turns") or "web_turns")
         mode = str(getattr(settings, "citation_gate_mode", "mark") or "mark")
+        if channel == "voice":
+            # Spoken: "(unverified: https://…)" would be read out by TTS.
+            # Drop the link, keep the label + the one-word marker.
+            mode = "strip"
         gr = gate.apply(final_text, mode=mode)
         in_scope = (scope == "all") or (scope == "web_turns" and used_web_tool)
         if gr.violations:
