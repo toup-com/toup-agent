@@ -92,8 +92,22 @@ from app.config import settings
 #
 # Cost accepted a second time: one more prompt-cache re-warm per tenant. See
 # tests/test_a_blocked_job_is_not_a_failed_job.py.
+#
+# MOVED A THIRD TIME, DELIBERATELY, 2026-08-18 (was 0039fbdc…5a473cb).
+# `web_search`'s description gained the FRESHNESS paragraph (results are
+# date-filtered and carry a published date; for "newest X" run a NEUTRAL
+# discovery query, not a site:-restricted one, then confirm on the official
+# domain; two agreeing sources or say you could not verify). Still 60
+# definitions; no tool added, removed or reordered; input_schema unchanged.
+#
+# This one had to be on the tool, not only in the system prompt: the incident
+# (docs/web-search/freshness-incident.md) showed the model choosing
+# site:-anchored queries at the moment it decides HOW to call web_search, and
+# the description is the text it reads at that moment.
+#
+# Cost accepted a third time: one more prompt-cache re-warm per tenant.
 MAIN_CORE_TOOLS_SHA256 = (
-    "0039fbdc16d8b3cb179fd1163f23e540ac0b4dd7715519e8c4eadba645a473cb"
+    "12280b25276446a79737b51b670476d7e9e8b06d71c57bb3562457c1646f5532"
 )
 MAIN_CORE_TOOLS_COUNT = 60
 
