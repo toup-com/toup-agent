@@ -49,7 +49,7 @@ from app.api.voice import router as voice_router
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
-from app.api.workspace_files import router as workspace_files_router
+from app.api.library import router as library_router
 from app.api.soul import router as soul_router
 from app.api.identity import router as identity_router
 from app.api.llm_setup import router as llm_setup_router
@@ -1712,10 +1712,13 @@ app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
-# Workspace file listing/read for the platform proxy + mobile Workspace
-# screen. AgentAPIKeyMiddleware (added above) already gates every /api
-# route behind X-Agent-Key, so the router needs no auth dependency.
-app.include_router(workspace_files_router, prefix=settings.api_prefix)
+# The file library — /api/library/* (id-based) and the /api/workspace/*
+# path shapes the shipped clients call — a VIRTUAL tree over this tenant's
+# files (app/services/library_service.py). The platform is a pass-through
+# proxy (app/api/workspace_proxy.py). AgentAPIKeyMiddleware (added above)
+# gates every /api route behind X-Agent-Key; get_current_user resolves it
+# to the tenant owner.
+app.include_router(library_router, prefix=settings.api_prefix)
 app.include_router(ws_browser_router, prefix=settings.api_prefix)
 # Unified jobs activity feed (PR 6 of the jobs/tasks/logs arc) —
 # server-side ``GET /apps/jobs/events`` query over job_events JOIN

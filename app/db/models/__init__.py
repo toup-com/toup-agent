@@ -31,6 +31,15 @@ from .day_chat import DayChat, ContextBudgetLog, MigrationStatus
 # Memory system
 from .memory import Memory, memory_relationships, BrainStats, MemoryEvent, RetrievalEvent
 from .media_playlist import MediaPlaylist
+# The user-facing file library (virtual tree over the tenant's files)
+# The file-origin constants (ORIGIN_UPLOAD / ORIGIN_AGENT / FILE_ORIGINS) are
+# deliberately NOT re-exported here: admin_dispatch below exports its own
+# ORIGIN_AGENT (message origin), and a package-level name that means two
+# things is a trap. Import them from app.db.models.user_file directly.
+from .user_file import (
+    UserFile, UserFolder,
+    SYSTEM_FOLDERS, SYSTEM_FOLDER_DOCUMENTS, SYSTEM_FOLDER_IMAGES, SYSTEM_FOLDER_UPLOADS,
+)
 
 # Entity & Knowledge Graph
 from .entity import Entity, EntityLink, EntityRelationship
@@ -209,6 +218,8 @@ __all__ = [
     "Conversation", "Message", "ProcessedMessage",
     "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "MediaPlaylist",
+    "UserFile", "UserFolder",
+    "SYSTEM_FOLDERS", "SYSTEM_FOLDER_DOCUMENTS", "SYSTEM_FOLDER_IMAGES", "SYSTEM_FOLDER_UPLOADS",
     "Entity", "EntityLink", "EntityRelationship",
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",

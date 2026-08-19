@@ -91,6 +91,13 @@ AGENT_ONLY_TABLES: set[str] = {
     # stations). Platform reads via the memories-style proxy; the platform DB
     # keeps a mirror table only as the read-fallback target.
     "media_playlists",
+    # The user-facing file library — a virtual tree (display names, folders,
+    # provenance) over files that physically live in the tenant container.
+    # The platform is a pass-through proxy and never reads these; there is
+    # deliberately NO platform mirror (an unreachable agent is a 503, not an
+    # empty library). See app/db/models/user_file.py.
+    "user_files",
+    "user_folders",
     # Apps & build jobs
     "apps",
     "build_jobs",

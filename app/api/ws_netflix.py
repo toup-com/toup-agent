@@ -93,7 +93,16 @@ async def serve_hls(stream_id: str, filename: str):
     if not hls_dir:
         raise HTTPException(status_code=404, detail="Stream not found")
 
-    file_path = hls_dir / filename
+    # `filename` is a path parameter from the client. Only a plain segment
+    # name inside THIS stream's directory may be served — a `..` or nested
+    # path resolves outside it and is a 404, never a read (2026-08-19
+    # file-endpoint audit: this was `hls_dir / filename` unchecked, with
+    # the extension allow-list applied only afterwards).
+    from pathlib import Path as _Path
+    base = _Path(hls_dir).resolve()
+    file_path = (base / _Path(filename).name).resolve()
+    if _Path(filename).name != filename or file_path.parent != base:
+        raise HTTPException(status_code=404, detail="Segment not found")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="Segment not found")
 

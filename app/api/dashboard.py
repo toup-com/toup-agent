@@ -10,6 +10,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -221,14 +222,24 @@ async def delete_doc(name: str = Query(...)):
 
 # ── Memory files (workspace .md files) ──────────────────────────────
 #
-# Client paths resolve through workspace_files.resolve_workspace_path
-# (resolve + is_relative_to): ../ and symlink escapes never leave the
-# workspace root. Escapes get the same response as a missing path so
-# nothing outside the workspace is confirmed to exist.
+# Client paths resolve through resolve_workspace_path (resolve +
+# is_relative_to): ../ and symlink escapes never leave the workspace root.
+# Escapes get the same response as a missing path so nothing outside the
+# workspace is confirmed to exist. (Lived in workspace_files.py until the
+# 2026-08-19 file-library rewrite retired that module.)
+
+_MEMORY_SKIP_DIRS = {"apps", "vibecoding", "toup-code", "generated", "node_modules", "__pycache__"}
+
+
+def resolve_workspace_path(path: str) -> Path:
+    base = Path(getattr(settings, "agent_workspace_dir", None) or "./workspace").resolve()
+    target = (base / path).resolve()
+    if not target.is_relative_to(base):
+        raise HTTPException(404, "Not found")
+    return target
 
 @router.get("/memory/{directory:path}")
 async def list_memory_dir(directory: str):
-    from app.api.workspace_files import resolve_workspace_path
     try:
         target = str(resolve_workspace_path(directory))
     except HTTPException:
@@ -253,7 +264,6 @@ async def list_memory_dir(directory: str):
 
 @router.get("/memory/file/{filepath:path}")
 async def get_memory_file(filepath: str):
-    from app.api.workspace_files import resolve_workspace_path
     target = str(resolve_workspace_path(filepath))  # 404 on escape
     if not os.path.isfile(target):
         raise HTTPException(404, "File not found")
@@ -268,7 +278,11 @@ async def search_memory(q: str = Query("")):
     base = getattr(settings, "agent_workspace_dir", None) or "./workspace"
     results = []
     q_lower = q.lower()
-    for root, _, files in os.walk(base):
+    for root, dirs, files in os.walk(base):
+        # Memory notes are the agent's own .md files; never descend into
+        # build trees, dotdirs or the document store — a `node_modules`
+        # README is not a memory, and its path is not for the UI.
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _MEMORY_SKIP_DIRS]
         for name in files:
             if not name.endswith(".md"):
                 continue
@@ -296,7 +310,6 @@ async def add_memory_entry(req: dict):
     entry = req.get("entry", "")
     if not file_path or not entry:
         raise HTTPException(400, "file and entry are required")
-    from app.api.workspace_files import resolve_workspace_path
     target = str(resolve_workspace_path(file_path))  # write traversal guard
     os.makedirs(os.path.dirname(target), exist_ok=True)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")

@@ -36,6 +36,7 @@ test_decay.py  # agent-mode
 test_job_reaper.py  # agent-mode
 test_job_recovery.py  # agent-mode
 test_jobs_api_no_raw_errors.py  # agent-mode
+test_library_api.py  # agent-mode: user_files/user_folders/messages are AGENT_ONLY (the file library lives on the tenant)
 test_multichannel_default.py  # agent-mode
 test_routine_dst_regression.py  # agent-mode
 test_routine_one_per_kind.py  # agent-mode

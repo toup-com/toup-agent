@@ -259,6 +259,11 @@ async def _get_user_for_file(
     return user
 
 
+# Public name for the auth ladder above — the file library's download /
+# preview routes need the same explicit-before-ambient order.
+get_user_for_file = _get_user_for_file
+
+
 async def _load_attachment(
     message_id: str, attachment_id: str, user_id: str, db: AsyncSession
 ) -> dict:
@@ -394,7 +399,50 @@ async def preview_file(
     if not key or not backend.exists(key):
         raise HTTPException(status_code=410, detail="File unavailable")
 
-    filename = att.get("filename") or "document"
+    return await render_preview(
+        request,
+        stream=lambda: stream_file(key),
+        open_file=lambda: backend.open(key),
+        path_of=lambda: backend.path(key),
+        size=backend.size(key),
+        backend_key=key,
+        mime=mime,
+        filename=att.get("filename") or "document",
+        download_url=f"{settings.api_prefix}/files/{message_id}/{attachment_id}",
+        token=token,
+        format=format,
+    )
+
+
+async def render_preview(
+    request: Optional[Request],
+    *,
+    stream,
+    size: int,
+    mime: str,
+    filename: str,
+    download_url: str,
+    open_file=None,
+    path_of=None,
+    token: Optional[str] = None,
+    format: str = "html",
+    backend_key: Optional[str] = None,
+) -> Response:
+    """Server-side preview for one file — shared by the chat attachment route
+    above and the file library (app/api/library.py).
+
+    ``stream()`` returns an async iterator of bytes (``stream_file(key)`` for
+    the storage backend, a plain chunked read for a library path): PDFs and
+    images are served straight from it and never need a local path — an S3
+    backend has none. ``open_file()`` (binary handle) is only used by the
+    legacy mammoth DOCX path and ``path_of()`` only by XLSX → HTML, which
+    needs a file on disk; either may be None, in which case those types
+    get the download-only fallback. ``backend_key`` is the file_storage key
+    (relative to generated/) when the file lives in the storage backend;
+    the LibreOffice DOCX/PPTX → PDF path needs it for its cache entry.
+    """
+    mime = mime or "application/octet-stream"
+    filename = filename or "document"
 
     # ── PDF / images → the bytes themselves, inline ───────────────
     # A PDF IS its own preview: every browser and WKWebView renders
@@ -403,11 +451,11 @@ async def preview_file(
     # download.
     if mime == "application/pdf" or mime.startswith("image/"):
         return StreamingResponse(
-            stream_file(key),
+            stream(),
             media_type=mime,
             headers={
-                "Content-Length": str(backend.size(key)),
-                "Content-Disposition": f'inline; filename="{filename}"',
+                "Content-Length": str(int(size or 0)),
+                "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}"',
                 "Cache-Control": "private, max-age=3600",
                 # Nothing on this route is user-authored markup, but a
                 # served image/PDF must never be sniffed into something
@@ -418,13 +466,13 @@ async def preview_file(
 
     # ── DOCX / PPTX → PDF via LibreOffice ────────────────────────
     # Production-grade faithful rendering. Cached per file.
-    if mime in (
+    if backend_key and mime in (
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ):
         from app.services.doc_preview import render_to_pdf
         try:
-            pdf_bytes = await render_to_pdf(key)
+            pdf_bytes = await render_to_pdf(backend_key)
         except RuntimeError as e:
             # Binary missing — agent needs libreoffice-{core,writer,impress}.
             raise HTTPException(status_code=501, detail=str(e))
@@ -435,7 +483,7 @@ async def preview_file(
             media_type="application/pdf",
             headers={
                 "Cache-Control": "private, max-age=3600",
-                "Content-Disposition": f'inline; filename="{att.get("filename","document")}.pdf"',
+                "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}.pdf"',
             },
         )
 
@@ -449,7 +497,9 @@ async def preview_file(
             import mammoth  # type: ignore
         except ImportError:
             raise HTTPException(status_code=501, detail="mammoth not installed")
-        with backend.open(key) as f:
+        if open_file is None:
+            return _preview_unavailable(request, download_url, filename, mime, size, token)
+        with open_file() as f:
             result = mammoth.convert_to_html(f)
         # Minimal shell so pane renders with basic typography.
         html = (
@@ -469,7 +519,9 @@ async def preview_file(
         except ImportError:
             raise HTTPException(status_code=501, detail="openpyxl not installed")
         import html as _html  # stored-XSS guard (audit-2026 re-audit round 11)
-        wb = load_workbook(backend.path(key), read_only=True, data_only=True)
+        if path_of is None:
+            return _preview_unavailable(request, download_url, filename, mime, size, token)
+        wb = load_workbook(path_of(), read_only=True, data_only=True)
         parts: list[str] = [
             "<!doctype html><meta charset='utf-8'>",
             "<style>body{font-family:system-ui,-apple-system,sans-serif;margin:0;padding:1rem;color:#222}"
@@ -503,14 +555,26 @@ async def preview_file(
     # (PPTX is now handled by the LibreOffice PDF path above; legacy 204
     # fallback removed.)
 
-    return _preview_unavailable(request, message_id, attachment_id, att, token)
+    return _preview_unavailable(request, download_url, filename, mime, size, token)
+
+
+def _ascii_filename(name: str) -> str:
+    """A Content-Disposition-safe filename (quotes/newlines out, non-ASCII
+    folded). The download routes send the full UTF-8 name via filename*."""
+    cleaned = (name or "file").replace('"', "'").replace("\r", " ").replace("\n", " ")
+    try:
+        cleaned.encode("latin-1")
+        return cleaned
+    except UnicodeEncodeError:
+        return cleaned.encode("ascii", "ignore").decode("ascii") or "file"
 
 
 def _preview_unavailable(
-    request: Request,
-    message_id: str,
-    attachment_id: str,
-    att: dict,
+    request: Optional[Request],
+    download_url: str,
+    filename: str,
+    mime: str,
+    size: int,
     token: Optional[str],
 ) -> Response:
     """415 for a type this endpoint cannot render — in the shape the caller
@@ -532,10 +596,9 @@ def _preview_unavailable(
     import html as _html
     from urllib.parse import quote
 
-    mime = att.get("mime_type", "") or "application/octet-stream"
-    filename = att.get("filename") or "document"
-    size = int(att.get("size_bytes") or 0)
-    download_url = f"{settings.api_prefix}/files/{message_id}/{attachment_id}"
+    mime = mime or "application/octet-stream"
+    filename = filename or "document"
+    size = int(size or 0)
     accept = (request.headers.get("accept") or "").lower() if request else ""
     wants_html = "text/html" in accept
 
