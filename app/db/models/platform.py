@@ -381,6 +381,13 @@ DISPATCH_PRODUCT_EVENTS: set[str] = {
     PE_DISPATCH_SCREENSHOT_DETECTED,
 }
 
+# A user's screenshot report opened as a message in their Admin thread
+# (`app/services/report_thread.py`). Deliberately NOT in DISPATCH_PRODUCT_EVENTS:
+# it is the START of the support funnel (report filed → operator's answer is a
+# `dispatch_created` with payload.report_reply → read → replied), not a step of
+# the dispatch funnel, and the set above is pinned at nine by its tests.
+PE_REPORT_FILED = "report_filed"
+
 # Values for ProductEvent.entity_type.
 PE_ENTITY_DISPATCH = "admin_dispatch"
 PE_ENTITY_THREAD_MESSAGE = "admin_thread_message"

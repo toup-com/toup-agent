@@ -1211,6 +1211,21 @@ class Settings(BaseSettings):
     support_attachment_max_bytes: int = 3_000_000  # ~3 MB
     support_attachment_allowed_mime: List[str] = ["image/png", "image/jpeg", "image/webp"]
 
+    # Admin thread pictures (migration 093), same posture as the support
+    # screenshots above and for the same reason: bytes in the platform DB,
+    # served only through an auth'd, ownership-checked route.
+    #
+    # 5 MB rather than 3: this one is fed by a phone camera roll, where a
+    # modern photo straight out of the picker routinely exceeds 3 MB and the
+    # user has no idea why their screenshot "failed". The client downscales
+    # first; the cap is the backstop, not the plan. HEIC is deliberately NOT
+    # allowed — iOS hands it over happily and no browser renders it, so the
+    # operator would receive a file they cannot open.
+    admin_thread_attachment_max_bytes: int = 5_000_000  # ~5 MB
+    admin_thread_attachment_allowed_mime: List[str] = [
+        "image/png", "image/jpeg", "image/webp",
+    ]
+
     # Phase C — CronService deprecation switch (2026-05-14, `ecb348a`'s
     # follow-up). The legacy CronJob/CronService system is being replaced
     # by Routines (kind=reminder). Default True keeps current behaviour

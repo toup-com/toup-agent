@@ -24,6 +24,15 @@ owns the issue, or an admin) — never a world-readable URL, never a token in a
 query string (use the Authorization header; the web admin fetches as a blob).
 On intake, a "card arrived" alert goes to settings.support_notify_email
 (default mrhx@toup.ai) — distinct from the reporter and the admin account.
+
+Since round 5 (2026-08-19) a report ALSO opens as a message in the reporter's
+Admin thread (``app/services/report_thread.py``): the note as an `in` row of
+`kind='report'` with the severity and the parsed capture context, and the
+screenshot upload hangs the picture on that row. That is what puts the report
+in Admin → Dispatch → Conversations, where the operator answers it — the
+answer to an unanswered report is delivered into the user's chat as a
+persistent card. Both destinations, always: the thread copy is written beside
+the card and the email and can never fail intake or the upload.
 """
 
 from __future__ import annotations
@@ -119,6 +128,77 @@ async def _notify_admin_new_card(issue_id: str) -> None:
         logger.warning("[support] notify email errored for %s: %s", issue_id, e)
 
 
+async def _open_report_thread(db: AsyncSession, issue, current_user: User, body: IssueIntakeRequest) -> None:
+    """Open the report in the reporter's Admin thread. Never raises.
+
+    The thread row is for the SESSION user — the identity that filed it — even
+    when an admin reports on behalf of someone else via ``reporter_email``: a
+    thread is a conversation with the account that will answer in it, and that
+    is the one holding the token. Reports go to BOTH email and the thread; the
+    email is unchanged (``_notify_admin_new_card``).
+    """
+    from app.services import report_thread
+
+    try:
+        _, created = await report_thread.open_report_in_thread(
+            db,
+            user_id=current_user.id,
+            issue_id=issue.id,
+            note=body.raw_report.strip(),
+            severity=body.severity.value,
+            channel=body.channel or "api",
+            repro_info=body.repro_info,
+            context=body.context,
+        )
+    except Exception as e:  # noqa: BLE001 — the thread is a second destination, not the report
+        logger.warning("[support] report %s: thread row not opened for %s: %s: %s",
+                       issue.id, current_user.id, type(e).__name__, e)
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover
+            pass
+        return
+    if created:
+        # A funnel fact — "reports filed" is the numerator of "reports
+        # answered". Length and labels, never the note.
+        from app.db.models.platform import PE_REPORT_FILED, PE_ENTITY_THREAD_MESSAGE
+        from app.services.product_events import emit_product_event
+        await emit_product_event(
+            PE_REPORT_FILED,
+            user_id=current_user.id,
+            actor_user_id=current_user.id,
+            entity_type=PE_ENTITY_THREAD_MESSAGE,
+            entity_id=report_thread.report_message_id(issue.id),
+            payload={
+                "severity": body.severity.value,
+                "channel": body.channel or "api",
+                "note_chars": len(body.raw_report or ""),
+                "support_issue_id": issue.id,
+            },
+            dedupe_key=f"{PE_REPORT_FILED}:{issue.id}",
+        )
+
+
+async def _attach_report_screenshot(
+    db: AsyncSession, issue_id: str, data: bytes, mime: str, sha: str, uploader_id: str,
+) -> None:
+    """Copy the screenshot onto the report's thread row. Never raises."""
+    from app.services import report_thread
+
+    try:
+        await report_thread.attach_report_screenshot(
+            db, issue_id=issue_id, data=data, mime_type=mime, sha256=sha,
+            uploaded_by_user_id=uploader_id,
+        )
+    except Exception as e:  # noqa: BLE001 — the support copy is already committed
+        logger.warning("[support] report %s: screenshot not copied to the thread: %s: %s",
+                       issue_id, type(e).__name__, e)
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover
+            pass
+
+
 def _require_enabled() -> None:
     if not getattr(settings, "support_agent_enabled", False):
         raise HTTPException(
@@ -156,6 +236,15 @@ async def intake_issue(
         repro_info=body.repro_info,
         severity=body.severity.value,
     )
+    # SECOND destination: the same report opens as a message in the reporter's
+    # Admin thread, so it lands in Conversations with its severity (and, once
+    # the next request delivers it, its screenshot) and the operator can
+    # answer it there. Written on the request path — the mobile client uploads
+    # the screenshot in its NEXT request and that upload has to find this row —
+    # but never allowed to fail intake: the issue is filed and the email below
+    # still goes; a thread that could not be opened is a warning in the log,
+    # not a report the user is told was lost.
+    await _open_report_thread(db, issue, current_user, body)
     # Diagnose off the request path (own DB session).
     pipeline.spawn(pipeline.run_diagnosis_pipeline(issue.id, actor_user_id=current_user.id))
     # Alert the notify target (mrhx@toup.ai by default) that a card arrived —
@@ -197,11 +286,19 @@ async def upload_attachment(
     if len(data) > max_bytes:
         raise HTTPException(status_code=413, detail=f"attachment exceeds {max_bytes} bytes")
 
+    sha = hashlib.sha256(data).hexdigest()
     att = await repo.create_attachment(
         db, issue_id=issue.id, data=data, mime_type=mime, kind="screenshot",
-        sha256=hashlib.sha256(data).hexdigest(),
+        sha256=sha,
         uploaded_by_user_id=current_user.id,
     )
+    # The same bytes onto the report's thread row (if intake opened one), so
+    # the operator sees the picture in Conversations. AFTER the support copy is
+    # committed and never able to fail this request: the card is the source of
+    # truth and the mobile client treats a non-2xx here as "the screenshot did
+    # not send". A copy that could not be made is logged and the card still
+    # has the picture — the Support tab shows it either way.
+    await _attach_report_screenshot(db, issue.id, data, mime, sha, current_user.id)
     return AttachmentUploadResponse(
         id=att.id, issue_id=issue.id, mime_type=att.mime_type, size_bytes=att.size_bytes,
     )

@@ -3088,3 +3088,237 @@ async def test_recipients_browses_on_an_empty_query_and_narrows_on_a_typed_one(d
     miss = await client.get(
         "/api/admin/dispatch/recipients", params={"query": "zzz-no-such-account-zzz"})
     assert miss.json() == [], miss.text
+
+
+# ── Attachments (migration 093) ───────────────────────────────────
+
+
+def _png(nbytes: int = 64) -> bytes:
+    """A real PNG header plus filler. The header matters: a route that ever
+    starts sniffing content must not be fooled by this fixture."""
+    return b"\x89PNG\r\n\x1a\n" + b"\x00" * max(0, nbytes - 8)
+
+
+@pytest.mark.asyncio
+async def test_a_user_can_attach_a_picture_and_only_they_and_admins_can_fetch_it(
+    dispatch_client, monkeypatch,
+):
+    """The whole point, end to end, plus the thing that would make it a leak.
+
+    The bytes live in the platform DB and are served from our own origin, so
+    "who may GET this id" is the entire security model. A second user must not
+    be able to fetch it by id — these are uuids in a table shared by everyone.
+    """
+    from app.api.notices import router as notices_router
+
+    client, app = dispatch_client
+    app.include_router(notices_router, prefix=settings.api_prefix + "/notices")
+
+    owner = await _mk_user()
+    stranger = await _mk_user()
+    admin = await _mk_user(role="admin")
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(owner)
+    res = await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("shot.png", _png(256), "image/png")},
+        data={"body": "it looks like this"},
+    )
+    assert res.status_code == 201, res.text
+    msg = res.json()["message"]
+    assert msg["body"] == "it looks like this"
+    assert len(msg["attachments"]) == 1, msg
+    att = msg["attachments"][0]
+    assert att["mime_type"] == "image/png"
+    assert att["size_bytes"] == 256
+    # The BYTES are not in the JSON. A thread GET returns up to 500 messages;
+    # inlining them would re-download every picture on every poll.
+    assert "data" not in att and "base64" not in res.text.lower()
+
+    # The owner can fetch it.
+    got = await client.get(f"/api/notices/thread/attachments/{att['id']}")
+    assert got.status_code == 200, got.text
+    assert got.content == _png(256)
+    assert got.headers["content-type"].startswith("image/png")
+    # User-supplied bytes from our own origin.
+    assert got.headers.get("x-content-type-options") == "nosniff"
+
+    # A different user cannot, by id.
+    app.dependency_overrides[get_current_user] = lambda: _principal(stranger)
+    assert (await client.get(f"/api/notices/thread/attachments/{att['id']}")).status_code == 404
+
+    # An admin can, through the admin route scoped to that user's thread...
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    ok = await client.get(f"/api/admin/dispatch/threads/{owner}/attachments/{att['id']}")
+    assert ok.status_code == 200, ok.text
+    assert ok.content == _png(256)
+    # ...but NOT by pointing that route at the wrong user. Being an admin is not
+    # a licence to read an id out of whatever thread it happens to live in.
+    wrong = await client.get(f"/api/admin/dispatch/threads/{stranger}/attachments/{att['id']}")
+    assert wrong.status_code == 404, wrong.text
+
+    # And it appears in the operator's thread view.
+    thread = await client.get(f"/api/admin/dispatch/threads/{owner}")
+    assert thread.json()["messages"][0]["attachments"][0]["id"] == att["id"]
+
+
+@pytest.mark.asyncio
+async def test_an_attachment_is_refused_by_type_and_by_size(dispatch_client, monkeypatch):
+    """Both caps, and the size one specifically because it is the DoS.
+
+    ``support_attachments`` and this table are the only blobs in the platform
+    DB, and the audio blob cache reaching 96% of that database is why the cap is
+    not decorative.
+    """
+    from app.api.notices import router as notices_router
+
+    client, app = dispatch_client
+    app.include_router(notices_router, prefix=settings.api_prefix + "/notices")
+    user = await _mk_user()
+    app.dependency_overrides[get_current_user] = lambda: _principal(user)
+
+    # HEIC is the one a phone offers most eagerly and no browser renders.
+    bad = await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("photo.heic", _png(32), "image/heic")},
+    )
+    assert bad.status_code == 415, bad.text
+
+    monkeypatch.setattr(settings, "admin_thread_attachment_max_bytes", 100, raising=False)
+    big = await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("big.png", _png(101), "image/png")},
+    )
+    assert big.status_code == 413, big.text
+
+    empty = await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("nothing.png", b"", "image/png")},
+    )
+    assert empty.status_code == 400, empty.text
+
+    # A refused upload must leave NO message behind. The row is added to the
+    # session before the file is validated, so this asserts the rollback rather
+    # than assuming it.
+    async with async_session_maker() as db:
+        n = (await db.execute(
+            select(func.count()).select_from(AdminThreadMessage)
+            .where(AdminThreadMessage.user_id == user)
+        )).scalar_one()
+    assert n == 0, f"{n} orphaned message rows survived a rejected upload"
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_message_for_everyone_takes_its_picture_with_it(dispatch_client):
+    """092 clears the words. A picture that outlived them would be a deletion
+    that only looked complete — and it is the half anyone would actually look
+    at."""
+    from app.api.notices import router as notices_router
+
+    client, app = dispatch_client
+    app.include_router(notices_router, prefix=settings.api_prefix + "/notices")
+
+    owner = await _mk_user()
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(owner)
+    res = await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("shot.png", _png(64), "image/png")},
+    )
+    att_id = res.json()["message"]["attachments"][0]["id"]
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    gone = await client.delete(
+        f"/api/admin/dispatch/threads/{owner}", params={"scope": "everyone"})
+    assert gone.status_code == 200, gone.text
+
+    # 404 for the OPERATOR too, by id. This assertion started life as
+    # `in (200, 404)`, which accepts either answer and therefore asserts
+    # nothing — and it was hiding the real question: "delete for everyone"
+    # clears the body, so leaving the bytes fetchable would make the
+    # destructive scope the one that destroys less. The blob is now purged.
+    assert (await client.get(
+        f"/api/admin/dispatch/threads/{owner}/attachments/{att_id}")).status_code == 404
+    # ...and not described in either thread view.
+    thread = await client.get(f"/api/admin/dispatch/threads/{owner}")
+    for m in thread.json()["messages"]:
+        assert m["attachments"] == [], m
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(owner)
+    assert (await client.get(f"/api/notices/thread/attachments/{att_id}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_removing_for_the_user_only_keeps_the_operators_copy_of_the_picture(
+    dispatch_client,
+):
+    """The other scope, which must NOT destroy anything.
+
+    `user_side` exists so the operator keeps a record of what they sent. If it
+    purged the bytes like `everyone` does, the two scopes would differ only in
+    wording — and the read-only transcript the whole feature promises would be
+    missing the one part that mattered.
+    """
+    from app.api.notices import router as notices_router
+
+    client, app = dispatch_client
+    app.include_router(notices_router, prefix=settings.api_prefix + "/notices")
+
+    owner = await _mk_user()
+    admin = await _mk_user(role="admin")
+    app.dependency_overrides[get_current_user] = lambda: _principal(owner)
+    att_id = (await client.post(
+        "/api/notices/thread/attachment",
+        files={"file": ("shot.png", _png(64), "image/png")},
+    )).json()["message"]["attachments"][0]["id"]
+
+    app.dependency_overrides[get_current_user] = lambda: _principal(admin, role="admin")
+    assert (await client.delete(
+        f"/api/admin/dispatch/threads/{owner}", params={"scope": "user_side"},
+    )).status_code == 200
+
+    # The operator still has it, described AND fetchable.
+    thread = await client.get(f"/api/admin/dispatch/threads/{owner}")
+    assert thread.json()["messages"][0]["attachments"][0]["id"] == att_id
+    kept = await client.get(f"/api/admin/dispatch/threads/{owner}/attachments/{att_id}")
+    assert kept.status_code == 200, kept.text
+    assert kept.content == _png(64)
+
+    # The user does not — neither the bytes nor the row.
+    app.dependency_overrides[get_current_user] = lambda: _principal(owner)
+    assert (await client.get(f"/api/notices/thread/attachments/{att_id}")).status_code == 404
+    assert (await client.get("/api/notices/thread")).json()["messages"] == []
+
+
+def test_the_serializer_refuses_to_describe_a_deleted_messages_attachment():
+    """Defence in depth, tested directly because nothing else reaches it.
+
+    In the live path `everyone` PURGES the bytes, so by the time any thread is
+    serialised there is nothing left to describe and this guard never fires — a
+    mutation that removes it kills no test. That is exactly the shape CLAUDE.md
+    warns about: a guard whose precondition something above it satisfies is
+    invisible to every check in the repo.
+
+    It is kept rather than deleted because the purge is one statement in one
+    transaction, and any future path that tombstones a row without calling it
+    would otherwise start advertising an image for a message whose words are
+    gone. So it is exercised here at the unit level, with an attachment that
+    still exists alongside a tombstone — a state the routes do not produce.
+    """
+    import types as _t
+    from app.api.admin.dispatch import THREAD_IN, thread_message_out
+
+    att = _t.SimpleNamespace(id="a-1", mime_type="image/png", size_bytes=10)
+    live = _t.SimpleNamespace(
+        id="m-1", direction=THREAD_IN, body="here", created_at=datetime.utcnow(),
+        dispatch_id=None, read_at=None, sender_name=None,
+        hidden_from_user_at=None, deleted_at=None,
+    )
+    assert len(thread_message_out(live, attachments=[att]).attachments) == 1
+
+    tombstoned = _t.SimpleNamespace(
+        id="m-2", direction=THREAD_IN, body=DELETED_BODY, created_at=datetime.utcnow(),
+        dispatch_id=None, read_at=None, sender_name=None,
+        hidden_from_user_at=None, deleted_at=datetime.utcnow(),
+    )
+    assert thread_message_out(tombstoned, attachments=[att]).attachments == []

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,12 @@ class IssueIntakeRequest(BaseModel):
     tenant_id: Optional[str] = Field(default=None, max_length=36)
     # Optional: report on behalf of another user (admin/support desk use).
     reporter_email: Optional[str] = Field(default=None, max_length=255)
+    # Optional structured capture context — `screen`, `app_version`, `build`,
+    # `platform`, `device`, `os` — for a client that would rather not encode
+    # them as `repro_info` lines. Unknown keys are dropped and every value is
+    # capped by `report_thread.parse_report_context`; the shipped mobile client
+    # sends none of this and its `repro_info` block is parsed instead.
+    context: Optional[Dict[str, str]] = Field(default=None)
 
 
 class DecisionRequest(BaseModel):

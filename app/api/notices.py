@@ -25,7 +25,9 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status,
+)
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import and_, func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,12 +36,18 @@ from app.api.auth import get_current_user
 from app.api.tenant_proxy import agent_proxy_info, proxy_to_agent
 # One definition of the thread wire shape for both surfaces — see §7 of the
 # dispatch contract; two copies would drift.
-from app.api.admin.dispatch import thread_message_out
+from app.api.admin.dispatch import (
+    attachment_response,
+    load_thread_attachments,
+    store_thread_attachment,
+    thread_message_out,
+)
 from app.db import get_db, User
 from app.db.models import (
     AdminDispatch,
     AdminDispatchTarget,
     AdminThreadMessage,
+    AdminThreadAttachment,
     CHAT_DELIVERED,
     CHAT_RETRACTED,
     DISPATCH_MODE_ONCE,
@@ -191,8 +199,12 @@ async def get_thread(
         )
     )).scalar_one()
 
+    atts = await load_thread_attachments(db, [m.id for m in rows])
     return {
-        "messages": [thread_message_out(m) for m in reversed(rows)],
+        "messages": [
+            thread_message_out(m, attachments=atts.get(m.id, ()))
+            for m in reversed(rows)
+        ],
         "unread": int(unread or 0),
     }
 
@@ -244,6 +256,91 @@ async def reply_to_admin(
         occurred_at=msg.created_at,
     )
     return resp
+
+
+@router.post("/thread/attachment", status_code=201)
+async def reply_to_admin_with_attachment(
+    file: UploadFile = File(...),
+    body: str = Form(default=""),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The user's reply, carrying a picture.
+
+    A separate route from ``POST /thread`` for the same reason as the operator
+    side: that one takes JSON and every existing client uses it for text.
+
+    Message and attachment are written in ONE transaction. There is no
+    "upload, then reference" step, so a user who abandons the compose leaves no
+    orphaned blob for anyone to sweep up later.
+
+    Still platform-side only — the agent never sees this row, and now never sees
+    the picture either (D2).
+    """
+    msg = AdminThreadMessage(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        dispatch_id=None,
+        direction=THREAD_IN,
+        body=(body or "").strip(),
+        author_admin_id=None,
+        created_at=datetime.utcnow(),
+    )
+    db.add(msg)
+    # Raises before the commit, so a rejected file leaves no message behind.
+    att = await store_thread_attachment(
+        db, message_id=msg.id, file=file, uploaded_by_user_id=current_user.id,
+    )
+
+    resp = {"message": thread_message_out(msg, attachments=[att])}
+    await db.commit()
+
+    await emit_product_event(
+        PE_DISPATCH_REPLIED,
+        user_id=current_user.id,
+        actor_user_id=current_user.id,
+        entity_type=PE_ENTITY_THREAD_MESSAGE,
+        entity_id=msg.id,
+        # Counts and sizes, never the words and never the bytes. Same rule as
+        # the text reply: this is the user's private message to a human.
+        payload={
+            "direction": THREAD_IN,
+            "body_chars": len(msg.body or ""),
+            "attachments": 1,
+            "attachment_bytes": int(att.size_bytes or 0),
+        },
+        dedupe_key=f"{PE_DISPATCH_REPLIED}:{msg.id}",
+        occurred_at=msg.created_at,
+    )
+    return resp
+
+
+@router.get("/thread/attachments/{att_id}")
+async def get_thread_attachment(
+    att_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an attachment to the user who owns the thread it belongs to.
+
+    The join to the parent message IS the authorisation: an id alone proves
+    nothing, and these are uuids in a table shared by every user. The
+    ``_visible_to_user()`` filter is applied for the same reason the thread list
+    applies it — a picture on a message the operator removed for this user must
+    not remain fetchable by its id after the words around it are gone.
+    """
+    att = (await db.execute(
+        select(AdminThreadAttachment)
+        .join(AdminThreadMessage, AdminThreadMessage.id == AdminThreadAttachment.message_id)
+        .where(
+            AdminThreadAttachment.id == att_id,
+            AdminThreadMessage.user_id == current_user.id,
+            _visible_to_user(),
+        )
+    )).scalar_one_or_none()
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+    return attachment_response(att)
 
 
 @router.post("/thread/read", status_code=status.HTTP_204_NO_CONTENT)

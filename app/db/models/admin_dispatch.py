@@ -33,8 +33,8 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint,
+    JSON, Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, String,
+    Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -86,6 +86,33 @@ CHAT_STATUSES: set[str] = {
 THREAD_OUT = "out"  # admin → user
 THREAD_IN = "in"    # user → admin
 THREAD_DIRECTIONS: set[str] = {THREAD_OUT, THREAD_IN}
+
+
+# ── Thread message kind — WHAT a row is, beyond who wrote it ─────────
+# `direction` says which side spoke; `kind` says what shape the message has.
+# NULL is an ordinary text message — every row written before migration 094
+# and every reply either side types. `report` is a screenshot report the user
+# filed from the app (POST /support/issues): its body is the note, and it
+# carries a `severity`, a `report_json` context block, and (usually) one
+# attachment — the screenshot. The kind is a column, not a JSON flag, because
+# the Conversations list has to badge severity in SQL over the whole table.
+THREAD_KIND_REPORT = "report"
+THREAD_KINDS: set[str] = {THREAD_KIND_REPORT}
+
+# Report severity, ordered. Mirrors `app.support.enums.IssueSeverity` — the
+# support intake is the ONLY writer, and it validates against that enum
+# before anything reaches here. The order is what "critical is loudest" means
+# in the list: the badge on a conversation is the HIGHEST severity among the
+# reports no operator has answered yet.
+REPORT_SEVERITY_LOW = "low"
+REPORT_SEVERITY_MEDIUM = "medium"
+REPORT_SEVERITY_HIGH = "high"
+REPORT_SEVERITY_CRITICAL = "critical"
+REPORT_SEVERITIES: tuple[str, ...] = (
+    REPORT_SEVERITY_LOW, REPORT_SEVERITY_MEDIUM,
+    REPORT_SEVERITY_HIGH, REPORT_SEVERITY_CRITICAL,
+)
+REPORT_SEVERITY_RANK: dict[str, int] = {s: i for i, s in enumerate(REPORT_SEVERITIES)}
 
 
 # ── Message origin — WHO the message is from, as a party ──────────
@@ -364,7 +391,82 @@ class AdminThreadMessage(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     deleted_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
+    # ── Screenshot reports (migration 094) ────────────────────────────
+    #
+    # A report the user files from the app (POST /support/issues) opens as an
+    # `in` row of `kind='report'` in the SAME per-user thread every other
+    # message lives in — there is no thread entity (D3), so "one conversation
+    # per report" means one report CARD per report, never two reports merged
+    # into one card. The support_issues row keeps being the source of truth
+    # for triage; this row is the conversation's copy of it.
+    #
+    #   kind         NULL for text (every pre-094 row); 'report' for a report.
+    #   severity     the reporter's own rating; a column so the Conversations
+    #                list can badge the loudest unanswered one in SQL.
+    #   report_json  {support_issue_id, channel, context:{screen, app_version,
+    #                build, platform, device, os, raw}} — what was captured
+    #                alongside the note. Display data; nothing filters on it.
+    #
+    # The row's id is a uuid5 of the support issue id
+    # (`report_thread.report_message_id`), the same idempotency trick the
+    # fan-out uses: the screenshot arrives in a SECOND request and has to find
+    # this row without a lookup column, and a replayed intake collides on the
+    # PK instead of filing the same report twice.
+    kind: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    severity: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    report_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     __table_args__ = (
         # Both readers page the same way: one user's thread, newest last.
         Index("ix_admin_thread_user_created", "user_id", "created_at"),
+    )
+
+
+class AdminThreadAttachment(Base):
+    """A picture attached to one operator↔user thread message.
+
+    **The bytes live here, in the platform DB.** That mirrors
+    ``SupportAttachment`` (models/support.py) deliberately rather than by
+    accident: same trust boundary (the owning user, or an admin), same
+    platform-side data, and the same three reasons its docstring gives —
+    Railway's platform-api has ephemeral disk, Message/Conversation attachments
+    are AGENT_ONLY and so unreachable from a platform table, and low volume plus
+    a hard per-file cap make DB storage appropriate. ``file_storage.py``'s
+    S3Backend stub is the documented seam for when that stops being true.
+
+    Bounded on purpose. An unbounded blob column in THIS database is not a
+    hypothetical — the audio blob cache reached 96% of it before being retired.
+    The cap is enforced at the route (``admin_thread_attachment_max_bytes``),
+    and the CASCADE below is the other half: 092 lets a body be cleared for
+    everyone, and a picture that outlived the words it belonged to would be a
+    deletion that only looked complete.
+
+    Never served from a world-readable URL and never with a token in the query
+    string — the only readers are auth'd, ownership-checked routes.
+    """
+
+    __tablename__ = "admin_thread_attachments"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    message_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("admin_thread_messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Recognises a duplicate upload, and gives an integrity check that does not
+    # require pulling the blob back through the ORM to compute one.
+    sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    uploaded_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False,
+    )
+
+    __table_args__ = (
+        # The only read pattern: the attachments of messages already loaded.
+        Index("ix_admin_thread_attachments_message_id", "message_id"),
     )

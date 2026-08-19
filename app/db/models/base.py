@@ -238,6 +238,7 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "admin_dispatches",
     "admin_dispatch_targets",
     "admin_thread_messages",
+    "admin_thread_attachments",
 }
 
 SHARED_TABLES: set[str] = {

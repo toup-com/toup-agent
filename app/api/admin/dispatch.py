@@ -39,13 +39,19 @@ users keep writing into a thread nobody could read.
 from __future__ import annotations
 
 import logging
+import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import and_, case, func, or_, select, update as sa_update
+from sqlalchemy import (
+    and_, case, delete as sa_delete, func, or_, select, update as sa_update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.admin.deps import require_admin
@@ -57,11 +63,13 @@ from app.db.models import (
     AgentConfig,
     AdminDispatchTarget,
     AdminThreadMessage,
+    AdminThreadAttachment,
     CHAT_DELIVERED,
     CHAT_NO_AGENT,
     CHAT_RETRACTED,
     DISPATCH_AUDIENCE_ALL,
     DISPATCH_AUDIENCE_USER,
+    DISPATCH_MODE_PERSISTENT,
     DISPATCH_QUEUED,
     PE_DISPATCH_CREATED,
     PE_DISPATCH_DELETED,
@@ -71,9 +79,10 @@ from app.db.models import (
     TARGET_PENDING,
     TARGET_SENDING,
     THREAD_IN,
+    THREAD_KIND_REPORT,
     THREAD_OUT,
 )
-from app.services import dispatch_tones
+from app.services import dispatch_tones, report_thread
 from app.services.admin_dispatch_worker import (
     build_reply_notification,
     count_recipients,
@@ -276,6 +285,19 @@ class AdminDispatchTargetOut(BaseModel):
     last_error: Optional[str]
 
 
+class ThreadAttachmentOut(BaseModel):
+    """An attachment, described but never inlined.
+
+    The bytes are NOT base64'd into the thread payload: a thread GET returns up
+    to 500 messages, and a single 3 MB picture becomes ~4 MB of JSON that every
+    poll re-downloads. The client gets an id and fetches the image once, through
+    an auth'd route the browser and RN can both cache normally.
+    """
+    id: str
+    mime_type: str
+    size_bytes: int
+
+
 class AdminThreadMessageOut(BaseModel):
     """One row of an Admin thread. Shared verbatim with the user-facing
     surface — ``app/api/notices.py`` imports this model rather than declaring a
@@ -295,6 +317,20 @@ class AdminThreadMessageOut(BaseModel):
     # a replica predating the migration still validates.
     hidden_from_user_at: Optional[str] = None
     deleted_at: Optional[str] = None
+    # Migration 093. Defaults to empty rather than None so every client can
+    # iterate it without a null check, including one built against the older
+    # shape.
+    attachments: List[ThreadAttachmentOut] = []
+    # Migration 094 — a screenshot report the user filed from the app.
+    # `kind` is None on an ordinary text row and 'report' on a report; then
+    # `severity` is the reporter's own rating and `report` is the context
+    # block ({support_issue_id, channel, context:{screen, app_version, build,
+    # platform, device, os, raw}}). All optional so a replica predating the
+    # migration still validates, and a tombstoned report keeps its kind and
+    # severity but drops the context, the way it drops its attachments.
+    kind: Optional[str] = None
+    severity: Optional[str] = None
+    report: Optional[Dict[str, object]] = None
 
 
 class AdminThreadSummaryOut(BaseModel):
@@ -316,6 +352,17 @@ class AdminThreadSummaryOut(BaseModel):
     # stored (see delete_thread for why there is no admin_threads table).
     user_visible_total: int = 0
     retracted_at: Optional[str] = None
+    # Screenshot reports (migration 094). `report_severity` is the badge: the
+    # highest severity among the user's reports no operator has answered yet,
+    # else the latest report's; None when they have never filed one.
+    # `report_open` says which of those two it is — an unanswered critical is
+    # the loudest thing on the screen, an answered one is a label. Both are
+    # derived per page by `report_thread.report_state_for_users`, the same
+    # predicate `reply_in_thread` uses to decide a reply answers a report, so
+    # the badge and the delivery cannot disagree.
+    report_severity: Optional[str] = None
+    report_open: bool = False
+    report_count: int = 0
 
 
 class ThreadUserOut(BaseModel):
@@ -336,7 +383,36 @@ class DispatchPreviewOut(BaseModel):
     broadcast_enabled: bool = False
 
 
-def thread_message_out(m: AdminThreadMessage) -> AdminThreadMessageOut:
+async def load_thread_attachments(
+    db: AsyncSession, message_ids: Sequence[str],
+) -> dict[str, list[AdminThreadAttachment]]:
+    """Attachments for a page of messages, in ONE query.
+
+    Deliberately selects the metadata columns only — never ``data``. Loading the
+    ORM entity would pull every blob on the page into memory to render a list
+    that shows none of them.
+    """
+    if not message_ids:
+        return {}
+    rows = (await db.execute(
+        select(
+            AdminThreadAttachment.id,
+            AdminThreadAttachment.message_id,
+            AdminThreadAttachment.mime_type,
+            AdminThreadAttachment.size_bytes,
+        )
+        .where(AdminThreadAttachment.message_id.in_(list(message_ids)))
+        .order_by(AdminThreadAttachment.created_at.asc())
+    )).all()
+    out: dict[str, list] = {}
+    for r in rows:
+        out.setdefault(r.message_id, []).append(r)
+    return out
+
+
+def thread_message_out(
+    m: AdminThreadMessage, *, attachments: Sequence = (),
+) -> AdminThreadMessageOut:
     return AdminThreadMessageOut(
         id=m.id,
         direction=m.direction,
@@ -360,6 +436,125 @@ def thread_message_out(m: AdminThreadMessage) -> AdminThreadMessageOut:
         # The user's view filters them out entirely (`notices.py`).
         hidden_from_user_at=_utc_iso(getattr(m, "hidden_from_user_at", None)),
         deleted_at=_utc_iso(getattr(m, "deleted_at", None)),
+        # A deleted message keeps its tombstone but loses its picture: 092
+        # clears the body for everyone, and returning the attachment of a
+        # message whose words are gone would undo that deletion in the one
+        # place anybody would actually look.
+        attachments=(
+            [] if getattr(m, "deleted_at", None) else [
+                ThreadAttachmentOut(
+                    id=a.id, mime_type=a.mime_type, size_bytes=int(a.size_bytes or 0),
+                )
+                for a in attachments
+            ]
+        ),
+        # A report keeps its kind and severity through a tombstone — the thread
+        # still has to say "a report was here" — but the context block goes
+        # with the words and the picture.
+        kind=getattr(m, "kind", None),
+        severity=getattr(m, "severity", None),
+        report=(
+            None
+            if getattr(m, "deleted_at", None) or getattr(m, "kind", None) != THREAD_KIND_REPORT
+            else (getattr(m, "report_json", None) or None)
+        ),
+    )
+
+
+# ── Attachments (migration 093) ───────────────────────────────────
+#
+# Shared by BOTH sides so the validation cannot drift: an operator and a user
+# must not be able to store different things in the same table.
+
+
+async def store_thread_attachment(
+    db: AsyncSession,
+    *,
+    message_id: str,
+    file: UploadFile,
+    uploaded_by_user_id: str,
+) -> AdminThreadAttachment:
+    """Validate and persist one picture. Raises HTTPException on bad input.
+
+    Reads ``max + 1`` bytes on purpose: ``UploadFile.read(n)`` with no argument
+    would pull an arbitrarily large body into memory to measure it, which is the
+    denial-of-service the cap exists to prevent. One byte over the cap is enough
+    to know it is over.
+    """
+    mime = (file.content_type or "").split(";")[0].strip().lower()
+    allowed = list(getattr(
+        settings, "admin_thread_attachment_allowed_mime",
+        ["image/png", "image/jpeg", "image/webp"],
+    ))
+    if mime not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"unsupported media type: {mime or 'unknown'}",
+        )
+
+    max_bytes = int(getattr(settings, "admin_thread_attachment_max_bytes", 5_000_000))
+    data = await file.read(max_bytes + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > max_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"attachment exceeds {max_bytes} bytes",
+        )
+
+    att = AdminThreadAttachment(
+        id=str(uuid.uuid4()),
+        message_id=message_id,
+        data=data,
+        mime_type=mime,
+        size_bytes=len(data),
+        sha256=hashlib.sha256(data).hexdigest(),
+        uploaded_by_user_id=uploaded_by_user_id,
+        created_at=datetime.utcnow(),
+    )
+    db.add(att)
+    return att
+
+
+async def _purge_message_attachments(db: AsyncSession, message_ids: Sequence[str]) -> int:
+    """Destroy the bytes for these messages. Used by the `everyone` scope only.
+
+    An explicit DELETE rather than relying on the FK's ON DELETE CASCADE: 092
+    does not remove the row, it tombstones it, so the cascade never fires. The
+    cascade is there for a genuine row deletion; this is for the deletion that
+    deliberately keeps the row.
+    """
+    ids = list(message_ids)
+    if not ids:
+        return 0
+    res = await db.execute(
+        sa_delete(AdminThreadAttachment).where(
+            AdminThreadAttachment.message_id.in_(ids)
+        )
+    )
+    return int(res.rowcount or 0)
+
+
+def attachment_response(att: AdminThreadAttachment) -> Response:
+    """Serve the bytes. Callers do the authorisation BEFORE calling this.
+
+    ``private, max-age`` rather than ``no-store``: these are immutable (the id
+    is a uuid and the row is never rewritten), so a thread that renders the same
+    picture on every poll should not re-download it. `private` keeps it out of
+    any shared cache, which matters because the route is ownership-checked.
+    """
+    return Response(
+        content=att.data,
+        media_type=att.mime_type,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "Content-Length": str(att.size_bytes or len(att.data or b"")),
+            # These are user-supplied bytes served from our origin. Even though
+            # the mime allowlist is images-only, an attacker-controlled file
+            # that sniffs as HTML would run in our origin without this.
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "inline",
+        },
     )
 
 
@@ -831,6 +1026,10 @@ async def list_threads(
     last_row = {r.user_id: (r.body, r.direction) for r in body_rows}
 
     users = await _emails_for(db, set(page_ids))
+    # Report facts for the page — two queries over the page's ids, never a
+    # third aggregate over the table. Scoped like `latest` above and for the
+    # same reason.
+    reports = await report_thread.report_state_for_users(db, page_ids)
     threads = [
         AdminThreadSummaryOut(
             user_id=r.user_id,
@@ -850,6 +1049,9 @@ async def list_threads(
                 if int(r.total or 0) > 0 and int(r.user_visible or 0) == 0
                 else None
             ),
+            report_severity=reports.get(r.user_id, report_thread.EMPTY_REPORT_STATE).severity,
+            report_open=reports.get(r.user_id, report_thread.EMPTY_REPORT_STATE).open_count > 0,
+            report_count=reports.get(r.user_id, report_thread.EMPTY_REPORT_STATE).report_count,
         )
         for r in agg_rows
     ]
@@ -898,9 +1100,18 @@ async def get_thread(
               if (m.hidden_from_user_at or m.deleted_at)]
     hidden_at = max(stamps) if stamps else None
 
+    _atts = await load_thread_attachments(db, [m.id for m in rows])
+    # Whether the NEXT reply answers a report — the composer says so before the
+    # operator presses Send, because that reply is delivered differently (a
+    # card in their chat, not only a thread row). Same predicate as the list
+    # badge and as `reply_in_thread`, by construction: one function.
+    state = await report_thread.open_report_for_user(db, user_id)
     return {
         "user": ThreadUserOut(id=user.id, email=user.email, name=user.name),
-        "messages": [thread_message_out(m) for m in reversed(rows)],
+        "messages": [
+            thread_message_out(m, attachments=_atts.get(m.id, ()))
+            for m in reversed(rows)
+        ],
         # The count the sidebar badge and the "New messages" divider both key
         # off. Derived here rather than recomputed client-side from `messages`,
         # which is one page and would under-report a long thread.
@@ -910,6 +1121,12 @@ async def get_thread(
         ),
         "user_visible_total": visible,
         "retracted_at": _utc_iso(hidden_at) if rows and visible == 0 else None,
+        "report_count": state.report_count,
+        "open_report": (
+            {"id": state.open_report_id, "severity": state.open_severity,
+             "count": state.open_count, "ids": list(state.open_report_ids)}
+            if state.open_count > 0 else None
+        ),
     }
 
 
@@ -962,6 +1179,19 @@ async def reply_in_thread(
     ORDER: the row is committed FIRST. A notification announcing a message a
     rollback erased is a tap into an empty thread; the reverse leaves the reply
     readable in the thread, which is where the user was being sent anyway.
+
+    ONE EXCEPTION, and it is the support loop: when this reply ANSWERS A
+    REPORT — the user filed a screenshot report from the app and no operator
+    has answered since — the reply is delivered as a persistent DISPATCH to
+    that one user instead (``_answer_report``). Same thread row (the fan-out's
+    own uuid5 row, pre-written here so the response carries it), same
+    announcement push, PLUS the card in their chat with the Reply action, and
+    the Sent log records it. The user reported from inside the app and is
+    looking at the chat, not at an inbox they may never have opened; the answer
+    lands where they are. Follow-ups inside the conversation stay thread-only,
+    exactly as before, so a long support exchange does not fill their chat with
+    cards. Which of the two will happen is on the thread GET (`open_report`),
+    so the composer can say so before Send.
     """
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user:
@@ -972,6 +1202,14 @@ async def reply_in_thread(
     # dispatch's `sender_name`, so a follow-up in the thread must not arrive
     # unsigned or under a second name.
     sender_name = settings.admin_dispatch_sender_name
+
+    state = await report_thread.open_report_for_user(db, user_id)
+    if state.open_count > 0 and getattr(settings, "admin_dispatch_enabled", True):
+        return await _answer_report(
+            db, admin=admin, user_id=user_id, body=body.body,
+            sender_name=sender_name, state=state, now=now,
+        )
+
     msg = AdminThreadMessage(
         # id AND created_at explicit: both column defaults fire at flush, and
         # the response is built before the commit.
@@ -986,7 +1224,8 @@ async def reply_in_thread(
     )
     db.add(msg)
 
-    resp = {"message": thread_message_out(msg)}
+    resp = {"message": thread_message_out(msg), "in_chat": False, "dispatch_id": None,
+            "answered_report_id": None}
     await db.commit()
 
     try:
@@ -1011,7 +1250,192 @@ async def reply_in_thread(
     return resp
 
 
+async def _answer_report(
+    db: AsyncSession,
+    *,
+    admin: User,
+    user_id: str,
+    body: str,
+    sender_name: str,
+    state: report_thread.ReportState,
+    now: datetime,
+) -> dict:
+    """The operator's answer to a screenshot report, delivered as a persistent
+    dispatch to that one user — through the EXISTING fan-out, not a new path.
+
+    What the fan-out will do with it (``admin_dispatch_worker._deliver_one``):
+    ``_ensure_thread_row`` finds the row pre-written below and skips (same
+    uuid5), ``_ensure_notification`` enqueues the announcement push whose deep
+    link is the Admin thread (persistent mode), and ``_agent_hop`` writes the
+    card into their chat — title ``REPORT_REPLY_TITLE``, the operator's words,
+    the Reply action a persistent card carries. `no_agent` and a down tenant are
+    handled the way every other dispatch handles them: recorded on the target,
+    the panel's Sent detail says so, Retry reaches them later.
+
+    The thread row is written HERE, before the fan-out, for two reasons: the
+    response has to carry the message (the composer swaps its optimistic bubble
+    for it), and the row must exist even if the fan-out dies before its first
+    commit — the answer is then readable in the thread and the dispatch shows
+    `failed` in Sent, which is the honest state. The row's id is the fan-out's
+    own uuid5 of (dispatch, user), so the two can never write it twice.
+
+    Not `urgent`, no tone: a support answer is not an alarm.
+    """
+    dispatch = AdminDispatch(
+        id=str(uuid.uuid4()),
+        created_by_user_id=admin.id,
+        mode=DISPATCH_MODE_PERSISTENT,
+        audience=DISPATCH_AUDIENCE_USER,
+        target_user_id=user_id,
+        sender_name=sender_name,
+        title=report_thread.REPORT_REPLY_TITLE,
+        body=body,
+        urgent=False,
+        tone=None,
+        status=DISPATCH_QUEUED,
+        created_at=now,
+    )
+    db.add(dispatch)
+    msg = AdminThreadMessage(
+        id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"admin-thread:{dispatch.id}:{user_id}")),
+        user_id=user_id,
+        dispatch_id=dispatch.id,
+        direction=THREAD_OUT,
+        body=body,
+        author_admin_id=admin.id,
+        sender_name=sender_name,
+        created_at=now,
+    )
+    db.add(msg)
+
+    resp = {
+        "message": thread_message_out(msg),
+        "in_chat": True,
+        "dispatch_id": dispatch.id,
+        "answered_report_id": state.open_report_id,
+    }
+    await db.commit()
+
+    # Same funnel row a composed dispatch writes, so "answers to reports" is a
+    # filter on the events that already exist rather than a second table.
+    await emit_product_event(
+        PE_DISPATCH_CREATED,
+        user_id=user_id,
+        actor_user_id=admin.id,
+        entity_type=PE_ENTITY_DISPATCH,
+        entity_id=dispatch.id,
+        payload={
+            "mode": dispatch.mode,
+            "audience": dispatch.audience,
+            "urgent": False,
+            "report_reply": True,
+            "report_id": state.open_report_id,
+            "report_severity": state.open_severity,
+        },
+        dedupe_key=f"{PE_DISPATCH_CREATED}:{dispatch.id}",
+        occurred_at=now,
+    )
+
+    # AFTER the commit, as create_dispatch does: the worker opens its own
+    # session and would not see an uncommitted row.
+    await spawn_dispatch_fanout(dispatch.id)
+    logger.info(
+        "[admin-dispatch] %s answers report %s for %s (severity=%s) by %s",
+        dispatch.id[:8], (state.open_report_id or "?")[:8], user_id[:8],
+        state.open_severity, admin.id[:8],
+    )
+    return resp
+
+
 # ── Read ─────────────────────────────────────────────────────────────
+
+@router.post("/threads/{user_id}/attachment", status_code=201)
+async def reply_in_thread_with_attachment(
+    user_id: str,
+    file: UploadFile = File(...),
+    body: str = Form(default=""),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The operator's reply, carrying a picture.
+
+    A SEPARATE route rather than making ``reply_in_thread`` multipart. That one
+    takes a JSON body and is the path both clients already use for text; turning
+    it into ``multipart/form-data`` would change the content type of every
+    existing caller to add a field almost none of them send.
+
+    Message and attachment are created in ONE transaction, so there is no window
+    where a row exists without the picture it is entirely about — and no orphan
+    attachment if the user abandons the compose. That is the reason this is not
+    a two-phase "upload, then reference" API.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    now = datetime.utcnow()
+    sender_name = settings.admin_dispatch_sender_name
+    msg = AdminThreadMessage(
+        id=str(uuid.uuid4()),
+        user_id=user_id,
+        dispatch_id=None,
+        direction=THREAD_OUT,
+        body=(body or "").strip(),
+        author_admin_id=admin.id,
+        sender_name=sender_name,
+        created_at=now,
+    )
+    db.add(msg)
+    # Validation raises BEFORE the commit, so a rejected file leaves no row.
+    att = await store_thread_attachment(
+        db, message_id=msg.id, file=file, uploaded_by_user_id=admin.id,
+    )
+
+    resp = {"message": thread_message_out(msg, attachments=[att])}
+    await db.commit()
+
+    try:
+        await build_reply_notification(
+            db,
+            user_id=user_id,
+            message_id=msg.id,
+            # A picture with no words still has to say something on a lock
+            # screen; "" would announce a blank notification.
+            body=msg.body or "Sent you an image",
+            sender_name=sender_name,
+            now=now,
+        )
+    except Exception:
+        logger.exception("[dispatch] reply notification failed for %s", user_id)
+
+    return resp
+
+
+@router.get("/threads/{user_id}/attachments/{att_id}")
+async def get_thread_attachment_admin(
+    user_id: str,
+    att_id: str,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Serve an attachment to an admin.
+
+    Scoped by ``user_id`` as well as the attachment id, so a mistyped or
+    guessed id cannot return a picture from somebody else's thread just because
+    the caller is an admin. The join is the authorisation.
+    """
+    att = (await db.execute(
+        select(AdminThreadAttachment)
+        .join(AdminThreadMessage, AdminThreadMessage.id == AdminThreadAttachment.message_id)
+        .where(
+            AdminThreadAttachment.id == att_id,
+            AdminThreadMessage.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not att:
+        raise HTTPException(404, "Attachment not found")
+    return attachment_response(att)
+
 
 @router.get("")
 async def list_dispatches(
@@ -1261,6 +1685,12 @@ async def delete_thread_message(
             row.deleted_at = now
             row.deleted_by_user_id = admin.id
             row.body = DELETED_BODY
+            # The picture goes with the words. "Delete for everyone" CLEARS the
+            # body rather than hiding it, so leaving the bytes fetchable by id
+            # would make the destructive scope the one that destroys less — and
+            # in a thread about a screenshot, the image IS the message. Also the
+            # only thing that reclaims the blob.
+            await _purge_message_attachments(db, [row.id])
     else:
         if row.hidden_from_user_at is None:
             row.hidden_from_user_at = now
@@ -1343,6 +1773,10 @@ async def delete_thread(
         else:
             m.hidden_from_user_at = now
             m.deleted_by_user_id = admin.id
+
+    if scope == SCOPE_EVERYONE:
+        # See the per-message path: the bytes go with the body they belonged to.
+        await _purge_message_attachments(db, [m.id for m in rows])
 
     # Committed BEFORE the hops, same ordering as revoke_dispatch: the
     # operator's intent is a fact the moment they press the button, and a crash

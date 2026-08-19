@@ -30,6 +30,14 @@ WHAT IT PROVES, in order (each step fails loudly with its own message):
     10 a `persistent` dispatch opens a thread instead        (and does NOT retract)
     11 the user can reply, and the operator can read it      (the ongoing thread)
     12 the operator can answer, and the user sees it         (with a notification)
+    — the support loop (round 5, steps 15-18 as printed) —
+    15 a screenshot report filed from the app appears in     (severity badge, report row,
+       the operator's Conversations, picture and all          the very bytes the phone sent)
+    16 the operator's answer lands in the user's CHAT as a   (persistent dispatch through the
+       card, in their thread, and as one push                 same fan-out; tenant wrote the card)
+    17 the user's answer comes back into the operator's      (and does not re-open the report)
+       thread
+    18 a follow-up after the answer is thread-only            (no second card)
 
 USAGE
     cd backend && ./.venv-test/bin/python scripts/e2e_admin_dispatch.py
@@ -154,6 +162,48 @@ def http(method: str, url: str, *, token=None, agent_key=None, body=None, expect
     return status, payload
 
 
+def http_upload(url: str, *, token: str, filename: str, data: bytes, mime: str, expect=None):
+    """One multipart/form-data POST with a single `file` part — what the mobile
+    client does with the screenshot. Hand-rolled boundary; nothing here needs a
+    client library, and the platform's own test suite already trusts httpx."""
+    boundary = f"----toupE2E{uuid.uuid4().hex}"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    ).encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode()
+            status = r.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        status = e.code
+    try:
+        payload = json.loads(raw) if raw else None
+    except json.JSONDecodeError:
+        payload = raw
+    if expect is not None and status != expect:
+        raise AssertionError(f"POST(multipart) {url} → {status} (wanted {expect})\n{raw[:600]}")
+    return status, payload
+
+
+def http_bytes(url: str, *, token: str, expect=200) -> tuple[int, bytes, str]:
+    """GET raw bytes (an attachment). Returns (status, body, content-type)."""
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read(), r.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as e:
+        if expect is not None and e.code != expect:
+            raise AssertionError(f"GET {url} → {e.code} (wanted {expect})")
+        return e.code, e.read(), e.headers.get("Content-Type", "")
+
+
 def wait_up(port: int, proc: subprocess.Popen, name: str, timeout=90) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -251,6 +301,14 @@ def main() -> int:
         }))
         procs.append(spawn("platform", "platform_main", plat_port, {
             "RUN_MODE": "platform", "DATABASE_URL": plat_db,
+            # Steps 15-18: the screenshot-report loop rides /api/support/issues,
+            # which is dark-launched behind this flag. The card email is off (no
+            # provider here) — the thread is the destination under test; and
+            # the diagnosis pipeline it also spawns has no LLM key and fails
+            # quietly in the platform log, which is fine: nothing below reads
+            # it.
+            "SUPPORT_AGENT_ENABLED": "true",
+            "SUPPORT_NOTIFY_ENABLED": "false",
         }))
         wait_up(agent_port, procs[0], "agent")
         wait_up(plat_port, procs[1], "platform")
@@ -461,6 +519,120 @@ def main() -> int:
               f"the reply enqueued its own notification (got {len(replies)}) — "
               "an answer nobody is told about is not an answer")
 
+        # ═══ THE SUPPORT LOOP (round 5) ══════════════════════════════════
+        # A screenshot report filed from the app opens as a report row in the
+        # user's Admin thread; the operator's answer is delivered as a
+        # persistent dispatch — a card in the user's CHAT (written by the
+        # tenant, over the network) plus the thread and a push; the user's
+        # reply comes back into the operator's thread. Cross-seam, for real.
+        step("The user files a SCREENSHOT REPORT from the app (note, severity, context, picture)")
+        _, intake = http("POST", f"{PLAT}/api/support/issues", token=user_token,
+                         body={"raw_report": "The send button does nothing on the chat screen",
+                               "channel": "mobile", "severity": "critical",
+                               "repro_info": "Screen: Chat\nApp: 1.2.0 (40)\n"
+                                             "Device: iPhone 15 Pro · iOS 18.5\nPlatform: ios"},
+                         expect=200)
+        issue_id = intake["id"]
+        png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4
+        http_upload(f"{PLAT}/api/support/issues/{issue_id}/attachment", token=user_token,
+                    filename="shot.png", data=png, mime="image/png", expect=200)
+        ok(f"support card {issue_id[:8]} filed, screenshot uploaded ({len(png)} bytes)")
+
+        _, threads2 = http("GET", f"{PLAT}/api/admin/dispatch/threads", token=admin_token, expect=200)
+        row = next((t for t in threads2["threads"] if t["user_id"] == user_id), None)
+        check(row is not None, "the report is in the operator's Conversations list")
+        if row:
+            check(row.get("report_severity") == "critical" and row.get("report_open") is True,
+                  f"badged CRITICAL and unanswered (got {row.get('report_severity')!r}, "
+                  f"open={row.get('report_open')!r})")
+            check(row["last_direction"] == "in" and "send button" in (row["last_body"] or ""),
+                  "the note is the conversation's last line")
+        _, opview2 = http("GET", f"{PLAT}/api/admin/dispatch/threads/{user_id}",
+                          token=admin_token, expect=200)
+        reports = [m for m in opview2["messages"] if m.get("kind") == "report"]
+        check(len(reports) == 1, f"one report row in the thread (got {len(reports)})")
+        rep = reports[0] if reports else {}
+        check(rep.get("severity") == "critical" and rep.get("direction") == "in",
+              "it is the user's own row, rated critical")
+        check((rep.get("report") or {}).get("support_issue_id") == issue_id,
+              "it names the support card it mirrors")
+        ctx = (rep.get("report") or {}).get("context") or {}
+        check(ctx.get("build") == "40" and ctx.get("screen") == "Chat" and ctx.get("platform") == "ios",
+              f"with the app build, screen and platform parsed out (got {ctx})")
+        atts = rep.get("attachments") or []
+        check(len(atts) == 1, f"the screenshot hangs off the report row (got {len(atts)})")
+        if atts:
+            st_b, got, ctype = http_bytes(
+                f"{PLAT}/api/admin/dispatch/threads/{user_id}/attachments/{atts[0]['id']}",
+                token=admin_token)
+            check(st_b == 200 and got == png and ctype.startswith("image/png"),
+                  f"the operator fetches the very bytes the phone sent ({len(got)} B, {ctype})")
+        check(opview2.get("open_report", {}) and opview2["open_report"].get("severity") == "critical",
+              "the thread says the next reply answers a critical report")
+
+        step("The operator answers the report — it lands in the user's CHAT as a card")
+        _, ans = http("POST", f"{PLAT}/api/admin/dispatch/threads/{user_id}", token=admin_token,
+                      body={"body": "Thanks — we can reproduce it. Which build are you on?"},
+                      expect=201)
+        check(ans.get("in_chat") is True and bool(ans.get("dispatch_id")),
+              "the reply was delivered as a persistent dispatch (in_chat=True)")
+        rep_disp = ans.get("dispatch_id") or ""
+        deadline = time.time() + 30
+        det2 = None
+        while rep_disp and time.time() < deadline:
+            _, det2 = http("GET", f"{PLAT}/api/admin/dispatch/{rep_disp}", token=admin_token)
+            if det2["dispatch"]["status"] in ("sent", "failed"):
+                break
+            time.sleep(0.4)
+        check(bool(det2) and det2["dispatch"]["status"] == "sent",
+              f"its fan-out settled to 'sent' (got {det2 and det2['dispatch']['status']})")
+        if det2:
+            check(det2["dispatch"]["title"] == "Reply to your report" and det2["dispatch"]["mode"] == "persistent",
+                  "titled 'Reply to your report', persistent (⇒ Reply action)")
+            tg = det2["targets"][0] if det2["targets"] else {}
+            check(tg.get("chat_status") == "delivered", f"the tenant wrote the card (chat_status={tg.get('chat_status')})")
+        _, msgs4 = http("GET", f"{AGENT}/api/day-chats/{today}/messages", agent_key=AGENT_KEY, expect=200)
+        card = [m for m in msgs4 if (m.get("admin_notice") or {}).get("dispatch_id") == rep_disp]
+        check(len(card) == 1, "the answer is IN the user's chat history, on the tenant, as a card")
+        if card:
+            n = card[0]["admin_notice"]
+            check(n["mode"] == "persistent" and n["title"] == "Reply to your report",
+                  f"the card carries the report-answer title and the Reply action (mode={n['mode']})")
+            check("reproduce it" in (card[0].get("content") or ""), "with the operator's words")
+        _, thread3 = http("GET", f"{PLAT}/api/notices/thread", token=user_token, expect=200)
+        check(any("reproduce it" in m["body"] for m in thread3["messages"] if m["direction"] == "out"),
+              "…and in the user's Admin thread")
+        outs_for = [m for m in thread3["messages"] if m["direction"] == "out" and "reproduce it" in m["body"]]
+        check(len(outs_for) == 1, "exactly once — the fan-out did not duplicate the pre-written row")
+        r = probe(code, env)
+        rows = json.loads(r.stdout.strip().splitlines()[-1])
+        pushes = [x for x in rows if x["idem"] == f"admin-dispatch:{rep_disp}:{user_id}"]
+        check(len(pushes) == 1 and (pushes[0]["data"] or {}).get("deep_link") == f"toup://notices?mission=admin:{rep_disp}",
+              "one announcement push for the answer, deep-linked to the Admin thread")
+        _, threads3 = http("GET", f"{PLAT}/api/admin/dispatch/threads", token=admin_token, expect=200)
+        row3 = next((t for t in threads3["threads"] if t["user_id"] == user_id), None)
+        check(bool(row3) and row3.get("report_open") is False and row3.get("report_severity") == "critical",
+              "the report is now ANSWERED — the badge falls from open to a label")
+
+        step("The user answers from the card, and it shows in the operator's thread")
+        http("POST", f"{PLAT}/api/notices/thread", token=user_token,
+             body={"body": "Build 40, TestFlight."}, expect=201)
+        _, opview3 = http("GET", f"{PLAT}/api/admin/dispatch/threads/{user_id}",
+                          token=admin_token, expect=200)
+        last = opview3["messages"][-1] if opview3["messages"] else {}
+        check(last.get("direction") == "in" and last.get("body") == "Build 40, TestFlight.",
+              "the user's answer is the newest row in the operator's thread")
+        check(opview3.get("open_report") is None, "and it does not re-open the report (only a report does)")
+
+        step("A follow-up inside the conversation is thread-only, as before")
+        _, fu = http("POST", f"{PLAT}/api/admin/dispatch/threads/{user_id}", token=admin_token,
+                     body={"body": "Fix ships in 1.2.1 — thanks."}, expect=201)
+        check(fu.get("in_chat") is False and fu.get("dispatch_id") is None,
+              "no dispatch, no card: the answer to the report was the card; this is a thread reply")
+        _, msgs5 = http("GET", f"{AGENT}/api/day-chats/{today}/messages", agent_key=AGENT_KEY, expect=200)
+        check(sum(1 for m in msgs5 if m.get("admin_notice")) == sum(1 for m in msgs4 if m.get("admin_notice")),
+              "the user's chat gained no card for it")
+
         # ── verdict ──────────────────────────────────────────────────────
         print()
         if _failures:
@@ -469,7 +641,8 @@ def main() -> int:
                 print(f"    · {f}")
             return 1
         print("\033[32m✓ end to end: composed on the platform, written by the tenant, "
-              "read by the user, retracted, replied to, and answered.\033[0m")
+              "read by the user, retracted, replied to, and answered — and a screenshot "
+              "report filed from the app was answered into the user's chat.\033[0m")
         return 0
 
     finally:
