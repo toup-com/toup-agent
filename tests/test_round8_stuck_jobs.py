@@ -60,6 +60,8 @@ class _ScriptedLLM:
                 ("s1", "web_search", {"query": "x"}),
                 ("s2", "web_search", {"query": "y"}),
             ]
+        elif self.calls == 2 and self.second_round_step == "hand_off":
+            batch = [("m1", "start_mission", {"title": "Keep watching", "goal": "watch releases"})]
         elif self.calls == 2:
             batch = [
                 ("u1", "update_job", {"job_id": self.jobs["id"], "current_step": self.second_round_step}),
@@ -149,6 +151,8 @@ async def _run_turn(monkeypatch, tmp_path, *, second_round_step: int = 1,
         if name == "web_fetch":
             await asyncio.sleep(0.02)
             return "# Docs\nbody text"
+        if name == "start_mission":
+            return "Mission created: \"Keep watching\" (id m-1)."
         return "?"
 
     monkeypatch.setattr(tools, "execute", fake_execute)
@@ -551,3 +555,28 @@ def test_legacy_rows_without_stamps_get_the_jobs_own_window_not_zero():
                {"id": "b", "type": "step_1", "label": "Write", "status": "pending"}]
     advance_steps(legacy2, 0, created + timedelta(seconds=4), fallback_start=created)
     assert legacy2[0]["duration_ms"] == 4000 and legacy2[1]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_a_handed_off_job_stays_open_and_the_reconciler_leaves_it(monkeypatch, tmp_path):
+    """The tool contract sanctions finishing via spawn / start_mission — the
+    job continues after the reply, so the finalizer must NOT close it, and
+    must mark it so the reconciler leaves it alone too."""
+    from app.agent import job_reconciler as jr
+    resp, job_id, frames, user_id, session_id = await _run_turn(
+        monkeypatch, tmp_path, second_round_step="hand_off")
+    assert job_id
+    row = await _job_row(job_id)
+    assert row.status == "running"
+    assert (row.config_json or {}).get("handed_off") is True
+    assert not [f for f in frames if f.get("job_id") == job_id and f.get("status") == "completed"]
+    # the answer message exists and the job is old enough, yet the reconciler
+    # respects the hand-off
+    from app.db import async_session_maker
+    from app.db.models import BuildJob
+    async with async_session_maker() as db:
+        j = await db.get(BuildJob, job_id)
+        j.created_at = datetime.utcnow() - timedelta(minutes=5)
+        await db.commit()
+    assert await jr.reconcile_delivered_turn_jobs() == 0
+    assert (await _job_row(job_id)).status == "running"
