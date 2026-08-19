@@ -69,10 +69,21 @@ def test_finalizer_closes_exact_recorded_ids():
     assert "take_created_job_ids()" in blk
     assert "_CJ.id == _jid" in blk
     assert "_CJ.user_id == user_id" in blk
-    assert "conversation_id ==" not in blk, (
-        "the conversation_id predicate is the inert/over-broad design; "
-        "close exact ids instead"
-    )
+    # Round 8: the ONE sanctioned conversation_id read is the registry
+    # fallback — used only when the turn called create_job and the registry
+    # came back empty (the 2026-08-19 lost-ContextVar shape) — and it is
+    # BOUNDED to this turn's window (created_at >= the turn's start), which
+    # is what the exact-id design was protecting against. Any other
+    # conversation_id predicate here is the inert/over-broad design.
+    import re as _re
+    for m in _re.finditer(r"conversation_id ==", blk):
+        stmt = blk[max(0, m.start() - 600): m.end() + 400]
+        assert "created_at >= datetime.utcfromtimestamp(start)" in stmt, (
+            "a conversation_id predicate in the finalizer must be bounded to "
+            "this turn (created_at >= the turn's start); an unbounded one "
+            "would close EARLIER turns' jobs"
+        )
+        assert 'tc.get("name") == "create_job"' in stmt or "not _created_job_ids" in stmt
 
 
 def test_the_phantom_session_attribute_never_returns():
@@ -127,7 +138,13 @@ def test_outcome_is_not_keyed_on_reply_text():
     turns as failures."""
     blk = _finalizer_block()
     assert '_answered' not in blk
-    assert 'status="completed"' in blk
+    # Round 8: the completed close moved to the shared closer
+    # (job_reconciler.close_job_completed) so the finalizer, the reconciler
+    # and the reaper write ONE terminal shape; the finalizer must call it.
+    assert "_close_job_completed(" in blk
+    _RECON = (_BACKEND / "app" / "agent" / "job_reconciler.py").read_text()
+    assert '"status": "completed"' in _RECON
+    assert 'BuildJob.status == "running"' in _RECON, "guarded close: running rows only"
 
 
 def test_card_end_push_survives_turn_cancellation():

@@ -386,9 +386,35 @@ _SESSION_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 # instance attr) because one ToolExecutor is shared across concurrent turns
 # and by spawned sub-agents — an instance list would let one turn close
 # another's jobs.
-_CREATED_JOB_IDS_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
-    "tool_executor_created_job_ids", default=(),
+#
+# Round 8: the value is a per-turn MUTABLE LIST, set once by set_session_id()
+# in the turn's own task and thereafter only MUTATED (append / clear in
+# place), never re-`set()`. Round 4's follow-up ran create_job inside
+# ``asyncio.gather(_run_bookkeeping(), web_batch)`` — a Task, which runs in a
+# COPY of the context — so a ``.set(ids + (job_id,))`` there landed in the
+# copy and evaporated when the Task finished. The finalizer read ``()`` and
+# every job created in the prescribed Round-4 shape (create_job in the same
+# response as the first searches) was left running for good (production,
+# 2026-08-19). A child Task inherits the REFERENCE to the parent's list, so
+# an append inside it is visible to the parent's finalizer, while a new turn
+# (its own set_session_id, its own list) still cannot see another turn's ids.
+_CREATED_JOB_IDS_CTX: contextvars.ContextVar[list] = contextvars.ContextVar(
+    "tool_executor_created_job_ids",
 )
+
+
+def _created_job_registry() -> list:
+    """The current turn's registry, creating one when no set_session_id()
+    ran in this context (tests, non-runner callers). The runner always sets
+    it, so the create-here path is the exception, not the design."""
+    try:
+        reg = _CREATED_JOB_IDS_CTX.get()
+    except LookupError:
+        reg = None
+    if not isinstance(reg, list):
+        reg = []
+        _CREATED_JOB_IDS_CTX.set(reg)
+    return reg
 # The assistant message id this turn's answer will be persisted under.
 # AgentRunner pre-mints it at run start (so generate_* attachments can
 # reference it before the row exists) and hands it to set_session_id();
@@ -5602,14 +5628,19 @@ class ToolExecutor:
         the "now" a relative reminder counts from (Round 4)."""
         _SESSION_ID_CTX.set(session_id or None)
         _ASST_MESSAGE_ID_CTX.set(asst_message_id or None)
-        _CREATED_JOB_IDS_CTX.set(())
+        # A FRESH list per turn (never `.clear()` of the inherited one: a
+        # sub-agent's run() would otherwise wipe its parent turn's registry).
+        _CREATED_JOB_IDS_CTX.set([])
         _TURN_STARTED_AT_CTX.set(float(turn_started_at) if turn_started_at else None)
 
     def take_created_job_ids(self) -> tuple:
         """Job ids the `create_job` tool made during this turn, then reset.
-        AgentRunner.run() calls this once at turn end to close them."""
-        ids = _CREATED_JOB_IDS_CTX.get()
-        _CREATED_JOB_IDS_CTX.set(())
+        AgentRunner.run() calls this once at turn end to close them. Reads
+        and clears the shared list IN PLACE — see _CREATED_JOB_IDS_CTX for
+        why it must never be replaced with a `.set()`."""
+        reg = _created_job_registry()
+        ids = tuple(reg)
+        del reg[:]
         return ids
 
     def peek_created_job_ids(self) -> tuple:
@@ -5617,7 +5648,7 @@ class ToolExecutor:
         resetting. `update_job` uses it to tell "a job of this turn" (whose
         terminal card push belongs to the runner's finalizer, which knows
         the answer text + message id) from an older job."""
-        return _CREATED_JOB_IDS_CTX.get()
+        return tuple(_created_job_registry())
 
     def turn_deep_link(self) -> tuple:
         """(chat_id, message_id) for this turn's pushes — the deep-link
@@ -6315,6 +6346,8 @@ class ToolExecutor:
         # (LA stepName, push bodies) — store them plain so no surface has to
         # remember to strip. Titles/descriptions are stripped at push time.
         from app.services.plain_text import plain_preview as _plain
+        from datetime import datetime as _dt_cj
+        from app.agent.job_steps import dump_steps as _dump_steps, open_first_step
         steps = []
         for i, label in enumerate(step_labels):
             steps.append({
@@ -6323,6 +6356,10 @@ class ToolExecutor:
                 "label": _plain(str(label), 120) or str(label),
                 "status": "pending",
             })
+        # Round 8: step 0 is RUNNING from creation, with its start stamped —
+        # the clients no longer have to guess which step is live, and the
+        # step's duration has a real opening edge.
+        open_first_step(steps, _dt_cj.utcnow())
         step_labels = [st["label"] for st in steps]
 
         # Round 3 (item 1): the icon-system tag, derived from the title's
@@ -6332,6 +6369,15 @@ class ToolExecutor:
         from app.agent.job_type import classify_job_type
         job_type = classify_job_type(title, description)
         chat_id, asst_message_id = self.turn_deep_link()
+        # Round 8: the answer message id this job's turn will persist under,
+        # so the reconciler (job_reconciler.py) can PROVE the answer was
+        # delivered — "does that message row exist?" — and close the job if
+        # the in-process finalizer never got to. config_json, not
+        # summary_message_id: that column is the "Open in chat" back-link
+        # and is stamped at completion, when the message exists.
+        _job_cfg: Dict[str, Any] = {"job_type": job_type}
+        if asst_message_id:
+            _job_cfg["asst_message_id"] = str(asst_message_id)[:64]
 
         # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
         # so the new columns are populated for agent-authored tasks.
@@ -6351,7 +6397,7 @@ class ToolExecutor:
             channel="agent_task",
             source_kind="manual",
             conversation_id=_SESSION_ID_CTX.get(),
-            config_json={"job_type": job_type},
+            config_json=_job_cfg,
         )
         job = await JobRunner().create_job(
             job_type="agent_task",
@@ -6361,7 +6407,7 @@ class ToolExecutor:
             status="running",
             model=settings.agent_model,
             layer=0,
-            steps_json=_json.dumps(steps),
+            steps_json=_dump_steps(steps),
         )
         job_id = job.id
 
@@ -6369,8 +6415,10 @@ class ToolExecutor:
         # the exact ids is what keeps the close precise: filtering by
         # conversation_id instead would sweep up jobs from EARLIER turns of the
         # same long-lived conversation, and source_kind='manual' is shared with
-        # dashboard-created jobs.
-        _CREATED_JOB_IDS_CTX.set(_CREATED_JOB_IDS_CTX.get() + (job_id,))
+        # dashboard-created jobs. APPEND to the shared per-turn list — never
+        # `.set()` a new value — so this is visible from inside the runner's
+        # concurrent bookkeeping Task (see _CREATED_JOB_IDS_CTX).
+        _created_job_registry().append(job_id)
 
         # Broadcast to frontend
         first_step = step_labels[0] if step_labels else "Working..."
@@ -6460,40 +6508,37 @@ class ToolExecutor:
             new_status = "waiting_on_user"
             error_message = None
 
+        from app.agent.job_steps import (
+            advance_steps as _advance_steps, counts as _step_counts,
+            dump_steps as _dump_steps, finish_all_steps as _finish_all,
+            parse_steps as _parse_steps,
+        )
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
             if not job:
                 return f"ERROR: Job {job_id} not found"
 
-            steps = []
-            try:
-                steps = _json.loads(job.steps_json) if job.steps_json else []
-            except (ValueError, TypeError):
-                pass
+            steps = _parse_steps(job.steps_json)
+            _now_uj = _dt.utcnow()
 
-            # Mark steps as done up to current_step
-            completed_count = 0
+            # Mark steps as done up to current_step. Round 8: the transition
+            # rules (and the per-step timing they stamp) live in job_steps —
+            # the same rules the finalizer and the reconciler apply, so the
+            # three writers cannot disagree about a step's window.
             if current_step is not None and steps:
-                for i, s in enumerate(steps):
-                    if i <= current_step:
-                        s["status"] = "done"
-                        completed_count += 1
-                    elif i == current_step + 1:
-                        s["status"] = "running"
-                job.steps_json = _json.dumps(steps)
-            else:
-                completed_count = sum(1 for s in steps if s.get("status") == "done")
+                _advance_steps(steps, int(current_step), _now_uj)
+                job.steps_json = _dump_steps(steps)
+            completed_count, _ = _step_counts(steps)
 
             if new_status:
                 job.status = new_status
             if error_message:
                 job.error_message = error_message
             if new_status == "completed":
-                job.completed_at = _dt.utcnow()
+                job.completed_at = _now_uj
                 # Mark all steps done
-                for s in steps:
-                    s["status"] = "done"
-                job.steps_json = _json.dumps(steps)
+                _finish_all(steps, _now_uj)
+                job.steps_json = _dump_steps(steps)
                 completed_count = len(steps)
             elif new_status == "waiting_on_user":
                 # NOT terminal: `completed_at` is what the clients read as

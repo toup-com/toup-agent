@@ -49,6 +49,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/devices/live-activity", tags=["Live Activity Devices"])
 
 
+def _looks_like_job_id(mission_id: str) -> bool:
+    """A raw uuid mission name is a JOB card (the widget's own rule:
+    ``JobFace.isWorkCard`` — anything without a reserved prefix). Every
+    reserved family carries a ``prefix:``; a bare uuid never does."""
+    try:
+        return str(uuid.UUID(mission_id)) == mission_id.lower()
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def _is_hex_token(v: str) -> bool:
     try:
         bytes.fromhex(v)
@@ -316,8 +326,20 @@ async def report_activity_token(
         await db.commit()
         return {"ok": True, "updated": updated}
 
+    # Round 8: JOB cards adopt too. The app starts a job's card locally when
+    # it backgrounds mid-job, named after the raw job id ("the platform's
+    # mission id for this job" — liveActivityLocal.ios.ts) or, per the
+    # updated contract, ``chatjob:<chat_id>``. The platform keys a chat
+    # job's pushes ``chatjob:<chat_id>`` and, since Round 8, also delivers
+    # them to a card registered under the job id (live_activity_service
+    # ``_job_id_of``). Without adoption the local card was invisible here,
+    # so it froze at whatever state the app last painted while the platform
+    # went on updating a card of its own — the "Live Activity says 1/3, the
+    # app says 2/3" disagreement (2026-08-19).
     if not (body.mission_id.startswith("chatturn:")
-            or body.mission_id.startswith("voice:")):
+            or body.mission_id.startswith("voice:")
+            or body.mission_id.startswith("chatjob:")
+            or _looks_like_job_id(body.mission_id)):
         return {"ok": True, "updated": 0}
 
     # Adopt: bind the locally-started turn card to the caller's most

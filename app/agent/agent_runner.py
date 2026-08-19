@@ -3053,7 +3053,25 @@ class AgentRunner:
                     event_fields=_steps.event_fields(),
                 )
                 if _bk_tcs:
-                    _, _par_res = await asyncio.gather(_run_bookkeeping(), _batch_coro)
+                    # Round 8: the batch is the Task; the bookkeeping runs
+                    # HERE, in the turn's own coroutine and context. Round
+                    # 4's follow-up gathered both, and `gather` runs each
+                    # coroutine in a Task with a COPY of the context — the
+                    # create_job registry write happened in the copy and the
+                    # finalizer never saw the job (production 2026-08-19: every
+                    # Round-4-shaped job left running). Same overlap, same
+                    # timing; the registry is now a shared list as well, so
+                    # neither half of this fix depends on the other. A cancel
+                    # (cancel_check raises in _run_bookkeeping, or the turn's
+                    # task is cancelled) takes the batch down with it, as the
+                    # gather did.
+                    _batch_task = asyncio.ensure_future(_batch_coro)
+                    try:
+                        await _run_bookkeeping()
+                        _par_res = await _batch_task
+                    except BaseException:
+                        _batch_task.cancel()
+                        raise
                 else:
                     _par_res = await _batch_coro
                 _parallel_results.update(_par_res)
@@ -3560,12 +3578,64 @@ class AgentRunner:
         _handed_off = any(
             tc.get("name") in ("spawn", "start_mission") for tc in all_tool_calls
         )
+        # Round 8: belt and braces for the registry. If the turn CALLED
+        # create_job but the registry is empty (the exact shape of the
+        # 2026-08-19 regression — a registry write lost across a Task
+        # boundary), fall back to the DB: this conversation's running
+        # agent-authored jobs created since this turn began. Bounded by the
+        # turn's own start so it cannot sweep an earlier turn's job — the
+        # over-reach the exact-id design exists to avoid. Costs nothing on
+        # turns that made no job.
+        if (not _created_job_ids
+                and any(tc.get("name") == "create_job" for tc in all_tool_calls)):
+            try:
+                from sqlalchemy import select as _sel_fb
+                from app.db.models import BuildJob as _CJfb
+                async with async_session_maker() as _fdb:
+                    _fb_rows = (await _fdb.execute(
+                        _sel_fb(_CJfb.id).where(
+                            _CJfb.user_id == user_id,
+                            _CJfb.conversation_id == session_id,
+                            _CJfb.status == "running",
+                            _CJfb.source_kind == "manual",
+                            _CJfb.job_type == "agent_task",
+                            _CJfb.created_at >= datetime.utcfromtimestamp(start) - timedelta(seconds=2),
+                        )
+                    )).all()
+                _created_job_ids = tuple(r[0] for r in _fb_rows)
+                if _created_job_ids:
+                    logger.warning(
+                        "[AGENT] create_job registry was empty; recovered %d job(s) "
+                        "from the DB for this turn", len(_created_job_ids),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.debug("[AGENT] registry DB fallback failed", exc_info=True)
+        if _created_job_ids and _handed_off:
+            # Something else (a sub-agent, a mission) owns the job now — mark
+            # it so the reconciler leaves it alone as well.
+            try:
+                from sqlalchemy import select as _sel_ho
+                from app.db.models import BuildJob as _CJho
+                async with async_session_maker() as _hdb:
+                    for _jid in _created_job_ids:
+                        _hj = await _hdb.get(_CJho, _jid)
+                        if _hj is not None and _hj.status == "running":
+                            _hcfg = dict(_hj.config_json or {})
+                            _hcfg["handed_off"] = True
+                            _hj.config_json = _hcfg
+                    await _hdb.commit()
+            except Exception:  # noqa: BLE001
+                logger.debug("[AGENT] handed_off stamp failed", exc_info=True)
         if _created_job_ids and not _handed_off:
             try:
                 from sqlalchemy import update as _upd_cj
                 from app.db.models import BuildJob as _CJ
                 from app.agent.job_status import (
                     ERR_AWAITING_CONFIRMATION, awaiting_confirmation,
+                )
+                from app.agent.job_reconciler import (
+                    announce_completed as _announce_completed,
+                    close_job_completed as _close_job_completed,
                 )
 
                 # Reaching this line means run() completed normally — an
@@ -3588,35 +3658,35 @@ class AgentRunner:
                 _park = bool(_staged_actions)
                 _now = datetime.utcnow()
                 _closed: List[tuple] = []
-                _values = (
-                    dict(status="waiting_on_user", completed_at=None,
-                         error_class=ERR_AWAITING_CONFIRMATION,
-                         user_message=awaiting_confirmation().user_message,
-                         total_tokens=total_input + total_output,
-                         model=model_used)
-                    if _park else
-                    dict(status="completed", completed_at=_now,
-                         total_tokens=total_input + total_output,
-                         model=model_used)
-                )
+                # Round 8: the completed close is the SHARED one
+                # (job_reconciler.close_job_completed) — status, completed_at,
+                # every remaining step done with its real window, the
+                # summary_message_id back-link, a job_events row — so the
+                # finalizer, the reconciler and the reaper write one terminal
+                # shape and the surfaces cannot disagree.
+                _completed: List[Any] = []
                 async with async_session_maker() as _cdb:
-                    # Guarded UPDATE rather than SELECT-then-mutate: `update_job`
-                    # or the reaper may drive a row terminal while we work, and
-                    # a read-then-write would clobber that. The WHERE re-checks
-                    # 'running' at write time.
-                    for _jid in _created_job_ids:
-                        _res = await _cdb.execute(
-                            _upd_cj(_CJ)
-                            .where(_CJ.id == _jid,
-                                   _CJ.user_id == user_id,
-                                   _CJ.status == "running")
-                            .values(**_values)
-                            .returning(_CJ.id, _CJ.title)
-                        )
-                        _row = _res.first()
-                        if _row:
-                            _closed.append((_row[0], _row[1] or ""))
-                    if _closed and _park:
+                    if _park:
+                        # Guarded UPDATE rather than SELECT-then-mutate:
+                        # `update_job` or the reaper may drive a row terminal
+                        # while we work, and a read-then-write would clobber
+                        # that. The WHERE re-checks 'running' at write time.
+                        for _jid in _created_job_ids:
+                            _res = await _cdb.execute(
+                                _upd_cj(_CJ)
+                                .where(_CJ.id == _jid,
+                                       _CJ.user_id == user_id,
+                                       _CJ.status == "running")
+                                .values(status="waiting_on_user", completed_at=None,
+                                        error_class=ERR_AWAITING_CONFIRMATION,
+                                        user_message=awaiting_confirmation().user_message,
+                                        total_tokens=total_input + total_output,
+                                        model=model_used)
+                                .returning(_CJ.id, _CJ.title)
+                            )
+                            _row = _res.first()
+                            if _row:
+                                _closed.append((_row[0], _row[1] or ""))
                         # Which card holds each job — the resume path matches on
                         # this. Written in the same transaction as the status so
                         # a parked job can never exist without its action id.
@@ -3626,6 +3696,17 @@ class AgentRunner:
                                 _pcfg = dict(_pj.config_json or {})
                                 _pcfg["pending_action_id"] = _staged_actions[-1]
                                 _pj.config_json = _pcfg
+                    else:
+                        for _jid in _created_job_ids:
+                            _cj = await _close_job_completed(
+                                _cdb, _jid, user_id=user_id, now=_now,
+                                message_id=asst_message_id if save_assistant_message else None,
+                                total_tokens=total_input + total_output,
+                                model=model_used, reason="turn_end",
+                            )
+                            if _cj is not None:
+                                _completed.append(_cj)
+                                _closed.append((_cj.job_id, _cj.title))
                     if _closed:
                         await _cdb.commit()
 
@@ -3640,6 +3721,7 @@ class AgentRunner:
                     # tool already sent. Card content per job: title, icon
                     # tag, m/m steps, its own conversation.
                     _to_end: List[Dict[str, Any]] = []
+                    _closed_now = {c.job_id for c in _completed}
                     from sqlalchemy import select as _sel_cj
                     _rows = (await _cdb.execute(
                         _sel_cj(_CJ.id, _CJ.title, _CJ.status,
@@ -3649,7 +3731,7 @@ class AgentRunner:
                                _CJ.user_id == user_id)
                     )).all()
                     for _r in _rows:
-                        if _r[2] != "completed":
+                        if _r[2] != "completed" or _r[0] in _closed_now:
                             continue
                         try:
                             _steps = json.loads(_r[3]) if _r[3] else []
@@ -3692,6 +3774,15 @@ class AgentRunner:
                                     cta_label="Open the chat to approve",
                                     chat_id=session_id, message_id=asst_message_id,
                                 )
+                        # Round 8: jobs closed here — the in-app frame (the web
+                        # card is WS-driven only) + the terminal card push, in
+                        # the one shape every closer uses.
+                        for _cj in _completed:
+                            await _announce_completed(
+                                _cj, message_id=asst_message_id, preview=final_text,
+                                day_chat_id=_day_chat_id or None,
+                                chat_id_fallback=session_id,
+                            )
                         # Jobs the model already marked completed mid-turn
                         # get their terminal push whether or not a sibling
                         # was parked — their card is otherwise never ended.

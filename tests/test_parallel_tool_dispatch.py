@@ -138,9 +138,12 @@ def test_loop_still_builds_results_in_tool_use_order():
 
 def test_loop_consumes_precomputed_parallel_results():
     # Round 4: the batch coroutine is built once and either awaited alone or
-    # gathered with the bookkeeping chain; the ordered loop consumes both.
+    # overlapped with the bookkeeping chain; the ordered loop consumes both.
+    # Round 8: the overlap is "batch as a Task, bookkeeping in the turn's own
+    # coroutine" — never a gather over both (see test_round4_speed).
     assert "_batch_coro = self._execute_tools_parallel(" in _SRC
-    assert "await asyncio.gather(_run_bookkeeping(), _batch_coro)" in _SRC
+    assert "_batch_task = asyncio.ensure_future(_batch_coro)" in _SRC
+    assert "await _run_bookkeeping()" in _SRC
     assert '_parallel_results.get(tc["id"])' in _SRC
 
 

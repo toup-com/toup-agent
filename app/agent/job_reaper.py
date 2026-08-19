@@ -53,6 +53,17 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
     cutoff = now - STALE_AFTER
     stale_minutes = int(STALE_AFTER.total_seconds() // 60)
 
+    # Round 8: a stalled job whose turn's answer was DELIVERED is completed,
+    # not cancelled — "stopped before it finished" was the lie this reaper
+    # told about every finalizer-less job for weeks. The reconciler runs on
+    # its own minute loop too; calling it here means this sweep can never
+    # cancel a row the reconciler would have completed a moment later.
+    try:
+        from app.agent.job_reconciler import reconcile_delivered_turn_jobs
+        await reconcile_delivered_turn_jobs(now)
+    except Exception as _re:  # noqa: BLE001 — the stall sweep still runs
+        logger.warning("[job_reaper] reconcile before sweep failed: %s", _re)
+
     async with async_session_maker() as db:
         result = await db.execute(
             select(BuildJob).where(

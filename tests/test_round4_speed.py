@@ -184,9 +184,18 @@ def test_job_bookkeeping_runs_with_the_web_batch_and_the_loop_stamps_after():
     runs after both — is what stamps step attribution on the frames."""
     src = _code_only(_RUN_INNER_SRC)
     i_bk = src.index("async def _run_bookkeeping() -> None:")
-    i_gather = src.index("await asyncio.gather(_run_bookkeeping(), _batch_coro)")
+    # Round 8: same overlap, different shape — the batch is the Task
+    # (ensure_future) and the bookkeeping runs in the turn's own coroutine,
+    # so create_job's per-turn registry write lands in the turn's context
+    # (an `asyncio.gather` ran it in a Task with a COPIED context and the
+    # finalizer never saw the job — production 2026-08-19).
+    i_task = src.index("_batch_task = asyncio.ensure_future(_batch_coro)")
+    i_await_bk = src.index("await _run_bookkeeping()\n                        _par_res = await _batch_task")
     i_loop = src.index("for tc in pending_tool_calls:\n                if cancel_check and cancel_check():")
-    assert i_bk < i_gather < i_loop
+    assert i_bk < i_task < i_await_bk < i_loop
+    assert "await asyncio.gather(_run_bookkeeping()" not in src, (
+        "bookkeeping must not run inside a gather Task — the ContextVar "
+        "registry write would be lost to the finalizer")
     # the pre-executed job tools are consumed by the ordered loop like the
     # parallel results are (no double execution)
     assert '_parallel_results[tc["id"]] = {' in src

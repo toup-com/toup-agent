@@ -136,6 +136,36 @@ def _is_chat_turn_mission(row: NotificationQueue, mission_id: str) -> bool:
         or mission_id.startswith(_CHAT_TURN_PREFIXES)
     )
 
+
+# Round 8: the widget's phase vocabulary by row kind (mirror of
+# subagent_orchestrator.JOB_PHASE_BY_KIND, kept here so the platform can
+# derive it for rows an older agent sent without ``data.phase``).
+_JOB_PHASE_BY_KIND = {
+    NOTIFY_KIND_MISSION_STARTED: "starting",
+    NOTIFY_KIND_PROGRESS: "running",
+    NOTIFY_KIND_MISSION_COMPLETED: "completed",
+    NOTIFY_KIND_MISSION_FAILED: "failed",
+    NOTIFY_KIND_NEEDS_INPUT: "needs_you",
+    NOTIFY_KIND_NEEDS_APPROVAL: "needs_you",
+}
+
+
+def _job_id_of(row: NotificationQueue) -> Optional[str]:
+    """The job a JOB row is about (``data.job_id``), when it differs from
+    the mission id it addresses. Round 8: the app starts a job's card
+    LOCALLY under the raw job id ("the platform's mission id for this
+    job") while the platform keys a chat job's pushes ``chatjob:<chat>``
+    — so a job push must also reach a card registered under the job id,
+    or the two surfaces drift apart the moment the app backgrounds."""
+    data = row.data_json or {}
+    if data.get("kind") != "job":
+        return None
+    jid = data.get("job_id")
+    if not isinstance(jid, str) or not jid.strip():
+        return None
+    jid = jid.strip()[:64]
+    return jid if jid != _mission_id(row) else None
+
 # An admin announcement is NOT from the user's agent, so its card must
 # not wear the agent's orb color — the Toup brand hue disowns it on the
 # lock screen the same way AdminNoticeCard does in chat.
@@ -368,7 +398,11 @@ def _row_extra_state(row: NotificationQueue) -> Dict[str, Any]:
     re-syncs it from the fraction it actually sends."""
     data = row.data_json or {}
     out: Dict[str, Any] = {}
-    for src, dst in (("job_type", "jobType"), ("step_name", "stepName"),
+    # Round 8: the widget's ContentState v2 keys ride alongside the Round-3
+    # ones — ``stepLabel`` = the step line, ``jobKind`` = the icon tag —
+    # so a pushed card carries the same fields a locally-started one does.
+    for src, dst in (("job_type", "jobType"), ("job_type", "jobKind"),
+                     ("step_name", "stepName"), ("step_name", "stepLabel"),
                      ("preview", "preview")):
         v = data.get(src)
         if isinstance(v, str) and v.strip():
@@ -380,6 +414,16 @@ def _row_extra_state(row: NotificationQueue) -> Dict[str, Any]:
     prog = data.get("progress")
     if isinstance(prog, (int, float)) and not isinstance(prog, bool):
         out["percent"] = max(0, min(100, int(prog)))
+    # ``phase``: the producer's word when it sent one (Round-8 agents stamp
+    # every job push), else derived from the row kind — so cards pushed by
+    # older agents render the same face. Job/turn rows only: a reminder or
+    # voice row is not a work card and must not grow a phase.
+    if data.get("kind") in ("job", "chat_turn") or _is_chat_turn_mission(row, _mission_id(row) or ""):
+        ph = data.get("phase")
+        if not (isinstance(ph, str) and ph in _JOB_PHASE_BY_KIND.values()):
+            ph = _JOB_PHASE_BY_KIND.get(row.event_kind)
+        if ph:
+            out["phase"] = ph
     cid = _safe_id(data.get("chat_id"))
     if cid:
         out["chatId"] = cid
@@ -595,18 +639,36 @@ async def _started_rows_for_device(db, device_id: str) -> List[LiveActivity]:
 
 
 async def _activities_for_mission(
-    db, user_id: str, mission_id: str,
+    db, user_id: str, mission_id: str, also_mission_id: Optional[str] = None,
 ) -> List[Tuple[LiveActivity, LiveActivityDevice]]:
+    """Started activities for ``mission_id`` — and, when given, for
+    ``also_mission_id`` (Round 8: a job row's raw job id, the name the
+    app's locally-started job card registers under). One row per device
+    when both names are up on it, and the LOCAL (``also_mission_id``) row
+    wins: it is the newer card and always carries a per-activity token
+    (adoption requires one), whereas an update to the platform's row over
+    the shared push-to-start token would preempt-end the local card to
+    disambiguate — the exact duplicate/flap this exists to prevent."""
+    names = [mission_id] + ([also_mission_id] if also_mission_id else [])
     result = await db.execute(
         select(LiveActivity, LiveActivityDevice)
         .join(LiveActivityDevice, LiveActivity.device_id == LiveActivityDevice.id)
         .where(
             LiveActivity.user_id == user_id,
-            LiveActivity.mission_id == mission_id,
+            LiveActivity.mission_id.in_(names),
             LiveActivity.status == LA_STARTED,
         )
     )
-    return [(la, dev) for la, dev in result.all()]
+    rows = [(la, dev) for la, dev in result.all()]
+    if not also_mission_id or len(rows) < 2:
+        return rows
+    by_device: Dict[str, Tuple[LiveActivity, LiveActivityDevice]] = {}
+    for la, dev in rows:
+        prev = by_device.get(la.device_id)
+        if prev is None or (prev[0].mission_id != also_mission_id
+                            and la.mission_id == also_mission_id):
+            by_device[la.device_id] = (la, dev)
+    return list(by_device.values())
 
 
 async def _row_for(db, device_id: str, mission_id: str) -> Optional[LiveActivity]:
@@ -1017,6 +1079,9 @@ async def handle_notification_row(
     per_device: Dict[str, Any] = {}
     delivered = False
     errored = False
+    # Round 8: a job row also addresses the card the app started for the
+    # job under its raw id (see _job_id_of).
+    job_alias = _job_id_of(row)
 
     if row.event_kind in _START_EVENT_KINDS:
         # data.silent → card appears without a banner (reminder
@@ -1037,7 +1102,9 @@ async def handle_notification_row(
         )
         for device in devices:
             started = await _started_rows_for_device(db, device.id)
-            _same = next((la for la in started if la.mission_id == mission_id), None)
+            _same = next((la for la in started
+                          if la.mission_id == mission_id
+                          or (job_alias and la.mission_id == job_alias)), None)
             if _same is not None:
                 if (
                     (row.data_json or {}).get("refresh_if_started")
@@ -1092,7 +1159,7 @@ async def handle_notification_row(
         status = "ok" if delivered else ("error" if errored else "skipped")
         return {"status": status, "delivered": delivered, "devices": per_device}
 
-    activities = await _activities_for_mission(db, row.user_id, mission_id)
+    activities = await _activities_for_mission(db, row.user_id, mission_id, job_alias)
     restarted = False
     restart_loud = False
 
@@ -1192,7 +1259,7 @@ async def handle_notification_row(
         # freshly started card.
         restarted = True
         delivered = False
-        activities = await _activities_for_mission(db, row.user_id, mission_id)
+        activities = await _activities_for_mission(db, row.user_id, mission_id, job_alias)
 
     if not activities:
         frag_skip: Dict[str, Any] = {
@@ -1218,6 +1285,20 @@ async def handle_notification_row(
             effective = max(effective, la.last_progress / 100.0)
 
         if row.event_kind == NOTIFY_KIND_PROGRESS:
+            # Round 8: a JOB progress row that would move the bar backwards
+            # is a reordered/retried OLDER tick — its step line and n/m
+            # counts are older too. The content state is replaced whole by
+            # every push, so "clamp the bar, apply the rest" put a stale
+            # "1/3 · Compare evidence" over a card the app already showed
+            # at 2/3. Drop the row for this device instead. Job rows only:
+            # their percent is a function of steps done, so lower means
+            # older; a mission's self-estimated percent may honestly fall.
+            if (
+                job_alias is not None or (row.data_json or {}).get("kind") == "job"
+            ) and progress is not None and la.last_progress is not None \
+                    and int(round(progress * 100)) < la.last_progress:
+                per_device[device.id] = {"status": "skipped", "reason": "stale_progress"}
+                continue
             headline = (row.body or row.title or "Working…")[:120]
             payload = apns_push.build_update_payload(
                 title=title, subtitle=headline, progress=effective,

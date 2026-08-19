@@ -598,6 +598,19 @@ CHAT_JOB_MISSION_PREFIX = "chatjob:"
 #: inside a worker holding a DB connection.
 JOB_CARD_END_AFTER_S = 8
 
+#: Round 8: the widget's phase vocabulary (LiveActivityWidget.swift
+#: ``JobFace.Phase``) by notify kind. Stamped on every job push as
+#: ``data.phase``; the platform's LA lane mirrors it into the content
+#: state (``phase``) and derives the same value for older agents' rows.
+JOB_PHASE_BY_KIND = {
+    "mission_started": "starting",
+    "progress": "running",
+    "mission_completed": "completed",
+    "mission_failed": "failed",
+    "needs_input": "needs_you",
+    "needs_approval": "needs_you",
+}
+
 
 def job_mission_id(job_id: str, chat_id: Optional[str]) -> str:
     """The Live Activity mission id a job's pushes address."""
@@ -634,6 +647,7 @@ async def _notify_job_event(
     refresh_if_started: bool = False,
     mission_id: Optional[str] = None,
     route: Optional[str] = None,
+    phase: Optional[str] = None,
 ) -> None:
     """Phone-surface lifecycle event for a spawned job: durable outbox →
     platform → APNs Live Activity (lock screen card + Dynamic Island),
@@ -661,6 +675,11 @@ async def _notify_job_event(
         at-least-once duplicate (a NEW job on the conversation's card).
       * ``mission_id`` / ``route`` — explicit overrides; derived from
         ``chat_id`` when omitted.
+      * ``phase`` (Round 8) — the card's phase in the widget's own
+        vocabulary (starting · running · completed · failed · needs_you);
+        derived from ``kind`` when omitted, so every job push carries the
+        state the phone should draw instead of leaving the widget to infer
+        it from the bar and the subtitle.
 
     Best-effort by contract: a job must never fail on notification
     plumbing."""
@@ -677,6 +696,9 @@ async def _notify_job_event(
             "job_id": job_id,
             "urgent": urgent,
         }
+        _phase = phase or JOB_PHASE_BY_KIND.get(kind)
+        if _phase:
+            data["phase"] = _phase
         if progress is not None:
             data["progress"] = progress
         if timer_end_ms:

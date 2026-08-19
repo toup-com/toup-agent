@@ -195,9 +195,18 @@ from app.services.plain_text import (  # noqa: E402  (stdlib-only module)
     strip_markdown as _strip_md,
 )
 
+# Round 8: ``phase`` / ``stepLabel`` / ``jobKind`` are the widget's
+# ContentState v2 keys (ios-widget/LiveActivityWidget.swift, 2026-08-18) —
+# the app's own local cards write them, and the widget derives its whole
+# face from ``phase`` when present, falling back to bar+subtitle inference
+# for older payloads. Until now the platform never sent them, so a pushed
+# card and a locally-started card for the same job could disagree.
+# ``stepName``/``jobType`` stay as-is for the older widget lineage.
 _EXTRA_STATE_STR = {"jobType": 16, "stepName": 80, "preview": 120,
-                    "chatId": 64, "messageId": 64}
+                    "chatId": 64, "messageId": 64,
+                    "phase": 16, "stepLabel": 80, "jobKind": 16}
 _EXTRA_STATE_INT = ("stepsDone", "stepsTotal", "percent")
+_KNOWN_PHASES = frozenset({"starting", "running", "completed", "failed", "needs_you"})
 
 
 def _extra_state(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -213,10 +222,12 @@ def _extra_state(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             # strip markdown BEFORE the cap (a `**` pair split by the cap
             # would otherwise survive). Ids are never markdown; skipping
             # them keeps _safe_id's output byte-identical.
-            if key in ("chatId", "messageId", "jobType"):
+            if key in ("chatId", "messageId", "jobType", "jobKind", "phase"):
                 out[key] = " ".join(v.split())[:cap]
             else:
                 out[key] = _plain(v, cap)
+    if out.get("phase") not in _KNOWN_PHASES:
+        out.pop("phase", None)
     for key in _EXTRA_STATE_INT:
         v = extra.get(key)
         if isinstance(v, bool):

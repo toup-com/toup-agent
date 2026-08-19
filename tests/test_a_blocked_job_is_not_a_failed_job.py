@@ -303,11 +303,15 @@ def test_the_turn_end_finalizer_parks_instead_of_reporting_done():
         "closes every job `completed` including the parked ones"
     )
     park = src.index("_park = bool(")
-    values = src.index('status="completed", completed_at=_now')
-    assert park < values, (
-        "the completed-values dict is built before _park is decided — the "
-        "branch cannot influence what is written"
+    # Round 8: the completed close is the shared closer, called only on the
+    # not-parked branch; the parked branch writes waiting_on_user itself.
+    completed = src.index("_cj = await _close_job_completed(")
+    parked = src.index('.values(status="waiting_on_user", completed_at=None,')
+    assert park < parked and park < completed, (
+        "the close is decided before _park is — the branch cannot influence "
+        "what is written"
     )
+    assert "if _park:" in src[park:completed], "the completed close must sit under the not-parked branch"
 
 
 def test_the_finalizer_reads_a_field_that_save_messages_does_not_consume():

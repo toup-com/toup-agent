@@ -629,6 +629,18 @@ async def lifespan(app: FastAPI):
             from app.db.database import async_session_maker
             from app.agent.job_recovery import recover_orphaned_jobs
 
+            # Round 8: a job whose answer was ALREADY delivered is completed,
+            # not "interrupted by the restart". Runs first, so recovery only
+            # ever sees rows that genuinely have no answer behind them.
+            # (job_reconciler.py — the same rule runs every minute after boot.)
+            try:
+                from app.agent.job_reconciler import reconcile_delivered_turn_jobs
+                _reconciled = await reconcile_delivered_turn_jobs()
+                if _reconciled:
+                    print(f"🧾 Boot reconcile: completed {_reconciled} delivered job(s)")
+            except Exception as _re:  # noqa: BLE001 — never block boot
+                print(f"⚠️ Boot reconcile skipped: {_re}")
+
             _rec = await recover_orphaned_jobs(async_session_maker)
             _interrupted = _rec.interrupted
             _gave_up = _rec.gave_up
@@ -922,6 +934,19 @@ async def lifespan(app: FastAPI):
             print("🧹 Stalled-job reaper started")
         except Exception as e:
             print(f"⚠️ Could not start stalled-job reaper: {e}")
+
+        # Round 8: delivered-turn reconciler — no job may stay 'running'
+        # after its turn's answer has been persisted. The turn-end finalizer
+        # is the primary closer; this is the server-side guarantee behind it
+        # (app/agent/job_reconciler.py), every 60 s.
+        try:
+            from app.agent.job_reconciler import reconcile_loop
+            app.state.job_reconciler_task = asyncio.create_task(
+                reconcile_loop(), name="delivered-jobs-reconcile",
+            )
+            print("🧾 Delivered-job reconciler started")
+        except Exception as e:
+            print(f"⚠️ Could not start job reconciler: {e}")
 
         # TriggerRunner — event-driven sibling. Started after RoutineRunner
         # so its restart sweep + rate-bucket warmup run before any inbound

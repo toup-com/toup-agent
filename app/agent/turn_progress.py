@@ -169,15 +169,28 @@ class TurnProgressEmitter:
             return
         if meta:
             # Provisional step context from the runner (see agent_runner
-            # OnToolStart docs); step_change refines it.
+            # OnToolStart docs); step_change refines it. Round 8: the
+            # provisional fields are a SNAPSHOT taken before the round's
+            # bookkeeping ran (the web batch is scheduled with them and its
+            # tool_start frames arrive after update_job advanced the step),
+            # so they may name an OLDER step than the last step_change did.
+            # They can only move the beacon FORWARD — a beacon that stepped
+            # back would push a lower stepsDone onto the phone card and the
+            # island would read "1/3" after the app said "2/3". A different
+            # job id is a new job and resets.
+            new_job = bool(meta.get("job_id")) and meta.get("job_id") != self.job_id
             if meta.get("job_id"):
                 self.job_id = meta.get("job_id")
             if meta.get("step_index") is not None:
                 try:
-                    self.step_index = int(meta["step_index"])
+                    _idx = int(meta["step_index"])
+                    if new_job or self.step_index is None or _idx >= self.step_index:
+                        self.step_index = _idx
+                        if meta.get("step_name"):
+                            self.step_name = meta.get("step_name")
                 except (TypeError, ValueError):
                     pass
-            if meta.get("step_name"):
+            elif meta.get("step_name") and (new_job or not self.step_name):
                 self.step_name = meta.get("step_name")
             if meta.get("steps_total"):
                 self.steps_total = int(meta["steps_total"])

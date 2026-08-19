@@ -88,7 +88,10 @@ def test_create_job_persists_and_returns_the_tag_without_touching_the_column():
     HANDLER discriminator and dispatch keys on it."""
     src = (_BACKEND / "app" / "agent" / "tool_executor.py").read_text()
     body = _fn_body(src, "async def _tool_create_job(")
-    assert 'config_json={"job_type": job_type}' in body
+    # Round 8: config_json also carries the turn's answer id for the
+    # reconciler; the tag is still the first key.
+    assert '_job_cfg: Dict[str, Any] = {"job_type": job_type}' in body
+    assert "config_json=_job_cfg" in body
     assert 'job_type="agent_task"' in body, "the handler discriminator is untouched"
     assert '"job_type": job_type' in body, "create_job's response carries the tag"
     assert '"job_type": job_type,' in _fn_body(src, "async def _tool_update_job(")
