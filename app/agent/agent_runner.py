@@ -1246,10 +1246,11 @@ class AgentRunner:
                 continue
             try:
                 from app.agent.subagent_orchestrator import _notify_job_event
+                from app.services.plain_text import humanize_label as _hl
                 _cfg = cfg if isinstance(cfg, dict) else {}
                 await _notify_job_event(
                     job_id=jid, label=title or "", kind="mission_completed",
-                    title=f"✅ Done: {(title or 'background task')[:150]}",
+                    title=f"✅ Done: {_hl(title)[:150]}",
                     body="Finished.", progress=100,
                     dismiss_after_s=900, dedup_suffix="completed",
                     chat_id=conv_id, job_type=_cfg.get("job_type"),
@@ -1342,6 +1343,13 @@ class AgentRunner:
         app_id: Optional[str] = None,
         force_new_session: bool = False,
         suppress_tools: bool = False,
+        # Epoch seconds the channel RECEIVED the user's message. run() starts
+        # only after the ack, the presave, the fast-path probe and task-intent
+        # detection, so anchoring "in N seconds" at run() entry lagged the ask
+        # by their sum (~0.1–1s, unbounded under load). The channel's own
+        # receipt stamp is the honest base for request-anchored offsets
+        # (routines__remind); absent → run() entry, as before.
+        received_at: Optional[float] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -1599,7 +1607,13 @@ class AgentRunner:
             # set_* calls above: session_id is only resolved above. The
             # pre-minted answer id rides along so job pushes can deep-link
             # to the reply before it exists (Round 3, item 3).
-            self.tools.set_session_id(session_id, asst_message_id, turn_started_at=start)
+            # turn_started_at prefers the channel's receipt stamp — the skill
+            # counts relative reminders from it, and PERF/waterfall keep
+            # `start` (run entry) so their spans stay honest.
+            self.tools.set_session_id(
+                session_id, asst_message_id,
+                turn_started_at=(received_at if received_at else start),
+            )
 
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
@@ -3763,8 +3777,15 @@ class AgentRunner:
                     # Round 4 (item 4): the card preview is plain text — a
                     # reply opening with **bold** put literal asterisks on the
                     # lock screen. Strip BEFORE slicing.
-                    from app.services.plain_text import plain_preview as _plain_preview
-                    _preview = _plain_preview(final_text, 100)
+                    from app.services.plain_text import (
+                        answer_preview as _answer_preview,
+                        humanize_label as _humanize_label,
+                        plain_preview as _plain_preview,
+                    )
+                    # The finished card's body: the first CONTENT line of the
+                    # answer, never the opening ack (push-copy gate,
+                    # 2026-08-19).
+                    _preview = _answer_preview(final_text, 100, fallback="Finished.")
 
                     async def _end_cards() -> None:
                         if _park:
@@ -3797,7 +3818,7 @@ class AgentRunner:
                             await _notify_job_event(
                                 job_id=_j["job_id"], label=_j["title"],
                                 kind="mission_completed",
-                                title=f"✅ Done: {_plain_preview(_j['title'] or 'background task', 150)}",
+                                title=f"✅ Done: {_humanize_label(_plain_preview(_j['title'] or '', 150))}",
                                 body=_preview or "Finished.", progress=100,
                                 dismiss_after_s=900, dedup_suffix="completed",
                                 chat_id=_j["chat_id"], message_id=asst_message_id,

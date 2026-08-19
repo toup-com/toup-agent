@@ -35,6 +35,7 @@ from app.db.models import User, Conversation, Message
 from app.api.auth import get_current_user
 from app.api.day_chats import (
     _serialize_admin_notice, _serialize_attachments, _serialize_media,
+    _serialize_tool_events,
 )
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,7 @@ async def messages_since(
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
             "admin_notice": _serialize_admin_notice(msg),
+            "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
         }

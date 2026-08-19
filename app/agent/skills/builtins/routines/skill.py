@@ -872,6 +872,12 @@ class RoutinesSkill(Skill):
                 delivery = None
 
         # ── Build the create payload now that tz is resolved ───────────
+        # When the reminder was SET — the request-anchored base for relative
+        # one-shots (overwritten below), creation time otherwise. Rides the
+        # result as `created_at_utc` so every client surface draws the
+        # set→fire span from one absolute base.
+        from datetime import timezone as _tz_set
+        set_at_naive = datetime.now(_tz_set.utc).replace(tzinfo=None, microsecond=0)
         payload: Dict[str, Any] = {
             "kind": "reminder",
             "name": name,
@@ -907,7 +913,16 @@ class RoutinesSkill(Skill):
                 _target = _base_dt + timedelta(seconds=once_in_seconds)
                 if _target < _now_utc + timedelta(seconds=2):
                     _target = _now_utc + timedelta(seconds=2)
+                # Round to the NEAREST second — replace(microsecond=0) alone
+                # truncated DOWN, shaving up to 0.999s off the requested
+                # offset on top of the anchor's own lag.
+                if _target.microsecond >= 500_000:
+                    _target += timedelta(seconds=1)
                 dt_utc = _target.replace(tzinfo=None, microsecond=0)
+                # The instant the offset was counted from — the result carries
+                # it as created_at_utc so every client surface can draw the
+                # set→fire span from the same absolute base.
+                set_at_naive = _base_dt.replace(tzinfo=None, microsecond=0)
             else:
                 dt_local = self._parse_local_datetime(once_raw_at or "", tz)
                 if dt_local is None:
@@ -957,14 +972,18 @@ class RoutinesSkill(Skill):
                 "[routines_skill.remind] duplicate suppressed user=%s existing=%s",
                 user_id[:8], _dup["id"],
             )
-            return _as_json({
+            # Compact like the created result — the duplicate dict leads with
+            # id + reminder_text + schedule_at_utc for the same cut-survival
+            # reason (its card parse is status-gated today, but the shape
+            # must not drift from the created one).
+            return json.dumps({
                 "status": "already_scheduled",
                 "reminder": _dup,
                 "hint": (
                     "This exact reminder is already scheduled — nothing new was "
                     "created. Tell the user it is set (once)."
                 ),
-            })
+            }, default=str, ensure_ascii=False)
 
         try:
             resp = await create_routine(req)
@@ -984,18 +1003,33 @@ class RoutinesSkill(Skill):
         delivery_out = (
             (resp.config or {}).get("delivery_channels") if resp.config else None
         ) or ["website"]
-        return _as_json({
+        # COMPACT and ORDERED, deliberately: the live tool_end frame cuts this
+        # result at 200 chars, and the chat's reminder card draws its FIRST
+        # paint from whatever survives the cut. The old shape pretty-printed
+        # (indent=2), led with `name`, echoed the mode enum as `when`, and
+        # carried no reminder_text at all — so the card's first frame could
+        # only say "Wake up reminder / Set for once" and flipped to the real
+        # text and countdown a fetch later. id + reminder_text and (for texts
+        # up to ~58 chars) schedule_at_utc sit inside the first 200 chars;
+        # created_at_utc survives only for very short texts — the card's
+        # origin has two deeper fallbacks (the live surface seeds it at the
+        # ask, the routines cache carries created_at), so that is fine.
+        # Everything the model needs but the card doesn't comes after.
+        return json.dumps({
             "status": "created",
             "reminder": {
                 "id": resp.id,
-                "name": resp.name,
-                "when": when,
-                "schedule_kind": getattr(resp, "schedule_kind", None),
-                "schedule_cron_local": resp.schedule_cron_local,
+                "reminder_text": text,
                 "schedule_at_utc": (
                     str(getattr(resp, "schedule_at", None))
                     if getattr(resp, "schedule_at", None) else None
                 ),
+                "created_at_utc": str(set_at_naive),
+                "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
+                "when": when,
+                "name": resp.name,
+                "schedule_kind": getattr(resp, "schedule_kind", None),
+                "schedule_cron_local": resp.schedule_cron_local,
                 "schedule_interval_seconds": getattr(
                     resp, "schedule_interval_seconds", None
                 ),
@@ -1007,13 +1041,12 @@ class RoutinesSkill(Skill):
                 ),
                 "enabled": resp.enabled,
                 "delivery_channels": delivery_out,
-                "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
             },
             "hint": (
                 "Reminder is live. The user can change/cancel it any time "
                 "from Mission Control on the dashboard."
             ),
-        })
+        }, default=str, ensure_ascii=False)
 
     # ── Duplicate guard (Round 4, item 5c) ─────────────────────────
     @staticmethod
@@ -1063,13 +1096,17 @@ class RoutinesSkill(Skill):
                 if (getattr(r, "schedule_cron_local", "") or "") != (payload.get("schedule_cron_local") or ""):
                     continue
             return {
+                # Same lead order as the create result: the card's parser
+                # reads whatever survives a 200-char cut.
                 "id": r.id,
+                "reminder_text": getattr(r, "reminder_text", None),
+                "schedule_at_utc": str(getattr(r, "schedule_at", None)) if getattr(r, "schedule_at", None) else None,
+                "created_at_utc": str(getattr(r, "created_at", None)) if getattr(r, "created_at", None) else None,
+                "next_run_at": str(getattr(r, "next_run_at", None)) if getattr(r, "next_run_at", None) else None,
                 "name": r.name,
                 "schedule_kind": r_shape,
-                "schedule_at_utc": str(getattr(r, "schedule_at", None)) if getattr(r, "schedule_at", None) else None,
                 "schedule_cron_local": getattr(r, "schedule_cron_local", None),
                 "schedule_interval_seconds": getattr(r, "schedule_interval_seconds", None),
-                "next_run_at": str(getattr(r, "next_run_at", None)) if getattr(r, "next_run_at", None) else None,
                 "enabled": True,
             }
         return None

@@ -6448,9 +6448,10 @@ class ToolExecutor:
         # stacking or superseding a new one (Round 3, item 4).
         import time as _t_cj
         from app.agent.subagent_orchestrator import _notify_job_event
+        from app.services.plain_text import humanize_label as _hl_cj
         await _notify_job_event(
             job_id=job_id, label=title, kind="mission_started",
-            title=f"🛠 Working on: {_plain(title, 150)}",
+            title=f"🛠 Working on: {_hl_cj(_plain(title, 150))}",
             body=_plain(description or "", 200),
             # Indeterminate timer, NOT progress=0. `_content_state` picks timer
             # over progress, so a bare 0 shipped a card reading a frozen "0%"
@@ -6626,7 +6627,10 @@ class ToolExecutor:
         pct = int(completed_count / len(steps) * 100) if steps else None
         from app.services.plain_text import plain_preview as _plain
         current_label = _plain(current_label, 120) if current_label else current_label
-        _job_title_plain = _plain(job.title or "background task", 150)
+        from app.services.plain_text import humanize_label as _hl_job
+        # Model-authored job titles are lock-screen headlines — gate the
+        # machinery vocabulary (push-copy gate, 2026-08-19).
+        _job_title_plain = _hl_job(_plain(job.title or "", 150))
         _card = dict(
             chat_id=chat_id, message_id=asst_message_id, job_type=job_type,
             step_name=current_label or None,

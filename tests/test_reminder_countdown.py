@@ -150,8 +150,14 @@ async def test_silent_countdown_start_no_banner_timer_and_digital_island(monkeyp
     assert aps["content-state"]["timerEndDateInMilliseconds"] == timer_ms
     assert aps["content-state"]["subtitle"] == "Time to stretch"
     assert aps["attributes"]["timerType"] == "digital"
-    # The mission id rides the tap URL so the app can ack the tap.
-    assert aps["attributes"]["deepLinkUrl"] == "toup://chat?mission=reminder:r-1"
+    # The mission id rides the tap URL so the app can ack the tap — plus the
+    # INSTANT-OPEN seed (reminder text + fire instant) so the app renders the
+    # message at t=0, before any network round-trip. (This assertion lagged
+    # the seed feature and was red on main; fixed 2026-08-19.)
+    assert aps["attributes"]["deepLinkUrl"] == (
+        "toup://chat?mission=reminder:r-1"
+        f"&rtext=Time%20to%20stretch&rat={timer_ms}"
+    )
     # Zombie backstop: the card self-marks stale 2 min after fire time.
     assert aps["stale-date"] == int(timer_ms / 1000) + 120
 

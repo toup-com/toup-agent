@@ -244,6 +244,7 @@ def _content_state(
     timer_end_ms: Optional[int] = None,
     fired: Optional[bool] = None,
     extra: Optional[Dict[str, Any]] = None,
+    timer_start_ms: Optional[int] = None,
 ) -> Dict[str, Any]:
     state: Dict[str, Any] = {"title": _plain(title, 80)}
     if subtitle:
@@ -267,6 +268,13 @@ def _content_state(
     # missions push discrete progress values.
     if timer_end_ms:
         state["timerEndDateInMilliseconds"] = int(timer_end_ms)
+        # The countdown's START — the instant the reminder was SET. Without
+        # it the widget's bar starts at view-render time and restarts from
+        # zero on every rebuild; with it the lock-screen bar is the same
+        # absolute set→fire span the in-app card fills. Optional: old
+        # widgets ignore the key.
+        if timer_start_ms and timer_start_ms < timer_end_ms:
+            state["timerStartDateInMilliseconds"] = int(timer_start_ms)
     elif progress is not None:
         state["progress"] = max(0.0, min(1.0, float(progress)))
         # Keep the two progress spellings consistent when the caller
@@ -325,6 +333,7 @@ def build_start_payload(
     subtitle: Optional[str] = None,
     progress: Optional[float] = 0.0,
     timer_end_ms: Optional[int] = None,
+    timer_start_ms: Optional[int] = None,
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
     alert_sound: Optional[str] = None,
@@ -363,7 +372,7 @@ def build_start_payload(
             # Control).
             "deepLinkUrl": deep_link,
         },
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra, timer_start_ms),
     }
     # Compact Dynamic Island timer style — the widget decodes
     # attributes.timerType ('circular' default | 'digital' mm:ss).
@@ -407,6 +416,7 @@ def build_update_payload(
     subtitle: Optional[str] = None,
     progress: Optional[float] = None,
     timer_end_ms: Optional[int] = None,
+    timer_start_ms: Optional[int] = None,
     alert_title: Optional[str] = None,
     alert_body: Optional[str] = None,
     alert_sound: Optional[str] = None,
@@ -418,7 +428,7 @@ def build_update_payload(
     aps: Dict[str, Any] = {
         "timestamp": int(timestamp or time.time()),
         "event": "update",
-        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra),
+        "content-state": _content_state(title, subtitle, progress, timer_end_ms, fired, extra, timer_start_ms),
     }
     if stale_date:
         aps["stale-date"] = int(stale_date)

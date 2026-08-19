@@ -382,9 +382,10 @@ async def _run_child(
         # Phone surface: start the lock-screen/Dynamic-Island card. The
         # bar animates ON-DEVICE toward the job's timeout window (zero
         # update pushes needed) — the honest ceiling for a bounded job.
+        from app.services.plain_text import humanize_label as _hl
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_started",
-            title=f"🛠 Working on: {(label or 'background task')[:150]}",
+            title=f"🛠 Working on: {_hl(label)[:150]}",
             body=(task or "")[:200],
             timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
             dedup_suffix="started",
@@ -686,12 +687,17 @@ async def _notify_job_event(
     try:
         from app.services.agent_notify_client import notify
 
+        from app.services.plain_text import humanize_label
+
         _mission = mission_id or job_mission_id(job_id, chat_id)
         _route = route or ("chat" if chat_id else "mission-control")
         data: dict[str, Any] = {
             "route": _route,
             "mission_id": _mission,
-            "mission_title": (label or "Background task")[:80],
+            # The card's HEADLINE. Model-authored labels leak the model's own
+            # vocabulary ("Dispatch background conversation" reached a lock
+            # screen, 2026-08-19) — gate every one.
+            "mission_title": humanize_label(label)[:80],
             "kind": "job",
             "job_id": job_id,
             "urgent": urgent,
@@ -769,12 +775,21 @@ async def notify_job_needs_user(
     plumbing.
     """
     kind = "needs_approval" if action_type in _APPROVAL_ACTIONS else "needs_input"
+    # A fixed HUMAN title — this was the one job lane whose OS banner title
+    # was the raw model-authored label with no prefix at all (the
+    # "Dispatch background conversation" banner, 2026-08-19). The label
+    # (gated) moves into the body where it is context, not a headline.
+    from app.services.plain_text import humanize_label as _hl
+    _label_h = _hl(label, fallback="")
+    _body = (f"{summary} {cta_label}." if cta_label else summary)
+    if _label_h:
+        _body = f"{_label_h} — {_body}"
     await _notify_job_event(
         job_id=job_id,
         label=label,
         kind=kind,
-        title=(label or "Background task")[:150],
-        body=(f"{summary} {cta_label}." if cta_label else summary)[:300],
+        title="Needs your OK" if kind == "needs_approval" else "Needs your input",
+        body=_body[:300],
         # No dismiss_after_s — a waiting card must persist until resolved.
         priority="high",
         dedup_suffix=f"waiting:{action_type}",

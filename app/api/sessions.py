@@ -706,6 +706,9 @@ def _message_to_response(
     api/day_chats.py serializes, so the two paths agree on every row instead of
     the fallback quietly reporting a different channel than the primary.
     """
+    # Local import: sessions ↔ day_chats would cycle at module load.
+    from app.api.day_chats import _serialize_tool_events
+
     memories_retrieved = None
     if message.memories_retrieved_json:
         try:
@@ -766,6 +769,12 @@ def _message_to_response(
         # feature exists to prevent. api/day_chats.py and
         # api/messages_recover.py carry the same key.
         admin_notice=msg_metadata.get("admin_notice") if msg_metadata else None,
+        # Same parity rule, and it bit for real (founder recording,
+        # 2026-08-19): tool_events was day-chats-only, so a resync that
+        # landed on this fallback stripped every reply's tools — the app's
+        # reminder card vanished, the fire row un-folded, and the thread
+        # visibly flickered for one frame while completely idle.
+        tool_events=_serialize_tool_events(message),
         attachments=attachments_list,
         channel=(
             (conversation_channels or {}).get(message.conversation_id)

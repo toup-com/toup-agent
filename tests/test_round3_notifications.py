@@ -226,8 +226,11 @@ def test_runner_hands_the_answer_id_to_the_tool_context():
     it with the session id, not learn it at the end."""
     src = (_BACKEND / "app" / "agent" / "agent_runner.py").read_text()
     # Round 4 added the turn's receipt time as a third argument (relative
-    # reminders count from it); the answer id still rides with the session.
-    assert "self.tools.set_session_id(session_id, asst_message_id, turn_started_at=start)" in src
+    # reminders count from it); 2026-08-19 anchored it to the CHANNEL's
+    # receipt stamp (received_at) with run() entry as the fallback — the
+    # answer id still rides with the session.
+    assert "turn_started_at=(received_at if received_at else start)" in src
+    assert "self.tools.set_session_id(" in src
 
 
 def test_cancel_path_ends_cards_of_jobs_completed_mid_turn():

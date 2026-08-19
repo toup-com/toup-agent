@@ -207,6 +207,16 @@ async def agent_notify(
                 or str(_data.get("mission_id") or "").startswith("reminder:")
             )
         )
+        # The reminder FIRE rides the fast lane too: the whole point of the
+        # row is landing at the fire SECOND, and the dispatch loop's 30s tick
+        # made the "now" banner + the countdown card's flip up to 30s late
+        # (masked on iOS 26 by the local AlarmKit ring; naked everywhere
+        # else). Reminder mission_ids never collide with conversation job
+        # cards, so the never-backwards clamp concern above doesn't apply.
+        or (
+            body.event_kind == "mission_completed"
+            and str(_data.get("mission_id") or "").startswith("reminder:")
+        )
     )
     if _fast:
         try:

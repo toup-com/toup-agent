@@ -280,6 +280,16 @@ def _timer_end_ms(row: NotificationQueue) -> Optional[int]:
     return None
 
 
+def _timer_start_ms(row: NotificationQueue) -> Optional[int]:
+    """The countdown's SET instant (``data.timer_start_ms``) — rides the
+    content-state so the widget draws the absolute set→fire span instead of
+    restarting its bar at every view rebuild."""
+    raw = (row.data_json or {}).get("timer_start_ms")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return int(raw)
+    return None
+
+
 def _dismissal_date(row: NotificationQueue, now: datetime) -> Optional[int]:
     raw = (row.data_json or {}).get("dismiss_after_s")
     if isinstance(raw, (int, float)) and raw >= 0:
@@ -578,6 +588,7 @@ async def _refresh_started_card(
         subtitle=(subtitle_override or "Starting…")[:120],
         progress=(progress if progress is not None else 0.0),
         timer_end_ms=timer_ms,
+        timer_start_ms=_timer_start_ms(row),
         alert_title=row.title,
         alert_body=row.body,
         alert_sound=dispatch_tones.apns_sound(data.get("tone")),
@@ -810,6 +821,19 @@ async def _send_start(
     db, device: LiveActivityDevice, row: NotificationQueue,
     mission_id: str, now: datetime, *, silent: bool = False,
 ) -> Dict[str, Any]:
+    # ORDER: before _preempt_device. A reminder-countdown START whose fire
+    # instant has already passed is a straggler (its inline fast-lane
+    # dispatch failed and the 30s loop picked it up after the FIRE row —
+    # which rides the fast lane since 2026-08-19). Arming a countdown over
+    # the ring — or preempting the ringing card to do it — resurrects a
+    # timer for a reminder that already fired.
+    if (
+        mission_id.startswith("reminder:")
+        and row.event_kind == NOTIFY_KIND_MISSION_STARTED
+    ):
+        _end = _timer_end_ms(row)
+        if _end and _end < int(now.timestamp() * 1000) - 5000:
+            return {"status": "skipped", "reason": "countdown_expired"}
     await _preempt_device(db, device, mission_id, now)
 
     progress = _progress_fraction(row)
@@ -944,6 +968,7 @@ async def _send_start(
             else (progress if progress is not None else 0.0)
         ),
         timer_end_ms=timer_ms,
+        timer_start_ms=_timer_start_ms(row),
         alert_title=None if silent else row.title,
         alert_body=None if silent else row.body,
         # The operator's chosen dispatch tone, resolved to the file name the
@@ -1303,6 +1328,7 @@ async def handle_notification_row(
             payload = apns_push.build_update_payload(
                 title=title, subtitle=headline, progress=effective,
                 timer_end_ms=_timer_end_ms(row),
+                timer_start_ms=_timer_start_ms(row),
                 stale_date=int(now.timestamp()) + 1800,
                 timestamp=int(now.timestamp()),
                 extra=extra_state,

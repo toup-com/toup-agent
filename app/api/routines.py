@@ -151,6 +151,17 @@ async def _reminder_countdown_notify(routine) -> None:
         end_ms = int(
             routine.schedule_at.replace(tzinfo=timezone.utc).timestamp() * 1000
         )
+        # The SET instant: the card's bar draws the absolute set→fire span
+        # (same track the in-app card fills) instead of restarting at every
+        # widget rebuild. created_at is UTC-naive like schedule_at.
+        start_ms = None
+        try:
+            if routine.created_at:
+                start_ms = int(
+                    routine.created_at.replace(tzinfo=timezone.utc).timestamp() * 1000
+                )
+        except Exception:  # noqa: BLE001 — the card works without a start
+            start_ms = None
         await notify(
             event_kind="mission_started",
             title=f"⏰ {name}"[:200],
@@ -161,6 +172,7 @@ async def _reminder_countdown_notify(routine) -> None:
                 "kind": "reminder",
                 "route": "chat",
                 "timer_end_ms": end_ms,
+                **({"timer_start_ms": start_ms} if start_ms else {}),
                 "timer_type": "digital",
                 # Round 4 (item 5a): dispatch inline on ingest — a short
                 # reminder's countdown must be on the phone within a

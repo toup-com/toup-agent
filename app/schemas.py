@@ -803,6 +803,12 @@ class ChatMessageResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     # Media metadata (YouTube/Netflix cards)
     media: Optional[dict] = None
+    # ToolPillRow records ({tool, started_at_ms, completed_at_ms, summary}).
+    # Serializer parity with /api/day-chats — the clients fall back to the
+    # session routes, and a field emitted by only one serializer vanishes on
+    # the fallback (the 2026-08-19 idle-flicker: tool-less rows overwrote
+    # tooled ones and the reminder card blinked out of the thread).
+    tool_events: Optional[List[dict]] = None
     # Operator notice (admin dispatch): {dispatch_id, mode, title,
     # sender_name, sent_at}. Declared here or it is dropped — this
     # model ignores undeclared keys, and the mobile client falls back

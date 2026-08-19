@@ -3231,6 +3231,12 @@ async def ws_chat(
                     " ".join((_original_user_text or text or "").split())[:60].strip()
                     or "Working on your answer"
                 )
+                # The turn's receipt instant — ONE stamp for the active-turn
+                # registry AND the runner's turn_started_at, so a relative
+                # reminder ("in 60 seconds") counts from when the user's
+                # message ARRIVED, not from run() entry after the presave,
+                # the fast-path probe and task-intent detection.
+                _turn_received_ts = time.time()
                 # Registered before the first frame: a client that reconnects
                 # one second into the turn already gets `turn_active`.
                 _set_active_turn(
@@ -3239,7 +3245,7 @@ async def ws_chat(
                     title=_turn_title,
                     stage="thinking",
                     tool=None,
-                    started_at=time.time(),
+                    started_at=_turn_received_ts,
                 )
                 _conn_turn_mission = _turn_mission_id
                 try:
@@ -3833,6 +3839,7 @@ async def ws_chat(
                     client_tz=client_tz,
                     app_id=app_id_from_msg,
                     force_new_session=force_new_session,
+                    received_at=_turn_received_ts,
                 ))
 
                 # Wait for agent to finish, but also listen for stop via a receiver task
@@ -4158,12 +4165,13 @@ async def ws_chat(
                         if getattr(response, "asst_message_id", None):
                             _answer_data["message_id"] = response.asst_message_id
                         # Round 4 (item 4): lock-screen strings are plain
-                        # text — strip markdown BEFORE slicing.
+                        # text — strip markdown BEFORE slicing. And the same
+                        # push-copy gate as the alert body: the card preview
+                        # must not open on the agent's "On it —" narration.
                         from app.services.plain_text import (
-                            plain_preview as _plain_preview,
-                            strip_markdown as _strip_md,
+                            answer_preview as _answer_preview,
                         )
-                        _answer_data["preview"] = _plain_preview(response.text, 120) or None
+                        _answer_data["preview"] = _answer_preview(response.text, 120, fallback="") or None
                         if _answer_data["preview"] is None:
                             _answer_data.pop("preview")
                         # REMINDER WINS at the source: when this turn
@@ -4186,10 +4194,16 @@ async def ws_chat(
                             for tc in response.tool_calls
                         ):
                             _answer_data["silent"] = True
+                        from app.services.plain_text import answer_preview as _ap
                         await notify(
                             event_kind="mission_completed",
                             title="Answer ready",
-                            body=_strip_md(response.text)[:180] or None,
+                            # Never the raw answer HEAD: the agent's opening
+                            # ack ("On it — two tasks running:") reached a
+                            # lock screen verbatim as the whole push body
+                            # (2026-08-19). answer_preview drops narration
+                            # and list intros, keeps the first content line.
+                            body=_ap(response.text, 180) or None,
                             data=_answer_data,
                             priority="high",
                             dedup_key=f"{_turn_mission_id}:completed",

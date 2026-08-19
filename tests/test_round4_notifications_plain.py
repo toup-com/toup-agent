@@ -85,15 +85,20 @@ def test_expo_message_is_plain():
 
 def test_producers_strip_before_slicing():
     ws = (BACKEND / "app" / "api" / "ws_chat.py").read_text()
-    assert '_answer_data["preview"] = _plain_preview(response.text, 120) or None' in ws
-    assert 'body=_strip_md(response.text)[:180] or None' in ws
+    # 2026-08-19: the preview rides the same push-copy gate as the alert
+    # body — answer_preview drops the agent's opening-ack narration before
+    # slicing (strip-then-slice still holds inside answer_preview).
+    assert '_answer_data["preview"] = _answer_preview(response.text, 120, fallback="") or None' in ws
+    assert 'body=_ap(response.text, 180) or None' in ws
     ar = (BACKEND / "app" / "agent" / "agent_runner.py").read_text()
-    assert "_preview = _plain_preview(final_text, 100)" in ar
+    assert '_preview = _answer_preview(final_text, 100, fallback="Finished.")' in ar
     so = (BACKEND / "app" / "agent" / "subagent_orchestrator.py").read_text()
     assert 'data["preview"] = _plain_preview(str(preview), 120)' in so
     te = (BACKEND / "app" / "agent" / "tool_executor.py").read_text()
     assert '"label": _plain(str(label), 120) or str(label)' in te   # step labels stored plain
-    assert 'title=f"🛠 Working on: {_plain(title, 150)}"' in te
+    # 2026-08-19: the title is additionally gated for internal vocabulary
+    # (humanize_label) — model-authored labels are lock-screen headlines.
+    assert 'title=f"🛠 Working on: {_hl_cj(_plain(title, 150))}"' in te
     assert "_job_title_plain" in te
     ap = (BACKEND / "app" / "agent" / "routines" / "autopilot_handler.py").read_text()
     assert "_strip_md(" in ap

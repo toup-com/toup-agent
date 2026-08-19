@@ -192,12 +192,14 @@ async def announce_completed(
         from app.agent.subagent_orchestrator import (
             JOB_CARD_END_AFTER_S, _notify_job_event,
         )
-        from app.services.plain_text import plain_preview as _plain
-        _preview = _plain(preview or "", 100) if preview else ""
+        from app.services.plain_text import (
+            answer_preview as _ap, humanize_label as _hl, plain_preview as _plain,
+        )
+        _preview = _ap(preview, 100) if preview else ""
         await _notify_job_event(
             job_id=closed.job_id, label=closed.title,
             kind="mission_completed",
-            title=f"✅ Done: {_plain(closed.title or 'background task', 150)}",
+            title=f"✅ Done: {_hl(_plain(closed.title or '', 150))}",
             body=_preview or "Finished.", progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
             chat_id=chat_id, message_id=message_id,

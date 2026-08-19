@@ -135,3 +135,70 @@ def plain_preview(text: Optional[str], limit: int) -> str:
     """Strip THEN slice — the order matters (a ``**`` pair cut in half by
     the slice would survive the strip). Single-line."""
     return strip_markdown(text, collapse_whitespace=True)[:limit]
+
+
+# ── Push copy gates (2026-08-19) ─────────────────────────────────────────────
+# The founder's lock screen read "Dispatch background conversation / On it —
+# two tasks running:". Both halves were leaks with the same shape: model- or
+# turn-authored text reaching a user-facing notification surface verbatim.
+# These two helpers are the seam every producer routes through.
+
+# A LABEL is internal jargon when it talks about the machinery instead of the
+# errand. Patterns, not single words: "check my Telegram channel" is a real
+# ask and must survive; "Dispatch background conversation" must not.
+_INTERNAL_LABEL_RES = [
+    re.compile(r"\b(dispatch(?:ed|ing)?|spawn(?:ed|ing)?|orchestrat\w*)\b.{0,24}\b(background|sub-?agent|mission|conversation|session|job|task)\b", re.IGNORECASE),
+    re.compile(r"\bbackground\s+(conversation|sub-?agent|session|turn|job|task|work)\b", re.IGNORECASE),
+    re.compile(r"\b(sub-?agent|chatturn|agent[_ ]task|autopilot tick)\b", re.IGNORECASE),
+    re.compile(r"^(job|task|mission|dispatch|background)$", re.IGNORECASE),
+]
+
+
+def humanize_label(label: Optional[str], fallback: str = "Working on it") -> str:
+    """A model-authored work label, made safe for a lock screen.
+
+    The label rides every job push as the card's HEADLINE (``mission_title``)
+    and several banner titles. The model names it from the vocabulary its own
+    prompts use — job, dispatch, background, sub-agent — which is meaningless
+    or alarming on a user's phone. A label that talks about the machinery is
+    replaced by ``fallback``; a label that names the errand passes untouched.
+    """
+    s = " ".join((label or "").split())
+    if not s:
+        return fallback
+    for pat in _INTERNAL_LABEL_RES:
+        if pat.search(s):
+            return fallback
+    return s
+
+
+# The agent's opening ack is process narration, not an answer. A first line
+# that ends in ':' is a list intro; a line matching these stems is a filler
+# ("On it — two tasks running:" was the founder's entire push body).
+_NARRATION_LINE_RE = re.compile(
+    r"^(on it|got it|sure|okay|ok|right away|will do|working on|absolutely|of course|one (sec|moment)|let me|here('s| is) what)\b",
+    re.IGNORECASE,
+)
+
+
+def answer_preview(
+    text: Optional[str], limit: int,
+    fallback: str = "Your answer is ready — tap to read it.",
+) -> str:
+    """The push body for a finished turn: the first CONTENT line of the
+    answer — never the agent's own process narration, never a colon-hanging
+    list intro.
+
+    The LAST remaining line is dropped only when it hangs on a colon: a
+    single-line answer that merely OPENS with a narration word ("Sure — your
+    flight is booked for June 3.") carries the content in the same line, and
+    discarding it would replace a real answer with the fallback.
+    """
+    plain = strip_markdown(text, collapse_whitespace=False)
+    lines = [ln.strip() for ln in plain.split("\n") if ln.strip()]
+    while len(lines) > 1 and (_NARRATION_LINE_RE.match(lines[0]) or lines[0].endswith(":")):
+        lines.pop(0)
+    if lines and len(lines) == 1 and lines[0].endswith(":"):
+        lines = []
+    body = " ".join(" ".join(lines).split())[:limit]
+    return body or fallback
