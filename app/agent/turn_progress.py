@@ -181,6 +181,11 @@ class TurnProgressEmitter:
                 self.step_name = meta.get("step_name")
             if meta.get("steps_total"):
                 self.steps_total = int(meta["steps_total"])
+        # Round 4: create_job / update_job are bookkeeping, not actions — the
+        # job's own pushes carry the card, and a beacon reading "update job…"
+        # is exactly the raw-tool-name subtitle this surface should not show.
+        if tool_name in ("create_job", "update_job"):
+            return
         now = time.monotonic()
         if self.tool_count > 1 and (now - self._last_emit_ts) < self.min_interval_s:
             return

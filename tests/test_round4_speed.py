@@ -737,3 +737,36 @@ def test_reader_falls_back_to_beautifulsoup_without_trafilatura(monkeypatch):
     html = "<html><head><title>T</title></head><body><article><p>" + "article body " * 40 + "</p></article></body></html>"
     status, out = R._parse_and_extract(html, "https://x.example/c", 10000)
     assert status == "ok" and out.startswith("# T\n\n") and "article body" in out
+
+
+def test_browser_precheck_reads_the_drivers_browsers_json(monkeypatch, tmp_path):
+    """The one-time doomed launch cost ~5 s of node-driver startup per
+    container start (every blue-green rollout). The pre-check answers from
+    the filesystem: the driver's browsers.json names the revision it wants;
+    if that dir is absent under the browsers path, the latch arms without
+    spawning anything. Fleet finding 2026-08-19: /opt/toup/playwright holds
+    revision 1223, patchright 1.61.2 wants 1228."""
+    import json, sys, types
+    from app.agent.skills.builtins.app_builder import browser_api as B
+
+    pkg_dir = tmp_path / "patchright"
+    (pkg_dir / "driver" / "package").mkdir(parents=True)
+    (pkg_dir / "driver" / "package" / "browsers.json").write_text(json.dumps({
+        "browsers": [{"name": "chromium", "revision": "1228"},
+                     {"name": "chromium-headless-shell", "revision": "1228"}]}))
+    fake_pkg = types.ModuleType("patchright"); fake_pkg.__file__ = str(pkg_dir / "__init__.py")
+    monkeypatch.setitem(sys.modules, "patchright", fake_pkg)
+    browsers = tmp_path / "ms-playwright"; browsers.mkdir()
+    (browsers / "chromium_headless_shell-1223").mkdir()          # the stale one
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(browsers))
+    monkeypatch.setattr(B, "_UNAVAILABLE_REASON", None)
+
+    reason = B._installed_browser_missing()
+    assert reason and "1228" in reason and "chromium_headless_shell-1223" in reason
+    assert B.browser_unavailable_reason() is not None          # latch armed, no launch
+
+    # install the wanted revision → the pre-check clears (self-heals on the next process)
+    (browsers / "chromium_headless_shell-1228").mkdir()
+    monkeypatch.setattr(B, "_UNAVAILABLE_REASON", None)
+    assert B._installed_browser_missing() is None
+    assert B.browser_unavailable_reason() is None

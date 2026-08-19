@@ -41,8 +41,57 @@ _lock = asyncio.Lock()
 _UNAVAILABLE_REASON: Optional[str] = None
 
 
+def _installed_browser_missing() -> Optional[str]:
+    """Filesystem pre-check (milliseconds, no driver spawn): does the browser
+    revision this patchright/playwright build expects exist in the browsers
+    dir? The one-time launch failure cost ~5 s of node-driver startup on a
+    0.5-CPU container — paid again on EVERY container start (every
+    blue-green rollout) before the in-process latch armed. The driver ships
+    `browsers.json` with the revisions it wants; the install dir is
+    `$PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`. Returns a reason
+    string when the executable dir is absent, None when present or unknown
+    (unknown → let the real launch decide, as before)."""
+    import json
+    import os
+    try:
+        try:
+            import patchright as _pkg
+        except ImportError:
+            import playwright as _pkg  # type: ignore[no-redef]
+        pkg_dir = os.path.dirname(_pkg.__file__)
+        with open(os.path.join(pkg_dir, "driver", "package", "browsers.json"), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        revs = {b.get("name"): str(b.get("revision")) for b in data.get("browsers", []) if b.get("name")}
+        want = revs.get("chromium-headless-shell") or revs.get("chromium")
+        if not want:
+            return None
+        base = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+        shell_dir = os.path.join(base, f"chromium_headless_shell-{want}")
+        full_dir = os.path.join(base, f"chromium-{want}")
+        if os.path.isdir(shell_dir) or os.path.isdir(full_dir):
+            return None
+        present = []
+        try:
+            present = sorted(d for d in os.listdir(base) if d.startswith("chromium"))[:4]
+        except OSError:
+            pass
+        return (
+            f"chromium revision {want} not installed under {base} "
+            f"(present: {', '.join(present) or 'nothing'})"
+        )
+    except Exception:  # noqa: BLE001 — a pre-check must never block a launch attempt
+        return None
+
+
 def browser_unavailable_reason() -> Optional[str]:
-    """Why the research browser cannot launch in this process, or None."""
+    """Why the research browser cannot launch in this process, or None.
+    Arms itself from the filesystem pre-check on first call, so the first
+    JS-rendered page after a container start does not pay a doomed launch."""
+    global _UNAVAILABLE_REASON
+    if _UNAVAILABLE_REASON is None:
+        _reason = _installed_browser_missing()
+        if _reason:
+            _mark_unavailable(_reason)
     return _UNAVAILABLE_REASON
 
 
@@ -59,7 +108,7 @@ async def _ensure_browser():
     """Lazy-init a headless-only browser for research. Separate from user browser."""
     global _browser, _context, _pw
 
-    if _UNAVAILABLE_REASON:
+    if browser_unavailable_reason():
         raise RuntimeError(f"Browser not available: {_UNAVAILABLE_REASON}")
 
     async with _lock:
