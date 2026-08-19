@@ -174,3 +174,19 @@ async def test_events_read_falls_back_to_local_when_proxy_returns_none(monkeypat
             memory_id="mem-9", limit=100, current_user=_User(), db=None,
         )
     assert exc.value.status_code == 404, "read fallback runs the local path"
+
+
+# ── Structural: the file routes must precede /{memory_id} ────────────────
+# Starlette matches in declaration order; a `/files` route declared after
+# `/{memory_id}` is silently captured by it ("files" parses as a memory id)
+# and every files request 404s. Same class of pin as the /breakdown and
+# /search ordering notes in memories.py.
+
+def test_file_routes_precede_the_memory_id_capture():
+    routes = _route_blocks()
+    order = [path for _, path, _, _ in routes]
+    id_capture = next(i for i, p in enumerate(order) if p.startswith("/{memory_id}"))
+    file_routes = [i for i, p in enumerate(order) if p.startswith("/files")]
+    assert file_routes, "the memory-file routes are gone"
+    late = [order[i] for i in file_routes if i > id_capture]
+    assert not late, f"file routes declared after /{{memory_id}} capture them: {late}"

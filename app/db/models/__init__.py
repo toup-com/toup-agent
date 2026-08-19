@@ -29,7 +29,7 @@ from .conversation import Conversation, Message, ProcessedMessage
 from .day_chat import DayChat, ContextBudgetLog, MigrationStatus
 
 # Memory system
-from .memory import Memory, memory_relationships, BrainStats, MemoryEvent, RetrievalEvent
+from .memory import Memory, MemoryFile, memory_relationships, BrainStats, MemoryEvent, RetrievalEvent
 from .media_playlist import MediaPlaylist
 # The user-facing file library (virtual tree over the tenant's files)
 # The file-origin constants (ORIGIN_UPLOAD / ORIGIN_AGENT / FILE_ORIGINS) are
@@ -216,7 +216,7 @@ __all__ = [
     # Models
     "User", "UserSession", "Identity",
     "Conversation", "Message", "ProcessedMessage",
-    "Memory", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
+    "Memory", "MemoryFile", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "MediaPlaylist",
     "UserFile", "UserFolder",
     "SYSTEM_FOLDERS", "SYSTEM_FOLDER_DOCUMENTS", "SYSTEM_FOLDER_IMAGES", "SYSTEM_FOLDER_UPLOADS",

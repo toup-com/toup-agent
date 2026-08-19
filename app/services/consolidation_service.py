@@ -399,7 +399,7 @@ NEW EPISODIC MEMORIES TO INCORPORATE:
 Write a single, comprehensive paragraph that merges ALL information from the existing semantic memory and the new episodic memories into one cohesive summary. 
 - Preserve EVERY unique fact, name, date, preference, and detail — do NOT drop information.
 - Remove redundancy — if the same fact appears multiple times, state it once.
-- Write in third person about the user (e.g., "The user prefers..." or "Nariman works at...").
+- Write in the second person, to the user (e.g., "You prefer..." or "You work at..."). Name other people by their name. NEVER write "The user".
 - The result should be a standalone summary that needs no additional context.
 - Maximum 300 words."""
             else:
@@ -411,7 +411,7 @@ EPISODIC MEMORIES:
 Write a single, comprehensive paragraph that captures ALL unique information from these memories into one cohesive summary.
 - Preserve EVERY unique fact, name, date, preference, and detail — do NOT drop information.
 - Remove redundancy — if the same fact appears multiple times, state it once.
-- Write in third person about the user (e.g., "The user prefers..." or "Nariman works at...").
+- Write in the second person, to the user (e.g., "You prefer..." or "You work at..."). Name other people by their name. NEVER write "The user".
 - The result should be a standalone summary that needs no additional context.
 - Maximum 300 words."""
 

@@ -48,6 +48,17 @@ class Memory(Base):
     category: Mapped[str] = mapped_column(String(20), index=True)
     memory_type: Mapped[str] = mapped_column(String(20), index=True)
 
+    # The memory file this row belongs to (app.memory_files). Every ACTIVE
+    # row gets one when the tenant's organize pass runs; NULL means the row
+    # predates that pass and readers fall back to the category→section map.
+    # A slug, not an FK — it survives file-row recreation and lets the
+    # platform's read-fallback group rows without the memory_files table
+    # (AGENT_ONLY, deliberately no platform mirror).
+    file_slug: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, index=True)
+    # Curated order within the file. Small integers, renumbered on write —
+    # a file holds tens of entries, not thousands.
+    file_position: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Embedding for semantic search (stored as JSON for SQLite)
     embedding_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -145,6 +156,51 @@ class Memory(Base):
         Index("ix_memories_user_category", "user_id", "category"),
         Index("ix_memories_user_type", "user_id", "memory_type"),
         Index("ix_memories_user_created", "user_id", "created_at"),
+    )
+
+
+class MemoryFile(Base):
+    """A curated memory file — the organizing unit above memory rows.
+
+    One row per (user, slug). System files (profile, preferences, knowledge,
+    learned, working, plus the people/areas catch-alls) always exist after
+    the organize pass; person and topic files are created on demand. Entries
+    are Memory rows carrying this slug in `memories.file_slug` — the file
+    row itself holds only identity and curation metadata, so entry counts
+    and freshness are always computed live and can never lie.
+
+    AGENT_ONLY with no platform mirror: the platform's read fallback
+    synthesizes a virtual file view from memories rows alone.
+    """
+    __tablename__ = "memory_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True)
+
+    slug: Mapped[str] = mapped_column(String(160), index=True)
+    section: Mapped[str] = mapped_column(String(20), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    # The one-line "read when…" header. Shown on the file page and injected
+    # into the prompt's memory-file index.
+    purpose: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Cross-links: JSON array of sibling file slugs ("see also").
+    related_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Order within the section (system files first, then by creation).
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # When the LLM consolidation pass last curated this file. NULL = only the
+    # deterministic organize pass has touched it (entries assigned, nothing
+    # merged). Per-file so a failed pass retries file by file.
+    consolidated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_memory_files_user_slug", "user_id", "slug", unique=True),
+        Index("ix_memory_files_user_section", "user_id", "section"),
     )
 
 

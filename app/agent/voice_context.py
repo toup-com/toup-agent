@@ -575,7 +575,14 @@ async def build_voice_context(
             text = cap_chars(text, int(budget_chars * BUDGET_SHARE_AGENT_BRAIN), keep="head")
         sections["agent_brain"] = text
     if user_mems:
-        text = _render_brain("# User Brain (What You Know About the User)", user_mems)
+        # The referent matters more in voice than anywhere: entries are
+        # written in the user's second person, and without this parenthesis
+        # "- [identity] Your name is Nariman" reads as the MODEL's name.
+        text = _render_brain(
+            "# User Brain (what you know about the user — entries speak TO "
+            "the user: 'you'/'your' in them means the USER, not you)",
+            user_mems,
+        )
         if budget_chars:
             text = cap_chars(text, int(budget_chars * BUDGET_SHARE_USER_BRAIN), keep="head")
         sections["user_brain"] = text

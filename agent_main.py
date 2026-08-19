@@ -1075,19 +1075,34 @@ async def lifespan(app: FastAPI):
             try:
                 from app.scripts.scheduled_tasks import (
                     run_decay_for_all_users,
-                    run_consolidation_for_all_users,
                     run_retrieval_feedback_analysis,
                     run_end_of_day_archival,
+                )
+                from app.services.memory_file_migration import (
+                    run_memory_file_maintenance,
                 )
                 _mm_jobs = [
                     (
                         "memory_decay",
                         run_decay_for_all_users,
-                        _MMIvl(hours=settings.decay_interval_hours),
+                        # CRON, not interval (rebuild-2026-08 RC3.1): an
+                        # interval's first fire is measured from scheduler
+                        # start, and the fleet is recreated on every merge to
+                        # main (median gap 0.3h at the 2026-08 audit) — so
+                        # this job never fired once. A cron fires at wall-
+                        # clock times regardless of restarts; same fix the
+                        # platform copy got in scheduled_tasks.py.
+                        _MMCron(hour="2,8,14,20", minute=0),
                     ),
                     (
                         "memory_consolidation",
-                        run_consolidation_for_all_users,
+                        # File-based curation (rebuild-2026-08 §3.7): merges
+                        # duplicates IN PLACE under the strict ops contract.
+                        # Replaces run_consolidation_for_all_users, whose
+                        # additive pass wrote a new semantic row and retired
+                        # nothing (dry run 2026-08-10: "0 rows rewritten or
+                        # retired") — half of how 89 unmerged factlets happened.
+                        run_memory_file_maintenance,
                         _MMCron(hour=settings.consolidation_cron_hour, minute=0),
                     ),
                     (
@@ -1104,8 +1119,11 @@ async def lifespan(app: FastAPI):
                 # still get an archival summary, so <recent_days> and
                 # recall_day stop silently skipping them.
                 if settings.enable_day_recall:
+                    # Cron for the same reason as memory_decay above — an
+                    # hourly interval also never fires on a fleet that
+                    # restarts more often than hourly.
                     _mm_jobs.append(
-                        ("day_archival", run_end_of_day_archival, _MMIvl(hours=1))
+                        ("day_archival", run_end_of_day_archival, _MMCron(minute=0))
                     )
             except Exception as e:
                 print(f"⚠️ Memory maintenance imports failed: {e}")
@@ -1125,6 +1143,19 @@ async def lifespan(app: FastAPI):
                     print(f"⚠️ Could not register memory job {_mm_id}: {e}")
             if _mm_registered:
                 print(f"🧠 Memory maintenance jobs: {', '.join(_mm_registered)}")
+            try:
+                from datetime import datetime as _dt, timedelta as _td
+                from apscheduler.triggers.date import DateTrigger as _MMDate
+                cron_service.scheduler.add_job(
+                    run_memory_file_maintenance,
+                    trigger=_MMDate(run_date=_dt.now() + _td(seconds=180)),
+                    id="memory_file_migration_boot",
+                    name="Memory Maintenance: boot organize+curate",
+                    replace_existing=True,
+                )
+                print("🧠 Memory file organize/curate scheduled for T+180s")
+            except Exception as e:
+                print(f"⚠️ Could not schedule memory file migration: {e}")
 
     except Exception as e:
         print(f"⚠️ Agent initialization error: {e}")

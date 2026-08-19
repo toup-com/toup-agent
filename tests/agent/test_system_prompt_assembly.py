@@ -40,7 +40,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 from app.db.models.user import User
-from app.db.models.memory import Memory
+from app.db.models.memory import Memory, MemoryFile
 
 
 # ── Fixture: minimal sqlite schema covering what _build_system_prompt touches ──
@@ -61,6 +61,13 @@ async def _make_engine():
         # of truth nothing keeps in sync; the tables below stay raw because
         # they are seeded by raw SQL, not by the ORM.
         await conn.run_sync(User.__table__.create, checkfirst=True)
+        # `memories` is ORM-seeded too (the tests below add Memory objects),
+        # so it gets the same treatment — a hand-written copy went red when
+        # the model gained file_slug/file_position (memory files, 2026-08).
+        # memory_files comes along because _build_system_prompt's user_brain
+        # now reads the file index.
+        await conn.run_sync(Memory.__table__.create, checkfirst=True)
+        await conn.run_sync(MemoryFile.__table__.create, checkfirst=True)
         for stmt in [
             """CREATE TABLE IF NOT EXISTS identities (
                 id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
@@ -72,30 +79,6 @@ async def _make_engine():
                 user_id VARCHAR(36) PRIMARY KEY, agent_name VARCHAR(255),
                 agent_color VARCHAR(20), onboarding_completed BOOLEAN DEFAULT 1,
                 disabled_tools TEXT, created_at TIMESTAMP, updated_at TIMESTAMP
-            )""",
-            """CREATE TABLE IF NOT EXISTS memories (
-                id VARCHAR(36) PRIMARY KEY, user_id VARCHAR(36),
-                brain_type VARCHAR(20) DEFAULT 'user', content TEXT,
-                summary VARCHAR(500), category VARCHAR(20),
-                memory_type VARCHAR(20),
-                embedding_json TEXT, importance FLOAT DEFAULT 0.5,
-                confidence FLOAT DEFAULT 1.0, strength FLOAT DEFAULT 1.0,
-                memory_level VARCHAR(20) DEFAULT 'episodic',
-                emotional_salience FLOAT DEFAULT 0.5,
-                last_reinforced_at TIMESTAMP,
-                consolidation_count INTEGER DEFAULT 0,
-                decay_rate FLOAT DEFAULT 0.1,
-                last_decayed_at TIMESTAMP, expires_at TIMESTAMP,
-                created_at TIMESTAMP, updated_at TIMESTAMP,
-                last_accessed_at TIMESTAMP, access_count INTEGER DEFAULT 0,
-                source_message_id VARCHAR(36),
-                source_type VARCHAR(50) DEFAULT 'conversation',
-                ref_kind VARCHAR(50), ref_id VARCHAR(100),
-                metadata_json TEXT, tags_json TEXT, canonical_content TEXT,
-                history_json TEXT, merged_from_json TEXT,
-                superseded_by VARCHAR(36),
-                is_active BOOLEAN DEFAULT 1, is_deleted BOOLEAN DEFAULT 0,
-                deleted_at TIMESTAMP, embedding BLOB, search_vector TEXT
             )""",
         ]:
             await conn.run_sync(lambda c, s=stmt: c.execute(text(s)))

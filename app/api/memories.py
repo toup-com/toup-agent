@@ -14,7 +14,7 @@ from app.schemas import (
     MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
     MemoryWithRelations, MemorySearchRequest, MemorySearchResponse,
     MemoryCategory, MemoryType, MemoryLevel, EntityResponse,
-    MemoryEventResponse, MemoryEventsResponse
+    MemoryEventResponse, MemoryEventsResponse, MemoryFileInstructRequest
 )
 from app.api.auth import get_current_user
 from app.memory_taxonomy import normalize_category
@@ -183,6 +183,8 @@ def memory_to_response(memory: Memory) -> MemoryResponse:
         superseded_by=getattr(memory, 'superseded_by', None),
         is_active=getattr(memory, 'is_active', True),
         expires_at=getattr(memory, 'expires_at', None),
+        file_slug=getattr(memory, 'file_slug', None),
+        file_position=getattr(memory, 'file_position', None),
         # Timestamps
         created_at=memory.created_at,
         updated_at=memory.updated_at,
@@ -357,6 +359,129 @@ async def memory_breakdown(
         "brains": brains,
         "total": sum(categories.values()),
     }
+
+
+# ── Memory files ────────────────────────────────────────────────────
+# The curated file view over memories rows (docs/memory/rebuild-2026-08.md).
+# Like /breakdown and /search these must be defined BEFORE /{memory_id}.
+# On the platform the local branch is the read-fallback and runs VIRTUAL —
+# the memory_files table is AGENT_ONLY with no platform mirror, so the view
+# is synthesized from memories rows alone.
+
+def _files_virtual_mode() -> bool:
+    from app.config import settings
+    return settings.run_mode == "platform"
+
+
+@router.get("/files", response_model=dict)
+async def list_memory_files(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The sectioned memory-file listing (Profile · People · Areas ·
+    Preferences · Knowledge · Learned · Working on)."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], "files")
+        if data is not None:
+            return JSONResponse(content=data)
+
+    from app.services.memory_file_service import MemoryFileService
+    service = MemoryFileService(db)
+    return await service.list_files(current_user.id, virtual_only=_files_virtual_mode())
+
+
+@router.get("/files/{slug:path}", response_model=dict)
+async def get_memory_file(
+    slug: str,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """One memory file: purpose, cross-links, and its entries in curated
+    order. Entries are full memory rows so the detail sheet keeps its
+    provenance (saved day, recall history, strength)."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], f"files/{slug}")
+        if data is not None:
+            return JSONResponse(content=data)
+
+    from app.services.memory_file_service import MemoryFileService
+    service = MemoryFileService(db)
+    resolved = await service.get_file(current_user.id, slug, virtual_only=_files_virtual_mode())
+    if resolved is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
+    info, entries = resolved
+    return {**info, "entries": [memory_to_response(m) for m in entries]}
+
+
+@router.post("/files/{slug:path}/instruct", response_model=dict)
+async def instruct_memory_file(
+    slug: str,
+    payload: MemoryFileInstructRequest,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Apply a natural-language instruction to one memory file ("merge the
+    briefing entries", "remove everything about the old job"). One LLM call
+    proposes strictly-validated ops; every applied op rides the existing
+    evolution primitives, so nothing is hard-deleted and the audit trail
+    stays complete."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], f"files/{slug}/instruct", "POST",
+            body=payload.model_dump(),
+        )
+        return JSONResponse(content=data if data is not None else {"applied": []})
+
+    if _files_virtual_mode():
+        # The platform fallback is read-only for files; curation runs where
+        # the memory lives. Same contract as an unreachable agent elsewhere.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Your agent isn't reachable right now. Please try again.",
+        )
+
+    from app.services.memory_file_ops import curate_file
+    _key = await _get_user_api_key(db, current_user.id)
+    try:
+        result = await curate_file(
+            db, current_user.id, slug,
+            instruction=payload.instruction, api_key=_key,
+        )
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
+    except Exception as e:
+        logger.warning("File instruction failed for %s: %s", slug, e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Your agent couldn't apply that change. Please try again.",
+        )
+    return result
+
+
+@router.delete("/files/{slug:path}", response_model=dict)
+async def delete_memory_file(
+    slug: str,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive a memory file: soft-deletes its entries (each gets a DELETED
+    audit event, same as deleting one memory) and removes the file itself
+    unless it is a system file — those stay and read as empty. Nothing is
+    hard-deleted."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(proxy[0], proxy[1], f"files/{slug}", "DELETE")
+        return JSONResponse(content=data if data is not None else {"archived": None})
+
+    from app.services.memory_file_service import MemoryFileService
+    service = MemoryFileService(db)
+    archived = await service.delete_file(current_user.id, slug, virtual_only=_files_virtual_mode())
+    if archived is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
+    return {"archived": archived, "slug": slug}
 
 
 # NOTE: /search routes must be defined BEFORE /{memory_id} to prevent route shadowing

@@ -150,6 +150,12 @@ class MemoryUpdate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class MemoryFileInstructRequest(BaseModel):
+    """The natural-language edit box on a memory file page: 'Tell your agent
+    what to change or remove.' Applied to that one file only."""
+    instruction: str = Field(min_length=1, max_length=2000)
+
+
 class MemoryResponse(BaseModel):
     id: str
     content: str
@@ -173,6 +179,10 @@ class MemoryResponse(BaseModel):
     superseded_by: Optional[str] = None  # ID of memory this was merged into
     is_active: bool = True  # False if superseded/archived
     expires_at: Optional[datetime] = None  # None = never expires
+    # Memory-file fields (rebuild 2026-08). None on rows the tenant's
+    # organize pass hasn't touched; clients fall back to the category map.
+    file_slug: Optional[str] = None
+    file_position: Optional[int] = None
     # Timestamps
     created_at: datetime
     updated_at: datetime

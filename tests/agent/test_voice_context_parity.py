@@ -604,7 +604,9 @@ async def test_488_control_todays_messages_do_load(voice_tables):
 async def test_voice_context_memories_keep_the_dump_shape(voice_tables):
     """D7 deliberately NOT changed: both brains, unranked, voice's
     headers and row format — but read from the TENANT db instead of over
-    HTTP from the platform."""
+    HTTP from the platform. The user_brain header names the referent since
+    the 2026-08 memory rebuild: entries are stored in the second person, so
+    the dump must say who 'you' is."""
     from app.db import async_session_maker
     from app.db.models.memory import Memory
     from app.agent.voice_context import build_voice_context
@@ -636,7 +638,8 @@ async def test_voice_context_memories_keep_the_dump_shape(voice_tables):
         "# Agent Brain (Permanent Knowledge)\n- [agent_soul] Speak plainly."
     )
     assert ctx.sections["user_brain"] == (
-        "# User Brain (What You Know About the User)\n"
+        "# User Brain (what you know about the user — entries speak TO "
+        "the user: 'you'/'your' in them means the USER, not you)\n"
         "- [preferences] Flat white, no sugar."
     )
     assert "memories" not in ctx.degraded

@@ -696,15 +696,24 @@ ASSISTANT RESPONSE:
 
 ## Extraction Rules (STRICT)
 
-1. **Each memory MUST be a complete, standalone sentence** that makes sense without any surrounding context.
-   - GOOD: "Nariman is applying to UofT MScAC program for graduate studies"
-   - BAD: "Project: had" or "Fact: Can you check?" or "Task: it"
+1. **Each memory MUST be a complete, standalone sentence** that makes sense without
+   any surrounding context — **written in the second person, to the user** ("You…",
+   "Your…"). Name other people by their name. NEVER write "The user…" or refer to
+   the user in the third person.
+   - GOOD: "You are applying to the UofT MScAC program for graduate studies"
+   - GOOD: "Maya is your daughter and lives in Berlin"
+   - BAD: "The user is applying to UofT" (third person) — or "Project: had" or "Fact: Can you check?"
 
 2. **SKIP these entirely — do NOT extract:**
    - Greetings, pleasantries, conversational filler ("hi", "thanks", "sure", "ok")
    - Questions the user asked (those aren't facts to remember)
    - Fragments shorter than 5 words
    - The assistant's own suggestions or explanations (only extract USER facts)
+   - Playback, search or tool OUTCOMES — a song that failed to play, the track that
+     was played instead, an error the assistant hit. What the assistant did or
+     couldn't do is never a fact about the user.
+   - Momentary bodily states (hungry, tired, cold, sleepy) — at most a passing mood
+     under rule 8, never a durable memory.
    - Vague or ambiguous statements that need context to understand
    - Technical commands or code snippets (unless they reveal a preference or decision)
 

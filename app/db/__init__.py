@@ -1,5 +1,5 @@
 from app.db.models import (
-    Base, User, UserRole, Conversation, Message, Memory, Entity, EntityLink, EntityRelationship, BrainStats,
+    Base, User, UserRole, Conversation, Message, Memory, MemoryFile, Entity, EntityLink, EntityRelationship, BrainStats,
     MemoryCategory, BrainRegion, MemoryType, MemoryLevel, MemoryEventType, MemoryEvent,
     memory_relationships,
     # Document & Media models
@@ -28,6 +28,7 @@ __all__ = [
     "Conversation", 
     "Message",
     "Memory",
+    "MemoryFile",
     "Entity",
     "EntityLink",
     "EntityRelationship",

@@ -347,7 +347,10 @@ class _FakeDedupService:
     def __init__(self, db, api_key=None):
         pass
 
-    async def smart_create_memories(self, new_memories, user_id):
+    async def smart_create_memories(self, new_memories, user_id, *, person_names=None):
+        # `person_names` mirrors the real contract (file routing, rebuild
+        # 2026-08); the fake ignores it — routing is dedup's concern, and
+        # this file guards the fan-out logic around it.
         return [
             (
                 SimpleNamespace(

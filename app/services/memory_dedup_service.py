@@ -109,6 +109,11 @@ class MemoryDedupService:
         self.db = db
         self.api_key = api_key
         self.memory_service = MemoryService(db, api_key=api_key)
+        # File routing (docs/memory/rebuild-2026-08.md §3.2): every write that
+        # lands here gets a memory-file home, so merge-not-append holds at the
+        # storage boundary rather than in each caller.
+        from app.services.memory_file_service import MemoryFileService
+        self.file_service = MemoryFileService(db)
         self.embedding_service = get_embedding_service()
         if api_key:
             from app.services.llm_service import LLMService
@@ -116,12 +121,54 @@ class MemoryDedupService:
         else:
             self.llm_service = get_llm_service()
     
+    async def _route_or_none(
+        self,
+        user_id: str,
+        new_memory: MemoryCreate,
+        person_names: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """The memory-file slug this write belongs to, or None when routing
+        is unavailable (e.g. the platform DB has no memory_files table).
+        A failed route must never cost the write itself."""
+        try:
+            brain = new_memory.brain_type.value if hasattr(new_memory.brain_type, "value") else (new_memory.brain_type or "user")
+            return await self.file_service.route_slug(
+                user_id, new_memory.category, brain, person_names=person_names,
+            )
+        except Exception as e:
+            logger.warning("[memory_files] routing unavailable, storing unfiled: %s", e)
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
+            return None
+
+    async def _stamp_file(self, memory: Optional[Memory], file_slug: Optional[str]) -> None:
+        """Backfill a file assignment on a surviving row. Its own small
+        transaction — the row it stamps is already committed, so a failure
+        here loses only the stamp, never the memory."""
+        if memory is None or not file_slug or getattr(memory, "file_slug", None):
+            return
+        try:
+            await self.file_service.assign_to_file(memory, file_slug)
+            await self.db.commit()
+        except Exception as e:
+            logger.warning(
+                "[memory_files] could not stamp %s onto memory %s: %s",
+                file_slug, getattr(memory, "id", "?"), e,
+            )
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
+
     async def smart_create_memory(
         self,
         new_memory: MemoryCreate,
         user_id: str,
         *,
         explicit_save: bool = False,
+        person_names: Optional[List[str]] = None,
     ) -> Tuple[Optional[Memory], str]:
         """
         Intelligently create or merge a memory.
@@ -163,6 +210,13 @@ class MemoryDedupService:
             )
             return None, f"rejected:{gate_reason}"
 
+        # Step 0.5: decide which memory file this write belongs to. Routed
+        # here — after the gate, before the lock — so every verdict below can
+        # keep the corpus filed: a created row lands in the file, a superseding
+        # row inherits the old row's place, a reinforced legacy row gets
+        # backfilled.
+        file_slug = await self._route_or_none(user_id, new_memory, person_names)
+
         # Step 1: Generate embedding for new content (async — the sync embed
         # blocks the event loop on OpenAI HTTP; W1.4e).
         # W1.5 mirror (write path): an embedding failure must degrade to an
@@ -190,6 +244,7 @@ class MemoryDedupService:
                 deduplicate=False,  # We already checked
                 embedding=new_embedding
             )
+            await self._stamp_file(memory, file_slug)
             logger.info(f"Created new memory: {memory.id}")
             return memory, "created"
 
@@ -256,6 +311,7 @@ class MemoryDedupService:
             new_memory=new_memory,
             user_id=user_id,
             new_embedding=new_embedding,
+            file_slug=file_slug,
         )
 
     async def smart_create_memories(
@@ -264,6 +320,7 @@ class MemoryDedupService:
         user_id: str,
         *,
         explicit_save: bool = False,
+        person_names: Optional[List[Optional[List[str]]]] = None,
     ) -> List[Tuple[Optional[Memory], str]]:
         """
         Batch variant of smart_create_memory for one turn's extraction (W1.4d).
@@ -292,6 +349,10 @@ class MemoryDedupService:
                 results[i] = (None, f"rejected:{gate_reason}")
                 continue
 
+            # Same routing as the singular path — see smart_create_memory.
+            names_i = person_names[i] if person_names and i < len(person_names) else None
+            file_slug = await self._route_or_none(user_id, new_memory, names_i)
+
             # W1.5 mirror (write path) — see smart_create_memory
             new_embedding = await self._embed_or_none(new_memory.content)
             # Same read-then-write race as the singular path.
@@ -308,6 +369,7 @@ class MemoryDedupService:
                     deduplicate=False,
                     embedding=new_embedding
                 )
+                await self._stamp_file(memory, file_slug)
                 logger.info(f"Created new memory: {memory.id}")
                 results[i] = (memory, "created")
                 continue
@@ -342,6 +404,7 @@ class MemoryDedupService:
                     new_memory=new_memory,
                     user_id=user_id,
                     new_embedding=new_embedding,
+                    file_slug=file_slug,
                 )
             else:
                 pending.append({
@@ -351,6 +414,7 @@ class MemoryDedupService:
                     "pending_positions": pending_positions,
                     "new_memory": new_memory,
                     "embedding": new_embedding,
+                    "file_slug": file_slug,
                 })
 
         if pending:
@@ -380,6 +444,7 @@ class MemoryDedupService:
                     new_memory=p["new_memory"],
                     user_id=user_id,
                     new_embedding=p["embedding"],
+                    file_slug=p["file_slug"],
                 )
 
         return results  # type: ignore[return-value]
@@ -669,7 +734,8 @@ class MemoryDedupService:
         top_match: Dict[str, Any],
         new_memory: MemoryCreate,
         user_id: str,
-        new_embedding: Optional[List[float]] = None
+        new_embedding: Optional[List[float]] = None,
+        file_slug: Optional[str] = None,
     ) -> Tuple[Memory, str]:
         """Apply an adjudication verdict.
 
@@ -687,6 +753,8 @@ class MemoryDedupService:
             existing = await self._get_memory_by_id(top_match['id'])
             if existing:
                 reinforced = await self._reinforce_existing_memory(existing, new_memory)
+                # A restated legacy row is the cheapest moment to file it.
+                await self._stamp_file(reinforced, file_slug)
                 return reinforced, "reinforced"
 
         elif decision['action'] == 'merge':
@@ -698,6 +766,7 @@ class MemoryDedupService:
                     new_memory_data=new_memory,
                     user_id=user_id
                 )
+                await self._stamp_file(merged, file_slug)
                 return merged, "merged"
             except Exception as e:
                 logger.error(f"Merge failed: {e}, creating new memory instead")
@@ -711,6 +780,7 @@ class MemoryDedupService:
                     user_id=user_id,
                     reason=decision.get('reason', 'Updated information'),
                     new_embedding=new_embedding,
+                    file_slug=file_slug,
                 )
                 return superseded, "contradiction_updated"
             except Exception as e:
@@ -723,6 +793,7 @@ class MemoryDedupService:
             deduplicate=False,
             embedding=new_embedding
         )
+        await self._stamp_file(memory, file_slug)
         logger.info(f"Created new memory: {memory.id}")
         return memory, "created"
 
@@ -952,6 +1023,7 @@ class MemoryDedupService:
         user_id: str,
         reason: str = "Updated information",
         new_embedding: Optional[List[float]] = None,
+        file_slug: Optional[str] = None,
     ) -> Memory:
         """
         Mark old memory as superseded and create the replacement.
@@ -985,6 +1057,23 @@ class MemoryDedupService:
             embedding=new_embedding,
             commit=False,
         )
+
+        # The replacement takes the superseded row's place in its memory file
+        # (same file, same position) so the entry evolves without moving;
+        # a legacy row with no file falls back to the routed slug. Set before
+        # the commit below so the pair stays atomic.
+        try:
+            inherited_slug = (old_memory.file_slug if old_memory is not None else None) or file_slug
+            if inherited_slug:
+                new_memory.file_slug = inherited_slug
+                if old_memory is not None and old_memory.file_position is not None:
+                    new_memory.file_position = old_memory.file_position
+                else:
+                    new_memory.file_position = await self.file_service._next_position(
+                        user_id, inherited_slug
+                    )
+        except Exception as e:
+            logger.warning("[memory_files] supersede inheritance failed: %s", e)
 
         try:
             if old_memory is not None:
@@ -1458,6 +1547,7 @@ Rules:
 - Don't lose any information from either source
 - If there's a contradiction, prefer the new information but note it
 - The merged content should read naturally as a single fact/memory
+- Write in the second person, to the user ("You…", "Your…"); name other people by their name; NEVER write "The user"
 - If the new information doesn't add anything new, just return the existing content"""
 
         try:

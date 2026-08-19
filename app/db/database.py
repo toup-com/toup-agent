@@ -888,6 +888,18 @@ async def init_db():
         # index: the decay query filters on user_id/is_deleted/strength and
         # reads this column per row it already selected.
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_decayed_at TIMESTAMP",
+        # Memory files 2026-08-19 (docs/memory/rebuild-2026-08.md). Which
+        # curated file a row belongs to, and its order within it. NULL =
+        # the tenant's organize pass hasn't touched the row yet — readers
+        # fall back to the category→section map, so this is purely additive
+        # and safe on live tenants. The memory_files table itself is new and
+        # created by create_all on agent boot; only the memories columns
+        # need the self-heal.
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS file_slug VARCHAR(160)",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS file_position INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_memories_user_file "
+        "ON memories (user_id, file_slug) "
+        "WHERE file_slug IS NOT NULL AND is_deleted = FALSE",
         # The tsvector column has existed since the decay migration but its
         # maintenance trigger shipped ONLY in alembic — and agent containers
         # boot via create_all, so 100% of tenant rows had search_vector NULL

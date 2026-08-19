@@ -30,6 +30,45 @@ logger = logging.getLogger(__name__)
 # TTL: 7 days from creation or last reinforcement
 ACTIVE_TASK_TTL_DAYS = 7
 
+# ── Same-task matching ────────────────────────────────────────────────
+# The old test was raw-word Jaccard > 0.5, which is why the founder's tenant
+# held three variants of "daily Gmail briefing at 11:49" and three of
+# "motivational quote at 5:06 PM": restatements share the substance but not
+# the filler ("receive one short motivational quote" vs "get a motivational
+# quote daily" overlaps 2/6 raw). Two fixes: compare CONTENT tokens only
+# (stopwords and bare numbers out), and treat a shared clock time plus any
+# shared content word as the same standing arrangement — the time is the
+# discriminating key for scheduled items.
+
+_TASK_STOPWORDS = frozenset(
+    "a an the to of for at in on and or but is are was be been being have has "
+    "want wants wanted like likes would should could will do does did you your "
+    "yours me my i we our us it its this that these those every each per day "
+    "days daily week weekly time times am pm o'clock oclock get gets receive "
+    "receives send sends sent one two with from about".split()
+)
+_TASK_TOKEN_RE = re.compile(r"[\w']+", re.UNICODE)
+_TASK_CLOCK_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+
+
+def _task_tokens(text: str) -> set:
+    return {
+        t for t in _TASK_TOKEN_RE.findall((text or "").lower())
+        if t not in _TASK_STOPWORDS and not t.isdigit()
+    }
+
+
+def _same_task(a: str, b: str) -> bool:
+    ta, tb = _task_tokens(a), _task_tokens(b)
+    if not ta or not tb:
+        return False
+    union = ta | tb
+    if union and len(ta & tb) / len(union) > 0.5:
+        return True
+    # Scheduled restatements: same clock time + any shared substance word.
+    clocks_a, clocks_b = set(_TASK_CLOCK_RE.findall(a or "")), set(_TASK_CLOCK_RE.findall(b or ""))
+    return bool(clocks_a and clocks_a & clocks_b and ta & tb)
+
 # Patterns that signal an active task in user messages
 _ACTIVE_TASK_PATTERNS = [
     re.compile(r"(?:i'm|i am|we're|we are)\s+(?:working on|building|debugging|fixing|implementing|writing|creating|designing|testing|deploying|setting up|configuring|migrating|refactoring|investigating|researching)", re.IGNORECASE),
@@ -196,13 +235,8 @@ async def store_active_task(
         )
     )).scalars().all()
 
-    content_words = set(content.lower().split())
-
     for mem in existing:
-        mem_words = set(mem.content.lower().split())
-        overlap = len(content_words & mem_words)
-        union = len(content_words | mem_words)
-        if union > 0 and overlap / union > 0.5:  # >50% word overlap = same task
+        if _same_task(content, mem.content):
             # Reinforce — reset TTL clock
             mem.last_reinforced_at = datetime.utcnow()
             mem.strength = 1.0  # Reset strength
@@ -216,11 +250,22 @@ async def store_active_task(
             # because the migration stamped expires_at once and nothing moved it.
             if mem.expires_at is not None:
                 mem.expires_at = datetime.utcnow() + timedelta(days=ACTIVE_TASK_TTL_DAYS)
+            if not mem.file_slug:
+                mem.file_slug = "working"
             await db.flush()
             logger.info("[active_task] Reinforced: %s", describe_memory(content))
             return mem.id
 
-    # Create new active task memory
+    # Create new active task memory. A standing arrangement ("send me a
+    # Gmail briefing every day at 11:49") is not a task with a shelf life:
+    # it gets NO lease and a 'standing' tag, so the expiry sweep leaves it
+    # alone and the app can label it honestly — the old path gave it a 7-day
+    # lease that expire_stale_memories would honour even though
+    # decay_expired_tasks deliberately exempts it.
+    from app.memory_taxonomy import describes_recurring_arrangement
+    import json as _json
+    standing = describes_recurring_arrangement(content)
+
     mem_id = str(uuid.uuid4())
     mem = Memory(
         id=mem_id,
@@ -247,12 +292,65 @@ async def store_active_task(
         # could ever retire it, and that reads a different column
         # (last_reinforced_at) on a different schedule. A row that outlives the
         # task it describes is exactly the junk this system is meant not to keep.
-        expires_at=datetime.utcnow() + timedelta(days=ACTIVE_TASK_TTL_DAYS),
+        expires_at=None if standing else datetime.utcnow() + timedelta(days=ACTIVE_TASK_TTL_DAYS),
+        tags_json=_json.dumps(["standing"]) if standing else None,
+        file_slug="working",
     )
     db.add(mem)
     await db.flush()
-    logger.info("[active_task] Created: %s", describe_memory(content))
+    logger.info("[active_task] Created%s: %s",
+                " (standing)" if standing else "", describe_memory(content))
     return mem_id
+
+
+async def normalize_working_leases(db: AsyncSession, user_id: str) -> Dict[str, int]:
+    """One-time repair of legacy working rows (docs/memory/rebuild-2026-08.md
+    RC3.4): rows born before 2026-07-29 have no lease and are invisible to the
+    expiry sweep forever; recurring arrangements created after it carry a
+    lease the sweep WILL honour even though they are standing.
+
+    - recurring content → standing: lease cleared, 'standing' tag added;
+    - non-recurring with no lease → leased from its last sign of life, which
+      may already be in the past — the sweep then ARCHIVES it (fades with a
+      DECAYED event, nothing deleted).
+
+    Idempotent; flushes, caller commits.
+    """
+    import json as _json
+    from app.db.models.memory import Memory
+    from app.memory_taxonomy import describes_recurring_arrangement
+
+    result = await db.execute(
+        select(Memory).where(
+            and_(
+                Memory.user_id == user_id,
+                Memory.category == "active_task",
+                Memory.is_active == True,
+                Memory.is_deleted == False,
+            )
+        )
+    )
+    changed = {"standing": 0, "leased": 0}
+    for mem in result.scalars().all():
+        tags = []
+        try:
+            tags = _json.loads(mem.tags_json) if mem.tags_json else []
+        except Exception:
+            tags = []
+        if describes_recurring_arrangement(mem.content):
+            if mem.expires_at is not None or "standing" not in tags:
+                mem.expires_at = None
+                if "standing" not in tags:
+                    tags.append("standing")
+                    mem.tags_json = _json.dumps(tags)
+                changed["standing"] += 1
+        elif mem.expires_at is None:
+            anchor = mem.last_reinforced_at or mem.created_at or datetime.utcnow()
+            mem.expires_at = anchor + timedelta(days=ACTIVE_TASK_TTL_DAYS)
+            changed["leased"] += 1
+    if changed["standing"] or changed["leased"]:
+        await db.flush()
+    return changed
 
 
 async def decay_expired_tasks(db: AsyncSession, user_id: str) -> int:
@@ -329,6 +427,8 @@ async def get_active_tasks(db: AsyncSession, user_id: str) -> List[Dict]:
     """
     from app.db.models.memory import Memory
 
+    from sqlalchemy import or_
+
     result = await db.execute(
         select(Memory).where(
             and_(
@@ -336,10 +436,22 @@ async def get_active_tasks(db: AsyncSession, user_id: str) -> List[Dict]:
                 Memory.category == "active_task",
                 Memory.is_active == True,
                 Memory.is_deleted == False,
+                # The lease is authoritative here too: a row whose lease ran
+                # out but whose sweep hasn't come round yet must not keep
+                # riding the prompt.
+                or_(Memory.expires_at.is_(None), Memory.expires_at > datetime.utcnow()),
             )
-        ).order_by(Memory.updated_at.desc())
+        ).order_by(Memory.updated_at.desc()).limit(20)
     )
     tasks = result.scalars().all()
+
+    import json as _json
+
+    def _is_standing(t) -> bool:
+        try:
+            return "standing" in (_json.loads(t.tags_json) if t.tags_json else [])
+        except Exception:
+            return False
 
     return [
         {
@@ -348,6 +460,8 @@ async def get_active_tasks(db: AsyncSession, user_id: str) -> List[Dict]:
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "last_reinforced_at": t.last_reinforced_at.isoformat() if t.last_reinforced_at else None,
             "strength": t.strength,
+            "standing": _is_standing(t),
+            "expires_at": t.expires_at.isoformat() if t.expires_at else None,
         }
         for t in tasks
     ]
@@ -371,41 +485,38 @@ def build_active_tasks_block(tasks: List[Dict]) -> str:
     if not tasks:
         return ""
 
+    standing = [t for t in tasks if t.get("standing")]
+    live = [t for t in tasks if not t.get("standing")]
+
     lines = [
         "\n<active_tasks>",
-        "Open threads with this user — things they were working on, "
-        "stuck on, or said they'd come back to. These persist across "
-        "days and channels. Don't list them; that's not what a friend "
-        "does. Instead:",
-        "",
-        "- **First message of the day** (or a long gap since last turn): "
-        "if one of these threads still feels unresolved, ask about it "
-        "naturally as part of your reply. \"Did the Stripe webhook thing "
-        "ever sort itself out?\" — that kind of beat. ONE thread max, the "
-        "most recently reinforced. Don't bring it up if their opener is "
-        "clearly about something else important.",
-        "",
-        "- **Mid-conversation:** if their current message connects to one "
-        "of these threads (even loosely), reference it directly. \"Right, "
-        "that ties back to the migration you were stuck on earlier.\"",
-        "",
-        "- **Never say** \"I see you're working on...\" or \"I remember "
-        "that you...\" — those are robot phrases. Just ask, or just say "
-        "the thing, the way a friend would.",
-        "",
-        "- **If a thread is done**, drop it: don't keep asking about a "
-        "task they've moved past. When in doubt, the recently-reinforced "
-        "ones are the live ones.",
-        "",
-        "Open threads (most-recently-reinforced first):",
+        "Open threads with this user — live across days and channels. Never "
+        "recite this list, and never say \"I see you're working on…\" or "
+        "\"I remember that you…\" — robot phrases. On the first message of "
+        "the day (or after a long gap), if one thread still feels unresolved, "
+        "ask about it naturally — ONE at most, the most recently reinforced, "
+        "and not when their opener is clearly about something else. "
+        "Mid-conversation, connect their message to a thread when it genuinely "
+        "ties in. Drop threads they've moved past.",
     ]
-    for t in tasks[:10]:  # Max 10 active tasks
-        age = ""
-        if t.get("last_reinforced_at"):
-            age = f" (last mentioned: {t['last_reinforced_at'][:10]})"
-        elif t.get("created_at"):
-            age = f" (since: {t['created_at'][:10]})"
-        lines.append(f"- {t['content']}{age}")
+    if live:
+        lines.append("")
+        lines.append("Open threads (most recently reinforced first):")
+        for t in live[:10]:
+            age = ""
+            if t.get("last_reinforced_at"):
+                age = f" (last mentioned: {t['last_reinforced_at'][:10]})"
+            elif t.get("created_at"):
+                age = f" (since: {t['created_at'][:10]})"
+            lines.append(f"- {t['content']}{age}")
+    if standing:
+        lines.append("")
+        lines.append(
+            "Standing arrangements (these run on their own — know them, "
+            "don't ask about them):"
+        )
+        for t in standing[:10]:
+            lines.append(f"- {t['content']}")
     lines.append("</active_tasks>")
 
     return "\n".join(lines) + "\n"
