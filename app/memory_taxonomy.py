@@ -953,17 +953,95 @@ def _inflect_third_person(head: str) -> str:
     return head + "s"
 
 
+# The knowledge graph's endpoint for the account owner is the literal entity
+# "USER" (case varies by producer). Everything ELSE about the user speaks to
+# them in the second person — the extractor, consolidation and merge prompts
+# all mandate "You…" — so a mirror that says "USER lives in Toronto" beside an
+# extracted "You live in Toronto." is a voice split the dedup boundary cannot
+# close: the two sentences stop colliding at the similarity probe and the same
+# fact survives twice (memverify test_f), and a correction supersedes one of
+# them while the other stays stale (memverify test_e). Render self-endpoint
+# edges in the second person too. English makes this cheap: second person and
+# plural agree everywhere except be/have/do and a handful of -s forms.
+_SECOND_PERSON_VERB_MAP = {
+    "is": "are", "was": "were", "has": "have", "does": "do", "goes": "go",
+}
+
+
+def _second_person_verb(verb: str) -> str:
+    low = verb.lower()
+    mapped = _SECOND_PERSON_VERB_MAP.get(low)
+    if mapped:
+        return mapped
+    if low in _NEVER_INFLECT:
+        return verb
+    if low.endswith("ies") and len(low) > 3:
+        return verb[:-3] + "y"
+    if low.endswith("es") and len(low) > 2 and low[:-2].endswith(("s", "x", "z", "ch", "sh")):
+        return verb[:-2]
+    if low.endswith("s") and not low.endswith("ss"):
+        return verb[:-1]
+    return verb
+
+
+def _is_self_entity(name: str) -> bool:
+    return (name or "").strip().lower() == "user"
+
+
 def humanize_relationship(
     source_name: str,
     relationship: str,
     target_name: str,
+    *,
+    second_person: bool = True,
 ) -> str:
     """Render a knowledge-graph edge as a sentence a person can read.
 
     The triple itself is never lost — callers keep it in `metadata_json`. This
     governs only what a human sees on the Memory screen and what gets embedded
     for search, both of which are better served by prose than by predicate-ese.
+
+    When an endpoint is the user's own entity ("USER"), the sentence speaks to
+    them — "You live in Toronto", "Aria is your assistant" — matching the voice
+    every other memory producer uses. `second_person=False` yields the raw
+    third-person form; `_relationship_was_forgotten` matches on it so an edge a
+    user forgot before this change stays forgotten.
     """
+    if not second_person:
+        return _render_relationship(source_name, relationship, target_name)
+    src_self = _is_self_entity(source_name)
+    tgt_self = _is_self_entity(target_name)
+    if not (src_self or tgt_self):
+        return _render_relationship(source_name, relationship, target_name)
+
+    S = "\x00SELF\x00"
+    sentence = _render_relationship(
+        S if src_self else source_name,
+        relationship,
+        S if tgt_self else target_name,
+    )
+    # Possessive endpoint first ("{t}'s assistant" -> "your assistant").
+    sentence = sentence.replace(S + "'s", "your")
+    # Sentence-initial self is the subject: "you" + second-person agreement on
+    # the finite verb that follows. Templates and the fallback are both
+    # subject-first, so position is the reliable signal here.
+    if sentence.startswith(S + " "):
+        parts = sentence.split(" ", 2)
+        verb = _second_person_verb(parts[1]) if len(parts) > 1 else ""
+        tail = parts[2] if len(parts) > 2 else ""
+        sentence = " ".join(x for x in ("you", verb, tail) if x)
+    sentence = sentence.replace(S, "you")
+    if sentence.startswith("you"):
+        sentence = "You" + sentence[3:]
+    return sentence
+
+
+def _render_relationship(
+    source_name: str,
+    relationship: str,
+    target_name: str,
+) -> str:
+    """The third-person rendering underneath `humanize_relationship`."""
     source = (source_name or "").strip()
     target = (target_name or "").strip()
     raw = (relationship or "").strip()

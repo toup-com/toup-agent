@@ -281,6 +281,57 @@ async def test_batch_write_path_degrades_without_sentence_transformers(monkeypat
     assert all(memory.embedding_json is None for memory, _ in results)
 
 
+async def test_batch_write_path_survives_a_missing_memory_files_table(
+    monkeypatch, memory_user, caplog
+):
+    """CI regression (2026-08-19): under RUN_MODE=platform the memories table
+    exists but the AGENT_ONLY memory_files table does not, so file routing
+    fails for every item. Routing runs on its own session and latches off
+    after the first failure — the degrade must cost ONLY the file stamp.
+    The original defect rolled back the SHARED session instead, expiring the
+    batch's earlier committed instances; the caller then read
+    DetachedInstanceError off a memory it had just been handed."""
+    import app.services.memory_dedup_service as mds
+
+    await _ensure_memory_tables()
+    _keyless_bundle_settings(monkeypatch, via_proxy=False)
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    monkeypatch.setattr(mds, "get_llm_service", lambda: MagicMock())
+
+    from sqlalchemy import text as sql_text
+
+    from app.db.database import async_session_maker, engine
+
+    async with engine.begin() as conn:
+        await conn.execute(sql_text("DROP TABLE IF EXISTS memory_files"))
+
+    with caplog.at_level(logging.WARNING):
+        async with async_session_maker() as db:
+            dedup = mds.MemoryDedupService(db)
+            results = await dedup.smart_create_memories(
+                new_memories=[
+                    _mem_create("User's cat is named Vesper"),
+                    _mem_create("User is learning Spanish on Tuesdays"),
+                ],
+                user_id=memory_user,
+            )
+
+    # The reads below run AFTER the session closed — the exact CI symptom.
+    assert [action for _, action in results] == ["created", "created"]
+    for memory, _ in results:
+        assert memory.content
+        assert memory.embedding_json is None
+        assert memory.file_slug is None  # stored unfiled, not dropped
+
+    unavailable = [
+        r for r in caplog.records if "routing unavailable" in r.getMessage()
+    ]
+    assert len(unavailable) == 1, (
+        "routing must latch off after the first failure, "
+        f"got {len(unavailable)} warnings"
+    )
+
+
 # ── (d) bind must re-resolve the provider cached during LOBBY boot ───
 
 

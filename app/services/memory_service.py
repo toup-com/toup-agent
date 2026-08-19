@@ -2283,6 +2283,13 @@ class MemoryService:
         relationship_content = humanize_relationship(
             source_name, relationship, target_name
         )
+        # Two older phrasings of the same edge, kept ONLY so the forgotten
+        # check below still matches rows written before each format change:
+        # the third-person prose era ("USER lives in Toronto") and the raw
+        # predicate era ("USER lives_in Toronto" with underscores spaced).
+        third_person_content = humanize_relationship(
+            source_name, relationship, target_name, second_person=False
+        )
         legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
 
         # ── Never-store backstop ─────────────────────────────────────────
@@ -2485,7 +2492,7 @@ class MemoryService:
         # brand-new memory — and there is no restore route to undo that.
         # Both phrasings are checked: see _relationship_was_forgotten.
         if not existing and await self._relationship_was_forgotten(
-            user_id, relationship_content, legacy_content
+            user_id, relationship_content, third_person_content, legacy_content
         ):
             return
 

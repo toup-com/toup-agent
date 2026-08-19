@@ -589,12 +589,45 @@ def test_relationship_rendering_never_leaks_a_raw_predicate():
         humanize_relationship("User", "connects_to", "Gmail")
 
     # An unknown predicate must still produce a sentence, not a bare stem.
+    # A "User"/"USER" endpoint is the account owner, so these speak TO them
+    # (second person) — the voice every other memory producer uses since the
+    # 2026-08 rebuild. Third person for self edges is only reachable via
+    # second_person=False (the forgotten-check's compatibility probe).
     assert humanize_relationship("User", "frobnicate", "Widget") == \
-        "User frobnicates Widget"
-    assert humanize_relationship("User", "carry", "Bag") == "User carries Bag"
-    # Already-inflected verbs are left alone rather than double-suffixed.
+        "You frobnicate Widget"
+    assert humanize_relationship("User", "carry", "Bag") == "You carry Bag"
+    # Already-inflected verbs are de-inflected for the second person, never
+    # double-suffixed.
     assert humanize_relationship("User", "watches", "Netflix") == \
-        "User watches Netflix"
+        "You watch Netflix"
+
+
+def test_self_endpoint_edges_speak_to_the_user():
+    """The mirror's voice must collide with the extractor's at the dedup
+    boundary. "USER lives in Toronto" beside "You live in Toronto." stopped
+    matching at the similarity probe the moment extraction moved to the
+    second person — the same fact survived twice (memverify test_f) and a
+    correction left the mirror copy stale (memverify test_e)."""
+    from app.memory_taxonomy import humanize_relationship as H
+
+    # Subject position: second-person agreement on the finite verb.
+    assert H("USER", "lives_in", "Toronto") == "You live in Toronto"
+    assert H("USER", "allergic_to", "peanuts") == "You are allergic to peanuts"
+    assert H("USER", "has_account_on", "GitHub") == "You have an account on GitHub"
+    # Modals are already person-invariant.
+    assert H("USER", "might_cause_problems_in", "Canada") == \
+        "You might cause problems in Canada"
+    # Object position and possessives.
+    assert H("Maya", "chats_with", "USER") == "Maya chats with you"
+    assert H("Aria", "is_agent_of", "USER") == "Aria is your assistant"
+    # A template that flips its slots still finds the subject by position.
+    assert H("Bunker", "performed_by", "USER") == "You perform Bunker"
+    # Edges between two non-self entities are untouched.
+    assert H("Vesper", "allergic_to", "chicken") == "Vesper is allergic to chicken"
+    # The escape hatch renders the pre-change form, byte for byte, so a
+    # relationship forgotten under the old voice stays forgotten.
+    assert H("USER", "lives_in", "Toronto", second_person=False) == \
+        "USER lives in Toronto"
 
 
 def test_only_verbs_are_conjugated():
@@ -627,9 +660,10 @@ def test_only_verbs_are_conjugated():
         "Guests people might come to the launch"
 
     # ...while genuine stems still conjugate — see the test above, which this
-    # must not regress.
-    assert H("User", "frobnicate", "Widget") == "User frobnicates Widget"
-    assert H("User", "work_at", "Acme") == "User works at Acme"
+    # must not regress. (Non-self subject: a "User" endpoint now renders in
+    # the second person, which is a different test's business.)
+    assert H("Rampage", "frobnicate", "Widget") == "Rampage frobnicates Widget"
+    assert H("Rampage", "work_at", "Acme") == "Rampage works at Acme"
 
     for rendered in (
         H("Vesper", "allergic_to", "chicken"),
@@ -1057,8 +1091,9 @@ def test_humanizer_never_inflects_a_modal_verb():
     # US spelling, matching the rest of the codebase.
     assert h("email routine", "summarizes", "Gmail") == \
         "email routine summarizes Gmail"
-    # And the genuinely-broken case still gets repaired.
-    assert h("User", "frobnicate", "Widget") == "User frobnicates Widget"
+    # And the genuinely-broken case still gets repaired. (Non-self subject:
+    # a "User" endpoint renders second person since the 2026-08 rebuild.)
+    assert h("Rampage", "frobnicate", "Widget") == "Rampage frobnicates Widget"
 
 
 def test_relationship_category_describes_the_object_not_the_person():

@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from app.db.models.base import Base
 from app.db.models.user import User
@@ -51,8 +52,13 @@ def _offline_embeddings(monkeypatch):
 
 
 async def _make_session():
+    # StaticPool: file routing opens a sibling session on this same bind
+    # (memory_dedup_service._route_or_none), and without a shared connection
+    # an in-memory sqlite hands every new connection its own empty database.
     engine = create_async_engine(
-        "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
+        "sqlite+aiosqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
     )
     async with engine.begin() as conn:
         await conn.run_sync(

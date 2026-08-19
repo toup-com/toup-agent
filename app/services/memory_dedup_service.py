@@ -114,6 +114,10 @@ class MemoryDedupService:
         # storage boundary rather than in each caller.
         from app.services.memory_file_service import MemoryFileService
         self.file_service = MemoryFileService(db)
+        # Routing infrastructure can legitimately be absent (a platform-mode
+        # monolith DB has no memory_files table). Latched on first failure so
+        # a batch degrades once, not once per item.
+        self._routing_unavailable = False
         self.embedding_service = get_embedding_service()
         if api_key:
             from app.services.llm_service import LLMService
@@ -130,17 +134,32 @@ class MemoryDedupService:
         """The memory-file slug this write belongs to, or None when routing
         is unavailable (e.g. the platform DB has no memory_files table).
         A failed route must never cost the write itself."""
+        if self._routing_unavailable:
+            return None
+        # Routing runs on its OWN session, never the caller's. A failed query
+        # aborts the transaction it ran in, and a rollback of the SHARED
+        # session expires every instance loaded in it — the caller's earlier
+        # batch results included, which is how CI read DetachedInstanceError
+        # off a memory it had just been handed. Isolation also means the
+        # person-file get-or-create commits on its own, which is idempotent.
         try:
             brain = new_memory.brain_type.value if hasattr(new_memory.brain_type, "value") else (new_memory.brain_type or "user")
-            return await self.file_service.route_slug(
-                user_id, new_memory.category, brain, person_names=person_names,
-            )
-        except Exception as e:
-            logger.warning("[memory_files] routing unavailable, storing unfiled: %s", e)
+            from app.services.memory_file_service import MemoryFileService
+            # Same database as the caller (its bind), never the caller's
+            # session — a maker-level default here would silently point at a
+            # different engine whenever the service was constructed on one.
+            routing_db = AsyncSession(bind=self.db.bind, expire_on_commit=False)
             try:
-                await self.db.rollback()
-            except Exception:
-                pass
+                slug = await MemoryFileService(routing_db).route_slug(
+                    user_id, new_memory.category, brain, person_names=person_names,
+                )
+                await routing_db.commit()
+                return slug
+            finally:
+                await routing_db.close()
+        except Exception as e:
+            self._routing_unavailable = True
+            logger.warning("[memory_files] routing unavailable, storing unfiled: %s", e)
             return None
 
     async def _stamp_file(self, memory: Optional[Memory], file_slug: Optional[str]) -> None:
@@ -159,6 +178,10 @@ class MemoryDedupService:
             )
             try:
                 await self.db.rollback()
+                # Rollback expires every instance in the session; the caller
+                # still holds this one and reads it after we return. Re-load
+                # so losing the stamp never costs the read.
+                await self.db.refresh(memory)
             except Exception:
                 pass
 
