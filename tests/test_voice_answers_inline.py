@@ -177,7 +177,11 @@ class TestVoicePromptOmitsDeferralTools:
         assert tool in pk_web
 
     def test_web_keeps_the_create_job_first_rule(self, pk_web):
-        assert "call `create_job` FIRST" in pk_web
+        # Round 4 (item 7): the rule still opens the job at the start of the
+        # work — but IN THE SAME RESPONSE as the first tool calls, never as
+        # a response by itself (that was one full LLM round-trip per turn).
+        assert "call `create_job` in the SAME response as the first step's tool calls" in pk_web
+        assert "never call update_job to mark completed" in pk_web
 
     def test_start_mission_is_offered_on_both(self, pk_voice, pk_web):
         assert "start_mission" in pk_voice

@@ -27,6 +27,7 @@ the same consumer contract.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import inspect
 import json
 import logging
@@ -131,6 +132,10 @@ async def _drive(svc: OpenAIAgentService, **kwargs):
     events = []
     async for ev in svc.create_message_stream(**kwargs):
         events.append(ev)
+    # Round 4: the usage report is scheduled as a background task right
+    # before message_end (no longer awaited inline) — yield once so the spy
+    # sees it, exactly as the runner's next await would in production.
+    await asyncio.sleep(0)
     return events
 
 

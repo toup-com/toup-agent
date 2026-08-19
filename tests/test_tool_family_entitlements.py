@@ -106,8 +106,22 @@ from app.config import settings
 # the description is the text it reads at that moment.
 #
 # Cost accepted a third time: one more prompt-cache re-warm per tenant.
+#
+# MOVED A FOURTH TIME, DELIBERATELY, 2026-08-19 (was 12280b25…6f5532).
+# Round 4, item 7 (speed): `create_job` / `update_job` descriptions now carry
+# the SPEED CONTRACT — call create_job IN THE SAME RESPONSE as the first
+# step's real tool calls (never alone), advance steps with update_job in the
+# same response as the next step's tools, and never call update_job to mark
+# 'completed' (the runner's finalizer already does that). Measured on the
+# founder's tenant 2026-08-18: the three bookkeeping-only LLM rounds were
+# 7–22 s of a 17–69 s turn. Still 60 definitions; no tool added, removed or
+# reordered; input_schema unchanged. Same rule as before: this had to be on
+# the tool, because the description is the text the model reads at the
+# moment it decides WHAT to put in one response.
+#
+# Cost accepted a fourth time: one more prompt-cache re-warm per tenant.
 MAIN_CORE_TOOLS_SHA256 = (
-    "12280b25276446a79737b51b670476d7e9e8b06d71c57bb3562457c1646f5532"
+    "9909dc25f3ab6d968700323853e05792fae53ed4f141b223917301d8d4384a09"
 )
 MAIN_CORE_TOOLS_COUNT = 60
 

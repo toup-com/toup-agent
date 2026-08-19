@@ -32,12 +32,35 @@ _context = None
 _pw = None
 _lock = asyncio.Lock()
 
+# Round 4 (item 7b): once launch has failed because the browser BINARY is
+# missing (or the package is), remember it. The agent image does not ship
+# chromium, so before this every JS-rendered / 403 page paid ~6 s to start
+# the driver, fail, and print the "please run patchright install" banner —
+# per page, per turn, fleet-wide. Process-lifetime latch: an operator who
+# installs the browser recycles the container anyway.
+_UNAVAILABLE_REASON: Optional[str] = None
+
+
+def browser_unavailable_reason() -> Optional[str]:
+    """Why the research browser cannot launch in this process, or None."""
+    return _UNAVAILABLE_REASON
+
+
+def _mark_unavailable(reason: str) -> None:
+    global _UNAVAILABLE_REASON
+    if _UNAVAILABLE_REASON is None:
+        _UNAVAILABLE_REASON = reason[:200]
+        logger.warning("[BROWSER_API] research browser marked unavailable for this process: %s", reason[:200])
+
 
 BROWSER_LAUNCH_TIMEOUT = 15  # seconds — fail fast if Chromium isn't available
 
 async def _ensure_browser():
     """Lazy-init a headless-only browser for research. Separate from user browser."""
     global _browser, _context, _pw
+
+    if _UNAVAILABLE_REASON:
+        raise RuntimeError(f"Browser not available: {_UNAVAILABLE_REASON}")
 
     async with _lock:
         if _browser and _browser.is_connected():
@@ -83,12 +106,19 @@ async def _ensure_browser():
 
         except asyncio.TimeoutError:
             logger.error("[BROWSER_API] Browser launch timed out after %ds — Chromium may not be installed", BROWSER_LAUNCH_TIMEOUT)
+            _mark_unavailable("launch timed out — chromium probably not installed")
             raise RuntimeError("Browser launch timed out — Chromium not available")
         except ImportError:
+            _mark_unavailable("patchright/playwright not installed")
             raise RuntimeError(
                 "Browser not available. Install: pip install patchright && patchright install chromium"
             )
-        except Exception:
+        except Exception as _launch_err:
+            _msg = str(_launch_err)
+            if "Executable doesn't exist" in _msg or "playwright install" in _msg.lower():
+                _mark_unavailable("browser executable missing (image has no chromium)")
+                logger.error("[BROWSER_API] Failed to launch headless browser: %s", _msg.splitlines()[0][:200])
+                raise RuntimeError("Browser not available: chromium executable missing") from _launch_err
             logger.exception("[BROWSER_API] Failed to launch headless browser")
             raise
 

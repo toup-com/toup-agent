@@ -190,6 +190,11 @@ async def send_live_activity(
 #
 # Value caps keep the whole payload inside Apple's 4KB LA budget with
 # every field populated (measured worst case ≈ 1.6KB).
+from app.services.plain_text import (  # noqa: E402  (stdlib-only module)
+    plain_preview as _plain,
+    strip_markdown as _strip_md,
+)
+
 _EXTRA_STATE_STR = {"jobType": 16, "stepName": 80, "preview": 120,
                     "chatId": 64, "messageId": 64}
 _EXTRA_STATE_INT = ("stepsDone", "stepsTotal", "percent")
@@ -204,7 +209,14 @@ def _extra_state(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     for key, cap in _EXTRA_STATE_STR.items():
         v = extra.get(key)
         if isinstance(v, str) and v.strip():
-            out[key] = " ".join(v.split())[:cap]
+            # Round 4 (item 4): the Live Activity renders these verbatim —
+            # strip markdown BEFORE the cap (a `**` pair split by the cap
+            # would otherwise survive). Ids are never markdown; skipping
+            # them keeps _safe_id's output byte-identical.
+            if key in ("chatId", "messageId", "jobType"):
+                out[key] = " ".join(v.split())[:cap]
+            else:
+                out[key] = _plain(v, cap)
     for key in _EXTRA_STATE_INT:
         v = extra.get(key)
         if isinstance(v, bool):
@@ -222,9 +234,9 @@ def _content_state(
     fired: Optional[bool] = None,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    state: Dict[str, Any] = {"title": title[:80]}
+    state: Dict[str, Any] = {"title": _plain(title, 80)}
     if subtitle:
-        state["subtitle"] = subtitle[:120]
+        state["subtitle"] = _plain(subtitle, 120)
     # Round 3 extras ride every state — including fired ones, where the
     # deep-link ids are still what a tap needs.
     state.update(_extra_state(extra))
@@ -282,7 +294,7 @@ def _alert(
     if not alert_title:
         return None
     alert: Dict[str, Any] = {
-        "title": alert_title[:120],
+        "title": _plain(alert_title, 120),
         # requested_sound is intentionally unused here. A name lands as
         # silence; "default" is the loudest thing an ActivityKit alert can
         # be, so a chosen tone DEGRADES to the system tone rather than to
@@ -290,7 +302,8 @@ def _alert(
         "sound": ACTIVITY_KIT_SOUND,
     }
     if alert_body:
-        alert["body"] = alert_body[:400]
+        # Multi-line surface: keep line breaks, drop the syntax.
+        alert["body"] = _strip_md(alert_body)[:400]
     return alert
 
 

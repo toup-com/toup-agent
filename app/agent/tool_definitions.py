@@ -1636,21 +1636,26 @@ def get_extended_tools():
             "description": (
                 "Create a trackable job for multi-step work you are doing NOW, in this "
                 "conversation. It appears live in the user's dashboard, sidebar, and on "
-                "their phone's lock screen / Dynamic Island. Declare steps up front and "
-                "call update_job as you complete each one. CONTRACT — never end your "
-                "reply while a job you created is still 'running': before finishing, "
-                "either (a) complete the work and mark it 'completed', (b) mark it "
-                "'waiting_on_user' if you are BLOCKED ON THE USER — a confirmation "
-                "card they must approve, a connector they must reconnect, a question "
-                "only they can answer, (c) mark it 'failed' with an error_message if "
-                "the work genuinely broke, or (d) hand the remaining work to spawn or "
-                "start_mission so something actually continues it. Waiting on someone "
-                "is NOT failing: 'failed' next to a card asking them to approve "
-                "something tells them the app is broken at the exact moment it is "
-                "working correctly. A job left 'running' when your turn ends freezes "
-                "every progress surface and is closed as stalled after 30 minutes. "
-                "Never create a job for work you are handing to start_mission — the "
-                "mission appears as its own tracked task in Mission Control."
+                "their phone's lock screen / Dynamic Island. Declare 2-4 short steps up "
+                "front; the LAST step is writing the answer. SPEED CONTRACT: every "
+                "response you spend on bookkeeping alone is a full model round-trip the "
+                "user waits through, so (1) call create_job IN THE SAME RESPONSE as the "
+                "first step's real tool calls (create_job first, then the searches/reads, "
+                "as parallel function calls) — never in a response by itself; (2) advance "
+                "steps with update_job(current_step=k) IN THE SAME RESPONSE as the next "
+                "step's tool calls, never alone; (3) do NOT call update_job to mark the "
+                "job 'completed' and do NOT advance the final writing step — the system "
+                "marks every remaining step done and completes the job the moment your "
+                "reply is delivered. The only reason to call update_job on its own is "
+                "'waiting_on_user' (BLOCKED ON THE USER — a confirmation card they must "
+                "approve, a connector they must reconnect, a question only they can "
+                "answer) or 'failed' with an error_message if the work genuinely broke; "
+                "or hand the remaining work to spawn / start_mission so something "
+                "actually continues it. Waiting on someone is NOT failing: 'failed' next "
+                "to a card asking them to approve something tells them the app is broken "
+                "at the exact moment it is working correctly. Never create a job for work "
+                "you are handing to start_mission — the mission appears as its own "
+                "tracked task in Mission Control."
             ),
             "input_schema": {
                 "type": "object",
@@ -1675,9 +1680,13 @@ def get_extended_tools():
         {
             "name": "update_job",
             "description": (
-                "Update the status of an existing job. Use this to mark steps as done, "
-                "update the overall job status, or add an error message. "
-                "Call this as you complete each step so the user sees live progress."
+                "Advance or re-status an existing job. To mark a step done, call it "
+                "IN THE SAME RESPONSE as the next step's tool calls (parallel function "
+                "calls) — a response containing only update_job is a wasted model "
+                "round-trip the user waits through. Never call it to mark 'completed' "
+                "and never advance the final writing step: the system completes the job "
+                "when your reply is delivered. Call it alone only for 'waiting_on_user' "
+                "or 'failed'."
             ),
             "input_schema": {
                 "type": "object",

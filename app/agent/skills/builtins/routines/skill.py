@@ -125,16 +125,15 @@ _DIET_TOOL_DESCRIPTIONS = {
         "`delivery_channels` unless the user explicitly restricts it."
     ),
     "routines__remind": (
-        "Create a reminder (kind=`reminder`) — literal text delivered at a "
-        "time, no LLM. Use this instead of `routines__create` for any "
-        "remind / alert / nudge request. Modes via `when`: `once` "
-        "(+`at_local`, then auto-disable), `daily` (+`daily_at_local`), "
-        "`every` (+`every_seconds`, optional `window_start_local`/"
-        "`window_end_local` daily window — without one the interval runs "
-        "24/7). All times are the user's local tz, resolved server-side. "
-        "Delivery is automatic to chat + every connected channel: never ask "
-        "where to send it; OMIT `delivery_channels` unless the user "
-        "explicitly restricts it."
+        "Create a reminder — literal text delivered at a time, no LLM. Use "
+        "instead of `routines__create` for any remind / alert / nudge; call "
+        "ONCE per request. `when`: `once` ('in N min' → `in_seconds`, never a "
+        "computed clock time; 'at 8:15' → `at_local`), `daily` "
+        "(+`daily_at_local`), `every` (+`every_seconds`, optional "
+        "`window_start_local`/`window_end_local`; none = 24/7). Times are the "
+        "user's local tz. Delivery is automatic to chat + every connected "
+        "channel: never ask where; OMIT `delivery_channels` unless the user "
+        "restricts it."
     ),
 }
 
@@ -156,9 +155,13 @@ _DIET_PROPERTY_DESCRIPTIONS = {
     "routines__remind": {
         "reminder_text": "Literal text delivered at fire time, written for the user to read.",
         "when": "`once` = one-shot + auto-disable; `daily` = same time every day; `every` = interval.",
+        "in_seconds": (
+            "when=`once`, RELATIVE ('in 1 min' → 60, 'in 90 seconds' → 90, "
+            "'in 2 hours' → 7200): seconds from now. Use instead of `at_local`."
+        ),
         "at_local": (
-            "Required when when=`once`: \"YYYY-MM-DD HH:MM\" or \"HH:MM\" "
-            "(today if still future, else tomorrow)."
+            "when=`once`, ABSOLUTE: \"YYYY-MM-DD HH:MM[:SS]\" or \"HH:MM[:SS]\" "
+            "(today if still future, else tomorrow). Relative → `in_seconds`."
         ),
         "daily_at_local": "Required when when=`daily`: \"HH:MM\" local.",
         "every_seconds": "Required when when=`every`: interval seconds, min 60.",
@@ -312,10 +315,15 @@ class RoutinesSkill(Skill):
                     "where the value is *literal text delivered at a time*, NOT "
                     "an LLM-generated summary.\n\n"
                     "Three modes via `when`:\n"
-                    "  • `once` — fire one time, then auto-disable. Pass "
-                    "`at_local` as either `\"YYYY-MM-DD HH:MM\"` (full local "
-                    "datetime) or `\"HH:MM\"` (today if still future, else "
-                    "tomorrow). Example: \"remind me to call mom at 6pm\".\n"
+                    "  • `once` — fire one time, then auto-disable. RELATIVE "
+                    "requests ('in 1 min', 'in 90 seconds', 'in 2 hours') → pass "
+                    "`in_seconds` (60 / 90 / 7200) and NOTHING else for the time; "
+                    "never convert a relative delay into a wall-clock `at_local` — "
+                    "the clock you see is minute-resolution and the reminder would "
+                    "fire early. ABSOLUTE requests ('at 8:15', 'tomorrow 6pm') → "
+                    "pass `at_local` as `\"YYYY-MM-DD HH:MM[:SS]\"` or "
+                    "`\"HH:MM[:SS]\"` (today if still future, else tomorrow). "
+                    "Example: \"remind me to call mom at 6pm\".\n"
                     "  • `daily` — fire every day at the same wall-clock time. "
                     "Pass `daily_at_local=\"HH:MM\"`. Example: \"remind me to "
                     "drink water every morning at 9\".\n"
@@ -332,7 +340,10 @@ class RoutinesSkill(Skill):
                     "`delivery_channels` delivers the reminder to the chat AND "
                     "every channel the user has connected (Telegram, WhatsApp) "
                     "automatically. Pass it only when the user explicitly "
-                    "restricts delivery (\"only telegram\" → [\"telegram\"])."
+                    "restricts delivery (\"only telegram\" → [\"telegram\"]). "
+                    "Call this tool exactly ONCE per reminder the user asked for; "
+                    "an identical reminder within the same minute is refused as a "
+                    "duplicate."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -355,13 +366,23 @@ class RoutinesSkill(Skill):
                                 "an interval (optionally bounded by a daily window)."
                             ),
                         },
+                        "in_seconds": {
+                            "type": "integer",
+                            "description": (
+                                "when=`once`, RELATIVE request: seconds from now "
+                                "('in 1 min' → 60, 'in 90 seconds' → 90, "
+                                "'in 2 hours' → 7200). Preferred over `at_local` "
+                                "for anything phrased as a delay. Min 5."
+                            ),
+                        },
                         "at_local": {
                             "type": "string",
                             "description": (
-                                "Required when when=`once`. Either "
-                                "\"YYYY-MM-DD HH:MM\" (explicit date+time) or "
-                                "\"HH:MM\" (today if still in the future, else "
-                                "tomorrow). Interpreted in the user's local tz."
+                                "when=`once`, ABSOLUTE time: either "
+                                "\"YYYY-MM-DD HH:MM[:SS]\" (explicit date+time) or "
+                                "\"HH:MM[:SS]\" (today if still in the future, else "
+                                "tomorrow). Interpreted in the user's local tz. "
+                                "Do NOT use for 'in N minutes' — pass `in_seconds`."
                             ),
                         },
                         "daily_at_local": {
@@ -562,7 +583,13 @@ class RoutinesSkill(Skill):
             "(reminder / alert / nudge — \"remind me to X\", \"ping me at Y\"), "
             "use **`routines__remind`** with the friendly `when` modes "
             "(once / daily / every). No LLM call, no MCP — just text on a "
-            "schedule.\n"
+            "schedule. A RELATIVE ask (\"in 1 min\", \"in 90 seconds\", "
+            "\"in 2 hours\") is `when=once` + `in_seconds` (60 / 90 / 7200) — "
+            "never convert it to a clock time yourself; the clock you see has "
+            "no seconds and the reminder would fire early. An ABSOLUTE ask "
+            "(\"at 8:15\", \"tomorrow at 6pm\") is `at_local`. Call the tool "
+            "exactly ONCE per reminder — one request, one call, one "
+            "confirmation sentence.\n"
             "  • If the user wants the agent to DO something "
             "(\"summarize my emails\", \"check my GitHub\"), use "
             "`routines__create` with kind=`email_briefing` or `agent_task`.\n"
@@ -597,10 +624,13 @@ class RoutinesSkill(Skill):
             "result's `delivery_channels`), and tell them they can adjust "
             "later from Mission Control on the dashboard.\n"
             "\n"
-            "**Before creating, always call `routines__list` first** to check "
-            "if a similar routine already exists — if so, offer to update it "
-            "instead of duplicating. (Note: `email_briefing` is one-per-user; "
-            "the API will 409 a duplicate. `agent_task` allows many.)\n"
+            "**Before creating a ROUTINE (`routines__create`), call "
+            "`routines__list` first** to check if a similar routine already "
+            "exists — if so, offer to update it instead of duplicating. (Note: "
+            "`email_briefing` is one-per-user; the API will 409 a duplicate. "
+            "`agent_task` allows many.) A plain reminder does NOT need the "
+            "list call — `routines__remind` refuses an exact duplicate itself; "
+            "just call it once.\n"
             "\n"
             "Routines are flag-gated. If `routines__create` returns "
             "`ERROR: Feature not available`, tell the user the feature isn't "
@@ -673,19 +703,38 @@ class RoutinesSkill(Skill):
         # and confuse the agent. Each branch records its inputs and
         # defers the per-kind payload build until after we have `tz`.
         once_raw_at: Optional[str] = None
+        once_in_seconds: Optional[int] = None
         daily_hhmm: Optional[tuple[int, int]] = None
         every_secs: Optional[int] = None
         window_start: Optional[str] = None
         window_end: Optional[str] = None
 
         if when == "once":
+            # Round 4 (item 5b): a RELATIVE reminder is a delay from NOW,
+            # computed HERE at execution time to the second. The model used
+            # to translate "in 1 min" into a wall-clock "HH:MM" from a
+            # minute-resolution clock, and the parser zeroed the seconds —
+            # so "in 1 min" always fired at the next minute BOUNDARY (the
+            # founder's 27 s). `in_seconds` wins when both are present.
+            _in_s = args.get("in_seconds")
+            if _in_s is not None and not isinstance(_in_s, bool):
+                try:
+                    _in_s = int(_in_s)
+                except (TypeError, ValueError):
+                    return f"ERROR: `in_seconds` must be an integer number of seconds (got {_in_s!r})."
+                if _in_s < 5:
+                    return "ERROR: `in_seconds` must be at least 5."
+                if _in_s > 366 * 86400:
+                    return "ERROR: `in_seconds` is more than a year — pass an `at_local` date instead."
+                once_in_seconds = _in_s
             raw = (args.get("at_local") or "").strip()
-            if not raw:
+            if once_in_seconds is None and not raw:
                 return (
-                    "ERROR: `at_local` is required when when=`once`. "
-                    "Pass \"YYYY-MM-DD HH:MM\" or \"HH:MM\"."
+                    "ERROR: when=`once` needs a time: `in_seconds` for a relative "
+                    "reminder ('in 1 min' → 60) or `at_local` (\"YYYY-MM-DD HH:MM\" "
+                    "/ \"HH:MM\") for an absolute one."
                 )
-            once_raw_at = raw
+            once_raw_at = raw or None
         elif when == "daily":
             raw = (args.get("daily_at_local") or "").strip()
             hhmm = self._parse_hhmm(raw)
@@ -832,16 +881,25 @@ class RoutinesSkill(Skill):
         }
 
         if when == "once":
-            dt_local = self._parse_local_datetime(once_raw_at or "", tz)
-            if dt_local is None:
-                return (
-                    f"ERROR: couldn't parse at_local={once_raw_at!r}. Use "
-                    "\"YYYY-MM-DD HH:MM\" or \"HH:MM\"."
-                )
-            # Translate local wall-clock to a UTC-naive datetime, which
-            # is the shape `schedule_at` expects.
             from datetime import timezone as _tzmod
-            dt_utc = dt_local.astimezone(_tzmod.utc).replace(tzinfo=None)
+            if once_in_seconds is not None:
+                # Relative: exact seconds from now (server clock, UTC), no
+                # rounding of any kind. The APScheduler DateTrigger fires at
+                # this instant.
+                dt_utc = (
+                    datetime.now(_tzmod.utc) + timedelta(seconds=once_in_seconds)
+                ).replace(tzinfo=None, microsecond=0)
+            else:
+                dt_local = self._parse_local_datetime(once_raw_at or "", tz)
+                if dt_local is None:
+                    return (
+                        f"ERROR: couldn't parse at_local={once_raw_at!r}. Use "
+                        "\"YYYY-MM-DD HH:MM[:SS]\" or \"HH:MM[:SS]\" — or `in_seconds` "
+                        "for a relative reminder."
+                    )
+                # Translate local wall-clock to a UTC-naive datetime, which
+                # is the shape `schedule_at` expects.
+                dt_utc = dt_local.astimezone(_tzmod.utc).replace(tzinfo=None)
             payload["schedule_kind"] = "at"
             payload["schedule_at"] = dt_utc
             # auto_disable defaults true server-side for 'at'; setting it
@@ -865,6 +923,29 @@ class RoutinesSkill(Skill):
             req = RoutineCreate(**payload)
         except Exception as e:
             return f"ERROR: invalid arguments: {e}"
+
+        # Round 4 (item 5c): one reminder request = one reminder. A model
+        # retry, a duplicated tool call, or a second turn saying the same
+        # thing must not create a twin. Same user, same text, same shape,
+        # firing within 90 s of an ENABLED existing one → return that one.
+        try:
+            _dup = await self._find_duplicate_reminder(user_id, payload)
+        except Exception:  # noqa: BLE001 — the guard must never block a create
+            logger.debug("[routines_skill.remind] duplicate probe failed", exc_info=True)
+            _dup = None
+        if _dup is not None:
+            logger.info(
+                "[routines_skill.remind] duplicate suppressed user=%s existing=%s",
+                user_id[:8], _dup["id"],
+            )
+            return _as_json({
+                "status": "already_scheduled",
+                "reminder": _dup,
+                "hint": (
+                    "This exact reminder is already scheduled — nothing new was "
+                    "created. Tell the user it is set (once)."
+                ),
+            })
 
         try:
             resp = await create_routine(req)
@@ -915,6 +996,65 @@ class RoutinesSkill(Skill):
             ),
         })
 
+    # ── Duplicate guard (Round 4, item 5c) ─────────────────────────
+    @staticmethod
+    async def _find_duplicate_reminder(
+        user_id: str, payload: Dict[str, Any], *, window_s: int = 90,
+    ) -> Optional[Dict[str, Any]]:
+        """An ENABLED reminder of this user with the same text and the same
+        schedule shape (one-shot within ``window_s`` seconds; daily/every
+        with the identical cron/interval) — or None."""
+        if not user_id:
+            return None
+        from datetime import timedelta
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import Routine
+
+        text_norm = " ".join((payload.get("reminder_text") or "").split()).lower()
+        if not text_norm:
+            return None
+        kind_shape = payload.get("schedule_kind") or "cron"
+        async with async_session_maker() as db:
+            rows = (await db.execute(
+                select(Routine).where(
+                    Routine.user_id == user_id,
+                    Routine.kind == "reminder",
+                    Routine.enabled.is_(True),
+                )
+            )).scalars().all()
+        for r in rows:
+            r_text = " ".join((getattr(r, "reminder_text", "") or "").split()).lower()
+            if r_text != text_norm:
+                continue
+            r_shape = getattr(r, "schedule_kind", None) or "cron"
+            if r_shape != kind_shape:
+                continue
+            if kind_shape == "at":
+                a = getattr(r, "schedule_at", None)
+                b = payload.get("schedule_at")
+                if not a or not b:
+                    continue
+                if abs((a - b).total_seconds()) > window_s:
+                    continue
+            elif kind_shape == "every":
+                if int(getattr(r, "schedule_interval_seconds", 0) or 0) != int(payload.get("schedule_interval_seconds") or 0):
+                    continue
+            else:  # cron
+                if (getattr(r, "schedule_cron_local", "") or "") != (payload.get("schedule_cron_local") or ""):
+                    continue
+            return {
+                "id": r.id,
+                "name": r.name,
+                "schedule_kind": r_shape,
+                "schedule_at_utc": str(getattr(r, "schedule_at", None)) if getattr(r, "schedule_at", None) else None,
+                "schedule_cron_local": getattr(r, "schedule_cron_local", None),
+                "schedule_interval_seconds": getattr(r, "schedule_interval_seconds", None),
+                "next_run_at": str(getattr(r, "next_run_at", None)) if getattr(r, "next_run_at", None) else None,
+                "enabled": True,
+            }
+        return None
+
     # ── Parsing helpers (skill-private) ────────────────────────────
     @staticmethod
     def _parse_hhmm(raw: str) -> Optional[tuple[int, int]]:
@@ -944,25 +1084,42 @@ class RoutinesSkill(Skill):
         raw = (raw or "").strip()
         if not raw:
             return None
-        # Try ISO-shape first: YYYY-MM-DD HH:MM (also accepts "T" sep).
-        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        # Try ISO-shape first: YYYY-MM-DD HH:MM[:SS] (also accepts "T" sep).
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
             try:
                 dt = datetime.strptime(raw, fmt)
                 return dt.replace(tzinfo=tz)
             except ValueError:
                 continue
-        # Else try HH:MM — pick today if still future, else tomorrow.
+        # Else try HH:MM[:SS] — pick today if still future, else tomorrow.
         # The model_validator on RoutineCreate rejects past schedule_at
         # so we need to land in the future here.
         hhmm = RoutinesSkill._parse_hhmm(raw)
         if hhmm is None:
             return None
         hh, mm = hhmm
+        # Round 4 (item 5b): keep the seconds when the caller gave them.
+        ss = 0
+        _parts = raw.split(":")
+        if len(_parts) == 3:
+            try:
+                ss = max(0, min(59, int(_parts[2])))
+            except ValueError:
+                ss = 0
         now_local = datetime.now(tz)
         target = now_local.replace(
-            hour=hh, minute=mm, second=0, microsecond=0
+            hour=hh, minute=mm, second=ss, microsecond=0
         )
         if target <= now_local:
+            # A wall-clock time that passed within the last two minutes is
+            # almost always the CURRENT minute computed by a model reading a
+            # minute-resolution clock during a slow turn ("in 1 min" →
+            # "19:19", executed at 19:19:05). Firing tomorrow for that is a
+            # silent day-long miss; fire in a moment instead. Anything older
+            # keeps the documented roll-to-tomorrow.
+            if (now_local - target) <= timedelta(seconds=120):
+                return now_local + timedelta(seconds=3)
             target = target + timedelta(days=1)
         return target
 

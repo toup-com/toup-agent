@@ -68,6 +68,8 @@ from app.agent.subagent_dispatcher import (
 from app.services.background_tasks import spawn as _spawn_bg
 
 
+from app.services.plain_text import strip_markdown as _strip_md
+
 logger = logging.getLogger(__name__)
 
 
@@ -696,7 +698,9 @@ async def _notify_job_event(
         if steps_total is not None:
             data["steps_total"] = int(steps_total)
         if preview:
-            data["preview"] = " ".join(str(preview).split())[:120]
+            # Round 4 (item 4): plain text on the card, stripped before cut.
+            from app.services.plain_text import plain_preview as _plain_preview
+            data["preview"] = _plain_preview(str(preview), 120)
         if end_after_s is not None:
             data["end_after_s"] = int(end_after_s)
         if refresh_if_started:
@@ -929,7 +933,8 @@ async def _finalize(
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_completed",
             title=f"✅ Done: {(label or 'background task')[:150]}",
-            body=(final_text or "")[:300], progress=100,
+            body=_strip_md(final_text or "")[:300],
+            progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
             urgent=_urgent,
             # Round 3: the summary message the child posted into the

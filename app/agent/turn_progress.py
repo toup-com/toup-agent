@@ -102,6 +102,15 @@ class TurnProgressEmitter:
         self.tool_count = 0
         self.last_emitted_progress = self.base
         self._last_emit_ts = 0.0
+        # Round 4 (item 3): job step context, fed by step_change events, so
+        # the interim beacon carries the same stepName / stepsDone /
+        # stepsTotal / jobType the job's own pushes do — the Dynamic Island
+        # segmented bar then never blanks between update_job calls.
+        self.job_id: Optional[str] = None
+        self.job_type: Optional[str] = None
+        self.step_index: Optional[int] = None
+        self.step_name: Optional[str] = None
+        self.steps_total: Optional[int] = None
 
     def _p(self) -> int:
         span = self.ceiling - self.base
@@ -127,10 +136,51 @@ class TurnProgressEmitter:
         force-quit after several tools already ran)."""
         self._last_emit_ts = 0.0
 
-    async def on_tool_start(self, tool_name: str) -> None:
+    async def on_step_change(self, payload: dict) -> None:
+        """Round 4 (item 3): remember the active job step (from the runner's
+        step_change event) and refresh the card right away — a step
+        transition is exactly the moment the island should move."""
+        try:
+            self.job_id = payload.get("job_id") or self.job_id
+            if payload.get("step_index") is not None:
+                self.step_index = int(payload["step_index"])
+            self.step_name = payload.get("step_name") or self.step_name
+            if payload.get("steps_total"):
+                self.steps_total = int(payload["steps_total"])
+            if payload.get("job_type"):
+                self.job_type = payload.get("job_type")
+        except Exception:  # noqa: BLE001
+            return
+        self.force_next()
+
+    def _job_fields(self) -> dict:
+        out: dict = {}
+        if self.job_type:
+            out["job_type"] = str(self.job_type)[:16]
+        if self.steps_total:
+            out["steps_total"] = int(self.steps_total)
+            if self.step_index is not None:
+                out["steps_done"] = max(0, min(int(self.step_index), int(self.steps_total)))
+        return out
+
+    async def on_tool_start(self, tool_name: str, meta: Optional[dict] = None) -> None:
         self.tool_count += 1
         if self.gate is not None and not self.gate():
             return
+        if meta:
+            # Provisional step context from the runner (see agent_runner
+            # OnToolStart docs); step_change refines it.
+            if meta.get("job_id"):
+                self.job_id = meta.get("job_id")
+            if meta.get("step_index") is not None:
+                try:
+                    self.step_index = int(meta["step_index"])
+                except (TypeError, ValueError):
+                    pass
+            if meta.get("step_name"):
+                self.step_name = meta.get("step_name")
+            if meta.get("steps_total"):
+                self.steps_total = int(meta["steps_total"])
         now = time.monotonic()
         if self.tool_count > 1 and (now - self._last_emit_ts) < self.min_interval_s:
             return
@@ -138,6 +188,15 @@ class TurnProgressEmitter:
         try:
             from app.services.agent_notify_client import notify
 
+            # Round 4 (item 3): when a job step is active, the card's step
+            # line is the STEP ("Read the top results"), not the tool verb —
+            # the tool verb rides as the alert body. Discrete step progress
+            # wins over the interpolated curve when we have it (the LA lane
+            # never moves a bar backwards, so it can only tighten).
+            _step_line = (self.step_name or _subtitle_for(tool_name))[:80]
+            if self.steps_total and self.step_index is not None:
+                progress = max(progress, int(self.base + (self.ceiling - self.base)
+                                             * (self.step_index / max(1, self.steps_total))))
             data = {
                 "mission_id": self.mission_id,
                 "mission_title": self.mission_title[:80],
@@ -145,7 +204,8 @@ class TurnProgressEmitter:
                 "progress": progress,
                 # Refresh an existing card only — never start one.
                 "update_only": True,
-                "step_name": _subtitle_for(tool_name)[:80],
+                "step_name": _step_line,
+                **self._job_fields(),
             }
             if self.chat_id:
                 data["chat_id"] = self.chat_id

@@ -86,9 +86,11 @@ def _reset_breaker():
     TE._gw_fails = 0
     TE._gw_skip_until = 0.0
     TE._gateway_unconfigured_warned = False
+    TE._reset_gateway_client()
     yield
     TE._gw_fails = 0
     TE._gw_skip_until = 0.0
+    TE._reset_gateway_client()
 
 
 def _executor():
@@ -102,6 +104,9 @@ def _wire(monkeypatch, result, *, token="tok-abc", base="https://toup.ai/api"):
     monkeypatch.setattr(TE.settings, "toup_token", token, raising=False)
     monkeypatch.setattr(TE.settings, "platform_api_url", base, raising=False)
     monkeypatch.setattr(TE.httpx, "AsyncClient", lambda **kw: client)
+    # Round 4: the gateway client is a shared keep-alive instance built once
+    # per process — drop it so THIS case's double is the one used.
+    TE._reset_gateway_client()
     return client
 
 
@@ -296,5 +301,7 @@ class TestTierWiring:
     def test_gateway_timeout_is_tighter_than_the_direct_client(self, src):
         """This tier runs first, so its timeout is latency every search pays
         before falling through."""
-        assert "httpx.AsyncClient(timeout=8.0)" in src
+        # Round 4: the gateway client is shared/keep-alive; its budget is
+        # the same 8 s (with a 4 s connect cap), now expressed as a Timeout.
+        assert "httpx.Timeout(8.0, connect=4.0)" in src
         assert "httpx.AsyncClient(timeout=15)" in src   # the direct path, unchanged

@@ -361,6 +361,34 @@ def _agent_key() -> str:
     return (getattr(settings, "agent_api_key", "") or "").strip()
 
 
+def report_llm_usage_bg(**kwargs) -> None:
+    """Schedule :func:`report_llm_usage` off the caller's critical path.
+
+    Round 4 (item 7b): the LLM stream paths awaited the deduction POST
+    (~0.3–0.5 s to the platform, measured) BEFORE yielding ``message_end``,
+    so every LLM round-trip of a turn paid it — 6 rounds ≈ 2.4 s. The call
+    is fail-open and idempotency-keyed, and its only in-process effect is
+    the CreditState refresh that the NEXT call's pre-flight reads; landing a
+    few hundred ms later is harmless (enforcement is a shadow deduct on the
+    fleet). So: spawn it, return immediately. Resolves ``report_llm_usage``
+    through the module global at call time so test doubles still apply.
+    """
+    from app.services.background_tasks import spawn as _spawn
+
+    async def _run() -> None:
+        try:
+            await report_llm_usage(**kwargs)
+        except Exception:  # noqa: BLE001 — never surfaces to the turn
+            logger.exception("[credits] background llm usage report failed")
+
+    try:
+        _spawn(_run(), name="credits.report_llm_usage")
+    except RuntimeError:
+        # No running loop (sync caller) — nothing to schedule on; the
+        # platform-side ledger is the durable record anyway.
+        logger.debug("[credits] no event loop for background usage report")
+
+
 async def report_llm_usage(
     *,
     user_id: str,

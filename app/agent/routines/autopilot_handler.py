@@ -50,6 +50,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services.plain_text import strip_markdown as _strip_md
 from .base_handler import RoutineResult
 
 logger = logging.getLogger(__name__)
@@ -548,7 +549,8 @@ class AutopilotHandler:
             await notify(
                 event_kind="progress",
                 title=f"Autopilot: {routine.name}"[:200],
-                body=(summary or state.get("last_summary") or "Working…")[:300],
+                body=_strip_md(
+                    summary or state.get("last_summary") or "Working…")[:300],
                 data={
                     "route": "mission-control",
                     "mission_id": routine.id,

@@ -357,10 +357,10 @@ class AnthropicService:
                 # Fire-and-forget — failures never block the chat response.
                 # See services/credit_reporter.py for the full design.
                 try:
-                    from app.services.credit_reporter import report_llm_usage
+                    from app.services.credit_reporter import report_llm_usage_bg
                     user_id = getattr(settings, "user_id", "") or ""
                     if user_id:
-                        await report_llm_usage(
+                        report_llm_usage_bg(
                             user_id=user_id,
                             model=response.model,
                             provider="anthropic",
@@ -556,10 +556,10 @@ class AnthropicService:
                     # Credit metering for streaming direct (non-proxy) calls.
                     # Fire-and-forget — never blocks the stream end.
                     try:
-                        from app.services.credit_reporter import report_llm_usage
+                        from app.services.credit_reporter import report_llm_usage_bg
                         user_id = getattr(settings, "user_id", "") or ""
                         if user_id:
-                            await report_llm_usage(
+                            report_llm_usage_bg(
                                 user_id=user_id,
                                 model=final.model,
                                 provider="anthropic",

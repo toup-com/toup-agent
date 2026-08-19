@@ -21,6 +21,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -72,6 +73,8 @@ from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
 from app.services.model_router import classify_request, RoutingDecision
 from app.agent.hooks import get_hook_bus, HookEvent
+from app.agent.step_tracker import StepTracker
+from app.agent.turn_timing import BOOKKEEPING_TOOLS, TurnWaterfall
 from app.services.background_tasks import spawn as _spawn_bg
 
 from app.services.memory_log import describe_memory
@@ -116,6 +119,63 @@ WEB_EVIDENCE_TOOLS: frozenset = frozenset({
     "web_search", "web_fetch", "extension_search", "extension_read",
     "extension_research", "browser", "browser_action", "browser_screenshot",
 })
+
+# Tools whose input/output name web pages — the client shows a favicon per
+# domain next to the action (Round 4, item 1). `tool_end` frames for these
+# carry `domains` (ordered, deduped hostnames) and `urls`.
+WEB_DOMAIN_TOOLS: frozenset = frozenset({
+    "web_search", "web_fetch", "extension_search", "extension_read",
+    "extension_research", "browser", "browser_action",
+})
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'()\[\]]+")
+
+
+def extract_web_refs(tool_name: str, tool_input: Any, result: Any,
+                     *, max_items: int = 10) -> Tuple[List[str], List[str]]:
+    """(domains, urls) a tool call touched, for the favicon strip.
+
+    Order: the fetched/operated URL first (input), then URLs in the result in
+    order of appearance. Domains are lower-cased hostnames without a leading
+    ``www.``, deduped, capped. Never raises.
+    """
+    from urllib.parse import urlparse
+
+    urls: List[str] = []
+    try:
+        if isinstance(tool_input, dict):
+            u = tool_input.get("url")
+            if isinstance(u, str) and u.startswith(("http://", "https://")):
+                urls.append(u.strip())
+        text = result if isinstance(result, str) else ""
+        if text and not text.startswith("ERROR:"):
+            for m in _URL_IN_TEXT_RE.findall(text):
+                u = m.rstrip(".,;:!?*`")
+                if u not in urls:
+                    urls.append(u)
+                if len(urls) >= max_items * 3:
+                    break
+    except Exception:  # noqa: BLE001
+        return [], []
+    domains: List[str] = []
+    kept: List[str] = []
+    for u in urls:
+        try:
+            host = (urlparse(u).hostname or "").lower()
+        except Exception:
+            continue
+        if not host:
+            continue
+        if host.startswith("www."):
+            host = host[4:]
+        if len(kept) < max_items:
+            kept.append(u)
+        if host not in domains:
+            domains.append(host)
+        if len(domains) >= max_items and len(kept) >= max_items:
+            break
+    return domains[:max_items], kept[:max_items]
+
 
 # F7 counters for the citation gate — process-local, logged; the agent has no
 # metrics endpoint for these yet, so the [citation-gate] log line is the
@@ -245,6 +305,22 @@ def _spawn_background(coro) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+
+def _accepts_meta(cb: Any) -> bool:
+    """True when a tool callback can take the Round-4 ``meta=`` keyword —
+    it declares a ``meta`` parameter or ``**kwargs``. Computed once per run;
+    a callback that can't is called exactly as before."""
+    if cb is None:
+        return False
+    try:
+        import inspect
+        params = inspect.signature(cb).parameters
+    except (TypeError, ValueError):
+        return False
+    if "meta" in params:
+        return True
+    return any(p.kind == p.VAR_KEYWORD for p in params.values())
 
 
 def _is_claude_model(model: str) -> bool:
@@ -611,8 +687,27 @@ class AgentResponse:
 
 
 OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
+# Round 4 (items 1/8): both tool callbacks may accept an extra keyword
+# `meta` (dict) — the runner passes it ONLY to callables whose signature
+# declares `meta` or **kwargs (see _accepts_meta), so every existing
+# two/three-positional implementation keeps working unchanged. Contents:
+#   tool_start meta: {call_id, step_index?, step_name?, steps_total?, job_id?}
+#                    (step fields are PROVISIONAL at stream time — the batch's
+#                    own create_job/update_job has not executed yet)
+#   tool_end   meta: {call_id, elapsed_ms, started_ms, completed_ms,
+#                     step_index?, step_name?, steps_total?, job_id?   (authoritative)
+#                     domains?: [host,…], urls?: [url,…]}              (web tools)
 OnToolStart = Callable[[str], Coroutine[Any, Any, None]]
 OnToolEnd = Callable[[str, str], Coroutine[Any, Any, None]]
+# Round 4 (item 8): step-level events for the run view. Payloads:
+#   {"kind":"step_change","job_id","step_index","step_name"?,"steps_total"?}
+#       — the active step moved (create_job / update_job executed)
+#   {"kind":"reasoning","iteration","elapsed_ms","ttft_ms"?,"output_tokens",
+#    "tool_calls":int, "job_id"?,"step_index"?,"step_name"?,"steps_total"?}
+#       — one per LLM round: the model's own thinking time, attributed to the
+#         step that was active while it thought. A tool-less step gets its
+#         duration from these.
+OnStepEvent = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 OnToolProgress = Callable[[str, str], Coroutine[Any, Any, None]]
 # Emitted per generated attachment. (message_id, attachment_dict)
 OnAttachment = Callable[[str, Dict[str, Any]], Coroutine[Any, Any, None]]
@@ -1228,6 +1323,7 @@ class AgentRunner:
         on_usage: Optional[OnUsage] = None,
         on_status: Optional[OnStatus] = None,
         on_tool_event: Optional[OnToolEvent] = None,
+        on_step_event: Optional[OnStepEvent] = None,
         media_paths: Optional[List[str]] = None,
         inbound_attachments: Optional[List[Dict[str, Any]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -1297,6 +1393,24 @@ class AgentRunner:
         if prompt_profile is None:
             prompt_profile = PromptProfile.FULL
         start = time.time()
+        # Round 4 (item 7a): one waterfall per turn — every stage below
+        # records into it and it renders as ONE [TURN_WATERFALL] line at the
+        # end. The scattered [PERF] lines stay as per-stage detail.
+        _wf = TurnWaterfall()
+        # Round 4 (item 8): which declared step is active right now — fed by
+        # the create_job/update_job calls as they execute; stamps step_index /
+        # job_id on every tool frame that follows.
+        _steps = StepTracker()
+        _tool_start_meta = _accepts_meta(on_tool_start)
+        _tool_end_meta = _accepts_meta(on_tool_end)
+        # Round 4 (item 7d): the client's live indicator used to wait for the
+        # first LLM call — behind phase 1 (1.5–9 s measured). Idempotent on
+        # the client, so say "thinking" the moment the turn is ours.
+        if on_status:
+            try:
+                await on_status("thinking")
+            except Exception:  # noqa: BLE001
+                pass
         logger.info(
             "[AGENT] === New agent run for user_id=%s profile=%s "
             "save_user=%s save_asst=%s post_proc=%s credit_budget=%s ===",
@@ -1431,6 +1545,7 @@ class AgentRunner:
 
         # ── Phase 1: Load from DB (short-lived session) ──────────
         t_phase1 = time.perf_counter()
+        _wf.start("phase1")
         async with async_session_maker() as db:
             # PR-2 (F-5/A2-2): resolve the effective timezone BEFORE session
             # resolution so _get_or_create_session can (a) stamp the new
@@ -1813,6 +1928,12 @@ class AgentRunner:
                     )
 
             logger.info(f"[PERF] build_system_prompt: {(time.perf_counter() - t_prompt) * 1000:.0f}ms — {len(system_prompt)} chars (~{estimate_tokens(system_prompt)} tokens)")
+            _wf.mark("build_system_prompt", int((time.perf_counter() - t_prompt) * 1000),
+                     t0_ms=int((t_prompt - _wf.t0) * 1000), tokens=estimate_tokens(system_prompt))
+            if self._last_retrieval_ms is not None:
+                _wf.mark("memory_retrieval", int(self._last_retrieval_ms or 0),
+                         t0_ms=int((t_prompt - _wf.t0) * 1000),
+                         retrieved=len(self._last_retrieved_memories or []))
 
             # F6: Single structured per-turn memory_health line.
             # ONE grep target for "is memory working for user X right now?".
@@ -1889,6 +2010,7 @@ class AgentRunner:
 
             await db.commit()
         logger.info(f"[PERF] phase1_total: {(time.perf_counter() - t_phase1) * 1000:.0f}ms")
+        _wf.end("phase1", n_hist=len(history) if isinstance(history, list) else None)
         # DB session closed — no connection held during LLM calls
 
         # Prepare messages
@@ -2395,6 +2517,11 @@ class AgentRunner:
             stop_reason = ""
             # A8-2: one compact-and-retry per LLM call on context overflow.
             _overflow_compacted = False
+            # Round 4: this round's LLM timing (for the reasoning step event).
+            _t_iter_start = time.perf_counter()
+            _llm_ms = 0
+            _llm_ttft_ms: Optional[int] = None
+            _call_out = 0
 
             for attempt in range(MAX_RETRIES + 1):
                 try:
@@ -2498,7 +2625,13 @@ class AgentRunner:
 
                         elif event.type == "tool_use_start":
                             if on_tool_start:
-                                await on_tool_start(event.tool_name)
+                                if _tool_start_meta:
+                                    await on_tool_start(
+                                        event.tool_name,
+                                        meta={"call_id": event.tool_id, **_steps.event_fields()},
+                                    )
+                                else:
+                                    await on_tool_start(event.tool_name)
 
                         elif event.type == "tool_use_end":
                             pending_tool_calls.append({
@@ -2527,6 +2660,21 @@ class AgentRunner:
                         f"[PERF] llm_total: {(time.perf_counter() - _t_llm_start) * 1000:.0f}ms "
                         f"(iteration {iteration + 1}, in={event.usage.get('input_tokens', 0)}, "
                         f"out={event.usage.get('output_tokens', 0)}, stop={stop_reason})"
+                    )
+                    _llm_ms = int((time.perf_counter() - _t_llm_start) * 1000)
+                    _llm_ttft_ms = (
+                        int((_t_first_token - _t_llm_start) * 1000)
+                        if _t_first_token is not None else None
+                    )
+                    _wf.llm_rounds += 1
+                    _wf.mark(
+                        "llm", _llm_ms, t0_ms=int((_t_llm_start - _wf.t0) * 1000),
+                        i=iteration + 1, ttft_ms=_llm_ttft_ms,
+                        inp=int(event.usage.get("input_tokens", 0) or 0),
+                        out=int(event.usage.get("output_tokens", 0) or 0),
+                        cached=int(event.usage.get("cache_read_input_tokens", 0) or 0) or None,
+                        stop=stop_reason or None,
+                        tools=[tc["name"] for tc in pending_tool_calls] or None,
                     )
                     break  # Success
 
@@ -2714,7 +2862,13 @@ class AgentRunner:
                                             await on_text_chunk(event.text)
                                     elif event.type == "tool_use_start":
                                         if on_tool_start:
-                                            await on_tool_start(event.tool_name)
+                                            if _tool_start_meta:
+                                                await on_tool_start(
+                                                    event.tool_name,
+                                                    meta={"call_id": event.tool_id, **_steps.event_fields()},
+                                                )
+                                            else:
+                                                await on_tool_start(event.tool_name)
                                     elif event.type == "tool_use_end":
                                         pending_tool_calls.append({
                                             "id": event.tool_id,
@@ -2775,10 +2929,34 @@ class AgentRunner:
             if assistant_content:
                 messages.append({"role": "assistant", "content": assistant_content})
 
+            _is_final_round = stop_reason != "tool_use" or not pending_tool_calls
+            # Round 4 (item 8): the model's own thinking for this round is a
+            # step-level event — the closing (tool-less) round is attributed
+            # to the LAST declared step (the writing step by construction),
+            # every other round to the step active while it thought.
+            if on_step_event:
+                try:
+                    _r_step = (
+                        _steps.final_step_index() if _is_final_round else _steps.step_index
+                    )
+                    await on_step_event({
+                        "kind": "reasoning",
+                        "iteration": iteration + 1,
+                        "elapsed_ms": int(_llm_ms or (time.perf_counter() - _t_iter_start) * 1000),
+                        "ttft_ms": _llm_ttft_ms,
+                        "output_tokens": int(_call_out or 0),
+                        "tool_calls": len(pending_tool_calls),
+                        "final": _is_final_round,
+                        **_steps.event_fields(step_index=_r_step),
+                    })
+                except Exception:  # noqa: BLE001 — a sink must never kill a turn
+                    logger.debug("[AGENT] on_step_event sink failed", exc_info=True)
+
             # If no tool calls, we're done
-            if stop_reason != "tool_use" or not pending_tool_calls:
+            if _is_final_round:
                 final_text = text_buf
                 break
+            _wf.note_round([tc["name"] for tc in pending_tool_calls])
 
             # Budget checkpoint A (mission hard-stop, 2026-07-16): the
             # breaching LLM call completes — one-call slip, a wrap-up
@@ -2809,13 +2987,65 @@ class AgentRunner:
             # <2 parallel-safe calls nothing is pre-executed, so single-tool
             # turns are byte-identical to before.
             tool_results: List[Dict[str, Any]] = []
-            _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
             _parallel_results: Dict[str, Dict[str, Any]] = {}
+            # Round 4 (items 7b/8): job bookkeeping runs FIRST, ahead of the
+            # concurrent web batch. The prompt now asks the model to put
+            # create_job / update_job in the SAME response as the tools of
+            # the step they open (that is what removes 1–3 whole LLM
+            # round-trips per turn — 7–22 s measured), and executing them
+            # first is what makes that correct: the job exists before the
+            # searches push progress, and the step index is set before the
+            # batch's tool_end frames are attributed.
+            for tc in pending_tool_calls:
+                if tc["name"] not in BOOKKEEPING_TOOLS:
+                    continue
+                if cancel_check and cancel_check():
+                    logger.info("[AGENT] Cancelled before tool execution")
+                    raise asyncio.CancelledError("Generation cancelled by user")
+                _bk_started_ms = int(time.time() * 1000)
+                _t_bk = time.perf_counter()
+                await _emit_tool_event({
+                    "phase": "start", "call_id": tc["id"], "name": tc["name"],
+                    "input": tc.get("input") or {}, "started_ms": _bk_started_ms,
+                    **_steps.event_fields(),
+                })
+                try:
+                    _bk_result = await self.tools.execute(tc["name"], tc["input"])
+                except Exception as e:
+                    logger.exception(f"[AGENT] Tool {tc['name']} crashed")
+                    _bk_result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                _bk_done_ms = int(time.time() * 1000)
+                _parallel_results[tc["id"]] = {
+                    "result": _bk_result, "started_ms": _bk_started_ms,
+                    "completed_ms": _bk_done_ms,
+                }
+                _wf.mark("tool", int((time.perf_counter() - _t_bk) * 1000),
+                         t0_ms=int((_t_bk - _wf.t0) * 1000), tool=tc["name"])
+                if _steps.observe(tc["name"], tc.get("input") or {}, _bk_result):
+                    if on_step_event:
+                        try:
+                            await on_step_event({"kind": "step_change", **_steps.event_fields()})
+                        except Exception:  # noqa: BLE001
+                            logger.debug("[AGENT] on_step_event sink failed", exc_info=True)
+                await _emit_tool_event({
+                    "phase": "end", "call_id": tc["id"], "name": tc["name"],
+                    "input": tc.get("input") or {}, "result": _bk_result,
+                    "started_ms": _bk_started_ms, "completed_ms": _bk_done_ms,
+                    "elapsed_ms": _bk_done_ms - _bk_started_ms,
+                    **_steps.event_fields(),
+                })
+
+            _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
             if len(_parallel_tcs) > 1:
-                _parallel_results = await self._execute_tools_parallel(
+                _t_par = time.perf_counter()
+                _parallel_results.update(await self._execute_tools_parallel(
                     _parallel_tcs, settings.agent_parallel_tool_cap,
                     on_tool_event=_emit_tool_event if on_tool_event else None,
-                )
+                    event_fields=_steps.event_fields(),
+                ))
+                _wf.mark("tool_batch", int((time.perf_counter() - _t_par) * 1000),
+                         t0_ms=int((_t_par - _wf.t0) * 1000), n=len(_parallel_tcs),
+                         tools=[tc["name"] for tc in _parallel_tcs])
             for tc in pending_tool_calls:
                 if cancel_check and cancel_check():
                     logger.info("[AGENT] Cancelled before tool execution")
@@ -2844,6 +3074,7 @@ class AgentRunner:
                     await _emit_tool_event({
                         "phase": "start", "call_id": tc["id"], "name": tc["name"],
                         "input": tc.get("input") or {}, "started_ms": _t_tool_started_ms,
+                        **_steps.event_fields(),
                     })
                     try:
                         result = await self.tools.execute(tc["name"], tc["input"])
@@ -2852,6 +3083,8 @@ class AgentRunner:
                         result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
                     _elapsed_ms = (time.perf_counter() - _t_tool) * 1000
                     _completed_at_ms = int(time.time() * 1000)
+                    _wf.mark("tool", int(_elapsed_ms), t0_ms=int((_t_tool - _wf.t0) * 1000),
+                             tool=tc["name"])
 
                 logger.info(f"[PERF] tool_exec({tc['name']}): {_elapsed_ms:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
@@ -2875,15 +3108,42 @@ class AgentRunner:
                 # need the full payload for debugging, pull it from
                 # logs instead of bloating every message row.
                 _record_summary = result if len(result) <= 2048 else (result[:2048] + "…")
-                tool_event_records.append({
+                # Round 4 (items 1/8): attribution + favicon refs ride the
+                # persisted record AND the live frame, so a message re-rendered
+                # from history shows the same steps/favicons a live turn did.
+                _step_fields = _steps.event_fields()
+                _domains: List[str] = []
+                _urls: List[str] = []
+                if tc["name"] in WEB_DOMAIN_TOOLS:
+                    _domains, _urls = extract_web_refs(tc["name"], tc.get("input"), result)
+                _rec: Dict[str, Any] = {
                     "tool": tc["name"],
+                    "call_id": tc["id"],
                     "started_at_ms": _t_tool_started_ms,
                     "completed_at_ms": _completed_at_ms,
                     "summary": _record_summary,
-                })
+                    **_step_fields,
+                }
+                if _domains:
+                    _rec["domains"] = _domains
+                    _rec["urls"] = _urls
+                tool_event_records.append(_rec)
                 if on_tool_end:
                     summary = result[:200] + "..." if len(result) > 200 else result
-                    await on_tool_end(tc["name"], summary, tc.get("input"))
+                    if _tool_end_meta:
+                        _meta: Dict[str, Any] = {
+                            "call_id": tc["id"],
+                            "elapsed_ms": int(_elapsed_ms),
+                            "started_ms": _t_tool_started_ms,
+                            "completed_ms": _completed_at_ms,
+                            **_step_fields,
+                        }
+                        if _domains:
+                            _meta["domains"] = _domains
+                            _meta["urls"] = _urls
+                        await on_tool_end(tc["name"], summary, tc.get("input"), meta=_meta)
+                    else:
+                        await on_tool_end(tc["name"], summary, tc.get("input"))
                 if _pre is None:
                     # Parallel-safe calls already emitted their own start/end
                     # pair from _one() with true concurrent timings.
@@ -2893,6 +3153,8 @@ class AgentRunner:
                         "started_ms": _t_tool_started_ms,
                         "completed_ms": _completed_at_ms,
                         "elapsed_ms": int(_elapsed_ms),
+                        **_step_fields,
+                        **({"domains": _domains, "urls": _urls} if _domains else {}),
                     })
 
                 # Drain newly-registered attachments (from generate_* tools) and
@@ -3033,6 +3295,8 @@ class AgentRunner:
                 )
                 await db.commit()
             logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
+            _wf.mark("save", int((time.perf_counter() - t_phase3) * 1000),
+                     t0_ms=int((t_phase3 - _wf.t0) * 1000))
         else:
             logger.info(
                 "[PERF] phase3_save: SKIPPED (save_assistant_message=False, "
@@ -3190,6 +3454,15 @@ class AgentRunner:
             f"| tools_sent={len(current_tools)} | in={total_input} out={total_output} "
             f"| tool_calls={len(all_tool_calls)}"
         )
+        # Round 4 (item 7a): the whole turn on one line, one clock.
+        _wf.meta.update({
+            "intent": getattr(query_intent, "category", None),
+            "channel": channel, "model": model_used or None,
+            "tool_calls": len(all_tool_calls),
+            "in": total_input, "out": total_output,
+            "job": _steps.job_id, "steps_total": _steps.steps_total or None,
+        })
+        _wf.emit()
 
         # Hook: agent run complete
         await _hb.emit(HookEvent.AGENT_END, {
@@ -3379,7 +3652,11 @@ class AgentRunner:
                         JOB_CARD_END_AFTER_S, _notify_job_event,
                         notify_job_needs_user,
                     )
-                    _preview = " ".join((final_text or "").split())[:100]
+                    # Round 4 (item 4): the card preview is plain text — a
+                    # reply opening with **bold** put literal asterisks on the
+                    # lock screen. Strip BEFORE slicing.
+                    from app.services.plain_text import plain_preview as _plain_preview
+                    _preview = _plain_preview(final_text, 100)
 
                     async def _end_cards() -> None:
                         if _park:
@@ -3403,7 +3680,7 @@ class AgentRunner:
                             await _notify_job_event(
                                 job_id=_j["job_id"], label=_j["title"],
                                 kind="mission_completed",
-                                title=f"✅ Done: {(_j['title'] or 'background task')[:150]}",
+                                title=f"✅ Done: {_plain_preview(_j['title'] or 'background task', 150)}",
                                 body=_preview or "Finished.", progress=100,
                                 dismiss_after_s=900, dedup_suffix="completed",
                                 chat_id=_j["chat_id"], message_id=asst_message_id,
@@ -3440,6 +3717,7 @@ class AgentRunner:
         tcs: List[Dict[str, Any]],
         cap: int,
         on_tool_event: Optional[Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]] = None,
+        event_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Execute idempotent read-only tool calls concurrently, bounded by a
         semaphore of size ``cap``.
@@ -3463,10 +3741,12 @@ class AgentRunner:
                 # lie with wrong durations. This also fires before the
                 # aggregate re-trim, so a multi-search turn keeps its tail
                 # sources instead of silently losing them.
+                _ef = event_fields or {}
                 if on_tool_event:
                     await on_tool_event({
                         "phase": "start", "call_id": tc["id"], "name": tc["name"],
                         "input": tc.get("input") or {}, "started_ms": started_ms,
+                        **_ef,
                     })
                 try:
                     result = await self.tools.execute(tc["name"], tc["input"])
@@ -3475,12 +3755,18 @@ class AgentRunner:
                     result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
                 _done_ms = int(time.time() * 1000)
                 if on_tool_event:
-                    await on_tool_event({
+                    _ev: Dict[str, Any] = {
                         "phase": "end", "call_id": tc["id"], "name": tc["name"],
                         "input": tc.get("input") or {}, "result": result,
                         "started_ms": started_ms, "completed_ms": _done_ms,
                         "elapsed_ms": _done_ms - started_ms,
-                    })
+                        **_ef,
+                    }
+                    if tc["name"] in WEB_DOMAIN_TOOLS:
+                        _d, _u = extract_web_refs(tc["name"], tc.get("input"), result)
+                        if _d:
+                            _ev["domains"], _ev["urls"] = _d, _u
+                    await on_tool_event(_ev)
                 return {
                     "result": result,
                     "started_ms": started_ms,
@@ -4041,8 +4327,11 @@ class AgentRunner:
             "Doc and never reaches their Drive.\n\n"
             "### Jobs & schedules\n"
             + ("" if _voice_now else
-               "Multi-step work → `create_job` then `update_job` as you "
-               "progress. Live job card visible at `/jobs`. ")
+               "Multi-step work → `create_job` in the same response as the "
+               "first step's tool calls, `update_job` in the same response as "
+               "the next step's; never spend a response on bookkeeping alone "
+               "and never mark completed (the system does when you reply). "
+               "Live job card visible at `/jobs`. ")
             + "For reminders "
             "(text delivered at a scheduled time) → `routines__remind` "
             "with `when=once|daily|every`. For recurring agent tasks "
@@ -4069,7 +4358,7 @@ class AgentRunner:
             "- 'make me a <tool/app>' / 'I need a <thing>' → use the app_builder skill\n"
             + ("- 'search the web' / 'find <X> for me' / 'look up <X>' → call `web_search`, then `web_fetch` on the two or three results worth reading. `browser` is for pages you must OPERATE (sign in, fill a form, click through a flow) or 'book <X>' — it drives a real headless browser and costs tens of seconds per step, so it is the wrong tool for a question that a search answers. If they should watch a browser session, drop `[[navigate:/browser]]`\n")
             +
-            "- 'remind me at <Y>' / 'in N minutes remind me' / 'every morning at 7 nudge me' → call `routines__remind`\n"
+            "- 'remind me at <Y>' / 'in N minutes remind me' / 'every morning at 7 nudge me' → call `routines__remind` ONCE ('in N minutes/seconds' → `in_seconds`, never a computed clock time)\n"
             "- 'schedule <agent task X>' / 'every morning summarise my email' → call `routines__create` with kind=`agent_task` or `email_briefing`\n"
             "- 'make this a PDF/doc/spreadsheet/deck' → call `generate_pdf` / `generate_docx` / `generate_xlsx` / `generate_pptx`\n"
             "- 'a GOOGLE doc/sheet' / 'in my Drive' / 'add this to my spreadsheet <url>' → the Google connector tools, NOT `generate_*`: "
@@ -4087,7 +4376,7 @@ class AgentRunner:
             "- 'yesterday's chat' / 'what did we talk about Monday' → call `recall_day`\n"
             + ("- The user is SPEAKING to you. Do the work in this turn and say the answer out loud. A question that a search answers is `web_search` → read the best results → speak a short spoken-shaped summary, naming the two or three sources you used. You have no way to hand this off: the job and sub-agent tools are not in your tool list on this surface, by design. Never promise a report, a summary 'when it's ready', or anything arriving later — on voice, later never arrives.\n"
                if _voice_now else
-               "- User asks you to DO something (research / build / fix / produce — anything beyond answering a question) that you will finish IN THIS TURN → call `create_job` FIRST, then `update_job` as you complete each step. NOT for a single connector call — 'add a row', 'send this email', 'create the doc' is one tool call whose approval card is already the status; a job around it is a second status you cannot keep in sync\n"
+               "- User asks you to DO something (research / build / fix / produce — anything beyond answering a question) that you will finish IN THIS TURN → call `create_job` in the SAME response as the first step's tool calls (parallel function calls; never a response with only create_job), then `update_job(current_step=k)` in the same response as the next step's tools; never call update_job to mark completed — the system completes the job when your reply is delivered. NOT for a single connector call — 'add a row', 'send this email', 'create the doc' is one tool call whose approval card is already the status; a job around it is a second status you cannot keep in sync\n"
                "- A tool that answers `confirmation_required` HAS NOT FAILED. It is staged and waiting for the user to press Send, and it runs after they do — outside this turn. Never `update_job` it to `failed`, never say it didn't work: say the draft is ready for them to approve\n")
             + "- 'while I'm away' / 'keep working on X' / 'keep me updated' / work that must continue after this conversation → call `start_mission`"
             + ("" if _voice_now else "; do NOT also create_job — the mission IS the tracked task and appears in Mission Control")
@@ -5041,7 +5330,7 @@ class AgentRunner:
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
             f"- You can read and write files using `read_file` and `write_file` tools.",
             f"- When you create a report or document for the user, end your reply with a markdown link [Open <name>](toup://report?path=<workspace-relative-path>) so they can tap to open it (the write_file result includes the exact link).",
-            f"- You can search the web using the `web_search` tool.",
+            f"- You can search the web using the `web_search` tool. Issue independent searches and page reads together in ONE response (parallel function calls) — they run concurrently; one per response serialises them.",
             # F6 (incident 2026-08-18): the model answered "newest Anthropic
             # model" from a stale prior + a site:-anchored search and cited URLs
             # it never saw. Static text — no per-turn bytes, prefix stays stable.
@@ -5050,7 +5339,7 @@ class AgentRunner:
             (
                 "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated')."
                 if _channel_safe == "voice" else
-                "- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` and advance it with `update_job` per step. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask."
+                "- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` — in the SAME response as the first step's tool calls, never alone — and advance it with `update_job(current_step=k)` in the same response as the next step's tools. Do not call update_job to mark it completed; the system completes it when your reply is delivered. Every response spent on bookkeeping alone is a round-trip the user waits through. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask."
             ),
         ]
         if hasattr(self, "_current_lane") and self._current_lane != "main":

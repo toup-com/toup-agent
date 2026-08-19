@@ -136,6 +136,10 @@ class Settings(BaseSettings):
     # when genuinely relevant memories exist, and nothing when they don't.
     # Re-measure before changing; tune against retrieval_events.
     memory_retrieval_limit: int = 10
+    # Round 4 (item 7b): the query embedding is ONE upstream call on the
+    # turn's critical path (7.8 s once, measured — a 9 s phase 1). Past this
+    # many seconds the vector leg is skipped and keyword/graph answer alone.
+    memory_embed_timeout_s: float = 3.0
     memory_retrieval_min_similarity: float = 0.35
 
     # Retrieval-time auto-reinforcement (2026-08-06). OFF by default, and it
@@ -431,6 +435,16 @@ class Settings(BaseSettings):
     fetch_cache_enabled: bool = True
     fetch_cache_ttl_s: int = 720           # 12 min
     fetch_cache_max: int = 256
+    # Round 4 (item 7b) — web_fetch latency budget. The HTTP read (shared
+    # keep-alive client) and the CPU-bound extraction (worker thread) are
+    # bounded separately; the tool-level 60 s ceiling still applies on top.
+    fetch_http_timeout_s: float = 12.0
+    fetch_extract_timeout_s: float = 8.0
+    # After the first "browser executable missing" launch failure the
+    # headless-browser fallback is skipped for the process lifetime instead
+    # of burning ~6 s per JS-rendered page re-discovering it. The agent
+    # image (Dockerfile.agent) does not install chromium today.
+    browser_fetch_latch_missing: bool = True
 
     # ── Web-search freshness / grounding (incident 2026-08-18) ───────
     # docs/web-search/freshness-incident.md. Every knob is a kill-switch or a

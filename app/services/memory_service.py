@@ -1,5 +1,6 @@
 """Memory service - CRUD operations and search for memories"""
 
+import asyncio
 import json
 import logging
 import re
@@ -3052,7 +3053,24 @@ class MemoryService:
         _embed_ms = 0.0
         _t_embed = time.monotonic()
         try:
-            query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
+            # Round 4 (item 7b): bounded. This ONE upstream call sits on the
+            # chat turn's critical path (7.8 s once, measured — a 9 s phase
+            # 1). Past the budget the vector leg is skipped and keyword /
+            # graph answer alone rather than the whole turn waiting.
+            _embed_budget = float(getattr(settings, "memory_embed_timeout_s", 0) or 0)
+            if _embed_budget > 0:
+                query_embedding = await asyncio.wait_for(
+                    self.embedding_service.embed_async(query, api_key=self.api_key),
+                    timeout=_embed_budget,
+                )
+            else:
+                query_embedding = await self.embedding_service.embed_async(query, api_key=self.api_key)
+        except asyncio.TimeoutError:
+            query_embedding = None
+            logger.warning(
+                "[HYBRID] Query embedding exceeded %.1fs — skipping vector strategy this turn",
+                float(getattr(settings, "memory_embed_timeout_s", 0) or 0),
+            )
         except Exception as e:
             query_embedding = None
             logger.warning(f"[HYBRID] Query embedding failed, skipping vector strategy: {e}")

@@ -194,7 +194,10 @@ def test_arg_shapes_identical_between_diet_and_full(monkeypatch, get_tools, diet
 @pytest.mark.parametrize(
     "get_tools, name, ceiling",
     [
-        (_routines_tools, "routines__remind", 650),
+        # Round 4 (item 5b): +`in_seconds` (a new schema property, ~60 tok
+        # with its description) — the relative-reminder fix. Re-measured
+        # diet ≈ 700; ceiling moved to sit just above it, same discipline.
+        (_routines_tools, "routines__remind", 720),
         (_routines_tools, "routines__create", 500),
         (_triggers_tools, "triggers__create", 450),
     ],

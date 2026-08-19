@@ -80,8 +80,10 @@ def _DIET_JOB_RULE(voice: bool) -> str:
                 "the answer. Never promise a report or anything arriving later. Only "
                 "`start_mission` defers, and only when they ask for work that outlives "
                 "the call\n")
-    return ("- multi-step work you'll finish THIS turn → `create_job` first, then "
-            "`update_job`; work that continues after the conversation → "
+    return ("- multi-step work you'll finish THIS turn → `create_job` IN THE SAME "
+            "response as the first step's tool calls (never alone), `update_job` in "
+            "the same response as the next step's tools; never mark completed — the "
+            "system does when you reply; work that continues after the conversation → "
             "`start_mission` (not create_job)\n")
 
 

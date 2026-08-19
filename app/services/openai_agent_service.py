@@ -494,11 +494,11 @@ class OpenAIAgentService:
                 # Network failures fail-open (DeductOutcome.network_ok=False
                 # leaves state untouched).
                 try:
-                    from app.services.credit_reporter import report_llm_usage
+                    from app.services.credit_reporter import report_llm_usage_bg
                     from app.config import settings as _cr_settings
                     user_id = getattr(_cr_settings, "user_id", "") or ""
                     if user_id:
-                        await report_llm_usage(
+                        report_llm_usage_bg(
                             user_id=user_id,
                             model=model,
                             provider="openai",
@@ -987,11 +987,11 @@ class OpenAIAgentService:
                 # Credit metering — same contract as the chat path (same
                 # helper-derived idempotency key, same cached_tokens forward).
                 try:
-                    from app.services.credit_reporter import report_llm_usage
+                    from app.services.credit_reporter import report_llm_usage_bg
                     from app.config import settings as _cr_settings
                     user_id = getattr(_cr_settings, "user_id", "") or ""
                     if user_id:
-                        await report_llm_usage(
+                        report_llm_usage_bg(
                             user_id=user_id,
                             model=model,
                             provider="openai",

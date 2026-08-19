@@ -67,11 +67,15 @@ def build_message(
     priority: str,
 ) -> Dict[str, Any]:
     """One Expo push message. ``data`` carries the deep-link payload
-    the app's response listener feeds into navigate() (PR5)."""
+    the app's response listener feeds into navigate() (PR5).
+
+    Round 4 (item 4): title/body are rendered verbatim by the OS —
+    markdown is stripped here so no producer has to remember to."""
+    from app.services.plain_text import strip_markdown as _strip_md
     return {
         "to": token,
-        "title": title,
-        "body": body or "",
+        "title": _strip_md(title, collapse_whitespace=True) or title,
+        "body": _strip_md(body) if body else "",
         "data": data or {},
         # Expo priority maps to FCM priority (delivery urgency).
         "priority": "high" if priority == "high" else "default",

@@ -409,6 +409,11 @@ def _turn_frame(kind: str, entry: dict, **extra) -> dict:
         "tool": entry.get("tool"),
         "started_at_ms": int((entry.get("started_at") or time.time()) * 1000),
     }
+    # Round 4 (item 5c/8): the running tool call's id, so a resumed client
+    # can pair this narration with the live tool_start/tool_end frames it
+    # already holds instead of adding a second unpaired row by tool NAME.
+    if entry.get("call_id"):
+        frame["call_id"] = entry.get("call_id")
     frame.update(extra)
     return frame
 
@@ -3407,7 +3412,8 @@ async def ws_chat(
                 _turn_flags = {"client_gone": False, "response_persisted": False,
                                "finished": False}
 
-                async def _mirror_turn(stage: str, tool: Optional[str] = None) -> None:
+                async def _mirror_turn(stage: str, tool: Optional[str] = None,
+                                       call_id: Optional[str] = None) -> None:
                     """Keep the in-flight registry current and narrate the turn
                     to the user's OTHER live sockets (the reconnected phone).
                     Only real transitions go on the wire — a 400-chunk answer
@@ -3415,10 +3421,12 @@ async def ws_chat(
                     entry = _active_turns.get(user_id)
                     if entry is None or entry.get("mission_id") != _turn_mission_id:
                         return
-                    if entry.get("stage") == stage and entry.get("tool") == tool:
+                    if (entry.get("stage") == stage and entry.get("tool") == tool
+                            and entry.get("call_id") == call_id):
                         return
                     entry["stage"] = stage
                     entry["tool"] = tool
+                    entry["call_id"] = call_id
                     try:
                         await broadcast_to_user(
                             user_id, _turn_frame("turn_status", entry),
@@ -3492,18 +3500,42 @@ async def ws_chat(
                     except Exception:
                         pass
 
-                async def on_tool_start(tool_name: str):
+                async def on_tool_start(tool_name: str, meta: Optional[dict] = None):
                     _tprint(f"{_DIM}  ⚙ {tool_name}{_RESET}")
-                    await _mirror_turn("tool", tool_name)
+                    await _mirror_turn("tool", tool_name, (meta or {}).get("call_id"))
                     try:
-                        await websocket.send_json({"type": "tool_start", "tool": tool_name})
+                        # Round 4 (items 1/8): call_id pairs this frame with
+                        # its tool_end (clients used to pair by NAME — a
+                        # resumed/duplicated row could never be closed);
+                        # step_index/job_id are PROVISIONAL here (the batch's
+                        # own create_job/update_job has not run yet) — the
+                        # tool_end frame's values are authoritative.
+                        _frame: dict = {"type": "tool_start", "tool": tool_name}
+                        if meta:
+                            for _k in ("call_id", "step_index", "step_name", "steps_total", "job_id", "job_type"):
+                                if meta.get(_k) is not None:
+                                    _frame[_k] = meta[_k]
+                        await websocket.send_json(_frame)
                     except Exception:
                         pass
                     # update_only rows: refresh the card if one exists.
                     try:
-                        await _turn_emitter.on_tool_start(tool_name)
+                        await _turn_emitter.on_tool_start(tool_name, meta=meta)
                     except Exception:
                         pass
+
+                async def on_step_event(payload: dict):
+                    """Round 4 (item 8): step_change / reasoning events for the
+                    run view. Frame = the payload with type=step_event."""
+                    try:
+                        await websocket.send_json({"type": "step_event", **(payload or {})})
+                    except Exception:
+                        pass
+                    if (payload or {}).get("kind") == "step_change":
+                        try:
+                            await _turn_emitter.on_step_change(payload)
+                        except Exception:
+                            pass
 
                 async def on_status(stage: str):
                     """Liveness signal during LLM dead-air (2026-07-16):
@@ -3545,13 +3577,22 @@ async def ws_chat(
                 # Collect build job info during tool execution for later persistence
                 _pending_job_cards: list = []
 
-                async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None):
+                async def on_tool_end(tool_name: str, summary: str, tool_input: dict = None,
+                                      meta: Optional[dict] = None):
                     short = summary[:120] + "..." if len(summary) > 120 else summary
                     # Collapse to single line for terminal readability
                     short = short.replace("\n", " ")
                     _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
                     try:
                         event: dict = {"type": "tool_end", "tool": tool_name, "summary": summary}
+                        # Round 4 (items 1/8): pairing id, timing, step
+                        # attribution (authoritative), and the domains/urls
+                        # the call touched so the client can show favicons.
+                        if meta:
+                            for _k in ("call_id", "elapsed_ms", "step_index", "step_name",
+                                       "steps_total", "job_id", "job_type", "domains", "urls"):
+                                if meta.get(_k) is not None:
+                                    event[_k] = meta[_k]
                         # Enrich with file data for Layer 2 editor UI
                         if tool_input:
                             _tn = tool_name.lower()
@@ -3784,6 +3825,7 @@ async def ws_chat(
                     on_credential_confirm_request=on_credential_confirm_request,
                     on_credit_exhausted=on_credit_exhausted,
                     on_status=on_status,
+                    on_step_event=on_step_event,
                     model_override=model,
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
@@ -4115,9 +4157,13 @@ async def ws_chat(
                             _answer_data["day_chat_id"] = response.day_chat_id
                         if getattr(response, "asst_message_id", None):
                             _answer_data["message_id"] = response.asst_message_id
-                        _answer_data["preview"] = (
-                            " ".join((response.text or "").split())[:120] or None
+                        # Round 4 (item 4): lock-screen strings are plain
+                        # text — strip markdown BEFORE slicing.
+                        from app.services.plain_text import (
+                            plain_preview as _plain_preview,
+                            strip_markdown as _strip_md,
                         )
+                        _answer_data["preview"] = _plain_preview(response.text, 120) or None
                         if _answer_data["preview"] is None:
                             _answer_data.pop("preview")
                         # REMINDER WINS at the source: when this turn
@@ -4143,7 +4189,7 @@ async def ws_chat(
                         await notify(
                             event_kind="mission_completed",
                             title="Answer ready",
-                            body=(response.text or "")[:180] or None,
+                            body=_strip_md(response.text)[:180] or None,
                             data=_answer_data,
                             priority="high",
                             dedup_key=f"{_turn_mission_id}:completed",

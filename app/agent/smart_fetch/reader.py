@@ -10,11 +10,12 @@ Strategy:
 No API keys needed. No CAPTCHA. Works on 95% of websites.
 """
 
+import asyncio
 import logging
 import ipaddress
 import re
 import socket
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -57,16 +58,49 @@ def _assert_public_url(url: str) -> None:
 async def _guarded_get(client: "httpx.AsyncClient", url: str, headers: dict,
                        max_redirects: int = 5) -> "httpx.Response":
     """GET with the SSRF guard applied to the initial URL and every redirect
-    hop (client must be created with follow_redirects=False)."""
+    hop (client must be created with follow_redirects=False).
+
+    Round 4 (item 7b): the guard's ``getaddrinfo`` is a blocking syscall —
+    run it in a worker thread so a slow resolver (100s of ms is normal)
+    cannot stall the event loop and, with it, every concurrent fetch."""
     current = url
     for _ in range(max_redirects + 1):
-        _assert_public_url(current)
+        await asyncio.to_thread(_assert_public_url, current)
         resp = await client.get(current, headers=headers)
         if resp.is_redirect and resp.headers.get("location"):
             current = urljoin(current, resp.headers["location"])
             continue
         return resp
     raise ValueError("web_fetch: too many redirects")
+
+
+# One shared client per process (Round 4, item 7b). A client per fetch paid a
+# fresh TCP+TLS handshake on every page — with the model batching 3–4 reads
+# per round that is 3–4 handshakes per round for nothing. Redirects stay
+# manual + guarded (see _guarded_get). Not tenant-specific: it holds no
+# cookies (cookies disabled) and no per-user state, so it survives /admin/bind.
+_SHARED_CLIENT: Optional[httpx.AsyncClient] = None
+_SHARED_CLIENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _SHARED_CLIENT, _SHARED_CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if (
+        _SHARED_CLIENT is None
+        or bool(getattr(_SHARED_CLIENT, "is_closed", False))
+        or _SHARED_CLIENT_LOOP is not loop
+        or _SHARED_CLIENT_LOOP.is_closed()
+    ):
+        _SHARED_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.fetch_http_timeout_s, connect=5.0),
+            follow_redirects=False,  # redirects are followed manually, guarded per hop
+            max_redirects=5,
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            cookies=None,
+        )
+        _SHARED_CLIENT_LOOP = loop
+    return _SHARED_CLIENT
 
 # Per-tenant TTL+LRU cache of extracted page text, keyed on (requested url,
 # max_chars) and the final post-redirect url. Cleared on /admin/bind
@@ -111,9 +145,20 @@ def _extract_with_trafilatura(html: str, url: str) -> Optional[str]:
         return None
 
 
+def _bs_parser() -> str:
+    """lxml is ~5–10× faster than html.parser on large pages and is already
+    in the image (trafilatura depends on it). Fall back only if it is
+    genuinely missing."""
+    try:
+        import lxml  # noqa: F401
+        return "lxml"
+    except ImportError:
+        return "html.parser"
+
+
 def _extract_with_bs4(html: str) -> str:
     """Fallback article extraction using BeautifulSoup."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, _bs_parser())
 
     # Remove non-content elements
     for tag in soup(["script", "style", "nav", "footer", "header", "aside",
@@ -216,6 +261,127 @@ def page_cache_get(url: str, max_chars: int) -> Optional[str]:
     return _PAGE_CACHE.get(page_cache_key(url, max_chars))
 
 
+def _lxml_meta(tree) -> dict:
+    """Page metadata from an lxml tree via a handful of xpaths — cheap.
+    (NOT trafilatura.extract_metadata: its date pass took 12 s on one real
+    docs page, measured.)"""
+    meta: dict = {}
+    def _first(xp: str) -> str:
+        try:
+            v = tree.xpath(xp)
+        except Exception:
+            return ""
+        if not v:
+            return ""
+        v0 = v[0]
+        return (v0 if isinstance(v0, str) else (v0.text or "")).strip()
+    meta["title"] = (
+        _first("//meta[@property='og:title']/@content")
+        or _first("//head/title/text()")
+        or _first("//title/text()")
+    )
+    meta["description"] = (
+        _first("//meta[@property='og:description']/@content")
+        or _first("//meta[@name='description']/@content")
+    )
+    meta["author"] = _first("//meta[@name='author']/@content")
+    date = (
+        _first("//meta[@property='article:published_time']/@content")
+        or _first("//meta[@name='datePublished']/@content")
+        or _first("//meta[@property='og:article:published_time']/@content")
+        or _first("//meta[@name='article:published_time']/@content")
+    )
+    if date:
+        meta["date"] = date
+    return meta
+
+
+def _parse_and_extract(html: str, url: str, max_chars: int) -> Tuple[str, str]:
+    """Sync, CPU-bound half of the reader — runs in a worker thread.
+
+    Returns ``(status, payload)``: ``("js", body_text)`` for a JS-rendered
+    shell, ``("empty", "")`` when nothing extractable, ``("ok", result)``.
+
+    ONE parse (lxml, ~10–100 ms on a 500 KB page) serves the JS-shell check,
+    the metadata, and trafilatura's extraction (it accepts the tree). The
+    previous shape parsed every page TWICE — a full BeautifulSoup pass just
+    to measure body text and read four <meta> tags, then trafilatura's own
+    parse — at 1.5–2 s of CPU per page (measured on the founder's fetches).
+    BeautifulSoup remains the fallback for pages trafilatura yields nothing on.
+    """
+    tree = None
+    try:
+        import trafilatura
+        tree = trafilatura.load_html(html)
+    except ImportError:
+        trafilatura = None  # type: ignore[assignment]
+    except Exception:
+        tree = None
+
+    if tree is not None:
+        # JS-shell check on VISIBLE text: drop script/style/noscript first so
+        # a 200 KB bundle in a <script> can't pass an empty page as content.
+        try:
+            for el in list(tree.iter("script", "style", "noscript", "template")):
+                el.drop_tree()
+        except Exception:
+            pass
+        try:
+            body = tree.find(".//body")
+            body_text = (body.text_content() if body is not None else tree.text_content()) or ""
+        except Exception:
+            body_text = ""
+        body_text = " ".join(body_text.split())
+        if len(body_text) < 100:
+            return "js", body_text
+        meta = _lxml_meta(tree)
+        text = None
+        try:
+            text = trafilatura.extract(
+                tree,
+                url=url,
+                include_comments=False,
+                include_tables=True,
+                include_links=False,
+                include_images=False,
+                favor_recall=True,
+                deduplicate=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ToupReader] trafilatura extraction failed: %s", e)
+            text = None
+        if not text:
+            text = _extract_with_bs4(html)
+    else:
+        # No trafilatura / unparsable by lxml → the historical BeautifulSoup path.
+        soup = BeautifulSoup(html, _bs_parser())
+        body = soup.find("body")
+        if body:
+            body_text = body.get_text(strip=True)
+            if len(body_text) < 100:
+                return "js", body_text
+        meta = _extract_metadata(soup)
+        text = _extract_with_trafilatura(html, url) or _extract_with_bs4(html)
+    if not text:
+        return "empty", ""
+
+    parts = []
+    if meta.get("title"):
+        parts.append(f"# {meta['title']}")
+    if meta.get("author"):
+        parts.append(f"Author: {meta['author']}")
+    if meta.get("date"):
+        parts.append(f"Date: {meta['date']}")
+    if parts:
+        parts.append("")  # blank line
+    parts.append(text)
+
+    result = "\n".join(parts)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n... (truncated)"
+    return "ok", result
+
+
 async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     """
     Fetch and extract clean text from a URL without a browser.
@@ -237,13 +403,10 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
             logger.info("[PERF] web_fetch cache=hit url=%s", url[:80])
             return cached
     try:
-        async with httpx.AsyncClient(
-            timeout=20,
-            follow_redirects=False,  # redirects are followed manually, guarded per hop
-            max_redirects=5,
-        ) as client:
-            resp = await _guarded_get(client, url, _HEADERS, max_redirects=5)
-            resp.raise_for_status()
+        _t_net = asyncio.get_running_loop().time()
+        resp = await _guarded_get(_client(), url, _HEADERS, max_redirects=5)
+        resp.raise_for_status()
+        _net_ms = int((asyncio.get_running_loop().time() - _t_net) * 1000)
 
         content_type = resp.headers.get("content-type", "")
 
@@ -258,40 +421,32 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
 
         html = resp.text
 
-        # Check if page is mostly JS-rendered (very little text content)
-        soup = BeautifulSoup(html, "html.parser")
-        body = soup.find("body")
-        if body:
-            body_text = body.get_text(strip=True)
-            # If body has < 100 chars of text, it's probably JS-rendered
-            if len(body_text) < 100:
-                logger.info("[ToupReader] Page appears JS-rendered (%d chars), caller should use browser", len(body_text))
-                return ""  # Signal to caller: use browser fallback
-
-        # Extract metadata
-        meta = _extract_metadata(soup)
-
-        # Try trafilatura first (best quality), then BS4
-        text = _extract_with_trafilatura(html, url) or _extract_with_bs4(html)
-
-        if not text:
+        # Round 4 (item 7b): parse + extract are CPU-bound (BeautifulSoup +
+        # trafilatura on a few hundred KB of HTML: 1–6 s measured on the
+        # founder's tenant). Done inline they BLOCKED THE EVENT LOOP, which
+        # serialised the "parallel" fetch batch — the other pages' requests
+        # only started after the first page's extraction finished. In a
+        # worker thread the batch truly overlaps and the loop keeps serving
+        # the stream. Bounded so a pathological page can't pin a worker.
+        _t_parse = asyncio.get_running_loop().time()
+        try:
+            status, payload = await asyncio.wait_for(
+                asyncio.to_thread(_parse_and_extract, html, url, max_chars),
+                timeout=settings.fetch_extract_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[ToupReader] extraction timed out (%.0fs) for %s",
+                           settings.fetch_extract_timeout_s, url[:80])
             return ""
-
-        # Format output with metadata
-        parts = []
-        if meta.get("title"):
-            parts.append(f"# {meta['title']}")
-        if meta.get("author"):
-            parts.append(f"Author: {meta['author']}")
-        if meta.get("date"):
-            parts.append(f"Date: {meta['date']}")
-        if parts:
-            parts.append("")  # blank line
-        parts.append(text)
-
-        result = "\n".join(parts)
-        if len(result) > max_chars:
-            result = result[:max_chars] + "\n... (truncated)"
+        _parse_ms = int((asyncio.get_running_loop().time() - _t_parse) * 1000)
+        logger.info("[PERF] web_fetch net=%dms extract=%dms bytes=%d url=%s",
+                    _net_ms, _parse_ms, len(html), url[:80])
+        if status == "js":
+            logger.info("[ToupReader] Page appears JS-rendered (%d chars), caller should use browser", len(payload))
+            return ""  # Signal to caller: use browser fallback
+        if status == "empty":
+            return ""
+        result = payload
         if cache_key is not None and result:
             _PAGE_CACHE.set(cache_key, result)
             final_key = (str(resp.url).strip(), max_chars)

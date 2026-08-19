@@ -162,6 +162,10 @@ async def _reminder_countdown_notify(routine) -> None:
                 "route": "chat",
                 "timer_end_ms": end_ms,
                 "timer_type": "digital",
+                # Round 4 (item 5a): dispatch inline on ingest — a short
+                # reminder's countdown must be on the phone within a
+                # second, not after the next 30 s tick.
+                "fast_lane": True,
                 # silent: the card appears with no banner — the user
                 # just got chat confirmation; the card IS the feedback.
                 "silent": True,

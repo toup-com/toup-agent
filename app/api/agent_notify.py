@@ -191,11 +191,21 @@ async def agent_notify(
     # before the start that is supposed to reset it for the new job
     # (the never-backwards clamp would then pin the new job's bar at the
     # previous job's 100%). Same kill switch, same CAS, same fallback.
+    # Round 4 (item 5a): a REMINDER COUNTDOWN start rides it too. A
+    # 60-second reminder's card used to wait for the 30 s tick and land
+    # with seconds left (or after the fire) — the "no countdown" report.
+    # `data.fast_lane` is the generic opt-in for a start row whose
+    # value is in being on the phone NOW.
+    _data = body.data or {}
     _fast = settings.notification_progress_fastlane_enabled and (
         body.event_kind == "progress"
         or (
             body.event_kind == "mission_started"
-            and bool((body.data or {}).get("refresh_if_started"))
+            and (
+                bool(_data.get("refresh_if_started"))
+                or bool(_data.get("fast_lane"))
+                or str(_data.get("mission_id") or "").startswith("reminder:")
+            )
         )
     )
     if _fast:

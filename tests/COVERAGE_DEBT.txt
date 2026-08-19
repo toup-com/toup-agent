@@ -41,6 +41,7 @@ test_routine_dst_regression.py  # agent-mode
 test_routine_one_per_kind.py  # agent-mode
 test_routine_reconnect_notice.py  # agent-mode
 test_routines_skill.py  # agent-mode
+test_round4_reminders.py  # agent-mode: routines + users on the agent side, same reason as test_routines_skill.py
 test_signup_hardening.py  # agent-mode
 test_subagent_context_isolation.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY); 8/8 green under agent, 3 of 4 platform failures were this lane and not staleness
 test_subagent_dispatcher.py  # agent-mode

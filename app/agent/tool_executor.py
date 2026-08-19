@@ -29,6 +29,7 @@ import httpx
 
 from app.config import settings
 from app.agent.tool_entitlements import refusal_for_tool as _tool_entitlement_refusal
+from app.services.background_tasks import spawn as _spawn_bg
 from app.services.exec_env import scrubbed_environ, sandbox_preexec
 from app.services.workspace_perms import share_path, shared_makedirs
 
@@ -223,6 +224,37 @@ def _gateway_note_fail() -> None:
             "[web_search] search gateway unreachable %d times — skipping that "
             "tier for %.0fs", _GW_FAIL_MAX, _GW_COOLDOWN_S,
         )
+
+
+_GATEWAY_CLIENT: Optional[httpx.AsyncClient] = None
+_GATEWAY_CLIENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _reset_gateway_client() -> None:
+    """Drop the shared gateway client (tests swap the httpx double per case;
+    a bind/rotate that changes the platform URL can call it too)."""
+    global _GATEWAY_CLIENT, _GATEWAY_CLIENT_LOOP
+    _GATEWAY_CLIENT = None
+    _GATEWAY_CLIENT_LOOP = None
+
+
+def _gateway_client() -> httpx.AsyncClient:
+    """Shared keep-alive client for the platform search gateway (Round 4).
+    Rebuilt if the event loop changed (tests / restarts)."""
+    global _GATEWAY_CLIENT, _GATEWAY_CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if (
+        _GATEWAY_CLIENT is None
+        or bool(getattr(_GATEWAY_CLIENT, "is_closed", False))
+        or _GATEWAY_CLIENT_LOOP is not loop
+        or _GATEWAY_CLIENT_LOOP.is_closed()
+    ):
+        _GATEWAY_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(8.0, connect=4.0),
+            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+        )
+        _GATEWAY_CLIENT_LOOP = loop
+    return _GATEWAY_CLIENT
 
 
 def _warn_gateway_unconfigured() -> None:
@@ -1818,6 +1850,21 @@ class ToolExecutor:
         user_id = self._current_user_id or ""
         if not user_id:
             return
+        # Round 4 (item 7b): the ledger POST (~0.3–1 s to the platform,
+        # measured) used to be awaited INSIDE the tool, so every search and
+        # every page read paid it on the turn's critical path. Fail-open and
+        # idempotency-keyed, so it runs as a background task; the tool result
+        # returns the moment the data is in hand.
+        latency_ms = int((time.monotonic() - started) * 1000)
+        _spawn_bg(self._meter_web_tool_bg(
+            tool, tier=tier, engine=engine, latency_ms=latency_ms,
+            query=query, url=url, user_id=user_id,
+        ))
+
+    async def _meter_web_tool_bg(
+        self, tool: str, *, tier: str, engine: str, latency_ms: int,
+        query: Optional[str], url: Optional[str], user_id: str,
+    ) -> None:
         try:
             import hashlib
             import uuid as _uuid
@@ -1834,7 +1881,7 @@ class ToolExecutor:
                 "tier": tier,
                 "engine": engine,
                 "channel": self._current_channel or "unknown",
-                "latency_ms": int((time.monotonic() - started) * 1000),
+                "latency_ms": latency_ms,
             }
             if query:
                 meta["query_sha256"] = hashlib.sha256(
@@ -2180,28 +2227,32 @@ class ToolExecutor:
             base = f"{base}/api"
 
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.post(
-                    f"{base}/search/web",
-                    json={
-                        "query": query,
-                        "count": count,
-                        # A property, but read defensively: this runs on the hot
-                        # path of every search and must not be the thing that
-                        # raises inside a tier whose whole contract is "never
-                        # deny an answer".
-                        "channel": getattr(self, "_current_channel", None) or None,
-                        # Advisory; an older gateway ignores unknown fields.
-                        "freshness_class": freshness_class,
-                    },
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Accept": "application/json",
-                        # Cloudflare fronts toup.ai and challenges unfamiliar
-                        # client signatures; bundle_client hits the same wall.
-                        "User-Agent": "toup-agent/1.0 (search-gateway)",
-                    },
-                )
+            # Round 4 (item 7b): one keep-alive client per process — a
+            # client per search paid a TCP+TLS handshake to toup.ai (behind
+            # Cloudflare) on every call; the connection is now reused
+            # across searches and across turns.
+            client = _gateway_client()
+            resp = await client.post(
+                f"{base}/search/web",
+                json={
+                    "query": query,
+                    "count": count,
+                    # A property, but read defensively: this runs on the hot
+                    # path of every search and must not be the thing that
+                    # raises inside a tier whose whole contract is "never
+                    # deny an answer".
+                    "channel": getattr(self, "_current_channel", None) or None,
+                    # Advisory; an older gateway ignores unknown fields.
+                    "freshness_class": freshness_class,
+                },
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    # Cloudflare fronts toup.ai and challenges unfamiliar
+                    # client signatures; bundle_client hits the same wall.
+                    "User-Agent": "toup-agent/1.0 (search-gateway)",
+                },
+            )
         except Exception as exc:
             _gateway_note_fail()
             logger.warning("[web_search] gateway unreachable: %s", exc)
@@ -2407,8 +2458,20 @@ class ToolExecutor:
 
         # Fallback: our own headless browser renders the page (JS-heavy sites,
         # 403s, or pages the httpx reader timed out on). No API key.
-        # Kill-switch: browser_fetch_enabled.
-        if settings.browser_fetch_enabled:
+        # Kill-switch: browser_fetch_enabled. Round 4: skipped for the rest
+        # of the process once a launch has proven the browser is not
+        # installed (browser_api.browser_unavailable_reason) — the failed
+        # launch cost ~6 s per page before.
+        _browser_blocked = None
+        if settings.browser_fetch_enabled and settings.browser_fetch_latch_missing:
+            try:
+                from app.agent.skills.builtins.app_builder.browser_api import (
+                    browser_unavailable_reason as _bur,
+                )
+                _browser_blocked = _bur()
+            except Exception:  # noqa: BLE001
+                _browser_blocked = None
+        if settings.browser_fetch_enabled and not _browser_blocked:
             try:
                 from app.agent.skills.builtins.app_builder.browser_api import read_page
                 text = await read_page(url)
@@ -2422,6 +2485,9 @@ class ToolExecutor:
                     return text
             except Exception as exc:
                 logger.warning("[web_fetch] Browser read_page also failed: %s", exc)
+        elif _browser_blocked:
+            logger.info("[web_fetch] browser fallback skipped (unavailable: %s) url=%s",
+                        _browser_blocked, url[:80])
 
         return f"ERROR: Could not read {url}"
 
@@ -6224,14 +6290,19 @@ class ToolExecutor:
         if not user_id:
             return "ERROR: No user context"
 
+        # Round 4 (item 4): step labels are notification-surface strings
+        # (LA stepName, push bodies) — store them plain so no surface has to
+        # remember to strip. Titles/descriptions are stripped at push time.
+        from app.services.plain_text import plain_preview as _plain
         steps = []
         for i, label in enumerate(step_labels):
             steps.append({
                 "id": str(_uuid.uuid4()),
                 "type": f"step_{i}",
-                "label": label,
+                "label": _plain(str(label), 120) or str(label),
                 "status": "pending",
             })
+        step_labels = [st["label"] for st in steps]
 
         # Round 3 (item 1): the icon-system tag, derived from the title's
         # intent words. Persisted in config_json (NOT the job_type COLUMN —
@@ -6310,8 +6381,8 @@ class ToolExecutor:
         from app.agent.subagent_orchestrator import _notify_job_event
         await _notify_job_event(
             job_id=job_id, label=title, kind="mission_started",
-            title=f"🛠 Working on: {title[:150]}",
-            body=(description or "")[:200],
+            title=f"🛠 Working on: {_plain(title, 150)}",
+            body=_plain(description or "", 200),
             # Indeterminate timer, NOT progress=0. `_content_state` picks timer
             # over progress, so a bare 0 shipped a card reading a frozen "0%"
             # for the whole turn — it looked broken and stayed that way until
@@ -6486,6 +6557,9 @@ class ToolExecutor:
             _notify_job_event,
         )
         pct = int(completed_count / len(steps) * 100) if steps else None
+        from app.services.plain_text import plain_preview as _plain
+        current_label = _plain(current_label, 120) if current_label else current_label
+        _job_title_plain = _plain(job.title or "background task", 150)
         _card = dict(
             chat_id=chat_id, message_id=asst_message_id, job_type=job_type,
             step_name=current_label or None,
@@ -6502,14 +6576,14 @@ class ToolExecutor:
             # budget-free.
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="progress",
-                title=f"Working on: {(job.title or 'background task')[:150]}",
+                title=f"Working on: {_job_title_plain}",
                 body="Writing your answer…", progress=100, priority="low",
                 dedup_suffix="progress:done", **_card,
             )
         elif job.status == "completed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_completed",
-                title=f"✅ Done: {(job.title or 'background task')[:150]}",
+                title=f"✅ Done: {_job_title_plain}",
                 body=current_label or "Finished.",
                 progress=100, dismiss_after_s=900, dedup_suffix="completed",
                 end_after_s=_JOB_CARD_END_AFTER_S, **_card,
@@ -6517,8 +6591,8 @@ class ToolExecutor:
         elif job.status == "failed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_failed",
-                title=f"⚠️ Didn't finish: {(job.title or 'background task')[:150]}",
-                body=(error_message or "The task hit an error.")[:300],
+                title=f"⚠️ Didn't finish: {_job_title_plain}",
+                body=_plain(error_message or "The task hit an error.", 300),
                 dedup_suffix="failed", **_card,
             )
         elif job.status == "waiting_on_user":
@@ -6539,13 +6613,20 @@ class ToolExecutor:
         else:
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="progress",
-                title=f"Working on: {(job.title or 'background task')[:150]}",
+                title=f"Working on: {_job_title_plain}",
                 body=current_label or None,
                 progress=pct, priority="low", dedup_suffix="progress",
                 **_card,
             )
 
+        # Round 4 (item 8): the runner's StepTracker reads total_steps /
+        # current_step from here to attribute later actions when it adopts a
+        # job it did not see created (regex intake, earlier turn).
         return _json.dumps({
             "ok": True, "status": job.status, "completed_steps": completed_count,
+            "total_steps": len(steps),
+            "current_step": (
+                min(completed_count, len(steps) - 1) if steps else None
+            ),
             "job_type": job_type,
         })
