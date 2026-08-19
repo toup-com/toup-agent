@@ -151,9 +151,39 @@ def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
     # records but a hand-edited row in production should degrade
     # gracefully, not 500 every history load.
     return [
-        e for e in events
+        _with_web_refs(e) for e in events
         if isinstance(e, dict) and "tool" in e and "started_at_ms" in e
     ] or None
+
+
+def _with_web_refs(rec: dict) -> dict:
+    """Stamp ``domains``/``urls`` on a web tool record that was persisted
+    without them.
+
+    The runner has written both fields on every web_search/web_fetch/browser
+    record since Round 4 (``agent_runner.extract_web_refs``, fleet 2026-08-19)
+    — but records persisted before that rollout carry only the summary, and
+    the clients' favicon resolver reads ``domains``. Probed 2026-08-19 on the
+    founder tenant: 23/23 post-rollout web_search records had the field,
+    117/117 pre-rollout ones did not — those are the "Searching the web" rows
+    that fell back to the generic glyph next to newer rows showing the site.
+    The persisted summary is the first 2 KB of the result (header plus the
+    first results, each with its URL), so the field can be derived at read
+    time. Never raises; a record that already has ``domains``, is not a web
+    tool, or names no URL is returned unchanged.
+    """
+    if rec.get("domains"):
+        return rec
+    try:
+        from app.agent.agent_runner import WEB_DOMAIN_TOOLS, extract_web_refs
+        if rec.get("tool") not in WEB_DOMAIN_TOOLS:
+            return rec
+        domains, urls = extract_web_refs(rec["tool"], None, rec.get("summary"))
+    except Exception:  # noqa: BLE001 — history must load even if this can't
+        return rec
+    if not domains:
+        return rec
+    return {**rec, "domains": domains, "urls": urls}
 
 
 # ── Agent proxy (platform mode proxies to user's VPS agent) ──────────
