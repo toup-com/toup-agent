@@ -97,10 +97,16 @@ def open_first_step(steps: List[Dict[str, Any]], now: datetime) -> List[Dict[str
     return steps
 
 
-def _last_window_start(steps: List[Dict[str, Any]], upto: int, now: datetime) -> datetime:
+def _last_window_start(
+    steps: List[Dict[str, Any]], upto: int, now: datetime,
+    fallback: Optional[datetime] = None,
+) -> datetime:
     """When the window that is closing right now opened: the running step's
     ``started_at`` if one is running among 0..upto, else the newest
-    ``completed_at`` before it, else ``now``."""
+    ``completed_at`` before it, else ``fallback`` (the job's own
+    ``created_at`` — rows written before timing existed carry no stamps at
+    all, and closing them at a zero-width window would print the very 0ms
+    this module removes), else ``now``."""
     for s in steps[: upto + 1]:
         if s.get("status") == "running":
             st = _parse_iso(s.get("started_at"))
@@ -111,16 +117,24 @@ def _last_window_start(steps: List[Dict[str, Any]], upto: int, now: datetime) ->
         c = _parse_iso(s.get("completed_at"))
         if c and (latest is None or c > latest):
             latest = c
-    return latest or now
+    if latest:
+        return latest
+    if fallback and fallback <= now:
+        return fallback
+    return now
 
 
-def advance_steps(steps: List[Dict[str, Any]], current_step: int, now: datetime) -> List[Dict[str, Any]]:
+def advance_steps(
+    steps: List[Dict[str, Any]], current_step: int, now: datetime,
+    fallback_start: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
     """``update_job(current_step=k)``: 0..k done, k+1 running (see module
-    docstring for the timing rules)."""
+    docstring for the timing rules). ``fallback_start`` = the job's
+    ``created_at``, the window start for rows that carry no stamps yet."""
     if not steps or current_step is None or current_step < 0:
         return steps
     k = min(int(current_step), len(steps) - 1)
-    window_start = _last_window_start(steps, k, now)
+    window_start = _last_window_start(steps, k, now, fallback_start)
     for i, s in enumerate(steps):
         if i <= k:
             if s.get("status") != "done":
@@ -133,12 +147,17 @@ def advance_steps(steps: List[Dict[str, Any]], current_step: int, now: datetime)
     return steps
 
 
-def finish_all_steps(steps: List[Dict[str, Any]], now: datetime) -> List[Dict[str, Any]]:
+def finish_all_steps(
+    steps: List[Dict[str, Any]], now: datetime,
+    fallback_start: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
     """Every remaining step done at ``now`` — the contract's "the system marks
-    every remaining step done ... the moment your reply is delivered"."""
+    every remaining step done ... the moment your reply is delivered".
+    ``fallback_start`` = the job's ``created_at`` (legacy rows, see
+    ``_last_window_start``)."""
     if not steps:
         return steps
-    window_start = _last_window_start(steps, len(steps) - 1, now)
+    window_start = _last_window_start(steps, len(steps) - 1, now, fallback_start)
     for s in steps:
         if s.get("status") != "done":
             s["status"] = "done"

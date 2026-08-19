@@ -6526,7 +6526,8 @@ class ToolExecutor:
             # the same rules the finalizer and the reconciler apply, so the
             # three writers cannot disagree about a step's window.
             if current_step is not None and steps:
-                _advance_steps(steps, int(current_step), _now_uj)
+                _advance_steps(steps, int(current_step), _now_uj,
+                               fallback_start=getattr(job, "created_at", None))
                 job.steps_json = _dump_steps(steps)
             completed_count, _ = _step_counts(steps)
 
@@ -6537,7 +6538,7 @@ class ToolExecutor:
             if new_status == "completed":
                 job.completed_at = _now_uj
                 # Mark all steps done
-                _finish_all(steps, _now_uj)
+                _finish_all(steps, _now_uj, fallback_start=getattr(job, "created_at", None))
                 job.steps_json = _dump_steps(steps)
                 completed_count = len(steps)
             elif new_status == "waiting_on_user":

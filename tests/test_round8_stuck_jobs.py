@@ -532,3 +532,22 @@ async def test_beacon_ignores_a_stale_provisional_step(monkeypatch):
     await em.on_tool_start("web_search", meta={"job_id": "K", "step_index": 0,
                                                "step_name": "Search", "steps_total": 2})
     assert em.step_index == 0 and em.job_id == "K"
+
+
+def test_legacy_rows_without_stamps_get_the_jobs_own_window_not_zero():
+    """Rows written before this image carry no step stamps. Closing them at
+    delivery must give the running step [job.created_at, delivered] — not a
+    zero-width window."""
+    from app.agent.job_steps import advance_steps, finish_all_steps
+    created = datetime(2026, 8, 19, 3, 1, 33)
+    delivered = created + timedelta(seconds=12)
+    legacy = [{"id": "a", "type": "step_0", "label": "Research", "status": "done"},
+              {"id": "b", "type": "step_1", "label": "Compare", "status": "done"},
+              {"id": "c", "type": "step_2", "label": "Write", "status": "running"}]
+    finish_all_steps(legacy, delivered, fallback_start=created)
+    assert legacy[2]["duration_ms"] == 12000
+    assert "duration_ms" not in legacy[0]          # done steps are left as they were
+    legacy2 = [{"id": "a", "type": "step_0", "label": "Research", "status": "pending"},
+               {"id": "b", "type": "step_1", "label": "Write", "status": "pending"}]
+    advance_steps(legacy2, 0, created + timedelta(seconds=4), fallback_start=created)
+    assert legacy2[0]["duration_ms"] == 4000 and legacy2[1]["status"] == "running"

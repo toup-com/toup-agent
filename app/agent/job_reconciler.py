@@ -114,7 +114,8 @@ async def close_job_completed(
     if job is None or job.status != "running" or job.user_id != user_id:
         return None
 
-    steps = finish_all_steps(parse_steps(job.steps_json), now)
+    steps = finish_all_steps(parse_steps(job.steps_json), now,
+                             fallback_start=getattr(job, "created_at", None))
     done, total = _step_counts(steps)
     cfg = dict(job.config_json or {})
     if reason != "turn_end":

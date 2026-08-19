@@ -61,9 +61,12 @@ def test_confirmation_required_is_explicitly_not_a_failure():
 
 def test_create_job_rule_excludes_a_single_connector_call():
     src = _src()
-    i = src.find("call `create_job` FIRST")
+    # Round 4 reworded the opener ("in the SAME response as the first step's
+    # tool calls" — the zero-round-trip contract); the connector exclusion
+    # that follows it is what this test guards.
+    i = src.find("call `create_job` in the SAME response as the first step's tool calls")
     assert i != -1, "the create_job rule moved — update this guard"
-    window = src[i:i + 700]
+    window = src[i:i + 900]
     assert "NOT for a single connector call" in window, (
         "the create_job rule still tells the model to wrap one connector "
         "call in a job, which is how a succeeded write got a Failed card"

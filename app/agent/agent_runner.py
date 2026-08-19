@@ -3722,14 +3722,21 @@ class AgentRunner:
                     # tag, m/m steps, its own conversation.
                     _to_end: List[Dict[str, Any]] = []
                     _closed_now = {c.job_id for c in _completed}
-                    from sqlalchemy import select as _sel_cj
-                    _rows = (await _cdb.execute(
-                        _sel_cj(_CJ.id, _CJ.title, _CJ.status,
-                                _CJ.steps_json, _CJ.config_json,
-                                _CJ.conversation_id)
-                        .where(_CJ.id.in_(list(_created_job_ids)),
-                               _CJ.user_id == user_id)
-                    )).all()
+                    # Round 8: this lookup only finds jobs the MODEL marked
+                    # completed mid-turn (update_job(completed)) — when every
+                    # created id was just closed above there is nothing to
+                    # find, and the SELECT would sit on the `done` critical
+                    # path for nothing (finalize measured 502 ms on the canary).
+                    _rows: List[Any] = []
+                    if _park or any(_jid not in _closed_now for _jid in _created_job_ids):
+                        from sqlalchemy import select as _sel_cj
+                        _rows = (await _cdb.execute(
+                            _sel_cj(_CJ.id, _CJ.title, _CJ.status,
+                                    _CJ.steps_json, _CJ.config_json,
+                                    _CJ.conversation_id)
+                            .where(_CJ.id.in_(list(_created_job_ids)),
+                                   _CJ.user_id == user_id)
+                        )).all()
                     for _r in _rows:
                         if _r[2] != "completed" or _r[0] in _closed_now:
                             continue
