@@ -123,8 +123,10 @@ def test_parallel_safe_set_is_read_only_web_tools_only():
 
 def test_single_tool_turn_skips_parallel_path():
     """`> 1` guard means a 0- or 1-parallel-safe-tool turn pre-executes
-    nothing → byte-identical to the old sequential behavior."""
-    assert "if len(_parallel_tcs) > 1:" in _SRC
+    nothing → byte-identical to the old sequential behavior. Round 4 adds
+    ONE exception: a lone web call is still batched when there is job
+    bookkeeping (create_job/update_job) in the same round to overlap with."""
+    assert "_run_batch = len(_parallel_tcs) > 1 or (bool(_parallel_tcs) and bool(_bk_tcs))" in _SRC
 
 
 def test_loop_still_builds_results_in_tool_use_order():
@@ -135,7 +137,10 @@ def test_loop_still_builds_results_in_tool_use_order():
 
 
 def test_loop_consumes_precomputed_parallel_results():
-    assert "await self._execute_tools_parallel(" in _SRC
+    # Round 4: the batch coroutine is built once and either awaited alone or
+    # gathered with the bookkeeping chain; the ordered loop consumes both.
+    assert "_batch_coro = self._execute_tools_parallel(" in _SRC
+    assert "await asyncio.gather(_run_bookkeeping(), _batch_coro)" in _SRC
     assert '_parallel_results.get(tc["id"])' in _SRC
 
 

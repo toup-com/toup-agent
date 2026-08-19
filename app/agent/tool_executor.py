@@ -396,6 +396,23 @@ _CREATED_JOB_IDS_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
 # every job push and Live Activity update (Round 3, item 3) — the phone
 # can open the conversation AND scroll to the answer without waiting for
 # the turn to end. Per-task like its siblings.
+# Round 4 (item 5b): when the user's message was RECEIVED (epoch seconds).
+# "Remind me in 60 seconds" means sixty seconds from when they said it, not
+# from when the model got around to calling the tool — the planning round
+# alone is 5–7 s, measured. Set by AgentRunner at run start; read by
+# `turn_started_at()` (the routines skill bases `in_seconds` on it).
+_TURN_STARTED_AT_CTX: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "tool_executor_turn_started_at", default=None,
+)
+
+
+def turn_started_at() -> Optional[float]:
+    """Epoch seconds the current turn started (its message was received),
+    or None outside a turn. Module-level so skills can read it without a
+    reference to the executor."""
+    return _TURN_STARTED_AT_CTX.get()
+
+
 _ASST_MESSAGE_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "tool_executor_asst_message_id", default=None,
 )
@@ -5575,14 +5592,18 @@ class ToolExecutor:
         Writes to the ``_CHANNEL_CTX`` ContextVar."""
         _CHANNEL_CTX.set((channel or "").strip().lower() or None)
 
-    def set_session_id(self, session_id: Optional[str], asst_message_id: Optional[str] = None):
+    def set_session_id(self, session_id: Optional[str], asst_message_id: Optional[str] = None,
+                       turn_started_at: Optional[float] = None):
         """Set the conversation this turn belongs to, and clear the per-turn
         created-job list. Writes to the ``_SESSION_ID_CTX`` ContextVar.
         ``asst_message_id`` (the runner's pre-minted answer id) is the
-        deep-link target every job push of this turn carries."""
+        deep-link target every job push of this turn carries.
+        ``turn_started_at`` (epoch s) is when the message was received —
+        the "now" a relative reminder counts from (Round 4)."""
         _SESSION_ID_CTX.set(session_id or None)
         _ASST_MESSAGE_ID_CTX.set(asst_message_id or None)
         _CREATED_JOB_IDS_CTX.set(())
+        _TURN_STARTED_AT_CTX.set(float(turn_started_at) if turn_started_at else None)
 
     def take_created_job_ids(self) -> tuple:
         """Job ids the `create_job` tool made during this turn, then reset.

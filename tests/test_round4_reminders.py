@@ -271,3 +271,49 @@ def test_reminder_countdown_start_is_fast_laned():
     assert '_data.get("fast_lane")' in an
     rt = (root / "routines.py").read_text()
     assert '"fast_lane": True' in rt
+
+
+@pytest.mark.asyncio
+async def test_relative_reminder_counts_from_when_the_user_said_it(monkeypatch):
+    """The planning round before the tool runs is 5–7 s (measured); the
+    runner stamps the turn's receipt time and the skill counts from THAT."""
+    import time as _time
+    from app.config import settings
+    from app.agent import tool_executor as TE
+    skill, mod = _load_skill()
+    user_id = await _seed_user()
+    monkeypatch.setattr(settings, "user_id", user_id)
+    captured = await _create_capture(monkeypatch, mod)
+
+    async def _no_dup(*a, **k):
+        return None
+    monkeypatch.setattr(mod.RoutinesSkill, "_find_duplicate_reminder", staticmethod(_no_dup))
+
+    token = TE._TURN_STARTED_AT_CTX.set(_time.time() - 7.0)   # message received 7 s ago
+    try:
+        t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+        result = await skill.execute_tool(
+            "routines__remind",
+            {"reminder_text": "oven", "when": "once", "in_seconds": 60, "delivery_channels": ["website"]},
+            _ctx(),
+        )
+    finally:
+        TE._TURN_STARTED_AT_CTX.reset(token)
+    assert not result.startswith("ERROR"), result
+    delta = (captured["req"].schedule_at - t0).total_seconds()
+    assert 51 <= delta <= 55, delta          # 60 s from receipt = ~53 s from now
+
+    # a delay the turn already outran fires in a moment, never in the past
+    token = TE._TURN_STARTED_AT_CTX.set(_time.time() - 30.0)
+    try:
+        t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+        result = await skill.execute_tool(
+            "routines__remind",
+            {"reminder_text": "oven2", "when": "once", "in_seconds": 10, "delivery_channels": ["website"]},
+            _ctx(),
+        )
+    finally:
+        TE._TURN_STARTED_AT_CTX.reset(token)
+    assert not result.startswith("ERROR"), result
+    delta = (captured["req"].schedule_at - t0).total_seconds()
+    assert 1 <= delta <= 4, delta

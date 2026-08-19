@@ -883,12 +883,31 @@ class RoutinesSkill(Skill):
         if when == "once":
             from datetime import timezone as _tzmod
             if once_in_seconds is not None:
-                # Relative: exact seconds from now (server clock, UTC), no
-                # rounding of any kind. The APScheduler DateTrigger fires at
-                # this instant.
-                dt_utc = (
-                    datetime.now(_tzmod.utc) + timedelta(seconds=once_in_seconds)
-                ).replace(tzinfo=None, microsecond=0)
+                # Relative: exact seconds from when the user SAID it — the
+                # turn's receipt time when the runner set it (the planning
+                # round before this tool runs is 5–7 s, measured; counting
+                # from execution made "in 60 seconds" ring at +67). Falls
+                # back to now outside a turn. Never in the past: a slow turn
+                # on a short delay fires in a moment. APScheduler's
+                # DateTrigger fires at this instant; no rounding anywhere.
+                _base = None
+                try:
+                    from app.agent.tool_executor import turn_started_at as _tsa
+                    _base = _tsa()
+                except Exception:  # noqa: BLE001
+                    _base = None
+                _now_utc = datetime.now(_tzmod.utc)
+                if _base:
+                    _base_dt = datetime.fromtimestamp(float(_base), tz=_tzmod.utc)
+                    # sanity: a stale/foreign value more than 10 min off is ignored
+                    if abs((_now_utc - _base_dt).total_seconds()) > 600:
+                        _base_dt = _now_utc
+                else:
+                    _base_dt = _now_utc
+                _target = _base_dt + timedelta(seconds=once_in_seconds)
+                if _target < _now_utc + timedelta(seconds=2):
+                    _target = _now_utc + timedelta(seconds=2)
+                dt_utc = _target.replace(tzinfo=None, microsecond=0)
             else:
                 dt_local = self._parse_local_datetime(once_raw_at or "", tz)
                 if dt_local is None:

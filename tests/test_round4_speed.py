@@ -176,19 +176,22 @@ def _code_only(src: str) -> str:
     return "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
 
 
-def test_job_bookkeeping_executes_before_the_parallel_web_batch():
+def test_job_bookkeeping_runs_with_the_web_batch_and_the_loop_stamps_after():
     """The prompt asks the model to put create_job/update_job in the SAME
-    response as the searches. That is only correct if the runner runs the
-    job tools first: the job must exist before the searches push progress
-    and the step index must be set before their tool_end frames are stamped."""
+    response as the searches. The runner runs the job chain CONCURRENTLY
+    with the web batch (create_job is 0.6–1 s of DB+notify; paying it in
+    front of the searches was ~1.5 s/turn) and the ORDERED loop — which
+    runs after both — is what stamps step attribution on the frames."""
     src = _code_only(_RUN_INNER_SRC)
-    i_bk = src.index('if tc["name"] not in BOOKKEEPING_TOOLS:')
-    i_par = src.index("_parallel_tcs = [tc for tc in pending_tool_calls if tc[\"name\"] in PARALLEL_SAFE_TOOLS]")
+    i_bk = src.index("async def _run_bookkeeping() -> None:")
+    i_gather = src.index("await asyncio.gather(_run_bookkeeping(), _batch_coro)")
     i_loop = src.index("for tc in pending_tool_calls:\n                if cancel_check and cancel_check():")
-    assert i_bk < i_par < i_loop
+    assert i_bk < i_gather < i_loop
     # the pre-executed job tools are consumed by the ordered loop like the
     # parallel results are (no double execution)
     assert '_parallel_results[tc["id"]] = {' in src
+    # a lone web call still overlaps with bookkeeping
+    assert "_run_batch = len(_parallel_tcs) > 1 or (bool(_parallel_tcs) and bool(_bk_tcs))" in src
 
 
 def test_tool_end_frames_carry_call_id_step_and_domains():

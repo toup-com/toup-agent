@@ -1599,7 +1599,7 @@ class AgentRunner:
             # set_* calls above: session_id is only resolved above. The
             # pre-minted answer id rides along so job pushes can deep-link
             # to the reply before it exists (Round 3, item 3).
-            self.tools.set_session_id(session_id, asst_message_id)
+            self.tools.set_session_id(session_id, asst_message_id, turn_started_at=start)
 
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
@@ -2996,56 +2996,73 @@ class AgentRunner:
             # first is what makes that correct: the job exists before the
             # searches push progress, and the step index is set before the
             # batch's tool_end frames are attributed.
-            for tc in pending_tool_calls:
-                if tc["name"] not in BOOKKEEPING_TOOLS:
-                    continue
-                if cancel_check and cancel_check():
-                    logger.info("[AGENT] Cancelled before tool execution")
-                    raise asyncio.CancelledError("Generation cancelled by user")
-                _bk_started_ms = int(time.time() * 1000)
-                _t_bk = time.perf_counter()
-                await _emit_tool_event({
-                    "phase": "start", "call_id": tc["id"], "name": tc["name"],
-                    "input": tc.get("input") or {}, "started_ms": _bk_started_ms,
-                    **_steps.event_fields(),
-                })
-                try:
-                    _bk_result = await self.tools.execute(tc["name"], tc["input"])
-                except Exception as e:
-                    logger.exception(f"[AGENT] Tool {tc['name']} crashed")
-                    _bk_result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
-                _bk_done_ms = int(time.time() * 1000)
-                _parallel_results[tc["id"]] = {
-                    "result": _bk_result, "started_ms": _bk_started_ms,
-                    "completed_ms": _bk_done_ms,
-                }
-                _wf.mark("tool", int((time.perf_counter() - _t_bk) * 1000),
-                         t0_ms=int((_t_bk - _wf.t0) * 1000), tool=tc["name"])
-                if _steps.observe(tc["name"], tc.get("input") or {}, _bk_result):
-                    if on_step_event:
-                        try:
-                            await on_step_event({"kind": "step_change", **_steps.event_fields()})
-                        except Exception:  # noqa: BLE001
-                            logger.debug("[AGENT] on_step_event sink failed", exc_info=True)
-                await _emit_tool_event({
-                    "phase": "end", "call_id": tc["id"], "name": tc["name"],
-                    "input": tc.get("input") or {}, "result": _bk_result,
-                    "started_ms": _bk_started_ms, "completed_ms": _bk_done_ms,
-                    "elapsed_ms": _bk_done_ms - _bk_started_ms,
-                    **_steps.event_fields(),
-                })
+            _bk_tcs = [tc for tc in pending_tool_calls if tc["name"] in BOOKKEEPING_TOOLS]
+
+            async def _run_bookkeeping() -> None:
+                for tc in _bk_tcs:
+                    if cancel_check and cancel_check():
+                        logger.info("[AGENT] Cancelled before tool execution")
+                        raise asyncio.CancelledError("Generation cancelled by user")
+                    _bk_started_ms = int(time.time() * 1000)
+                    _t_bk = time.perf_counter()
+                    await _emit_tool_event({
+                        "phase": "start", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "started_ms": _bk_started_ms,
+                        **_steps.event_fields(),
+                    })
+                    try:
+                        _bk_result = await self.tools.execute(tc["name"], tc["input"])
+                    except Exception as e:
+                        logger.exception(f"[AGENT] Tool {tc['name']} crashed")
+                        _bk_result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
+                    _bk_done_ms = int(time.time() * 1000)
+                    _parallel_results[tc["id"]] = {
+                        "result": _bk_result, "started_ms": _bk_started_ms,
+                        "completed_ms": _bk_done_ms,
+                    }
+                    _wf.mark("tool", int((time.perf_counter() - _t_bk) * 1000),
+                             t0_ms=int((_t_bk - _wf.t0) * 1000), tool=tc["name"])
+                    if _steps.observe(tc["name"], tc.get("input") or {}, _bk_result):
+                        if on_step_event:
+                            try:
+                                await on_step_event({"kind": "step_change", **_steps.event_fields()})
+                            except Exception:  # noqa: BLE001
+                                logger.debug("[AGENT] on_step_event sink failed", exc_info=True)
+                    await _emit_tool_event({
+                        "phase": "end", "call_id": tc["id"], "name": tc["name"],
+                        "input": tc.get("input") or {}, "result": _bk_result,
+                        "started_ms": _bk_started_ms, "completed_ms": _bk_done_ms,
+                        "elapsed_ms": _bk_done_ms - _bk_started_ms,
+                        **_steps.event_fields(),
+                    })
 
             _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
-            if len(_parallel_tcs) > 1:
+            # The web batch runs concurrently when there are ≥2 web calls, OR
+            # when there is bookkeeping to overlap with — create_job is 0.6–1 s
+            # and update_job 0.5 s of DB + notify work (measured), and paying
+            # that serially in front of the searches was ~1.5 s per turn. The
+            # ordered loop below stamps step attribution AFTER both finish, so
+            # the frames are still correct; only the voice tool_event payloads
+            # for the batch see the pre-batch (provisional) step.
+            _run_batch = len(_parallel_tcs) > 1 or (bool(_parallel_tcs) and bool(_bk_tcs))
+            if _run_batch:
                 _t_par = time.perf_counter()
-                _parallel_results.update(await self._execute_tools_parallel(
+                _batch_coro = self._execute_tools_parallel(
                     _parallel_tcs, settings.agent_parallel_tool_cap,
                     on_tool_event=_emit_tool_event if on_tool_event else None,
                     event_fields=_steps.event_fields(),
-                ))
+                )
+                if _bk_tcs:
+                    _, _par_res = await asyncio.gather(_run_bookkeeping(), _batch_coro)
+                else:
+                    _par_res = await _batch_coro
+                _parallel_results.update(_par_res)
                 _wf.mark("tool_batch", int((time.perf_counter() - _t_par) * 1000),
                          t0_ms=int((_t_par - _wf.t0) * 1000), n=len(_parallel_tcs),
-                         tools=[tc["name"] for tc in _parallel_tcs])
+                         tools=[tc["name"] for tc in _parallel_tcs],
+                         with_bookkeeping=bool(_bk_tcs) or None)
+            elif _bk_tcs:
+                await _run_bookkeeping()
             for tc in pending_tool_calls:
                 if cancel_check and cancel_check():
                     logger.info("[AGENT] Cancelled before tool execution")
@@ -3454,7 +3471,9 @@ class AgentRunner:
             f"| tools_sent={len(current_tools)} | in={total_input} out={total_output} "
             f"| tool_calls={len(all_tool_calls)}"
         )
-        # Round 4 (item 7a): the whole turn on one line, one clock.
+        # Round 4 (item 7a): the whole turn on one line, one clock — emitted
+        # at the very end (after the job finalizer) so `turn_ms` is what the
+        # caller actually waited for.
         _wf.meta.update({
             "intent": getattr(query_intent, "category", None),
             "channel": channel, "model": model_used or None,
@@ -3462,7 +3481,7 @@ class AgentRunner:
             "in": total_input, "out": total_output,
             "job": _steps.job_id, "steps_total": _steps.steps_total or None,
         })
-        _wf.emit()
+        _wf.start("finalize")
 
         # Hook: agent run complete
         await _hb.emit(HookEvent.AGENT_END, {
@@ -3692,10 +3711,18 @@ class AgentRunner:
                                 end_after_s=JOB_CARD_END_AFTER_S,
                             )
 
-                    await asyncio.shield(asyncio.create_task(_end_cards()))
+                    # Round 4 (item 7b): scheduled, not awaited — the rows are
+                    # already terminal above; the pushes are outbox writes the
+                    # `done` frame does not depend on, and awaiting them held
+                    # the reply back ~0.5–1 s (measured). A background task
+                    # keeps the same "survives a turn cancellation" property
+                    # the shield had (the module-level set holds it).
+                    _spawn_background(_end_cards())
             except Exception as _e:  # a turn must never fail on job plumbing
                 logger.warning("[AGENT] create_job turn-end finalize failed: %s", _e)
 
+        _wf.end("finalize")
+        _wf.emit()
         return AgentResponse(
             text=final_text,
             session_id=session_id,

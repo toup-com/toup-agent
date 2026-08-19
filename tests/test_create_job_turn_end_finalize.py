@@ -130,12 +130,17 @@ def test_outcome_is_not_keyed_on_reply_text():
     assert 'status="completed"' in blk
 
 
-def test_card_end_push_is_shielded():
+def test_card_end_push_survives_turn_cancellation():
     """The row is committed terminal BEFORE the push, and closing it removes
     the reaper backstop — so losing the push to a turn cancellation would
-    strand the card on the phone forever."""
+    strand the card on the phone forever. Round 4: the push is a BACKGROUND
+    task (held by the module-level set, so it survives the turn's task being
+    cancelled — the property the earlier `asyncio.shield` bought) and no
+    longer awaited: it held the `done` frame back ~0.5–1 s for an outbox
+    write nothing downstream depends on."""
     blk = _finalizer_block()
-    assert "asyncio.shield(" in blk
+    assert "_spawn_background(_end_cards())" in blk
+    assert "await asyncio.shield(asyncio.create_task(_end_cards()))" not in blk
 
 
 def test_finalizer_can_never_fail_the_turn():
