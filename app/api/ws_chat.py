@@ -3501,6 +3501,16 @@ async def ws_chat(
                     }
                     if mime in preview_mimes or mime == "application/pdf" or mime.startswith("image/"):
                         payload["preview_url"] = f"{settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
+                    # Intrinsic pixels for an image, so the card can lay out at
+                    # the picture's own shape on FIRST paint instead of guessing
+                    # a ratio and jumping when the file decodes. This frame is
+                    # built field by field, so anything not named here is
+                    # dropped — the REST history path passes the whole dict and
+                    # needs no equivalent. Omitted when unknown (a header that
+                    # would not parse, or a pre-existing row).
+                    if att.get("width") and att.get("height"):
+                        payload["width"] = att["width"]
+                        payload["height"] = att["height"]
                     try:
                         await websocket.send_json(payload)
                     except Exception:

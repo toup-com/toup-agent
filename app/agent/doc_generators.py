@@ -74,6 +74,14 @@ class Attachment:
     size_bytes: int
     storage_path: str
     created_at: str
+    # Intrinsic pixels for image attachments; None for everything else and for
+    # an image whose header would not decode. Clients lay the card out at this
+    # shape on FIRST paint — without it they have to guess an aspect ratio and
+    # the picture jumps when it decodes. These ride the Message.attachments JSON
+    # column, so carrying them needed no migration; old rows simply answer None
+    # and the client falls back to measuring the file itself.
+    width: Optional[int] = None
+    height: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -272,6 +280,28 @@ def _html_text(html: str) -> str:
     return _HTML_TAG_RE.sub(" ", html or "").strip()
 
 
+def _image_dimensions(data: bytes, mime_type: str) -> tuple[Optional[int], Optional[int]]:
+    """Intrinsic (width, height) for image bytes, or (None, None).
+
+    Reads the HEADER only — Pillow is lazy, so `.size` never decodes the pixels.
+    Deliberately lives in `_persist` rather than in the image tools: EVERY image
+    that reaches a chat card goes through here (generate_image, edit_image,
+    send_photo, convert_document, anything added later), so the create path and
+    the edit path cannot end up stamping different things. Best-effort by
+    design — a picture is worth delivering even when its header will not parse.
+    """
+    if not (mime_type or "").startswith("image/"):
+        return None, None
+    try:
+        from PIL import Image as _PILImage  # already a dependency (HEIC decode)
+        with _PILImage.open(io.BytesIO(data)) as im:
+            w, h = im.size
+        return (int(w), int(h)) if w > 0 and h > 0 else (None, None)
+    except Exception:
+        logger.debug("attachment: could not read image dimensions", exc_info=True)
+        return None, None
+
+
 async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) -> Attachment:
     """Write bytes to storage under {user_scope}/{uuid}_{filename} and return an Attachment."""
     att_id = uuid.uuid4().hex
@@ -279,6 +309,7 @@ async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) 
     backend = get_storage_backend()
     await backend.put(key, data)
     _prewarm_preview(key, mime_type)
+    width, height = _image_dimensions(data, mime_type)
     return Attachment(
         id=att_id,
         filename=filename,
@@ -286,6 +317,8 @@ async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) 
         size_bytes=len(data),
         storage_path=key,
         created_at=datetime.now(timezone.utc).isoformat(),
+        width=width,
+        height=height,
     )
 
 
