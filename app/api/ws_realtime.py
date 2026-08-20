@@ -18,6 +18,9 @@ Protocol (Browser ↔ Proxy):
     { "type": "config", "voice": "nova", "session_id": "..." } — session config
     { "type": "played", "ms": 1234 }                            — V2: audio ms actually
                                                                   played before barge-in
+    { "type": "client_event", "event": "audio_start_failed|mic_busy|reconnect_ok|
+      reconnect_failed|...", "detail": "..." }                   — client telemetry,
+                                                                  counted only (see _vcount)
 
   Server sends:
     { "type": "audio_delta", "data": "<base64 PCM16>" }  — assistant audio chunk
@@ -111,6 +114,98 @@ _PLAY_MEDIA_TIMEOUT_S = 20.0
 # the failure mode worth remembering: the model then reasons from an empty
 # toolbox to "I can't do that", which is how a play became a Spotify referral.
 _REALTIME_NATIVE = {"think", "navigate_to", "play_media"}
+
+
+# How long `_apply_full_context` waits on each leg of the personal context
+# before serving the session without it. Module-level so a test can shrink them
+# and drive the timeout branch — which is the branch that used to hand the model
+# an unrunnable tool array, and which no test could reach while these were
+# literals buried in a closure.
+_CTX_INSTRUCTIONS_TIMEOUT_S = 40.0
+_CTX_TOOLS_TIMEOUT_S = 10.0
+_CTX_LANG_TIMEOUT_S = 10.0
+
+
+def _executable_tools(tools: Optional[list] = None) -> list:
+    """The subset of `tools` that can actually EXECUTE on this session.
+
+    One definition, used by both the normal path (`_tools_step`) and every
+    fallback, so a fallback can never hand the model a tool the relay is
+    unable to run. Under V2 that is `_REALTIME_NATIVE`; under v1 the relay has
+    a tunnel or a local ToolExecutor and the whole array is fair game.
+    """
+    src = list(REALTIME_TOOLS if tools is None else tools)
+    if _v2_active():
+        return [t for t in src if t["name"] in _REALTIME_NATIVE]
+    return src
+
+
+def _tools_are_usable(tools: list) -> bool:
+    """Can this tool array answer a real request at all?
+
+    `think` is the entire bridge to the user's agent — every search, every
+    file, every connector. A session configured without it can still chat, so
+    it looks healthy on every other signal while being unable to do the one
+    thing the product is for. That is the alert.
+    """
+    return any(t.get("name") == "think" for t in (tools or []))
+
+
+# ── Voice health counters ────────────────────────────────────────────────
+# One greppable line per event, same shape as [TURN_WATERFALL]: the platform
+# has no metrics sink, and Railway log search is what an on-call actually has.
+# Counts are process-local and exported by `voice_counter_snapshot()` for
+# tests and for /admin. The names are the taxonomy — every distinct way a
+# voice session or turn can fail gets its own, because until 2026-08-20 they
+# all collapsed into one `relay_error` on the phone and there was no way to
+# tell a dead agent from an unbound local.
+_VOICE_COUNTERS: dict = {}
+
+
+def _vcount(name: str, user_id: Optional[str] = None, **fields) -> None:
+    """Record a voice health event. Never raises — this is instrumentation."""
+    try:
+        _VOICE_COUNTERS[name] = _VOICE_COUNTERS.get(name, 0) + 1
+        extra = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+        logger.info(
+            "[VOICE_METRIC] %s user=%s n=%d%s",
+            name, (user_id or "-")[:8], _VOICE_COUNTERS[name],
+            (" " + extra) if extra else "",
+        )
+    except Exception:  # noqa: BLE001 — a counter must never break a call
+        pass
+
+
+def voice_counter_snapshot() -> dict:
+    """Copy of the process-local counters."""
+    return dict(_VOICE_COUNTERS)
+
+
+def _think_task(arguments: dict, last_user_text: str = "") -> str:
+    """The task string for a `think` call, never empty.
+
+    Production 2026-08-20 logged ``Function call: think({})`` — the model
+    opened the turn with NO arguments at all. The relay passed `""` straight
+    through, the agent's turn endpoint 422'd on the empty message, the
+    tool-less fallback then 400'd for the same reason, and the user got a
+    non-answer for a question they had actually asked. Same class as the
+    952-byte `generate_pdf("x")`: a mandated tool called with a stub.
+
+    The transcript of what the user just said is the honest substitute, and it
+    is exactly what `think` was going to be handed anyway.
+    """
+    task = str((arguments or {}).get("task") or "").strip()
+    if task:
+        return task
+    fallback = (last_user_text or "").strip()
+    if fallback:
+        _vcount("think_empty_task_recovered", detail="used_transcript")
+        return fallback
+    _vcount("think_empty_task_unrecoverable")
+    return (
+        "The user asked something but the request did not come through. "
+        "Ask them briefly to repeat it."
+    )
 
 
 def _resolve_v2_for_user(user_id: Optional[str]) -> bool:
@@ -3244,12 +3339,15 @@ async def realtime_voice_ws(
 
     if not user_id:
         if client_disconnected:
+            _vcount("session_open_abandoned")
             return
+        _vcount("session_open_failed_auth")
         await safe_send_close_ws(
             websocket, code=4401, message="Authentication failed",
         )
         return
 
+    _vcount("session_open_attempt", user_id)
     logger.info("[REALTIME] Session starting for user %s", user_id[:8])
 
     # Resolve V2 for THIS connection (global flag OR per-user allowlist) and pin
@@ -3491,8 +3589,7 @@ async def realtime_voice_ws(
         # and connector) via /api/v1/internal/agent-turn — plus the client-side `navigate_to`.
         # Onboarding tools are re-added below. This forces the model down the working path
         # instead of calling e.g. web_search directly.
-        if _v2_active():
-            tools = [t for t in tools if t["name"] in _REALTIME_NATIVE]
+        tools = _executable_tools(tools)
         if onboarding:
             tools = list(tools)  # copy
             tools.append({
@@ -3577,6 +3674,9 @@ async def realtime_voice_ws(
         logger.exception("[REALTIME] Failed to connect to OpenAI")
         err_str = str(e).lower()
         is_billing = any(kw in err_str for kw in ["quota", "billing", "rate_limit", "402", "429", "credit", "balance"])
+        _vcount("session_open_failed", user_id,
+                cause="billing" if is_billing else "openai_connect",
+                err=type(e).__name__)
         error_payload: dict = {
             "type": "error",
             "code": "connect_failed",
@@ -3648,6 +3748,8 @@ async def realtime_voice_ws(
     except Exception as e:
         _cancel_bg()
         logger.exception("[REALTIME] Failed to configure session")
+        _vcount("session_open_failed", user_id, cause="session_config",
+                err=type(e).__name__)
         # The exception text is ours to read in the logs, never the user's.
         await websocket.send_json({
             "type": "error",
@@ -3672,6 +3774,8 @@ async def realtime_voice_ws(
         except Exception:
             pass
         return
+    _vcount("session_open_ok", user_id, cache_hit=_cache_hit,
+            ms=int((time.monotonic() - _t0) * 1000))
     logger.info("[REALTIME] ready in %.0fms (cache_hit=%s)", (time.monotonic() - _t0) * 1000, _cache_hit)
 
     # V2: warn the client 5 minutes before OpenAI's hard 60-minute session cap
@@ -3702,27 +3806,65 @@ async def realtime_voice_ws(
     # the day chat. Reset per turn beside `response_text_accum`, and drained by
     # the persist below — see `_InnerToolRelay._open_rec`.
     turn_tool_events: list = []
+    # Per-turn outcome counters. A DICT, mutated in place and never rebound —
+    # `turn_tool_events` is the cautionary tale: a plain rebinding inside
+    # `openai_to_client` made it a local of that function and every read of it
+    # raised UnboundLocalError, which is what took voice down on 2026-08-20.
+    _turn: dict = {"tools": 0}
 
     async def _apply_full_context() -> None:
         # shield(): a timeout here abandons the wait, not the underlying
         # build — a late result still lands in the cache path below on the
         # next connect. _cancel_bg reaps everything at session end.
         instr: Optional[str] = None
-        tools: list = list(_first_tools) if _first_tools else list(REALTIME_TOOLS)
+        # The fallback must satisfy the SAME executability rule `_tools_step`
+        # applies, or a slow context build silently re-arms the raw agent tools
+        # that cannot run on the relay: the model then calls `web_search`
+        # directly, gets "your terminal agent is not connected", and narrates a
+        # broken capability. Raw REALTIME_TOOLS here was doubly wrong — it was
+        # also cached below and adopted as `applied_ctx`, so ONE slow build
+        # poisoned the user's tool list for the rest of the session and every
+        # warm reopen inside the cache TTL.
+        tools: list = list(_first_tools) if _first_tools else _executable_tools()
         language: Optional[str] = _first_language
+        # Separate waits: these used to share one `try`, so an instructions
+        # timeout skipped the tools await entirely and took the fallback above
+        # even when the tool list had been ready for 30 seconds.
         try:
-            instr = await asyncio.wait_for(asyncio.shield(_instructions_t), timeout=40.0)
-            tools = await asyncio.wait_for(asyncio.shield(_tools_t), timeout=10.0)
+            instr = await asyncio.wait_for(
+                asyncio.shield(_instructions_t), timeout=_CTX_INSTRUCTIONS_TIMEOUT_S)
         except Exception:
-            logger.warning("[REALTIME] Context build timed out — session continues on base config")
+            _vcount("context_instructions_timeout", user_id)
+            logger.warning("[REALTIME] Instructions build timed out — session continues on base config")
         try:
-            language = await asyncio.wait_for(asyncio.shield(_lang_t), timeout=10.0) or _first_language
+            tools = await asyncio.wait_for(
+                asyncio.shield(_tools_t), timeout=_CTX_TOOLS_TIMEOUT_S)
+        except Exception:
+            _vcount("context_tools_timeout", user_id)
+            logger.warning("[REALTIME] Tool list timed out — session continues on the executable set")
+        try:
+            language = await asyncio.wait_for(
+                asyncio.shield(_lang_t), timeout=_CTX_LANG_TIMEOUT_S) or _first_language
         except Exception:
             logger.warning("[REALTIME] Language hint timed out — transcription stays on auto-detect")
+        # THE alert. A session that reaches the user without `think` cannot
+        # search, read a file, or touch a connector — it can only make
+        # conversation, which is indistinguishable from health on every other
+        # signal. Never cache such a list: that would carry the dead loadout
+        # into every warm reopen for the whole TTL.
+        _usable = _tools_are_usable(tools)
+        if not _usable:
+            _vcount("voice_turn_no_tools_attached", user_id,
+                    tools=len(tools), v2=_v2_active())
+            logger.error(
+                "[REALTIME] ALERT no executable tools attached for user=%s "
+                "(%d tools, think missing) — the session can talk but cannot act",
+                user_id[:8], len(tools),
+            )
         try:
             final_instr = instr or _first_instructions
             await openai_ws.send(json.dumps(_session_config(final_instr, tools, language)))
-            if instr:
+            if instr and _usable:
                 _instr_cache[user_id] = (instr, tools, time.monotonic())
             logger.info(
                 "[REALTIME] Full context applied at +%.0fms (%d chars, %d tools, language=%s)",
@@ -4049,6 +4191,19 @@ async def realtime_voice_ws(
                         except Exception:
                             pass
 
+                # Client-side telemetry. The two failures that end a voice call
+                # most often are not visible from here at all: the mic never
+                # started ("Could not start the audio engine" — another app
+                # holds the singleton), and the reconnect after a drop. Both
+                # were invisible server-side, so "voice is broken" arrived as a
+                # report with nothing behind it. Purely a counter: it relays
+                # nothing to OpenAI and cannot affect the call. Older clients
+                # never send it, which costs nothing.
+                elif msg_type == "client_event":
+                    _name = str(msg.get("event") or "unknown")[:48]
+                    _vcount(f"client_{_name}", user_id,
+                            detail=str(msg.get("detail") or "")[:120] or None)
+
                 elif msg_type == "stop":
                     got_stop["v"] = True
                     break
@@ -4057,11 +4212,20 @@ async def realtime_voice_ws(
             pass
         except Exception as e:
             logger.warning("[REALTIME] client_to_openai error: %s", e)
+            _vcount("client_relay_died", user_id, err=type(e).__name__)
 
     async def openai_to_client():
         """Relay OpenAI Realtime API events → browser."""
         nonlocal response_text_accum, db_session_id, last_user_text, turn_model
         nonlocal pending_media
+        # `turn_tool_events` is REBOUND below (``turn_tool_events = []``, the
+        # per-turn reset). Without this declaration that assignment makes the
+        # name local to THIS function for its whole body, so every read of it —
+        # the assistant persist, and the `think` dispatch — raises
+        # UnboundLocalError. Production, 2026-08-20: the `think` read is the one
+        # outside a try, so it unwound the relay loop and ended the call the
+        # instant the user asked for anything. See test_voice_turn_survives.
+        nonlocal turn_tool_events
         try:
             async for raw_msg in openai_ws:
                 event = json.loads(raw_msg)
@@ -4170,6 +4334,17 @@ async def realtime_voice_ws(
                         # one persists. Clearing with the resets below would
                         # drop the record before the row that carries it exists.
                         turn_tool_events = []
+
+                        # Turn outcome. A SPOKEN response with no tool call is
+                        # the quiet failure mode this P0 wore for weeks: the
+                        # model answers from its own head — no search, no
+                        # sources, no agent — and everything downstream looks
+                        # fine. Rate of these is the voice-health number worth
+                        # watching; `_turn["tools"]` counts the outer calls.
+                        _vcount("voice_turn_completed", user_id)
+                        if not _turn["tools"]:
+                            _vcount("voice_turn_zero_tool_calls", user_id)
+                        _turn["tools"] = 0
 
                         # ── Reply-language directive (see `next_reply_directive`) ──
                         # HERE, not at the transcript, because the decision
@@ -4314,6 +4489,7 @@ async def realtime_voice_ws(
                         except json.JSONDecodeError:
                             arguments = {}
 
+                        _turn["tools"] += 1
                         logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
                         # Structured card for THIS call's completed frame (play_media
                         # only). Deliberately separate from `pending_media`, which is
@@ -4332,83 +4508,109 @@ async def realtime_voice_ws(
                             "detail": _tc_detail,
                         })
 
-                        # ── Client-side tool: navigate_to ──
-                        if func_name == "navigate_to":
-                            path = arguments.get("path", "/")
-                            _ALLOWED = {"/", "/chat", "/brain/user", "/brain/agent",
-                                        "/workspace", "/dashboard", "/agent"}
-                            if path not in _ALLOWED:
-                                result = f"Invalid path '{path}'."
+                        # Everything below runs INSIDE this try. Until
+                        # 2026-08-20 it did not, and the cost of that was the
+                        # whole call: `openai_to_client` IS the relay loop, so a
+                        # raise anywhere in tool dispatch unwound it, sent one
+                        # `relay_error`, and ended the session — the user saw
+                        # their words transcribed and then nothing. A tool that
+                        # fails is ordinary (a container mid-rollout, a 422, a
+                        # connector timeout); it must come back as a failed
+                        # RESULT the model can speak about, with the call still
+                        # up. See test_voice_turn_survives.
+                        result = ""
+                        try:
+                            # ── Client-side tool: navigate_to ──
+                            if func_name == "navigate_to":
+                                path = arguments.get("path", "/")
+                                _ALLOWED = {"/", "/chat", "/brain/user", "/brain/agent",
+                                            "/workspace", "/dashboard", "/agent"}
+                                if path not in _ALLOWED:
+                                    result = f"Invalid path '{path}'."
+                                else:
+                                    await websocket.send_json({"type": "navigate", "path": path})
+                                    _NAMES = {"/": "Hub", "/chat": "Chat", "/brain/user": "User Brain",
+                                              "/brain/agent": "Agent Brain", "/workspace": "Workspace",
+                                              "/dashboard": "Dashboard", "/agent": "Agent Setup"}
+                                    result = f"Navigated to {_NAMES.get(path, path)}. Voice conversation continues."
+
+                            # ── Play media: straight to the agent's resolver ──
+                            elif func_name == "play_media":
+                                result, _played = await _play_media_direct(
+                                    user_id, str(arguments.get("query", "")),
+                                    variety=bool(arguments.get("variety")))
+                                # Carried to this turn's assistant persist so the
+                                # thread gets the same Toup media card a chat play
+                                # produces. Cleared after the persist below.
+                                if _played:
+                                    pending_media = _played
+                                    _frame_media = _played
+
+                            # ── Think: delegate reasoning to best model ──
+                            elif func_name == "think":
+                                task = _think_task(arguments, last_user_text)
+                                _relay = _InnerToolRelay(websocket, call_id, sink=turn_tool_events)
+                                result, turn_model_used = await _think(
+                                    user_id, task, db_session_id, relay=_relay)
+                                turn_model = turn_model_used
+
+                            # ── Onboarding: set UI phase ──
+                            elif func_name == "set_onboarding_phase":
+                                phase = arguments.get("phase", "")
+                                await websocket.send_json({
+                                    "type": "onboarding_phase",
+                                    "phase": phase,
+                                })
+                                result = f"Onboarding UI phase set to '{phase}'. The user can now see the {phase} interface."
+
+                            # ── Onboarding: finalize (compile profiles, mark complete) ──
+                            elif func_name == "finalize_onboarding":
+                                result = await _finalize_onboarding(user_id)
+                                try:
+                                    from app.db.database import async_session_maker as _asm
+                                    from app.db.models import AgentConfig
+                                    async with _asm() as _db:
+                                        _cfg = (await _db.execute(
+                                            select(AgentConfig).where(AgentConfig.user_id == user_id)
+                                        )).scalar_one_or_none()
+                                        if _cfg:
+                                            _cfg.onboarding_completed = True
+                                            await _db.commit()
+                                            logger.info("[REALTIME] Onboarding finalized for user %s", user_id[:8])
+                                except Exception as oe:
+                                    logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
+                                await websocket.send_json({"type": "onboarding_phase", "phase": "done"})
+
+                                # Trigger personalized workspace generation on VPS
+                                try:
+                                    _vps = await _get_vps_info(user_id)
+                                    if _vps:
+                                        _agent_url, _agent_key = _vps
+                                        await _vps_api(
+                                            _agent_url, _agent_key, "POST",
+                                            "/api/workflows/generate-from-onboarding",
+                                        )
+                                        logger.info("[REALTIME] Triggered workspace generation for %s", user_id[:8])
+                                except Exception as _wg_err:
+                                    logger.warning("[REALTIME] Workspace generation trigger failed: %s", _wg_err)
+
                             else:
-                                await websocket.send_json({"type": "navigate", "path": path})
-                                _NAMES = {"/": "Hub", "/chat": "Chat", "/brain/user": "User Brain",
-                                          "/brain/agent": "Agent Brain", "/workspace": "Workspace",
-                                          "/dashboard": "Dashboard", "/agent": "Agent Setup"}
-                                result = f"Navigated to {_NAMES.get(path, path)}. Voice conversation continues."
-
-                        # ── Play media: straight to the agent's resolver ──
-                        elif func_name == "play_media":
-                            result, _played = await _play_media_direct(
-                                user_id, str(arguments.get("query", "")),
-                                variety=bool(arguments.get("variety")))
-                            # Carried to this turn's assistant persist so the
-                            # thread gets the same Toup media card a chat play
-                            # produces. Cleared after the persist below.
-                            if _played:
-                                pending_media = _played
-                                _frame_media = _played
-
-                        # ── Think: delegate reasoning to best model ──
-                        elif func_name == "think":
-                            task = arguments.get("task", "")
-                            _relay = _InnerToolRelay(websocket, call_id, sink=turn_tool_events)
-                            result, turn_model_used = await _think(
-                                user_id, task, db_session_id, relay=_relay)
-                            turn_model = turn_model_used
-
-                        # ── Onboarding: set UI phase ──
-                        elif func_name == "set_onboarding_phase":
-                            phase = arguments.get("phase", "")
-                            await websocket.send_json({
-                                "type": "onboarding_phase",
-                                "phase": phase,
-                            })
-                            result = f"Onboarding UI phase set to '{phase}'. The user can now see the {phase} interface."
-
-                        # ── Onboarding: finalize (compile profiles, mark complete) ──
-                        elif func_name == "finalize_onboarding":
-                            result = await _finalize_onboarding(user_id)
-                            try:
-                                from app.db.database import async_session_maker as _asm
-                                from app.db.models import AgentConfig
-                                async with _asm() as _db:
-                                    _cfg = (await _db.execute(
-                                        select(AgentConfig).where(AgentConfig.user_id == user_id)
-                                    )).scalar_one_or_none()
-                                    if _cfg:
-                                        _cfg.onboarding_completed = True
-                                        await _db.commit()
-                                        logger.info("[REALTIME] Onboarding finalized for user %s", user_id[:8])
-                            except Exception as oe:
-                                logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
-                            await websocket.send_json({"type": "onboarding_phase", "phase": "done"})
-
-                            # Trigger personalized workspace generation on VPS
-                            try:
-                                _vps = await _get_vps_info(user_id)
-                                if _vps:
-                                    _agent_url, _agent_key = _vps
-                                    await _vps_api(
-                                        _agent_url, _agent_key, "POST",
-                                        "/api/workflows/generate-from-onboarding",
-                                    )
-                                    logger.info("[REALTIME] Triggered workspace generation for %s", user_id[:8])
-                            except Exception as _wg_err:
-                                logger.warning("[REALTIME] Workspace generation trigger failed: %s", _wg_err)
-
-                        else:
-                            # ── Server-side tools ──
-                            result = await _execute_tool(user_id, func_name, arguments)
+                                # ── Server-side tools ──
+                                result = await _execute_tool(user_id, func_name, arguments)
+                        except Exception as _tool_err:
+                            logger.exception(
+                                "[REALTIME] Tool %s raised — session stays up", func_name,
+                            )
+                            _vcount("tool_dispatch_exception", user_id,
+                                    tool=func_name, err=type(_tool_err).__name__)
+                            # Phrased for the model, which will say it out loud:
+                            # it should retry or explain, not announce that it
+                            # lacks the capability (the 2026-07-31 shape).
+                            result = (
+                                "ERROR: that didn't go through just now — a "
+                                "temporary problem on our side, not a missing "
+                                "capability. Say so briefly and offer to retry."
+                            )
 
                         # Check if onboarding just completed (legacy detection via memory_store)
                         if (onboarding and func_name == "memory_store"
@@ -4506,7 +4708,12 @@ async def realtime_voice_ws(
             except Exception:
                 pass
         except Exception as e:
-            logger.warning("[REALTIME] openai_to_client error: %s", e)
+            # Reaching here now means the relay loop itself broke, not a tool:
+            # tool dispatch has owned its own failures since 2026-08-20. Log the
+            # type — `relay_error` on the phone is one string for what used to
+            # be a dozen distinct causes, and the counter is where they separate.
+            logger.exception("[REALTIME] openai_to_client error: %s", e)
+            _vcount("relay_loop_died", user_id, err=type(e).__name__)
             try:
                 await websocket.send_json({
                     "type": "error",
