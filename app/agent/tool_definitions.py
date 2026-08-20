@@ -169,20 +169,19 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "memory_search",
             "description": (
-                "Search your memory system using semantic search. "
-                "Returns matching memories ranked by relevance."
+                "Find which of the user's memory FILES holds something. "
+                "Searches every file body and title, and also the user's "
+                "uploaded documents and media. Each result names its file "
+                "([areas/toup] …) — open the whole file with "
+                "memory_read_file. Prefer memory_read_file when the index in "
+                "`# User Brain` already names the file you want."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural language search query.",
-                    },
-                    "brain_type": {
-                        "type": "string",
-                        "description": "Filter by brain type: 'user', 'agent', or 'work'.",
-                        "enum": ["user", "agent", "work"],
+                        "description": "What to look for, in natural language.",
                     },
                     "limit": {
                         "type": "integer",
@@ -193,67 +192,91 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
-        # 6. Memory store
+        # 5b. Memory read file (v3 §3.2) — the depth tool. Without it the
+        #     index in `# User Brain` is a map to nowhere: it names files and
+        #     nothing can open one, which is exactly what round 8 shipped.
+        # ------------------------------------------------------------------
+        {
+            "name": "memory_read_file",
+            "description": (
+                "Read one of the user's memory files in full — its "
+                "description, every bullet, and the files it links to. Use "
+                "the slug from the index in `# User Brain` (e.g. "
+                "'people/majid-tajik', 'areas/toup'). Profile, Current "
+                "context and Learned are already in your context; you do not "
+                "need to read those."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "The file's slug, e.g. 'topics/music'.",
+                    },
+                },
+                "required": ["slug"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 6. Memory store — the explicit-ask path (v3 §2.1.3)
+        #
+        # No category, no brain_type, no importance: v3 has no per-row
+        # taxonomy, and the curator decides which FILE a fact belongs in. A
+        # schema that still asked for a category was asking the model to pick
+        # from an enum whose values no longer route anything.
         # ------------------------------------------------------------------
         {
             "name": "memory_store",
             "description": (
-                "Store a new memory into your brain. "
-                "Automatically deduplicates and merges with existing memories."
+                "Remember something the user EXPLICITLY asked you to "
+                "remember. This is the 'remember that…' path, not a general "
+                "note-taker: everything else worth keeping is written to "
+                "their memory files automatically after the turn. Pass ONE "
+                "durable fact about the user or their world, in their own "
+                "terms — never a reminder, a task, a one-off request, how "
+                "they feel right now, or anything a tool just returned. The "
+                "writer chooses the file, rewrites it in the house voice, and "
+                "may decline; read the result."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "The memory content to store.",
-                    },
-                    "category": {
-                        "type": "string",
                         "description": (
-                            "Memory category: identity, preferences, beliefs, emotions, people, "
-                            "places, family, experiences, projects, schedule, work, learning, "
-                            "knowledge, tools, media, health, habits, food, travel, goals, context."
+                            "The fact to remember, as one sentence."
                         ),
                     },
-                    "brain_type": {
-                        "type": "string",
-                        "description": "Brain type (default 'user').",
-                        "enum": ["user", "agent", "work"],
-                    },
-                    "importance": {
-                        "type": "number",
-                        "description": "Importance score 0.0-1.0 (default 0.5).",
-                    },
                 },
-                "required": ["content", "category"],
+                "required": ["content"],
             },
         },
         # ------------------------------------------------------------------
-        # 6b. Memory delete (audit A6-6: memory_delete was listed in the
-        #     memory-intent tool set but had no definition or handler, so
-        #     "forget X" could never be honored via tool)
+        # 6b. Memory delete — "forget X" (v3 §2.1.3). Takes WHAT to forget,
+        #     not an id: the product has no memory ids any more, and the
+        #     round-8 schema told the model to get one from memory_search,
+        #     which now returns file slugs and snippets.
         # ------------------------------------------------------------------
         {
             "name": "memory_delete",
             "description": (
-                "Delete a stored memory (soft delete). Use when the user asks "
-                "you to forget something or a stored fact is wrong/outdated. "
-                "Find the memory's id with memory_search first, then pass it "
-                "here."
+                "Forget something the user asked you to forget, or remove a "
+                "stored fact they say is wrong. Describe WHAT to remove in "
+                "plain words ('that I live in Toronto'); the writer finds it "
+                "in the memory files and removes it, and the removal shows up "
+                "in the user's memory log."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "memory_id": {
+                    "content": {
                         "type": "string",
                         "description": (
-                            "The id of the memory to delete, as returned by "
-                            "memory_search."
+                            "What to forget, in plain words."
                         ),
                     },
                 },
-                "required": ["memory_id"],
+                "required": ["content"],
             },
         },
         # ------------------------------------------------------------------

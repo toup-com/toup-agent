@@ -3,7 +3,7 @@ Tool Executor — Runs tools requested by the LLM and returns string results.
 
 Supported tools:
   exec, read_file, write_file, edit_file,
-  memory_search, memory_store, web_search, web_fetch
+  memory_search, memory_read_file, memory_store, web_search, web_fetch
 
 Per-tool output limits prevent bloating context:
   exec:       10 KB
@@ -470,6 +470,8 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "write_file": 1_000,
     "edit_file": 1_000,
     "memory_search": 10_000,
+    # A whole file. The 8 KB body cap plus its header fits inside this.
+    "memory_read_file": 10_000,
     "memory_store": 1_000,
     "memory_delete": 1_000,
     "web_search": 10_000,
@@ -1697,160 +1699,204 @@ class ToolExecutor:
             return f"ERROR: Permission denied: {path}"
     
     # ------------------------------------------------------------------
-    # 5. memory_search
+    # 5. memory_search — file bodies + the document/media leg (v3 §3.2/§3.4)
     # ------------------------------------------------------------------
     async def _tool_memory_search(self, inp: Dict[str, Any]) -> str:
         query = inp.get("query", "")
-        brain_type = inp.get("brain_type")
         limit = int(inp.get("limit", 5))
-        
+
         if not query:
             return "ERROR: query is required"
-        
+
         try:
             from app.db.database import async_session_maker
-            from app.services.memory_service import MemoryService
+            from app.services import memory_file_ops
 
+            lines: List[str] = []
             async with async_session_maker() as db:
-                svc = MemoryService(db)
-                # W1.5: route through the hybrid engine (RRF over
-                # vector+keyword+graph, strength floor) — same retriever
-                # auto-recall uses every turn — instead of pure dense
-                # cosine, which missed keyword/graph-only matches.
-                results = await svc.hybrid_search(
-                    user_id=self._current_user_id,
-                    query=query,
-                    limit=limit,
-                    min_similarity=0.1,
-                    brain_types=[brain_type] if brain_type else None,
-                    strategies=["vector", "keyword", "graph"],
+                files = await memory_file_ops.search_files(
+                    db, self._current_user_id, query, limit=limit,
                 )
-            
-            if not results:
-                return "No memories found."
-            
-            lines = []
-            for i, mem in enumerate(results, 1):
-                score = mem.get("similarity_score", 0)
-                cat = mem.get("category", "")
-                content = mem.get("content", "")
-                # id included so memory_delete can target a result (A6-6).
-                mem_id = mem.get("id", "")
-                lines.append(f"{i}. [{cat}] (sim={score:.2f}, id={mem_id}) {content}")
+                for f in files:
+                    lines.append(f"[{f['slug']}] {f['title']} — {f['snippet']}")
+
+                # The document/media leg. These rows are the ONE surviving
+                # reader of `memories` (v3 §3.4): uploads and transcripts keep
+                # their embedding pipeline and are reachable here, and they
+                # appear in no memory UI. Scoped by source_type so a retired
+                # conversation row can never come back through this tool.
+                if len(lines) < limit:
+                    docs = await self._search_documents(
+                        db, query, limit - len(lines),
+                    )
+                    lines.extend(docs)
+
+            if not lines:
+                return "No memory files or documents matched."
             return "\n".join(lines)
-        
+
         except Exception as exc:
             logger.exception("memory_search failed")
             return f"ERROR: {exc}"
-    
+
+    async def _search_documents(self, db, query: str, limit: int) -> List[str]:
+        """Uploaded documents and media, by embedding. Never files."""
+        if limit <= 0:
+            return []
+        try:
+            from app.services.memory_service import MemoryService
+
+            svc = MemoryService(db)
+            embedding = await svc.embedding_service.embed_async(
+                query, api_key=svc.api_key,
+            )
+            rows = await svc.search_memories_by_embedding(
+                user_id=self._current_user_id,
+                embedding=embedding,
+                limit=limit,
+                min_similarity=0.3,
+                source_types=["document", "media"],
+            )
+            return [
+                f"[document] {r.get('content', '')[:400]}" for r in rows
+            ]
+        except Exception as exc:
+            # A missing embedding key must not take the file half down with
+            # it — the files are the memory, documents are the extra.
+            logger.info("memory_search document leg unavailable: %s", exc)
+            return []
+
     # ------------------------------------------------------------------
-    # 6. memory_store
+    # 5b. memory_read_file — open one file in full (v3 §3.2)
+    # ------------------------------------------------------------------
+    async def _tool_memory_read_file(self, inp: Dict[str, Any]) -> str:
+        slug = (inp.get("slug") or "").strip()
+        if not slug:
+            return "ERROR: slug is required"
+
+        try:
+            from app.db.database import async_session_maker
+            from app.services import memory_file_ops
+
+            async with async_session_maker() as db:
+                file = await memory_file_ops.get_file(db, self._current_user_id, slug)
+
+            if file is None:
+                return (
+                    f"No memory file '{slug}'. The index in # User Brain "
+                    "lists every file that exists."
+                )
+            head = f"# {file['title']} ({file['slug']})"
+            if file.get("description"):
+                head += f"\n{file['description']}"
+            body = (file.get("body_md") or "").strip() or "(this file is empty)"
+            out = f"{head}\n\n{body}"
+            links = file.get("links") or []
+            if links:
+                out += "\n\nSee also: " + ", ".join(
+                    f"{l['title']} ({l['slug']})" for l in links
+                )
+            return out
+
+        except Exception as exc:
+            logger.exception("memory_read_file failed")
+            return f"ERROR: {exc}"
+
+    # ------------------------------------------------------------------
+    # 6. memory_store — "the user asked you to remember this" (v3 §2.1.3)
+    #
+    # No longer a note-taker with its own write path. Round 8's version built
+    # a MemoryCreate and called `smart_create_memory(explicit_save=True)` on
+    # its own session — and `explicit_save=True` is not a hint, it turns OFF
+    # three gate rules, while passing no turn text made two more abstain. The
+    # model-controlled write was screened by length and secrets and nothing
+    # else, and the voice tunnel funnelled through it too.
+    #
+    # Now it is an INSTRUCTION to the one writer. The explicit ask satisfies
+    # the source gate (the user said "remember this"), and everything else —
+    # durability, routing, identity, the bullet lint, the 8 KB cap, the change
+    # line — applies exactly as it does to a typed instruct.
     # ------------------------------------------------------------------
     async def _tool_memory_store(self, inp: Dict[str, Any]) -> str:
-        content = inp.get("content", "")
-        # "context" is in NO enum — it was the pre-unification sink value, so
-        # this default wrote a category the app cannot label and that
-        # query_classifier's `category.in_(...)` can never match.
-        category = inp.get("category") or "other"
-        brain_type = inp.get("brain_type", "user")
-        importance = float(inp.get("importance", 0.5))
-
+        content = (inp.get("content") or "").strip()
         if not content:
             return "ERROR: content is required"
 
         try:
-            from datetime import datetime, timedelta
             from app.db.database import async_session_maker
-            from app.services.memory_dedup_service import MemoryDedupService
-            from app.schemas import MemoryCreate, BrainType, MemoryType, MemoryLevel
-            from app.memory_taxonomy import normalize_memory_type
+            from app.services import memory_curator
 
-            # Transient memories arriving over the voice tunnel used to lose
-            # their horizon here and become permanent. Accepted as an optional
-            # field so older callers that omit it behave exactly as before.
-            try:
-                _ttl = inp.get("ttl_days")
-                _ttl = int(_ttl) if _ttl not in (None, "") else None
-            except (TypeError, ValueError):
-                _ttl = None
-
-            memory_data = MemoryCreate(
-                content=content,
-                summary=content[:100],
-                brain_type=BrainType(brain_type),
-                category=category,
-                memory_type=MemoryType(
-                    normalize_memory_type(inp.get("memory_type") or "fact")
-                ),
-                importance=importance,
-                confidence=float(inp.get("confidence") or 0.9),
-                memory_level=MemoryLevel.EPISODIC,
-                emotional_salience=0.5,
-                source_type="agent_tool",
-                expires_at=(
-                    datetime.utcnow() + timedelta(days=_ttl) if _ttl else None
-                ),
-            )
-            
             async with async_session_maker() as db:
-                # Fetch user's API key for embedding
-                _ukey = None
-                try:
-                    from sqlalchemy import select as _sel
-                    from app.db import AgentConfig
-                    _r = await db.execute(_sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == self._current_user_id))
-                    _ukey = _r.scalar_one_or_none()
-                except Exception:
-                    pass
-                dedup = MemoryDedupService(db, api_key=_ukey)
-                memory, action = await dedup.smart_create_memory(
-                    new_memory=memory_data,
-                    user_id=self._current_user_id,
-                    # This tool is only reached because something asked for the
-                    # fact to be remembered, so the user-chosen-secret tier
-                    # applies (a locker passphrase, a garage door code). Cards,
-                    # government ids and API keys are refused here regardless.
-                    explicit_save=True,
+                result = await memory_curator.instruct_global(
+                    db, self._current_user_id,
+                    f"Remember this: {content}",
+                    api_key=await self._tenant_api_key(db),
                 )
 
-            if memory is None:
-                # The write gate refused it. Say so plainly rather than raising:
-                # the model reads this string, and "rejected:sensitive_secret"
-                # tells it not to retry with the same content.
-                return f"Memory not stored ({action}). Nothing was written."
-
-            return f"Memory {action}: {memory.id} — {memory.content[:80]}"
+            if result["applied"]:
+                where = ", ".join(result.get("changed_files") or [])
+                return f"Remembered ({result['applied']} change) in {where}."
+            # Say WHY plainly: the model reads this string, and "that is a
+            # one-off request, not a durable fact" tells it not to retry.
+            if result.get("rejected"):
+                return (
+                    "Not stored. " + "; ".join(str(r) for r in result["rejected"])[:400]
+                )
+            return "Nothing to store — the memory files already cover that."
 
         except Exception as exc:
             logger.exception("memory_store failed")
             return f"ERROR: {exc}"
 
+    async def _tenant_api_key(self, db) -> Optional[str]:
+        """The tenant's own OpenAI key, so a writer call bills them."""
+        try:
+            from sqlalchemy import select as _sel
+
+            from app.db import AgentConfig
+
+            return (await db.execute(
+                _sel(AgentConfig.openai_api_key).where(
+                    AgentConfig.user_id == self._current_user_id
+                )
+            )).scalar_one_or_none()
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
-    # 6b. memory_delete
+    # 6b. memory_delete — "forget X" (v3 §2.1.3)
+    #
+    # There are no memory ids in the product any more, so the round-8 shape
+    # (find an id with memory_search, pass it here) names nothing that
+    # exists. "Forget X" is a removal INSTRUCTION, routed through the same
+    # writer: it finds the bullet, removes it, and writes the change line the
+    # user will see in their memory log.
     # ------------------------------------------------------------------
     async def _tool_memory_delete(self, inp: Dict[str, Any]) -> str:
-        """A6-6: 'forget X' had no executable path — memory_delete was in
-        the memory-intent tool set with no definition or handler. Wired to
-        MemoryService.delete_memory (soft delete + audit event)."""
-        memory_id = inp.get("memory_id", "")
-
-        if not memory_id:
-            return "ERROR: memory_id is required"
+        # `content` is the v3 field; `memory_id` is accepted so a model
+        # working from a stale tool list gets an answer instead of an error.
+        what = (inp.get("content") or inp.get("memory_id") or "").strip()
+        if not what:
+            return "ERROR: content is required — say WHAT to forget"
 
         try:
             from app.db.database import async_session_maker
-            from app.services.memory_service import MemoryService
+            from app.services import memory_curator
 
             async with async_session_maker() as db:
-                svc = MemoryService(db)
-                deleted = await svc.delete_memory(
-                    memory_id=memory_id,
-                    user_id=self._current_user_id,
+                result = await memory_curator.instruct_global(
+                    db, self._current_user_id,
+                    f"Forget this — remove it from the memory files: {what}",
+                    api_key=await self._tenant_api_key(db),
                 )
 
-            if deleted:
-                return f"Memory {memory_id} deleted."
-            return f"ERROR: memory {memory_id} not found."
+            if result["applied"]:
+                where = ", ".join(result.get("changed_files") or [])
+                return f"Forgotten ({result['applied']} change) in {where}."
+            return (
+                "Nothing was removed — no memory file holds that. "
+                "Use memory_search to see what is stored."
+            )
 
         except Exception as exc:
             logger.exception("memory_delete failed")

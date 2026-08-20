@@ -192,48 +192,17 @@ class RetrievalFeedback:
         used_memories: List[Dict[str, Any]],
     ) -> List[str]:
         """
-        Reinforce the memories the assistant response actually cited.
+        v3: a NO-OP that returns [].
 
-        Returns the ids that were passed to DecayService (not the ids that
-        actually moved — the 1-hour cooldown may no-op some of them).
-        Never raises: reinforcement is a quality signal, not turn-critical.
+        It reinforced the rows the assistant cited, through
+        `DecayService.reinforce_memory`. Both the rows and the decay engine
+        are retired (docs/memory/rebuild-2026-08-v3.md §1.1), and nothing
+        feeds this function any more — sentence retrieval is gone, so
+        `used_memories` is always empty at every call site. Kept as a stub
+        rather than deleted because `app/api/feedback.py` still routes to
+        this service; the honest answer is "nothing was reinforced".
         """
-        if not used_memories:
-            return []
-
-        try:
-            from app.config import settings
-            if not bool(getattr(settings, "memory_reinforce_on_cite", True)):
-                return []
-        except Exception:
-            pass
-
-        reinforced: List[str] = []
-        try:
-            from app.services.decay_service import DecayService
-            decay_svc = DecayService(self.db)
-            for mem in used_memories[: self.REINFORCE_CITED_LIMIT]:
-                mem_id = mem.get("id") or ""
-                if not mem_id:
-                    continue
-                await decay_svc.reinforce_memory(
-                    memory_id=mem_id,
-                    user_id=user_id,
-                    access_context="cited",
-                    similarity_score=mem.get("similarity_score", 0.5),
-                    commit=False,
-                )
-                reinforced.append(mem_id)
-        except Exception as e:
-            logger.warning(f"[FEEDBACK] Cite reinforcement failed (non-fatal): {e}")
-            return reinforced
-
-        if reinforced:
-            logger.info(
-                f"[FEEDBACK] Reinforced {len(reinforced)} cited memories "
-                f"for user {user_id}"
-            )
-        return reinforced
+        return []
 
     # ------------------------------------------------------------------
     # 2. Analyze extraction quality

@@ -196,6 +196,10 @@ class SubAgentManager:
                     user_id=run.user_id,
                     telegram_chat_id=run.telegram_chat_id,
                     model_override=run.model,
+                    # "[Background Task: …] TASK: …" is machine-authored, and
+                    # a sub-agent turn is not a user-facing event. See
+                    # cron_service for the RCA.
+                    disable_post_processing=True,
                 ),
                 timeout=timeout_seconds,
             )

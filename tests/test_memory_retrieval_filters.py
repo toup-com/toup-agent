@@ -357,18 +357,12 @@ async def test_an_active_task_is_not_a_core_fact(session_maker):
     )
 
 
-async def test_active_task_writes_use_a_real_memory_type(session_maker):
-    """`semantic` is a MemoryLevel. The type column must hold a MemoryType."""
-    from app.memory_taxonomy import MemoryType
-
-    src = open(
-        os.path.join(os.path.dirname(__file__), "..", "app", "services", "active_task_service.py")
-    ).read()
-    assert 'memory_type="semantic"' not in src, (
-        "active_task_service still writes memory_type=\"semantic\", which is a "
-        "MemoryLevel value in a MemoryType column"
-    )
-    assert {t.value for t in MemoryType} >= {"task"}
+# `test_active_task_writes_use_a_real_memory_type` RETIRED with
+# `active_task_service` (v3 §1.1). It pinned that the active-task producer
+# did not write the MemoryLevel value "semantic" into the MemoryType column.
+# There is no active-task producer, no `working` file and no per-row type in
+# v3; the confusion it guarded against cannot recur because neither column
+# is on the write path.
 
 
 # ── 4. An expired memory must not come back ───────────────────────────
@@ -412,48 +406,56 @@ async def test_an_expired_memory_is_not_retrievable(session_maker):
 
 # ── 5. The ingest surface must apply the FULL gate ────────────────────
 
-def test_ingest_applies_the_full_gate_not_just_the_backstop():
-    """`/api/ingest/message` reaches `memories` through create_memory directly.
+def test_the_ingest_surface_extracts_nothing_at_all():
+    """STRONGER than the gate-ordering rule it replaces.
 
-    create_memory's own docstring is explicit that it applies ONLY the
-    never-store tier — cards, identity numbers, API keys — because the junk
-    rules need the conversation turn. This endpoint HAS the turn (it is the
-    request body), so it is the boundary that must apply them, and it did not:
-    every scaffolding / echo / quoted-content / inferred-interest rule was
-    skipped on a surface the frontend calls (`api.ts -> POST /ingest/message`)
-    with `extract_memories` defaulting to True.
+    This used to assert that BOTH `/ingest` extraction sites ran
+    `memory_gate_reason` before `create_memory`, and it checked the ORDER —
+    the right thing to check while those sites existed. They were the sixth
+    memory writer: the rule-based extractor plus a direct `create_memory`,
+    with `extract_memories` defaulting to True on a router mounted by both
+    entrypoints, still minting `MemoryCategory.ACTIVE_TASK` rows after that
+    category's whole surface was deleted.
 
-    Both extraction sites are checked — the bulk conversation path had neither
-    the gate nor the MemoryRejected catch, so one never-store value aborted a
-    whole import with a 500 instead of skipping a row.
+    v3 severed them (docs/memory/rebuild-2026-08-v3.md §2.1), so "the
+    extraction sites are gated" is no longer the invariant — "there are no
+    extraction sites" is, and it cannot be satisfied by a gate someone later
+    reorders or removes. The MESSAGE STORAGE half survives and is a live
+    control, pinned in tests/test_ingestion_routes_to_tenant.py.
+
+    Asserted on the AST, because the module now carries a long comment
+    explaining what was severed and a grep would match its own explanation.
     """
     import ast
     import pathlib
 
-    src = pathlib.Path("app/api/ingest.py").read_text()
-    tree = ast.parse(src)
+    tree = ast.parse(pathlib.Path("app/api/ingest.py").read_text())
 
-    gated = 0
+    forbidden = {"extract_memories", "create_memory", "smart_create_memory"}
+    offenders = []
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+        if not isinstance(node, ast.Call):
             continue
-        body = ast.unparse(node)
-        if "extractor.extract_memories" not in body:
-            continue
-        assert "memory_gate_reason" in body, (
-            f"{node.name} extracts memories and writes them without the full "
-            "gate — only create_memory's never-store backstop stands between "
-            "the regex extractor and the user's brain"
-        )
-        # The gate has to run BEFORE the row is built, not after.
-        assert body.index("memory_gate_reason") < body.index("create_memory"), (
-            f"{node.name} calls create_memory before consulting the gate"
-        )
-        gated += 1
+        func = node.func
+        name = getattr(func, "attr", None) or getattr(func, "id", None)
+        if name in forbidden:
+            offenders.append(f"line {node.lineno}: {name}()")
+        # Constructing the row model directly is the other way in.
+        if isinstance(func, ast.Name) and func.id == "Memory":
+            offenders.append(f"line {node.lineno}: Memory(...)")
+    assert not offenders, (
+        "app/api/ingest.py writes memory again — it was the SIXTH writer and "
+        "was severed in v3; the curator is the one writer: " + "; ".join(offenders)
+    )
 
-    assert gated >= 2, (
-        f"expected both ingest extraction sites to be gated, found {gated} — "
-        "if a site was removed, update this test deliberately"
+    # Anti-vacuity: the file must still BE the ingest route. Deleting the
+    # module would satisfy every assertion above.
+    handlers = {
+        n.name for n in ast.walk(tree)
+        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
+    }
+    assert {"ingest_message", "ingest_conversation"} <= handlers, (
+        "the ingest handlers are gone — this test now proves nothing"
     )
 
 
@@ -488,7 +490,15 @@ def test_every_memory_write_surface_screens_never_store_values():
                     f"MemoryService.{fn} writes content with no never-store screen"
                 )
         else:
-            assert "sensitive_content_reason" in fns["merge_into_memory"], (
-                "POST /memories/{id}/merge writes an unscreened query parameter "
-                "into memory content"
+            # v3 §4: `POST /memories/{id}/merge` — which wrote an unscreened
+            # QUERY PARAMETER into memory content — is gone with the row
+            # surface. Every v3 write is an ops batch, and the never-store
+            # screen moved to the one place a bullet can be born:
+            # `memory_file_ops.validate_ops` → `_secret_problem`. Asserted
+            # there rather than here, because "the route that had the hole
+            # no longer exists" is only half the guarantee.
+            assert "merge_into_memory" not in fns
+            ops = pathlib.Path("app/services/memory_file_ops.py").read_text()
+            assert "sensitive_content_reason" in ops, (
+                "the v3 ops engine writes bullets with no never-store screen"
             )

@@ -1,4 +1,11 @@
-"""Ingestion pipeline endpoints - process conversations and extract memories
+"""Ingestion endpoints — store a conversation. They do NOT write memory.
+
+v3 (docs/memory/rebuild-2026-08-v3.md §2.1): these two routes used to be the
+sixth writer, running the extractor's rule-based half and calling
+`MemoryService.create_memory` directly. Both extraction blocks are severed;
+what remains is conversation + message storage with embeddings, which is what
+an external ingestion client is actually importing. See the long note inside
+`ingest_message` for the callers checked and why the response shape is kept.
 
 TOPOLOGY (see app/api/tenant_proxy.py)
     Identical defect and identical fix to `app/api/documents.py`, which is
@@ -14,27 +21,21 @@ TOPOLOGY (see app/api/tenant_proxy.py)
     the handlers run against the tenant store the agent actually reads.
 """
 
-import json
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.db import get_db, Conversation, Message, Memory, Entity, EntityLink
+from app.db import get_db, Conversation, Message
 from app.schemas import (
     IngestMessageRequest, IngestConversationRequest, IngestResponse,
-    MemoryCreate, MemoryResponse, MemoryCategory, MemoryType
 )
 from app.api.auth import get_current_user
-from app.api.memories import memory_to_response
 from app.api.tenant_proxy import agent_proxy_info, proxy_to_agent
-from app.services import get_memory_extractor, get_embedding_service
-from app.services.memory_service import MemoryService
-from app.services.memory_gate import MemoryRejected, memory_gate_reason
+from app.services import get_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,10 @@ async def ingest_message(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Ingest a single conversation turn (user message + assistant response).
-    Extracts memories, entities, and creates embeddings.
+    """Store one conversation turn (user message + assistant response).
+
+    Memory is NOT written here — the curator writes it from the agent's own
+    turn. `memories_extracted` is always 0.
     """
     # Route to the tenant BEFORE touching this session — every table below is
     # AGENT_ONLY. No local fallback: a turn "ingested" into the platform DB is
@@ -67,10 +69,8 @@ async def ingest_message(
             )
         return JSONResponse(content=data)
 
-    memory_service = MemoryService(db)
-    extractor = get_memory_extractor()
     embedding_service = get_embedding_service()
-    
+
     # Get or create conversation
     conversation_id = request.conversation_id
     if conversation_id:
@@ -121,100 +121,42 @@ async def ingest_message(
     conversation.message_count += 2
     await db.flush()
     
-    memories_created = []
-    entities_created = 0
-    
-    if request.extract_memories:
-        # Extract memories from the conversation turn
-        extracted = extractor.extract_memories(
-            request.user_message,
-            request.assistant_response
-        )
-        
-        for ext_memory in extracted:
-            # FULL gate, not just the never-store backstop.
-            #
-            # This route reaches `memories` through create_memory directly, so
-            # it was screened only by that function's never-store tier — cards,
-            # identity numbers, API keys. Every junk rule (scaffolding, echo,
-            # quoted content, inferred interest, unsupported claim, transient
-            # horizon) was skipped, on a surface the frontend calls
-            # (`api.ts -> POST /ingest/message`) with `extract_memories`
-            # defaulting to True.
-            #
-            # The provenance rules need the conversation turn, which is exactly
-            # what this endpoint already has in the request — so unlike the
-            # storage backstop in create_memory, the full gate CAN be applied
-            # here, and this is the boundary that should apply it.
-            gate_reason = memory_gate_reason(
-                ext_memory.content,
-                user_message=request.user_message,
-                assistant_response=request.assistant_response,
-            )
-            if gate_reason:
-                logger.info(
-                    "[memory_gate] ingest refused (%s) for user=%s",
-                    gate_reason, str(current_user.id)[:8],
-                )
-                continue
+    # ── NO EXTRACTION HERE (v3 §2.1) ─────────────────────────────────
+    #
+    # This route was the SIXTH writer, and it survived the convergence pass
+    # because it does not import anything the retirement grep looked for: it
+    # calls the extractor's RULE-BASED half (`extract_memories`, regexes, no
+    # LLM) and writes through `MemoryService.create_memory` directly. It was
+    # still minting `MemoryCategory.ACTIVE_TASK` rows — the category whose
+    # entire surface v3 deleted — with `extract_memories` defaulting to True
+    # on a route mounted by BOTH agent_main and platform_main.
+    #
+    # It cannot feed a memory FILE, so this was never a correctness bug in
+    # the product; it was a truth bug in the invariant. "Every producer
+    # converges on the curator" has to be true of every producer, and
+    # `tests/test_curator_producers.py` now walks the AST of app/ so this
+    # class cannot hide again.
+    #
+    # Callers checked before severing: `frontend/src/store.ts`'s
+    # `ingestDemoMessage` (zero call sites — the demo helper it fed is gone)
+    # and `backend/app/scripts/demo_mode.py` (an operator script). No mobile
+    # caller, no production client.
+    #
+    # MESSAGE STORAGE STAYS. Same treatment as the REST /chat routes: this
+    # endpoint's other half — conversation + messages + embeddings — is
+    # genuinely useful and is what an external ingestion client is actually
+    # importing. `memories_extracted` is now always 0 and `memories` always
+    # empty; the response SHAPE is unchanged so an existing client does not
+    # break, it just stops being told about rows nothing can read.
 
-            # Create memory
-            memory_data = MemoryCreate(
-                content=ext_memory.content,
-                summary=ext_memory.summary,
-                category=ext_memory.category,
-                memory_type=ext_memory.memory_type,
-                importance=ext_memory.importance,
-                confidence=ext_memory.confidence,
-                tags=ext_memory.tags,
-                metadata=ext_memory.metadata,
-            )
-
-            try:
-                memory = await memory_service.create_memory(
-                    current_user.id,
-                    memory_data,
-                    source_message_id=user_msg.id
-                )
-            except MemoryRejected:
-                continue
-            memories_created.append(memory)
-            
-            # Create/link entities
-            for ent_data in ext_memory.entities:
-                # Handle both dict and ExtractedEntity objects
-                if hasattr(ent_data, 'name'):
-                    ent_name = ent_data.name
-                    ent_type = ent_data.entity_type
-                else:
-                    ent_name = ent_data["name"]
-                    ent_type = ent_data["type"]
-                    
-                entity = await _get_or_create_entity(
-                    db,
-                    current_user.id,
-                    ent_name,
-                    ent_type,
-                    embedding_service
-                )
-                
-                # Link entity to memory
-                link = EntityLink(
-                    memory_id=memory.id,
-                    entity_id=entity.id,
-                    role="mentioned"
-                )
-                db.add(link)
-                entities_created += 1
-    
     await db.commit()
     
     return IngestResponse(
         conversation_id=conversation_id,
         messages_ingested=2,
-        memories_extracted=len(memories_created),
-        entities_extracted=entities_created,
-        memories=[memory_to_response(m) for m in memories_created]
+        memories_extracted=0,
+        entities_extracted=0,
+        memories=[],
     )
 
 
@@ -224,9 +166,9 @@ async def ingest_conversation(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Ingest a full conversation with multiple messages.
-    Processes all messages and extracts memories.
+    """Store a full conversation with multiple messages.
+
+    Memory is NOT written here — see `ingest_message`.
     """
     proxy = await agent_proxy_info(current_user.id, db)
     if proxy:
@@ -241,10 +183,8 @@ async def ingest_conversation(
             )
         return JSONResponse(content=data)
 
-    memory_service = MemoryService(db)
-    extractor = get_memory_extractor()
     embedding_service = get_embedding_service()
-    
+
     # Create conversation
     conversation = Conversation(
         id=str(uuid.uuid4()),
@@ -255,10 +195,7 @@ async def ingest_conversation(
     db.add(conversation)
     await db.flush()
     
-    all_memories = []
-    total_entities = 0
-    
-    # Process messages in pairs (user + assistant)
+    # Process and store the messages. No extraction — see /ingest/message.
     messages_stored = []
     for msg_data in request.messages:
         msg = Message(
@@ -270,115 +207,22 @@ async def ingest_conversation(
         )
         db.add(msg)
         messages_stored.append(msg)
-    
+
     conversation.message_count = len(messages_stored)
     await db.flush()
-    
-    if request.extract_memories:
-        # Process pairs of user-assistant messages
-        for i in range(0, len(messages_stored) - 1, 2):
-            if i + 1 < len(messages_stored):
-                user_msg = messages_stored[i]
-                assistant_msg = messages_stored[i + 1]
-                
-                if user_msg.role == "user" and assistant_msg.role == "assistant":
-                    extracted = extractor.extract_memories(
-                        user_msg.content,
-                        assistant_msg.content
-                    )
-                    
-                    for ext_memory in extracted:
-                        # Same full gate as /ingest/message above. This bulk
-                        # path had neither the gate NOR the MemoryRejected
-                        # catch, so a never-store value here aborted the whole
-                        # conversation import with a 500 instead of skipping
-                        # one row.
-                        gate_reason = memory_gate_reason(
-                            ext_memory.content,
-                            user_message=user_msg.content,
-                            assistant_response=assistant_msg.content,
-                        )
-                        if gate_reason:
-                            logger.info(
-                                "[memory_gate] conversation ingest refused (%s) "
-                                "for user=%s", gate_reason, str(current_user.id)[:8],
-                            )
-                            continue
 
-                        memory_data = MemoryCreate(
-                            content=ext_memory.content,
-                            summary=ext_memory.summary,
-                            category=ext_memory.category,
-                            memory_type=ext_memory.memory_type,
-                            importance=ext_memory.importance,
-                            confidence=ext_memory.confidence,
-                            tags=ext_memory.tags,
-                            metadata=ext_memory.metadata,
-                        )
-
-                        memory = await memory_service.create_memory(
-                            current_user.id,
-                            memory_data,
-                            source_message_id=user_msg.id
-                        )
-                        all_memories.append(memory)
-                        
-                        for ent_data in ext_memory.entities:
-                            entity = await _get_or_create_entity(
-                                db,
-                                current_user.id,
-                                ent_data["name"],
-                                ent_data["type"],
-                                embedding_service
-                            )
-                            link = EntityLink(
-                                memory_id=memory.id,
-                                entity_id=entity.id,
-                                role="mentioned"
-                            )
-                            db.add(link)
-                            total_entities += 1
-    
     await db.commit()
     
     return IngestResponse(
         conversation_id=conversation.id,
         messages_ingested=len(messages_stored),
-        memories_extracted=len(all_memories),
-        entities_extracted=total_entities,
-        memories=[memory_to_response(m) for m in all_memories]
+        memories_extracted=0,
+        entities_extracted=0,
+        memories=[],
     )
 
-
-async def _get_or_create_entity(
-    db: AsyncSession,
-    user_id: str,
-    name: str,
-    entity_type: str,
-    embedding_service
-) -> Entity:
-    """Get existing entity or create new one"""
-    result = await db.execute(
-        select(Entity).where(
-            Entity.user_id == user_id,
-            Entity.name == name,
-            Entity.entity_type == entity_type
-        )
-    )
-    entity = result.scalar_one_or_none()
-    
-    if entity:
-        entity.mention_count += 1
-        entity.last_seen_at = datetime.utcnow()
-    else:
-        entity = Entity(
-            id=str(uuid.uuid4()),
-            user_id=user_id,
-            name=name,
-            entity_type=entity_type,
-            embedding_json=embedding_service.embed_to_json(name),
-        )
-        db.add(entity)
-    
-    await db.flush()
-    return entity
+# `_get_or_create_entity` was deleted with the extraction blocks: its only two
+# callers were the entity fan-out inside them. Entities and their links are
+# still written by the conversation path's own extractor
+# (`memory_service.store_entity_relationship`, MCP `entity_relationship_create`)
+# — this route never needed a second, private way to make one.

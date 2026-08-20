@@ -167,7 +167,9 @@ def platform_knowledge_diet(voice: bool = False) -> str:
         "## Decision rules — quick hints\n"
         "Your tool schemas carry the detail; these map intent → tool.\n"
         "- 'remember <fact>' → `memory_store`; 'what do you know about X' → "
-        "`memory_search` (turn-relevant memories are already in `# User Brain`)\n"
+        "open the file the `# User Brain` index names with `memory_read_file`, "
+        "else `memory_search` (Profile, Current context and Learned are "
+        "already in `# User Brain`)\n"
         "- 'make me a <tool/app>' → app_builder skill; afterwards offer "
         "`[[open_app:<slug>]]`\n"
         + _DIET_SEARCH_RULE(voice) +

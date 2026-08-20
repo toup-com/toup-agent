@@ -215,83 +215,12 @@ def test_recurring_arrangements_are_not_treated_as_transient():
         assert describes_recurring_arrangement(c) is False, c
 
 
-@pytest.mark.asyncio
-async def test_expiry_sweep_archives_but_never_deletes():
-    """The sweep sets is_active=False. The row and its content survive."""
-    from app.db.models import Memory, User
-    from app.services.memory_expiry import expire_stale_memories
-
-    user_id = str(uuid.uuid4())
-    stale_id, fresh_id, permanent_id = (str(uuid.uuid4()) for _ in range(3))
-
-    engine, Session = await _memory_session()
-    async with Session() as db:
-        db.add(User(id=user_id, email=f"ttl-{user_id[:8]}@example.com", hashed_password="x"))
-        db.add(Memory(
-            id=stale_id, user_id=user_id, content="remind me to eat tea in 2 minutes",
-            category="active_task", memory_type="task", brain_type="user",
-            expires_at=datetime.utcnow() - timedelta(days=1),
-        ))
-        db.add(Memory(
-            id=fresh_id, user_id=user_id, content="the deploy is still running",
-            category="active_task", memory_type="task", brain_type="user",
-            expires_at=datetime.utcnow() + timedelta(days=3),
-        ))
-        db.add(Memory(
-            id=permanent_id, user_id=user_id, content="the user's daughter is called Mira",
-            category="people", memory_type="fact", brain_type="user",
-            expires_at=None,
-        ))
-        await db.commit()
-
-        archived = await expire_stale_memories(db, user_id)
-        await db.commit()
-
-        assert [m.id for m in archived] == [stale_id]
-
-        stale = await db.get(Memory, stale_id)
-        fresh = await db.get(Memory, fresh_id)
-        permanent = await db.get(Memory, permanent_id)
-
-        # Archived, NOT deleted — content intact and still queryable.
-        assert stale.is_active is False
-        assert stale.is_deleted is False
-        assert stale.content == "remind me to eat tea in 2 minutes"
-
-        assert fresh.is_active is True
-        assert permanent.is_active is True
-
-    await engine.dispose()
+# RETIRED with memory v3: `test_expiry_sweep_archives_but_never_deletes`.
+# `memory_expiry.expire_stale_memories` is deleted. There is no `expires_at` on the write path, so there is nothing to sweep and no archive-vs-delete choice to pin.
 
 
-@pytest.mark.asyncio
-async def test_expiry_sweep_is_tenant_scoped():
-    """The sweep must never touch another user's memories."""
-    from app.db.models import Memory, User
-    from app.services.memory_expiry import expire_stale_memories
-
-    mine, theirs = str(uuid.uuid4()), str(uuid.uuid4())
-    their_memory_id = str(uuid.uuid4())
-
-    engine, Session = await _memory_session()
-    async with Session() as db:
-        for uid in (mine, theirs):
-            db.add(User(id=uid, email=f"iso-{uid[:8]}@example.com", hashed_password="x"))
-        db.add(Memory(
-            id=their_memory_id, user_id=theirs, content="another tenant's expired memory",
-            category="active_task", memory_type="task", brain_type="user",
-            expires_at=datetime.utcnow() - timedelta(days=5),
-        ))
-        await db.commit()
-
-        archived = await expire_stale_memories(db, mine)
-        await db.commit()
-
-        assert archived == []
-        their_memory = await db.get(Memory, their_memory_id)
-        assert their_memory.is_active is True, "cross-tenant write!"
-
-    await engine.dispose()
+# RETIRED with memory v3: `test_expiry_sweep_is_tenant_scoped`.
+# Same subject.
 
 
 # ── 3. Rendering: no raw triples ──────────────────────────────────────
@@ -358,50 +287,12 @@ def test_mobile_card_renders_content_first():
 
 # ── 4. Reinforcement must not neutralise decay ────────────────────────
 
-def test_reinforcement_does_not_inflate_consolidation_count():
-    """consolidation_count is a decay-resistance multiplier worth up to 2x.
-
-    Incrementing it on every RESTATEMENT (rather than on real consolidation)
-    made frequently-mentioned throwaways the most decay-resistant rows in the
-    brain — production had counts as high as 94.
-
-    Scoped to the two reinforce functions on purpose: `merge_memory` and
-    `consolidation_service` increment it legitimately, because a merge really
-    is a consolidation.
-    """
-    import inspect
-    import re
-
-    from app.services.memory_dedup_service import MemoryDedupService
-    from app.services.memory_service import MemoryService
-
-    # Match an actual MUTATION of the field, not a mention of it — the reinforce
-    # paths legitimately READ consolidation_count when building audit events.
-    mutation = re.compile(
-        r"\.consolidation_count\s*(?:\+=|=(?!=))", re.MULTILINE
-    )
-
-    for fn in (
-        MemoryDedupService._reinforce_existing_memory,
-        MemoryService._reinforce_memory,
-    ):
-        src = inspect.getsource(fn)
-        assert not mutation.search(src), (
-            f"{fn.__qualname__} mutates consolidation_count — this is a "
-            f"decay-resistance multiplier and must only change on real "
-            f"consolidation, not on every restatement"
-        )
+# RETIRED with memory v3: `test_reinforcement_does_not_inflate_consolidation_count`.
+# `_reinforce_existing_memory` and `consolidation_count` are dedup-service state. Both deleted.
 
 
-def test_importance_is_not_a_one_way_ratchet():
-    import pathlib
-
-    for path in (
-        "app/services/memory_dedup_service.py",
-        "app/services/memory_service.py",
-    ):
-        src = pathlib.Path(path).read_text()
-        assert "0.7 * _old_importance + 0.3 * new_data.importance" in src, path
+# RETIRED with memory v3: `test_importance_is_not_a_one_way_ratchet`.
+# `importance` is engine metadata; v3 ships no such field to any client and ranks nothing by it.
 
 
 # ── 5. Agent brain ────────────────────────────────────────────────────
@@ -536,24 +427,36 @@ def test_query_classifier_emits_only_canonical_categories():
         assert not stale, f"{probe!r} -> retired categories {stale}"
 
 
-def test_portrait_categories_are_canonical():
-    """PORTRAIT_CATEGORIES was a SIXTH copy — it listed retired `projects`."""
-    from app.memory_taxonomy import MemoryCategory
-    from app.services.user_portrait_service import PORTRAIT_CATEGORIES
-
-    canonical = {c.value for c in MemoryCategory}
-    stale = [c for c in PORTRAIT_CATEGORIES if c not in canonical]
-    assert not stale, f"portrait references retired categories: {stale}"
+# RETIRED with memory v3: `test_portrait_categories_are_canonical`.
+# `user_portrait_service.PORTRAIT_CATEGORIES` is deleted with the portrait block (v3 §3.1).
 
 
-def test_agent_runner_normalizes_classifier_categories_defensively():
-    """Belt and braces: even a stale list must cost recall, not correctness."""
+def test_the_prompt_builder_no_longer_filters_retrieval_by_category():
+    """The defensive normalisation this used to pin protected a real
+    hazard: `hybrid_search` ANDs `Memory.category.in_(categories)` onto
+    every strategy, so ONE stale value returned zero memories for a whole
+    class of question rather than degrading.
+
+    Memory v3 (§3.1) removes the query-classified retrieval fan-out from
+    `_build_system_prompt` entirely — the memory block is three files, an
+    index and a lexical pick over file bodies, and no category filter
+    exists to be stale. Pinned as an ABSENCE so the hazard cannot return
+    without its guard: a future category filter in the prompt builder must
+    normalise, and this test is where that is recorded.
+
+    `canonical_category_for_filter` remains the right tool for any READ
+    filter elsewhere — see the tests above it in this file."""
     import inspect
 
     from app.agent.agent_runner import AgentRunner
 
-    src = inspect.getsource(AgentRunner._build_system_prompt)
-    assert "normalize_category(c) for c in _raw_categories" in src
+    src = "\n".join(
+        line for line in inspect.getsource(AgentRunner._build_system_prompt).splitlines()
+        if not line.strip().startswith("#")   # the comment naming what it retired
+    )
+    assert "hybrid_search" not in src
+    assert "classify_query(" not in src
+    assert "categories=search_categories" not in src
 
 
 # ── 5b. Relationship rows read as sentences, not predicate-ese ────────
@@ -674,172 +577,26 @@ def test_only_verbs_are_conjugated():
         assert not re.search(r"\b(?:allergics|artists|lents|peoples)\b", rendered), rendered
 
 
-def test_forgotten_relationships_stay_forgotten_across_the_phrasing_change():
-    """The soft-delete guard matches content EXACTLY, and the template moved.
-
-    Rows forgotten before humanize_relationship carry the raw predicate form.
-    If the guard only checked the new prose form, every one of them would be
-    resurrected on the next mention — and there is no restore route, so the
-    user cannot undo it a second time.
-    """
-    import inspect
-
-    from app.services.memory_service import MemoryService
-
-    src = inspect.getsource(MemoryService.store_entity_relationship)
-    assert "legacy_content" in src, (
-        "the pre-humanize phrasing is no longer checked against soft-deletes"
-    )
-    guard = inspect.getsource(MemoryService._relationship_was_forgotten)
-    assert "in_(candidates)" in guard
+# RETIRED with memory v3: `test_forgotten_relationships_stay_forgotten_across_the_phrasing_change`.
+# The relationship MIRROR row is deleted (v3 §1.1); `_relationship_was_forgotten` guarded its resurrection. The graph edge it protected is unaffected and had no such resurrection path.
 
 
 # ── 5c. Expiry leases respect explicit user intent ────────────────────
 
-async def test_user_keep_clears_the_expiry_lease():
-    """Tapping Keep must actually save the memory.
-
-    Reinforcement moved strength and last_reinforced_at but never expires_at,
-    so a memory the user explicitly kept was still archived by the sweep —
-    and there is no restore route.
-
-    This test EXECUTES the path. The previous version only asserted the source
-    text contained the right lines, which is why it stayed green while the
-    branch raised `NameError: logger` on every real Keep: decay_service.py
-    called logger.info() in a module that never imported logging. A source
-    assertion cannot catch an undefined name — only running the code can.
-    """
-    from app.db.models.memory import Memory
-    from app.services.decay_service import DecayService
-
-    engine, Session = await _memory_session()
-    try:
-        async with Session() as db:
-            mem = Memory(
-                id="keep-1",
-                user_id="u-keep",
-                content="The user wants a daily Gmail briefing at 11:49.",
-                category="active_task",
-                brain_type="user",
-                memory_type="fact",
-                memory_level="episodic",
-                importance=0.6,
-                confidence=0.8,
-                strength=1.0,
-                # Recently reinforced ON PURPOSE: Keep must win over the
-                # 1-hour cooldown early-return, not be skipped by it.
-                last_reinforced_at=datetime.utcnow() - timedelta(minutes=5),
-                expires_at=datetime.utcnow() + timedelta(days=3),
-            )
-            db.add(mem)
-            await db.flush()
-
-            svc = DecayService(db)
-            returned = await svc.reinforce_memory(
-                "keep-1", "u-keep", access_context="user_reinforce"
-            )
-
-            assert returned is not None, "Keep could not load the memory"
-            assert mem.expires_at is None, (
-                "Keep must clear the expiry lease; the memory is still on a "
-                "countdown and the sweep will archive it anyway."
-            )
-    finally:
-        await engine.dispose()
+# RETIRED with memory v3: `test_user_keep_clears_the_expiry_lease`.
+# The Keep button and the lease are both gone: a file body has no per-bullet expiry, and the Memory page's row actions were deleted in §5.1.
 
 
-async def test_recurring_arrangements_survive_the_active_task_archiver():
-    """decay_expired_tasks archives on category alone — it must not eat routines.
-
-    The taxonomy migration remapped legacy `schedule` onto `active_task` and
-    deliberately left recurring arrangements without an expires_at. That
-    exemption is worthless unless THIS archiver honours it too: a standing
-    "daily Gmail briefing" has no reinforcement of its own (the routine fires,
-    not the memory), so the plain age rule archived four of the founder's real
-    routines on the day of the rollout.
-    """
-    from app.db.models.memory import Memory
-    from app.services.active_task_service import decay_expired_tasks
-
-    old = datetime.utcnow() - timedelta(days=30)
-    engine, Session = await _memory_session()
-    try:
-        async with Session() as db:
-            recurring = Memory(
-                id="rec-1", user_id="u-rec",
-                content="The user wants a daily email routine at 1:43 PM to "
-                        "summarize the last five Gmail messages.",
-                category="active_task", brain_type="user", memory_type="fact",
-                memory_level="episodic", importance=0.6, confidence=0.8,
-                strength=1.0, created_at=old, last_reinforced_at=old,
-                expires_at=None,
-            )
-            one_off = Memory(
-                id="task-1", user_id="u-rec",
-                content="The user asked to be reminded to call their brother.",
-                category="active_task", brain_type="user", memory_type="fact",
-                memory_level="episodic", importance=0.4, confidence=0.8,
-                strength=1.0, created_at=old, last_reinforced_at=old,
-                expires_at=None,
-            )
-            leased = Memory(
-                id="task-2", user_id="u-rec",
-                content="The user is comparing project-management tools.",
-                category="active_task", brain_type="user", memory_type="fact",
-                memory_level="episodic", importance=0.4, confidence=0.8,
-                strength=1.0, created_at=old, last_reinforced_at=old,
-                # Old enough for the age rule, but the lease has NOT run out.
-                expires_at=datetime.utcnow() + timedelta(days=2),
-            )
-            db.add_all([recurring, one_off, leased])
-            await db.flush()
-
-            archived = await decay_expired_tasks(db, "u-rec")
-
-            assert recurring.is_active is True, (
-                "a standing daily routine was archived by the active-task TTL"
-            )
-            assert leased.is_active is True, (
-                "expires_at is authoritative; archiving ahead of it overrules "
-                "the sweep, the reinforce path and the Keep button"
-            )
-            assert one_off.is_active is False, (
-                "a genuinely stale one-off task should still be archived"
-            )
-            assert archived == 1
-    finally:
-        await engine.dispose()
+# RETIRED with memory v3: `test_recurring_arrangements_survive_the_active_task_archiver`.
+# `active_task_service`'s archiver is deleted. A standing arrangement is ONE line in you/profile, and the curator's durability rules say so; pinned in test_memory_curator.py.
 
 
-def test_durable_restatement_promotes_a_transient_memory():
-    """Transient -> durable must clear the lease.
-
-    Dedup returns the incumbent WITHOUT creating a new row, so the reinforce
-    path is the only place the promotion can happen.
-    """
-    import inspect
-
-    from app.services.memory_dedup_service import MemoryDedupService
-    from app.services.memory_service import MemoryService
-
-    for fn in (
-        MemoryDedupService._reinforce_existing_memory,
-        MemoryService._reinforce_memory,
-    ):
-        src = inspect.getsource(fn)
-        assert "if new_expiry is None:" in src or "if _new_expiry is None:" in src, (
-            f"{fn.__qualname__} keeps a stale lease on a durable restatement"
-        )
+# RETIRED with memory v3: `test_durable_restatement_promotes_a_transient_memory`.
+# The promote-on-restatement rule lived in `_reinforce_existing_memory` and is exactly the behaviour that made a repeatedly-played track immortal. Deleted with the service.
 
 
-def test_active_task_reinforcement_renews_the_expiry_lease():
-    """Two TTL mechanisms cover these rows; both clocks must move together."""
-    import inspect
-
-    from app.services import active_task_service
-
-    src = inspect.getsource(active_task_service.store_active_task)
-    assert "mem.expires_at = datetime.utcnow() + timedelta(days=ACTIVE_TASK_TTL_DAYS)" in src
+# RETIRED with memory v3: `test_active_task_reinforcement_renews_the_expiry_lease`.
+# Same subject.
 
 
 # ── 6. Write path reaches the tenant ──────────────────────────────────
@@ -862,15 +619,18 @@ def test_memory_writes_never_silently_fall_back_to_platform_db():
 
 
 def test_write_routes_proxy_to_the_tenant():
+    """Same invariant, v3's write surface. `create/update/reinforce` were
+    row routes and are gone (rebuild-2026-08-v3 §4); the writes that
+    remain are the two instruct boxes, file delete and forget-everything."""
     import inspect
 
     from app.api import memories as memories_api
 
     for fn in (
-        memories_api.update_memory,
-        memories_api.delete_memory,
-        memories_api.create_memory,
-        memories_api.reinforce_memory,
+        memories_api.instruct_memory,
+        memories_api.instruct_memory_file,
+        memories_api.delete_memory_file,
+        memories_api.forget_all_memories,
     ):
         src = inspect.getsource(fn)
         assert "_proxy_memories_write" in src, f"{fn.__name__} does not proxy writes"
@@ -878,66 +638,16 @@ def test_write_routes_proxy_to_the_tenant():
 
 # ── 7. D-mem-B: MCP memory writes must reach the tenant ───────────────
 
-def test_mcp_memory_writes_proxy_to_the_tenant():
-    """D-mem-B (2026-07-29 remediation tracker).
-
-    `memory_update` on an id the agent had just been handed returned
-    "Memory not found". Root cause: the MCP tools run on the PLATFORM and were
-    bound to the platform session, but `memories` is AGENT_ONLY — the row is
-    real, it is simply in the tenant's database. #375 fixed this class for the
-    REST routes and missed this surface.
-
-    Parsed from source: importing mcp_server needs fastmcp, which is not
-    installed in every environment.
-    """
-    import ast
-    import pathlib
-
-    src = pathlib.Path("app/mcp_server.py").read_text()
-    tree = ast.parse(src)
-
-    names = {
-        n.name: n
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-    }
-    assert "_proxy_memory_write_to_tenant" in names
-
-    # memory_create was missing from this loop, and so was the proxy: the
-    # agent's own memory_create tool wrote tenant-private content into the
-    # SHARED platform DB, where its owner can never read it back. Worse after
-    # #377 — update and delete proxy to a tenant that has no such row, so the
-    # stranded row is also un-editable and un-deletable.
-    for tool in ("memory_create", "memory_update", "memory_delete"):
-        body = ast.unparse(names[tool])
-        assert "_proxy_memory_write_to_tenant" in body, (
-            f"{tool} does not route to the tenant — it will 404 on every real id"
-        )
-        # The tenant must be consulted BEFORE the local session, or the
-        # platform's empty table answers first and we are back to the bug.
-        assert body.index("_proxy_memory_write_to_tenant") < body.index(
-            "MemoryService(db)"
-        ), f"{tool} consults the platform session before the tenant"
-
-    # memory_list is a READ, so it may fall back to the platform session — but
-    # it has to ASK the tenant first. Listing the platform DB does not error,
-    # it returns an empty list, so an agent checking what it already knows
-    # about someone is told "nothing" while their memories sit in the tenant.
-    assert "_proxy_memory_list_from_tenant" in names
-    list_body = ast.unparse(names["memory_list"])
-    assert "_proxy_memory_list_from_tenant" in list_body, (
-        "memory_list reads the platform DB and will report zero memories"
-    )
-    assert list_body.index("_proxy_memory_list_from_tenant") < list_body.index(
-        "MemoryService(db)"
-    ), "memory_list consults the platform session before the tenant"
+# RETIRED with memory v3: `test_mcp_memory_writes_proxy_to_the_tenant`.
+# Its subject was `memory_create`/`update`/`delete`/`list`, all deleted. The v3 replacement's proxying is pinned behaviourally in tests/test_mcp_memory_search_tenant.py.
 
 
 def test_remaining_mcp_tools_on_agent_only_tables_are_known():
     """Guard rail: this surface is not fully proxied yet, and that is tracked.
 
-    memory_create/update/delete/list now route to the tenant. The rest of the
-    MCP tools still run against the platform session while their tables are
+    v3 replaced the five row tools with three file tools
+    (`memory_search`, `memory_files`, `memory_remember`), all proxied. The
+    rest still run against the platform session while their tables are
     AGENT_ONLY — `entities`, `entity_relationships`, `conversations`. Fixing
     those needs agent-side REST routes that do not exist yet (there is no
     app/api/entities.py to proxy to), so it is a separate change.
@@ -958,8 +668,9 @@ def test_remaining_mcp_tools_on_agent_only_tables_are_known():
         if not any("mcp.tool" in ast.unparse(d) for d in n.decorator_list):
             continue
         body = ast.unparse(n)
-        if "async_session_maker()" in body and "_from_tenant" not in body \
-                and "_to_tenant" not in body:
+        proxied = ("_from_tenant", "_to_tenant", "_proxy_files_read",
+                   "_proxy_memories_write")
+        if "async_session_maker()" in body and not any(m in body for m in proxied):
             unproxied.add(n.name)
 
     # memory_search left this set on 2026-08-05. The old entry read "has a
@@ -1117,81 +828,15 @@ def test_relationship_category_describes_the_object_not_the_person():
     assert c(None, None) == "knowledge"
     assert c("wharrgarbl", "flimflam") == "knowledge"
 
-
-def test_recategorize_is_not_in_the_default_repair_run():
-    """Its logic is right; bulk-applying it to legacy rows makes data worse.
-
-    It depends on entity TYPES, and those are unreliable upstream — "Better
-    Call Saul" is typed `topic`, songs are typed `project`. Measured on the
-    founder's tenant: ~5 rows improved, ~8 degraded. And no subset of type
-    pairs separates them, because the same person/project pair produces both
-    "User owns Toup" (correctly -> work) and "Drake artist of 0-100"
-    (wrongly -> work, should be media).
-    """
-    import importlib
-
-    mod = importlib.import_module("scripts.repair_memory_regressions")
-
-    assert "recategorize" in mod.STEPS, "keep it reachable via --only"
-    assert "recategorize" not in mod.DEFAULT_STEPS, (
-        "recategorize stays opt-in: it rewrites the category of every "
-        "relationship row, so it should be run deliberately after `retype` and "
-        "after reading the dry-run, not as a side effect of a routine repair"
-    )
-    assert set(mod.DEFAULT_STEPS) == {
-        "retype", "restore", "humanize", "reminders",
-    }
-    # `retype` supplies the evidence `recategorize` reads, so it must come
-    # first in a default run — recategorising against stale types is exactly
-    # what made the first attempt degrade 8 rows.
-    assert mod.DEFAULT_STEPS.index("retype") == 0
-
-
-# ── 9. Category breakdown (the filter bar's data source) ───────────────
-
-def test_breakdown_route_is_declared_before_the_id_route():
-    """`/memories/breakdown` must not be swallowed by `/memories/{memory_id}`.
-
-    FastAPI matches in declaration order, so a path param declared first would
-    turn every breakdown request into a lookup for a memory whose id is
-    literally "breakdown" — a 404, or worse a 500 from the uuid parse. The
-    file already carries this hazard for `/search`; the note there is why.
-    """
-    import inspect
-    import re
-
-    from app.api import memories as memories_api
-
-    src = inspect.getsource(memories_api)
-    order = re.findall(r'@router\.get\("(/[^"]*)"', src)
-
-    assert "/breakdown" in order, "the breakdown route is not registered"
-    assert order.index("/breakdown") < order.index("/{memory_id}"), (
-        "/breakdown is declared after /{memory_id} and will be shadowed"
-    )
-
-
-def test_breakdown_normalizes_legacy_categories_before_counting():
-    """Counts must fold legacy values, or the filter bar shows both.
-
-    A tenant mid-migration can hold `schedule` and `active_task` at once. Two
-    chips for one category — with the counts split between them — is worse than
-    no chip at all, because tapping either shows a partial list.
-    """
-    import inspect
-
-    from app.api import memories as memories_api
-
-    src = inspect.getsource(memories_api.memory_breakdown)
-    assert "normalize_category" in src, (
-        "breakdown counts raw category values and will double-count legacy rows"
-    )
-    # Counting must exclude what the user cannot see, or the chips will not add
-    # up to the "N remembered" header.
-    assert "Memory.is_deleted == False" in src
-    assert "Memory.is_active == True" in src
-    # And it must reach the tenant: `memories` is AGENT_ONLY.
-    assert "_proxy_memories" in src
+# RETIRED with the row product (memory v3 §4):
+#   test_breakdown_route_is_declared_before_the_id_route
+#   test_breakdown_normalizes_legacy_categories_before_counting
+# `GET /api/memories/breakdown` counted rows per taxonomy category for a
+# filter bar neither client has called since round 7, and both the route
+# and the `/{memory_id}` capture it had to precede are gone. The ordering
+# invariant they protected lives on in tests/test_memories_rest_tenant_
+# proxy.py::test_no_literal_route_is_shadowed_by_the_slug_capture, which
+# states it for every literal route rather than for one.
 
 
 # ── 10. Entity typing (the prerequisite for correct categories) ────────
@@ -1217,10 +862,14 @@ def test_entity_type_vocabulary_is_generated_not_hand_listed():
     for media in ("show", "movie", "music", "book"):
         assert media in block, f"{media} missing — shows/songs mistype again"
 
-    src = pathlib.Path("app/services/memory_extractor.py").read_text()
-    assert "{entity_type_block}" in src, "prompt no longer interpolates the block"
-    assert "person, organization, place, project, technology, event, topic, tool" \
-        not in src, "the hardcoded 8-type list is back"
+    # The SOURCE half of this test retired with the extractor prompt it
+    # pinned (`{entity_type_block}` was interpolated into
+    # `extract_relationships_with_llm`, deleted in v3 §2.1). The generated
+    # vocabulary itself survives and still has a consumer: it types the
+    # entities the knowledge graph stores, which MCP `entity_search` /
+    # `graph_traverse` and app/api/graph.py read. What is asserted above —
+    # every type reaches the block, media types included — is the half that
+    # kept "Better Call Saul" from being typed `topic`.
 
 
 def test_entity_keyword_keys_are_all_canonical_types():

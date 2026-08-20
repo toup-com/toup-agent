@@ -14,39 +14,11 @@ from sqlalchemy import select, func, and_, case
 
 from app.db import get_db, Memory
 from app.api.auth import get_current_user
-from app.api.memories import memory_to_response
-from app.schemas import MemoryResponse
-from app.services.decay_service import get_decay_service
-from app.services.consolidation_service import get_consolidation_service
 
 router = APIRouter(prefix="/admin", tags=["Admin — System"])
 
 
 # ============ Response Models ============
-
-class DecayResult(BaseModel):
-    memories_processed: int
-    memories_updated: int
-    message: str
-
-
-class ConsolidationResult(BaseModel):
-    memories_considered: int
-    groups_found: int
-    memories_consolidated: int
-    message: str
-
-
-class WeakMemoriesResponse(BaseModel):
-    memories: List[MemoryResponse]
-    total_count: int
-    threshold: float
-
-
-class ReviewSuggestionsResponse(BaseModel):
-    memories: List[MemoryResponse]
-    total_count: int
-
 
 class MemoryHealthStats(BaseModel):
     total_memories: int
@@ -115,99 +87,18 @@ class MemoryHealthForUser(BaseModel):
 
 
 # ============ Memory Endpoints ============
-
-@router.post("/decay", response_model=DecayResult)
-async def trigger_decay(
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    decay_service = get_decay_service(db)
-    processed, updated = await decay_service.apply_decay_to_user(current_user.id)
-    return DecayResult(
-        memories_processed=processed,
-        memories_updated=updated,
-        message=f"Decay applied: {updated} of {processed} memories had strength reduced",
-    )
-
-
-@router.post("/consolidate", response_model=ConsolidationResult)
-async def trigger_consolidation(
-    force: bool = False,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    consolidation_service = get_consolidation_service(db)
-    considered, groups, consolidated = await consolidation_service.run_consolidation(
-        current_user.id, force=force
-    )
-    return ConsolidationResult(
-        memories_considered=considered,
-        groups_found=groups,
-        memories_consolidated=consolidated,
-        message=f"Consolidation complete: {consolidated} memories consolidated into {groups} groups",
-    )
-
-
-@router.get("/weak-memories", response_model=WeakMemoriesResponse)
-async def get_weak_memories(
-    threshold: float = 0.3,
-    limit: int = 50,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    decay_service = get_decay_service(db)
-    memories = await decay_service.get_weak_memories(
-        current_user.id, threshold=threshold, limit=limit
-    )
-    return WeakMemoriesResponse(
-        memories=[memory_to_response(m) for m in memories],
-        total_count=len(memories),
-        threshold=threshold,
-    )
-
-
-@router.get("/review-suggestions", response_model=ReviewSuggestionsResponse)
-async def get_review_suggestions(
-    limit: int = 10,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    decay_service = get_decay_service(db)
-    memories = await decay_service.get_memories_to_review(current_user.id, limit=limit)
-    return ReviewSuggestionsResponse(
-        memories=[memory_to_response(m) for m in memories],
-        total_count=len(memories),
-    )
-
-
-@router.post("/memories/{memory_id}/reinforce", response_model=MemoryResponse)
-async def reinforce_memory(
-    memory_id: str,
-    context: str = "manual",
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    decay_service = get_decay_service(db)
-    memory = await decay_service.reinforce_memory(
-        memory_id, current_user.id, access_context=context
-    )
-    if not memory:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
-    return memory_to_response(memory)
-
-
-@router.post("/memories/{memory_id}/promote", response_model=MemoryResponse)
-async def promote_to_semantic(
-    memory_id: str,
-    current_user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    consolidation_service = get_consolidation_service(db)
-    memory = await consolidation_service.promote_to_semantic(memory_id, current_user.id)
-    if not memory:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found")
-    return memory_to_response(memory)
-
+#
+# v3 (docs/memory/rebuild-2026-08-v3.md §1.1): /decay, /consolidate,
+# /weak-memories, /review-suggestions, /memories/{id}/reinforce and
+# /memories/{id}/promote are DELETED with the engines behind them. Strength,
+# decay, reinforcement and the additive consolidation pass are retired: the
+# product's unit is a curated FILE, and no client payload carries a row or an
+# engine field any more. Six operator buttons that would each have run a
+# writer over a table nothing reads.
+#
+# /health below survives untouched — it is a raw count over the legacy
+# `memories` table, which is still on disk (that IS the rollback) and is
+# still the one thing an operator wants during the migration.
 
 @router.get("/health", response_model=MemoryHealthStats)
 async def get_memory_health(

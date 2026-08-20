@@ -75,7 +75,11 @@ def test_full_profile_has_every_historic_section():
         "about_you",
         "owner_recognition",
         "user_brain",
-        "active_tasks",
+        # `active_tasks` was here until memory v3 (§1.1/§3.1). The block
+        # rendered `category='active_task'` memory ROWS, which the file
+        # model retires; what the user is in the middle of lives in the
+        # Current context file, inside user_brain. A slot kept for a block
+        # nothing builds is how the F1 filter bug reads in reverse.
         "agent_brain",
         "work_brain",
         "skills",

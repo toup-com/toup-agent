@@ -1,20 +1,25 @@
-"""`store_entity_relationship`: one embedding, hoisted out of the transaction,
-and a never-store screen on the one Memory INSERT that had none.
+"""`store_entity_relationship`: a never-store screen, and the graph edge that
+survives v3.
 
-Three properties, each of which was false in production:
+Three properties were false in production. TWO of them retire with the
+Memory MIRROR that v3 deletes (§1.1) — the double embedding, and the
+#407/#408 hazard of holding a pooled connection across it — because there
+is no embedding on this path any more. Their retirement notes are inline
+below rather than in a changelog, so the next reader sees why a test that
+was load-bearing is gone.
 
-  1. The function embedded the IDENTICAL string twice — once inside
-     `find_similar_memories`, once directly before the INSERT.
-  2. Both calls were sync `embed()` inside an `async def`, and both ran AFTER
-     `_upsert_entity` had already flushed an `entities` INSERT — a network
-     round-trip while holding row locks and a pooled connection. That is the
-     #407/#408 shape (network call inside an open transaction -> pinned
-     pgbouncer connection -> PendingRollbackError -> HTTP 500 on chat turns).
-  3. It was the only Memory INSERT in the codebase with no content screen:
-     `relationship_gate_reason` judges the SHAPE of a triple, never its
-     values, so `("Nariman", "has_api_key", "sk-…")` was stored verbatim —
-     content, entity name and graph edge label. `entity_relationship_create`
-     is a model-callable MCP tool, so that payload is reachable from a prompt.
+What SURVIVES is the third, and it is the one that was reachable from a
+prompt:
+
+  It was the only Memory INSERT in the codebase with no content screen:
+  `relationship_gate_reason` judged the SHAPE of a triple, never its
+  values, so `("Nariman", "has_api_key", "sk-…")` was stored verbatim —
+  content, entity name and graph edge label. `entity_relationship_create`
+  is a model-callable MCP tool, so that payload is reachable from a prompt.
+
+The screen still aborts the WHOLE write, mirror or no mirror, because
+`entities.name` stores the string verbatim and
+`entity_relationships.relationship_label` renders it back.
 
 Everything here runs on the file's own sqlite engine (same pattern as
 test_memory_taxonomy_and_ttl.py), so it also runs in the sqlite CI sweep.
@@ -145,118 +150,15 @@ async def _count(db, model) -> int:
 # ── 1. One embedding per relationship, not two ────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_relationship_embeds_the_string_exactly_once():
-    """It used to embed the identical sentence twice, per stored relationship.
-
-    Once inside find_similar_memories (memory_service.py:1967 before this
-    change) and once immediately before the INSERT (:2309). Same string, same
-    provider, two round-trips.
-    """
-    from app.db.models.memory import Memory
-    from app.services.memory_service import MemoryService
-
-    user_id = str(uuid.uuid4())
-    engine, Session = await _graph_session()
-    try:
-        async with Session() as db:
-            await _seed_user(db, user_id)
-            svc = MemoryService(db)
-            embedder, _ = _instrument(svc, db)
-
-            await svc.store_entity_relationship(
-                user_id=user_id,
-                source_name="Nariman",
-                source_type="person",
-                target_name="Toup",
-                target_type="project",
-                relationship="owns",
-            )
-
-            texts = [c["text"] for c in embedder.calls]
-            assert len(embedder.calls) == 1, (
-                f"expected ONE embedding round-trip, got {len(embedder.calls)}: {texts}"
-            )
-            assert texts == ["Nariman owns Toup"]
-
-            # ...and the vector actually reached the row, so "one call" did not
-            # become "one call and an unembedded memory".
-            stored = (await db.execute(select(Memory))).scalars().all()
-            assert len(stored) == 1
-            assert stored[0].embedding_json is not None
-    finally:
-        await engine.dispose()
+# RETIRED with the relationship MIRROR (v3 §1.1): `test_relationship_embeds_the_string_exactly_once`.
+# It embedded `relationship_content` so the Memory MIRROR row could be found by vector search. The mirror is deleted (v3 §1.1) and with it the embedding — this path now makes no provider call at all, which is a stronger version of "exactly once".
 
 
 # ── 2. The round-trip happens outside the transaction ─────────────────
 
 
-@pytest.mark.asyncio
-async def test_relationship_embedding_happens_before_the_session_is_touched():
-    """The embedding must not run while the session holds write state.
-
-    WHAT THIS ASSERTS: at the instant the embedding call is made, the session
-    has no open transaction, no pending INSERTs (`db.new`), no pending UPDATEs
-    (`db.dirty`), and `_upsert_entity` — the first thing in the function that
-    executes SQL, and which FLUSHES a new `entities` row — has not run yet.
-
-    WHAT IT DOES NOT ASSERT: that the event loop is unblocked during the call.
-    That is `embed_async`'s contract (a run_in_executor wrapper); this stub is
-    a plain coroutine so the snapshot above is read on the loop thread. Nor
-    does it prove anything about a caller that hands the service a session
-    already inside a transaction — it proves this function does not open one
-    before embedding.
-    """
-    from app.services.memory_service import MemoryService
-
-    user_id = str(uuid.uuid4())
-    engine, Session = await _graph_session()
-    try:
-        async with Session() as db:
-            await _seed_user(db, user_id)
-            svc = MemoryService(db)
-            embedder, events = _instrument(svc, db)
-
-            # Session is clean when the call starts — otherwise the snapshot
-            # below would be measuring the fixture, not the function.
-            assert db.in_transaction() is False
-            assert not db.new and not db.dirty
-
-            await svc.store_entity_relationship(
-                user_id=user_id,
-                source_name="Nariman",
-                source_type="person",
-                target_name="Toup",
-                target_type="project",
-                relationship="owns",
-            )
-
-            # Snapshot assertions FIRST, deliberately: under the mutation that
-            # puts the embedding back inside the transaction there are two
-            # calls, and this test should report the position failure rather
-            # than shadow it with a call-count mismatch (test 1 owns that).
-            assert embedder.calls, "no embedding happened at all"
-            snap = embedder.calls[0]
-            assert snap["in_transaction"] is False, (
-                "embedded with a transaction already open — the #407/#408 shape"
-            )
-            assert snap["pending_new"] == 0, (
-                f"embedded with {snap['pending_new']} pending INSERT(s) staged"
-            )
-            assert snap["pending_dirty"] == 0, (
-                f"embedded with {snap['pending_dirty']} pending UPDATE(s) staged"
-            )
-            assert len(embedder.calls) == 1
-
-            # Ordering, independent of the session-state snapshot: the embed
-            # precedes the first entity upsert (which flushes an INSERT and so
-            # takes row locks for the rest of the transaction).
-            assert events, "nothing was recorded"
-            assert events[0].startswith("embed:"), events
-            assert "upsert_entity" in events, events
-            assert events.index("embed:async") < events.index("upsert_entity"), events
-    finally:
-        await engine.dispose()
+# RETIRED with the relationship MIRROR (v3 §1.1): `test_relationship_embedding_happens_before_the_session_is_touched`.
+# The #407/#408 hazard (a network round trip inside the transaction the entity upserts opened) is gone by CONSTRUCTION rather than by ordering: there is no embedding call left on this path. `test_a_mirror_gated_relationship_still_writes_the_graph_edge` below is what now proves the graph write survives.
 
 
 # ── 3. A secret cannot enter through the entity graph ─────────────────
@@ -385,50 +287,5 @@ async def test_a_mirror_gated_relationship_still_writes_the_graph_edge():
 # ── 5. ANTI-VACUITY CONTROL ───────────────────────────────────────────
 
 
-@pytest.mark.asyncio
-async def test_a_benign_relationship_still_stores_end_to_end():
-    """CONTROL. Must stay GREEN under every mutation in the PR body.
-
-    Without it, "the secret test passes" and "the embed test passes" are both
-    satisfiable by a function that stores nothing at all.
-    """
-    from app.db.models.entity import Entity, EntityLink, EntityRelationship
-    from app.db.models.memory import Memory
-    from app.services.memory_service import MemoryService
-
-    user_id = str(uuid.uuid4())
-    engine, Session = await _graph_session()
-    try:
-        async with Session() as db:
-            await _seed_user(db, user_id)
-            svc = MemoryService(db)
-            # Stubbed only to keep the provider off the network; the assertions
-            # below are about the rows, not about the embedder.
-            _instrument(svc, db)
-
-            await svc.store_entity_relationship(
-                user_id=user_id,
-                source_name="Nariman",
-                source_type="person",
-                target_name="Toup",
-                target_type="project",
-                relationship="owns",
-                confidence=0.9,
-            )
-
-            memories = (await db.execute(select(Memory))).scalars().all()
-            assert len(memories) == 1, "the benign relationship was not mirrored"
-            mem = memories[0]
-            assert mem.content == "Nariman owns Toup"
-            assert mem.source_type == "entity_extraction"
-            assert mem.embedding_json is not None, "stored without a vector"
-
-            assert await _count(db, Entity) == 2
-            assert await _count(db, EntityRelationship) == 1
-            assert await _count(db, EntityLink) == 2
-
-            edge = (await db.execute(select(EntityRelationship))).scalars().one()
-            assert edge.relationship_type == "owns"
-            assert edge.relationship_label == "Nariman owns Toup"
-    finally:
-        await engine.dispose()
+# RETIRED with the relationship MIRROR (v3 §1.1): `test_a_benign_relationship_still_stores_end_to_end`.
+# "Stores" meant a Memory row. There is no mirror row to store; the graph edge is asserted by the test above it.

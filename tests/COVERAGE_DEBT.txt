@@ -26,13 +26,13 @@ memverify/  # live Postgres+pgvector + RUN_MODE=agent; own runner, not the unit 
 
 # --- run under RUN_MODE=agent (see the agent-mode step) ---
 test_agent_notify_outbox.py  # agent-mode
+test_agent_runner_subagent_params.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY). TRIAGED 2026-08-20 — the two untriaged failures were stale source probes (the `asyncio.create_task` spawn form, and an import matched by TEXT that a reflow broke); the third was a dead Phase-3 invariant. 17/17 green under agent, so it is back in a sweep instead of quarantined.
 test_autopilot_approvals.py  # agent-mode
 test_autopilot_engine.py  # agent-mode
 test_autopilot_tick_hygiene.py  # agent-mode
 test_channel_day_consistency.py  # agent-mode
 test_create_job_turn_context.py  # agent-mode
 test_day_chat_unification.py  # agent-mode
-test_decay.py  # agent-mode
 test_job_reaper.py  # agent-mode
 test_job_recovery.py  # agent-mode
 test_jobs_api_no_raw_errors.py  # agent-mode
@@ -58,8 +58,7 @@ test_memory_upsert_and_enum.py  # agent-mode — the floor-invariant index tests
 
 # --- QUARANTINED: red on 2026-08-03, none of them ever run by CI ---
 test_agent_defer_boot_init.py  # asserts something the code no longer does
-test_agent_runner_subagent_params.py  # fails for a reason not yet triaged
-test_api.py  # needs a real database; sqlite has no such table/column
+test_api.py  # needs a real database; sqlite has no such table/column. TRIAGED 2026-08-20 (memory v3): 15 tests retired with the deleted row API + admin decay/consolidate; 11 remain, 3 green. The 8 reds ALL predate the rebuild — 6 are `create_user` -> `no such table: credit_balances` (this entry's own reason; auth_service is byte-identical to 91c45ee9), 1 is a missing sentence_transformers, 1 is the rule-based extractor's own assertion (byte-identical too). Nothing here is memory-shaped any more.
 test_auth_timezone_from_coords.py  # needs a real database; sqlite has no such table/column
 test_autopilot_handoff.py  # needs a real database; sqlite has no such table/column
 test_backfill_day_chats.py  # exceeds a 240s per-file budget
@@ -67,7 +66,6 @@ test_connector_dispatcher.py  # needs a real database; sqlite has no such table/
 test_connector_mcp.py  # asserts something the code no longer does
 test_connector_providers_t3_t4.py  # needs a real database; sqlite has no such table/column
 test_connector_schema.py  # asserts something the code no longer does
-test_consolidation.py  # agent-mode — rewritten 2026-08-10 against the current ConsolidationService API
 test_conversation_resolver.py  # fails for a reason not yet triaged
 test_cron_service_deprecation.py  # fails for a reason not yet triaged
 test_cron_tool_removed.py  # references code that no longer exists

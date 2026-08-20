@@ -31,9 +31,7 @@ from app.schemas import (
 from app.api.auth import get_current_user
 from app.services.llm_service import get_llm_service
 from app.services.prompt_builder import get_prompt_builder
-from app.services.memory_extractor import get_memory_extractor
 from app.services.memory_service import MemoryService
-from app.services.memory_dedup_service import MemoryDedupService
 from app.services.embedding_service import get_embedding_service
 from app.config import settings
 
@@ -86,7 +84,6 @@ async def _chat_complete(
     # Initialize services
     llm_service = get_llm_service()
     prompt_builder = get_prompt_builder()
-    memory_extractor = get_memory_extractor()
     embedding_service = get_embedding_service()
     memory_service = MemoryService(db)
     
@@ -179,84 +176,14 @@ async def _chat_complete(
     session.total_tokens += llm_response.tokens_total
     session.updated_at = datetime.utcnow()
     
-    # 10. Extract and store memories (if enabled)
+    # 10. Memory: nothing is extracted here (v3 §2.1.6).
+    #
+    # Same excision as app/api/chat.py — see the note there. This module is
+    # additionally not mounted by ANY entrypoint (agent_main mounts
+    # app.api.chat; platform_main mounts neither), so it was a dormant fourth
+    # writer rather than a live one.
     extracted_memories: List[MemoryResponse] = []
-    
-    if request.auto_extract_memories and settings.auto_extract_memories:
-        try:
-            _user_key = None
-            try:
-                from app.db import AgentConfig
-                _r = await db.execute(select(AgentConfig.openai_api_key).where(AgentConfig.user_id == current_user.id))
-                _user_key = _r.scalar_one_or_none()
-            except Exception:
-                pass
-            extracted = await memory_extractor.extract_memories_with_llm(
-                user_message=request.message,
-                assistant_response=llm_response.content,
-                brain_type="user",
-                max_memories=5,
-                api_key=_user_key,
-            )
-            
-            # Use dedup service for intelligent memory creation
-            dedup_service = MemoryDedupService(db, api_key=_user_key)
 
-            # Store extracted memories with deduplication
-            for mem in extracted:
-                # Create MemoryCreate schema from extracted data
-                memory_data = MemoryCreate(
-                    content=mem.content,
-                    summary=mem.summary,
-                    brain_type=BrainType.USER,
-                    category=mem.category.value,
-                    memory_type=mem.memory_type,
-                    importance=mem.importance,
-                    confidence=mem.confidence,
-                    memory_level=MemoryLevel.EPISODIC,
-                    emotional_salience=0.5,
-                    tags=mem.tags,
-                    metadata=mem.metadata,
-                    source_type="conversation"
-                )
-                
-                # Use smart_create_memory for deduplication
-                stored_memory, action = await dedup_service.smart_create_memory(
-                    new_memory=memory_data,
-                    user_id=current_user.id
-                )
-                
-                # Log what happened. See the note in app/api/chat.py: this
-                # runs BEFORE the None check below, so a gate refusal crashed here.
-                if stored_memory is None:
-                    logger.info(f"Memory {action} — nothing written")
-                else:
-                    logger.info("Memory %s", describe_memory(stored_memory.content, action=action,
-                                         category=stored_memory.category, memory_id=stored_memory.id))
-
-                if stored_memory:
-                    extracted_memories.append(MemoryResponse(
-                        id=stored_memory.id,
-                        content=stored_memory.content,
-                        canonical_content=stored_memory.canonical_content,
-                        summary=stored_memory.summary,
-                        brain_type=stored_memory.brain_type,
-                        category=stored_memory.category,
-                        memory_type=stored_memory.memory_type,
-                        importance=stored_memory.importance,
-                        confidence=stored_memory.confidence,
-                        strength=stored_memory.strength or 1.0,
-                        is_active=stored_memory.is_active if hasattr(stored_memory, 'is_active') else True,
-                        created_at=stored_memory.created_at,
-                        updated_at=stored_memory.updated_at,
-                        last_accessed_at=stored_memory.last_accessed_at,
-                        access_count=stored_memory.access_count,
-                        source_type=stored_memory.source_type
-                    ))
-        except Exception as e:
-            logger.warning(f"Memory extraction failed: {e}")
-            # Don't fail the request if extraction fails
-    
     # 11. Commit all changes
     await db.commit()
     await db.refresh(session)
@@ -432,75 +359,8 @@ async def _chat_stream(
             
             await db.commit()
             
-            # === MEMORY EXTRACTION (async after commit) ===
-            # Run memory extraction with deduplication
-            if request.auto_extract_memories and settings.auto_extract_memories:
-                try:
-                    memory_extractor = get_memory_extractor()
+            # Memory extraction was here; see the note on the sync route.
 
-                    _ukey2 = None
-                    try:
-                        from app.db import AgentConfig
-                        _r2 = await db.execute(select(AgentConfig.openai_api_key).where(AgentConfig.user_id == current_user.id))
-                        _ukey2 = _r2.scalar_one_or_none()
-                    except Exception:
-                        pass
-                    extracted = await memory_extractor.extract_memories_with_llm(
-                        user_message=request.message,
-                        assistant_response=full_response,
-                        brain_type="user",
-                        max_memories=5,
-                        api_key=_ukey2,
-                    )
-                    
-                    dedup_service = MemoryDedupService(db, api_key=_ukey2)
-                    extracted_memory_ids = []
-                    for mem in extracted:
-                        memory_data = MemoryCreate(
-                            content=mem.content,
-                            summary=mem.summary,
-                            brain_type=BrainType.USER,
-                            category=mem.category.value,
-                            memory_type=mem.memory_type,
-                            importance=mem.importance,
-                            confidence=mem.confidence,
-                            memory_level=MemoryLevel.EPISODIC,
-                            emotional_salience=0.5,
-                            tags=mem.tags,
-                            metadata=mem.metadata,
-                            source_type="conversation"
-                        )
-                        
-                        # Use smart_create_memory for deduplication
-                        stored_memory, action = await dedup_service.smart_create_memory(
-                            new_memory=memory_data,
-                            user_id=current_user.id
-                        )
-                        
-                        if stored_memory is None:
-                            logger.info(f"Memory {action} — nothing written")
-                            continue
-                        logger.info("Memory %s", describe_memory(stored_memory.content, action=action,
-                                         category=stored_memory.category, memory_id=stored_memory.id))
-                        extracted_memory_ids.append({
-                            "id": stored_memory.id,
-                            "action": action,
-                            "content": stored_memory.content[:100]
-                        })
-                    
-                    await db.commit()
-                    
-                    # Send extracted memories event
-                    if extracted_memory_ids:
-                        extract_data = json.dumps({
-                            "type": "extracted_memories",
-                            "data": extracted_memory_ids
-                        })
-                        yield f"data: {extract_data}\n\n"
-                        
-                except Exception as e:
-                    logger.warning(f"Memory extraction failed in stream: {e}")
-            
             # Send done event with metadata
             done_data = json.dumps({
                 "type": "done",

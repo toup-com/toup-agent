@@ -60,22 +60,42 @@ def test_maintenance_flag_default_is_deliberate():
     assert "agent_memory_maintenance_enabled: bool = True" in _config_src()
 
 
-def test_agent_main_registers_all_four_memory_jobs_behind_flag():
-    """agent_main's lifespan must reference the flag and the exact same
-    service entry points platform_main's setup_scheduler registers."""
+def test_agent_main_registers_the_memory_jobs_behind_flag():
+    """agent_main's lifespan must reference the flag and the service entry
+    points it schedules.
+
+    Memory v3 (§3.1) retires `retrieval_feedback_analysis`: it read
+    `retrieval_events`, whose only feeder was the runner's per-turn
+    `log_retrieval_feedback` call, and that call's input was
+    hybrid_search's results — which the file model no longer produces. A
+    weekly job over a table nothing writes is a cron that always reports
+    zero, so it is unregistered rather than left ticking.
+
+    v3 also retires `memory_decay` (the Ebbinghaus pass over
+    `memories.strength`) and re-points the surviving slot at
+    `memory_file_ops.run_memory_maintenance`, which just ensures the three
+    system files exist. The slot KEEPS the id `memory_consolidation`
+    deliberately: `replace_existing=True` keys on the id, so a redeploy
+    replaces an old registration rather than leaving an orphan pointing at
+    a deleted function. WS-5's migration hooks in here."""
     src = _agent_main_src()
     assert "settings.agent_memory_maintenance_enabled" in src
-    for entry_point in (
-        "run_decay_for_all_users",
-        "run_consolidation_for_all_users",
-        "run_retrieval_feedback_analysis",
-        "run_end_of_day_archival",
-    ):
+    for entry_point in ("run_memory_maintenance", "run_end_of_day_archival"):
         assert entry_point in src, entry_point
-    # Job ids mirror platform_main's setup_scheduler.
-    for job_id in ("memory_decay", "memory_consolidation",
-                   "retrieval_feedback_analysis", "day_archival"):
+    for job_id in ("memory_consolidation", "day_archival"):
         assert f'"{job_id}"' in src, job_id
+    # Code, not commentary — the comments recording the retirements name them.
+    code = "\n".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
+    )
+    for gone in (
+        "run_retrieval_feedback_analysis",
+        '"retrieval_feedback_analysis"',
+        "run_decay_for_all_users",
+        '"memory_decay"',
+        "run_memory_file_maintenance",
+    ):
+        assert gone not in code, gone
 
 
 def test_agent_main_archival_respects_day_recall_gate():
@@ -140,21 +160,38 @@ def test_memory_delete_tool_definition_exists():
     names = {t["name"] for t in get_agent_tools()}
     assert "memory_delete" in names
     tool = next(t for t in get_agent_tools() if t["name"] == "memory_delete")
-    assert tool["input_schema"]["required"] == ["memory_id"]
+    # v3: WHAT to forget, in plain words. There are no memory ids left.
+    assert tool["input_schema"]["required"] == ["content"]
 
 
 def test_memory_delete_executor_handler_exists():
     """Dispatch is getattr(self, f\"_tool_{name}\") — the handler method
-    must exist and wire to the soft-delete service."""
+    must exist and route to the one writer."""
     src = _tool_executor_src()
     assert "async def _tool_memory_delete" in src
-    assert "delete_memory(" in src
+    assert "memory_curator.instruct_global(" in src
 
 
-def test_memory_search_results_surface_ids():
-    """memory_delete takes a memory_id from memory_search output — the
-    search result lines must include the id."""
-    assert "id={mem_id}" in _tool_executor_src()
+def test_memory_delete_has_lost_its_id_source():
+    """`memory_delete` took a memory_id straight out of `memory_search`'s
+    rendered output — that coupling was the whole reason the search lines
+    carried `id=`.
+
+    Memory v3 (§3.2) re-points `memory_search` at memory FILES, so it
+    emits `[slug] Title — snippet` and no row id exists to copy. WS-2
+    finished the repair: "forget X" is now a removal INSTRUCTION routed
+    through the curator, which finds the bullet, removes it, and writes the
+    change line the user sees in their memory log."""
+    src = _tool_executor_src()
+    assert "id={mem_id}" not in src
+    assert "async def _tool_memory_delete" in src
+    at = src.index("async def _tool_memory_delete")
+    body = src[at: at + 2000]
+    assert "memory_curator.instruct_global(" in body
+    assert "memory_id" in body, (
+        "a model working from a stale tool list still sends memory_id; "
+        "accepting it as an alias is what turns a hard error into an answer"
+    )
 
 
 def test_memory_delete_in_output_limits():

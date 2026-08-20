@@ -13,11 +13,16 @@ Profile semantics
   historic order. Today's behaviour for every user-facing turn
   (web, mobile, telegram, voice, extension, voice-realtime).
 - ``SUBAGENT`` — a stripped prompt suitable for a non-user-facing
-  child agent run. Drops persona/identity stack, user memories,
-  active tasks, day-as-chat continuity (today_so_far / recent_days /
-  reply_to), platform map, onboarding. Keeps just enough to use
-  tools coherently: a task preamble, skills, environment,
-  runtime context, formatting.
+  child agent run. Drops persona/identity stack, user memory files,
+  day-as-chat continuity (today_so_far / recent_days / reply_to),
+  platform map, onboarding. Keeps just enough to use tools
+  coherently: a task preamble, skills, environment, runtime context,
+  formatting.
+
+  v3 note: ``active_tasks`` left every list with the block itself —
+  the working-file render was built from ``active_task`` memory rows,
+  which the file model retires (rebuild-2026-08-v3 §1.1). What the
+  user is in the middle of lives in Current context now.
 
 Why two profiles, not "minimal":
   Per Amendment 1, ``MINIMAL`` is intentionally omitted from v1.
@@ -78,8 +83,7 @@ _FULL_SECTIONS: tuple[str, ...] = (
     "platform_knowledge",  # WHAT Toup is — pages, capabilities
     "about_you",         # User's name + local time-of-day
     "owner_recognition", # Founder-only: this user owns Toup (gated)
-    "user_brain",        # WHO the user is
-    "active_tasks",      # CONTINUITY — open threads
+    "user_brain",        # WHO the user is — the memory files (v3 §3.1)
     "agent_brain",       # Agent brain (env-flag gated)
     "work_brain",        # Work brain (env-flag gated)
     "skills",            # WHAT the agent can do
@@ -126,7 +130,6 @@ _AUTOPILOT_SECTIONS: tuple[str, ...] = (
     "voice_rules",
     "about_you",
     "user_brain",
-    "active_tasks",
     "skills",
     "environment",
     "runtime",
@@ -207,6 +210,12 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
     # Memory writes — child must not pollute user brain
     "memory_store",
     "memory_delete",
+    # v3: a sub-agent gets no user_brain section (prompt_profile above),
+    # so handing it a tool that returns a whole memory file in full would
+    # reopen the isolation the section list closes. `memory_search` keeps
+    # its exemption below — it answers a scoped question; this one hands
+    # over Profile.
+    "memory_read_file",
     # No grandchildren — v1 depth = 1
     "spawn",
     # No missions from sub-agents (Autopilot PR8)

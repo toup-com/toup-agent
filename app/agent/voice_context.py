@@ -43,10 +43,11 @@ catalogued; four of them are ended here, by construction:
 
 Deliberately NOT changed here (see the module docstring of ws_realtime
 for the legacy copies, which stay until a live canary):
-  D7  memory rendering keeps voice's shape — an unranked dump of both
-      brains with head-caps — rather than the runner's hybrid retrieval.
-      Switching retrieval strategy is a product change; this PR is a
-      relocation.
+  D7  CLOSED by memory v3 (2026-08-20). Voice's unranked 200-row dump of
+      both brains is gone; this module and `agent_runner` now call the same
+      loader (`memory_file_ops.load_brain`) and the same renderer
+      (`memory_files.render_user_brain`), so the two assemblers cannot
+      describe the user differently. Only the char budget differs.
   D9  `# Voice — Always Apply` (the runner's tone guardrails) has no
       voice counterpart and does not get one here.
 
@@ -69,24 +70,25 @@ from app.agent.agent_runner import (
     render_identity_anchor,
     render_identity_sections,
 )
+from app.memory_files import (
+    CAP_CURRENT_CONTEXT,
+    CAP_LEARNED,
+    CAP_PROFILE,
+    render_user_brain,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# Ceiling the agent's own /api/memories enforces (le=200). Kept identical
-# so the dump this module produces is the same set the relay used to
-# fetch over HTTP.
-VOICE_MEMORIES_LIMIT = 200
 
 # The relay requests `/{date}/messages?limit=500`; the same cap here keeps
 # a 501-message day rendering the same 500 rows on both sides.
 DAY_MESSAGES_LIMIT = 500
 
-# Budget split, unchanged from the relay: agent brain keeps its head
-# (highest-priority entries first), user brain likewise, day history keeps
-# its TAIL (the newest turns are the ones that matter in a live call).
-BUDGET_SHARE_AGENT_BRAIN = 0.2
-BUDGET_SHARE_USER_BRAIN = 0.3
+# Budget split. v3 folds the agent brain into the `learned` file, so the
+# memory block is ONE section — it takes the sum of what the two brains
+# used to share, and day history keeps its TAIL (the newest turns are the
+# ones that matter in a live call).
+BUDGET_SHARE_USER_BRAIN = 0.5
 BUDGET_SHARE_DAY_HISTORY = 0.5
 
 # Section keys, in the order they are joined into `instructions`.
@@ -98,7 +100,8 @@ BUDGET_SHARE_DAY_HISTORY = 0.5
 VOICE_SECTION_ORDER = (
     "identity",
     "identity_anchor",
-    "agent_brain",
+    # `agent_brain` is gone: the agent brain IS the `learned` file now, and
+    # it renders inside user_brain with Profile and Current context.
     "user_brain",
     "day_history",
     "voice_mode",
@@ -157,16 +160,6 @@ def cap_chars(text: str, max_chars: int, keep: str = "head") -> str:
         kept.reverse()
     marker = "- [context trimmed to budget]"
     return "\n".join([header, marker] + kept) if keep == "tail" else "\n".join([header] + kept + [marker])
-
-
-def _render_brain(header: str, memories: List[Any]) -> str:
-    """`# Header` + one `- [category] content` row per memory."""
-    lines = [header]
-    for m in memories:
-        cat = getattr(m, "category", "") or ""
-        content = getattr(m, "content", "") or ""
-        lines.append(f"- [{cat}] {content}")
-    return "\n".join(lines)
 
 
 def day_history_header(
@@ -298,10 +291,12 @@ def render_onboarding() -> str:
         "### Phase 1: Names\n"
         "Your FIRST question MUST be to ask what the user wants to call you and what their name is.\n"
         "Wait for their answer. Then:\n"
-        "- Store user's name: memory_store(brain_type='user', category='identity', "
-        "content='User name: <name>')\n"
-        "- Store your name: memory_store(brain_type='agent', category='agent_soul', "
-        "content='My name is <name>')\n\n"
+        "- Store THEIR name: memory_store(content='<name>, the person you are "
+        "talking to') — memory_store takes ONE argument, the fact in plain words. "
+        "You do not choose a file or a category; the writer files it.\n"
+        "- Do NOT store YOUR name with memory_store. Your name and personality are "
+        "your identity, not facts about them — remember what they chose and pass it "
+        "to finalize_onboarding at the end.\n\n"
 
         "### Phase 2: Color\n"
         "After names are set, say something like: \"Now, what color would you like for me? "
@@ -312,27 +307,29 @@ def render_onboarding() -> str:
         "'[COLOR_SELECTED: #hex]'. Acknowledge the color warmly.\n\n"
 
         "### Phase 3: Deep Profiling\n"
-        "Continue naturally, ONE question at a time:\n"
-        "- What they primarily need you for — goals, work domain. "
-        "Store: brain_type='user', category='goals'\n"
-        "- Their preferred language. "
-        "Store: brain_type='user', category='preferences'\n"
-        "- How they want you to communicate — formal/casual, concise/detailed, "
-        "personality preferences. Store: brain_type='agent', category='agent_soul'\n"
-        "- Any behavioral rules they want (things to always/never do). "
-        "Store: brain_type='agent', category='agent_soul'\n"
-        "- Anything else — hobbies, schedule, work style. "
-        "Store: brain_type='user', category appropriate\n\n"
+        "Continue naturally, ONE question at a time. Facts ABOUT THEM go to "
+        "memory_store(content='...'); how YOU should behave is your identity and "
+        "goes to finalize_onboarding.\n"
+        "- What they primarily need you for — goals, work domain. memory_store\n"
+        "- Their preferred language. memory_store\n"
+        "- Anything else — hobbies, schedule, work style. memory_store\n"
+        "- How they want you to communicate (formal/casual, concise/detailed) and "
+        "any always/never rules: do NOT call memory_store. Hold on to it and pass "
+        "it as `personality` to finalize_onboarding.\n\n"
 
         "### Phase 4: Wrap Up\n"
         "After gathering core info (minimum: both names, color, goals, language, "
         "personality preference), summarize what you learned. Then call "
-        "finalize_onboarding() to save the complete profiles and finish.\n\n"
+        "finalize_onboarding(agent_name='<the name they chose for you>', "
+        "personality='<how they want you to behave>') to save the profiles and "
+        "finish.\n\n"
 
         "RULES:\n"
         "- Be warm, enthusiastic, conversational. You're meeting your human!\n"
         "- Ask ONE question at a time. Never dump a list.\n"
-        "- Use memory_store for EACH piece of info as you learn it.\n"
+        "- Use memory_store for EACH fact about the USER as you learn it, one "
+        "argument: memory_store(content='...'). Never pass brain_type or category "
+        "— those parameters do not exist.\n"
         "- Match the user's language automatically.\n"
         "- Do NOT call finalize_onboarding until you have gathered enough info."
     )
@@ -551,52 +548,57 @@ async def build_voice_context(
         await _load_agent_name(db, user_id), fmt="voice"
     )
 
-    # ── 2. Memory — voice's dump shape, tenant rows ───────────────────
-    agent_mems: List[Any] = []
-    user_mems: List[Any] = []
+    # ── 2. Memory files — the SAME render text chat gets ──────────────
+    # v3 §3.3. Voice used to call `list_memories(limit=200)` twice and dump
+    # `- [category] content` rows, one per brain: no ranking, no files, and
+    # a shape text chat had not used for a year. Parity is now structural —
+    # one loader, one renderer (`memory_files.render_user_brain`), the same
+    # three system files and the same index. Only the BUDGET differs, and
+    # only because a live call has one.
+    brain = None
+    memories_failed = False
     try:
-        from app.services.memory_service import MemoryService
+        from app.services.memory_file_ops import load_brain
 
-        svc = MemoryService(db)
-        agent_mems, _ = await svc.list_memories(
-            user_id=user_id, limit=VOICE_MEMORIES_LIMIT, brain_type="agent",
-        )
-        user_mems, _ = await svc.list_memories(
-            user_id=user_id, limit=VOICE_MEMORIES_LIMIT, brain_type="user",
-        )
-        memories_failed = False
+        brain = await load_brain(db, user_id, query="")
     except Exception as exc:
-        logger.warning("[voice_ctx] memory load failed for %s: %s", user_id[:8], exc)
+        logger.warning("[voice_ctx] memory file load failed for %s: %s", user_id[:8], exc)
         memories_failed = True
 
-    if agent_mems:
-        text = _render_brain("# Agent Brain (Permanent Knowledge)", agent_mems)
-        if budget_chars:
-            text = cap_chars(text, int(budget_chars * BUDGET_SHARE_AGENT_BRAIN), keep="head")
-        sections["agent_brain"] = text
-    if user_mems:
-        # The referent matters more in voice than anywhere: entries are
-        # written in the user's second person, and without this parenthesis
-        # "- [identity] Your name is Nariman" reads as the MODEL's name.
-        text = _render_brain(
-            "# User Brain (what you know about the user — entries speak TO "
-            "the user: 'you'/'your' in them means the USER, not you)",
-            user_mems,
+    if brain is not None:
+        share = int(budget_chars * BUDGET_SHARE_USER_BRAIN) if budget_chars else 0
+        body = render_user_brain(
+            profile_body=brain.profile,
+            current_context_body=brain.current_context,
+            learned_body=brain.learned,
+            index=brain.index,
+            # Voice has no query at session start, so there is nothing to
+            # rank against — `load_brain("")` returns no relevant files by
+            # construction and the model reads the index instead.
+            relevant=(),
+            # Voice's budget is a share of the session's, not the runner's
+            # per-block caps. Passing the runner's caps here would let the
+            # three files alone exceed the whole voice budget.
+            cap_profile=share or CAP_PROFILE,
+            cap_current_context=share or CAP_CURRENT_CONTEXT,
+            cap_learned=share or CAP_LEARNED,
         )
-        if budget_chars:
-            text = cap_chars(text, int(budget_chars * BUDGET_SHARE_USER_BRAIN), keep="head")
-        sections["user_brain"] = text
+        if body:
+            text = (
+                "# User Brain (this user's memory files — bullets describe "
+                "the USER unless the file is about a named person)\n" + body
+            )
+            if share:
+                text = cap_chars(text, share, keep="head")
+            sections["user_brain"] = text
+
     if memories_failed:
         degraded.append("memories")
-    elif not agent_mems and not user_mems:
+    elif brain is not None and not (
+        brain.profile.strip() or brain.current_context.strip()
+        or brain.learned.strip() or brain.index
+    ):
         empty.append("memories")
-    elif not agent_mems or not user_mems:
-        # Granular signal for the operator; `degraded` stays coarse so a
-        # consumer does not have to know the brain taxonomy.
-        logger.info(
-            "[voice_ctx] one brain empty for %s (agent=%d user=%d)",
-            user_id[:8], len(agent_mems), len(user_mems),
-        )
 
     # ── 3. Today — the relay's day feed, reproduced byte for byte ─────
     # Newest existing day chat, the date-guard header, the relay's line

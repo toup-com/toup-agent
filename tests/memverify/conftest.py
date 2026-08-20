@@ -53,7 +53,16 @@ if not _ENV_OK:  # pragma: no cover - guard path
 
 
 # ── Tables this suite owns and truncates between tests ───────────────────
+#
+# v3: `memory_files` and `memory_file_changes` are THE product. `memories`
+# and the entity tables stay on the list because they still exist (the
+# legacy table is the rollback, and the graph still has consumers) — a
+# truncate of a table nothing writes is free, and leaving one off is how a
+# scenario inherits another's rows.
 _MEMORY_TABLES = [
+    "memory_file_changes",
+    "memory_files",
+    "memory_capture_outbox",
     "retrieval_events",
     "memory_events",
     "memory_relationships",
@@ -101,7 +110,7 @@ def _ensure_schema_once() -> None:
                 await conn.execute(
                     text(
                         "SELECT 1 FROM information_schema.tables "
-                        "WHERE table_schema='public' AND table_name='memories'"
+                        "WHERE table_schema='public' AND table_name='memory_files'"
                     )
                 )
             ).scalar()
@@ -184,19 +193,20 @@ async def user_b(db) -> str:
 
 # ── Labeled corpus: executed once per run, concurrently ──────────────────
 #
-# Every labeled scenario gets its OWN synthetic user and its OWN DB session, so
-# they can run concurrently against the real OpenAI extractor without
-# interfering. Results are plain data, so the per-test truncation that follows
-# cannot invalidate them.
+# Every labeled scenario gets its OWN synthetic user and its OWN DB session,
+# so they can run concurrently against the real writer without interfering.
+# Results are plain data, so the per-test truncation that follows cannot
+# invalidate them.
 #
-# The user's display name is a real-looking one on purpose: memory_gate's
-# relationship rule FAILS OPEN when the tenant identity is a placeholder
-# ("Agent Owner", "Test User" — see _PLACEHOLDER_ALIASES). Naming these users
-# "Test User" would silently disable that rule for the whole corpus and make the
-# junk numbers look better than production's. The placeholder shape is covered
-# separately in test_b_precision_junk.py.
+# The user's display name is a real-looking one on purpose: the identity
+# resolver reports `known=False` for a placeholder ("Agent Owner", "Test
+# User" — see user_identity.PLACEHOLDER_ALIASES), and the user-not-in-people
+# rule fails SOFT in that state. Naming these users "Test User" would
+# silently disable the rule for the whole corpus and make the routing
+# numbers look better than production's. The placeholder shape is covered
+# separately, in test_g_isolation.py.
 
-LABELED_USER_NAME = "Dara Ahmadi"
+from .corpus import LABELED_USER_NAME  # noqa: E402
 
 
 async def _execute_labeled(scenarios):
@@ -207,24 +217,35 @@ async def _execute_labeled(scenarios):
     sem = asyncio.Semaphore(limit)
     out: Dict[str, Any] = {}
 
-    async def _one(sc):
+    async def _one(sc, dirty=False):
+        key = sc.id + ("[dirty]" if dirty else "")
         async with sem:
             async with async_session_maker() as session:
                 uid = await make_user(
                     session,
                     name=LABELED_USER_NAME,
-                    email=f"{sc.id.lower()}-{uuid.uuid4().hex[:6]}@memverify.local",
+                    email=f"{key.lower().replace('[', '-').replace(']', '')}"
+                          f"-{uuid.uuid4().hex[:6]}@memverify.local",
                 )
                 try:
-                    res = await run_scenario(session, uid, sc)
+                    res = await run_scenario(session, uid, sc, dirty=dirty)
                     err = None
                 except Exception as exc:  # noqa: BLE001 - reported, not swallowed
-                    res = ScenarioResult(sc.id, [], [m.id for m in sc.must_store], [])
+                    res = ScenarioResult(key, missed=[m.id for m in sc.must_capture])
                     err = f"{type(exc).__name__}: {exc}"
-                out[sc.id] = {"result": res, "user_id": uid, "error": err}
+                out[key] = {"result": res, "user_id": uid, "error": err}
+
+    jobs = [_one(sc) for sc in scenarios]
+    # The BELT run: a scenario carrying an `injected` suffix is additionally
+    # driven with the string ws_chat actually builds. See pipeline.py.
+    jobs += [
+        _one(sc, dirty=True)
+        for sc in scenarios
+        if any(t.injected for t in sc.turns)
+    ]
 
     started = time.time()
-    await asyncio.gather(*(_one(sc) for sc in scenarios))
+    await asyncio.gather(*jobs)
     await engine.dispose()
     record_metric("labeled_wall_clock_s", round(time.time() - started, 1))
     return out

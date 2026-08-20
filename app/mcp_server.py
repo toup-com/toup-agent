@@ -17,7 +17,6 @@ from fastmcp import FastMCP
 from app.config import settings
 from app.db.database import async_session_maker
 from app.services.memory_service import MemoryService
-from app.services.memory_gate import MemoryRejected
 
 logger = logging.getLogger(__name__)
 
@@ -32,88 +31,6 @@ mcp = FastMCP(
 
 
 # ── Helper: resolve user_id from context ──────────────────────────────
-
-# Sentinel: "this user has no tenant agent, use the local session".
-# Distinguished from None, which means "the tenant answered, nothing found".
-_NO_TENANT = object()
-
-
-async def _proxy_memory_write_to_tenant(
-    db,
-    user_id: str,
-    memory_id: str,
-    method: str,
-    body: Optional[dict] = None,
-):
-    """Route an MCP memory write to the tenant agent that owns the row.
-
-    D-mem-B (2026-07-29): `memories` is an AGENT_ONLY table. It exists in each
-    tenant container's own Postgres, NOT in the platform DB this MCP server is
-    bound to. So `memory_update` on an id the agent had just been handed
-    returned "Memory not found" — the row is real, it is simply in another
-    database. #375 fixed this for the REST routes in `app/api/memories.py` but
-    missed this MCP surface.
-
-    Returns `_NO_TENANT` when the user has no active agent (caller falls back
-    to the local session), None when the tenant reports 404, else the decoded
-    body. Never raises: an MCP tool must return a structured error, not a 500.
-    """
-    from app.api.memories import _get_agent_proxy_info, _proxy_memories_write
-
-    try:
-        proxy = await _get_agent_proxy_info(user_id, db)
-    except Exception:
-        return _NO_TENANT
-    if not proxy:
-        return _NO_TENANT
-
-    try:
-        return await _proxy_memories_write(
-            proxy[0], proxy[1], memory_id, method, body=body
-        )
-    except Exception as e:
-        # _proxy_memories_write raises HTTPException(404) when the tenant does
-        # not have the row, and 502 when it is unreachable. Both collapse to
-        # "not found" for the tool's caller, which is the honest answer.
-        if getattr(e, "status_code", None) == 404:
-            return None
-        logger.warning(
-            "[mcp] memory write proxy %s %s failed: %s", method, memory_id, e
-        )
-        return None
-
-
-async def _proxy_memory_list_from_tenant(
-    db,
-    user_id: str,
-    params: Optional[dict] = None,
-    path: str = "",
-):
-    """Read memories from the tenant agent that actually holds the rows.
-
-    Read counterpart to `_proxy_memory_write_to_tenant`. Returns None when
-    there is no tenant agent or the tenant is unreachable — for a READ that is
-    an acceptable fall-back to the platform session, which is the deliberate
-    asymmetry documented on `_proxy_memories`. Never raises.
-
-    ``path`` selects the tenant sub-resource: "" lists, "search" runs the
-    semantic search. Both are reads, so both share the fall-back rule.
-    """
-    from app.api.memories import _get_agent_proxy_info, _proxy_memories
-
-    try:
-        proxy = await _get_agent_proxy_info(user_id, db)
-    except Exception:
-        return None
-    if not proxy:
-        return None
-
-    try:
-        return await _proxy_memories(proxy[0], proxy[1], path, params=params or {})
-    except Exception as e:
-        logger.warning("[mcp] memory %s proxy failed: %s", path or "list", e)
-        return None
-
 
 def _get_user_id() -> str:
     """Resolve the MCP request's user_id.
@@ -147,421 +64,123 @@ def _get_user_id() -> str:
         raise
 
 
-# ── Memory Tools ──────────────────────────────────────────────────────
+# ── Memory Tools (v3 §2.1.6 / §4) ─────────────────────────────────────
+#
+# What used to be here: `memory_search` / `memory_create` / `memory_update` /
+# `memory_delete` / `memory_list`, five row tools against `GET|POST|PATCH|
+# DELETE /api/memories[/{id}]`. Every one of those routes is DELETED in v3 —
+# the product's unit is a FILE, and `memories` is retired. A tool that proxies
+# a route which no longer exists does not fail loudly; it returns the
+# platform's own stale monolith-era rows and calls them the user's memory.
+#
+# Worse, `memory_create`'s own docstring instructed the model to store a
+# memory "about a specific routine, trigger, or connector" with `ref_kind`
+# and `ref_id` — that guidance is a named producer of the routine-prompt junk
+# v3 exists to remove (write-path recon, answer (c)), and routines are
+# scheduler objects that were never memories.
+#
+# What remains: a READ over files, and one WRITE that is an instruction to
+# the curator — the same two shapes the in-agent tools have. Both proxy to
+# the tenant, because that is where the files live; unlike round 8, the read
+# does NOT fall back to the platform session, because there is nothing there
+# to fall back to.
 
-@mcp.tool()
-async def memory_search(
-    query: str,
-    limit: int = 10,
-    brain_type: str = "user",
-    categories: Optional[list[str]] = None,
-    min_importance: Optional[float] = None,
-    min_similarity: float = 0.1,
-    include_explanation: bool = False,
-) -> dict:
-    """Search user memories by semantic similarity.
+async def _proxy_files_read(db, user_id: str, path: str, params: Optional[dict] = None):
+    """Read a v3 file route on the tenant agent. None when unreachable."""
+    from app.api.memories import _get_agent_proxy_info, _proxy_memories
 
-    Returns ranked results with relevance scores. Supports filtering
-    by brain_type (user/agent/work), categories, and importance.
-    """
-    from app.api.memories import MemorySearchRequest
-
-    user_id = _get_user_id()
-    request = MemorySearchRequest(
-        query=query,
-        brain_type=brain_type,
-        categories=categories,
-        min_importance=min_importance,
-        min_similarity=min_similarity,
-        limit=min(limit, 50),
-        include_explanation=include_explanation,
-    )
-
-    async with async_session_maker() as db:
-        # Ask the tenant first — `memories` is AGENT_ONLY, so searching the
-        # platform session queries the wrong database. It does not error: it
-        # matches against whatever monolith-era rows are still sitting in the
-        # platform table. Measured 2026-08-05 on the canary: 2 stale rows from
-        # 2026-07-28 on the platform (one carrying a category that is not even
-        # in the taxonomy) versus 19 real memories in the tenant. So an MCP
-        # client could memory_create into the tenant and then fail to find it,
-        # because the write and the read were hitting different databases.
-        # The REST route (`GET /api/memories/search`) has always proxied; only
-        # this tool did not. Same fall-back rule as memory_list: a read MAY
-        # fall back, a write may not.
-        proxied = await _proxy_memory_list_from_tenant(
-            db, user_id,
-            path="search",
-            params={
-                k: v for k, v in {
-                    "query": query,
-                    "limit": min(limit, 50),
-                    "brain_type": brain_type,
-                    "categories": ",".join(categories) if categories else None,
-                    "min_importance": min_importance,
-                    "min_similarity": min_similarity,
-                }.items() if v is not None
-            },
-        )
-        if isinstance(proxied, dict) and isinstance(proxied.get("results"), list):
-            rows = proxied["results"]
-            return {
-                "results": [
-                    {
-                        "id": str(m.get("id")),
-                        "content": m.get("content"),
-                        "summary": m.get("summary"),
-                        "category": m.get("category"),
-                        "importance": float(m.get("importance") or 0.0),
-                        # The tenant serialises MemoryWithScore, whose score
-                        # field is `similarity_score`; this tool's contract
-                        # calls it `score`.
-                        "score": float(m.get("similarity_score") or 0.0),
-                        "explanation": m.get("explanation"),
-                    }
-                    for m in rows
-                ],
-                "total": proxied.get("total_count", len(rows)),
-                "search_time_ms": proxied.get("search_time_ms", 0.0),
-            }
-
-        svc = MemoryService(db)
-        results, total, search_time = await svc.search_memories(user_id, request)
-        return {
-            "results": [
-                {
-                    "id": str(r.memory.id),
-                    "content": r.memory.content,
-                    "summary": r.memory.summary,
-                    "category": r.memory.category,
-                    "importance": float(r.memory.importance),
-                    "score": float(r.score),
-                    "explanation": getattr(r, "explanation", None),
-                }
-                for r in results
-            ],
-            "total": total,
-            "search_time_ms": search_time,
-        }
+    try:
+        proxy = await _get_agent_proxy_info(user_id, db)
+    except Exception:
+        return None
+    if not proxy:
+        return None
+    try:
+        data = await _proxy_memories(proxy[0], proxy[1], path, params=params or {})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[mcp] memory %s proxy failed: %s", path, e)
+        return None
+    if isinstance(data, dict) and "__status__" in data:
+        return None
+    return data
 
 
 @mcp.tool()
-async def memory_create(
-    content: str,
-    category: str,
-    brain_type: str = "user",
-    memory_type: str = "note",
-    memory_level: str = "episodic",
-    importance: float = 0.5,
-    tags: Optional[list[str]] = None,
-    metadata: Optional[dict] = None,
-    ref_kind: Optional[str] = None,
-    ref_id: Optional[str] = None,
-) -> dict:
-    """Store a memory in the user's brain.
+async def memory_search(query: str, limit: int = 10) -> dict:
+    """Search the user's memory FILES.
 
-    Type vs Level (Ticket 2.1 — these are different things, don't conflate):
-      `memory_type`  — WHAT KIND of fact this is. One of:
-                       fact, preference, task, event, person, place,
-                       project, decision, skill, file, note, conversation.
-                       Default: "note".
-      `memory_level` — WHICH COGNITIVE LAYER it lives in. One of:
-                       episodic, semantic, procedural, meta.
-                       Default: "episodic".
-
-    Upsert by entity (Ticket 2): if this memory is about a specific
-    routine, trigger, or connector, set BOTH `ref_kind` (e.g.
-    "routine", "trigger", "connector") AND `ref_id` (the entity's
-    id/uuid). When a memory with the same (user, ref_kind, ref_id)
-    already exists, the new content REPLACES it instead of creating
-    a duplicate. Without ref_kind+ref_id, semantic-similarity dedup
-    is used (less reliable).
-
-    Returns the created or updated memory.
+    Returns file-attributed snippets: each result names the file it came
+    from ("areas/toup"), which can then be opened whole. There are no memory
+    ids and no per-row categories — the file is the unit.
     """
-    # Fast-fail validation BEFORE any heavier imports so the LLM gets a
-    # parseable error in <100ms instead of a 3 s Pydantic round-trip.
-    # Ticket 2.1 — the "semantic" mistake the agent made was passing a
-    # MemoryLevel value into a MemoryType slot. Schema imports are
-    # lightweight (no FastAPI / DB side-effects).
-    from app.schemas import MemoryType as _MT, MemoryLevel as _ML
+    user_id = _get_user_id()
+    async with async_session_maker() as db:
+        data = await _proxy_files_read(
+            db, user_id, "search", {"q": query, "limit": min(limit, 50)},
+        )
+    if data is None:
+        return {"error": "Your agent isn't reachable right now.", "results": []}
+    results = data.get("results") or []
+    return {"results": results, "total": len(results)}
 
-    _valid_types = [t.value for t in _MT]
-    if memory_type not in _valid_types:
-        return {
-            "error": f"Invalid memory_type {memory_type!r}. Must be one of: "
-                     f"{', '.join(_valid_types)}. Note: cognitive layers "
-                     f"like 'episodic' / 'semantic' go in `memory_level`, "
-                     f"not `memory_type`.",
-        }
-    _valid_levels = [l.value for l in _ML]
-    if memory_level not in _valid_levels:
-        return {
-            "error": f"Invalid memory_level {memory_level!r}. Must be one of: "
-                     f"{', '.join(_valid_levels)}.",
-        }
 
-    # Heavier imports only after the cheap validation passes.
-    from app.api.memories import MemoryCreate, MemoryUpdate
-    from app.db.models import Memory as _Memory
-    from sqlalchemy import select as _select
+@mcp.tool()
+async def memory_files(slug: Optional[str] = None) -> dict:
+    """List the user's memory files, or read ONE of them in full.
+
+    Without `slug`: every file, grouped by section, with its title and the
+    one-line description that says when to read it. With `slug` (e.g.
+    "areas/toup", "people/majid-tajik", "you/profile"): that file's whole
+    markdown body plus the files it links to.
+    """
+    user_id = _get_user_id()
+    async with async_session_maker() as db:
+        path = f"files/{slug.strip()}" if (slug or "").strip() else "files"
+        data = await _proxy_files_read(db, user_id, path)
+    if data is None:
+        return {"error": "Your agent isn't reachable right now."}
+    return data
+
+
+@mcp.tool()
+async def memory_remember(instruction: str) -> dict:
+    """Tell the user's agent to remember, change or forget something.
+
+    Plain language, exactly as the user would say it: "remember that she
+    uses an Android phone", "the IELTS date moved to Sept 12", "forget that
+    I live in Toronto". The agent's own writer decides which file it belongs
+    in, rewrites it in the house voice, merges it with anything it already
+    knows, and records a line in the user's memory log.
+
+    It may decline — one-off requests, reminders, transient states and tool
+    output are never stored. Read `applied` and `rejected` in the reply
+    rather than assuming the write happened.
+    """
+    from app.api.memories import _get_agent_proxy_info, _proxy_memories_write
 
     user_id = _get_user_id()
-
-    memory_data = MemoryCreate(
-        content=content,
-        category=category,
-        brain_type=brain_type,
-        memory_type=memory_type,
-        memory_level=memory_level,
-        importance=importance,
-        tags=tags or [],
-        metadata=metadata or {},
-    )
+    text = (instruction or "").strip()
+    if not text:
+        return {"error": "instruction is required"}
 
     async with async_session_maker() as db:
-        # The tenant decides FIRST — before any query against this session.
-        #
-        # Same reason as memory_update/memory_delete below: `memories` is an
-        # AGENT_ONLY table living in the tenant's own Postgres, not in the
-        # platform DB this MCP server is bound to. #377 proxied update and
-        # delete but left create writing locally, which is worse than a plain
-        # bug: the row lands in the shared platform DB (exactly what
-        # AGENT_ONLY_TABLES exists to prevent), the owner never sees it —
-        # tenant hybrid_search and the Memory screen read the tenant DB — and
-        # once update/delete proxy, it can no longer be edited or removed.
-        #
-        # The ref_kind/ref_id upsert below stays on the no-tenant branch on
-        # purpose. It queries `memories` directly, so against a tenant-having
-        # user it would be interrogating the wrong database — the lookup that
-        # is supposed to PREVENT duplicate rows would miss every time and
-        # create them instead. MemoryCreate carries no ref_kind/ref_id (the
-        # REST surface never had them), so the tenant cannot be asked to do
-        # the upsert either without a schema change and a fleet rollout;
-        # until then a tenant-backed create falls back to the semantic dedup
-        # inside MemoryService.create_memory, which this tool's own docstring
-        # already describes as the weaker path.
-        proxied = await _proxy_memory_write_to_tenant(
-            db, user_id, "", "POST",
-            body=memory_data.model_dump(mode="json", exclude_none=True),
-        )
-        if proxied is not _NO_TENANT:
-            if proxied is None:
-                # Unreachable tenant. Do NOT fall through to the local session:
-                # reporting success against a database the agent never reads is
-                # how a user comes to believe something was saved when it was
-                # not. Reads may fall back; writes must not.
-                return {"error": "Could not reach your agent to save this memory."}
-            if ref_kind and ref_id:
-                proxied = {**proxied, "ref_kind": ref_kind, "ref_id": ref_id}
-            return {**proxied, "action": "created"}
-
-        # ── no tenant agent: legacy platform-local path ──────────────
-        # Upsert path: when ref_kind+ref_id are set, look up the existing
-        # memory and UPDATE it. This is the Ticket 2 fix: routines + triggers
-        # that change schedule update their canonical memory instead of
-        # producing N stale rows.
-        if ref_kind and ref_id:
-            existing = (await db.execute(
-                _select(_Memory).where(
-                    _Memory.user_id == user_id,
-                    _Memory.ref_kind == ref_kind,
-                    _Memory.ref_id == ref_id,
-                    _Memory.is_deleted.is_(False),
-                ).limit(1)
-            )).scalar_one_or_none()
-            if existing is not None:
-                svc = MemoryService(db)
-                update_data = MemoryUpdate()
-                update_data.content = content
-                update_data.category = category
-                update_data.importance = importance
-                if tags is not None:
-                    update_data.tags = tags
-                try:
-                    updated = await svc.update_memory(existing.id, user_id, update_data)
-                except MemoryRejected as exc:
-                    return {"action": "rejected", "reason": exc.reason}
-                if updated is not None:
-                    return {
-                        "id": str(updated.id),
-                        "content": updated.content,
-                        "category": updated.category,
-                        "importance": float(updated.importance),
-                        "ref_kind": ref_kind,
-                        "ref_id": ref_id,
-                        "action": "updated",
-                    }
-
-        svc = MemoryService(db)
         try:
-            memory = await svc.create_memory(user_id, memory_data)
-        except MemoryRejected as exc:
-            # Model-controlled path: say why, so it does not retry verbatim.
-            return {"action": "rejected", "reason": exc.reason}
-        # Stamp ref linkage if provided. Service-level path doesn't know
-        # about it; we apply it post-create so the partial unique index
-        # catches future collisions.
-        if ref_kind and ref_id:
-            memory.ref_kind = ref_kind
-            memory.ref_id = ref_id
-            await db.commit()
-        return {
-            "id": str(memory.id),
-            "content": memory.content,
-            "category": memory.category,
-            "importance": float(memory.importance),
-            "ref_kind": ref_kind,
-            "ref_id": ref_id,
-            "created_at": memory.created_at.isoformat() if memory.created_at else None,
-            "action": "created",
-        }
-
-
-@mcp.tool()
-async def memory_update(
-    memory_id: str,
-    content: Optional[str] = None,
-    category: Optional[str] = None,
-    importance: Optional[float] = None,
-    tags: Optional[list[str]] = None,
-) -> dict:
-    """Update an existing memory's content, category, or importance.
-
-    Only provided fields are updated. Re-generates embedding if content changes.
-    """
-    from app.api.memories import MemoryUpdate
-
-    user_id = _get_user_id()
-    update_data = MemoryUpdate()
-    if content is not None:
-        update_data.content = content
-    if category is not None:
-        update_data.category = category
-    if importance is not None:
-        update_data.importance = importance
-    if tags is not None:
-        update_data.tags = tags
-
-    async with async_session_maker() as db:
-        # D-mem-B: `memories` is AGENT_ONLY — it lives in the tenant
-        # container's DB, not in the platform's. Running this against the
-        # platform session returned "Memory not found" for every id the agent
-        # had just been handed, because the row genuinely is not here. Same
-        # class as the REST write routes fixed in #375; this MCP surface was
-        # missed. Route to the tenant, exactly as api/memories.py does.
-        proxied = await _proxy_memory_write_to_tenant(
-            db, user_id, memory_id, "PATCH",
-            body=update_data.model_dump(mode="json", exclude_none=True),
-        )
-        if proxied is not _NO_TENANT:
-            if proxied is None:
-                return {"error": "Memory not found", "id": memory_id}
-            return {**proxied, "updated": True}
-
-        svc = MemoryService(db)
+            proxy = await _get_agent_proxy_info(user_id, db)
+        except Exception:
+            proxy = None
+        if not proxy:
+            # A WRITE never falls back to the platform session. The files are
+            # AGENT_ONLY; "succeeding" against the wrong database is how a
+            # user comes to believe something was saved that was not.
+            return {"error": "Your agent isn't reachable right now.", "applied": 0}
         try:
-            memory = await svc.update_memory(memory_id, user_id, update_data)
-        except MemoryRejected as exc:
-            # Model-controlled path: say why, so it does not retry verbatim.
-            return {"action": "rejected", "reason": exc.reason}
-        if not memory:
-            return {"error": "Memory not found", "id": memory_id}
-        return {
-            "id": str(memory.id),
-            "content": memory.content,
-            "category": memory.category,
-            "importance": float(memory.importance),
-            "updated": True,
-        }
-
-
-@mcp.tool()
-async def memory_delete(memory_id: str) -> dict:
-    """Delete a memory by ID (soft delete)."""
-    user_id = _get_user_id()
-    async with async_session_maker() as db:
-        # See memory_update: the row lives in the tenant DB, not here.
-        proxied = await _proxy_memory_write_to_tenant(
-            db, user_id, memory_id, "DELETE"
-        )
-        if proxied is not _NO_TENANT:
-            return {"id": memory_id, "deleted": True}
-
-        svc = MemoryService(db)
-        deleted = await svc.delete_memory(memory_id, user_id)
-        return {"id": memory_id, "deleted": deleted}
-
-
-@mcp.tool()
-async def memory_list(
-    limit: int = 20,
-    brain_type: Optional[str] = None,
-    category: Optional[str] = None,
-    min_importance: Optional[float] = None,
-) -> dict:
-    """List memories with optional filters.
-
-    Returns memories ordered by creation date (newest first).
-    """
-    user_id = _get_user_id()
-    async with async_session_maker() as db:
-        # Ask the tenant first — `memories` is AGENT_ONLY, so listing against
-        # the platform session queries the wrong database. It does not error;
-        # it returns an EMPTY list, so an agent asking "what do I already know
-        # about this person?" concludes "nothing" while their real memories sit
-        # in the tenant DB. Unlike the write paths this MAY fall back (worst
-        # case is an empty list either way) — but it has to try first.
-        proxied = await _proxy_memory_list_from_tenant(
-            db, user_id,
-            params={
-                k: v for k, v in {
-                    "limit": min(limit, 100),
-                    "brain_type": brain_type,
-                    "category": category,
-                    "min_importance": min_importance,
-                }.items() if v is not None
-            },
-        )
-        if isinstance(proxied, dict) and isinstance(proxied.get("memories"), list):
-            rows = proxied["memories"]
-            return {
-                "memories": [
-                    {
-                        "id": str(m.get("id")),
-                        "content": m.get("content"),
-                        "summary": m.get("summary"),
-                        "category": m.get("category"),
-                        "importance": float(m.get("importance") or 0.0),
-                        "created_at": m.get("created_at"),
-                    }
-                    for m in rows
-                ],
-                "total": proxied.get("total", len(rows)),
-            }
-
-        svc = MemoryService(db)
-        memories, total = await svc.list_memories(
-            user_id,
-            limit=min(limit, 100),
-            brain_type=brain_type,
-            category=category,
-            min_importance=min_importance,
-        )
-        return {
-            "memories": [
-                {
-                    "id": str(m.id),
-                    "content": m.content,
-                    "summary": m.summary,
-                    "category": m.category,
-                    "importance": float(m.importance),
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                }
-                for m in memories
-            ],
-            "total": total,
-        }
+            data = await _proxy_memories_write(
+                proxy[0], proxy[1], "instruct", "POST",
+                body={"instruction": text},
+            )
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"{type(e).__name__}", "applied": 0}
+    return data or {"applied": 0}
 
 
 # ── Session Tools ─────────────────────────────────────────────────────

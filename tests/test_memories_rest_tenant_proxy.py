@@ -1,29 +1,27 @@
 """Every /api/memories route must reach the tenant (G-1, audit 2026-08-09).
 
-`memories` is AGENT_ONLY: the real rows live in the tenant container's DB and
-the platform's copy is stale monolith-era data. 11 of 19 routes proxied; the
-other 8 quietly served (or wrote!) the platform DB:
+`memory_files` is AGENT_ONLY: the real memory lives in the tenant
+container's DB. The original failure mode was never "someone removed a
+proxy call", it was "someone added an endpoint and forgot the proxy
+exists" — so the pin is structural and applies to future routes.
 
-  reads : /related  /region  /type  /{id}/events  /{id}/history
-          /duplicates/report
-  writes: /deduplicate  /{id}/merge
+MEMORY V3 (2026-08-20) moved the behavioural half of this file to
+`tests/test_memories_v3_api.py`: the routes it drove — `/deduplicate`,
+`/{id}/merge`, `/{id}/related`, `/{id}/events` — served the retired ROW
+layer and no longer exist. What remains here is the invariant those tests
+were an instance of, re-derived against the v3 surface, plus the one
+asymmetry that CHANGED and must not drift back:
 
-Two of the reads are called by the web app today (api.ts: /related, /type),
-so the memory UI showed 2026-05 data or 404s. The two writes violated the
-writes-must-502 contract (`_proxy_memories_write` docstring): /deduplicate
-"succeeded" against stale rows while the user's real duplicates sat
-untouched; /merge rewrote a platform row the agent never reads.
-
-The structural test pins the invariant for FUTURE routes too — the failure
-mode was never "someone removed a proxy call", it was "someone added an
-endpoint and forgot the proxy exists".
+  round 8: a read that could not reach the tenant fell back to the
+           platform DB, because rows were mirrored there.
+  v3:      there is no mirror. A read that cannot reach the tenant is a
+           503, and an empty library would read as data loss.
 """
 
 from __future__ import annotations
 
 import inspect
 import re
-import types
 
 import pytest
 
@@ -40,8 +38,6 @@ def _route_blocks():
         body = blocks[i + 1] if i + 1 < len(blocks) else ""
         m = re.match(r'@router\.(\w+)\("([^"]*)"', deco)
         fn = re.search(r"async def (\w+)", body)
-        # body of THIS handler only — stop at the next decorator if regex
-        # split ever changes; today each block is exactly one handler.
         out.append((m.group(1).upper(), m.group(2), fn.group(1) if fn else "?", body))
     return out
 
@@ -50,15 +46,21 @@ def _route_blocks():
 
 def test_every_memories_route_consults_the_tenant_proxy():
     routes = _route_blocks()
-    assert len(routes) >= 19, f"route sweep looks broken: found {len(routes)}"
+    # The floor is now an EXACT count. Round 8 asserted `>= 19` because the
+    # surface was still growing; v3's surface is closed (contract §4), so a
+    # new route is a decision someone has to make here on purpose. It moved
+    # to 11 once (WS-5): §7's rollback has to be executable, the tenant's
+    # tables are only reachable through the tenant, and a rollback nobody
+    # can run is a paragraph rather than a plan.
+    assert len(routes) == 11, f"route sweep looks broken: found {len(routes)}"
     missing = [
         f"{meth} /memories{path or ''} ({name})"
         for meth, path, name, body in routes
         if "_get_agent_proxy_info" not in body
     ]
     assert not missing, (
-        "routes that never reach the tenant (the platform copy of `memories` "
-        f"is stale monolith data): {missing}"
+        "routes that never reach the tenant (memory_files is AGENT_ONLY and "
+        f"the platform has NO copy at all): {missing}"
     )
 
 
@@ -67,126 +69,55 @@ def test_write_routes_use_the_write_proxy_not_the_read_fallback():
     against the wrong database. Writes go through _proxy_memories_write,
     which 502s instead of falling back."""
     routes = {name: body for _, _, name, body in _route_blocks()}
-    for name in ("deduplicate_memories", "merge_into_memory", "create_memory",
-                 "update_memory", "delete_memory"):
+    for name in ("instruct_memory_file", "instruct_memory", "delete_memory_file",
+                 "forget_all_memories", "admin_migrate_v3",
+                 "admin_migrate_v3_rollback"):
         assert "_proxy_memories_write" in routes[name], (
             f"{name} is a write and must use the 502-on-failure proxy"
         )
 
 
-# ── Behavioral: the two new write proxies route correctly ────────────────
-
-class _User:
-    id = "00000000-0000-0000-0000-000000000001"
-
-
-@pytest.fixture
-def proxied(monkeypatch):
-    calls = []
-
-    async def fake_info(user_id, db):
-        return ("http://agent.test", "key-123")
-
-    async def fake_write(agent_url, agent_api_key, path, method,
-                         body=None, params=None):
-        calls.append({"path": path, "method": method, "params": params})
-        return {"proxied": True}
-
-    async def fake_read(agent_url, agent_api_key, path, params=None,
-                        method="GET", body=None):
-        calls.append({"path": path, "method": method, "params": params})
-        return {"proxied": True}
-
-    monkeypatch.setattr(mem_api, "_get_agent_proxy_info", fake_info)
-    monkeypatch.setattr(mem_api, "_proxy_memories_write", fake_write)
-    monkeypatch.setattr(mem_api, "_proxy_memories", fake_read)
-    return calls
-
-
-async def test_deduplicate_routes_to_the_tenant_with_its_params(proxied):
-    resp = await mem_api.deduplicate_memories(
-        category="preferences", brain_type=None, dry_run=False,
-        current_user=_User(), db=None,
-    )
-    assert resp.status_code == 200
-    assert proxied == [{
-        "path": "deduplicate", "method": "POST",
-        "params": {"dry_run": False, "category": "preferences"},
-    }], "brain_type=None must be omitted, dry_run must pass through"
-
-
-async def test_merge_routes_to_the_tenant(proxied):
-    resp = await mem_api.merge_into_memory(
-        memory_id="mem-1", new_content="the office moved to floor 3",
-        source_type="manual", current_user=_User(), db=None,
-    )
-    assert resp.status_code == 200
-    assert proxied[0]["path"] == "mem-1/merge"
-    assert proxied[0]["params"]["new_content"] == "the office moved to floor 3"
-
-
-async def test_merge_refuses_never_store_content_before_proxying(proxied):
-    """The secret gate is a pure function; it must fire before the network,
-    preserving the 422 + reason instead of a generic tenant 502."""
-    from fastapi import HTTPException
-
-    pan = "4111 1111 1111 1111"  # test PAN, passes Luhn
-    with pytest.raises(HTTPException) as exc:
-        await mem_api.merge_into_memory(
-            memory_id="mem-1", new_content=f"my card number is {pan}",
-            source_type="manual", current_user=_User(), db=None,
+def test_reads_no_longer_fall_back_to_the_platform_database():
+    """The one contract that CHANGED. `_proxy_memories` still returns None
+    on failure, but every caller now raises 503 instead of running a local
+    branch — there is nothing left in the platform DB to run it against."""
+    routes = {name: body for _, _, name, body in _route_blocks()}
+    for name in ("list_memory_files", "get_memory_file", "search_memory_files",
+                 "memory_log", "admin_migrate_v3_report"):
+        body = routes[name]
+        assert "_agent_unreachable()" in body, name
+        assert "MemoryService" not in body, (
+            f"{name} runs a platform-DB branch — that is the round-8 virtual "
+            "view, and under v3 it can only produce an empty library"
         )
-    assert exc.value.status_code == 422
-    assert proxied == [], "refused content must never leave the platform"
 
 
-async def test_related_read_proxies_with_depth(proxied):
-    resp = await mem_api.get_memory_with_relations(
-        memory_id="mem-9", depth=2, current_user=_User(), db=None,
-    )
-    assert resp.status_code == 200
-    assert proxied == [{"path": "mem-9/related", "method": "GET",
-                        "params": {"depth": 2}}]
+# ── Structural: ordering ─────────────────────────────────────────────────
+# Starlette matches in declaration order. `{slug:path}` is greedy, so every
+# literal route must either be declared BEFORE the captures or be
+# unreachable-by-construction from them. Round 8's version of this test
+# looked for `/{memory_id}` — the capture that route no longer exists.
+
+def test_no_literal_route_is_shadowed_by_the_slug_capture():
+    order = [path for _, path, _, _ in _route_blocks()]
+    captures = [i for i, p in enumerate(order) if "{slug:path}" in p]
+    assert captures, "the memory-file routes are gone"
+    for i, path in enumerate(order):
+        if "{" in path:
+            continue
+        for c in captures:
+            if c < i:
+                assert order[c].startswith("/files/"), (
+                    f"literal route {path!r} is declared after the greedy "
+                    f"capture {order[c]!r} and can never be reached"
+                )
 
 
-async def test_events_read_falls_back_to_local_when_proxy_returns_none(monkeypatch):
-    """Reads MAY fall back (worst case: stale/empty) — pin the asymmetry."""
-    async def fake_info(user_id, db):
-        return ("http://agent.test", "key-123")
-
-    async def fake_read(*a, **kw):
-        return None  # tenant unreachable
-
-    class _Svc:
-        def __init__(self, db):
-            pass
-
-        async def get_memory(self, memory_id, user_id):
-            return None  # local platform DB has no such row
-
-    monkeypatch.setattr(mem_api, "_get_agent_proxy_info", fake_info)
-    monkeypatch.setattr(mem_api, "_proxy_memories", fake_read)
-    monkeypatch.setattr(mem_api, "MemoryService", _Svc)
-
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException) as exc:
-        await mem_api.get_memory_events(
-            memory_id="mem-9", limit=100, current_user=_User(), db=None,
-        )
-    assert exc.value.status_code == 404, "read fallback runs the local path"
-
-
-# ── Structural: the file routes must precede /{memory_id} ────────────────
-# Starlette matches in declaration order; a `/files` route declared after
-# `/{memory_id}` is silently captured by it ("files" parses as a memory id)
-# and every files request 404s. Same class of pin as the /breakdown and
-# /search ordering notes in memories.py.
-
-def test_file_routes_precede_the_memory_id_capture():
-    routes = _route_blocks()
-    order = [path for _, path, _, _ in routes]
-    id_capture = next(i for i, p in enumerate(order) if p.startswith("/{memory_id}"))
-    file_routes = [i for i, p in enumerate(order) if p.startswith("/files")]
-    assert file_routes, "the memory-file routes are gone"
-    late = [order[i] for i in file_routes if i > id_capture]
-    assert not late, f"file routes declared after /{{memory_id}} capture them: {late}"
+def test_the_row_era_routes_are_gone_not_merely_unused():
+    """`/breakdown`, `/search` (POST), `/{memory_id}` and friends were the
+    row product. Leaving one behind leaves a way back to it."""
+    paths = {path for _, path, _, _ in _route_blocks()}
+    assert not [p for p in paths if "{memory_id}" in p]
+    assert "/breakdown" not in paths
+    assert "/deduplicate" not in paths
+    assert "/duplicates/report" not in paths

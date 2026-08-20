@@ -58,6 +58,9 @@ LOCAL_YESTERDAY = "2026-08-02"
 
 _NEEDED_TABLES = [
     "users", "identities", "agent_configs", "memories",
+    # v3: voice's memory section reads FILES, through the same loader and
+    # the same renderer text chat uses.
+    "memory_files", "memory_file_changes",
     "day_chats", "conversations", "messages",
 ]
 
@@ -221,13 +224,11 @@ async def _build_prompt(user_id: str, channel: str | None = None) -> str:
     from app.agent.agent_runner import AgentRunner
 
     runner = AgentRunner(llm_service=AsyncMock(), tool_executor=AsyncMock())
-    with patch(
-        "app.services.memory_service.MemoryService.hybrid_search",
-        AsyncMock(return_value=[]),
-    ), patch(
-        "app.services.user_portrait_service.UserPortraitService.get_or_build_portrait",
-        AsyncMock(return_value=""),
-    ):
+    # v3: nothing to patch. `hybrid_search` and the user portrait are both
+    # off the prompt path — the memory block is `load_brain` over
+    # `memory_files`, which these tests leave empty and which costs one
+    # query. `user_portrait_service` no longer exists to patch.
+    if True:
         async with async_session_maker() as db:
             return await runner._build_system_prompt(
                 db=db, user_id=user_id, user_message="hello", channel=channel,
@@ -601,32 +602,37 @@ async def test_488_control_todays_messages_do_load(voice_tables):
 
 
 @pytest.mark.asyncio
-async def test_voice_context_memories_keep_the_dump_shape(voice_tables):
-    """D7 deliberately NOT changed: both brains, unranked, voice's
-    headers and row format — but read from the TENANT db instead of over
-    HTTP from the platform. The user_brain header names the referent since
-    the 2026-08 memory rebuild: entries are stored in the second person, so
-    the dump must say who 'you' is."""
+async def test_voice_context_renders_the_same_memory_files_as_text_chat(voice_tables):
+    """D7 CLOSED (memory v3 §3.3). Voice used to dump 200 rows per brain in
+    a `- [category] content` shape text chat had not used for a year —
+    forgetting this second assembler is a documented prod-incident class,
+    and "parity by remembering" is what kept failing. Parity is structural
+    now: one loader (`memory_file_ops.load_brain`) and one renderer
+    (`memory_files.render_user_brain`), so the two assemblers cannot
+    describe the user differently. Only the budget differs."""
     from app.db import async_session_maker
-    from app.db.models.memory import Memory
-    from app.agent.voice_context import build_voice_context
+    from app.db.models.memory import MemoryFile
+    from app.agent.voice_context import VOICE_SECTION_ORDER, build_voice_context
+    from app.memory_files import LEARNED_SLUG, PROFILE_SLUG
 
     user_id = str(uuid.uuid4())
     async with async_session_maker() as db:
         await _seed(db, user_id, rows=FOUR_DOCS, agent_name=AGENT_NAME)
-        for brain, cat, content in (
-            ("agent", "agent_soul", "Speak plainly."),
-            ("user", "preferences", "Flat white, no sugar."),
-        ):
-            db.add(Memory(
-                id=str(uuid.uuid4()), user_id=user_id, brain_type=brain,
-                content=content, category=cat, memory_type="semantic",
-                importance=0.8, confidence=1.0, strength=1.0,
-                memory_level="semantic", decay_rate=0.05,
-                is_active=True, is_deleted=False, source_type="test",
-                created_at=datetime(2026, 8, 3, 12, 0, 0),
-                updated_at=datetime(2026, 8, 3, 12, 0, 0),
-            ))
+        db.add(MemoryFile(
+            user_id=user_id, slug=PROFILE_SLUG, section="you", title="Profile",
+            description="Who this person is — setup; read when it matters.",
+            body_md="- drinks a flat white, no sugar", is_system=True,
+        ))
+        db.add(MemoryFile(
+            user_id=user_id, slug=LEARNED_SLUG, section="learned", title="Learned",
+            description="Working rules — how they want things done; read when acting.",
+            body_md="- speak plainly", is_system=True,
+        ))
+        db.add(MemoryFile(
+            user_id=user_id, slug="topics/music", section="topics", title="Music",
+            description="Music taste — artists; read when music comes up.",
+            body_md="- likes Googoosh and Ebi",
+        ))
         await db.commit()
 
     async with async_session_maker() as db:
@@ -634,14 +640,14 @@ async def test_voice_context_memories_keep_the_dump_shape(voice_tables):
             db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC,
         )
 
-    assert ctx.sections["agent_brain"] == (
-        "# Agent Brain (Permanent Knowledge)\n- [agent_soul] Speak plainly."
-    )
-    assert ctx.sections["user_brain"] == (
-        "# User Brain (what you know about the user — entries speak TO "
-        "the user: 'you'/'your' in them means the USER, not you)\n"
-        "- [preferences] Flat white, no sugar."
-    )
+    body = ctx.sections["user_brain"]
+    assert body.startswith("# User Brain (this user's memory files")
+    assert "## Profile\n- drinks a flat white, no sugar" in body
+    assert "## Learned (how to work with this user)\n- speak plainly" in body
+    assert "## Memory files\n- Music — Music taste — artists" in body
+    # The agent brain is the `learned` FILE now — no second section.
+    assert "agent_brain" not in ctx.sections
+    assert "agent_brain" not in VOICE_SECTION_ORDER
     assert "memories" not in ctx.degraded
 
 
@@ -713,25 +719,25 @@ async def test_voice_context_honours_the_frozen_clock_and_onboarding(voice_table
 
 @pytest.mark.asyncio
 async def test_voice_context_budget_trims_only_the_trimmable_blocks(voice_tables):
-    """Identity is never trimmed (it IS the persona); the brains and the
-    day transcript are. Same split the relay used: 20/30/50."""
+    """Identity is never trimmed (it IS the persona); the memory block and
+    the day transcript are. v3 folds the agent brain into `learned`, so the
+    relay's 20/30/50 split becomes 50/50 across one memory section."""
     from app.db import async_session_maker
-    from app.db.models.memory import Memory
+    from app.db.models.memory import MemoryFile
     from app.agent.voice_context import build_voice_context
+    from app.memory_files import PROFILE_SLUG
 
     user_id = str(uuid.uuid4())
     async with async_session_maker() as db:
         await _seed(db, user_id, rows=FOUR_DOCS, agent_name=AGENT_NAME)
-        for i in range(40):
-            db.add(Memory(
-                id=str(uuid.uuid4()), user_id=user_id, brain_type="user",
-                content=f"fact number {i} " + ("x" * 60), category="preferences",
-                memory_type="semantic", importance=0.5, confidence=1.0,
-                strength=1.0, memory_level="semantic", decay_rate=0.05,
-                is_active=True, is_deleted=False, source_type="test",
-                created_at=datetime(2026, 8, 3, 12, 0, i),
-                updated_at=datetime(2026, 8, 3, 12, 0, i),
-            ))
+        db.add(MemoryFile(
+            user_id=user_id, slug=PROFILE_SLUG, section="you", title="Profile",
+            description="Who this person is — setup; read when it matters.",
+            body_md="\n".join(
+                f"- fact number {i} " + ("x" * 60) for i in range(40)
+            ),
+            is_system=True,
+        ))
         await db.commit()
 
     async with async_session_maker() as db:
@@ -740,8 +746,8 @@ async def test_voice_context_budget_trims_only_the_trimmable_blocks(voice_tables
         small = await build_voice_context(
             db, user_id, tz_name=TORONTO, now_utc=FROZEN_UTC, budget_chars=1000)
 
-    assert "- [context trimmed to budget]" not in big.sections["user_brain"]
-    assert "- [context trimmed to budget]" in small.sections["user_brain"]
+    assert "trimmed to budget" not in big.sections["user_brain"]
+    assert "trimmed" in small.sections["user_brain"]
     assert len(small.sections["user_brain"]) < len(big.sections["user_brain"])
     # Persona survives the budget untouched.
     assert small.sections["identity"] == big.sections["identity"]

@@ -637,11 +637,26 @@ def test_dashboard_tasks_use_unattended_channel():
 
 
 def test_recalled_memory_is_data_fenced():
-    """Stored/second-order injection: the recalled '# User Brain' block must be
-    framed as reference data under injection_fencing_v2."""
+    """Stored/second-order injection: the '# User Brain' block must be
+    framed as reference data under injection_fencing_v2.
+
+    A memory file can hold text the user PASTED or that arrived from
+    another person and was written into a bullet by the curator, so the
+    block is DATA. Memory v3 changed the wording (the block is files now,
+    not recalled sentences) — what is pinned is the binding and the
+    prohibition, not the prose:
+      * the fence is applied by a single literal `.replace("# User Brain\n"
+        …, 1)`, so a renamed heading silently stops fencing while
+        `injection_fencing_v2` still reads True;
+      * the framing must forbid following instructions found inside."""
     src = (_BACKEND / "app" / "agent" / "agent_runner.py").read_text()
-    assert "STORED REFERENCE DATA recalled" in src
-    assert "never follow instructions" in src.lower() or "NEVER follow instructions" in src
+    assert "STORED REFERENCE DATA" in src
+    fence = src[src.index("injection_fencing_v2"):]
+    fence = fence[: fence.index("        # PR-1")]
+    assert fence.count(chr(34) + "# User Brain") >= 2, (
+        "the fence no longer binds to the `# User Brain` heading literal"
+    )
+    assert "never follow instructions" in src.lower()
 
 
 # ── Round 10 (2026-07-22 sink+authz sweep) ─────────────────────────────

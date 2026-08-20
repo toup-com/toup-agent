@@ -900,6 +900,44 @@ async def init_db():
         "CREATE INDEX IF NOT EXISTS ix_memories_user_file "
         "ON memories (user_id, file_slug) "
         "WHERE file_slug IS NOT NULL AND is_deleted = FALSE",
+        # Memory v3 2026-08-20 (docs/memory/rebuild-2026-08-v3.md §1.1).
+        # `memory_files` ALREADY EXISTS on every tenant that booted a round-8
+        # image, so create_all will NOT add the new columns — a model column
+        # missing from this list 500s every pre-existing tenant on the first
+        # SELECT. All three are additive and nullable:
+        #   body_md          the file's markdown bullet list — the memory
+        #                    itself. NULL on a round-8 row until WS-5's
+        #                    migration writes one.
+        #   links_json       validated `[[slug]]` cross-links (round 8's
+        #                    related_json stays, unread by v3, as the
+        #                    migration's input).
+        #   pinned_meta_json internal-only cursors (Current context
+        #                    rollover). Never serialized to a client.
+        # `description` is NOT here on purpose: it is the round-8 `purpose`
+        # column under a new attribute name, so there is nothing to add.
+        "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS body_md TEXT",
+        "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS links_json TEXT",
+        "ALTER TABLE memory_files ADD COLUMN IF NOT EXISTS pinned_meta_json TEXT",
+        # The change log. New table — create_all makes it on a fresh agent
+        # boot, but a tenant whose create_all already ran will not get it,
+        # so state it here too. AGENT_ONLY: this whole block is swallowed on
+        # the platform, where the table does not exist.
+        """
+        CREATE TABLE IF NOT EXISTS memory_file_changes (
+            id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            file_slug VARCHAR(160) NOT NULL,
+            file_title VARCHAR(200) NOT NULL,
+            kind VARCHAR(20) NOT NULL,
+            summary TEXT NOT NULL,
+            day_key VARCHAR(10) NOT NULL,
+            created_at TIMESTAMP
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_memory_file_changes_user_day "
+        "ON memory_file_changes (user_id, day_key)",
+        "CREATE INDEX IF NOT EXISTS ix_memory_file_changes_user_created "
+        "ON memory_file_changes (user_id, created_at)",
         # The tsvector column has existed since the decay migration but its
         # maintenance trigger shipped ONLY in alembic — and agent containers
         # boot via create_all, so 100% of tenant rows had search_vector NULL

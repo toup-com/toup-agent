@@ -72,11 +72,16 @@ AGENT_ONLY_TABLES: set[str] = {
     "autopilot_approvals",
     # Memory system
     "memories",
-    # Curated memory files (the organizing layer over memories rows).
-    # Deliberately NO platform mirror: the platform's read fallback
-    # synthesizes a virtual file view from memories rows alone, so an
-    # unreachable agent degrades to organized-but-uncurated, never to a lie.
+    # Curated memory files — in v3 these ARE the memory (body_md), not an
+    # organizing layer over rows. Deliberately NO platform mirror: with
+    # rows retired the platform has nothing to synthesize from, so a file
+    # read there degrades to 503 rather than to a lie (rebuild-2026-08-v3
+    # §4). The clients already own an honest error state.
     "memory_files",
+    # The writer's audit trail: one row per applied mutation, bucketed by
+    # the USER-LOCAL day. Backs the Memory log calendar. Same isolation as
+    # memory_files — it names what the agent learned about its owner.
+    "memory_file_changes",
     # Durable outbox for facts extracted but not yet stored — capture is
     # fire-and-forget, so without this a failed write loses the turn silently.
     "memory_capture_outbox",

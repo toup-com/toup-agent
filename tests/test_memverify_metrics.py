@@ -214,146 +214,131 @@ def test_workflow_no_longer_swallows_a_missing_secret():
 
 
 # ── The metric definitions ───────────────────────────────────────────────
+#
+# v3 replaced `unlabeled_rate_pct` (a per-ROW taxonomy rate) with
+# `lint_clean_pct` and `misroute_pct`. See the module docstring of
+# tests/memverify/metrics.py for why those two are the failures the FILE
+# model can have and the row model could not. `label_verdict`,
+# `CATCH_ALL_BY_BRAIN` and the tests that pinned them retire with the
+# `category` column they read.
 
 
 def _metrics():
     from tests.memverify.metrics import (  # noqa: PLC0415 - import cost is real
-        CATCH_ALL,
-        CATCH_ALL_BY_BRAIN,
+        DENOMINATOR_OF,
         GATED_METRICS,
-        LABELED,
-        NON_CANONICAL,
         ScenarioCounts,
         check,
-        label_verdict,
+        format_report,
         load_baseline,
         summarize,
     )
 
     return dict(
-        CATCH_ALL=CATCH_ALL,
-        CATCH_ALL_BY_BRAIN=CATCH_ALL_BY_BRAIN,
+        DENOMINATOR_OF=DENOMINATOR_OF,
         GATED_METRICS=GATED_METRICS,
-        LABELED=LABELED,
-        NON_CANONICAL=NON_CANONICAL,
         ScenarioCounts=ScenarioCounts,
         check=check,
-        label_verdict=label_verdict,
+        format_report=format_report,
         load_baseline=load_baseline,
         summarize=summarize,
     )
-
-
-@pytest.mark.parametrize(
-    "category,brain,expected",
-    [
-        # Canonical, discriminating -> labeled.
-        ("identity", "user", "labeled"),
-        ("health", "user", "labeled"),
-        ("active_task", "user", "labeled"),
-        ("corrections", "agent", "labeled"),
-        # The catch-all bucket: stored fine, says nothing.
-        ("other", "user", "catch_all"),
-        ("domain_knowledge", "agent", "catch_all"),
-        # WorkCategory has exactly one member, so `process` is not evidence of
-        # a missing label — see metrics.py's docstring.
-        ("process", "work", "labeled"),
-        # Nothing at all.
-        (None, "user", "non_canonical"),
-        ("", "user", "non_canonical"),
-        ("   ", "user", "non_canonical"),
-        # The exact 2026-07-29 shape: pre-unification values the app has no
-        # label for. They ALIAS to something canonical, but the value sitting
-        # in the column is not canonical, so the app still renders "Other".
-        ("schedule", "user", "non_canonical"),
-        ("projects", "user", "non_canonical"),
-        ("family", "user", "non_canonical"),
-        # An outright unknown value.
-        ("quux", "user", "non_canonical"),
-        # A canonical USER value is meaningless on the AGENT brain.
-        ("identity", "agent", "non_canonical"),
-        # Blank brain_type defaults to the user brain.
-        ("identity", "", "labeled"),
-        ("other", None, "catch_all"),
-    ],
-)
-def test_label_verdict(category, brain, expected):
-    assert _metrics()["label_verdict"](category, brain) == expected
-
-
-def test_catch_all_table_still_matches_the_taxonomy():
-    """`CATCH_ALL_BY_BRAIN` is a copy of what `normalize_category` falls back
-    to. If the taxonomy changes its fallback and this table does not, the
-    unlabeled rate silently starts measuring the wrong thing."""
-    from app.memory_taxonomy import normalize_category
-
-    m = _metrics()
-    for brain, expected in m["CATCH_ALL_BY_BRAIN"].items():
-        assert normalize_category("a-value-no-taxonomy-will-ever-have", brain) == expected
 
 
 def _scenario(SC, **kw):
     return SC(id=kw.pop("id", "X"), **kw)
 
 
-def test_summarize_computes_all_three_headline_numbers():
+#: A measured summary that meets every bound. Every `check` test below
+#: starts from this and breaks exactly one thing, so a test can never pass
+#: because of a key it forgot to set.
+def _clean_measured():
+    return {
+        "capture_pct": 100.0,
+        "precision_pct": 100.0,
+        "lint_clean_pct": 100.0,
+        "misroute_pct": 0.0,
+        "capture_markers_total": 11,
+        "junk_markers_total": 37,
+        "lint_units_total": 40,
+        "captured_markers_total": 11,
+    }
+
+
+def _bounds():
+    return {
+        "capture_pct": {"min": 100.0},
+        "precision_pct": {"min": 100.0},
+        "lint_clean_pct": {"min": 100.0},
+        "misroute_pct": {"max": 0.0},
+    }
+
+
+def test_summarize_computes_all_four_headline_numbers():
     m = _metrics()
     SC = m["ScenarioCounts"]
     scenarios = [
-        # A capture scenario: 4 facts wanted, 3 found. 4 rows stored, one of
-        # them in the catch-all bucket.
+        # A capture scenario: 4 facts wanted, 3 found, 1 of the 3 misrouted.
+        # It wrote 5 bullets, one of which fails lint, and 2 descriptions.
         _scenario(
             SC,
-            id="A01",
-            must_store_total=4,
-            must_store_found=3,
-            labels=(
-                ("identity", "user"),
-                ("health", "user"),
-                ("work", "user"),
-                ("other", "user"),
-            ),
-            counts_toward_recall=True,
+            id="P01",
+            capture_total=4,
+            capture_found=3,
+            misrouted=1,
+            bullets_total=5,
+            bullet_problems=1,
+            descriptions_total=2,
+            counts_toward_capture=True,
         ),
-        # A junk scenario: 5 markers must stay out, 1 got in. It also left one
-        # non-canonical row behind.
+        # A junk scenario: 5 markers must stay out, 1 got in. It also left a
+        # file behind that the label forbids.
         _scenario(
             SC,
             id="B01",
-            must_not_store_total=5,
-            must_not_store_hit=1,
-            labels=(("schedule", "user"),),
+            reject_total=5,
+            reject_hit=1,
+            bullets_total=1,
+            forbidden_slugs=1,
         ),
-        # A scenario with must_store markers that does NOT count toward recall
-        # (SENSITIVE K05 is exactly this shape). It must not move recall_pct.
+        # A scenario with capture markers that does NOT count toward the
+        # capture rate — the BELT run of an injected scenario is exactly this
+        # shape. It must not move `capture_pct`, but it MUST still contribute
+        # its junk markers and its lint units.
         _scenario(
             SC,
-            id="K05",
-            must_store_total=10,
-            must_store_found=0,
-            must_not_store_total=1,
-            must_not_store_hit=0,
-            labels=(("health", "user"),),
-            counts_toward_recall=False,
+            id="B01[dirty]",
+            capture_total=10,
+            capture_found=0,
+            reject_total=1,
+            reject_hit=0,
+            bullets_total=0,
+            counts_toward_capture=False,
         ),
     ]
     got = m["summarize"](scenarios)
 
-    assert got["recall_facts_total"] == 4
-    assert got["recall_facts_found"] == 3
-    assert got["recall_pct"] == 75.0
+    assert got["capture_markers_total"] == 4
+    assert got["capture_markers_found"] == 3
+    assert got["capture_pct"] == 75.0
 
     assert got["junk_markers_total"] == 6
     assert got["junk_stored_count"] == 1
     assert got["precision_pct"] == round(100 * 5 / 6, 2)
 
-    assert got["stored_rows_total"] == 6
-    assert got["non_canonical_rows"] == 1
-    assert got["catch_all_rows"] == 1
-    assert got["unlabeled_rows"] == 2
-    assert got["unlabeled_rate_pct"] == round(100 * 2 / 6, 2)
-    assert got["non_canonical_rate_pct"] == round(100 * 1 / 6, 2)
-    assert got["catch_all_rate_pct"] == round(100 * 1 / 6, 2)
+    # 6 bullets + 2 descriptions = 8 lint units, 1 bad.
+    assert got["bullets_total"] == 6
+    assert got["descriptions_total"] == 2
+    assert got["lint_units_total"] == 8
+    assert got["lint_problems"] == 1
+    assert got["lint_clean_pct"] == round(100 * 7 / 8, 2)
+
+    # Misroute divides by everything CAPTURED, belt runs included.
+    assert got["captured_markers_total"] == 3
+    assert got["misrouted_count"] == 1
+    assert got["misroute_pct"] == round(100 * 1 / 3, 2)
+
+    assert got["forbidden_slugs"] == 1
 
 
 def test_summarize_on_a_perfect_run():
@@ -363,25 +348,38 @@ def test_summarize_on_a_perfect_run():
         [
             _scenario(
                 SC,
-                must_store_total=2,
-                must_store_found=2,
-                must_not_store_total=3,
-                must_not_store_hit=0,
-                labels=(("identity", "user"), ("goals", "user")),
-                counts_toward_recall=True,
+                capture_total=2,
+                capture_found=2,
+                reject_total=3,
+                reject_hit=0,
+                bullets_total=4,
+                descriptions_total=1,
+                counts_toward_capture=True,
             )
         ]
     )
-    assert got["recall_pct"] == 100.0
+    assert got["capture_pct"] == 100.0
     assert got["precision_pct"] == 100.0
-    assert got["unlabeled_rate_pct"] == 0.0
-    # A perfect run clears both `contract` bounds in the REAL committed
-    # baseline. It does not clear unlabeled_rate_pct, whose bound is null —
-    # that is the point of the null, and it is asserted separately below.
+    assert got["lint_clean_pct"] == 100.0
+    assert got["misroute_pct"] == 0.0
+    # A perfect run clears every bound in the REAL committed baseline that
+    # HAS one. It does not clear `misroute_pct`, whose bound is null because
+    # the v3 suite has not yet run against a live model — that is the point
+    # of the null, and it is asserted separately below.
     offenders = {
-        v.metric for v in m["check"](got, m["load_baseline"]()) if v.metric != "unlabeled_rate_pct"
+        v.metric for v in m["check"](got, m["load_baseline"]())
+        if v.kind != "unrecorded"
     }
     assert offenders == set(), offenders
+
+
+def test_the_report_names_every_headline_number():
+    """The console line is what a human actually reads. A metric that moves
+    and is not printed is a metric nobody will notice."""
+    m = _metrics()
+    text = m["format_report"](_clean_measured())
+    for word in ("capture", "precision", "lint", "misroute"):
+        assert word in text.lower(), word
 
 
 # ── The baseline comparison ──────────────────────────────────────────────
@@ -389,52 +387,23 @@ def test_summarize_on_a_perfect_run():
 
 def test_check_passes_a_run_that_meets_every_bound():
     m = _metrics()
-    measured = {
-        "recall_pct": 100.0,
-        "precision_pct": 100.0,
-        "unlabeled_rate_pct": 12.0,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
-    }
-    baseline = {
-        "recall_pct": {"min": 100.0},
-        "precision_pct": {"min": 100.0},
-        "unlabeled_rate_pct": {"max": 15.0},
-        "non_canonical_rate_pct": {"max": 0.0},
-    }
-    assert m["check"](measured, baseline) == []
+    assert m["check"](_clean_measured(), _bounds()) == []
 
 
 @pytest.mark.parametrize(
     "metric,value,kind",
     [
-        ("recall_pct", 96.7, "min"),
+        ("capture_pct", 96.7, "min"),
         ("precision_pct", 97.2, "min"),
-        ("unlabeled_rate_pct", 15.01, "max"),
-        ("non_canonical_rate_pct", 1.1, "max"),
+        ("lint_clean_pct", 99.9, "min"),
+        ("misroute_pct", 0.01, "max"),
     ],
 )
 def test_check_reports_a_regression_on_each_gated_metric(metric, value, kind):
     m = _metrics()
-    measured = {
-        "recall_pct": 100.0,
-        "precision_pct": 100.0,
-        "unlabeled_rate_pct": 12.0,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
-    }
+    measured = _clean_measured()
     measured[metric] = value
-    baseline = {
-        "recall_pct": {"min": 100.0},
-        "precision_pct": {"min": 100.0},
-        "unlabeled_rate_pct": {"max": 15.0},
-        "non_canonical_rate_pct": {"max": 0.0},
-    }
-    violations = m["check"](measured, baseline)
+    violations = m["check"](measured, _bounds())
     assert [v.metric for v in violations] == [metric]
     assert violations[0].kind == kind
     assert str(value) in str(violations[0])
@@ -444,23 +413,12 @@ def test_a_null_bound_is_a_failure_not_a_pass():
     """The same class of defect as the CI step itself: an unmeasured number
     must not read as a pass. The message has to carry the value to record."""
     m = _metrics()
-    measured = {
-        "recall_pct": 100.0,
-        "precision_pct": 100.0,
-        "unlabeled_rate_pct": 8.5,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
-    }
-    baseline = {
-        "recall_pct": {"min": 100.0},
-        "precision_pct": {"min": 100.0},
-        "unlabeled_rate_pct": {"max": None},
-        "non_canonical_rate_pct": {"max": 0.0},
-    }
+    measured = _clean_measured()
+    measured["misroute_pct"] = 8.5
+    baseline = _bounds()
+    baseline["misroute_pct"] = {"max": None}
     violations = m["check"](measured, baseline)
-    assert [v.metric for v in violations] == ["unlabeled_rate_pct"]
+    assert [v.metric for v in violations] == ["misroute_pct"]
     assert violations[0].kind == "unrecorded"
     assert "8.5" in str(violations[0])
 
@@ -468,55 +426,46 @@ def test_a_null_bound_is_a_failure_not_a_pass():
 @pytest.mark.parametrize(
     "denominator,metric",
     [
-        ("recall_facts_total", "recall_pct"),
+        ("capture_markers_total", "capture_pct"),
         ("junk_markers_total", "precision_pct"),
-        ("stored_rows_total", "unlabeled_rate_pct"),
+        ("lint_units_total", "lint_clean_pct"),
+        ("captured_markers_total", "misroute_pct"),
     ],
 )
 def test_check_refuses_a_vacuous_rate(denominator, metric):
-    """ANTI-VACUITY. `summarize` returns 0.0 for an empty denominator, which
-    would sail past `min: 100`? No — but `max: 15` on an empty store, and
-    `precision 100%` over zero markers, both read as clean passes on a corpus
-    that did nothing. A zero denominator is a failure."""
+    """ANTI-VACUITY. `summarize` returns 0.0 for an empty denominator, so
+    `misroute 0%` over zero captures and `precision 100%` over zero markers
+    both read as clean passes on a corpus that did nothing. A zero
+    denominator is a failure.
+
+    Every gated metric has a denominator, and this parametrization is
+    derived from `DENOMINATOR_OF` in the assertion below — so a new metric
+    added without one cannot slip through uncovered.
+    """
     m = _metrics()
-    measured = {
-        "recall_pct": 100.0,
-        "precision_pct": 100.0,
-        "unlabeled_rate_pct": 0.0,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
-    }
+    measured = _clean_measured()
     measured[denominator] = 0
-    baseline = {
-        "recall_pct": {"min": 100.0},
-        "precision_pct": {"min": 100.0},
-        "unlabeled_rate_pct": {"max": 15.0},
-        "non_canonical_rate_pct": {"max": 0.0},
-    }
-    violations = m["check"](measured, baseline)
+    violations = m["check"](measured, _bounds())
     assert metric in [v.metric for v in violations]
     assert all(v.kind == "vacuous" for v in violations if v.metric == metric)
 
 
+def test_every_gated_metric_has_a_denominator():
+    m = _metrics()
+    missing = [g for g in m["GATED_METRICS"] if g not in m["DENOMINATOR_OF"]]
+    assert not missing, (
+        f"{missing} are gated with no denominator — a rate with no "
+        "anti-vacuity check is a rate that passes on an empty run"
+    )
+
+
 def test_check_reports_a_gated_metric_with_no_baseline_entry():
     m = _metrics()
-    measured = {
-        "recall_pct": 100.0,
-        "precision_pct": 100.0,
-        "unlabeled_rate_pct": 5.0,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
-    }
-    baseline = {"recall_pct": {"min": 100.0}}
-    violations = m["check"](measured, baseline)
+    violations = m["check"](_clean_measured(), {"capture_pct": {"min": 100.0}})
     assert {v.metric for v in violations} == {
         "precision_pct",
-        "unlabeled_rate_pct",
-        "non_canonical_rate_pct",
+        "lint_clean_pct",
+        "misroute_pct",
     }
     assert all(v.kind == "missing" for v in violations)
 
@@ -554,18 +503,17 @@ def test_baseline_marks_an_unrecorded_bound_as_unrecorded():
 
 
 def test_the_repo_baseline_still_gates_a_regressed_run():
-    """End-to-end over the REAL committed file: a run that misses one fact and
-    stores one junk row must not pass."""
+    """End-to-end over the REAL committed file: a run that misses one fact,
+    stores one junk entry and writes one badly-voiced bullet must not pass."""
     m = _metrics()
-    baseline = m["load_baseline"]()
-    bad = {
-        "recall_pct": 96.67,
-        "precision_pct": 97.22,
-        "unlabeled_rate_pct": 4.0,
-        "non_canonical_rate_pct": 0.0,
-        "recall_facts_total": 30,
-        "junk_markers_total": 36,
-        "stored_rows_total": 90,
+    bad = _clean_measured()
+    bad.update({
+        "capture_pct": 90.91,
+        "precision_pct": 97.3,
+        "lint_clean_pct": 97.5,
+        "misroute_pct": 9.09,
+    })
+    violations = m["check"](bad, m["load_baseline"]())
+    assert {v.metric for v in violations} >= {
+        "capture_pct", "precision_pct", "lint_clean_pct",
     }
-    violations = m["check"](bad, baseline)
-    assert {v.metric for v in violations} >= {"recall_pct", "precision_pct"}

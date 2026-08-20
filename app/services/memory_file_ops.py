@@ -1,28 +1,34 @@
-"""LLM-mediated curation of ONE memory file, under a strict ops contract.
+"""The memory-file store and its strict ops engine (v3 §1.3–§2.2).
 
-Two callers, one engine (docs/memory/rebuild-2026-08.md §3.6–3.7):
+Everything that reads or writes `memory_files.body_md` goes through here.
+The LLM half — prompts, the model call, the retry — lives in
+`memory_curator.py`; this module is deterministic and testable without a
+key, which is what lets `make memory-verify-ci` keep teeth without an LLM.
 
-- the natural-language edit box on a file page ("Tell your agent what to
-  change or remove") → `curate_file(..., instruction=...)`;
-- the one-time migration's per-file consolidation pass → `curate_file(...)`
-  with no instruction.
+The op set (v3 §2.2):
 
-The model proposes operations; nothing it says is applied until it survives
-validation, and every applied op rides the EXISTING evolution primitives
-(merge_memory / supersede_memory / soft delete / smart create), so history,
-audit events, embeddings and the recall surfaces stay honest. Sources of a
-merge are soft-archived with `superseded_by` pointers — nothing this module
-does hard-deletes a row, which is what makes the whole pass reversible.
+    create_file        {section, slug, title, description}
+    update_description {slug, description}
+    add                {slug, bullet, change}
+    rewrite            {slug, match, bullet, change}
+    remove             {slug, match, change}
+    link               {slug, links: [slug]}
+    delete_file        {slug, change}
 
-Validation is the contract:
-- every referenced id must be an ACTIVE entry of THIS file;
-- an id may be touched by at most one op;
-- text must be non-empty, ≤ MAX_ENTRY_CHARS, and in the user's second
-  person — any "the user" phrasing rejects that op;
-- `delete` is capped (noise removal, not clearance — the file-delete button
-  owns wholesale removal), and consolidation may delete less than instruct;
-- an invalid op skips THAT op, never the batch; a malformed response
-  retries once with the validator's complaints appended.
+`match` is the EXACT existing bullet text. No index arithmetic: a model
+that miscounts by one silently rewrites the wrong fact, and a body that
+changed between the read and the write makes every index stale.
+
+Validation is a SIMULATION. Ops are applied to an in-memory copy of the
+touched files in order, so `create_file` followed by `add` to that slug
+validates, `rewrite` sees the bullet a previous `add` produced, and the
+8 KB per-file cap is measured against the body the batch would actually
+leave behind. `apply_ops` then persists exactly the state validation
+computed — the two can never disagree, because there is only one walk.
+
+An invalid op skips THAT op and appends a complaint; the caller may retry
+once with the complaints appended (memory_curator does). Nothing is
+partially applied: the persist step writes whole bodies.
 """
 
 from __future__ import annotations
@@ -30,378 +36,1045 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
-from app.db.models import Memory, MemoryFile
-from app.db.models.enums import MemoryEventType
-from app.memory_files import SECTION_DEFAULT_CATEGORY, SYSTEM_FILES, FileSection, is_valid_slug
-from app.memory_taxonomy import normalize_category
-from app.services.memory_file_service import MemoryFileService
-from app.services.memory_log import describe_memory
-from app.services.memory_service import MemoryService
+from app.db.models import MemoryFile, MemoryFileChange
+from app.memory_files import (
+    ALWAYS_INJECTED_SLUGS,
+    CURRENT_CONTEXT_SLUG,
+    LEARNED_SLUG,
+    MAX_BODY_CHARS,
+    PROFILE_SLUG,
+    SECTION_ORDER,
+    SYSTEM_FILES,
+    FileSection,
+    bullet_problem,
+    description_problem,
+    extract_links,
+    is_bullet_list,
+    is_valid_slug,
+    parse_bullets,
+    render_bullets,
+    section_of_slug,
+    slugify,
+    title_from_slug,
+)
+from app.services.user_identity import UserIdentity
 
 logger = logging.getLogger(__name__)
 
 MAX_OPS = 40
-MAX_ENTRY_CHARS = 600
-# Voice guard: storage speaks to the user. Any third-person "the user"
-# phrasing is the exact defect this rebuild removes — never let an op
-# reintroduce it.
-_THIRD_PERSON_RE = re.compile(r"\bthe\s+user\b", re.IGNORECASE)
+MAX_LINKS_PER_FILE = 8
+MAX_CHANGE_CHARS = 300
+
+#: kind written to memory_file_changes, per op.
+_CHANGE_KIND = {
+    "create_file": "created",
+    "update_description": "updated",
+    "add": "updated",
+    "rewrite": "updated",
+    "remove": "removed",
+    "delete_file": "file_deleted",
+}
 
 
-def _entry_text(m: Memory) -> str:
-    return (m.canonical_content or m.content or "").strip()
+# ── In-memory file state (the simulation) ─────────────────────────────
+
+@dataclass
+class FileState:
+    slug: str
+    section: str
+    title: str
+    description: Optional[str] = None
+    bullets: List[str] = field(default_factory=list)
+    links: List[str] = field(default_factory=list)
+    is_system: bool = False
+    raw_body: Optional[str] = None
+    #: True when the file has no row yet (a create_file in this batch).
+    is_new: bool = False
+    #: True when a delete_file op in this batch removed it.
+    deleted: bool = False
+    #: True when a BULLET op changed the body. Deliberately NOT set by
+    #: `link` or `update_description`: those write their own columns, and
+    #: re-rendering the body for them would reflow it for no reason.
+    dirty: bool = False
+
+    @property
+    def has_prose(self) -> bool:
+        """True when the stored body holds anything that is not a bullet.
+
+        Current context is `##` layer headings with prose beneath (v3 §6),
+        and `parse_bullets` cannot see any of it. Re-rendering such a body
+        from `bullets` would DELETE the layers — so a bullet op on a prose
+        body is refused rather than applied. WS-3's updater owns that file's
+        shape; the curator must not flatten it on the way past.
+        """
+        return not is_bullet_list(self.raw_body)
+
+    def body(self) -> str:
+        """The body this state renders to. Byte-exact unless a bullet op
+        touched it."""
+        if not self.dirty and self.raw_body is not None:
+            return self.raw_body
+        return render_bullets(self.bullets)
+
+
+def _state_from_row(row: MemoryFile) -> FileState:
+    return FileState(
+        slug=row.slug,
+        section=row.section,
+        title=row.title,
+        description=row.description,
+        bullets=parse_bullets(row.body_md),
+        links=_load_links(row),
+        is_system=bool(row.is_system),
+        raw_body=row.body_md,
+    )
+
+
+def _load_links(row: MemoryFile) -> List[str]:
+    try:
+        parsed = json.loads(row.links_json) if row.links_json else []
+        return [s for s in parsed if isinstance(s, str)]
+    except Exception:
+        return []
+
+
+# ── Reads ─────────────────────────────────────────────────────────────
+
+async def _all_files(db: AsyncSession, user_id: str) -> List[MemoryFile]:
+    """Every v3 file row for a user, one query.
+
+    Round-8 rows (sections `knowledge`, `working`, `preferences`, the bare
+    `profile`) are filtered OUT rather than shown in a v3 section they were
+    never written for. They stay on disk untouched — that is the rollback —
+    until WS-5's migration folds them into v3 files.
+    """
+    rows = (await db.execute(
+        select(MemoryFile).where(MemoryFile.user_id == user_id)
+    )).scalars().all()
+    valid = {s.value for s in SECTION_ORDER}
+    return [r for r in rows if r.section in valid and section_of_slug(r.slug) is not None]
+
+
+def _sort_key(row: MemoryFile) -> Tuple[int, int, str]:
+    order = [s.value for s in SECTION_ORDER]
+    return (
+        order.index(row.section) if row.section in order else len(order),
+        0 if row.is_system else 1,
+        (row.title or "").lower(),
+    )
+
+
+async def ensure_system_files(db: AsyncSession, user_id: str) -> List[MemoryFile]:
+    """Create the three fixed files if they are missing. Agent-side only.
+
+    Idempotent and cheap. A file born here has an EMPTY body and the canon
+    description from `SYSTEM_FILES` — the one place a description is not
+    generated, because these three exist before the writer has ever run.
+    """
+    existing = {
+        r.slug: r for r in (await db.execute(
+            select(MemoryFile).where(
+                and_(MemoryFile.user_id == user_id,
+                     MemoryFile.slug.in_(list(SYSTEM_FILES)))
+            )
+        )).scalars().all()
+    }
+    created: List[MemoryFile] = []
+    for position, (slug, spec) in enumerate(SYSTEM_FILES.items()):
+        row = existing.get(slug)
+        if row is None:
+            row = MemoryFile(
+                user_id=user_id,
+                slug=slug,
+                section=spec["section"],
+                title=spec["title"],
+                description=spec["description"],
+                body_md="",
+                is_system=True,
+                position=position,
+            )
+            db.add(row)
+            created.append(row)
+        else:
+            # ADOPTION, and it is the path EVERY already-live tenant takes.
+            #
+            # A round-8 `learned` row carries the same slug and the same
+            # meaning, so it is adopted rather than colliding with the unique
+            # index. The trap: round 8's rows carry a `purpose`-era
+            # description ("Corrections and lessons.") that fails
+            # DESCRIPTION_RE — and that string is BOTH served to the client
+            # and injected into the prompt as the index line for this file.
+            # Repairing it only when it is EMPTY (the old condition) left
+            # every existing tenant with an invalid one forever, which is
+            # also a lint failure the eval set would report against a writer
+            # that never wrote it.
+            if row.section != spec["section"]:
+                row.section = spec["section"]
+            if not row.is_system:
+                row.is_system = True
+            if not row.title:
+                row.title = spec["title"]
+            if description_problem(row.description):
+                row.description = spec["description"]
+    if created:
+        await db.flush()
+    return created
+
+
+def file_summary(row: MemoryFile) -> Dict[str, Any]:
+    """The listing payload for one file. No engine metadata, by construction:
+    this dict is the complete set of keys a client ever sees for a file row."""
+    return {
+        "slug": row.slug,
+        "section": row.section,
+        "title": row.title,
+        "description": row.description,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+async def list_files(db: AsyncSession, user_id: str) -> Dict[str, Any]:
+    """`{sections: [{section, files: [...]}]}` in canonical section order."""
+    await ensure_system_files(db, user_id)
+    await db.commit()
+    rows = sorted(await _all_files(db, user_id), key=_sort_key)
+    by_section: Dict[str, List[Dict[str, Any]]] = {s.value: [] for s in SECTION_ORDER}
+    for row in rows:
+        by_section[row.section].append(file_summary(row))
+    return {
+        "sections": [
+            {"section": s.value, "files": by_section[s.value]} for s in SECTION_ORDER
+        ]
+    }
+
+
+async def get_file(
+    db: AsyncSession, user_id: str, slug: str
+) -> Optional[Dict[str, Any]]:
+    """One file with its body and its links resolved to titles.
+
+    None when the slug is malformed or unknown. A system slug always
+    resolves — `ensure_system_files` makes it exist first.
+    """
+    if not is_valid_slug(slug):
+        return None
+    if slug in SYSTEM_FILES:
+        await ensure_system_files(db, user_id)
+        await db.commit()
+    row = (await db.execute(
+        select(MemoryFile).where(
+            and_(MemoryFile.user_id == user_id, MemoryFile.slug == slug)
+        )
+    )).scalar_one_or_none()
+    if row is None or section_of_slug(row.slug) is None:
+        return None
+
+    body = row.body_md or ""
+    # Links are the union of the stored list and whatever `[[slug]]` the
+    # body actually mentions — the body is the thing the user reads, so a
+    # link they can see must be tappable even if a `link` op never ran.
+    wanted: List[str] = []
+    for s in list(_load_links(row)) + extract_links(body):
+        if s not in wanted:
+            wanted.append(s)
+    titles: Dict[str, str] = {}
+    if wanted:
+        for other in (await db.execute(
+            select(MemoryFile.slug, MemoryFile.title).where(
+                and_(MemoryFile.user_id == user_id, MemoryFile.slug.in_(wanted))
+            )
+        )).all():
+            titles[other[0]] = other[1]
+    return {
+        "slug": row.slug,
+        "section": row.section,
+        "title": row.title,
+        "description": row.description,
+        "body_md": body,
+        "links": [
+            {"slug": s, "title": titles.get(s) or title_from_slug(s)} for s in wanted
+        ],
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+_SNIPPET_RADIUS = 90
+
+
+def _snippet(body: str, needle: str) -> str:
+    """The line the match landed on, trimmed around it."""
+    low = body.lower()
+    at = low.find(needle)
+    if at < 0:
+        first = next((ln for ln in body.splitlines() if ln.strip()), "")
+        return first.lstrip("-* ").strip()[: _SNIPPET_RADIUS * 2]
+    start = body.rfind("\n", 0, at) + 1
+    end = body.find("\n", at)
+    line = body[start: end if end > 0 else len(body)].lstrip("-* ").strip()
+    if len(line) <= _SNIPPET_RADIUS * 2:
+        return line
+    rel = max(0, line.lower().find(needle) - _SNIPPET_RADIUS)
+    return ("…" if rel else "") + line[rel: rel + _SNIPPET_RADIUS * 2] + "…"
+
+
+async def search_files(
+    db: AsyncSession, user_id: str, query: str, limit: int = 10
+) -> List[Dict[str, Any]]:
+    """Title + body substring search, file-attributed.
+
+    LIKE rather than tsvector on purpose: `memory_files` is tens of rows per
+    user, the bodies are small, and the same statement has to run on sqlite
+    (every test lane) and Postgres (production) with identical results.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    needle = f"%{q.lower()}%"
+    rows = (await db.execute(
+        select(MemoryFile).where(
+            and_(
+                MemoryFile.user_id == user_id,
+                or_(
+                    MemoryFile.title.ilike(needle),
+                    MemoryFile.body_md.ilike(needle),
+                    MemoryFile.description.ilike(needle),
+                ),
+            )
+        )
+    )).scalars().all()
+    rows = [r for r in rows if section_of_slug(r.slug) is not None]
+    rows.sort(key=_sort_key)
+    out: List[Dict[str, Any]] = []
+    for row in rows[:limit]:
+        out.append({
+            "slug": row.slug,
+            "title": row.title,
+            "snippet": _snippet(row.body_md or row.description or "", q.lower()),
+        })
+    return out
+
+
+async def read_log(db: AsyncSession, user_id: str, month: str) -> Dict[str, Any]:
+    """`{days: [{day, entries: [...]}]}` for one YYYY-MM, newest day first."""
+    if not re.fullmatch(r"\d{4}-\d{2}", month or ""):
+        raise ValueError("month must be YYYY-MM")
+    rows = (await db.execute(
+        select(MemoryFileChange).where(
+            and_(
+                MemoryFileChange.user_id == user_id,
+                MemoryFileChange.day_key.like(f"{month}-%"),
+            )
+        ).order_by(MemoryFileChange.created_at.desc())
+    )).scalars().all()
+    days: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        days.setdefault(row.day_key, []).append({
+            "file_slug": row.file_slug,
+            "file_title": row.file_title,
+            "kind": row.kind,
+            "summary": row.summary,
+            "at": row.created_at.isoformat() if row.created_at else None,
+        })
+    return {
+        "days": [
+            {"day": day, "entries": entries}
+            for day, entries in sorted(days.items(), reverse=True)
+        ]
+    }
+
+
+async def delete_file(db: AsyncSession, user_id: str, slug: str) -> bool:
+    """Delete a file, or empty it when it is a system file.
+
+    False when the slug resolves to nothing (the route turns that into 404).
+    """
+    if not is_valid_slug(slug):
+        return False
+    row = (await db.execute(
+        select(MemoryFile).where(
+            and_(MemoryFile.user_id == user_id, MemoryFile.slug == slug)
+        )
+    )).scalar_one_or_none()
+    if row is None:
+        return False
+    title = row.title
+    if slug in SYSTEM_FILES or row.is_system:
+        row.body_md = ""
+        row.links_json = None
+        row.updated_at = datetime.utcnow()
+    else:
+        await db.delete(row)
+    await _write_change(
+        db, user_id, slug, title, "file_deleted",
+        f"Deleted {title}." if slug not in SYSTEM_FILES else f"Cleared {title}.",
+    )
+    await db.commit()
+    return True
+
+
+async def forget_everything(db: AsyncSession, user_id: str) -> int:
+    """Drop every file and every change row. Returns the files removed."""
+    rows = (await db.execute(
+        select(MemoryFile).where(MemoryFile.user_id == user_id)
+    )).scalars().all()
+    for row in rows:
+        await db.delete(row)
+    changes = (await db.execute(
+        select(MemoryFileChange).where(MemoryFileChange.user_id == user_id)
+    )).scalars().all()
+    for change in changes:
+        await db.delete(change)
+    await db.commit()
+    return len(rows)
+
+
+# ── The injection load (§3.1) ─────────────────────────────────────────
+
+@dataclass
+class BrainFiles:
+    profile: str = ""
+    current_context: str = ""
+    learned: str = ""
+    #: (title, description) for every other non-empty file.
+    index: List[Tuple[str, Optional[str]]] = field(default_factory=list)
+    #: (title, body) for up to N lexically relevant files.
+    relevant: List[Tuple[str, str]] = field(default_factory=list)
+    file_count: int = 0
+
+
+_WORD_RE = re.compile(r"[\w']+", re.UNICODE)
+_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "be", "my", "me", "i", "you", "your", "it",
+    "that", "this", "what", "do", "does", "did", "can", "how", "about",
+})
+
+
+def _tokens(text: str) -> Set[str]:
+    return {
+        t for t in (w.lower() for w in _WORD_RE.findall(text or ""))
+        if len(t) > 2 and t not in _STOPWORDS
+    }
+
+
+def lexical_rank(query: str, rows: Sequence[MemoryFile]) -> List[MemoryFile]:
+    """Files ordered by overlap with the query, best first, zeroes dropped.
+
+    Deliberately not an embedding: this runs on every non-trivial turn, the
+    corpus is tens of files, and a title/description match is the signal the
+    index already advertises to the model.
+    """
+    q = _tokens(query)
+    if not q:
+        return []
+    scored: List[Tuple[float, str, MemoryFile]] = []
+    for row in rows:
+        title_hits = len(q & _tokens(row.title or ""))
+        desc_hits = len(q & _tokens(row.description or ""))
+        body_hits = len(q & _tokens(row.body_md or ""))
+        score = title_hits * 3 + desc_hits * 2 + body_hits
+        if score:
+            scored.append((-score, row.slug, row))
+    scored.sort(key=lambda s: (s[0], s[1]))
+    return [row for _, _, row in scored]
+
+
+async def load_brain(
+    db: AsyncSession,
+    user_id: str,
+    query: str = "",
+    *,
+    max_relevant: int = 2,
+    max_index: int = 40,
+) -> BrainFiles:
+    """Everything the prompt needs, in ONE query.
+
+    Round 8's index called `list_files`, which ran a full per-user scan of
+    `memories`, and injecting two files in full would have run it three
+    times per turn. `memory_files` is tens of rows: read them once.
+    """
+    rows = await _all_files(db, user_id)
+    by_slug = {r.slug: r for r in rows}
+    brain = BrainFiles(file_count=len(rows))
+    brain.profile = (by_slug.get(PROFILE_SLUG).body_md or "") if PROFILE_SLUG in by_slug else ""
+    brain.current_context = (
+        (by_slug.get(CURRENT_CONTEXT_SLUG).body_md or "")
+        if CURRENT_CONTEXT_SLUG in by_slug else ""
+    )
+    brain.learned = (by_slug.get(LEARNED_SLUG).body_md or "") if LEARNED_SLUG in by_slug else ""
+
+    others = [
+        r for r in sorted(rows, key=_sort_key)
+        if r.slug not in ALWAYS_INJECTED_SLUGS and (r.body_md or "").strip()
+    ]
+    brain.index = [(r.title, r.description) for r in others][:max_index]
+    brain.relevant = [
+        (r.title, r.body_md or "") for r in lexical_rank(query, others)[:max_relevant]
+    ]
+    return brain
+
+
+# ── Validation (the simulation) ───────────────────────────────────────
+
+@dataclass
+class OpsPlan:
+    accepted: List[Dict[str, Any]] = field(default_factory=list)
+    complaints: List[str] = field(default_factory=list)
+    states: Dict[str, FileState] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.accepted)
+
+
+def _clean_change(op_name: str, raw: Any, complaints: List[str]) -> Optional[str]:
+    text = (raw or "").strip() if isinstance(raw, str) else ""
+    if not text:
+        complaints.append(
+            f"{op_name}: a `change` line is required — one short sentence for "
+            "the memory log, e.g. \"Added Music: likes Googoosh.\""
+        )
+        return None
+    return text[:MAX_CHANGE_CHARS]
+
+
+def _secret_problem(text: str) -> Optional[str]:
+    """The never-store tier (cards, government ids, API keys) — the one gate
+    rule v3 keeps verbatim (§2.3), from the v3-owned `memory_secrets` module
+    rather than from the row-era gate that is being cut."""
+    try:
+        from app.services.memory_secrets import sensitive_content_reason
+
+        reason = sensitive_content_reason(text, explicit_save=True)
+    except Exception:  # pragma: no cover - the gate module is always present
+        return None
+    if reason:
+        return f"refused: {reason.removeprefix('sensitive_')} is never stored"
+    return None
 
 
 def validate_ops(
     raw_ops: Any,
-    entries: List[Memory],
+    existing: Sequence[MemoryFile],
     *,
-    instruction_mode: bool,
-) -> Tuple[List[Dict], List[str]]:
-    """Split a model response into applicable ops and per-op rejections."""
-    problems: List[str] = []
+    identity: Optional[UserIdentity] = None,
+) -> OpsPlan:
+    """Walk the ops against a copy of the files and report what survives."""
+    plan = OpsPlan()
     if not isinstance(raw_ops, list):
-        return [], ["ops must be a list"]
+        plan.complaints.append("ops must be a list")
+        return plan
     if len(raw_ops) > MAX_OPS:
-        return [], [f"too many ops ({len(raw_ops)} > {MAX_OPS})"]
+        plan.complaints.append(f"too many ops ({len(raw_ops)} > {MAX_OPS})")
+        return plan
 
-    by_handle = {f"e{i + 1}": m for i, m in enumerate(entries)}
-    touched: set = set()
-    valid: List[Dict] = []
-    delete_count = 0
+    states: Dict[str, FileState] = {r.slug: _state_from_row(r) for r in existing}
+    plan.states = states
+    complaints = plan.complaints
+    linked_slugs: List[Tuple[str, str]] = []  # (source op label, target slug)
 
-    def _claim(handles: List[str], op_name: str) -> bool:
-        for h in handles:
-            if h not in by_handle:
-                problems.append(f"{op_name}: unknown entry id {h!r}")
-                return False
-            if h in touched:
-                problems.append(f"{op_name}: entry {h} already touched by an earlier op")
-                return False
-        touched.update(handles)
-        return True
+    def _target(op_name: str, raw_slug: Any) -> Optional[FileState]:
+        slug = (raw_slug or "").strip() if isinstance(raw_slug, str) else ""
+        if not is_valid_slug(slug):
+            complaints.append(f"{op_name}: {slug!r} is not a valid slug")
+            return None
+        state = states.get(slug)
+        if state is None or state.deleted:
+            complaints.append(f"{op_name}: no file {slug!r} — create it first")
+            return None
+        return state
 
-    def _clean_text(op_name: str, text: Any) -> Optional[str]:
-        text = (text or "").strip() if isinstance(text, str) else ""
-        if not text:
-            problems.append(f"{op_name}: empty text")
+    def _bullet_ops_allowed(state: FileState, op_name: str) -> bool:
+        if not state.has_prose:
+            return True
+        complaints.append(
+            f"{op_name} on {state.slug}: this file's body is not a bullet "
+            "list (it has headings and prose) — it is rewritten by its own "
+            "updater, not by ops"
+        )
+        return False
+
+    def _check_bullet(op_name: str, raw: Any, state: FileState) -> Optional[str]:
+        text = (raw or "").strip() if isinstance(raw, str) else ""
+        problem = bullet_problem(text)
+        if problem:
+            complaints.append(f"{op_name} on {state.slug}: {problem}")
             return None
-        if len(text) > MAX_ENTRY_CHARS:
-            problems.append(f"{op_name}: text over {MAX_ENTRY_CHARS} chars")
+        secret = _secret_problem(text)
+        if secret:
+            complaints.append(f"{op_name} on {state.slug}: {secret}")
             return None
-        if _THIRD_PERSON_RE.search(text):
-            problems.append(f"{op_name}: third-person voice ('the user') is not allowed")
-            return None
+        for target in extract_links(text):
+            linked_slugs.append((f"{op_name} on {state.slug}", target))
         return text
+
+    def _fits(state: FileState, op_name: str) -> bool:
+        if len(state.body()) <= MAX_BODY_CHARS:
+            return True
+        complaints.append(
+            f"{op_name} on {state.slug}: file would exceed {MAX_BODY_CHARS} "
+            "chars — consolidate it first (rewrite two bullets into one)"
+        )
+        return False
+
+    def _self_person(slug: str, title: str) -> bool:
+        if not slug.startswith("people/") or identity is None or not identity.known:
+            return False
+        segment = slug.split("/", 1)[1]
+        return (
+            identity.is_self(title)
+            or any(segment == slugify(a) for a in identity.aliases)
+        )
 
     for op in raw_ops:
         if not isinstance(op, dict):
-            problems.append("op is not an object")
+            complaints.append("op is not an object")
             continue
         kind = op.get("op")
-        if kind == "merge":
-            ids = op.get("ids") or []
-            if not isinstance(ids, list) or len(ids) < 2:
-                problems.append("merge: needs at least two ids")
-                continue
-            text = _clean_text("merge", op.get("text"))
-            if text is None or not _claim([str(i) for i in ids], "merge"):
-                continue
-            valid.append({"op": "merge", "ids": [str(i) for i in ids], "text": text})
-        elif kind == "update":
-            handle = str(op.get("id") or "")
-            text = _clean_text("update", op.get("text"))
-            if text is None or not _claim([handle], "update"):
-                continue
-            valid.append({"op": "update", "id": handle, "text": text})
-        elif kind == "delete":
-            handle = str(op.get("id") or "")
-            if not _claim([handle], "delete"):
-                continue
-            delete_count += 1
-            valid.append({"op": "delete", "id": handle, "reason": str(op.get("reason") or "")[:200]})
-        elif kind == "add":
-            text = _clean_text("add", op.get("text"))
-            if text is None:
-                continue
-            valid.append({"op": "add", "text": text, "category": op.get("category")})
-        elif kind == "set_purpose":
-            text = _clean_text("set_purpose", op.get("text"))
-            if text is None:
-                continue
-            valid.append({"op": "set_purpose", "text": text[:300]})
-        elif kind == "set_related":
-            slugs = [s for s in (op.get("slugs") or []) if isinstance(s, str) and is_valid_slug(s)]
-            valid.append({"op": "set_related", "slugs": slugs[:8]})
-        else:
-            problems.append(f"unknown op {kind!r}")
 
-    # Deletion cap. Consolidation exists to merge, not to clear; the user's
-    # own instruction gets more room, and wholesale removal has its own
-    # button (delete file).
-    if entries:
-        ceiling = max(3, len(entries) // 2) if instruction_mode else max(1, len(entries) // 5)
-        if delete_count > ceiling:
-            problems.append(
-                f"delete cap exceeded ({delete_count} > {ceiling}) — every delete op dropped; "
-                "use the file's delete action for wholesale removal"
+        if kind == "create_file":
+            slug = (op.get("slug") or "").strip() if isinstance(op.get("slug"), str) else ""
+            title = (op.get("title") or "").strip() if isinstance(op.get("title"), str) else ""
+            declared = (op.get("section") or "").strip() if isinstance(op.get("section"), str) else ""
+            if not is_valid_slug(slug):
+                complaints.append(f"create_file: {slug!r} is not a valid slug")
+                continue
+            section = section_of_slug(slug)
+            if section is None:
+                complaints.append(
+                    f"create_file: {slug!r} has no section — namespace it "
+                    "people/, topics/ or areas/"
+                )
+                continue
+            if declared and declared != section.value:
+                complaints.append(
+                    f"create_file: {slug!r} is a {section.value} file, not "
+                    f"{declared!r} — the slug decides the section"
+                )
+                continue
+            if slug in SYSTEM_FILES or (slug in states and not states[slug].deleted):
+                complaints.append(f"create_file: {slug!r} already exists")
+                continue
+            if not title:
+                complaints.append(f"create_file: {slug!r} needs a title")
+                continue
+            problem = description_problem(op.get("description"))
+            if problem:
+                complaints.append(f"create_file {slug!r}: {problem}")
+                continue
+            if _self_person(slug, title):
+                complaints.append(
+                    f"create_file: {slug!r} is the person whose memory this "
+                    "is — their facts belong in you/profile, never in people/"
+                )
+                continue
+            states[slug] = FileState(
+                slug=slug, section=section.value, title=title,
+                description=(op.get("description") or "").strip(),
+                is_new=True, dirty=True, raw_body="",
             )
-            valid = [v for v in valid if v["op"] != "delete"]
+            plan.accepted.append({
+                "op": "create_file", "slug": slug, "title": title,
+                "section": section.value,
+                "description": states[slug].description,
+                "change": f"Created {title}.",
+            })
 
-    return valid, problems
+        elif kind == "update_description":
+            state = _target("update_description", op.get("slug"))
+            if state is None:
+                continue
+            problem = description_problem(op.get("description"))
+            if problem:
+                complaints.append(f"update_description {state.slug}: {problem}")
+                continue
+            state.description = (op.get("description") or "").strip()
+            plan.accepted.append({
+                "op": "update_description", "slug": state.slug,
+                "description": state.description,
+                "change": f"Updated what {state.title} is for.",
+            })
+
+        elif kind == "add":
+            state = _target("add", op.get("slug"))
+            if state is None or not _bullet_ops_allowed(state, "add"):
+                continue
+            if _self_person(state.slug, state.title):
+                complaints.append(
+                    f"add: {state.slug!r} is the person whose memory this is "
+                    "— put it in you/profile"
+                )
+                continue
+            bullet = _check_bullet("add", op.get("bullet"), state)
+            if bullet is None:
+                continue
+            change = _clean_change("add", op.get("change"), complaints)
+            if change is None:
+                continue
+            if bullet in state.bullets:
+                complaints.append(f"add on {state.slug}: that bullet is already there")
+                continue
+            state.bullets.append(bullet)
+            state.dirty = True
+            if not _fits(state, "add"):
+                state.bullets.pop()
+                continue
+            plan.accepted.append({
+                "op": "add", "slug": state.slug, "bullet": bullet, "change": change,
+            })
+
+        elif kind == "rewrite":
+            state = _target("rewrite", op.get("slug"))
+            if state is None or not _bullet_ops_allowed(state, "rewrite"):
+                continue
+            match = (op.get("match") or "").strip() if isinstance(op.get("match"), str) else ""
+            if match not in state.bullets:
+                complaints.append(
+                    f"rewrite on {state.slug}: no bullet reads exactly "
+                    f"{match!r} — `match` must be the existing text"
+                )
+                continue
+            bullet = _check_bullet("rewrite", op.get("bullet"), state)
+            if bullet is None:
+                continue
+            change = _clean_change("rewrite", op.get("change"), complaints)
+            if change is None:
+                continue
+            at = state.bullets.index(match)
+            state.bullets[at] = bullet
+            state.dirty = True
+            if not _fits(state, "rewrite"):
+                state.bullets[at] = match
+                continue
+            plan.accepted.append({
+                "op": "rewrite", "slug": state.slug, "match": match,
+                "bullet": bullet, "change": change,
+            })
+
+        elif kind == "remove":
+            state = _target("remove", op.get("slug"))
+            if state is None or not _bullet_ops_allowed(state, "remove"):
+                continue
+            match = (op.get("match") or "").strip() if isinstance(op.get("match"), str) else ""
+            if match not in state.bullets:
+                complaints.append(
+                    f"remove on {state.slug}: no bullet reads exactly {match!r}"
+                )
+                continue
+            change = _clean_change("remove", op.get("change"), complaints)
+            if change is None:
+                continue
+            state.bullets.remove(match)
+            state.dirty = True
+            plan.accepted.append({
+                "op": "remove", "slug": state.slug, "match": match, "change": change,
+            })
+
+        elif kind == "link":
+            state = _target("link", op.get("slug"))
+            if state is None:
+                continue
+            raw_links = op.get("links")
+            if not isinstance(raw_links, list):
+                complaints.append(f"link on {state.slug}: links must be a list of slugs")
+                continue
+            wanted = [s.strip() for s in raw_links if isinstance(s, str) and s.strip()]
+            bad = [s for s in wanted if not is_valid_slug(s)]
+            if bad:
+                complaints.append(f"link on {state.slug}: invalid slugs {bad}")
+                continue
+            for target in wanted:
+                linked_slugs.append((f"link on {state.slug}", target))
+            state.links = wanted[:MAX_LINKS_PER_FILE]
+            plan.accepted.append({
+                "op": "link", "slug": state.slug, "links": state.links,
+            })
+
+        elif kind == "delete_file":
+            state = _target("delete_file", op.get("slug"))
+            if state is None:
+                continue
+            change = _clean_change("delete_file", op.get("change"), complaints)
+            if change is None:
+                continue
+            if state.slug in SYSTEM_FILES:
+                # A system file is emptied, never dropped — the same rule the
+                # DELETE route follows, stated here so the writer cannot
+                # delete Profile out from under the injection.
+                state.bullets = []
+                state.dirty = True
+                plan.accepted.append({
+                    "op": "delete_file", "slug": state.slug, "change": change,
+                    "system": True,
+                })
+            else:
+                state.deleted = True
+                state.dirty = True
+                plan.accepted.append({
+                    "op": "delete_file", "slug": state.slug, "change": change,
+                })
+
+        else:
+            complaints.append(f"unknown op {kind!r}")
+
+    # Links are resolved LAST: a link may legitimately point at a file the
+    # same batch created. A dangling one is dropped rather than failing the
+    # batch — the writer is the last line of defence for `[[slug]]`, and a
+    # broken link on a page is worse than a missing one.
+    live = {s for s, st in states.items() if not st.deleted}
+    dangling = sorted({t for _, t in linked_slugs if t not in live})
+    if dangling:
+        complaints.append(
+            "links point at files that do not exist and were dropped: "
+            + ", ".join(dangling)
+        )
+        for state in states.values():
+            if state.links:
+                kept = [s for s in state.links if s in live]
+                if kept != state.links:
+                    state.links = kept
+        for accepted in plan.accepted:
+            if accepted["op"] == "link":
+                accepted["links"] = [s for s in accepted["links"] if s in live]
+
+    return plan
 
 
-def render_entries_for_prompt(entries: List[Memory]) -> str:
-    lines = []
-    for i, m in enumerate(entries):
-        bits = []
-        if m.created_at:
-            bits.append(f"saved {m.created_at.date().isoformat()}")
-        if m.expires_at:
-            bits.append(f"fades {m.expires_at.date().isoformat()}")
-        try:
-            if m.tags_json and "standing" in json.loads(m.tags_json):
-                bits.append("standing arrangement")
-        except Exception:
-            pass
-        meta = f" ({', '.join(bits)})" if bits else ""
-        lines.append(f"[e{i + 1}]{meta} {_entry_text(m)}")
-    return "\n".join(lines)
+# ── Apply ─────────────────────────────────────────────────────────────
+
+async def resolve_user_tz(db: AsyncSession, user_id: str) -> Optional[str]:
+    """The user's IANA zone, VALIDATED, or None.
+
+    One resolver for both day-bucketing (`_resolve_day_key`) and the writer's
+    "today is …" line. They have to agree: a change line filed under the
+    user's local Tuesday while the prompt told the model it was Monday makes
+    every relative date the writer resolves off by a day.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        from app.db.models.user import User
+
+        tz_name = (await db.execute(
+            select(User.timezone).where(User.id == user_id)
+        )).scalar_one_or_none()
+        if tz_name:
+            ZoneInfo(tz_name)  # an unparseable zone is not trusted
+            return tz_name
+    except Exception as exc:
+        logger.warning(
+            "[memory_files] timezone falling back to UTC for user=%s: %s",
+            str(user_id)[:8], exc,
+        )
+    return None
 
 
-def build_curation_prompt(
+async def _resolve_day_key(db: AsyncSession, user_id: str) -> str:
+    """The user's LOCAL YYYY-MM-DD, UTC when their zone is unknown.
+
+    Same resolution chain every other day-bucketing caller uses:
+    `User.timezone`, VALIDATED (an unparseable zone is not trusted), then
+    UTC. A calendar that files a 23:40-local write under tomorrow is a
+    calendar the user cannot reconcile with their own day.
+    """
+    now = datetime.now(timezone.utc)
+    tz_name = await resolve_user_tz(db, user_id)
+    if tz_name:
+        from zoneinfo import ZoneInfo
+
+        return now.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+    return now.strftime("%Y-%m-%d")
+
+
+async def _write_change(
+    db: AsyncSession,
+    user_id: str,
+    slug: str,
     title: str,
-    purpose: Optional[str],
-    entries_block: str,
-    *,
-    instruction: Optional[str],
-) -> str:
-    head = (
-        f'You are curating one file of a user\'s memory: "{title}".\n'
-        f"Current purpose line: {purpose or '(none)'}\n\n"
-        "Entries (each has an id):\n"
-        f"{entries_block or '(no entries)'}\n\n"
-    )
-    contract = """Reply with ONLY valid JSON: {"ops": [...]}. Allowed ops:
-- {"op": "merge", "ids": ["e1","e4"], "text": "..."} — fold entries that describe the SAME fact, task or arrangement (variants, restatements, partial updates) into one concise entry carrying every distinct detail. The first id survives.
-- {"op": "update", "id": "e2", "text": "..."} — rewrite one entry in place: fix voice, fold in a correction, trim bloat.
-- {"op": "delete", "id": "e3", "reason": "..."} — remove true noise only: one-off tool or playback outcomes, momentary states, meaningless fragments.
-- {"op": "add", "text": "...", "category": "..."} — a genuinely new entry (rare).
-- {"op": "set_purpose", "text": "..."} — the file's one-line header: what it holds and when to read it, e.g. "Your IELTS prep — tutor, dates and targets; read when IELTS comes up."
-- {"op": "set_related", "slugs": ["people/majid-tajik"]} — sibling files this one should point at.
-
-Hard rules:
-- Every entry text is written in the SECOND PERSON, to the user: "You…", "Your…". Other people by name. NEVER "The user".
-- One or two short sentences per entry. Preserve every name, number, date and time EXACTLY. Never invent or embellish facts.
-- Prefer merge over delete; when unsure, keep.
-- If the file is already clean, reply {"ops": []}.
-"""
-    if instruction:
-        task = (
-            "The user asked for this change to the file — apply it with the fewest ops "
-            f"that fully honor it, touching nothing else:\n\"{instruction}\"\n\n"
-        )
-    else:
-        task = (
-            "Consolidate this file: merge duplicates and restatements, normalize voice, "
-            "remove noise, and give it a purpose line if the current one is missing or wrong. "
-            "Produce the MINIMAL op set.\n\n"
-        )
-    return head + task + contract
+    kind: str,
+    summary: str,
+    day_key: Optional[str] = None,
+) -> None:
+    db.add(MemoryFileChange(
+        user_id=user_id,
+        file_slug=slug,
+        file_title=title,
+        kind=kind,
+        summary=summary[:MAX_CHANGE_CHARS],
+        day_key=day_key or await _resolve_day_key(db, user_id),
+        created_at=datetime.utcnow(),
+    ))
 
 
-async def _propose_ops(
-    llm_service,
-    prompt: str,
-) -> List[Dict]:
-    response = await llm_service.complete_with_json(
-        messages=[{"role": "user", "content": prompt}],
-        model=settings.memory_extraction_model,
-        temperature=0.0,
-    )
-    parsed = response
-    if hasattr(response, "content"):
-        raw = response.content.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-        parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise ValueError("curation response is not an object")
-    return parsed.get("ops", [])
+async def write_change_line(
+    db: AsyncSession, user_id: str, slug: str, title: str, kind: str, summary: str,
+) -> None:
+    """One audit line from a writer that is not the ops engine.
+
+    The v3 migration is the only such writer: it applies its ops with
+    `change_lines=False` and then files its own single line per filled
+    file. Same table, same user-local day resolution, so the Memory log
+    cannot end up with two notions of what day it is.
+    """
+    await _write_change(db, user_id, slug, title, kind, summary)
 
 
 async def apply_ops(
-    db: AsyncSession,
-    user_id: str,
-    slug: str,
-    ops: List[Dict],
-    entries: List[Memory],
-    *,
-    api_key: Optional[str] = None,
-    trigger_source: str = "file_curation",
-) -> Dict:
-    """Apply validated ops through the existing evolution primitives."""
-    memory_service = MemoryService(db, api_key=api_key)
-    file_service = MemoryFileService(db)
-    by_handle = {f"e{i + 1}": m for i, m in enumerate(entries)}
-    applied: List[Dict] = []
+    db: AsyncSession, user_id: str, plan: OpsPlan, *, change_lines: bool = True,
+) -> Dict[str, Any]:
+    """Persist exactly the state the validation walk computed.
 
-    file_row = (await db.execute(
-        select(MemoryFile).where(and_(MemoryFile.user_id == user_id, MemoryFile.slug == slug))
-    )).scalar_one_or_none()
-
-    section = FileSection(file_row.section) if file_row else FileSection.KNOWLEDGE
-
-    for op in ops:
-        kind = op["op"]
-        try:
-            if kind == "merge":
-                survivor = by_handle[op["ids"][0]]
-                await memory_service.merge_memory(
-                    memory_id=survivor.id,
-                    new_content=op["text"],
-                    change_summary=f"Folded {len(op['ids']) - 1} duplicate entr"
-                                   f"{'y' if len(op['ids']) == 2 else 'ies'} into this one",
-                    source_type=trigger_source,
-                    user_id=user_id,
-                )
-                for handle in op["ids"][1:]:
-                    source = by_handle[handle]
-                    await memory_service.supersede_memory(
-                        old_memory_id=source.id, new_memory_id=survivor.id, user_id=user_id,
-                    )
-                    await memory_service._log_memory_event(
-                        memory_id=source.id,
-                        user_id=user_id,
-                        event_type=MemoryEventType.CONSOLIDATED,
-                        event_data={"into": survivor.id, "via": trigger_source},
-                        trigger_source=trigger_source,
-                    )
-                applied.append({"op": "merge", "survivor": survivor.id, "folded": len(op["ids"]) - 1})
-            elif kind == "update":
-                target = by_handle[op["id"]]
-                if _entry_text(target) != op["text"]:
-                    await memory_service.merge_memory(
-                        memory_id=target.id,
-                        new_content=op["text"],
-                        change_summary="Rewritten during file curation",
-                        source_type=trigger_source,
-                        user_id=user_id,
-                    )
-                    applied.append({"op": "update", "id": target.id})
-            elif kind == "delete":
-                target = by_handle[op["id"]]
-                await memory_service.delete_memory(target.id, user_id)
-                applied.append({"op": "delete", "id": target.id, "reason": op.get("reason", "")})
-            elif kind == "add":
-                from app.schemas import BrainType, MemoryCreate
-                category = normalize_category(
-                    (op.get("category") or SECTION_DEFAULT_CATEGORY[section]),
-                    brain_type="agent" if section == FileSection.LEARNED else "user",
-                )
-                created = await memory_service.create_memory(
-                    user_id=user_id,
-                    memory_data=MemoryCreate(
-                        content=op["text"],
-                        brain_type=BrainType.AGENT if section == FileSection.LEARNED else BrainType.USER,
-                        category=category,
-                        memory_type="task" if section == FileSection.WORKING else "fact",
-                        importance=0.6,
-                        source_type=trigger_source,
-                    ),
-                    deduplicate=False,
-                )
-                await file_service.assign_to_file(created, slug)
-                await db.commit()
-                applied.append({"op": "add", "id": created.id})
-            elif kind == "set_purpose" and file_row is not None:
-                file_row.purpose = op["text"]
-                applied.append({"op": "set_purpose"})
-            elif kind == "set_related" and file_row is not None:
-                file_row.related_json = json.dumps(op["slugs"])
-                applied.append({"op": "set_related", "slugs": op["slugs"]})
-        except Exception as e:
-            logger.warning("[file_ops] %s failed on %s: %s", kind, slug, e)
-
-    if file_row is not None:
-        file_row.updated_at = datetime.utcnow()
-    await db.commit()
-    return {"applied": applied}
-
-
-async def curate_file(
-    db: AsyncSession,
-    user_id: str,
-    slug: str,
-    *,
-    instruction: Optional[str] = None,
-    api_key: Optional[str] = None,
-    mark_consolidated: bool = False,
-) -> Dict:
-    """Propose + validate + apply curation ops for one file.
-
-    Returns {"applied": [...], "rejected": [...], "entry_count": n}.
-    Raises ValueError for an unknown file. LLM or parse failures surface as
-    an exception for the caller to translate (the API returns 502; the
-    migration retries on its next slot).
+    `change_lines=False` is the MIGRATION's mode and nothing else's (WS-5).
+    A migration replays a whole legacy corpus through the writer in batches,
+    so the per-op trail this function normally writes would open the user's
+    Memory log on the day they upgraded with dozens of lines describing ops
+    they never asked for. `memory_v3_migration` writes exactly one line per
+    file it filled instead — "Migrated from your earlier memory." — which is
+    the one sentence that is true about all of them. Default True, so every
+    conversational writer is byte-identical to before.
     """
-    file_service = MemoryFileService(db)
-    resolved = await file_service.get_file(user_id, slug)
-    if resolved is None:
-        raise ValueError(f"memory file {slug!r} not found")
-    info, entries = resolved
+    if not plan.accepted:
+        return {"applied": 0, "changed_files": []}
 
-    if api_key:
-        from app.services.llm_service import LLMService
-        llm_service = LLMService(api_key=api_key)
-    else:
-        from app.services.llm_service import get_llm_service
-        llm_service = get_llm_service()
+    touched = {op["slug"] for op in plan.accepted}
+    rows = {
+        r.slug: r for r in (await db.execute(
+            select(MemoryFile).where(
+                and_(MemoryFile.user_id == user_id, MemoryFile.slug.in_(list(touched)))
+            )
+        )).scalars().all()
+    }
+    day_key = await _resolve_day_key(db, user_id)
+    now = datetime.utcnow()
 
-    prompt = build_curation_prompt(
-        info["title"], info.get("purpose"),
-        render_entries_for_prompt(entries),
-        instruction=instruction,
-    )
-    raw_ops = await _propose_ops(llm_service, prompt)
-    ops, problems = validate_ops(raw_ops, entries, instruction_mode=bool(instruction))
-    if problems and not ops and raw_ops:
-        # Whole proposal rejected — one retry with the complaints appended.
-        retry_prompt = (
-            prompt
-            + "\n\nYour previous reply was rejected for these reasons — fix them:\n- "
-            + "\n- ".join(problems)
-        )
-        raw_ops = await _propose_ops(llm_service, retry_prompt)
-        ops, problems = validate_ops(raw_ops, entries, instruction_mode=bool(instruction))
+    for slug in sorted(touched):
+        state = plan.states.get(slug)
+        if state is None:
+            continue
+        row = rows.get(slug)
+        if state.deleted:
+            if row is not None:
+                await db.delete(row)
+            continue
+        if row is None:
+            section = section_of_slug(slug)
+            row = MemoryFile(
+                user_id=user_id,
+                slug=slug,
+                section=state.section or (section.value if section else FileSection.TOPICS.value),
+                title=state.title,
+                is_system=slug in SYSTEM_FILES,
+                position=100,
+            )
+            db.add(row)
+            rows[slug] = row
+        row.title = state.title
+        row.description = state.description
+        row.body_md = state.body()
+        row.links_json = json.dumps(state.links) if state.links else None
+        row.updated_at = now
 
-    result = await apply_ops(
-        db, user_id, slug, ops, entries,
-        api_key=api_key,
-        trigger_source="file_instruction" if instruction else "file_consolidation",
-    )
+    if change_lines:
+        for op in plan.accepted:
+            slug = op["slug"]
+            state = plan.states.get(slug)
+            title = state.title if state else title_from_slug(slug)
+            kind = _CHANGE_KIND.get(op["op"])
+            if kind is None or op["op"] == "link":
+                continue
+            await _write_change(db, user_id, slug, title, kind, op["change"], day_key)
 
-    if mark_consolidated:
-        file_row = (await db.execute(
-            select(MemoryFile).where(and_(MemoryFile.user_id == user_id, MemoryFile.slug == slug))
-        )).scalar_one_or_none()
-        if file_row is not None:
-            file_row.consolidated_at = datetime.utcnow()
-            await db.commit()
+    await db.commit()
+    return {
+        "applied": len(plan.accepted),
+        "changed_files": sorted(touched),
+        # TITLES, in the same order, for anything a person reads. A slug is
+        # an internal id and no client renders one — the confirmation under
+        # the input box saying "Saved 1 change in people/majid-tajik" is the
+        # only place one ever leaked to a user. `plan.states` is already in
+        # hand here, so the lookup costs nothing; `title_from_slug` covers a
+        # slug whose state was dropped.
+        "changed_titles": [
+            (plan.states[s].title if s in plan.states else title_from_slug(s))
+            for s in sorted(touched)
+        ],
+    }
 
+
+
+# ── The scheduled slot (agent-side) ───────────────────────────────────
+
+async def run_memory_maintenance() -> Dict[str, Any]:
+    """The agent scheduler's nightly + boot memory job.
+
+    Cheap and idempotent by design. Round 8's occupant of this slot was
+    `memory_file_migration.run_memory_file_maintenance` (DELETED by WS-5,
+    which was its last reader): organize every row → repair working leases
+    → run an LLM curation pass over every file that needed one. All three
+    operate on `memories` rows, which v3 retires. Today the slot does two
+    things: make sure the three system files exist, and run the round-8 →
+    v3 migration once.
+
+    The REGISTRATION SHAPE is kept deliberately (boot one-shot at T+180s
+    plus a nightly cron, both marker-cheap): WS-5's v3 migration hooks in
+    HERE rather than adding a second pair of registrations in `agent_main`,
+    so there is one slot to keep on a CronTrigger instead of two.
+
+    Single-tenant: an agent container serves exactly one user
+    (`settings.user_id`). On the platform this returns immediately.
+    """
+    from app.config import settings
+
+    user_id = getattr(settings, "user_id", "") or ""
+    if not user_id:
+        return {"skipped": "no tenant user"}
+
+    from app.db.database import async_session_maker
+
+    async with async_session_maker() as db:
+        created = await ensure_system_files(db, user_id)
+        await db.commit()
     logger.info(
-        "[file_ops] curated %s for user=%s: %d applied, %d rejected%s",
-        slug, user_id, len(result["applied"]), len(problems),
-        " (instruction)" if instruction else "",
+        "[memory_files] maintenance: %d system file(s) created for user=%s",
+        len(created), str(user_id)[:8],
     )
-    result["rejected"] = problems
-    result["entry_count"] = len(entries)
-    return result
+
+    # The round-8 → v3 migration (§7). Marker-guarded: every fire after the
+    # first one is a single indexed SELECT. It runs AFTER the system files
+    # exist because the writer routes the owner's facts into `you/profile`
+    # and cannot add to a file that is not there. A failure here must not
+    # take the maintenance slot down with it — the migration owns its own
+    # retry policy through the marker.
+    migration: Dict[str, Any] = {"skipped": "not attempted"}
+    try:
+        from app.services.memory_v3_migration import run_scheduled_migration
+
+        migration = await run_scheduled_migration()
+    except Exception as exc:  # pragma: no cover - defence for the scheduler
+        logger.error("[memory_files] v3 migration slot raised: %s", exc)
+        migration = {"status": "failed", "error": str(exc)[:400]}
+
+    # Current context's day rollover (v3 §6). It has its own HOURLY cron —
+    # this is the boot pass, so a container that came up after midnight ages
+    # the file at T+180s instead of waiting for the next hour, and a fleet
+    # recreated every 0.3 h never leaves a stale `Today` in the prompt. It is
+    # idempotent per user-local day, so calling it from two slots is free.
+    rollover: Dict[str, Any] = {"skipped": "not_run"}
+    try:
+        from app.services.current_context import run_context_rollover
+
+        rollover = await run_context_rollover()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[memory_files] context rollover skipped: %s", exc)
+    return {
+        "system_files_created": len(created),
+        "memory_v3_migration": migration,
+        "context_rollover": rollover,
+    }

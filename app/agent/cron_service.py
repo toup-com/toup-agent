@@ -410,6 +410,14 @@ class CronService:
                 # mutating-connector deny applies (nobody is present to confirm
                 # an action injected content might request). audit-2026 INJ-1.
                 channel="cron",
+                # A scheduled job's prompt is MACHINE-authored. Without this
+                # the curator was handed "[Scheduled task: Gmail briefing]
+                # fetch messages … max_results=1" as something the user said,
+                # every day on a schedule — that is where the routine-prompt
+                # rows in the founder's brain came from (write-path recon,
+                # answer (c)). agent_task_handler has passed this since the
+                # same RCA; the three synthetic runners were missed.
+                disable_post_processing=True,
                 on_text_chunk=handler.on_text_chunk,
                 on_tool_start=handler.on_tool_start,
                 on_tool_end=handler.on_tool_end,

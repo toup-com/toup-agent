@@ -1,4 +1,9 @@
 from app.services.embedding_service import EmbeddingService, get_embedding_service
+# `memory_extractor` keeps only its RULE-BASED half in v3 — the LLM
+# extractor and the relationship extractor are deleted with the row corpus
+# they produced. Its two remaining consumers are app/api/ingest.py and
+# app/scripts/seed_data.py; the conversation path writes through
+# `memory_curator` instead.
 from app.services.memory_extractor import MemoryExtractor, get_memory_extractor, ExtractedMemory, ExtractedEntity
 from app.services.auth_service import (
     verify_password, get_password_hash, create_access_token,
@@ -6,8 +11,6 @@ from app.services.auth_service import (
     get_user_by_id, get_user_by_email, change_user_password,
 )
 from app.services.memory_service import MemoryService
-from app.services.decay_service import DecayService, get_decay_service
-from app.services.consolidation_service import ConsolidationService, get_consolidation_service
 from app.services.document_service import DocumentService, get_document_service
 
 __all__ = [
@@ -27,11 +30,6 @@ __all__ = [
     "get_user_by_id",
     "get_user_by_email",
     "MemoryService",
-    # NEW: Decay and Consolidation services
-    "DecayService",
-    "get_decay_service",
-    "ConsolidationService",
-    "get_consolidation_service",
     # NEW: Document processing
     "DocumentService",
     "get_document_service",

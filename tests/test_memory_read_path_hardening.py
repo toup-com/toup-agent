@@ -212,28 +212,17 @@ async def test_a_pgvector_failure_is_logged_and_does_not_return_an_empty_200(
     )
 
 
-# ── 3. The merge branch must honour the lease ─────────────────────────
-
-def test_merge_and_reinforce_both_reconcile_the_expiry_lease():
-    """They are the two outcomes of one decision; only one honoured the TTL."""
-    import ast
-    import pathlib
-
-    src = pathlib.Path("app/services/memory_dedup_service.py").read_text()
-    tree = ast.parse(src)
-    fns = {
-        n.name: ast.unparse(n)
-        for n in ast.walk(tree)
-        if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-    }
-
-    for fn in ("_reinforce_existing_memory", "_merge_memories"):
-        assert "expires_at" in fns[fn], (
-            f"{fn} is a dedup outcome that never touches expires_at — a "
-            "transient memory restated as durable keeps its lease and is "
-            "archived on schedule"
-        )
-
+# ── 3. RETIRED: the merge/reinforce lease reconciliation ──────────────
+#
+# `test_merge_and_reinforce_both_reconcile_the_expiry_lease` pinned that
+# `_reinforce_existing_memory` and `_merge_memories` — the two outcomes of
+# one dedup decision — both touch `expires_at`, so a transient memory
+# restated as durable does not keep its lease. Both functions and the
+# service that held them are deleted in v3 (§1.1): there is no lease, no
+# reinforcement and no row-level merge. The v3 shape of "restating a fact
+# updates it instead of stacking a second copy" is the writer preferring
+# `rewrite` over `add`, and it is measured by the eval set's
+# merge-don't-append fixture rather than by a source probe.
 
 # ── 4. A filter the API accepts must actually bind ────────────────────
 
@@ -251,26 +240,33 @@ def test_memory_level_reaches_the_search_request():
     assert r2.memory_levels == [MemoryLevel.SEMANTIC]
 
 
-def test_the_search_endpoint_maps_memory_level_and_rejects_unknown_values():
+def test_the_search_endpoint_no_longer_takes_row_filters_at_all():
+    """The defect this pinned: `GET /api/memories/search` passed the
+    SINGULAR `memory_level=` into `MemorySearchRequest`, pydantic dropped
+    it on the floor, and a caller asking for episodic memories silently got
+    everything.
+
+    Memory v3 (§4) replaces that endpoint with `GET /search?q=`, which
+    searches FILE bodies and titles and takes no row filter — no
+    memory_level, no brain_type, no categories, no min_similarity. A
+    parameter that cannot be passed cannot be silently dropped. The schema
+    hazard itself is still pinned above, on `MemorySearchRequest`, because
+    other callers (the MCP tool) still build one."""
     import ast
     import pathlib
 
     src = pathlib.Path("app/api/memories.py").read_text()
     tree = ast.parse(src)
-    fn = next(
+    search = next(
         ast.unparse(n)
         for n in ast.walk(tree)
         if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef))
-        and "memory_level" in ast.unparse(n)
-        and "MemorySearchRequest(" in ast.unparse(n)
+        and n.name == "search_memory_files"
     )
-    assert "memory_levels=" in fn, (
-        "the endpoint still passes the singular `memory_level=`, which pydantic "
-        "drops — the caller's filter never binds"
-    )
-    assert "HTTP_422" in fn, (
-        "an unknown memory_level should 422, not silently widen the search"
-    )
+    for row_filter in ("memory_level", "brain_type", "categories",
+                       "min_similarity", "min_importance"):
+        assert row_filter not in search, row_filter
+    assert "MemorySearchRequest(" not in search
 
 
 # ── 5. A failed lookup must not be cached ─────────────────────────────

@@ -518,6 +518,84 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
 
 
+# ── The voice turn's memory write (v3 §2.1.2) ─────────────────────────
+#
+# The realtime relay runs on platform-api; the curator runs agent-side,
+# where the memory lives. Round 8 resolved that split the wrong way: it ran
+# a full LLM EXTRACTION on the platform and pushed each result across the
+# tunnel as a `memory_store` tool call with `explicit_save=True`, which
+# disarmed three gate rules and is why the founder's brain held permanent
+# rows about songs he asked to play once.
+#
+# The relay cannot simply reuse `/internal/agent-turn`: it deliberately
+# calls that with save=False (which maps to disable_post_processing=True),
+# because `think`'s `task` is a string the REALTIME MODEL synthesised, not
+# what the user said. Mining that string is the 409A incident. So the honest
+# seam is a second small internal route that takes the REAL transcript and
+# runs the same writer the chat path runs — one hop, same auth, same
+# visibility rules as /internal/voice-context above.
+
+
+class CurateTurnRequest(BaseModel):
+    # The user's own words, verbatim from transcription. NEVER the relay's
+    # synthesised `task`, and never a tool result.
+    user_text: str = Field(..., max_length=8000)
+    assistant_text: str = Field(default="", max_length=8000)
+    channel: str = Field(default="voice", max_length=32)
+
+
+class CurateTurnResponse(BaseModel):
+    applied: int = 0
+    changed_files: List[str] = Field(default_factory=list)
+    skipped: Optional[str] = None
+
+
+@router.post("/internal/curate-turn", response_model=CurateTurnResponse,
+             include_in_schema=False)
+async def internal_curate_turn(req: CurateTurnRequest, request: Request):
+    """Internal-only: write one spoken turn into the user's memory files."""
+    # Only meaningful on tenant agent containers. On the platform, 404 so the
+    # endpoint is invisible to probers (mirrors agent.py:refresh-tools).
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+
+    try:
+        from app.services import memory_curator
+
+        async with async_session_maker() as db:
+            result = await memory_curator.curate_turn(
+                db, user_id,
+                user_text=req.user_text,
+                assistant_text=req.assistant_text,
+                channel=req.channel or "voice",
+            )
+        # Current context's Today layer (v3 §6) — off the response path, in
+        # its own session, and unable to fail this route. The relay is
+        # waiting on this reply while the user is still in a live call.
+        try:
+            from app.services.current_context import spawn_refresh
+
+            spawn_refresh(async_session_maker, user_id)
+        except Exception as ctx_err:  # noqa: BLE001
+            logger.warning("Current-context refresh not scheduled: %s", ctx_err)
+        return CurateTurnResponse(
+            applied=int(result.get("applied", 0)),
+            changed_files=list(result.get("changed_files") or []),
+            skipped=result.get("skipped"),
+        )
+    except Exception as e:
+        logger.exception("Internal curate-turn error for user %s", user_id)
+        raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+
+
 # ── Voice inner-tool stream ───────────────────────────────────────────
 # Live visibility for the realtime-voice `think` path: which tool is running,
 # the exact query, and the sources the answer is grounded in — emitted WHILE

@@ -1,15 +1,17 @@
-"""Drivers that exercise the REAL production memory pipeline.
+"""Drivers that exercise the REAL production writer.
 
 Nothing here re-implements capture. `drive_turn` calls
-`AgentRunner._extract_memories` — the exact bound method the agent invokes in
-turn post-processing (agent_runner.py:4637) — with a stub `self` that supplies
-the only attribute it touches (`_last_extraction_ok`). That means the LLM
-extraction call, the write-time gate, the batched dedup, the entity upsert and
-the relationship mirror all run exactly as they do in production, against a real
-Postgres with pgvector.
+`memory_curator.curate_turn` — the exact function `_background_post_processing`
+calls in turn post-processing — so the pre-gates, the prompt, the model call,
+the deterministic validator and the atomic apply all run exactly as they do
+in production, against a real Postgres.
 
-`recall` drives the read side through `MemoryService.hybrid_search` with the same
-parameters `agent_runner.py:3454` uses.
+The one deliberate difference from production is the ARGUMENT, and it is the
+point of the suite: the runner passes `display_user_message`, so `drive_turn`
+passes the clean text too. A scenario that carries `injected` is additionally
+driven a second time with the DIRTY string (`drive_turn_dirty`) — belt as
+well as braces. If the durability rules only work because the injection was
+stripped upstream, the belt run says so.
 """
 
 from __future__ import annotations
@@ -17,224 +19,98 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import select
+
+from .corpus import Capture, Reject, Scenario, Turn
 
 
 # ── Write path ───────────────────────────────────────────────────────────
 
-class _RunnerStub:
-    """Minimal stand-in for AgentRunner.
-
-    `_extract_memories` reads nothing off `self` and writes only
-    `_last_extraction_ok`; asserting that here means a future refactor that
-    starts depending on more runner state fails loudly instead of silently
-    testing a different code path.
-    """
-
-    _last_extraction_ok: str = "-"
-
-
 async def drive_turn(
     db,
     user_id: str,
-    user_message: str,
-    assistant_response: str = "",
+    user_text: str,
+    assistant_text: str = "",
     *,
     trivial: bool = False,
-) -> int:
-    """Run one conversational turn through production capture. Returns count."""
-    from app.agent.agent_runner import AgentRunner
+    channel: str = "app",
+) -> Dict[str, Any]:
+    """Run one turn through the production writer. Returns its result dict."""
+    from app.services import memory_curator
 
-    stub = _RunnerStub()
-    n = await AgentRunner._extract_memories(
-        stub, db, user_id, user_message, assistant_response, trivial
+    result = await memory_curator.curate_turn(
+        db, user_id,
+        user_text=user_text,
+        assistant_text=assistant_text,
+        channel=channel,
+        query_was_trivial=trivial,
     )
     await db.commit()
-    return n
+    return result
 
 
-async def drive_conversation(db, user_id: str, turns: Sequence["Turn"]) -> int:
-    total = 0
+async def drive_conversation(db, user_id: str, turns: Sequence[Turn]) -> int:
+    applied = 0
     for t in turns:
-        total += await drive_turn(
-            db, user_id, t.user, t.assistant, trivial=t.trivial
+        res = await drive_turn(
+            db, user_id, t.user, t.assistant, trivial=t.trivial,
         )
-    return total
+        applied += int(res.get("applied", 0))
+    return applied
 
 
-async def store_direct(
-    db,
-    user_id: str,
-    content: str,
-    *,
-    category: str = "identity",
-    memory_type: str = "fact",
-    importance: float = 0.8,
-    expires_at=None,
-) -> Any:
-    """Write one memory through the dedup service (the memory_store tool path)."""
-    from app.schemas import MemoryCreate, BrainType, MemoryType, MemoryLevel
-    from app.services.memory_dedup_service import MemoryDedupService
+async def drive_conversation_dirty(db, user_id: str, turns: Sequence[Turn]) -> int:
+    """The BELT: hand the writer the string ws_chat actually builds.
 
-    dedup = MemoryDedupService(db)
-    memory, action = await dedup.smart_create_memory(
-        new_memory=MemoryCreate(
-            content=content,
-            brain_type=BrainType.USER,
-            category=category,
-            memory_type=MemoryType(memory_type),
-            importance=importance,
-            confidence=0.9,
-            memory_level=MemoryLevel.EPISODIC,
-            emotional_salience=0.5,
-            source_type="agent_tool",
-            expires_at=expires_at,
-        ),
-        user_id=user_id,
-    )
-    await db.commit()
-    return memory, action
-
-
-async def seed_bulk(db, user_id: str, contents: Sequence[str], *, chunk: int = 64) -> int:
-    """Seed many memories fast, bypassing dedup but NOT bypassing storage.
-
-    Rows are written through `MemoryService.create_memory` with real embeddings
-    (batched concurrently), so vector search, tsvector search and the graph all
-    behave exactly as they would on organically-captured rows. Only the dedup
-    adjudication is skipped — deduplication is measured in category F, and
-    running it here would make a 1000-row seed cost 1000 LLM calls.
+    Production never does this — `agent_runner` passes
+    `display_user_message`, pinned structurally in
+    tests/test_curator_producers.py. This run asks the other half of the
+    question: if the injection DID reach the writer, do the durability rules
+    still refuse it? A suite that only tests the clean path cannot tell
+    "the rules work" from "the strip works".
     """
-    import asyncio
-
-    from app.schemas import MemoryCreate, BrainType, MemoryType, MemoryLevel
-    from app.services.embedding_service import get_embedding_service
-    from app.services.memory_service import MemoryService
-
-    svc = MemoryService(db)
-    embedder = get_embedding_service()
-    written = 0
-
-    for start in range(0, len(contents), chunk):
-        batch = list(contents[start : start + chunk])
-        vectors = await asyncio.gather(
-            *(embedder.embed_async(c) for c in batch), return_exceptions=True
+    applied = 0
+    for t in turns:
+        res = await drive_turn(
+            db, user_id, t.user + (t.injected or ""), t.assistant,
+            trivial=t.trivial,
         )
-        for content, vec in zip(batch, vectors):
-            await svc.create_memory(
-                user_id=user_id,
-                memory_data=MemoryCreate(
-                    content=content,
-                    brain_type=BrainType.USER,
-                    category="other",
-                    memory_type=MemoryType("fact"),
-                    importance=0.6,
-                    confidence=0.9,
-                    memory_level=MemoryLevel.EPISODIC,
-                    emotional_salience=0.5,
-                    source_type="seed",
-                ),
-                deduplicate=False,
-                embedding=None if isinstance(vec, BaseException) else vec,
-                commit=False,
-            )
-            written += 1
-        await db.commit()
-    return written
+        applied += int(res.get("applied", 0))
+    return applied
 
 
-# ── Read path ────────────────────────────────────────────────────────────
+# ── Store inspection: FILES, not rows ────────────────────────────────────
 
-async def recall(
-    db,
-    user_id: str,
-    query: str,
-    *,
-    limit: Optional[int] = None,
-    min_similarity: Optional[float] = None,
-    strategies: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """Retrieve as agent_runner.py:3454 does."""
-    from app.config import settings
-    from app.services.memory_service import MemoryService
-
-    return await MemoryService(db).hybrid_search(
-        user_id=user_id,
-        query=query,
-        limit=limit if limit is not None else settings.memory_retrieval_limit,
-        min_similarity=(
-            min_similarity
-            if min_similarity is not None
-            else settings.memory_retrieval_min_similarity
-        ),
-        strategies=strategies or ["vector", "keyword", "graph"],
-    )
-
-
-async def injected_context(db, user_id: str, query: str) -> List[Dict[str, Any]]:
-    """The memory rows that actually reach the model on one turn.
-
-    Mirrors agent_runner.py's assembly: the query-independent core facts
-    (`get_core_facts`, capped at CORE_FACTS_LIMIT) merged ahead of the
-    query-conditioned `hybrid_search` results. Retrieval tests assert on THIS,
-    because "did the agent know?" is a question about the composed context, not
-    about one leg of it.
-    """
-    from app.agent.agent_runner import CORE_FACTS_LIMIT
-    from app.services.memory_service import MemoryService
-
-    svc = MemoryService(db)
-    core = await svc.get_core_facts(user_id=user_id, limit=CORE_FACTS_LIMIT)
-    retrieved = await recall(db, user_id, query)
-
-    seen = {m["id"] for m in core}
-    return core + [m for m in retrieved if m["id"] not in seen]
-
-
-async def injected_contents(db, user_id: str, query: str) -> List[str]:
-    return [m["content"] for m in await injected_context(db, user_id, query)]
-
-
-# ── Store inspection ─────────────────────────────────────────────────────
-
-async def active_memories(db, user_id: str) -> List[Any]:
-    """Every memory a retrieval path could serve for this user."""
-    from app.db.models.memory import Memory
+async def all_files(db, user_id: str) -> List[Any]:
+    from app.db.models import MemoryFile
 
     rows = await db.execute(
-        select(Memory)
-        .where(
-            and_(
-                Memory.user_id == user_id,
-                Memory.is_deleted == False,  # noqa: E712
-                Memory.is_active == True,  # noqa: E712
-            )
-        )
-        .order_by(Memory.created_at)
+        select(MemoryFile)
+        .where(MemoryFile.user_id == user_id)
+        .order_by(MemoryFile.slug)
     )
     return list(rows.scalars())
 
 
-async def all_memory_rows(db, user_id: str) -> List[Any]:
-    """Every row, including soft-deleted and superseded."""
-    from app.db.models.memory import Memory
+async def bodies_by_slug(db, user_id: str) -> Dict[str, str]:
+    return {f.slug: (f.body_md or "") for f in await all_files(db, user_id)}
+
+
+async def change_summaries(db, user_id: str) -> List[str]:
+    from app.db.models import MemoryFileChange
 
     rows = await db.execute(
-        select(Memory).where(Memory.user_id == user_id).order_by(Memory.created_at)
+        select(MemoryFileChange.summary).where(MemoryFileChange.user_id == user_id)
     )
-    return list(rows.scalars())
+    return [r[0] for r in rows.all()]
 
 
-async def active_contents(db, user_id: str) -> List[str]:
-    return [m.content for m in await active_memories(db, user_id)]
+def bullets_of(body: str) -> List[str]:
+    from app.memory_files import parse_bullets
 
-
-async def count_all_memories(db) -> int:
-    from app.db.models.memory import Memory
-
-    return int((await db.execute(select(func.count(Memory.id)))).scalar() or 0)
+    return parse_bullets(body)
 
 
 # ── Ground-truth matching ────────────────────────────────────────────────
@@ -244,94 +120,193 @@ def norm(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-@dataclass(frozen=True)
-class Marker:
-    """A machine-checkable claim about the store.
+def find_capture(
+    marker: Capture, bodies: Dict[str, str]
+) -> Optional[Tuple[str, str]]:
+    """(slug, bullet) where all of `all_of` appear in ONE bullet, else None.
 
-    `all_of` substrings must ALL appear in a SINGLE memory for the marker to be
-    considered present. Markers use distinctive tokens (proper nouns, numbers,
-    rare words) so matching cannot be satisfied by an unrelated row.
+    One BULLET, not one file: §1.3 says one complete self-contained fact per
+    bullet, so a marker whose tokens are scattered across two bullets has
+    not been captured as a fact — it has been captured as two fragments.
     """
+    for slug, body in bodies.items():
+        for bullet in bullets_of(body):
+            n = norm(bullet)
+            if all(norm(tok) in n for tok in marker.all_of):
+                return slug, bullet
+    return None
 
-    id: str
-    all_of: Sequence[str]
 
-    def found_in(self, contents: Sequence[str]) -> Optional[str]:
-        for c in contents:
-            n = norm(c)
-            if all(norm(tok) in n for tok in self.all_of):
-                return c
-        return None
+def capture_is_routed(marker: Capture, slug: str) -> bool:
+    """Did it land where the label says it should?"""
+    from app.memory_files import section_of_slug
 
+    if marker.file:
+        return slug == marker.file
+    if marker.section:
+        section = section_of_slug(slug)
+        return section is not None and section.value == marker.section
+    return True
+
+
+def find_reject(marker: Reject, bodies: Dict[str, str]) -> Optional[str]:
+    """The body text where all of `all_of` appear TOGETHER, else None.
+
+    Per-file rather than per-bullet on purpose: junk that got split across
+    two bullets of the same file is still junk that was stored.
+    """
+    for slug, body in bodies.items():
+        n = norm(body)
+        if all(norm(tok) in n for tok in marker.all_of):
+            return f"{slug} :: {body.strip()[:200]}"
+    return None
+
+
+# ── Lint over everything the writer left behind ──────────────────────────
 
 @dataclass
-class Turn:
-    user: str
-    assistant: str = ""
-    trivial: bool = False
+class LintReport:
+    bullets_total: int = 0
+    bullet_problems: List[str] = field(default_factory=list)
+    descriptions_total: int = 0
+    description_problems: List[str] = field(default_factory=list)
+
+    @property
+    def clean(self) -> bool:
+        return not self.bullet_problems and not self.description_problems
 
 
-@dataclass
-class Scenario:
-    id: str
-    turns: List[Turn]
-    must_store: List[Marker] = field(default_factory=list)
-    must_not_store: List[Marker] = field(default_factory=list)
-    lang: str = "en"
-    note: str = ""
+def lint_files(files: Sequence[Any]) -> LintReport:
+    """Every bullet through `bullet_problem`, every description through
+    `DESCRIPTION_RE`. This is the deterministic half of §1.3/§1.4, applied
+    to what the REAL writer produced rather than to a hand-written fixture.
+    """
+    from app.memory_files import (
+        CURRENT_CONTEXT_SLUG, bullet_problem, description_problem, is_bullet_list,
+    )
 
+    report = LintReport()
+    for f in files:
+        body = f.body_md or ""
+        # Current context is `##` layer headings with prose (§6), not a
+        # bullet list — WS-3 owns its shape and the bullet lint does not
+        # apply to it.
+        if f.slug != CURRENT_CONTEXT_SLUG and body.strip():
+            if not is_bullet_list(body):
+                report.bullet_problems.append(
+                    f"{f.slug}: body is not a bullet list"
+                )
+            for bullet in bullets_of(body):
+                report.bullets_total += 1
+                problem = bullet_problem(bullet)
+                if problem:
+                    report.bullet_problems.append(f"{f.slug}: {problem} :: {bullet}")
+        if f.description:
+            report.descriptions_total += 1
+            problem = description_problem(f.description)
+            if problem:
+                report.description_problems.append(f"{f.slug}: {problem}")
+    return report
+
+
+# ── One scenario's verdict, as plain data ────────────────────────────────
 
 @dataclass
 class ScenarioResult:
     scenario_id: str
-    stored: List[str]
-    missed: List[str]
-    junk: List[str]
-    #: (category, brain_type) for every ACTIVE row the scenario left behind.
-    #:
-    #: Captured here rather than re-queried later because the labeled corpus is
-    #: executed once per session and the autouse `_reset_database` fixture
-    #: TRUNCATEs the memory tables before every test — by the time an assertion
-    #: body runs, the rows are gone. Carrying the labels out as plain data is
-    #: the same trick `stored`/`missed`/`junk` already use.
-    labels: List[tuple] = field(default_factory=list)
-
-    @property
-    def recall(self) -> float:
-        total = len(self.stored) + len(self.missed)
-        return 1.0 if total == 0 else len(self.stored) / total
+    #: Capture markers found, as id -> (slug, bullet).
+    captured: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    missed: List[str] = field(default_factory=list)
+    #: Captured but in the WRONG file.
+    misrouted: List[str] = field(default_factory=list)
+    #: Reject markers that were stored anyway.
+    junk: List[str] = field(default_factory=list)
+    #: Slugs the label forbids that exist anyway.
+    forbidden_slugs: List[str] = field(default_factory=list)
+    #: Section-cardinality violations ("exactly one people file").
+    cardinality: List[str] = field(default_factory=list)
+    lint: LintReport = field(default_factory=LintReport)
+    slugs: List[str] = field(default_factory=list)
+    bodies: Dict[str, str] = field(default_factory=dict)
+    changes: List[str] = field(default_factory=list)
+    applied: int = 0
 
     def describe(self) -> str:
-        lines = [f"scenario={self.scenario_id} recall={self.recall:.0%} junk={len(self.junk)}"]
+        lines = [
+            f"scenario={self.scenario_id} applied={self.applied} "
+            f"files={self.slugs}"
+        ]
         if self.missed:
-            lines.append("  MISSED (must be stored, was not):")
+            lines.append("  MISSED (must be captured, was not):")
             lines += [f"    - {m}" for m in self.missed]
+        if self.misrouted:
+            lines.append("  MISROUTED (captured, wrong file):")
+            lines += [f"    - {m}" for m in self.misrouted]
         if self.junk:
             lines.append("  JUNK (must NOT be stored, was):")
             lines += [f"    - {j}" for j in self.junk]
+        if self.forbidden_slugs:
+            lines.append(f"  FORBIDDEN FILES: {self.forbidden_slugs}")
+        if self.cardinality:
+            lines += [f"  CARDINALITY: {c}" for c in self.cardinality]
+        if not self.lint.clean:
+            lines.append("  LINT:")
+            lines += [f"    - {p}" for p in self.lint.bullet_problems]
+            lines += [f"    - {p}" for p in self.lint.description_problems]
+        for slug, body in sorted(self.bodies.items()):
+            if body.strip():
+                lines.append(f"  [{slug}]")
+                lines += [f"      {ln}" for ln in body.strip().splitlines()]
         return "\n".join(lines)
 
 
-async def run_scenario(db, user_id: str, sc: Scenario) -> ScenarioResult:
-    await drive_conversation(db, user_id, sc.turns)
-    rows = await active_memories(db, user_id)
-    contents = [m.content for m in rows]
-    # `category` and `brain_type` are plain String columns on the model, but
-    # coerce anyway so a future switch to a SQLAlchemy Enum type does not turn
-    # every label into "MemoryCategory.OTHER" and silently break the metric.
-    labels = [
-        (
-            str(getattr(m.category, "value", m.category) or ""),
-            str(getattr(m.brain_type, "value", m.brain_type) or ""),
-        )
-        for m in rows
-    ]
+async def run_scenario(db, user_id: str, sc: Scenario, *, dirty: bool = False):
+    from app.memory_files import SYSTEM_FILES, section_of_slug
 
-    stored, missed, junk = [], [], []
-    for m in sc.must_store:
-        (stored if m.found_in(contents) else missed).append(m.id)
-    for m in sc.must_not_store:
-        hit = m.found_in(contents)
+    applied = (
+        await drive_conversation_dirty(db, user_id, sc.turns) if dirty
+        else await drive_conversation(db, user_id, sc.turns)
+    )
+
+    files = await all_files(db, user_id)
+    bodies = {f.slug: (f.body_md or "") for f in files}
+    res = ScenarioResult(
+        scenario_id=sc.id + ("[dirty]" if dirty else ""),
+        applied=applied,
+        slugs=sorted(bodies),
+        bodies=bodies,
+        changes=await change_summaries(db, user_id),
+        lint=lint_files(files),
+    )
+
+    for marker in sc.must_capture:
+        hit = find_capture(marker, bodies)
+        if hit is None:
+            res.missed.append(marker.id)
+            continue
+        slug, bullet = hit
+        res.captured[marker.id] = (slug, bullet)
+        if not capture_is_routed(marker, slug):
+            want = marker.file or f"section={marker.section}"
+            res.misrouted.append(f"{marker.id}: wanted {want}, got {slug}")
+
+    for marker in sc.must_reject:
+        hit = find_reject(marker, bodies)
         if hit:
-            junk.append(f"{m.id} :: {hit[:160]}")
-    return ScenarioResult(sc.id, stored, missed, junk, labels)
+            res.junk.append(f"{marker.id} :: {hit}")
+
+    res.forbidden_slugs = [s for s in sc.forbid_slugs if s in bodies]
+
+    if sc.exactly_one_in_section:
+        want = sc.exactly_one_in_section
+        in_section = [
+            s for s in bodies
+            if s not in SYSTEM_FILES
+            and (section_of_slug(s).value if section_of_slug(s) else None) == want
+        ]
+        if len(in_section) != 1:
+            res.cardinality.append(
+                f"expected exactly 1 file in section {want!r}, got {in_section}"
+            )
+
+    return res

@@ -65,6 +65,10 @@ from app.services.memory_log import describe_memory
 
 logger = logging.getLogger(__name__)
 
+# The one slug this module needs: onboarding compiles the user_profile
+# Identity document from the profile FILE (see _finalize_onboarding).
+from app.memory_files import PROFILE_SLUG  # noqa: E402
+
 router = APIRouter(tags=["Realtime Voice"])
 
 # ── Module refs (set from agent_main.py lifespan) ─────────────────────
@@ -636,24 +640,22 @@ async def build_realtime_instructions(
     if vps:
         agent_url, agent_api_key = vps
 
-        # Prefetch the four independent VPS reads concurrently. A cold or
-        # stalled agent container used to burn their 15s timeouts one after
-        # another (identity → agent brain → user brain → day-chats) while the
-        # client heard nothing pre-`ready`; concurrent, the wall time is the
-        # slowest single read. Processing below stays sequential so section
-        # order is unchanged. (_vps_api never raises — it returns None — but
-        # return_exceptions guards refactors.)
+        # Prefetch the independent VPS reads concurrently. A cold or stalled
+        # agent container used to burn their 15s timeouts one after another
+        # while the client heard nothing pre-`ready`; concurrent, the wall
+        # time is the slowest single read. Processing below stays sequential
+        # so section order is unchanged. (_vps_api never raises — it returns
+        # None — but return_exceptions guards refactors.)
+        #
+        # TWO reads now, not four. The agent-brain and user-brain legs are
+        # DELETED — see `_MEMORY_IS_NOT_IN_THIS_BUILDER` below.
         _prefetched = await asyncio.gather(
             _load_identities_local(user_id),
-            _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
-                     params={"brain_type": "agent", "limit": _MEMORIES_MAX_LIMIT}),
-            _vps_api(agent_url, agent_api_key, "GET", "/api/memories",
-                     params={"brain_type": "user", "limit": _MEMORIES_MAX_LIMIT}),
             _vps_api(agent_url, agent_api_key, "GET", "/api/day-chats",
                      params={"limit": 1}),
             return_exceptions=True,
         )
-        identities_data, agent_mems_data, user_mems_data, dc_list_prefetch = (
+        identities_data, dc_list_prefetch = (
             r if not isinstance(r, BaseException) else None for r in _prefetched
         )
         # SAY SO when a leg comes back empty. `_vps_api` turns every non-2xx into
@@ -665,17 +667,56 @@ async def build_realtime_instructions(
         # 422'd. Both had been silently failing, on every call, for as long as
         # those two contracts had been skewed. A prompt that lost its context
         # must never again look the same as a prompt that had none to lose.
+        #
+        # ── _MEMORY_IS_NOT_IN_THIS_BUILDER (memory v3) ────────────────────
+        #
+        # `agent_brain` and `user_brain` are no longer legs of this list,
+        # because they are no longer READS. They were two `GET /api/memories`
+        # calls — a route v3 deleted — so leaving them here would have logged
+        # "no agent_brain, user_brain" on literally every voice call forever,
+        # which is precisely the "looks like the user has nothing" failure the
+        # paragraph above exists to prevent. Re-pointing them was the other
+        # option and was rejected: the platform must not become a THIRD
+        # assembler of the memory block. The contract is one
+        # `render_user_brain` with two callers, both agent-side
+        # (agent_runner and app/agent/voice_context.py), and a platform-side
+        # re-render is exactly the drift that produced #448 (voice with no
+        # persona) and #488 (voice narrating yesterday).
+        #
+        # The reason deletion beats re-pointing is about the ROLLOUT, not
+        # about reachability. The route and the data MIGRATE TOGETHER, per
+        # tenant: an agent still on the old image has not migrated and its
+        # old route renders rows; an agent on the new image has migrated and
+        # its route renders files. So whatever an agent can answer at all, it
+        # answers consistently with its own storage state, and fleet skew
+        # mid-rollout is self-consistent per tenant rather than mixed.
+        #
+        # A platform-side reader is the one thing that would break that. It
+        # would render whichever shape the PLATFORM believes in against
+        # whatever the TENANT has actually migrated to — the two are
+        # independently versioned, so that is a guaranteed mismatch for the
+        # whole rollout window, in the exact direction nobody would look.
+        #
+        # The residual case — an agent that is reachable and whose
+        # /internal/voice-context still does not answer — is not fixed by a
+        # second reader either. It is COUNTED instead: see
+        # `voice_ctx_hollow=1` in `_instructions_step`.
+        #
+        # So the fallback is identity + day history, and it says so. The
+        # statement is UNCONDITIONAL: a degraded prompt must announce itself
+        # even when every read it still makes succeeds.
         _missing = [
             _name for _name, _val in (
-                ("identity", identities_data), ("agent_brain", agent_mems_data),
-                ("user_brain", user_mems_data), ("day_chats", dc_list_prefetch),
+                ("identity", identities_data), ("day_chats", dc_list_prefetch),
             ) if not _val
         ]
-        if _missing:
-            logger.warning(
-                "[REALTIME] voice context DEGRADED — no %s for user %s; the model "
-                "is answering without it", ", ".join(_missing), user_id[:8],
-            )
+        logger.warning(
+            "[REALTIME] voice context is the LEGACY FALLBACK for user %s — it "
+            "carries identity + day history and NO MEMORY by construction "
+            "(the agent-side builder owns the memory block)%s",
+            user_id[:8],
+            f"; additionally missing: {', '.join(_missing)}" if _missing else "",
+        )
 
         # 1. Load identity documents from VPS
         try:
@@ -698,40 +739,12 @@ async def build_realtime_instructions(
         except Exception as e:
             logger.warning("[REALTIME] Failed to load VPS identities: %s", e)
 
-        # 2. Load ALL agent brain memories from VPS
-        try:
-            if agent_mems_data:
-                mems = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
-                if isinstance(mems, list) and mems:
-                    lines = ["# Agent Brain (Permanent Knowledge)"]
-                    for m in mems:
-                        cat = m.get("category", "")
-                        content = m.get("content", "")
-                        lines.append(f"- [{cat}] {content}")
-                    text = "\n".join(lines)
-                    if _budget:
-                        text = _cap_chars(text, int(_budget * 0.2), keep="head")
-                    sections.append(text)
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to load VPS agent memories: %s", e)
-
-        # 2b. Load ALL user brain memories from VPS
-        try:
-            if user_mems_data:
-                mems = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
-                if isinstance(mems, list) and mems:
-                    lines = ["# User Brain (What You Know About the User)"]
-                    for m in mems:
-                        cat = m.get("category", "")
-                        content = m.get("content", "")
-                        lines.append(f"- [{cat}] {content}")
-                    text = "\n".join(lines)
-                    if _budget:
-                        text = _cap_chars(text, int(_budget * 0.3), keep="head")
-                    sections.append(text)
-                    logger.info("[REALTIME] Loaded %d user brain memories from VPS", len(mems))
-        except Exception as e:
-            logger.warning("[REALTIME] Failed to load VPS user memories: %s", e)
+        # 2 / 2b. The "# Agent Brain" and "# User Brain" sections are GONE
+        # with the reads that fed them (see _MEMORY_IS_NOT_IN_THIS_BUILDER).
+        # They rendered `- [category] content` per row — a shape v3 has no
+        # source for and would not want: the memory block is now Profile +
+        # Current context + Learned + a described index, rendered ONCE by
+        # `app.memory_files.render_user_brain` on the agent side.
 
         # 2c. Load today's chat history via Day-as-Chat (cross-channel context)
         # Uses /api/day-chats endpoint which loads ALL messages from today
@@ -989,10 +1002,12 @@ async def build_realtime_instructions(
             "### Phase 1: Names\n"
             "Your FIRST question MUST be to ask what the user wants to call you and what their name is.\n"
             "Wait for their answer. Then:\n"
-            "- Store user's name: memory_store(brain_type='user', category='identity', "
-            "content='User name: <name>')\n"
-            "- Store your name: memory_store(brain_type='agent', category='agent_soul', "
-            "content='My name is <name>')\n\n"
+            "- Store THEIR name: memory_store(content='<name>, the person you are "
+            "talking to') — memory_store takes ONE argument, the fact in plain words. "
+            "You do not choose a file or a category; the writer files it.\n"
+            "- Do NOT store YOUR name with memory_store. Your name and personality are "
+            "your identity, not facts about them — remember what they chose and pass it "
+            "to finalize_onboarding at the end.\n\n"
 
             "### Phase 2: Color\n"
             "After names are set, say something like: \"Now, what color would you like for me? "
@@ -1003,27 +1018,29 @@ async def build_realtime_instructions(
             "'[COLOR_SELECTED: #hex]'. Acknowledge the color warmly.\n\n"
 
             "### Phase 3: Deep Profiling\n"
-            "Continue naturally, ONE question at a time:\n"
-            "- What they primarily need you for — goals, work domain. "
-            "Store: brain_type='user', category='goals'\n"
-            "- Their preferred language. "
-            "Store: brain_type='user', category='preferences'\n"
-            "- How they want you to communicate — formal/casual, concise/detailed, "
-            "personality preferences. Store: brain_type='agent', category='agent_soul'\n"
-            "- Any behavioral rules they want (things to always/never do). "
-            "Store: brain_type='agent', category='agent_soul'\n"
-            "- Anything else — hobbies, schedule, work style. "
-            "Store: brain_type='user', category appropriate\n\n"
+            "Continue naturally, ONE question at a time. Facts ABOUT THEM go to "
+            "memory_store(content='...'); how YOU should behave is your identity and "
+            "goes to finalize_onboarding.\n"
+            "- What they primarily need you for — goals, work domain. memory_store\n"
+            "- Their preferred language. memory_store\n"
+            "- Anything else — hobbies, schedule, work style. memory_store\n"
+            "- How they want you to communicate (formal/casual, concise/detailed) and "
+            "any always/never rules: do NOT call memory_store. Hold on to it and pass "
+            "it as `personality` to finalize_onboarding.\n\n"
 
             "### Phase 4: Wrap Up\n"
             "After gathering core info (minimum: both names, color, goals, language, "
             "personality preference), summarize what you learned. Then call "
-            "finalize_onboarding() to save the complete profiles and finish.\n\n"
+            "finalize_onboarding(agent_name='<the name they chose for you>', "
+            "personality='<how they want you to behave>') to save the profiles and "
+            "finish.\n\n"
 
             "RULES:\n"
             "- Be warm, enthusiastic, conversational. You're meeting your human!\n"
             "- Ask ONE question at a time. Never dump a list.\n"
-            "- Use memory_store for EACH piece of info as you learn it.\n"
+            "- Use memory_store for EACH fact about the USER as you learn it, one "
+            "argument: memory_store(content='...'). Never pass brain_type or category "
+            "— those parameters do not exist.\n"
             "- Match the user's language automatically.\n"
             "- Do NOT call finalize_onboarding until you have gathered enough info."
         )
@@ -1935,79 +1952,56 @@ async def _save_voice_messages(
     logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", saved, session_id[:8])
 
 
-# ── Background memory extraction (mirrors agent_runner._extract_memories) ──
-async def _extract_voice_memories(user_id: str, user_text: str, assistant_text: str) -> None:
-    """Extract and store memories from a voice conversation turn on VPS.
+# ── The voice turn's memory write (v3 §2.1.2) ─────────────────────────
+async def _curate_voice_turn(user_id: str, user_text: str, assistant_text: str) -> None:
+    """Hand one spoken turn to the agent's curator. Never raises.
 
-    Uses LLM extraction on platform, then pushes memories to VPS via tunnel
-    memory_store tool. No personal data is written to the platform DB.
+    What died here: `_extract_voice_memories` ran the sentence extractor ON
+    THE PLATFORM and pushed each result across the agent tunnel as a
+    `memory_store` tool call with `explicit_save=True`. That flag turned OFF
+    three gate rules and the call carried no turn text, so two more abstained
+    — a voice-extracted memory was screened by scaffolding, length and the
+    never-store secret tier and nothing else. The file's own comment named
+    the result: permanent rows like "The user requested to play the song
+    'Setarehaye Sorbi'" with access_count=20.
+
+    v3 sends the TRANSCRIPT to the agent instead and lets the one writer
+    decide, under the same gates, the same durability rules and the same
+    lint as a typed turn. Nothing about memory is computed on the platform.
+
+    Not `/internal/agent-turn`: the relay calls that with save=False (which
+    maps to disable_post_processing=True) precisely because `think`'s task
+    string is the realtime model's synthesis, not the user's words. This
+    route takes the real transcript.
     """
     try:
-        from app.services.memory_extractor import get_memory_extractor
-        from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
-
-        if not is_agent_connected(user_id):
-            logger.info("[REALTIME] VPS not connected, skipping voice memory extraction")
+        vps = await _get_vps_info(user_id)
+        if not vps:
+            logger.info("[REALTIME] agent not reachable, skipping voice memory write")
             return
-
-        # Key for LLM extraction (operational data, not personal). Under the
-        # fully-hosted model the user has no key of their own, so reuse the
-        # realtime key resolver which falls back to the platform key — else
-        # voice memory extraction silently no-ops for every hosted user.
-        user_api_key = await _get_user_openai_key(user_id)
-
-        extractor = get_memory_extractor()
-        extracted = await extractor.extract_memories_with_llm(
-            user_message=user_text,
-            assistant_response=assistant_text,
-            brain_type="user",
-            max_memories=15,
-            api_key=user_api_key,
+        agent_url, agent_api_key = vps
+        result = await _vps_api(
+            agent_url, agent_api_key, "POST", "/api/v1/internal/curate-turn",
+            json_body={
+                "user_text": user_text[:8000],
+                "assistant_text": (assistant_text or "")[:8000],
+                "channel": "voice",
+            },
+            # A curator call is one LLM round trip on the agent. 15 s is the
+            # identity/memory READ default and would time out mid-write.
+            timeout=60.0,
         )
-
-        if not extracted:
+        if result is None:
+            logger.warning("[REALTIME] voice memory write failed for %s", user_id[:8])
             return
-
-        # Push each memory to VPS via tunnel memory_store (handles embedding + dedup on VPS)
-        pushed = 0
-        for mem in extracted:
-            cat = mem.category.value if hasattr(mem.category, "value") else mem.category
-            try:
-                # ttl_days MUST cross the tunnel. The extractor computes it
-                # for exactly the transient case ("play Ebi's music", "remind
-                # me in 2 minutes"), and dropping it here is why the founder's
-                # brain holds permanent rows like "The user requested to play
-                # the song 'Setarehaye Sorbi'" with access_count=20 — media
-                # requests are overwhelmingly a voice behaviour, and this is
-                # the voice write path. Without a horizon they are immortal
-                # and outrank real preferences in retrieval forever.
-                result = await send_tool_call(user_id, "memory_store", {
-                    "content": mem.content,
-                    "category": cat,
-                    "brain_type": "user",
-                    "importance": mem.importance,
-                    "ttl_days": getattr(mem, "ttl_days", None),
-                    "memory_type": (
-                        mem.memory_type.value
-                        if hasattr(mem.memory_type, "value") else mem.memory_type
-                    ),
-                    "confidence": mem.confidence,
-                })
-                if not result.startswith("ERROR"):
-                    pushed += 1
-                    logger.info("[REALTIME] Memory stored on VPS: %s", describe_memory(mem.content, category=mem.category))
-                else:
-                    logger.warning("[REALTIME] VPS memory_store failed: %s", result[:200])
-            except Exception as e:
-                logger.warning("[REALTIME] VPS memory_store exception: %s", e)
-
         logger.info(
-            "[REALTIME] Voice memory extraction done: %d/%d pushed to VPS for %s",
-            pushed, len(extracted), user_id[:8],
+            "[REALTIME] voice memory: %s op(s)%s for %s",
+            result.get("applied", 0),
+            f" (skipped: {result['skipped']})" if result.get("skipped") else "",
+            user_id[:8],
         )
-
     except Exception as e:
-        logger.warning("[REALTIME] Voice memory extraction failed: %s", e)
+        logger.warning("[REALTIME] voice memory write failed: %s", e)
 
 
 # System prompt for the tool-less Option B fallback in `_think`.
@@ -2155,7 +2149,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                 # _save_voice_messages' real transcripts, and mining it for
                 # memories minted facts the user never stated (the 409A
                 # incident api_v1.py documents). Voice memory extraction runs
-                # from real transcripts via _extract_voice_memories instead.
+                # from real transcripts via _curate_voice_turn instead.
                 save_user_message=False,
                 save_assistant_message=False,
                 disable_post_processing=True,
@@ -2349,16 +2343,31 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
 
 
 # ── Finalize onboarding — compile profiles + write .md files ─────────
-async def _finalize_onboarding(user_id: str) -> str:
-    """Compile agent and user memories into Identity records and .md files.
+async def _finalize_onboarding(
+    user_id: str,
+    agent_name: Optional[str] = None,
+    personality: Optional[str] = None,
+) -> str:
+    """Compile the agent's soul and the user's profile into Identity records.
 
-    ALL data is read from and written to the user's VPS. The platform DB
-    is NEVER used for personal data (memories, identities, conversations).
+    v3 REWIRING. This used to read `GET /api/memories?brain_type=agent|user`
+    and reverse-engineer both documents out of the rows — including finding
+    the agent's own name with a substring search for "my name is". That
+    route is deleted, so both reads 404'd and every onboarding finished by
+    compiling a soul and a profile from ZERO memories, silently. The same
+    class of failure the 2026-08-01 limit=200 fix was about, one layer up.
 
-    1. Read agent + user memories from VPS (they were stored via tunnel memory_store)
-    2. Compile saul.md (agent soul) + identity.md (user profile)
-    3. Write .md files to VPS via tunnel write_file
-    4. Upsert Identity records in VPS DB via tunnel exec
+    The two halves are genuinely different and now travel by different
+    roads, which is the point:
+
+    * the AGENT's name and personality are SOUL, not memory. v3 does not
+      keep them in the memory product at all, and `PUT /api/soul` is what
+      owns `AgentConfig.agent_name`. They arrive here as PARAMETERS the
+      model passes to `finalize_onboarding`, instead of being mined back out
+      of a memory dump.
+    * the USER's facts are memory, and the curator has already filed them
+      into `you/profile` as the conversation went. So the profile document
+      is read from the FILE — one read of a route that exists.
     """
     from app.api.ws_agent_tunnel import is_agent_connected, send_tool_call
 
@@ -2369,63 +2378,60 @@ async def _finalize_onboarding(user_id: str) -> str:
         # Ensure VPS user exists (for FK constraints)
         await _ensure_vps_user(user_id)
 
-        # ── 1. Read memories from VPS ──
-        # Both reads used limit=10000 against the agent's ceiling of 200 and so
-        # 422'd every time — the same skew that was fixed in
-        # build_realtime_instructions (see _MEMORIES_MAX_LIMIT). Here the cost
-        # was worse than a thin prompt: this is the function that COMPILES
-        # saul.md and identity.md at the end of onboarding, so every voice
-        # onboarding finished by writing a soul and a profile built from zero
-        # memories. Re-verified against the live agent 2026-08-01:
-        # limit=200 → 200 OK, limit=201 → 422.
+        # ── 1. The USER half: read the profile FILE ──
+        # One read of a route that exists (`GET /api/memories/files/{slug}`),
+        # not two reads of one that does not. This is not a third assembler:
+        # onboarding is compiling a profile DOCUMENT, not rendering a voice
+        # prompt, so it takes the body verbatim rather than re-deriving it.
         vps = await _get_vps_info(user_id)
-        agent_memories = []
-        user_memories = []
+        profile_body = ""
 
         if vps:
             agent_url, agent_api_key = vps
-
-            agent_mems_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "agent", "limit": _MEMORIES_MAX_LIMIT},
+            profile = await _vps_api(
+                agent_url, agent_api_key, "GET",
+                f"/api/memories/files/{PROFILE_SLUG}",
             )
-            if agent_mems_data:
-                agent_memories = agent_mems_data.get("memories", agent_mems_data) if isinstance(agent_mems_data, dict) else agent_mems_data
-                if not isinstance(agent_memories, list):
-                    agent_memories = []
+            if isinstance(profile, dict):
+                profile_body = (profile.get("body_md") or "").strip()
 
-            user_mems_data = await _vps_api(
-                agent_url, agent_api_key, "GET", "/api/memories",
-                params={"brain_type": "user", "limit": _MEMORIES_MAX_LIMIT},
+        if not profile_body:
+            # SAY SO. The predecessor logged counts that were always 0 and
+            # wrote the documents anyway; a profile compiled from nothing
+            # must not look like a profile compiled from a quiet user.
+            logger.warning(
+                "[REALTIME] Onboarding finalize for %s: you/profile is EMPTY "
+                "or unreadable — the user_profile document will be a stub",
+                user_id[:8],
             )
-            if user_mems_data:
-                user_memories = user_mems_data.get("memories", user_mems_data) if isinstance(user_mems_data, dict) else user_mems_data
-                if not isinstance(user_memories, list):
-                    user_memories = []
+        else:
+            logger.info(
+                "[REALTIME] Onboarding finalize for %s: profile body %d chars",
+                user_id[:8], len(profile_body),
+            )
 
-        logger.info(
-            "[REALTIME] Onboarding finalize: %d agent, %d user memories from VPS",
-            len(agent_memories), len(user_memories),
-        )
-
-        # ── 2. Compile saul.md (agent soul) ──
+        # ── 2. Compile the agent soul from what the MODEL reported ──
+        # The name used to be recovered with `"my name is" in content.lower()`
+        # over agent-brain rows — a substring search standing in for a
+        # contract. It is a parameter now, so a missing name is visible here
+        # instead of silently yielding "Agent Soul".
+        agent_name = (agent_name or "").strip() or None
+        _persona = (personality or "").strip()
         soul_sections = ["# Agent Soul\n"]
-        agent_name = None
-        for m in agent_memories:
-            cat = m.get("category", "")
-            content = m.get("content", "")
-            if "my name is" in content.lower():
-                agent_name = content.split("is")[-1].strip().rstrip(".")
-            soul_sections.append(f"- [{cat}] {content}")
+        if agent_name:
+            soul_sections.append(f"- Your name is {agent_name}.")
+        if _persona:
+            soul_sections.append(f"- {_persona}")
+        if not agent_name and not _persona:
+            logger.warning(
+                "[REALTIME] Onboarding finalize for %s: the model called "
+                "finalize_onboarding with no agent name and no personality",
+                user_id[:8],
+            )
         saul_content = "\n".join(soul_sections)
 
         # ── 3. Compile identity.md (user profile) ──
-        identity_sections = ["# User Profile\n"]
-        for m in user_memories:
-            cat = m.get("category", "")
-            content = m.get("content", "")
-            identity_sections.append(f"- [{cat}] {content}")
-        identity_content = "\n".join(identity_sections)
+        identity_content = "# User Profile\n\n" + (profile_body or "(not yet known)")
 
         # ── 4. Write .md files to VPS ──
         # DEPRECATED: saul.md / identity.md no longer used — Identity table is source of truth.
@@ -2448,7 +2454,13 @@ async def _finalize_onboarding(user_id: str) -> str:
                     # ever mounted in platform_main, so every onboarding upsert
                     # 404'd and was swallowed by the warning below. Verified
                     # live 2026-08-01: GET {agent}/api/identity -> 404 while
-                    # /api/soul and /api/memories both -> 200. Writing here puts
+                    # /api/soul and /api/memories both -> 200.
+                    #
+                    # That last clause is STALE as of memory v3: `/api/memories`
+                    # (the row list) is deleted. The agent's memory surface is
+                    # `/api/memories/files/...`, which is what this function now
+                    # reads for the user profile. /api/soul is unaffected — it
+                    # is the Soul surface, and Soul is not memory. Writing here puts
                     # the rows exactly where _load_identities_local now reads
                     # them, so a user's onboarding persona reaches their voice
                     # prompt instead of vanishing.
@@ -3497,22 +3509,40 @@ async def realtime_voice_ws(
 
     async def _instructions_step() -> Optional[str]:
         _ctx_now = datetime.now(timezone.utc)
-        legacy: Optional[str] = None
-        try:
-            legacy = await build_realtime_instructions(
-                user_id, onboarding=onboarding, now_utc=_ctx_now
-            )
-            logger.info("[REALTIME] Built instructions (%d chars, onboarding=%s)", len(legacy), onboarding)
-        except Exception:
-            logger.exception("[REALTIME] Failed to build instructions")
 
-        # Serve the agent's version only when explicitly enabled; otherwise
-        # the agent call is a SHADOW — compared and logged, never served —
-        # so the two can be shown to agree on real traffic first.
         want_agent = _agent_ctx_enabled_for(user_id)
         want_shadow = settings.voice_context_shadow and not want_agent
+
+        # LAZY. The legacy builder makes its own tenant round-trips, and this
+        # runs on the connect critical section — before the client hears
+        # `ready`. It used to be built unconditionally and then discarded
+        # whenever the agent path succeeded, which with `want_agent` on and
+        # the shadow off is the COMMON case. That was defensible while it was
+        # "the comparison we are about to make"; with the agent path serving,
+        # it is work whose result is provably unused.
+        #
+        # Still EAGER under `want_shadow`, because comparing is the shadow's
+        # entire job. (No latency figure is claimed here — nobody has
+        # measured one. The argument is that the work is unnecessary, not
+        # that it is slow.)
+        async def _legacy() -> Optional[str]:
+            try:
+                built = await build_realtime_instructions(
+                    user_id, onboarding=onboarding, now_utc=_ctx_now
+                )
+                logger.info(
+                    "[REALTIME] Built instructions (%d chars, onboarding=%s)",
+                    len(built), onboarding,
+                )
+                return built
+            except Exception:
+                logger.exception("[REALTIME] Failed to build instructions")
+                return None
+
         if not (want_agent or want_shadow):
-            return legacy
+            return await _legacy()
+
+        legacy: Optional[str] = await _legacy() if want_shadow else None
 
         agent_instr = None
         try:
@@ -3551,9 +3581,26 @@ async def realtime_voice_ws(
         # want_agent: serve it, but never at the cost of having nothing.
         if agent_instr:
             return agent_instr
+
+        # ── The residual case, made COUNTABLE ────────────────────────────
+        #
+        # The agent builder can return None for a reason that is neither the
+        # deleted route nor reachability — a 500 from a bug, a timeout under
+        # load. The user then gets a whole voice call with no memory and no
+        # way to see that, and neither do we unless it is in the trail. So
+        # this is not a path to fix by adding a second reader; it is a thing
+        # to COUNT, on the same principle `_missing` was built on: a prompt
+        # that lost its context must never look like a prompt that had none.
+        #
+        # `voice_ctx_hollow=1` is a stable token on purpose — "how often are
+        # we serving hollow context?" has to be answerable by counting log
+        # lines, without a repro.
+        legacy = await _legacy()
         logger.warning(
-            "[REALTIME] agent voice-context unavailable — falling back to the "
-            "legacy builder for user=%s", str(user_id)[:8],
+            "[REALTIME] voice_ctx_hollow=1 user=%s onboarding=%s legacy=%s — "
+            "the agent voice-context builder did not answer, so this session "
+            "is served the legacy fallback, which carries NO MEMORY",
+            str(user_id)[:8], onboarding, bool(legacy),
         )
         return legacy
 
@@ -3607,8 +3654,32 @@ async def realtime_voice_ws(
             tools.append({
                 "type": "function",
                 "name": "finalize_onboarding",
-                "description": "Call when onboarding conversation is complete to save all profiles and finish setup. Only call after gathering: both names, color, goals, language, and personality.",
-                "parameters": {"type": "object", "properties": {}},
+                "description": (
+                    "Call when the onboarding conversation is complete, to save "
+                    "the profiles and finish setup. Only call after gathering: "
+                    "both names, colour, goals, language and personality. Pass "
+                    "the name the user chose FOR YOU and how they want you to "
+                    "behave — those are your identity, not facts about them, so "
+                    "they travel here rather than through memory_store."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "The name the user chose for you.",
+                        },
+                        "personality": {
+                            "type": "string",
+                            "description": (
+                                "One or two sentences: tone, formality, length "
+                                "preferences, and any always/never rules they "
+                                "gave you."
+                            ),
+                        },
+                    },
+                    "required": ["agent_name"],
+                },
             })
         return tools
 
@@ -4410,12 +4481,12 @@ async def realtime_voice_ws(
                                 except Exception:
                                     logger.warning("[REALTIME] Reply-language session.update failed")
 
-                        # Auto-extract memories from this conversation turn (background)
+                        # Write this spoken turn to memory (background).
                         if last_user_text and full_text and settings.auto_extract_memories:
                             asyncio.create_task(
-                                _extract_voice_memories(user_id, last_user_text, full_text)
+                                _curate_voice_turn(user_id, last_user_text, full_text)
                             )
-                            last_user_text = ""  # Reset so we don't re-extract
+                            last_user_text = ""  # Reset so we don't re-write
 
                     response_text_accum = ""
                     turn_model = default_turn_model  # Reset for next turn
@@ -4565,7 +4636,11 @@ async def realtime_voice_ws(
 
                             # ── Onboarding: finalize (compile profiles, mark complete) ──
                             elif func_name == "finalize_onboarding":
-                                result = await _finalize_onboarding(user_id)
+                                result = await _finalize_onboarding(
+                                    user_id,
+                                    agent_name=arguments.get("agent_name"),
+                                    personality=arguments.get("personality"),
+                                )
                                 try:
                                     from app.db.database import async_session_maker as _asm
                                     from app.db.models import AgentConfig

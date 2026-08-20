@@ -265,49 +265,29 @@ def test_voice_agent_turn_disables_post_processing_when_not_saving():
     )
 
 
-def test_voice_tunnel_forwards_the_expiry_horizon():
-    """ttl_days must cross the tunnel or transient voice memories are immortal."""
-    from app.api import ws_realtime
-
-    src = inspect.getsource(ws_realtime._extract_voice_memories)
-    assert '"ttl_days"' in src
-
-
-def test_memory_store_tool_accepts_and_applies_ttl():
-    """The receiving end must actually use it — a forwarded field that the
-    handler ignores is worse than not sending it, because it looks fixed."""
-    from app.agent.tool_executor import ToolExecutor
-
-    src = inspect.getsource(ToolExecutor._tool_memory_store)
-    assert 'inp.get("ttl_days")' in src
-    assert "expires_at=" in src
-    # The old default wrote a category that exists in no enum.
-    assert 'inp.get("category", "context")' not in src
-
-
-def test_dedup_adjudicates_the_most_similar_candidate():
-    """Regression for the blended-score P0.
-
-    find_similar_memories ranks by final_score (similarity is only 40%), so
-    candidates[0] was frequently NOT the nearest row — dedup then read
-    similarity off the wrong one. Asserted by executing the sort, not by
-    reading the source.
-    """
-    from app.services.memory_dedup_service import MemoryDedupService  # noqa: F401
-
-    candidates = [
-        {"id": "hot-but-distant", "similarity_score": 0.62, "final_score": 0.91},
-        {"id": "true-duplicate", "similarity_score": 0.94, "final_score": 0.78},
-    ]
-    ordered = sorted(
-        candidates, key=lambda c: c.get("similarity_score", 0), reverse=True
-    )
-    assert ordered[0]["id"] == "true-duplicate"
-
-    src = inspect.getsource(MemoryDedupService.smart_create_memory)
-    assert "key=lambda c: c.get('similarity_score', 0)" in src, (
-        "dedup is still adjudicating whichever row won the relevance blend"
-    )
+# ── RETIRED with the voice tunnel and the dedup service (v3 §2.1) ─────
+#
+# `test_voice_tunnel_forwards_the_expiry_horizon` pinned that `ttl_days`
+# crossed the agent tunnel, because dropping it is why the founder's brain
+# held permanent rows about songs he asked to play once. The TUNNEL is gone:
+# the relay sends the transcript to `/api/v1/internal/curate-turn` and the
+# curator decides, under the same durability rules a typed turn gets. There
+# is no TTL to forward because there is no lease — a one-off play request is
+# not stored at all. Pinned in test_curator_producers.py::
+# test_the_voice_tunnel_is_severed.
+#
+# `test_memory_store_tool_accepts_and_applies_ttl` pinned the receiving end.
+# `memory_store` now routes to `instruct_global`; it computes no expiry and
+# takes no category. Pinned in test_curator_producers.py::
+# test_memory_store_routes_through_the_curator.
+#
+# `test_dedup_adjudicates_the_most_similar_candidate` pinned the blended-score
+# P0 — `find_similar_memories` ranks by `final_score` (similarity is 40% of
+# it), so `candidates[0]` was frequently not the nearest row. Its subject,
+# `MemoryDedupService`, is deleted. v3 has no similarity adjudication at all:
+# the writer is SHOWN the file bodies and chooses `rewrite` over `add`
+# itself, which is measured end to end by the eval set's merge-don't-append
+# fixture rather than by a sort.
 
 
 # ── Placeholder-identity fail-open ────────────────────────────────────────

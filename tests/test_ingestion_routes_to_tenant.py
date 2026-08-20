@@ -581,49 +581,122 @@ async def test_control_document_ingest_still_works_and_is_retrievable(ctx, monke
 
 
 @pytest.mark.asyncio
-async def test_control_message_ingest_still_works_and_is_retrievable(ctx, monkeypatch):
-    """Same control for ingest.py: a turn goes in, the fact comes back out."""
+@pytest.mark.parametrize("extract_flag", [True, False])
+async def test_control_message_ingest_stores_the_turn_and_writes_no_memory(
+    ctx, extract_flag
+):
+    """The control for ingest.py, half rewritten and half kept.
+
+    KEPT — the routing control this test exists for: a turn goes in, the
+    conversation and both messages are stored, and the tenant was NOT called
+    (`run_mode=monolith`, so the route serves locally). That half is exactly
+    what a control is for and it still ships.
+
+    REWRITTEN — the memory half. This used to monkeypatch
+    `ingest_mod.get_memory_extractor` with a stub returning one
+    `ExtractedMemory` and assert `memories_extracted == 1` plus a `Memory`
+    row containing "Falcon". `/ingest` was the SIXTH memory writer — the
+    rule-based extractor plus a direct `create_memory`, with
+    `extract_memories` defaulting to True on a router mounted by both
+    entrypoints — and v3 severed it (rebuild-2026-08-v3 §2.1). The symbol it
+    patched no longer exists, so the stub and the monkeypatch went with it.
+
+    PARAMETRIZED over `extract_memories` ON PURPOSE. The request field is
+    still in the schema (`IngestMessageRequest.extract_memories`), so a test
+    that only ever passed `False` would not notice extraction coming back —
+    it would read as "the caller asked for nothing and got nothing". Passing
+    True is the case that matters: the caller asks, and the answer is still
+    zero rows.
+    """
     from app.db.database import async_session_maker
     from app.db.models import Conversation, Memory, Message
-    from app.services.memory_extractor import ExtractedMemory
 
-    monkeypatch.setattr(ctx["settings"], "run_mode", "monolith")
-
-    class _Extractor:
-        def extract_memories(self, user_message, assistant_response):
-            return [ExtractedMemory(
-                content="Nariman's rocket is called Falcon.",
-                summary=None,
-                category="knowledge",
-                memory_type="fact",
-                importance=0.7,
-                confidence=0.9,
-                entities=[],
-                tags=[],
-                metadata={},
-            )]
-
-    import app.api.ingest as ingest_mod
-    monkeypatch.setattr(ingest_mod, "get_memory_extractor", lambda: _Extractor())
-
-    r = await ctx["client"].post("/api/ingest/message", json={
-        "user_message": "My rocket is called Falcon.",
-        "assistant_response": "Noted.",
-        "extract_memories": True,
-    })
+    monkeypatch_settings = ctx["settings"]
+    original_mode = monkeypatch_settings.run_mode
+    monkeypatch_settings.run_mode = "monolith"
+    try:
+        r = await ctx["client"].post("/api/ingest/message", json={
+            "user_message": "My rocket is called Falcon.",
+            "assistant_response": "Noted.",
+            "extract_memories": extract_flag,
+        })
+    finally:
+        monkeypatch_settings.run_mode = original_mode
 
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["messages_ingested"] == 2
-    assert body["memories_extracted"] == 1
-    assert ctx["agent"].calls == []
 
+    # The half that still ships.
+    assert body["messages_ingested"] == 2
+    assert ctx["agent"].calls == []
     assert await _count(Conversation) == 1
     assert await _count(Message) == 2
 
+    # The half that v3 severed — whatever the caller asked for.
+    assert body["memories_extracted"] == 0, (
+        f"ingest reported extracting memories with extract_memories="
+        f"{extract_flag} — the sixth writer is back"
+    )
+    assert body["entities_extracted"] == 0
+    assert body["memories"] == []
+
     async with async_session_maker() as s:
         contents = (await s.execute(select(Memory.content))).scalars().all()
-    assert any("Falcon" in c for c in contents), contents
+    assert contents == [], f"ingest wrote a memory row: {contents}"
+    assert not any("Falcon" in c for c in contents), contents
+
+
+@pytest.mark.asyncio
+async def test_control_conversation_ingest_stores_every_message_and_no_memory(ctx):
+    """The sibling control, which never existed.
+
+    `/ingest/conversation` had only a PROXY test — nothing checked that the
+    local handler stores what it is given. v3 rewrote that handler's body
+    (the extraction block came out, and the message loop was restructured
+    around it), so a mistake there — an off-by-one in the pairing loop, a
+    lost `flush`, a message_count that no longer matches — would have been
+    invisible. Three messages in, three rows out, zero memory.
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import Conversation, Memory, Message
+
+    original_mode = ctx["settings"].run_mode
+    ctx["settings"].run_mode = "monolith"
+    try:
+        r = await ctx["client"].post("/api/ingest/conversation", json={
+            "messages": [
+                {"role": "user", "content": "Where do I keep the keys?"},
+                {"role": "assistant", "content": "In the blue bowl."},
+                {"role": "user", "content": "My rocket is called Falcon."},
+            ],
+            "title": "Keys",
+            # Asked for, and still refused — same reasoning as the message
+            # control: the schema field survives, so True is the case that
+            # would notice extraction coming back.
+            "extract_memories": True,
+        })
+    finally:
+        ctx["settings"].run_mode = original_mode
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["messages_ingested"] == 3
+    assert ctx["agent"].calls == []
+
+    assert await _count(Conversation) == 1
+    assert await _count(Message) == 3
+    assert await _count(Memory) == 0
+
+    assert body["memories_extracted"] == 0
+    assert body["entities_extracted"] == 0
+    assert body["memories"] == []
+
+    # An odd message count must not lose the trailing message — the old
+    # handler paired messages two at a time and only the PAIRS were mined,
+    # so a dangling third was easy to drop when the loop was rewritten.
+    async with async_session_maker() as s:
+        stored = (await s.execute(select(Message.content))).scalars().all()
+    assert any("Falcon" in c for c in stored), stored
 
 
 # ── end-to-end: platform → the REAL agent-side handler ──────────────────

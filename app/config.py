@@ -939,7 +939,36 @@ class Settings(BaseSettings):
     # can be shown to agree on real traffic before anything depends on it.
     # Any failure of the agent call falls back to the legacy builder, and
     # then to the base stub; a voice session must never open with nothing.
-    voice_context_from_agent: bool = False
+    #
+    # ⚠️ MEMORY V3 (2026-08-20) MAKES THIS FLIP A DEPLOY PREREQUISITE.
+    # The legacy relay builder fetches the user's brain with two
+    # `GET /api/memories?brain_type=…&limit=200` calls, and v3 deletes every
+    # row route from that surface (rebuild-2026-08-v3 §4). With this flag
+    # OFF those calls 404, `_vps_api` turns a non-2xx into None, and a voice
+    # session opens with persona + day history and NO memory — quietly, on
+    # every session. `[REALTIME] … missing=agent_brain,user_brain` is the
+    # symptom in the logs.
+    #
+    # FLIPPED ON, 2026-08-20, WS-2. The canary-first argument that kept this
+    # False PREDATES v3 and it INVERTS under it.
+    #
+    # That argument was: ON changes what every voice session hears, so prove
+    # the new builder matches the old one on real traffic first. It assumed
+    # OFF is the safe side. With the row routes deleted, OFF is not the old
+    # behaviour — it is a THIRD behaviour nobody has ever run: the legacy
+    # builder's two memory legs 404, `_vps_api` folds that to None, and every
+    # voice session opens memory-less. There is no version of this branch in
+    # which leaving it OFF preserves anything.
+    #
+    # `voice_context_shadow` stays True, so the comparison keeps being logged
+    # (now with the legacy side degraded, which is the point). The fallback
+    # chain is unchanged and still terminates in the base stub: a failure of
+    # the agent call cannot open a session with nothing.
+    #
+    # `voice_context_from_agent_user_ids` stays for the reverse case — a
+    # single tenant on an old image can be listed to force the agent path,
+    # or the global can be set False in one deploy's env to roll back.
+    voice_context_from_agent: bool = True
     voice_context_shadow: bool = True
     # Per-user canary for the flip above. `voice_context_from_agent` is a
     # platform-process global — one process serves every tenant — so the

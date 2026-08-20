@@ -1,5 +1,32 @@
-"""
-Tests for the Toup Memory System
+"""API smoke tests for the routes that still exist.
+
+WHAT LEFT, 2026-08-20 (memory v3)
+
+This file was mostly a driver for the round-8 ROW API — `POST /memories`,
+`/{id}/events`, `/{id}/reinforce`, `/category/{c}`, `/region/{r}`, plus the
+admin decay/consolidate endpoints. All of that is deleted
+(docs/memory/rebuild-2026-08-v3.md §1.1, §4), so those 15 tests retired with
+their subject; see tests/RETIRED_WITH_MEMORY_V3.md for the accounting.
+
+What is left has a LIVE subject: auth, the ingest routes (whose message
+storage survives even though their extraction was severed), the stats
+routes, the `/agent/store` + `/agent/recall` API, and the two pure-function
+service tests.
+
+WHY THE AUTH FIXTURE CHANGED, AND WHAT IT DOES NOT CHANGE
+
+Every test here took its token from `POST /api/auth/demo`. That route has
+been gated OFF by default since 2026-08-09 (c83c575b, "demo login is an open
+door") — it is unauthenticated with the password in source, so it 404s
+everywhere, deliberately. The fixture asserted 200, so it raised, so all 19
+tests that depend on it ERRORED. That is a PRE-EXISTING red, eleven days
+older than this rebuild and nothing to do with memory.
+
+The fixture now mints a token directly, the way tests/conftest.py already
+does. No product code changes and the gate is untouched: a TEST should not
+depend on a production route that is disabled on purpose, and
+`test_demo_login` below now asserts the shipped behaviour (404 when
+disabled) instead of the behaviour PR #528 removed.
 """
 
 import pytest
@@ -8,8 +35,10 @@ from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.main import app
+from app.config import settings
 from app.db import init_db, drop_db, async_session_maker
 from app.services import create_user, get_embedding_service, get_memory_extractor
+from app.services.auth_service import create_access_token
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -37,21 +66,41 @@ async def client():
 
 @pytest_asyncio.fixture
 async def auth_headers(client: AsyncClient):
-    """Get auth headers for a demo user"""
-    response = await client.post("/api/auth/demo")
-    assert response.status_code == 200
-    token = response.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+    """A token for a real user, minted directly.
+
+    NOT via `POST /api/auth/demo`: that route is gated off by default and
+    404s (see the module docstring), which is why every test in this file
+    used to error in setup. Same primitive tests/conftest.py uses.
+    """
+    async with async_session_maker() as session:
+        user = await create_user(
+            session, email="apitest@toup.local", password="apitest123456",
+            name="API Test User",
+        )
+        user_id = user.id
+    return {"Authorization": f"Bearer {create_access_token(user_id)}"}
 
 
 # ============ Auth Tests ============
 
 @pytest.mark.asyncio
-async def test_demo_login(client: AsyncClient):
-    """Test demo user login"""
+async def test_demo_login_is_closed_unless_explicitly_enabled(client: AsyncClient):
+    """PR #528: the demo route is an open door, so it ships disabled.
+
+    It is unauthenticated and its password is in source, so anywhere it is
+    reachable anyone can mint a valid session. 404 rather than 403 so the
+    disabled route does not advertise its own existence — that is the
+    assertion, and asserting 200 (as this test used to) asserts the hole.
+    """
     response = await client.post("/api/auth/demo")
-    assert response.status_code == 200
-    assert "access_token" in response.json()
+    if settings.demo_login_enabled:
+        assert response.status_code == 200
+        assert "access_token" in response.json()
+    else:
+        assert response.status_code == 404, (
+            "the demo login route answered while disabled — anyone who can "
+            "reach this deployment can now mint a session"
+        )
 
 
 @pytest.mark.asyncio
@@ -66,107 +115,12 @@ async def test_get_me(client: AsyncClient, auth_headers: dict):
 
 # ============ Memory Tests ============
 
-@pytest.mark.asyncio
-async def test_create_memory(client: AsyncClient, auth_headers: dict):
-    """Test creating a memory"""
-    response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "I love Python programming",
-            "category": "preferences",
-            "memory_type": "preference",
-            "importance": 0.8,
-        }
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert data["content"] == "I love Python programming"
-    assert data["category"] == "preferences"
-    assert data["memory_type"] == "preference"
 
 
-@pytest.mark.asyncio
-async def test_get_memory(client: AsyncClient, auth_headers: dict):
-    """Test getting a memory by ID"""
-    # Create first
-    create_response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Test memory content",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    memory_id = create_response.json()["id"]
-    
-    # Get
-    response = await client.get(
-        f"/api/memories/{memory_id}",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    assert response.json()["id"] == memory_id
 
 
-@pytest.mark.asyncio
-async def test_search_memories(client: AsyncClient, auth_headers: dict):
-    """Test semantic search for memories"""
-    # Create some memories
-    for content in [
-        "I enjoy hiking in the mountains",
-        "Python is my favorite programming language",
-        "I need to call my doctor tomorrow",
-    ]:
-        await client.post(
-            "/api/memories",
-            headers=auth_headers,
-            json={
-                "content": content,
-                "category": "knowledge",
-                "memory_type": "fact",
-            }
-        )
-    
-    # Search
-    response = await client.post(
-        "/api/memories/search",
-        headers=auth_headers,
-        json={
-            "query": "programming languages",
-            "limit": 10,
-        }
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert "results" in data
-    # Python memory should rank high
-    if data["results"]:
-        assert "Python" in data["results"][0]["content"] or len(data["results"]) > 0
 
 
-@pytest.mark.asyncio
-async def test_get_memories_by_category(client: AsyncClient, auth_headers: dict):
-    """Test getting memories by category"""
-    # Create memories in different categories
-    await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Preference memory test",
-            "category": "preferences",
-            "memory_type": "preference",
-        }
-    )
-    
-    response = await client.get(
-        "/api/memories/category/preferences",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    memories = response.json()
-    assert all(m["category"] == "preferences" for m in memories)
 
 
 # ============ Ingestion Tests ============
@@ -347,259 +301,45 @@ def test_category_classification():
 
 # ============ Memory Enhancement API Tests ============
 
-@pytest.mark.asyncio
-async def test_create_memory_returns_strength(client: AsyncClient, auth_headers: dict):
-    """Test that created memory includes strength field"""
-    response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Testing memory strength",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert "strength" in data
-    assert data["strength"] == 1.0  # New memories start at full strength
 
 
-@pytest.mark.asyncio
-async def test_create_memory_returns_memory_level(client: AsyncClient, auth_headers: dict):
-    """Test that created memory includes memory_level field"""
-    response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Testing memory level",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert "memory_level" in data
-    assert data["memory_level"] == "episodic"  # Default level
 
 
-@pytest.mark.asyncio
-async def test_create_memory_with_emotional_salience(client: AsyncClient, auth_headers: dict):
-    """Test creating memory with emotional salience"""
-    response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "This is a very emotional memory",
-            "category": "emotions",
-            "memory_type": "emotion",
-            "importance": 0.9,
-            "emotional_salience": 0.95,
-        }
-    )
-    assert response.status_code == 201
-    data = response.json()
-    assert "emotional_salience" in data
-    assert data["emotional_salience"] == 0.95
 
 
-@pytest.mark.asyncio
-async def test_get_memory_events(client: AsyncClient, auth_headers: dict):
-    """Test getting memory events (audit trail)"""
-    # Create a memory
-    create_response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Test memory for events",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    memory_id = create_response.json()["id"]
-    
-    # Get events
-    response = await client.get(
-        f"/api/memories/{memory_id}/events",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    events = response.json()
-    
-    # Should have at least a 'created' event
-    assert len(events) >= 1
-    assert any(e["event_type"] == "created" for e in events)
 
 
-@pytest.mark.asyncio
-async def test_memory_access_creates_event(client: AsyncClient, auth_headers: dict):
-    """Test that accessing a memory creates an accessed event"""
-    # Create a memory
-    create_response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Memory to access",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    memory_id = create_response.json()["id"]
-    
-    # Access the memory
-    await client.get(f"/api/memories/{memory_id}", headers=auth_headers)
-    
-    # Get events
-    response = await client.get(
-        f"/api/memories/{memory_id}/events",
-        headers=auth_headers
-    )
-    events = response.json()
-    
-    # Should have 'created' and 'accessed' events
-    event_types = [e["event_type"] for e in events]
-    assert "created" in event_types
-    assert "accessed" in event_types
 
 
-@pytest.mark.asyncio
-async def test_memory_update_creates_event(client: AsyncClient, auth_headers: dict):
-    """Test that updating a memory creates an updated event"""
-    # Create a memory
-    create_response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Original content",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    memory_id = create_response.json()["id"]
-    
-    # Update the memory
-    await client.patch(
-        f"/api/memories/{memory_id}",
-        headers=auth_headers,
-        json={"content": "Updated content"}
-    )
-    
-    # Get events
-    response = await client.get(
-        f"/api/memories/{memory_id}/events",
-        headers=auth_headers
-    )
-    events = response.json()
-    
-    # Should have 'updated' event
-    assert any(e["event_type"] == "updated" for e in events)
 
 
-@pytest.mark.asyncio
-async def test_reinforce_memory_endpoint(client: AsyncClient, auth_headers: dict):
-    """Test the reinforce memory endpoint"""
-    # Create a memory
-    create_response = await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Memory to reinforce",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    memory_id = create_response.json()["id"]
-    
-    # Reinforce the memory
-    response = await client.post(
-        f"/api/memories/{memory_id}/reinforce",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data.get("success") is True
 
 
-@pytest.mark.asyncio
-async def test_search_returns_enhanced_fields(client: AsyncClient, auth_headers: dict):
-    """Test that search results include strength and memory_level"""
-    # Create a memory
-    await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Python programming is great",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    
-    # Search
-    response = await client.post(
-        "/api/memories/search",
-        headers=auth_headers,
-        json={
-            "query": "Python programming",
-            "limit": 5,
-        }
-    )
-    assert response.status_code == 200
-    data = response.json()
-    
-    if data["results"]:
-        result = data["results"][0]
-        assert "strength" in result
-        assert "memory_level" in result
 
 
-@pytest.mark.asyncio
-async def test_memory_list_returns_enhanced_fields(client: AsyncClient, auth_headers: dict):
-    """Test that memory list includes enhanced fields"""
-    # Create a memory
-    await client.post(
-        "/api/memories",
-        headers=auth_headers,
-        json={
-            "content": "Test memory for listing",
-            "category": "knowledge",
-            "memory_type": "fact",
-        }
-    )
-    
-    # List memories
-    response = await client.get(
-        "/api/memories",
-        headers=auth_headers
-    )
-    assert response.status_code == 200
-    memories = response.json()
-    
-    if memories:
-        memory = memories[0]
-        assert "strength" in memory
-        assert "memory_level" in memory
-        assert "emotional_salience" in memory
 
 
 # ============ Admin API Tests (if accessible) ============
 
-@pytest.mark.asyncio
-async def test_admin_decay_requires_auth(client: AsyncClient):
-    """Test that admin decay endpoint requires authentication"""
-    response = await client.post("/api/admin/decay")
-    assert response.status_code == 401
 
 
-@pytest.mark.asyncio
-async def test_admin_consolidate_requires_auth(client: AsyncClient):
-    """Test that admin consolidation endpoint requires authentication"""
-    response = await client.post("/api/admin/consolidate")
-    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_admin_memory_health_requires_auth(client: AsyncClient):
-    """Test that admin memory-health endpoint requires authentication"""
-    response = await client.get("/api/admin/memory-health")
-    assert response.status_code == 401
+    """The per-user memory-health snapshot must not be readable unguarded.
+
+    This asked for `/api/admin/memory-health` — a path that has never
+    existed; the route has always been `/memory-health/{user_id}`. So it got
+    a 404 from the ROUTER and asserted 401, which means it has never once
+    tested authentication. Its subject survives (the route is still there,
+    still an operator surface over one user's data), so it is repaired
+    rather than retired.
+    """
+    response = await client.get(
+        "/api/admin/memory-health/00000000-0000-0000-0000-000000000000"
+    )
+    assert response.status_code == 401, (
+        "the per-user memory-health snapshot answered without a token"
+    )
 

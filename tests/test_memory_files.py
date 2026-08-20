@@ -1,286 +1,287 @@
-"""Memory files — the organizing layer (docs/memory/rebuild-2026-08.md §3).
+"""Memory files v3 — the canon module (docs/memory/rebuild-2026-08-v3.md §1).
 
-Pins: the category→section map covers the whole taxonomy, slugs are safe,
-virtual synthesis groups rows exactly like the organized view will, the
-organize pass is idempotent and person-aware, file reads order by curation,
-and file deletion archives (soft) with audit events — never hard-deletes.
+Pure, stdlib-only, no DB: sections and slugs, the description regex, the
+bullet lint that keeps the one voice, body parse/render round trips, the
+truncation rule, and the SHARED injection renderer both assemblers use.
+
+Round 8's version of this file pinned a category→section map. v3 has no
+such map in canon — categories are not the router any more — so what is
+pinned here is the slug namespace, which is.
 """
 
-import uuid
-from datetime import datetime, timedelta
+import pytest
 
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from app.db.models.base import Base
-from app.db.models.user import User
-from app.db.models.memory import Memory, MemoryEvent, MemoryFile
-from app.db.models.entity import Entity, EntityLink
 from app.memory_files import (
-    SYSTEM_FILES,
+    ALWAYS_INJECTED_SLUGS,
+    CAP_PROFILE,
+    CURRENT_CONTEXT_LAYERS,
+    CURRENT_CONTEXT_SLUG,
+    DESCRIPTION_RE,
+    HEADING_CURRENT_CONTEXT,
+    HEADING_INDEX,
+    HEADING_LEARNED,
+    HEADING_PROFILE,
+    LEARNED_SLUG,
+    MAX_BODY_CHARS,
+    PROFILE_SLUG,
+    SECTION_LABEL,
     SECTION_ORDER,
+    SYSTEM_FILES,
+    TRUNCATION_NOTE,
     FileSection,
-    default_slug_for,
+    area_slug,
+    body_is_empty,
+    bullet_problem,
+    description_problem,
+    extract_links,
+    index_line,
     is_valid_slug,
+    parse_bullets,
     person_slug,
-    render_file_markdown,
-    section_for,
+    render_bullets,
+    render_user_brain,
+    section_of_slug,
     slugify,
+    title_from_slug,
+    topic_slug,
+    truncate_body,
 )
-from app.memory_taxonomy import MEMORY_CATEGORY_ALIASES, MemoryCategory
-from app.services.memory_file_service import MemoryFileService
 
 
-async def _make_session() -> tuple[AsyncSession, str]:
-    engine = create_async_engine(
-        "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(
-            Base.metadata.create_all,
-            tables=[
-                User.__table__, Memory.__table__, MemoryFile.__table__,
-                MemoryEvent.__table__, Entity.__table__, EntityLink.__table__,
-            ],
-        )
-    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    db = maker()
-    user_id = str(uuid.uuid4())
-    db.add(User(id=user_id, email=f"{user_id[:8]}@test.local", hashed_password="x"))
-    await db.commit()
-    return db, user_id
+# ── Sections and system files ─────────────────────────────────────────
 
-
-def _memory(user_id: str, content: str, *, category: str, brain_type: str = "user",
-            created_days_ago: int = 0, **kw) -> Memory:
-    when = datetime.utcnow() - timedelta(days=created_days_ago)
-    return Memory(
-        user_id=user_id, content=content, category=category,
-        memory_type=kw.pop("memory_type", "fact"), brain_type=brain_type,
-        created_at=when, updated_at=when, **kw,
-    )
-
-
-# ── Canon: map + slugs ────────────────────────────────────────────────
-
-async def test_section_map_covers_taxonomy():
-    # Every canonical user category resolves to a section — none may fall
-    # through to a KeyError or to a section outside the seven.
-    for cat in MemoryCategory:
-        section = section_for(cat.value, "user")
-        assert section in SECTION_ORDER, f"{cat.value} → {section}"
-    # Every legacy alias resolves through normalize_category to the same
-    # section its canonical value gets.
-    for alias, canonical in MEMORY_CATEGORY_ALIASES.items():
-        assert section_for(alias, "user") == section_for(canonical.value, "user"), alias
-    # Brain precedence: agent brain is always Learned (even for the
-    # colliding 'preferences'), work brain splits on active_task.
-    assert section_for("preferences", "agent") == FileSection.LEARNED
-    assert section_for("anything", "agent") == FileSection.LEARNED
-    assert section_for("active_task", "work") == FileSection.WORKING
-    assert section_for("process", "work") == FileSection.LEARNED
-    # Unknown user categories land in Knowledge — files have no junk drawer.
-    assert section_for("completely-novel", "user") == FileSection.KNOWLEDGE
-    assert section_for(None, "user") == FileSection.KNOWLEDGE
-    # Every section has a default slug and every default slug is a system file.
+def test_sections_are_the_five_v3_sections_in_display_order():
+    assert [s.value for s in SECTION_ORDER] == [
+        "you", "people", "topics", "areas", "learned"
+    ]
     for section in SECTION_ORDER:
-        slug = default_slug_for(
-            "active_task" if section == FileSection.WORKING else None, "user"
-        )
-        assert is_valid_slug(slug)
-    assert default_slug_for("goals", "user") == "areas/work"
-    assert default_slug_for("corrections", "agent") == "learned"
+        assert SECTION_LABEL[section]
+    # Round 8's catch-alls are gone from canon — no Preferences, no
+    # Knowledge, no Working. A file with nowhere to go is a routing bug,
+    # not a drawer to open.
+    assert not {"preferences", "knowledge", "working", "profile"} & {
+        s.value for s in SECTION_ORDER
+    }
 
 
-async def test_slugs_are_safe_and_unicode_capable():
+def test_the_three_system_files_are_the_always_injected_ones():
+    assert set(SYSTEM_FILES) == {PROFILE_SLUG, CURRENT_CONTEXT_SLUG, LEARNED_SLUG}
+    assert set(ALWAYS_INJECTED_SLUGS) == set(SYSTEM_FILES)
+    for slug, spec in SYSTEM_FILES.items():
+        assert is_valid_slug(slug), slug          # they ride URLs
+        assert FileSection(spec["section"]) in SECTION_ORDER
+        # A system file's description is the worked example the writer
+        # copies, so it must satisfy the same regex it is held to.
+        assert description_problem(spec["description"]) is None, slug
+
+
+def test_section_of_slug_reads_the_namespace_and_refuses_to_guess():
+    assert section_of_slug(PROFILE_SLUG) == FileSection.YOU
+    assert section_of_slug(LEARNED_SLUG) == FileSection.LEARNED
+    assert section_of_slug("people/majid-tajik") == FileSection.PEOPLE
+    assert section_of_slug("topics/music") == FileSection.TOPICS
+    assert section_of_slug("areas/toup") == FileSection.AREAS
+    # A round-8 slug names no v3 namespace. It must answer None rather than
+    # falling back to a section — that fallback is how a `knowledge` row
+    # would surface inside a v3 section it was never written for.
+    for legacy in ("knowledge", "preferences", "working", "profile", "people"):
+        assert section_of_slug(legacy) is None, legacy
+
+
+# ── Slugs ─────────────────────────────────────────────────────────────
+
+def test_slugs_are_safe_and_unicode_capable():
     assert slugify("Majid Tajik") == "majid-tajik"
     assert slugify("  IELTS — Prep!  ") == "ielts-prep"
     assert slugify("محمد السالم") == "محمد-السالم"  # Persian survives
     assert person_slug("Majid Tajik") == "people/majid-tajik"
+    assert topic_slug("Music") == "topics/music"
+    assert area_slug("Toup") == "areas/toup"
     assert person_slug("!!!") is None
     assert is_valid_slug("people/majid-tajik")
-    assert is_valid_slug("profile")
     assert not is_valid_slug("../../etc/passwd")
     assert not is_valid_slug("a/b/c")
     assert not is_valid_slug("has_underscore")
     assert not is_valid_slug("")
-    # System slugs must themselves validate — they ride URLs.
-    for slug in SYSTEM_FILES:
-        assert is_valid_slug(slug), slug
 
 
-async def test_render_markdown_shape():
-    md = render_file_markdown(
-        "IELTS", "Your IELTS prep; read when it comes up.",
-        ["You are targeting band 7.5.", "", "Your tutor is Majid."],
-        related=["people/majid-tajik"],
+def test_title_from_slug_is_a_last_resort_only():
+    assert title_from_slug(PROFILE_SLUG) == "Profile"
+    assert title_from_slug("people/majid-tajik") == "Majid tajik"
+
+
+# ── Descriptions ──────────────────────────────────────────────────────
+
+def test_description_pattern_is_enforced_not_suggested():
+    good = (
+        "Your IELTS preparation — tutor, dates and band targets; "
+        "read when IELTS or the exam comes up."
     )
-    lines = md.splitlines()
-    assert lines[0] == "# IELTS"
-    assert lines[1].startswith("*") and lines[1].endswith("*")
-    assert "- You are targeting band 7.5." in lines
-    assert "- Your tutor is Majid." in lines
-    assert lines[-1] == "See also: people/majid-tajik"
-    assert "- \n" not in md  # empty entries dropped
+    assert DESCRIPTION_RE.match(good)
+    assert description_problem(good) is None
+
+    for bad, why in [
+        ("", "empty"),
+        ("Music", "no structure at all"),
+        ("Music - things; read when music comes up.", "hyphen, not an em dash"),
+        ("Music — things, read when music comes up.", "comma, not a semicolon"),
+        ("Music — things; read when music comes up", "no trailing period"),
+        ("Music — things; when music comes up.", "missing the 'read when' trigger"),
+        ("Music — things; read when music comes up.\nand more", "two lines"),
+    ]:
+        assert description_problem(bad) is not None, why
 
 
-# ── Virtual synthesis ─────────────────────────────────────────────────
+def test_there_is_no_templated_description_helper():
+    """Round 8's `default_purpose` minted "Nariman — someone in your life;
+    read when they come up." for every person file, and the curation gate
+    that was supposed to replace it refused files with fewer than two
+    entries — so the mad-lib was permanent on exactly the files that got
+    one. v3 §1.4 deletes it: a file is born with a real description or the
+    create op is rejected."""
+    import app.memory_files as canon
 
-async def test_virtual_listing_groups_rows():
-    db, user_id = await _make_session()
-    db.add_all([
-        _memory(user_id, "Your name is Nariman.", category="identity"),
-        _memory(user_id, "You prefer dark mode.", category="preferences"),
-        _memory(user_id, "You are preparing for IELTS.", category="goals"),
-        _memory(user_id, "Maya is your daughter.", category="people"),
-        _memory(user_id, "Prefers short answers.", category="corrections", brain_type="agent"),
-        _memory(user_id, "Daily briefing at 11:49.", category="active_task", memory_type="task"),
-        _memory(user_id, "An inactive row must not count.", category="identity", is_active=False),
-    ])
-    await db.commit()
-
-    service = MemoryFileService(db)
-    listing = await service.list_files(user_id, virtual_only=True)
-    assert listing["organized"] is False
-    by_slug = {
-        f["slug"]: f for s in listing["sections"] for f in s["files"]
-    }
-    # Sections arrive in canonical order.
-    assert [s["section"] for s in listing["sections"]] == [s.value for s in SECTION_ORDER]
-    # Every system file is present even when empty.
-    for slug in SYSTEM_FILES:
-        assert slug in by_slug, slug
-    assert by_slug["profile"]["entry_count"] == 1  # inactive row skipped
-    assert by_slug["preferences"]["entry_count"] == 1
-    assert by_slug["areas/work"]["entry_count"] == 1
-    assert by_slug["people"]["entry_count"] == 1
-    assert by_slug["learned"]["entry_count"] == 1
-    assert by_slug["working"]["entry_count"] == 1
-    assert by_slug["knowledge"]["entry_count"] == 0
-    assert by_slug["knowledge"]["updated_at"] is None
-    assert by_slug["profile"]["updated_at"] is not None
+    assert not hasattr(canon, "default_purpose")
 
 
-# ── Organize (Phase A) ────────────────────────────────────────────────
+# ── Bullet voice ──────────────────────────────────────────────────────
 
-async def test_organize_assigns_slugs_and_person_files_idempotently():
-    db, user_id = await _make_session()
-    m_person = _memory(user_id, "Majid Tajik is your IELTS tutor.", category="people")
-    m_group = _memory(user_id, "Your cousins visit in the summer.", category="people")
-    m_goal = _memory(user_id, "You are applying to UofT MScAC.", category="goals", created_days_ago=3)
-    db.add_all([m_person, m_group, m_goal])
-    entity = Entity(user_id=user_id, name="Majid Tajik", entity_type="person", mention_count=4)
-    db.add(entity)
-    await db.flush()
-    db.add(EntityLink(memory_id=m_person.id, entity_id=entity.id))
-    # A two-person row must NOT be attributed to either person's file.
-    entity2 = Entity(user_id=user_id, name="Sara", entity_type="person", mention_count=1)
-    db.add(entity2)
-    await db.flush()
-    db.add(EntityLink(memory_id=m_group.id, entity_id=entity.id))
-    db.add(EntityLink(memory_id=m_group.id, entity_id=entity2.id))
-    await db.commit()
-
-    service = MemoryFileService(db)
-    report = await service.organize_user(user_id)
-    assert report["assigned"] == 3
-    await db.refresh(m_person); await db.refresh(m_goal); await db.refresh(m_group)
-    assert m_person.file_slug == "people/majid-tajik"
-    assert m_group.file_slug == "people"  # ambiguous → catch-all
-    assert m_goal.file_slug == "areas/work"
-    assert m_goal.file_position is not None
-
-    # The person file row exists, carries the person's name, is not system.
-    row = (await db.execute(
-        select(MemoryFile).where(MemoryFile.user_id == user_id, MemoryFile.slug == "people/majid-tajik")
-    )).scalar_one()
-    assert row.title == "Majid Tajik"
-    assert row.is_system is False
-    assert row.purpose  # fallback purpose until consolidation writes one
-
-    # Idempotent: a second run assigns nothing and creates nothing new.
-    report2 = await service.organize_user(user_id)
-    assert report2["assigned"] == 0
-    files = (await db.execute(select(MemoryFile).where(MemoryFile.user_id == user_id))).scalars().all()
-    assert len(files) == len(SYSTEM_FILES) + 1
-
-    listing = await service.list_files(user_id)
-    assert listing["organized"] is True
-    by_slug = {f["slug"]: f for s in listing["sections"] for f in s["files"]}
-    assert by_slug["people/majid-tajik"]["entry_count"] == 1
-    assert by_slug["people/majid-tajik"]["section"] == "people"
+@pytest.mark.parametrize("bullet", [
+    "uses an Android phone",
+    "has a Claude Max 20x subscription; uses the Claude phone app and Claude Desktop",
+    "IELTS exam booked for Aug 30, 2026",
+    "goal: build visible abs / six pack, wants the fastest route",
+    "teaches by sending an upgraded word; Nariman writes a sentence with it, then he corrects it",
+    "می‌خواهد هر روز صبح خلاصه ایمیل‌ها را بگیرد",
+    # Two words IS a fact. The three-word floor this file used to pin
+    # rejected the design doc's own worked example.
+    "likes Googoosh",
+])
+def test_the_house_voice_passes(bullet):
+    assert bullet_problem(bullet) is None, bullet
 
 
-# ── File reads ────────────────────────────────────────────────────────
-
-async def test_get_file_orders_by_curation_and_resolves_system_empties():
-    db, user_id = await _make_session()
-    a = _memory(user_id, "Older but curated later.", category="identity", created_days_ago=9)
-    b = _memory(user_id, "Newer but curated first.", category="identity", created_days_ago=1)
-    a.file_slug = "profile"; a.file_position = 2
-    b.file_slug = "profile"; b.file_position = 1
-    c = _memory(user_id, "No position yet.", category="identity", created_days_ago=5)
-    c.file_slug = "profile"
-    db.add_all([a, b, c])
-    await db.commit()
-
-    service = MemoryFileService(db)
-    resolved = await service.get_file(user_id, "profile")
-    assert resolved is not None
-    info, entries = resolved
-    assert info["title"] == "Profile"
-    assert [m.id for m in entries] == [b.id, a.id, c.id]  # position asc, unpositioned last
-    assert info["entry_count"] == 3
-
-    # A system slug with no entries still resolves (empty file)…
-    empty = await service.get_file(user_id, "knowledge")
-    assert empty is not None and empty[0]["entry_count"] == 0
-    # …an unknown slug with no entries does not.
-    assert await service.get_file(user_id, "areas/nonexistent") is None
-    # …and traversal shapes never resolve.
-    assert await service.get_file(user_id, "../etc") is None
+@pytest.mark.parametrize("bullet,why", [
+    ("You use an Android phone", "the subject is implied, never restated"),
+    ("Your name is Nariman", "same"),
+    ("The user prefers dark mode", "third person about 'the user'"),
+    ("wants", "a single word is a fragment, not a fact"),
+    ("", "empty"),
+    ("x" * 401, "over 400 chars"),
+    ("ran job 6f1c2b9a-1111-2222-3333-444455556666 yesterday", "a UUID"),
+    ("gmail briefing uses max_results=1 every morning", "a tool parameter"),
+    ("first line\nsecond line", "a bullet is one line"),
+])
+def test_the_lint_rejects_what_round_8_stored(bullet, why):
+    assert bullet_problem(bullet) is not None, why
 
 
-# ── Deletion ──────────────────────────────────────────────────────────
+def test_a_long_hex_id_is_rejected_but_ordinary_numbers_are_not():
+    assert bullet_problem("session id is 0123456789abcdef0123") is not None
+    # A phone number, a year, a price: none of these are ids.
+    assert bullet_problem("pays 98.90 CAD a month for the Max plan") is None
+    assert bullet_problem("moved to Toronto in 2019 for the UofT program") is None
 
-async def test_delete_file_archives_softly_with_events():
-    db, user_id = await _make_session()
-    service = MemoryFileService(db)
-    m1 = _memory(user_id, "Majid teaches on Tuesdays.", category="people")
-    m2 = _memory(user_id, "Majid prefers WhatsApp.", category="people")
-    db.add_all([m1, m2])
-    await db.flush()
-    await service.ensure_file(user_id, "people/majid", title="Majid")
-    m1.file_slug = "people/majid"; m1.file_position = 0
-    m2.file_slug = "people/majid"; m2.file_position = 1
-    await db.commit()
 
-    archived = await service.delete_file(user_id, "people/majid")
-    assert archived == 2
-    await db.refresh(m1); await db.refresh(m2)
-    assert m1.is_deleted and m2.is_deleted
-    assert m1.deleted_at is not None
-    # Audit events written, one per entry.
-    events = (await db.execute(
-        select(MemoryEvent).where(MemoryEvent.user_id == user_id)
-    )).scalars().all()
-    assert len(events) == 2 and all(e.event_type == "deleted" for e in events)
-    # The person file row is gone; a system file would have survived.
-    gone = (await db.execute(
-        select(MemoryFile).where(MemoryFile.user_id == user_id, MemoryFile.slug == "people/majid")
-    )).scalar_one_or_none()
-    assert gone is None
+# ── Bodies ────────────────────────────────────────────────────────────
 
-    # Deleting a SYSTEM file keeps the row, archives entries.
-    m3 = _memory(user_id, "You prefer tea.", category="preferences")
-    m3.file_slug = "preferences"
-    db.add(m3)
-    await service.ensure_file(user_id, "preferences")
-    await db.commit()
-    assert await service.delete_file(user_id, "preferences") == 1
-    kept = (await db.execute(
-        select(MemoryFile).where(MemoryFile.user_id == user_id, MemoryFile.slug == "preferences")
-    )).scalar_one_or_none()
-    assert kept is not None
-    # Unknown slug → None (route turns this into a 404).
-    assert await service.delete_file(user_id, "areas/never-existed") is None
+def test_bullets_round_trip_and_ignore_non_bullet_lines():
+    body = (
+        "## Today\nSome prose about today.\n\n"
+        "- uses an Android phone\n"
+        "* likes Googoosh\n"
+        "-   spaced oddly\n"
+    )
+    assert parse_bullets(body) == [
+        "uses an Android phone", "likes Googoosh", "spaced oddly",
+    ]
+    assert render_bullets(["a b c", "  ", "d e f"]) == "- a b c\n- d e f"
+    assert render_bullets([]) == ""
+    assert body_is_empty("") and body_is_empty(None) and body_is_empty("   ")
+
+
+def test_links_are_extracted_in_first_seen_order_without_duplicates():
+    body = "- taught by [[people/majid]]\n- also [[people/majid]] and [[areas/ielts]]"
+    assert extract_links(body) == ["people/majid", "areas/ielts"]
+    assert extract_links("") == []
+
+
+def test_truncation_lands_between_bullets_and_says_so():
+    """Half a bullet is a FALSE fact, not a short one: "allergic to" reads
+    as a complete predicate."""
+    body = "\n".join(f"- fact number {i} about this person" for i in range(40))
+    out = truncate_body(body, 200)
+    assert len(out) <= 200
+    assert out.endswith(TRUNCATION_NOTE)
+    for line in out.splitlines():
+        assert line == TRUNCATION_NOTE or line.startswith("- ")
+    # Under the cap, nothing changes at all.
+    assert truncate_body("- short", 500) == "- short"
+
+
+# ── The shared injection renderer ─────────────────────────────────────
+
+def test_render_user_brain_has_the_contract_shape():
+    out = render_user_brain(
+        profile_body="- uses an Android phone",
+        current_context_body="## Today\nPreparing for the IELTS exam.",
+        learned_body="- answer in Farsi when asked in Farsi",
+        index=[("IELTS", "Your IELTS prep — dates; read when IELTS comes up."),
+               ("Music", None)],
+        relevant=[("IELTS", "- exam booked for Aug 30, 2026")],
+    )
+    # No heading of its own: the caller owns `# User Brain`, because the
+    # injection fence binds to that exact literal.
+    assert not out.startswith("# User Brain")
+    order = [out.index(h) for h in (
+        HEADING_PROFILE, HEADING_CURRENT_CONTEXT, HEADING_LEARNED, HEADING_INDEX,
+    )]
+    assert order == sorted(order)
+    assert "- IELTS — Your IELTS prep — dates; read when IELTS comes up." in out
+    assert "- Music" in out                      # a description-less file still lists
+    assert out.rindex("## IELTS") > out.index(HEADING_INDEX)  # whole file last
+
+
+def test_render_user_brain_omits_what_is_empty():
+    assert render_user_brain() == ""
+    only_profile = render_user_brain(profile_body="- uses an Android phone")
+    assert only_profile == "## Profile\n- uses an Android phone"
+
+
+def test_render_user_brain_enforces_every_cap():
+    big = "\n".join(f"- fact number {i} about this person" for i in range(400))
+    out = render_user_brain(
+        profile_body=big, current_context_body=big, learned_body=big,
+        index=[(f"File {i}", f"F{i} — s; read when x.") for i in range(100)],
+        relevant=[("Alpha", big), ("Beta", big), ("Gamma", big)],
+    )
+    assert out.count(TRUNCATION_NOTE) >= 3
+    assert out.count("\n- File ") <= 40           # MAX_INDEX_LINES
+    assert "## Alpha" in out and "## Beta" in out
+    assert "## Gamma" not in out                  # MAX_RELEVANT_FILES = 2
+    profile_block = out.split(HEADING_CURRENT_CONTEXT)[0]
+    assert len(profile_block) <= CAP_PROFILE + len(HEADING_PROFILE) + 2
+
+
+def test_body_cap_is_a_real_number_and_the_layers_are_named():
+    assert MAX_BODY_CHARS == 8 * 1024
+    assert CURRENT_CONTEXT_LAYERS[0] == "Today"
+    assert CURRENT_CONTEXT_LAYERS[-1] == "Past 12 months"
+    assert index_line("Music", None) == "- Music"
+
+
+# ── Legacy half ───────────────────────────────────────────────────────
+
+def test_the_round_8_map_survives_only_behind_the_legacy_prefix():
+    """WS-2 deletes it with `memory_file_service`; WS-5's migration reads it
+    to interpret round-8 file assignments. Nothing v3 may touch it, and the
+    naming is what makes that checkable."""
+    import app.memory_files as canon
+
+    assert canon.legacy_default_slug_for("goals", "user") == "areas/work"
+    assert canon.legacy_default_slug_for("corrections", "agent") == "learned"
+    assert canon.legacy_section_of_slug("knowledge") == canon.LegacyFileSection.KNOWLEDGE
+    # The v3 names must not resolve to round-8 values.
+    assert not hasattr(canon, "USER_CATEGORY_SECTION")
+    assert not hasattr(canon, "default_slug_for")
+    assert not hasattr(canon, "section_for")

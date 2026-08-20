@@ -1,17 +1,23 @@
-"""Durable outbox for facts that were extracted but could not be stored.
+"""Durable outbox for turns the memory curator could not write (v3 §2.1.6).
 
-Capture runs fire-and-forget in turn post-processing, after the reply has been
-streamed. That is the right place for it — it keeps extraction off the
+The curator runs fire-and-forget in turn post-processing, after the reply has
+been streamed. That is the right place for it — it keeps the writer off the
 user-visible path — but it also means nothing is watching when it fails. A
-connection blip while writing, and every fact the user stated that turn is gone
-with no error surfaced to anyone and no way to notice afterwards.
+connection blip, a rate limit, a bad JSON reply, and everything the user
+stated that turn is gone with no error surfaced to anyone.
 
-The LLM call itself already retries once (A6-2), and an embedding failure
-already degrades to an unembedded write (W1.5). This covers the third case: the
-extraction SUCCEEDED and the write did not.
+**The payload is the TURN, not a set of facts.** Round 8 parked serialized
+`MemoryCreate` rows here, which made the retry free — the extraction was
+already paid for. v3 has no such intermediate: the curator reads the files as
+they are NOW and decides what to change, so a replay a turn later must re-run
+it against the state it will actually be applied to. Replaying an old op set
+would rewrite bullets that have since moved. The retry therefore costs one
+model call, and `REPLAY_PER_TURN` is 1 for that reason.
 
-The payload is the extracted memories, not the raw turn, so a retry costs no
-LLM call — the expensive half is already done and paid for.
+The table and its columns are UNCHANGED — only what `payload_json` holds
+changes, from a list of facts to `{user_text, assistant_text, channel, ts}`.
+Keeping the DDL still means no `_alter_statements` entry and no migration on
+54 tenants for a table that holds, in practice, nothing.
 
 Modelled on agent_notify_outbox: attempts, a backoff cursor, and a terminal
 state so a poison row is not retried forever.
@@ -39,8 +45,10 @@ class MemoryCaptureOutbox(Base):
     # The turn this came from, for provenance. Nullable because the message row
     # is not guaranteed to have been committed when capture ran.
     source_message_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
-    # The already-extracted memories, serialized. Retrying replays THESE.
-    payload_json: Mapped[List[Dict[str, Any]]] = mapped_column(
+    # The turn: {"user_text", "assistant_text", "channel", "ts"}. Retrying
+    # re-runs the curator over it against the CURRENT files (see the module
+    # docstring for why a stored op set would be wrong).
+    payload_json: Mapped[Dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=False,
     )
     created_at: Mapped[datetime] = mapped_column(

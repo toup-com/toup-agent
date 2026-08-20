@@ -83,6 +83,9 @@ class HeartbeatService:
             # Unattended run — tag the channel so injection_fencing_v2's
             # mutating-connector deny applies (audit-2026 INJ-1).
             channel="heartbeat",
+            # "[Heartbeat] <settings.heartbeat_prompt>" is the platform
+            # talking to itself. See cron_service for the RCA.
+            disable_post_processing=True,
         )
 
         text = (response.text or "").strip()

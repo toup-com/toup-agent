@@ -1,225 +1,607 @@
-"""Curation ops engine (docs/memory/rebuild-2026-08.md §3.6): the strict
-contract between the LLM's proposals and what actually touches rows.
+"""The v3 ops engine and the file store (rebuild-2026-08-v3 §1.3–§2.2).
 
-Pins: validation rejects unknown ids, double-touch, third-person voice and
-over-deletion; application rides the existing evolution primitives (merge →
-supersede with lineage + consolidated events, delete → soft, add → filed);
-nothing hard-deletes.
+Round 8's version of this file pinned an ops contract over `memories` ROWS
+addressed by positional handles (`e1..eN`). v3 addresses BULLETS by their
+exact text, writes whole bodies, and logs every mutation — so this is a
+rewrite, not an edit.
+
+Self-contained sqlite (its own engine), so RUN_MODE is irrelevant here.
 """
 
-import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db.models.base import Base
+from app.db.models.memory import MemoryFile, MemoryFileChange
 from app.db.models.user import User
-from app.db.models.memory import BrainStats, Memory, MemoryEvent, MemoryFile, memory_relationships
-from app.db.models.entity import Entity, EntityLink
-from app.services.memory_file_ops import (
-    apply_ops,
-    build_curation_prompt,
-    render_entries_for_prompt,
-    validate_ops,
+from app.memory_files import (
+    CURRENT_CONTEXT_SLUG,
+    LEARNED_SLUG,
+    MAX_BODY_CHARS,
+    PROFILE_SLUG,
+    SYSTEM_FILES,
+    description_problem,
 )
-from app.services.memory_file_service import MemoryFileService
+from app.services import memory_file_ops as ops
+from app.services.user_identity import forget_cached_identity, resolve_user_identity
+
+GOOD_DESC = (
+    "Your IELTS preparation — tutor, dates and band targets; "
+    "read when IELTS or the exam comes up."
+)
 
 
-class _StubEmbedding:
-    """Offline embedding: behaves like the degraded (no-provider) path."""
-
-    async def embed_async(self, text, api_key=None):
-        return None
-
-    def embed(self, text, api_key=None):
-        return None
-
-
-@pytest.fixture(autouse=True)
-def _offline_embeddings(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.memory_service.get_embedding_service", lambda: _StubEmbedding()
-    )
-    monkeypatch.setattr(
-        "app.services.memory_dedup_service.get_embedding_service", lambda: _StubEmbedding()
-    )
-
-
-async def _make_session():
+async def _session(name: str = "Nariman Hosseini") -> tuple[AsyncSession, str]:
     engine = create_async_engine(
         "sqlite+aiosqlite://", connect_args={"check_same_thread": False}
     )
     async with engine.begin() as conn:
         await conn.run_sync(
             Base.metadata.create_all,
-            tables=[
-                User.__table__, Memory.__table__, MemoryFile.__table__,
-                MemoryEvent.__table__, BrainStats.__table__,
-                Entity.__table__, EntityLink.__table__, memory_relationships,
-            ],
+            tables=[User.__table__, MemoryFile.__table__, MemoryFileChange.__table__],
         )
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     db = maker()
     user_id = str(uuid.uuid4())
-    db.add(User(id=user_id, email=f"{user_id[:8]}@test.local", hashed_password="x"))
+    db.add(User(
+        id=user_id, email=f"{user_id[:8]}@test.local", hashed_password="x", name=name,
+    ))
     await db.commit()
+    forget_cached_identity()
     return db, user_id
 
 
-def _mem(user_id, content, *, category="active_task", slug="working", pos=0, **kw):
-    return Memory(
-        user_id=user_id, content=content, category=category,
-        memory_type=kw.pop("memory_type", "task"), brain_type="user",
-        file_slug=slug, file_position=pos, **kw,
-    )
+async def _apply(db, user_id, raw_ops, *, identity=None):
+    if identity is None:
+        identity = await resolve_user_identity(db, user_id)
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    plan = ops.validate_ops(raw_ops, await ops._all_files(db, user_id), identity=identity)
+    result = await ops.apply_ops(db, user_id, plan)
+    return plan, result
 
 
-# ── Validation ────────────────────────────────────────────────────────
-
-async def test_validate_rejects_bad_ops_and_keeps_good_ones():
-    entries = [_mem("u", f"Entry {i}") for i in range(4)]
-    ops, problems = validate_ops(
-        [
-            {"op": "merge", "ids": ["e1", "e2"], "text": "You get a daily Gmail briefing at 11:49 AM."},
-            {"op": "update", "id": "e9", "text": "Unknown id."},          # unknown
-            {"op": "update", "id": "e1", "text": "Already merged above."},  # double touch
-            {"op": "update", "id": "e3", "text": "The user prefers tea."},  # third person
-            {"op": "update", "id": "e3", "text": ""},                       # empty
-            {"op": "merge", "ids": ["e4"], "text": "One id is not a merge."},
-            {"op": "set_related", "slugs": ["people/majid", "../etc", "areas/ielts"]},
-            {"op": "nonsense"},
-        ],
-        entries, instruction_mode=False,
-    )
-    assert [o["op"] for o in ops] == ["merge", "set_related"]
-    assert ops[1]["slugs"] == ["people/majid", "areas/ielts"]  # traversal dropped
-    assert len(problems) == 6  # incl. the unknown-op complaint
-    # The whole batch is never rejected for one bad op.
-    assert any("third-person" in p for p in problems)
+def _create_ielts(**over):
+    op = {
+        "op": "create_file", "section": "areas", "slug": "areas/ielts",
+        "title": "IELTS", "description": GOOD_DESC,
+    }
+    op.update(over)
+    return op
 
 
-async def test_validate_delete_cap_differs_by_mode():
-    entries = [_mem("u", f"Entry {i}") for i in range(10)]
-    deletes = [{"op": "delete", "id": f"e{i + 1}", "reason": "noise"} for i in range(4)]
-    # Consolidation may delete at most 1/5 — four deletes on ten entries all drop.
-    ops, problems = validate_ops(deletes, entries, instruction_mode=False)
-    assert ops == [] and any("delete cap" in p for p in problems)
-    # An explicit user instruction gets max(3, half) — four of ten is fine.
-    ops, problems = validate_ops(deletes, entries, instruction_mode=True)
-    assert len(ops) == 4 and not problems
+# ── The store ─────────────────────────────────────────────────────────
+
+async def test_system_files_are_created_once_and_listed_in_order():
+    db, user_id = await _session()
+    assert len(await ops.ensure_system_files(db, user_id)) == 3
+    await db.commit()
+    assert await ops.ensure_system_files(db, user_id) == []   # idempotent
+
+    listing = await ops.list_files(db, user_id)
+    assert [s["section"] for s in listing["sections"]] == [
+        "you", "people", "topics", "areas", "learned"
+    ]
+    by_slug = {f["slug"]: f for s in listing["sections"] for f in s["files"]}
+    assert set(by_slug) == set(SYSTEM_FILES)
+    # The listing payload is exactly five keys. Not one engine field.
+    assert set(by_slug[PROFILE_SLUG]) == {
+        "slug", "section", "title", "description", "updated_at"
+    }
 
 
-async def test_validate_ops_shape_guards():
-    assert validate_ops("not-a-list", [], instruction_mode=False) == ([], ["ops must be a list"])
-    ops, problems = validate_ops(
-        [{"op": "update", "id": "e1", "text": "x" * 700}],
-        [_mem("u", "hi")], instruction_mode=False,
-    )
-    assert ops == [] and any("over" in p for p in problems)
+async def test_an_adopted_round_8_learned_row_gets_a_VALID_description():
+    """The path EVERY already-live tenant takes, and it was one-sided.
 
+    Round 8's `learned` row carries the same slug and the same meaning, so
+    `ensure_system_files` adopts it rather than colliding with the unique
+    index. But its description is a `purpose`-era sentence — "Corrections
+    and lessons." — which fails DESCRIPTION_RE, and the repair only ran when
+    the field was EMPTY. So every existing tenant kept an invalid
+    description forever, in a string that is BOTH served to the client and
+    injected into the prompt as this file's index line ("the description IS
+    the signal", memory_files.index_line).
 
-# ── Prompt shape ──────────────────────────────────────────────────────
-
-async def test_prompt_renders_entries_and_voice_contract():
-    m1 = _mem("u", "You get a motivational quote at 5:06 PM.",
-              tags_json=json.dumps(["standing"]))
-    m1.created_at = datetime(2026, 5, 18)
-    m2 = _mem("u", "Daily Gmail briefing at 11:49.", pos=1)
-    m2.created_at = datetime(2026, 8, 10)
-    m2.expires_at = datetime(2026, 8, 25)
-    block = render_entries_for_prompt([m1, m2])
-    assert block.splitlines()[0].startswith("[e1] (saved 2026-05-18, standing arrangement)")
-    assert "fades 2026-08-25" in block.splitlines()[1]
-
-    prompt = build_curation_prompt("Working on", None, block, instruction=None)
-    assert "SECOND PERSON" in prompt
-    assert 'NEVER "The user"' in prompt
-    assert '{"ops": []}' in prompt
-
-    asked = build_curation_prompt("Working on", "p", block, instruction="merge the briefing entries")
-    assert "merge the briefing entries" in asked
-
-
-# ── Application ───────────────────────────────────────────────────────
-
-async def test_apply_merge_keeps_survivor_and_archives_sources_softly():
-    db, user_id = await _make_session()
-    service = MemoryFileService(db)
-    await service.ensure_file(user_id, "working")
-    a = _mem(user_id, "Send a summary of my Gmail inbox every day at 11:49 AM.", pos=0)
-    b = _mem(user_id, "You want a daily briefing of your Gmail at 11:49.", pos=1)
-    c = _mem(user_id, "Daily Gmail briefing at 11:49 AM Toronto time.", pos=2)
-    db.add_all([a, b, c])
+    It also poisons the eval set's lint metric with a defect no writer
+    caused, which is how a measured invariant stops meaning anything.
+    """
+    db, user_id = await _session()
+    db.add(MemoryFile(
+        user_id=user_id, slug=LEARNED_SLUG, section="learned",
+        title="Learned", description="Corrections and lessons.",
+        body_md="- send reminders to this chat, not Telegram", position=5,
+    ))
     await db.commit()
 
-    result = await apply_ops(
-        db, user_id, "working",
-        [{"op": "merge", "ids": ["e1", "e2", "e3"],
-          "text": "You get a daily Gmail briefing at 11:49 AM (America/Toronto)."}],
-        [a, b, c],
-    )
-    assert result["applied"] == [{"op": "merge", "survivor": a.id, "folded": 2}]
-
-    await db.refresh(a); await db.refresh(b); await db.refresh(c)
-    assert a.canonical_content == "You get a daily Gmail briefing at 11:49 AM (America/Toronto)."
-    assert a.is_active and not a.is_deleted
-    assert json.loads(a.merged_from_json) == [b.id, c.id]
-    assert (b.is_active, c.is_active) == (False, False)
-    assert b.superseded_by == a.id and c.superseded_by == a.id
-    assert not b.is_deleted and not c.is_deleted  # soft, reversible
-    # Survivor keeps its place in the file.
-    assert (a.file_slug, a.file_position) == ("working", 0)
-
-    events = (await db.execute(select(MemoryEvent).where(MemoryEvent.user_id == user_id))).scalars().all()
-    kinds = sorted(e.event_type for e in events)
-    assert kinds.count("consolidated") == 2  # one per folded source
-    assert "updated" in kinds  # the survivor's rewrite
-
-
-async def test_apply_update_delete_add_and_file_metadata():
-    db, user_id = await _make_session()
-    service = MemoryFileService(db)
-    file_row = await service.ensure_file(user_id, "preferences", commit=True)
-    a = _mem(user_id, "The user prefers dark mode.", category="preferences",
-             slug="preferences", pos=0, memory_type="preference")
-    b = _mem(user_id, "You could not find the track 'qolb qolnb'.",
-             category="preferences", slug="preferences", pos=1)
-    db.add_all([a, b])
+    created = await ops.ensure_system_files(db, user_id)
     await db.commit()
 
-    result = await apply_ops(
-        db, user_id, "preferences",
-        [
-            {"op": "update", "id": "e1", "text": "You prefer dark mode."},
-            {"op": "delete", "id": "e2", "reason": "one-off playback outcome"},
-            {"op": "add", "text": "You like your coffee black.", "category": "preferences"},
-            {"op": "set_purpose", "text": "What you like; read before choosing for you."},
-            {"op": "set_related", "slugs": ["profile"]},
-        ],
-        [a, b],
+    # Adopted, not duplicated.
+    assert LEARNED_SLUG not in [r.slug for r in created]
+    rows = [r for r in await ops._all_files(db, user_id) if r.slug == LEARNED_SLUG]
+    assert len(rows) == 1
+    row = rows[0]
+
+    assert description_problem(row.description) is None, row.description
+    assert row.description == SYSTEM_FILES[LEARNED_SLUG]["description"]
+    assert row.is_system is True
+    # The BODY is never touched: the user's corrections survive the repair.
+    assert row.body_md == "- send reminders to this chat, not Telegram"
+
+
+async def test_a_valid_description_is_left_alone():
+    """ANTI-VACUITY for the test above: "always overwrite" would pass it and
+    would clobber a description the writer had legitimately regenerated."""
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    rows = {r.slug: r for r in await ops._all_files(db, user_id)}
+    custom = (
+        "How to work with Dara — tone, tools and standing corrections; "
+        "read when you are about to act on their behalf."
     )
-    ops_applied = [o["op"] for o in result["applied"]]
-    assert ops_applied == ["update", "delete", "add", "set_purpose", "set_related"]
+    assert description_problem(custom) is None
+    rows[LEARNED_SLUG].description = custom
+    await db.commit()
 
-    await db.refresh(a); await db.refresh(b); await db.refresh(file_row)
-    assert a.canonical_content == "You prefer dark mode."
-    assert b.is_deleted and b.deleted_at is not None and b.superseded_by is None
-    assert file_row.purpose == "What you like; read before choosing for you."
-    assert json.loads(file_row.related_json) == ["profile"]
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    rows = {r.slug: r for r in await ops._all_files(db, user_id)}
+    assert rows[LEARNED_SLUG].description == custom
 
-    added_id = result["applied"][2]["id"]
-    added = (await db.execute(select(Memory).where(Memory.id == added_id))).scalar_one()
-    assert added.file_slug == "preferences"
-    assert added.file_position == 2  # appended after existing positions
-    assert added.category == "preferences"
 
-    # A no-op update (same text) applies nothing.
-    result2 = await apply_ops(
-        db, user_id, "preferences",
-        [{"op": "update", "id": "e1", "text": "You prefer dark mode."}],
-        [a],
+async def test_round_8_rows_are_invisible_rather_than_mis_sectioned():
+    """A tenant that booted a round-8 image has `knowledge`/`working` file
+    rows. They stay on disk untouched — that is the rollback — but they
+    must not surface inside a v3 section they were never written for."""
+    db, user_id = await _session()
+    db.add(MemoryFile(
+        user_id=user_id, slug="knowledge", section="knowledge",
+        title="Knowledge", description="Facts about your world.",
+    ))
+    await db.commit()
+
+    listing = await ops.list_files(db, user_id)
+    slugs = {f["slug"] for s in listing["sections"] for f in s["files"]}
+    assert "knowledge" not in slugs
+    assert await ops.get_file(db, user_id, "knowledge") is None
+    # …and the row is still there.
+    assert (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == "knowledge")
+    )).scalar_one_or_none() is not None
+
+
+async def test_a_round_8_learned_row_is_adopted_not_duplicated():
+    """`learned` is the one slug both models use, and (user_id, slug) is
+    unique — a second INSERT would raise rather than degrade."""
+    db, user_id = await _session()
+    db.add(MemoryFile(
+        user_id=user_id, slug=LEARNED_SLUG, section="learned",
+        title="Learned", description=None, is_system=False, body_md="- keep this",
+    ))
+    await db.commit()
+
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    rows = (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == LEARNED_SLUG)
+    )).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].is_system is True
+    assert rows[0].body_md == "- keep this"      # the body is never touched
+    assert rows[0].description == SYSTEM_FILES[LEARNED_SLUG]["description"]
+
+
+# ── Ops: the happy path ───────────────────────────────────────────────
+
+async def test_create_then_add_in_one_batch_validates_and_persists():
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "IELTS exam booked for Aug 30, 2026",
+         "change": "Added IELTS: exam booked for Aug 30."},
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "targeting band 7.5 overall",
+         "change": "Added IELTS: band target."},
+    ])
+    assert plan.complaints == []
+    assert result["applied"] == 3
+
+    file = await ops.get_file(db, user_id, "areas/ielts")
+    assert file["title"] == "IELTS"
+    assert file["description"] == GOOD_DESC
+    assert file["body_md"] == (
+        "- IELTS exam booked for Aug 30, 2026\n- targeting band 7.5 overall"
     )
-    assert result2["applied"] == []
+    assert file["section"] == "areas"
+    # The payload a client sees carries no engine field.
+    assert set(file) == {
+        "slug", "section", "title", "description", "body_md", "links", "updated_at"
+    }
+
+
+async def test_rewrite_and_remove_address_a_bullet_by_its_exact_text():
+    """No index arithmetic: a model that miscounts by one silently rewrites
+    the wrong fact, and any concurrent write makes an index stale."""
+    db, user_id = await _session()
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "exam booked for Aug 30, 2026",
+         "change": "Added IELTS: exam date."},
+        {"op": "add", "slug": "areas/ielts", "bullet": "targeting band 7.5 overall",
+         "change": "Added IELTS: band target."},
+    ])
+
+    plan, _ = await _apply(db, user_id, [
+        {"op": "rewrite", "slug": "areas/ielts",
+         "match": "exam booked for Aug 30, 2026",
+         "bullet": "exam moved to Sep 13, 2026",
+         "change": "Updated IELTS: exam moved to Sep 13."},
+        {"op": "remove", "slug": "areas/ielts", "match": "targeting band 7.5 overall",
+         "change": "Removed the old band target from IELTS."},
+    ])
+    assert plan.complaints == []
+    file = await ops.get_file(db, user_id, "areas/ielts")
+    assert file["body_md"] == "- exam moved to Sep 13, 2026"
+
+    # A `match` that is not present is refused, not fuzzily matched.
+    plan, result = await _apply(db, user_id, [
+        {"op": "rewrite", "slug": "areas/ielts", "match": "exam moved to Sep 13",
+         "bullet": "exam moved again", "change": "x"},
+    ])
+    assert result["applied"] == 0
+    assert any("no bullet reads exactly" in c for c in plan.complaints)
+
+
+async def test_every_mutation_writes_one_change_line_on_the_user_local_day():
+    db, user_id = await _session()
+    # A zone west of UTC, where "now" is often yesterday locally.
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one()
+    user.timezone = "America/Toronto"
+    await db.commit()
+
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "exam booked for Aug 30, 2026",
+         "change": "Added IELTS: exam booked for Aug 30."},
+        {"op": "link", "slug": "areas/ielts", "links": [PROFILE_SLUG]},
+    ])
+
+    changes = (await db.execute(
+        select(MemoryFileChange).where(MemoryFileChange.user_id == user_id)
+    )).scalars().all()
+    kinds = sorted(c.kind for c in changes)
+    assert kinds == ["created", "updated"], "link is not a user-visible change"
+    from zoneinfo import ZoneInfo
+    expected = datetime.now(ZoneInfo("America/Toronto")).strftime("%Y-%m-%d")
+    assert {c.day_key for c in changes} == {expected}
+    assert any(c.summary == "Added IELTS: exam booked for Aug 30." for c in changes)
+    assert all(c.file_title == "IELTS" for c in changes)
+
+
+async def test_the_log_groups_by_day_within_a_month():
+    db, user_id = await _session()
+    await _apply(db, user_id, [_create_ielts()])
+    month = datetime.utcnow().strftime("%Y-%m")
+
+    log = await ops.read_log(db, user_id, month)
+    assert len(log["days"]) == 1
+    entries = log["days"][0]["entries"]
+    assert entries[0]["file_slug"] == "areas/ielts"
+    assert entries[0]["kind"] == "created"
+    assert set(entries[0]) == {"file_slug", "file_title", "kind", "summary", "at"}
+    assert (await ops.read_log(db, user_id, "1999-01"))["days"] == []
+    with pytest.raises(ValueError):
+        await ops.read_log(db, user_id, "not-a-month")
+
+
+# ── Ops: what must be refused ─────────────────────────────────────────
+
+async def test_a_mutation_without_a_change_line_is_refused():
+    """The change line is the memory log. An op that skips it writes a fact
+    the user can never find out about."""
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "exam booked for Aug 30, 2026"},
+    ])
+    assert result["applied"] == 1                       # the create only
+    assert any("`change` line is required" in c for c in plan.complaints)
+
+
+async def test_the_owner_never_gets_a_people_file():
+    """The v3 answer to "why is there a People file about me": the resolver
+    is asked before the slug is minted."""
+    db, user_id = await _session(name="Nariman Hosseini")
+    plan, result = await _apply(db, user_id, [
+        {"op": "create_file", "section": "people", "slug": "people/nariman",
+         "title": "Nariman",
+         "description": "The owner — his facts; read when he comes up."},
+        {"op": "create_file", "section": "people", "slug": "people/nariman-hosseini",
+         "title": "Nariman Hosseini",
+         "description": "The owner again — facts; read when he comes up."},
+        {"op": "create_file", "section": "people", "slug": "people/majid-tajik",
+         "title": "Majid Tajik",
+         "description": "The IELTS tutor — how he teaches; read when Majid comes up."},
+    ])
+    assert result["changed_files"] == ["people/majid-tajik"]
+    assert sum("people/nariman" in c for c in plan.complaints) == 2
+
+
+async def test_a_short_email_local_part_does_not_establish_an_identity():
+    """`n@toup.ai` on a tenant whose users.name is still "Agent Owner":
+    the alias set is {agent, agent owner, n}, and a one-character alias
+    would flip `known` on for exactly the placeholder tenant the flag
+    exists to report. Short aliases stay MATCHABLE, they just cannot be
+    the sole evidence."""
+    db, user_id = await _session(name="Agent Owner")
+    from sqlalchemy import update
+
+    await db.execute(update(User).where(User.id == user_id).values(email="n@toup.ai"))
+    await db.commit()
+    forget_cached_identity()
+    identity = await resolve_user_identity(db, user_id)
+    assert "n" in identity.aliases
+    assert identity.known is False
+
+
+async def test_an_unknown_identity_does_not_block_person_files():
+    """A fresh tenant is 'Agent Owner' with an <hex>@agent.local email. The
+    resolver must report `known=False` and the writer must fail OPEN —
+    failing closed drops real facts on every new tenant."""
+    db, user_id = await _session(name="Agent Owner")
+    identity = await resolve_user_identity(db, user_id)
+    assert identity.known is False
+    _, result = await _apply(db, user_id, [
+        {"op": "create_file", "section": "people", "slug": "people/sara",
+         "title": "Sara", "description": "A colleague — where they work; read when Sara comes up."},
+    ], identity=identity)
+    assert result["applied"] == 1
+
+
+async def test_the_voice_lint_runs_on_every_written_bullet():
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "You are targeting band 7.5",
+         "change": "x"},
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "the tutor set max_results=1 on the practice search", "change": "x"},
+    ])
+    assert result["applied"] == 1
+    assert any("subject is implied" in c for c in plan.complaints)
+    assert any("tool parameters" in c for c in plan.complaints)
+
+
+async def test_a_never_store_value_is_refused_at_the_bullet():
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "pays the tutor with card 4111 1111 1111 1111 every month",
+         "change": "Added IELTS: payment card."},
+    ])
+    assert result["applied"] == 1
+    assert any("never stored" in c for c in plan.complaints)
+
+
+async def test_a_description_that_is_not_the_pattern_kills_the_create():
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        {"op": "create_file", "section": "topics", "slug": "topics/music",
+         "title": "Music", "description": "Music stuff"},
+    ])
+    assert result["applied"] == 0
+    assert any("read when" in c for c in plan.complaints)
+
+
+async def test_the_section_comes_from_the_slug_not_from_the_model():
+    db, user_id = await _session()
+    plan, _ = await _apply(db, user_id, [
+        {"op": "create_file", "section": "areas", "slug": "topics/music",
+         "title": "Music",
+         "description": "Music — taste and artists; read when music comes up."},
+        {"op": "create_file", "section": "topics", "slug": "music",
+         "title": "Music",
+         "description": "Music — taste and artists; read when music comes up."},
+    ])
+    assert any("is a topics file, not 'areas'" in c for c in plan.complaints)
+    assert any("has no section" in c for c in plan.complaints)
+
+
+async def test_the_per_file_cap_rejects_the_op_that_would_overflow_it():
+    db, user_id = await _session()
+    filler = "keeps a very long standing arrangement noted in detail " * 6
+    ops_batch = [_create_ielts()]
+    for i in range(200):
+        ops_batch.append({
+            "op": "add", "slug": "areas/ielts", "bullet": f"{filler} number {i}",
+            "change": f"Added IELTS: note {i}.",
+        })
+    plan, _ = await _apply(db, user_id[:], ops_batch[:41])   # MAX_OPS is 40
+    assert plan.complaints == ["too many ops (41 > 40)"]
+
+    plan, _ = await _apply(db, user_id, ops_batch[:40])
+    file = await ops.get_file(db, user_id, "areas/ielts")
+    assert len(file["body_md"]) <= MAX_BODY_CHARS
+    assert any("consolidate it first" in c for c in plan.complaints)
+
+
+async def test_an_op_naming_a_file_that_does_not_exist_is_refused():
+    db, user_id = await _session()
+    plan, result = await _apply(db, user_id, [
+        {"op": "add", "slug": "areas/nope", "bullet": "something true", "change": "x"},
+        {"op": "add", "slug": "not a slug", "bullet": "something true", "change": "x"},
+        {"op": "frobnicate", "slug": PROFILE_SLUG},
+    ])
+    assert result["applied"] == 0
+    assert any("create it first" in c for c in plan.complaints)
+    assert any("not a valid slug" in c for c in plan.complaints)
+    assert any("unknown op" in c for c in plan.complaints)
+
+
+async def test_links_must_resolve_and_a_dangling_one_is_dropped():
+    """The writer is the last line of defence for `[[slug]]`: a link the
+    client renders as tappable and that opens nothing is worse than none."""
+    db, user_id = await _session()
+    plan, _ = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "create_file", "section": "people", "slug": "people/majid-tajik",
+         "title": "Majid Tajik",
+         "description": "The IELTS tutor — how he teaches; read when Majid comes up."},
+        # Forward reference to a file created in the SAME batch: legal.
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "taught by [[people/majid-tajik]] over Teams",
+         "change": "Added IELTS: tutor."},
+        {"op": "link", "slug": "areas/ielts",
+         "links": ["people/majid-tajik", "people/ghost"]},
+    ])
+    assert any("do not exist and were dropped" in c for c in plan.complaints)
+    file = await ops.get_file(db, user_id, "areas/ielts")
+    assert [l["slug"] for l in file["links"]] == ["people/majid-tajik"]
+    assert file["links"][0]["title"] == "Majid Tajik"
+
+
+async def test_a_bullet_op_on_a_prose_body_is_refused_not_flattened():
+    """Current context is `##` layer headings with prose beneath (§6), and
+    `parse_bullets` cannot see any of it — so re-rendering that body from
+    its bullets DELETES the layers. An `add` there is refused rather than
+    applied, and a `link` (which writes its own column) must not reflow the
+    body either."""
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    row = (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == CURRENT_CONTEXT_SLUG)
+    )).scalar_one()
+    layered = "## Today\nPreparing for the IELTS exam on Aug 30.\n## Yesterday\nRested."
+    row.body_md = layered
+    await db.commit()
+
+    plan, result = await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": CURRENT_CONTEXT_SLUG,
+         "bullet": "has soccer at 5:20 PM today", "change": "x"},
+        {"op": "link", "slug": CURRENT_CONTEXT_SLUG, "links": ["areas/ielts"]},
+    ])
+    assert any("not a bullet list" in c for c in plan.complaints)
+    file = await ops.get_file(db, user_id, CURRENT_CONTEXT_SLUG)
+    assert file["body_md"] == layered, "the layers were flattened"
+    assert [l["slug"] for l in file["links"]] == ["areas/ielts"], (
+        "a link must still apply — it writes its own column"
+    )
+
+
+async def test_current_context_prose_survives_a_batch_that_does_not_touch_it():
+    """WS-3 owns that body's `##` layer shape. A curator pass that reads
+    every file must not flatten it into bullets on the way past."""
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    row = (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == CURRENT_CONTEXT_SLUG)
+    )).scalar_one()
+    row.body_md = "## Today\nPreparing for the IELTS exam on Aug 30.\n## Yesterday\nRested."
+    await db.commit()
+
+    await _apply(db, user_id, [_create_ielts()])
+    file = await ops.get_file(db, user_id, CURRENT_CONTEXT_SLUG)
+    assert file["body_md"].startswith("## Today\nPreparing")
+
+
+# ── Delete ────────────────────────────────────────────────────────────
+
+async def test_delete_drops_a_normal_file_and_only_empties_a_system_one():
+    db, user_id = await _session()
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "exam booked for Aug 30, 2026",
+         "change": "Added IELTS: exam date."},
+    ])
+    assert await ops.delete_file(db, user_id, "areas/ielts") is True
+    assert await ops.get_file(db, user_id, "areas/ielts") is None
+
+    profile = (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == PROFILE_SLUG)
+    )).scalar_one()
+    profile.body_md = "- uses an Android phone"
+    await db.commit()
+    assert await ops.delete_file(db, user_id, PROFILE_SLUG) is True
+    # The row survives — the injection depends on it existing.
+    assert (await ops.get_file(db, user_id, PROFILE_SLUG))["body_md"] == ""
+    assert await ops.delete_file(db, user_id, "areas/never-existed") is False
+
+    kinds = [c.kind for c in (await db.execute(
+        select(MemoryFileChange).where(MemoryFileChange.kind == "file_deleted")
+    )).scalars().all()]
+    assert kinds == ["file_deleted", "file_deleted"]
+
+
+async def test_forget_everything_clears_files_and_the_log():
+    db, user_id = await _session()
+    await _apply(db, user_id, [_create_ielts()])
+    removed = await ops.forget_everything(db, user_id)
+    assert removed == 4                                  # 3 system + IELTS
+    assert (await ops.list_files(db, user_id))["sections"][1]["files"] == []
+    month = datetime.utcnow().strftime("%Y-%m")
+    assert (await ops.read_log(db, user_id, month))["days"] == []
+
+
+# ── Search + the injection load ───────────────────────────────────────
+
+async def test_search_is_file_attributed_over_bodies_and_titles():
+    db, user_id = await _session()
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "taught by Majid over Teams",
+         "change": "Added IELTS: tutor."},
+    ])
+    hits = await ops.search_files(db, user_id, "teams")
+    assert [h["slug"] for h in hits] == ["areas/ielts"]
+    assert set(hits[0]) == {"slug", "title", "snippet"}
+    assert "Teams" in hits[0]["snippet"]
+    assert await ops.search_files(db, user_id, "") == []
+    assert await ops.search_files(db, user_id, "nothing matches this") == []
+
+
+async def test_load_brain_reads_the_three_files_plus_a_ranked_index():
+    db, user_id = await _session()
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "exam booked for Aug 30, 2026",
+         "change": "Added IELTS: exam date."},
+        {"op": "create_file", "section": "topics", "slug": "topics/music",
+         "title": "Music",
+         "description": "Music taste — artists; read when music comes up."},
+        # NOTE: three words minimum. "likes Googoosh" — the contract's own
+        # change-line example — would be REJECTED by its own bullet lint.
+        {"op": "add", "slug": "topics/music", "bullet": "likes Googoosh and Ebi",
+         "change": "Added Music: likes Googoosh."},
+    ])
+    profile = (await db.execute(
+        select(MemoryFile).where(MemoryFile.slug == PROFILE_SLUG)
+    )).scalar_one()
+    profile.body_md = "- uses an Android phone"
+    await db.commit()
+
+    brain = await ops.load_brain(db, user_id, "how is the ielts exam prep going")
+    assert brain.profile == "- uses an Android phone"
+    assert brain.current_context == ""
+    assert [t for t, _ in brain.index] == ["Music", "IELTS"]     # section order
+    assert all(d for _, d in brain.index), "the index carries descriptions"
+    assert [t for t, _ in brain.relevant] == ["IELTS"]           # query-ranked
+    # The three always-injected files are never ALSO in the index.
+    assert "Profile" not in [t for t, _ in brain.index]
+
+
+async def test_an_empty_file_is_not_advertised_in_the_index():
+    """An index line for a file with nothing in it costs tokens every turn
+    and can only mislead the model into opening it."""
+    db, user_id = await _session()
+    await _apply(db, user_id, [_create_ielts()])
+    brain = await ops.load_brain(db, user_id, "ielts")
+    assert brain.index == []
+    assert brain.file_count == 4

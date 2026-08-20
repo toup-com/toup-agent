@@ -120,10 +120,52 @@ from app.config import settings
 # moment it decides WHAT to put in one response.
 #
 # Cost accepted a fourth time: one more prompt-cache re-warm per tenant.
+# MOVED A FIFTH TIME, DELIBERATELY, 2026-08-20 (was 9909dc25…4384a09, 60).
+# Memory v3 (docs/memory/rebuild-2026-08-v3.md §3.2) ADDS ONE TOOL —
+# `memory_read_file(slug)` — and rewrites two descriptions.
+#
+# This one had to be a wire change, and it is the load-bearing half of the
+# whole rebuild. The `# User Brain` block is now an INDEX naming the user's
+# memory files plus three of them in full; round 8 shipped that index with
+# no way to open a file (`memory_search` had no slug parameter and
+# `memory_service.py` contained zero references to `file_slug`), so the map
+# led nowhere and the model could only guess. Dropping sentence retrieval
+# without a file-read tool would be a pure regression — no prompt can
+# substitute for a tool that does not exist.
+#
+# The two rewritten descriptions: `memory_search` now says it searches
+# FILES (and stops offering `brain_type`, a row concept), and
+# `memory_store` says it is the explicit "remember that…" path rather than
+# a general note-taker — the sentence that let it become the highest-volume
+# junk producer on the founder's tenant.
+#
+# Cost accepted a fifth time: one more prompt-cache re-warm per tenant.
+#
+# MOVED A SIXTH TIME, SAME DAY, SAME REBUILD (was c41caf91…cebabdde3, 61).
+# WS-1 changed the two descriptions; WS-2 changes the two SCHEMAS behind
+# them, which is the other half of the same reversal:
+#
+#   * `memory_store` no longer takes `category` / `brain_type` /
+#     `importance`. v3 has no per-row taxonomy — the curator picks the FILE —
+#     so those three asked the model to choose from an enum whose values
+#     route nothing. `content` is the whole input now.
+#   * `memory_delete` no longer takes `memory_id`. There are no memory ids
+#     in the product, and the round-8 schema told the model to fetch one
+#     from `memory_search`, which returns file slugs and snippets. It takes
+#     WHAT to forget, in plain words.
+#
+# Both are wire changes because a stale schema is worse than a stale
+# description: the model sends a required field the executor ignores, and
+# the tool silently does something other than what was asked. Landing them
+# in the same release as WS-1's description edits costs the SAME cache
+# re-warm rather than a second one.
+#
+# Cost accepted a sixth time: no ADDITIONAL re-warm (same release as the
+# fifth).
 MAIN_CORE_TOOLS_SHA256 = (
-    "9909dc25f3ab6d968700323853e05792fae53ed4f141b223917301d8d4384a09"
+    "4d695a6856cf9488e1f6def0cd1b7507ff2450a8f125193a079219d1d4f836ba"
 )
-MAIN_CORE_TOOLS_COUNT = 60
+MAIN_CORE_TOOLS_COUNT = 61
 
 DOC_TOOL_NAMES = {
     "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",

@@ -121,7 +121,7 @@ TOOLS_WORK_TRACKING: FrozenSet[str] = frozenset({
 })
 
 TOOLS_MEMORY: FrozenSet[str] = frozenset({
-    "memory_search", "memory_store", "memory_delete",
+    "memory_search", "memory_read_file", "memory_store", "memory_delete",
 }) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_WEB: FrozenSet[str] = frozenset({
@@ -763,6 +763,12 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "navigate_to",  # Page transfers — needed in any intent
     "recall_day",   # Past-day questions can fall under any category
     "memory_search",  # "what do you remember about X" can hit any intent
+    # Same reasoning, and stronger: the `# User Brain` index NAMES the
+    # user's files on every non-trivial turn, so any intent can end up
+    # holding a slug it needs to open. A tool the prompt advertises and the
+    # intent gate hides is the A6-3 failure class (the model either
+    # hallucinates the content or says it cannot read its own memory).
+    "memory_read_file",
     # "Remember <fact>" is an explicit-save ask the system prompt mandates
     # a memory_store call for, yet greeting/question/web/media intents
     # filtered the tool out — the model either hallucinated "saved!" or

@@ -1,25 +1,51 @@
-"""Memory CRUD and search endpoints"""
+"""Memory files — the whole /api/memories surface (v3 §4).
+
+Eight product routes and three admin ones, one unit: the FILE. Round 8's 23 routes served `memories`
+ROWS — 29 engine fields per row, strength meters, leases, recall counts,
+events — and both Memory pages were database-row inspectors built on them.
+v3 retires the rows from the product (§1.1): the file's `body_md` is the
+memory, and NO payload here carries an engine field. `tests/
+test_memories_v3_api.py::test_no_engine_metadata_reaches_a_client` walks
+every response and fails on one.
+
+Three invariants survive from round 8, each of which cost a cycle:
+
+1. **Every handler consults `_get_agent_proxy_info`.** `memory_files` is
+   AGENT_ONLY: the rows live in the tenant container. A route that forgets
+   this serves the platform's empty copy. The structural test greps this
+   module's source for the literal.
+2. **Writes go through `_proxy_memories_write`, which 502s and NEVER falls
+   back.** A write that silently "succeeds" against the platform DB is how
+   a user comes to believe they deleted something that is still there.
+3. **Literal routes are declared before path captures.** Starlette matches
+   in declaration order and `{slug:path}` is greedy.
+
+What CHANGED from round 8: reads no longer fall back to a platform-DB
+view. With rows retired there is nothing to synthesize a file from, so an
+unreachable agent is `503 {"detail": "Your agent isn't reachable right
+now."}` — the clients already own an honest error state, and an empty
+"No memories yet" for a full library reads as data loss.
+"""
 
 import json
 import logging
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
+
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-import httpx
 
-from app.db import get_db, Memory, MemoryEvent, AgentConfig
-from app.schemas import (
-    MemoryCreate, MemoryUpdate, MemoryResponse, MemoryWithScore,
-    MemoryWithRelations, MemorySearchRequest, MemorySearchResponse,
-    MemoryCategory, MemoryType, MemoryLevel, EntityResponse,
-    MemoryEventResponse, MemoryEventsResponse, MemoryFileInstructRequest
+from app.db import get_db, Memory, AgentConfig
+# Re-exported: `app.mcp_server` imports these three from this module (they
+# are the memory write schemas the MCP tools proxy with), and ingest.py /
+# agent.py / stats.py import `memory_to_response` below. Both are the
+# document/media leg (§3.4), not the memory product.
+from app.schemas import (  # noqa: F401
+    MemoryCreate, MemoryUpdate, MemoryResponse, MemorySearchRequest,
+    MemoryFileInstructRequest,
 )
 from app.api.auth import get_current_user
-from app.memory_taxonomy import normalize_category
-from app.services.memory_service import MemoryService
-from app.services.memory_gate import MemoryRejected, sensitive_content_reason
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +89,13 @@ async def _proxy_memories(
     agent_url: str, agent_api_key: str, path: str,
     params: Optional[dict] = None, method: str = "GET", body: Optional[dict] = None,
 ):
-    """Proxy a memories READ to the VPS agent.
+    """Proxy a memories READ to the tenant agent.
 
-    Returns None on any failure, which makes the caller fall back to the
-    platform DB. That is acceptable for reads (worst case: an empty list) but
-    NOT for writes — see `_proxy_memories_write`.
+    Returns None on any failure. In round 8 that meant "fall back to the
+    platform DB"; in v3 it means 503 — see `_agent_unreachable`. The
+    fallback existed because rows were mirrored platform-side; files are
+    not, and a synthesized-from-nothing file view is a lie, not a
+    degradation.
 
     TKT-LAT-007 (wave 3): shared agent_http client.
     """
@@ -88,6 +116,8 @@ async def _proxy_memories(
             )
         if resp.status_code == 200:
             return resp.json()
+        if resp.status_code == 404:
+            return {"__status__": 404}
         logger.warning("Agent memories proxy %s returned %s", url, resp.status_code)
     except Exception as e:
         logger.warning("Agent memories proxy %s failed: %s", url, e)
@@ -98,20 +128,15 @@ async def _proxy_memories_write(
     agent_url: str, agent_api_key: str, path: str,
     method: str, body: Optional[dict] = None, params: Optional[dict] = None,
 ):
-    """Proxy a memories WRITE (POST/PATCH/DELETE) to the tenant agent.
+    """Proxy a memories WRITE (POST/DELETE) to the tenant agent.
 
-    Backlog BE-1. `memories` is an AGENT_ONLY table: it exists in the tenant
-    container's DB, not in the platform's Supabase DB. Reads have been proxied
-    for a while, but writes were not — so every PATCH/DELETE executed against a
-    database with no such table and could not possibly affect what the user
-    sees. That is why the mobile app shipped with FEATURE_FLAGS.MEMORY_WRITES
-    hard-off and no way to correct a wrong memory.
-
-    Unlike the read helper this NEVER falls back to the platform DB. A write
-    that cannot reach the tenant must surface as an error: silently "succeeding"
-    against the wrong database is how a user comes to believe they deleted
-    something that is still there. Raises HTTPException on failure; propagates
-    the agent's own status code when it returns one.
+    Backlog BE-1. `memory_files` is an AGENT_ONLY table: it exists in the
+    tenant container's DB, not in the platform's. Unlike the read helper
+    this NEVER falls back to the platform DB. A write that cannot reach the
+    tenant must surface as an error: silently "succeeding" against the
+    wrong database is how a user comes to believe they deleted something
+    that is still there. Raises HTTPException on failure; propagates the
+    agent's own status code when it returns one.
     """
     from app.services.agent_http import get_agent_http_client
 
@@ -124,7 +149,10 @@ async def _proxy_memories_write(
             headers={"X-Agent-Key": agent_api_key},
             params=params or {},
             json=body,
-            timeout=15.0,
+            # Curation is an LLM round trip on the tenant. 15s was tuned for
+            # a row UPDATE; an instruct that has to think needs longer than
+            # the client's own patience, not less.
+            timeout=45.0 if path.endswith("instruct") or path == "instruct" else 15.0,
         )
     except Exception as e:
         logger.warning("Agent memories write proxy %s %s failed: %s", method, url, e)
@@ -143,7 +171,7 @@ async def _proxy_memories_write(
 
     if resp.status_code == 404:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Memory not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
         )
 
     logger.warning(
@@ -158,26 +186,92 @@ async def _proxy_memories_write(
 router = APIRouter(prefix="/memories", tags=["Memories"])
 
 
+def _agent_unreachable() -> HTTPException:
+    """The one degraded answer a file read may give.
+
+    Round 8 synthesized a virtual file view from platform rows when the
+    tenant did not answer. v3 has no rows to synthesize from, and "No
+    memories yet" for a full library reads as data loss — so the honest
+    answer is that the agent is not reachable, which both clients render.
+    """
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Your agent isn't reachable right now.",
+    )
+
+
+def _platform_mode() -> bool:
+    """True on platform-api, where `memory_files` does not exist at all."""
+    from app.config import settings
+    return settings.run_mode == "platform"
+
+
+def _slug_path(slug: str) -> str:
+    """VALIDATE the `{slug:path}` capture, or 404. Never sanitize-and-continue.
+
+    This is the only check standing between a user-controlled path segment
+    and an X-Agent-Key-AUTHENTICATED proxy URL. It used to be
+    `slug.lstrip("/")`, which strips a leading slash and nothing else — so
+    `/api/memories/files/..%2f..%2fadmin/whatever` arrived at the tenant
+    agent as an authenticated request to a path the caller chose. Starlette
+    decodes `%2f` before the `:path` converter sees it, so the traversal is
+    already a real `../` by the time this function runs.
+
+    `is_valid_slug` is the right test and it is the one the WRITER uses: the
+    same slug regex with a 120-char cap, admitting exactly one namespace
+    segment and excluding dots, query strings, fragments, percent-escapes,
+    backslashes and every traversal form by construction.
+
+    Rejecting rather than stripping is the point — a sanitizer that "fixes"
+    a hostile path still forwards a request the caller shaped, and there is
+    no legitimate slug it can repair.
+
+    404 rather than 400: a malformed slug and an unknown slug are the same
+    answer to the client ("that file does not exist"), and a distinguishable
+    400 tells a prober which shapes reach the parser.
+    """
+    from app.memory_files import is_valid_slug, section_of_slug
+
+    cleaned = (slug or "").strip().lstrip("/")
+    # Shape AND namespace. `is_valid_slug` alone would pass
+    # "absolute/path" — well-formed, in no v3 section, and still forwarded.
+    # `section_of_slug` is the same predicate `_all_files` uses to decide
+    # what is a v3 file at all, so the route and the store agree on what can
+    # exist rather than the route being one shape looser.
+    if not is_valid_slug(cleaned) or section_of_slug(cleaned) is None:
+        logger.warning(
+            "[memories] rejected a malformed file slug (%d chars)", len(slug or "")
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
+        )
+    return cleaned
+
+
 def memory_to_response(memory: Memory) -> MemoryResponse:
-    """Convert Memory model to response schema with new enhancement fields"""
+    """Row serializer for the DOCUMENT/MEDIA leg only (v3 §3.4).
+
+    No route in this module returns it. It stays here because
+    `app/api/ingest.py`, `app/api/agent.py` and `app/api/stats.py` import
+    it by this name for their own ingestion payloads, which describe
+    documents and media — not the user's memory files.
+    """
     return MemoryResponse(
         id=memory.id,
         content=memory.content,
-        canonical_content=getattr(memory, 'canonical_content', None),  # Memory evolution
+        canonical_content=getattr(memory, 'canonical_content', None),
         summary=memory.summary,
-        brain_type=getattr(memory, 'brain_type', 'user'),  # Default to 'user' for backward compatibility
+        brain_type=getattr(memory, 'brain_type', 'user'),
         category=memory.category,
         memory_type=memory.memory_type,
         importance=memory.importance,
         confidence=memory.confidence,
-        # NEW: Memory enhancement fields
         strength=memory.strength,
         memory_level=memory.memory_level,
         emotional_salience=memory.emotional_salience,
         last_reinforced_at=memory.last_reinforced_at,
         consolidation_count=memory.consolidation_count,
         decay_rate=memory.decay_rate,
-        # Memory Evolution fields
         history=json.loads(memory.history_json) if getattr(memory, 'history_json', None) else None,
         merged_from=json.loads(memory.merged_from_json) if getattr(memory, 'merged_from_json', None) else None,
         superseded_by=getattr(memory, 'superseded_by', None),
@@ -185,7 +279,6 @@ def memory_to_response(memory: Memory) -> MemoryResponse:
         expires_at=getattr(memory, 'expires_at', None),
         file_slug=getattr(memory, 'file_slug', None),
         file_position=getattr(memory, 'file_position', None),
-        # Timestamps
         created_at=memory.created_at,
         updated_at=memory.updated_at,
         last_accessed_at=memory.last_accessed_at,
@@ -196,181 +289,9 @@ def memory_to_response(memory: Memory) -> MemoryResponse:
     )
 
 
-def event_to_response(event: MemoryEvent) -> MemoryEventResponse:
-    """Convert MemoryEvent model to response schema"""
-    return MemoryEventResponse(
-        id=event.id,
-        memory_id=event.memory_id,
-        event_type=event.event_type,
-        timestamp=event.timestamp,
-        event_data=json.loads(event.event_data_json) if event.event_data_json else None,
-        trigger_source=event.trigger_source,
-    )
-
-
-@router.post("", response_model=MemoryResponse, status_code=status.HTTP_201_CREATED)
-async def create_memory(
-    memory_data: MemoryCreate,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Create a new memory"""
-    # BE-1: route to the tenant agent, where the memories table actually lives.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories_write(
-            proxy[0], proxy[1], "", "POST",
-            body=memory_data.model_dump(mode="json", exclude_none=True),
-        )
-        if data is None:
-            # The agent accepted the write but returned no body. The app types
-            # this response as a MemoryDetail, so returning `null` would crash
-            # the client — surface it as an error instead.
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Your agent saved the memory but returned no details.",
-            )
-        return JSONResponse(content=data, status_code=status.HTTP_201_CREATED)
-
-    _key = await _get_user_api_key(db, current_user.id)
-    service = MemoryService(db, api_key=_key)
-    try:
-        memory = await service.create_memory(current_user.id, memory_data)
-    except MemoryRejected as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "That memory carries a value we never store "
-                f"({exc.reason.removeprefix('sensitive_')}). "
-                "Card numbers, government identity numbers and API keys are "
-                "refused on every path."
-            ),
-        )
-    return memory_to_response(memory)
-
-
-@router.get("", response_model=dict)
-async def list_memories(
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    brain_type: Optional[str] = Query(None, description="Filter by brain type: user, agent, work"),
-    category: Optional[str] = Query(None, description="Filter by category"),
-    memory_type: Optional[str] = Query(None, description="Filter by memory type"),
-    min_importance: Optional[float] = Query(None, ge=0, le=1),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    List all memories for the current user with optional filters.
-
-    This is different from /search which does semantic similarity search.
-    This endpoint returns memories in chronological order without embedding search.
-    """
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params = {"limit": limit, "offset": offset}
-        if brain_type:
-            params["brain_type"] = brain_type
-        if category:
-            params["category"] = category
-        if memory_type:
-            params["memory_type"] = memory_type
-        if min_importance is not None:
-            params["min_importance"] = str(min_importance)
-        data = await _proxy_memories(proxy[0], proxy[1], "", params)
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-    memories, total_count = await service.list_memories(
-        user_id=current_user.id,
-        limit=limit,
-        offset=offset,
-        brain_type=brain_type,
-        category=category,
-        memory_type=memory_type,
-        min_importance=min_importance
-    )
-    
-    return {
-        "memories": [memory_to_response(m) for m in memories],
-        "total_count": total_count,
-        "limit": limit,
-        "offset": offset
-    }
-
-
-# NOTE: must be defined BEFORE /{memory_id} or the path param shadows it.
-@router.get("/breakdown", response_model=dict)
-async def memory_breakdown(
-    brain_type: Optional[str] = Query(None, description="Restrict counts to one brain"),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """How many memories sit in each category, for the filter bar.
-
-    The Memory screen filters on brain_type only, because twenty categories is
-    too many for a phone tab bar. The consequence is that the taxonomy is
-    invisible: the founder's list opens on Knowledge / People / Knowledge and
-    reads exactly like the "only three categories" bug it was, even though ten
-    categories are in use. Counts make the spread visible and let the app offer
-    a real category filter.
-
-    Cheap by construction — a GROUP BY over one indexed column, no embeddings
-    and no per-row work, so it can sit next to the list request.
-    """
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params = {"brain_type": brain_type} if brain_type else {}
-        data = await _proxy_memories(proxy[0], proxy[1], "breakdown", params)
-        if data is not None:
-            return JSONResponse(content=data)
-
-    from sqlalchemy import func
-
-    conditions = [
-        Memory.user_id == current_user.id,
-        Memory.is_deleted == False,  # noqa: E712
-        Memory.is_active == True,  # noqa: E712
-    ]
-    if brain_type:
-        conditions.append(Memory.brain_type == brain_type)
-
-    rows = (await db.execute(
-        select(Memory.category, Memory.brain_type, func.count(Memory.id))
-        .where(*conditions)
-        .group_by(Memory.category, Memory.brain_type)
-    )).all()
-
-    categories: dict = {}
-    brains: dict = {}
-    for cat, brain, n in rows:
-        key = normalize_category(cat, brain_type=brain or "user")
-        categories[key] = categories.get(key, 0) + n
-        brains[brain or "user"] = brains.get(brain or "user", 0) + n
-
-    return {
-        # Descending so the app can render the filter bar in a useful order
-        # without re-sorting, and so a long tail stays at the far end.
-        "categories": dict(
-            sorted(categories.items(), key=lambda kv: (-kv[1], kv[0]))
-        ),
-        "brains": brains,
-        "total": sum(categories.values()),
-    }
-
-
-# ── Memory files ────────────────────────────────────────────────────
-# The curated file view over memories rows (docs/memory/rebuild-2026-08.md).
-# Like /breakdown and /search these must be defined BEFORE /{memory_id}.
-# On the platform the local branch is the read-fallback and runs VIRTUAL —
-# the memory_files table is AGENT_ONLY with no platform mirror, so the view
-# is synthesized from memories rows alone.
-
-def _files_virtual_mode() -> bool:
-    from app.config import settings
-    return settings.run_mode == "platform"
+# ── Files ───────────────────────────────────────────────────────────
+# NOTE: literal paths first. `{slug:path}` is greedy and every route below
+# it that is not prefixed by a literal would be swallowed.
 
 
 @router.get("/files", response_model=dict)
@@ -378,17 +299,19 @@ async def list_memory_files(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """The sectioned memory-file listing (Profile · People · Areas ·
-    Preferences · Knowledge · Learned · Working on)."""
+    """The sectioned file listing: You · People · Topics · Areas · Learned."""
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         data = await _proxy_memories(proxy[0], proxy[1], "files")
-        if data is not None:
+        if data is not None and "__status__" not in data:
             return JSONResponse(content=data)
+        raise _agent_unreachable()
 
-    from app.services.memory_file_service import MemoryFileService
-    service = MemoryFileService(db)
-    return await service.list_files(current_user.id, virtual_only=_files_virtual_mode())
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_file_ops
+    return await memory_file_ops.list_files(db, current_user.id)
 
 
 @router.get("/files/{slug:path}", response_model=dict)
@@ -397,22 +320,29 @@ async def get_memory_file(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """One memory file: purpose, cross-links, and its entries in curated
-    order. Entries are full memory rows so the detail sheet keeps its
-    provenance (saved day, recall history, strength)."""
+    """One file: title, description, `body_md`, and its links with titles."""
+    slug = _slug_path(slug)
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         data = await _proxy_memories(proxy[0], proxy[1], f"files/{slug}")
-        if data is not None:
+        if data is not None and "__status__" not in data:
             return JSONResponse(content=data)
+        if data is not None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
+            )
+        raise _agent_unreachable()
 
-    from app.services.memory_file_service import MemoryFileService
-    service = MemoryFileService(db)
-    resolved = await service.get_file(current_user.id, slug, virtual_only=_files_virtual_mode())
-    if resolved is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
-    info, entries = resolved
-    return {**info, "entries": [memory_to_response(m) for m in entries]}
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_file_ops
+    file = await memory_file_ops.get_file(db, current_user.id, slug)
+    if file is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
+        )
+    return file
 
 
 @router.post("/files/{slug:path}/instruct", response_model=dict)
@@ -422,36 +352,36 @@ async def instruct_memory_file(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Apply a natural-language instruction to one memory file ("merge the
-    briefing entries", "remove everything about the old job"). One LLM call
-    proposes strictly-validated ops; every applied op rides the existing
-    evolution primitives, so nothing is hard-deleted and the audit trail
-    stays complete."""
+    """"Tell your agent what to change or remove", scoped to ONE file.
+
+    The curator proposes ops, the deterministic validator judges them, and
+    what survives is applied atomically with a change line per mutation.
+    Ops naming another file are dropped: the user is looking at one file.
+    """
+    slug = _slug_path(slug)
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         data = await _proxy_memories_write(
             proxy[0], proxy[1], f"files/{slug}/instruct", "POST",
             body=payload.model_dump(),
         )
-        return JSONResponse(content=data if data is not None else {"applied": []})
+        return JSONResponse(content=data if data is not None else {
+            "applied": 0, "rejected": [], "note": "Nothing to change.",
+        })
 
-    if _files_virtual_mode():
-        # The platform fallback is read-only for files; curation runs where
-        # the memory lives. Same contract as an unreachable agent elsewhere.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Your agent isn't reachable right now. Please try again.",
-        )
+    if _platform_mode():
+        raise _agent_unreachable()
 
-    from app.services.memory_file_ops import curate_file
-    _key = await _get_user_api_key(db, current_user.id)
+    from app.services import memory_curator
+    key = await _get_user_api_key(db, current_user.id)
     try:
-        result = await curate_file(
-            db, current_user.id, slug,
-            instruction=payload.instruction, api_key=_key,
+        result = await memory_curator.instruct_file(
+            db, current_user.id, slug, payload.instruction, api_key=key,
         )
     except ValueError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
+        )
     except Exception as e:
         logger.warning("File instruction failed for %s: %s", slug, e)
         raise HTTPException(
@@ -467,315 +397,241 @@ async def delete_memory_file(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Archive a memory file: soft-deletes its entries (each gets a DELETED
-    audit event, same as deleting one memory) and removes the file itself
-    unless it is a system file — those stay and read as empty. Nothing is
-    hard-deleted."""
+    """Delete a file. A SYSTEM file (Profile, Current context, Learned) is
+    emptied instead of dropped — the injection depends on it existing."""
+    slug = _slug_path(slug)
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        data = await _proxy_memories_write(proxy[0], proxy[1], f"files/{slug}", "DELETE")
-        return JSONResponse(content=data if data is not None else {"archived": None})
+        await _proxy_memories_write(proxy[0], proxy[1], f"files/{slug}", "DELETE")
+        return JSONResponse(content={"deleted": True})
 
-    from app.services.memory_file_service import MemoryFileService
-    service = MemoryFileService(db)
-    archived = await service.delete_file(current_user.id, slug, virtual_only=_files_virtual_mode())
-    if archived is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found")
-    return {"archived": archived, "slug": slug}
+    if _platform_mode():
+        raise _agent_unreachable()
 
-
-# NOTE: /search routes must be defined BEFORE /{memory_id} to prevent route shadowing
-@router.get("/search", response_model=MemorySearchResponse)
-async def search_memories_get(
-    query: str = Query(..., min_length=1),
-    limit: int = Query(10, ge=1, le=50),
-    brain_type: Optional[str] = Query(None, description="Filter by brain type: user, agent, work"),
-    categories: Optional[str] = Query(None, description="Comma-separated categories"),
-    min_importance: Optional[float] = Query(None, ge=0, le=1),
-    min_similarity: float = Query(0.1, ge=0, le=1, description="Minimum similarity threshold"),
-    min_strength: Optional[float] = Query(None, ge=0, le=1),
-    memory_level: Optional[str] = Query(None),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Semantic search for memories (GET method for browser/frontend compatibility)"""
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params: dict = {"query": query, "limit": limit, "min_similarity": str(min_similarity)}
-        if brain_type:
-            params["brain_type"] = brain_type
-        if categories:
-            params["categories"] = categories
-        if min_importance is not None:
-            params["min_importance"] = str(min_importance)
-        if min_strength is not None:
-            params["min_strength"] = str(min_strength)
-        if memory_level:
-            params["memory_level"] = memory_level
-        data = await _proxy_memories(proxy[0], proxy[1], "search", params)
-        if data is not None:
-            return JSONResponse(content=data)
-
-    from app.schemas import MemorySearchRequest, BrainType
-    
-    # Parse categories if provided.
-    # Normalize first, and drop anything still unrecognised. A bare
-    # `MemoryCategory(c)` raises ValueError -> 500 on any retired value, and
-    # retired values are exactly what old clients send: the web Brain page's
-    # filter bar still enumerates the pre-unification names. A stale filter
-    # should degrade, not crash the search.
-    category_list = None
-    if categories:
-        category_list = []
-        for raw in categories.split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                category_list.append(MemoryCategory(normalize_category(raw)))
-            except ValueError:
-                logger.info(
-                    "[memories] ignoring unrecognised category filter %r", raw
-                )
-        category_list = category_list or None
-
-    # Parse brain_type if provided
-    brain_type_enum = None
-    if brain_type:
-        try:
-            brain_type_enum = BrainType(brain_type)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Unknown brain_type {brain_type!r}.",
-            )
-    
-    memory_level_list = None
-    if memory_level:
-        try:
-            memory_level_list = [MemoryLevel(memory_level)]
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=(
-                    f"Unknown memory_level {memory_level!r}. Valid values: "
-                    + ", ".join(sorted(m.value for m in MemoryLevel))
-                ),
-            )
-
-    # Build search request
-    request = MemorySearchRequest(
-        query=query,
-        limit=limit,
-        brain_type=brain_type_enum,
-        categories=category_list,
-        min_importance=min_importance,
-        min_similarity=min_similarity,
-        min_strength=min_strength,
-        # The schema field is `memory_levels` (plural, a list). Passing the
-        # singular name meant pydantic dropped it on the floor: the caller asked
-        # for episodic memories and silently got everything. Mapped, and an
-        # unknown value now 422s instead of quietly widening the search —
-        # mirroring the brain_type handling above rather than the `categories`
-        # path, which degrades on purpose because it carries retired aliases.
-        memory_levels=memory_level_list,
-    )
-    
-    _key = await _get_user_api_key(db, current_user.id)
-    service = MemoryService(db, api_key=_key)
-    results, total_count, search_time_ms = await service.search_memories(
-        current_user.id, request
-    )
-    
-    return MemorySearchResponse(
-        query=request.query,
-        results=results,
-        total_count=total_count,
-        search_time_ms=search_time_ms
-    )
-
-
-@router.post("/search", response_model=MemorySearchResponse)
-async def search_memories(
-    request: MemorySearchRequest,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Semantic search for memories with filters"""
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(
-            proxy[0], proxy[1], "search", method="POST",
-            body=request.model_dump(exclude_none=True),
-        )
-        if data is not None:
-            return JSONResponse(content=data)
-
-    _key = await _get_user_api_key(db, current_user.id)
-    service = MemoryService(db, api_key=_key)
-    results, total_count, search_time_ms = await service.search_memories(
-        current_user.id, request
-    )
-
-    return MemorySearchResponse(
-        query=request.query,
-        results=results,
-        total_count=total_count,
-        search_time_ms=search_time_ms
-    )
-
-
-@router.get("/{memory_id}", response_model=MemoryResponse)
-async def get_memory(
-    memory_id: str,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get a memory by ID"""
-    # This read never proxied, so opening a memory from search hit the platform
-    # DB and 404'd for every user with an active agent — i.e. all of them.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(proxy[0], proxy[1], memory_id)
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-    memory = await service.get_memory(memory_id, current_user.id)
-
-    if not memory:
+    from app.services import memory_file_ops
+    if not await memory_file_ops.delete_file(db, current_user.id, slug):
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Memory file not found"
         )
+    return {"deleted": True}
 
-    return memory_to_response(memory)
+
+# ── The global instruct box ─────────────────────────────────────────
 
 
-@router.get("/{memory_id}/related", response_model=MemoryWithRelations)
-async def get_memory_with_relations(
-    memory_id: str,
-    depth: int = Query(1, ge=1, le=3),
+@router.post("/instruct", response_model=dict)
+async def instruct_memory(
+    payload: MemoryFileInstructRequest,
     current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Get a memory with its related memories and entities"""
-    # The web app's memory detail view calls this; unproxied it read the
-    # platform DB's stale monolith rows and 404'd (or answered from 2026-05
-    # data) for every user with an active agent — i.e. all of them.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(
-            proxy[0], proxy[1], f"{memory_id}/related", params={"depth": depth}
-        )
-        if data is not None:
-            return JSONResponse(content=data)
+    """"Tell your agent what to remember" — no file named.
 
-    service = MemoryService(db)
-    memory = await service.get_memory(memory_id, current_user.id)
-    
-    if not memory:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
-    
-    related = await service.get_related_memories(memory_id, current_user.id, depth)
-    
-    # Get entities (from entity_links)
-    entities = []
-    for link in memory.entity_links:
-        entity = link.entity
-        entities.append(EntityResponse(
-            id=entity.id,
-            name=entity.name,
-            entity_type=entity.entity_type,
-            description=entity.description,
-            mention_count=entity.mention_count,
-            first_seen_at=entity.first_seen_at,
-            last_seen_at=entity.last_seen_at,
-            attributes=json.loads(entity.attributes_json) if entity.attributes_json else None
-        ))
-    
-    return MemoryWithRelations(
-        **memory_to_response(memory).model_dump(),
-        related_memories=[memory_to_response(m) for m in related],
-        entities=entities
-    )
-
-
-@router.patch("/{memory_id}", response_model=MemoryResponse)
-async def update_memory(
-    memory_id: str,
-    update_data: MemoryUpdate,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Update a memory"""
-    # BE-1: writes must reach the tenant DB — see _proxy_memories_write.
+    Same ops engine; the curator routes the fact to the right file and
+    creates one when nothing fits.
+    """
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         data = await _proxy_memories_write(
-            proxy[0], proxy[1], memory_id, "PATCH",
-            body=update_data.model_dump(mode="json", exclude_none=True),
+            proxy[0], proxy[1], "instruct", "POST", body=payload.model_dump(),
         )
-        if data is None:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Your agent saved the change but returned no details.",
-            )
-        return JSONResponse(content=data)
+        return JSONResponse(content=data if data is not None else {
+            "applied": 0, "rejected": [], "note": "Nothing to change.",
+        })
 
-    service = MemoryService(db)
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_curator
+    key = await _get_user_api_key(db, current_user.id)
     try:
-        memory = await service.update_memory(memory_id, current_user.id, update_data)
-    except MemoryRejected as exc:
-        # Same answer as create: a never-store value must not become storable
-        # by editing an existing row instead of making a new one.
+        return await memory_curator.instruct_global(
+            db, current_user.id, payload.instruction, api_key=key,
+        )
+    except Exception as e:
+        logger.warning("Global instruction failed for %s: %s", current_user.id[:8], e)
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "That memory carries a value we never store "
-                f"({exc.reason.removeprefix('sensitive_')}). "
-                "Card numbers, government identity numbers and API keys are "
-                "refused on every path."
-            ),
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Your agent couldn't apply that change. Please try again.",
         )
 
-    if not memory:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
 
-    return memory_to_response(memory)
+# ── Search and log ──────────────────────────────────────────────────
 
 
-@router.delete("/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_memory(
-    memory_id: str,
+@router.get("/search", response_model=dict)
+async def search_memory_files(
+    q: str = Query(..., min_length=1, description="What to look for"),
+    limit: int = Query(10, ge=1, le=50),
     current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Delete a memory (soft delete)"""
-    # BE-1: writes must reach the tenant DB — see _proxy_memories_write.
-    # Deleting against the platform DB previously reported success while the
-    # memory stayed visible on the user's phone.
+    """Search file bodies and titles. Results are FILES, with a snippet."""
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        await _proxy_memories_write(proxy[0], proxy[1], memory_id, "DELETE")
-        return
-
-    service = MemoryService(db)
-    deleted = await service.delete_memory(memory_id, current_user.id)
-
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
+        data = await _proxy_memories(
+            proxy[0], proxy[1], "search", {"q": q, "limit": limit}
         )
+        if data is not None and "__status__" not in data:
+            return JSONResponse(content=data)
+        raise _agent_unreachable()
+
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_file_ops
+    return {"results": await memory_file_ops.search_files(db, current_user.id, q, limit)}
+
+
+@router.get("/log", response_model=dict)
+async def memory_log(
+    month: str = Query(..., pattern=r"^\d{4}-\d{2}$", description="YYYY-MM"),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The Memory log for one month: what the writer changed, by user-local
+    day. `day_key` is stored at write time — bucketing UTC timestamps
+    client-side files a 23:40-local change under tomorrow."""
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], "log", {"month": month})
+        if data is not None and "__status__" not in data:
+            return JSONResponse(content=data)
+        raise _agent_unreachable()
+
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_file_ops
+    try:
+        return await memory_file_ops.read_log(db, current_user.id, month)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
+        )
+
+
+# ── Admin / migration (WS-5) ────────────────────────────────────────
+# Three routes, driven by `backend/scripts/memory_v3_migrate_fleet.py` and
+# `backend/scripts/memory_v3_rollback.py` (both in the rotate_agent_keys
+# shape). Auth is the SAME dependency every other route here uses — on the
+# tenant, `get_current_user` accepts `X-Agent-Key` and resolves it to
+# `settings.user_id`, so an "admin" route is scoped to exactly one user by
+# construction. There is no wider story and none is invented here.
+#
+# The platform half is a pure proxy: `memory_files`, `memory_file_changes`
+# and `migration_status` are all AGENT_ONLY, so a platform-local branch
+# would have nothing to read and nothing to write.
+
+
+@router.post("/admin/migrate-v3", response_model=dict)
+async def admin_migrate_v3(
+    dry_run: bool = Query(True, description="Report only; write nothing"),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run the round-8 → v3 migration for this tenant (§7).
+
+    `dry_run` defaults to TRUE and is the whole safety story of the fleet
+    driver: the report it returns is complete — before counts, after file
+    bodies, and every source row id mapped to a disposition — while the
+    database is not touched at all.
+    """
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], "admin/migrate-v3", "POST",
+            params={"dry_run": dry_run},
+        )
+        return JSONResponse(content=data if data is not None else {"status": "unknown"})
+
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_v3_migration
+
+    key = await _get_user_api_key(db, current_user.id)
+    try:
+        return await memory_v3_migration.migrate_user_guarded(
+            db, current_user.id, dry_run=dry_run, api_key=key,
+        )
+    except Exception as e:
+        logger.warning("memory v3 migration failed for %s: %s", current_user.id[:8], e)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The memory migration could not complete. See the report.",
+        )
+
+
+@router.get("/admin/migrate-v3/report", response_model=dict)
+async def admin_migrate_v3_report(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Marker state, the stored report, and a LIVE snapshot of the tenant.
+
+    The live half is deliberate: called BEFORE a real run this endpoint is
+    the per-tenant "before" backup the driver records in-band, and called
+    after it is the proof of what changed.
+    """
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories(proxy[0], proxy[1], "admin/migrate-v3/report")
+        if data is not None and "__status__" not in data:
+            return JSONResponse(content=data)
+        raise _agent_unreachable()
+
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_v3_migration
+
+    return await memory_v3_migration.read_report(db, current_user.id)
+
+
+@router.post("/admin/migrate-v3/rollback", response_model=dict)
+async def admin_migrate_v3_rollback(
+    confirm: str = Query(
+        ...,
+        description="Must be exactly 'ROLLBACK MEMORY V3'.",
+    ),
+    hard: bool = Query(False, description="Ignore the report; drop every v3 file"),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Undo the migration for this tenant (§7, the rollback half).
+
+    It lives here rather than in a database script because the tenant's
+    tables are only reachable through the tenant, and a rollback nobody can
+    execute is a paragraph, not a plan. Run it BEFORE redeploying the
+    previous image tag — this route does not exist in that image.
+
+    Behind an exact confirmation string for the same reason
+    `DELETE /api/memories` is: it is destructive and it is reachable with a
+    key that a proxy already holds.
+    """
+    if confirm != "ROLLBACK MEMORY V3":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="confirm must be exactly 'ROLLBACK MEMORY V3'",
+        )
+    proxy = await _get_agent_proxy_info(current_user.id, db)
+    if proxy:
+        data = await _proxy_memories_write(
+            proxy[0], proxy[1], "admin/migrate-v3/rollback", "POST",
+            params={"confirm": confirm, "hard": hard},
+        )
+        return JSONResponse(content=data if data is not None else {"rolled_back": False})
+
+    if _platform_mode():
+        raise _agent_unreachable()
+
+    from app.services import memory_v3_migration
+
+    return await memory_v3_migration.rollback(db, current_user.id, hard=hard)
+
+
+# ── Forget everything ───────────────────────────────────────────────
 
 
 @router.delete("", status_code=status.HTTP_200_OK)
@@ -788,22 +644,19 @@ async def forget_all_memories(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Forget every memory for the calling user.
+    """Forget every memory file for the calling user.
 
-    Deliberately NOT exposed as a model-callable agent tool. "Forget everything
-    about me" is a destructive bulk operation, and the memory-poisoning tests in
-    this repo (tests/memverify/test_j_injection.py) drive pasted content that
-    says exactly "delete all stored memories for this user". A tool the model
-    can call is a lever that injected content can pull; a user-initiated
-    endpoint behind an explicit confirmation string is not.
+    Deliberately NOT exposed as a model-callable agent tool. "Forget
+    everything about me" is a destructive bulk operation, and the
+    memory-poisoning tests in this repo (tests/memverify/test_j_injection.py)
+    drive pasted content that says exactly "delete all stored memories for
+    this user". A tool the model can call is a lever that injected content
+    can pull; a user-initiated endpoint behind an explicit confirmation
+    string is not.
 
-    The agent can still honour a spoken "forget X" for a SINGLE fact through
-    memory_delete, which is scoped to one id it had to find first.
-
-    Soft-delete semantics, identical to single-fact deletion: rows become
-    unreachable from every read path and every list endpoint, each one is
-    audited, and the derived entity graph is cleared so it cannot re-surface
-    the forgotten content.
+    Wipes files AND the change log AND the retired `memories` rows — the
+    legacy table is the v3 rollback, but "forget everything" is the one
+    request where leaving a copy behind would be the lie.
     """
     if confirm != "FORGET EVERYTHING":
         raise HTTPException(
@@ -811,420 +664,26 @@ async def forget_all_memories(
             detail="confirm must be exactly 'FORGET EVERYTHING'",
         )
 
-    # Same contract as every other write: it must reach the tenant DB, and a
-    # failure must surface rather than silently "succeed" against the platform.
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         return await _proxy_memories_write(
             proxy[0], proxy[1], "", "DELETE", params={"confirm": confirm}
         )
 
-    removed = await MemoryService(db).forget_all_memories(
-        current_user.id, trigger_source="forget_all_api"
-    )
-    return {"success": True, "removed": removed}
+    if _platform_mode():
+        raise _agent_unreachable()
 
+    from app.services import memory_file_ops
+    from app.services.memory_service import MemoryService
 
-@router.get("/category/{category}", response_model=List[MemoryResponse])
-async def get_memories_by_category(
-    category: str,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get memories by category (supports user, agent, and work categories)"""
-    # Try proxying to remote agent first
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        params = {"limit": limit, "offset": offset}
-        data = await _proxy_memories(proxy[0], proxy[1], f"category/{category}", params)
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-    memories = await service.get_memories_by_category(
-        current_user.id, category, limit, offset
-    )
-    return [memory_to_response(m) for m in memories]
-
-
-@router.get("/region/{region}", response_model=List[MemoryResponse])
-async def get_memories_by_region(
-    region: str,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get memories by brain region (deprecated, use /category/{category})"""
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(
-            proxy[0], proxy[1], f"region/{region}",
-            params={"limit": limit, "offset": offset},
+    removed_files = await memory_file_ops.forget_everything(db, current_user.id)
+    removed_rows = 0
+    try:
+        removed_rows = await MemoryService(db).forget_all_memories(
+            current_user.id, trigger_source="forget_all_api"
         )
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-    memories = await service.get_memories_by_category(
-        current_user.id, region, limit, offset
-    )
-    return [memory_to_response(m) for m in memories]
-
-
-@router.get("/type/{memory_type}", response_model=List[MemoryResponse])
-async def get_memories_by_type(
-    memory_type: MemoryType,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get memories by type"""
-    # Called by the web app's type-filtered memory list (api.ts). Same class
-    # as /related: the real rows live in the tenant DB.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(
-            proxy[0], proxy[1], f"type/{memory_type.value}",
-            params={"limit": limit, "offset": offset},
-        )
-        if data is not None:
-            return JSONResponse(content=data)
-
-    from sqlalchemy import select, and_
-
-    result = await db.execute(
-        select(Memory)
-        .where(
-            and_(
-                Memory.user_id == current_user.id,
-                Memory.memory_type == memory_type.value,
-                Memory.is_deleted == False,
-                Memory.is_active == True  # Only active memories
-            )
-        )
-        .order_by(Memory.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-    )
-    memories = result.scalars().all()
-    return [memory_to_response(m) for m in memories]
-
-
-# ============ Memory Events (Audit Log) Endpoints ============
-
-@router.get("/{memory_id}/events", response_model=MemoryEventsResponse)
-async def get_memory_events(
-    memory_id: str,
-    limit: int = Query(100, ge=1, le=500),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get the audit trail (events) for a specific memory.
-    
-    Events include: created, accessed, reinforced, decayed, consolidated, updated, deleted.
-    This provides a complete history of all operations on the memory.
-    """
-    # memory_events is AGENT_ONLY too — an unproxied read shows an empty
-    # audit trail for a memory that has a real one on the tenant.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(
-            proxy[0], proxy[1], f"{memory_id}/events", params={"limit": limit}
-        )
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-
-    # First verify the memory belongs to this user
-    memory = await service.get_memory(memory_id, current_user.id)
-    if not memory:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
-    
-    events = await service.get_memory_events(memory_id, current_user.id, limit)
-    
-    return MemoryEventsResponse(
-        memory_id=memory_id,
-        events=[event_to_response(e) for e in events],
-        total_count=len(events)
-    )
-
-
-# ============ Memory Reinforcement Endpoints ============
-
-@router.post("/{memory_id}/reinforce")
-async def reinforce_memory(
-    memory_id: str,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Reinforce a memory to increase its strength.
-    
-    This implements spaced repetition - accessing a memory makes it stronger
-    and more resistant to decay. Useful when a memory is actively recalled
-    or confirmed by the user.
-    """
-    # BE-1: "Keep" on the Memory screen lands here; it must reach the tenant.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories_write(
-            proxy[0], proxy[1], f"{memory_id}/reinforce", "POST"
-        )
-        return JSONResponse(content=data or {"success": True, "memory_id": memory_id})
-
-    from app.services.decay_service import DecayService
-
-    decay_service = DecayService(db)
-
-    memory = await decay_service.reinforce_memory(
-        memory_id=memory_id,
-        user_id=str(current_user.id),
-        access_context="user_reinforce"
-    )
-    
-    if not memory:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
-    
-    return {
-        "success": True,
-        "memory_id": memory_id,
-        "new_strength": memory.strength,
-        "access_count": memory.access_count,
-        "message": "Memory reinforced successfully"
-    }
-
-
-# ============ Memory Evolution Endpoints ============
-
-@router.get("/{memory_id}/history")
-async def get_memory_history(
-    memory_id: str,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get the evolution history of a specific memory.
-    
-    Returns the complete history of how this memory changed over time,
-    including all versions, merge events, and change summaries.
-    """
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories(proxy[0], proxy[1], f"{memory_id}/history")
-        if data is not None:
-            return JSONResponse(content=data)
-
-    service = MemoryService(db)
-    history = await service.get_memory_history(memory_id, current_user.id)
-    
-    if not history:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
-    
-    return history
-
-
-@router.post("/deduplicate")
-async def deduplicate_memories(
-    category: Optional[str] = Query(None, description="Optional category filter"),
-    brain_type: Optional[str] = Query(None, description="Optional brain type filter"),
-    dry_run: bool = Query(True, description="If True, just report what would be merged"),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Scan and merge duplicate memories.
-    
-    This endpoint finds memories that are similar enough to be considered
-    duplicates and either reports them (dry_run=True) or merges them (dry_run=False).
-    
-    When memories are merged:
-    - The primary memory absorbs the content from duplicates
-    - History is preserved showing the merge
-    - Duplicates are marked as superseded (is_active=False)
-    
-    Args:
-        category: Optional category to limit scan
-        brain_type: Optional brain type to limit scan
-        dry_run: If True, just report what would be merged without doing it
-    """
-    # A WRITE (it retires rows via is_active=False). Unproxied, it merged the
-    # platform DB's stale monolith rows while the user's real duplicates sat
-    # untouched on the tenant — and reported success. Writes must reach the
-    # tenant or 502 (`_proxy_memories_write` contract); dry_run goes through
-    # the same door because a report computed from the wrong database is a
-    # lie with a smaller blast radius, not a safe fallback.
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        _params = {"dry_run": dry_run}
-        if category is not None:
-            _params["category"] = category
-        if brain_type is not None:
-            _params["brain_type"] = brain_type
-        data = await _proxy_memories_write(
-            proxy[0], proxy[1], "deduplicate", "POST", params=_params
-        )
-        return JSONResponse(content=data or {})
-
-    from app.services.memory_dedup_service import MemoryDedupService
-    _key = await _get_user_api_key(db, current_user.id)
-    dedup_service = MemoryDedupService(db, api_key=_key)
-    results = await dedup_service.find_and_merge_duplicates(
-        user_id=current_user.id,
-        category=category,
-        brain_type=brain_type,
-        dry_run=dry_run
-    )
-    
-    return {
-        "dry_run": dry_run,
-        "operations": results,
-        "total_merge_groups": len(results),
-        "total_duplicates_found": sum(len(op.get("duplicates", [])) for op in results),
-        "message": "Dry run complete - no changes made" if dry_run else f"Merged {len(results)} groups of duplicates"
-    }
-
-
-@router.get("/duplicates/report")
-async def get_duplicate_report(
-    category: Optional[str] = Query(None, description="Optional category filter"),
-    threshold: float = Query(0.85, ge=0.5, le=1.0, description="Similarity threshold"),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Generate a report of potential duplicate memories.
-    
-    This is a read-only operation that analyzes your memories and
-    identifies groups of similar memories that could be merged.
-    
-    Returns statistics and detailed groups of potential duplicates.
-    """
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        _params = {"threshold": threshold}
-        if category is not None:
-            _params["category"] = category
-        data = await _proxy_memories(
-            proxy[0], proxy[1], "duplicates/report", params=_params
-        )
-        if data is not None:
-            return JSONResponse(content=data)
-
-    from app.services.memory_dedup_service import MemoryDedupService
-    _key = await _get_user_api_key(db, current_user.id)
-    dedup_service = MemoryDedupService(db, api_key=_key)
-    report = await dedup_service.get_duplicate_report(
-        user_id=current_user.id,
-        category=category,
-        threshold=threshold
-    )
-    
-    return report
-
-
-@router.post("/{memory_id}/merge")
-async def merge_into_memory(
-    memory_id: str,
-    new_content: str = Query(..., description="New content to merge into the memory"),
-    source_type: str = Query("manual", description="Source of this merge"),
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Manually merge new content into an existing memory.
-    
-    This uses the LLM to intelligently combine the existing memory content
-    with the new information, creating a single coherent memory.
-    
-    The merge is tracked in the memory's history.
-    """
-    # Never-store backstop, same as create_memory and update_memory: this
-    # route calls MemoryDedupService._merge_memories directly, which UPDATES
-    # an existing row — it passes through neither smart_create_memory's full
-    # gate nor create_memory's storage backstop, so a card number refused at
-    # create and update was still accepted here, as a query parameter.
-    # Never-store tier only (a manual merge is an explicit user action).
-    #
-    # It runs FIRST because it is a pure function: checking before proxying
-    # keeps the 422 (with its reason) instead of letting the tenant's refusal
-    # come back through the write proxy as a generic 502. The tenant enters
-    # this same handler at the top, so it runs the identical check locally.
-    _secret_early = sensitive_content_reason(new_content or "", explicit_save=True)
-    if _secret_early:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "That content carries a value we never store "
-                f"({_secret_early.removeprefix('sensitive_')}). "
-                "Card numbers, government identity numbers and API keys are "
-                "refused on every path."
-            ),
-        )
-
-    # A WRITE against an existing row. Unproxied, the row it looked up lived
-    # in the platform DB — real memories on the tenant 404'd, and any stale
-    # monolith row with the same id got silently rewritten. Must 502, never
-    # fall back (same contract as PATCH/DELETE above).
-    proxy = await _get_agent_proxy_info(current_user.id, db)
-    if proxy:
-        data = await _proxy_memories_write(
-            proxy[0], proxy[1], f"{memory_id}/merge", "POST",
-            params={"new_content": new_content, "source_type": source_type},
-        )
-        return JSONResponse(content=data or {})
-
-    from app.services.memory_dedup_service import MemoryDedupService
-    from app.schemas import MemoryCreate, BrainType, MemoryType
-
-    service = MemoryService(db)
-    
-    # First verify the memory exists and belongs to user
-    memory = await service.get_memory(memory_id, current_user.id)
-    if not memory:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Memory not found"
-        )
-    
-    _key = await _get_user_api_key(db, current_user.id)
-    dedup_service = MemoryDedupService(db, api_key=_key)
-
-    # Create a temporary MemoryCreate for the merge
-    merge_data = MemoryCreate(
-        content=new_content,
-        category=memory.category,
-        memory_type=MemoryType(memory.memory_type),
-        brain_type=BrainType(memory.brain_type) if memory.brain_type else BrainType.USER,
-        source_type=source_type
-    )
-    
-    # Use the internal merge method
-    updated = await dedup_service._merge_memories(
-        existing_memory_id=memory_id,
-        new_content=new_content,
-        new_memory_data=merge_data,
-        user_id=current_user.id
-    )
-    
-    return {
-        "success": True,
-        "memory_id": memory_id,
-        "merged_content": updated.canonical_content or updated.content,
-        "history_count": len(json.loads(updated.history_json)) if updated.history_json else 1,
-        "message": "Content merged successfully"
-    }
+    except Exception as e:
+        # The legacy table is retired from the product; failing to clear it
+        # must not make the user think their FILES survived.
+        logger.warning("legacy row wipe failed for %s: %s", current_user.id[:8], e)
+    return {"success": True, "removed": removed_files + removed_rows}

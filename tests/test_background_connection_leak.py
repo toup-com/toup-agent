@@ -17,8 +17,8 @@ remaining instances". They are not. The scan's LLM predicate was
 remaining sites reach the model through `LLMService.complete_with_json`
 instead, so no depth of call-graph walking could have matched them:
 
-    agent_runner._extract_memories
-        -> memory_extractor.extract_memories_with_llm
+    agent_runner._extract_memories                      [v3: now the curator]
+        -> memory_extractor.extract_memories_with_llm   [v3: curate_turn]
         -> _complete_json_with_retry -> LLMService.complete_with_json
 
     agent_reflection.reflect_on_turn
@@ -202,20 +202,34 @@ class TestAgentRunnerSites:
         import app.agent.agent_runner as AR
         return Path(AR.__file__).read_text()
 
-    def test_extraction_commits_between_the_read_and_the_llm(self, src):
-        """The ordering IS the fix: a commit after the call releases nothing."""
-        read = src.index("_sel(AgentConfig.openai_api_key).where(AgentConfig.user_id == user_id)")
-        llm = src.index("await extractor.extract_memories_with_llm(")
-        block = src[read:llm]
+    def test_the_curator_commits_before_its_model_call(self):
+        """The ordering IS the fix: a commit after the call releases nothing.
+
+        v3 moved this site. `_extract_memories` is deleted; the writer is
+        `memory_curator.curate_turn`, reached from the SAME fire-and-forget
+        `_background_post_processing`, and it still does DB reads (identity,
+        system files, the file bodies) before a multi-second model round
+        trip. Same hazard, same fix, one file over.
+        """
+        import app.services.memory_curator as MC
+
+        src = Path(MC.__file__).read_text()
+        at = src.index("async def curate_turn(")
+        body = src[at:]
+        read = body.index("await ops.ensure_system_files(db, user_id)")
+        llm = body.index("await _run_ops(")
+        block = body[read:llm]
         assert "await db.commit()" in block, (
-            "_extract_memories still holds the pooled connection across "
-            "extract_memories_with_llm"
+            "curate_turn holds the pooled connection across the model call"
         )
 
-    def test_extraction_still_reads_the_tenant_key(self, src):
-        """Same guard as the reflect test: deleting the read would also make
-        the ordering assertion vacuous."""
-        assert "_sel(AgentConfig.openai_api_key)" in src
+    def test_the_curator_still_does_the_reads_that_make_the_ordering_matter(self):
+        """Deleting the reads would make the ordering assertion vacuous."""
+        import app.services.memory_curator as MC
+
+        src = Path(MC.__file__).read_text()
+        assert "resolve_user_identity(db, user_id)" in src
+        assert "ops._all_files(db, user_id)" in src
 
     def test_background_post_processing_keeps_a_strong_ref(self, src):
         assert "_spawn_background(_background_post_processing())" in src

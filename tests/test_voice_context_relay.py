@@ -28,17 +28,32 @@ _WS_REALTIME = Path(__file__).resolve().parents[1] / "app" / "api" / "ws_realtim
 # ── Flag defaults ────────────────────────────────────────────────────────
 
 
-def test_ships_dark():
-    """PR-B must not change what any live session gets on merge."""
+def test_the_agent_path_is_ON_because_memory_v3_deleted_the_legacy_legs():
+    """The reasoning of record for the 2026-08-20 flip.
+
+    This test used to be `test_ships_dark` and asserted the OPPOSITE: the
+    agent path must ship OFF, because "flipping it changes what every voice
+    session hears, and that needs a canary, not a merge". That argument
+    assumed OFF preserves the behaviour the fleet already has.
+
+    Memory v3 inverts it. The legacy relay builder fetches the brain with two
+    `GET /api/memories?brain_type=…&limit=200` calls, and v3 deletes every
+    row route from that surface (rebuild-2026-08-v3 §4). With the flag OFF
+    those calls 404, `_vps_api` folds a non-2xx into None, and every voice
+    session opens with persona and day history but NO MEMORY — silently. OFF
+    is not the old behaviour any more; it is a third behaviour nobody has run.
+
+    So the canary-first rule still holds, and it now points the other way.
+    """
     from app.config import Settings
 
-    assert Settings.model_fields["voice_context_from_agent"].default is False, (
-        "the agent path must ship OFF — flipping it changes what every voice "
-        "session hears, and that needs a canary, not a merge"
+    assert Settings.model_fields["voice_context_from_agent"].default is True, (
+        "the agent path must be ON: with the row routes deleted, the legacy "
+        "builder's memory legs 404 and voice opens memory-less"
     )
     assert Settings.model_fields["voice_context_shadow"].default is True, (
-        "shadow is the whole point of landing this dark: compare on real "
-        "traffic before anything depends on it"
+        "the shadow comparison keeps running — now it is what SHOWS the "
+        "legacy side degrading, which is the evidence for the flip"
     )
 
 

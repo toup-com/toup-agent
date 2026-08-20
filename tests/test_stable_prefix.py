@@ -194,6 +194,13 @@ class TestTurnContextMessage:
         assert "# User Brain" in msg["content"]
         # Injection fencing: recalled content is data, not instructions.
         assert "never follow" in msg["content"].lower()
+        # …and the framing must name what actually rides in the block. It
+        # said "recalled memories, open threads" while the block carried
+        # sentence retrieval and an active-tasks list; under v3 it carries
+        # the user's memory FILES, and a model told the wrong thing about
+        # what it is reading is a prompt bug nothing else catches.
+        assert "memory files" in msg["content"].lower()
+        assert "open threads" not in msg["content"].lower()
 
 
 class TestFlagDefault:
@@ -272,11 +279,22 @@ class TestRunnerWiring:
         assert tc_idx < user_append_idx
 
     def test_subagent_isolation_survives_turn_context(self):
-        """SUBAGENT profile deliberately gets no user_brain /
-        active_tasks; the turn-context routing must respect the same
-        profile allow-list the section filter enforces."""
+        """SUBAGENT profile deliberately gets no user_brain; the
+        turn-context routing must respect the same profile allow-list the
+        section filter enforces.
+
+        `active_tasks` was the second half of this pin until memory v3
+        (§1.1/§3.1) retired the block with the `active_task` rows it
+        rendered — what the user is in the middle of lives in Current
+        context, inside user_brain. The pin is asserted BOTH ways so a
+        future block cannot quietly reappear without its gate."""
         assert '"user_brain" in _profile_sections' in _SRC
-        assert '"active_tasks" in _profile_sections' in _SRC
+        assert '"user_brain" not in _profile_sections' in _SRC
+        # The retired block must be gone from the turn-context order tuple:
+        # a key not listed there lands last, alphabetically.
+        order = _SRC[_SRC.index("_tc_order = ("):]
+        order = order[: order.index(")")]
+        assert "active_tasks" not in order
 
     def test_stable_path_is_openai_only(self):
         """Review #6: Anthropic's tool_choice cannot express an

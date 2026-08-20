@@ -513,15 +513,27 @@ class TestNoMemoryContentReachesALogger:
     anywhere in these modules is caught the day it lands.
     """
 
+    # v3: the retired services are OFF this list (they no longer exist), and
+    # the v3 writer is ON it. `memory_curator` and `memory_file_ops` are the
+    # only two modules that now see a memory body at all, so they are exactly
+    # where the next instance of this defect would land — and the curator
+    # logs on every non-trivial turn, which is the volume the original bug
+    # was about.
     MODULES = [
-        "app/services/active_task_service.py", "app/services/agent_reflection.py",
-        "app/services/memory_dedup_service.py", "app/services/memory_service.py",
-        "app/services/memory_extractor.py", "app/services/memory_expiry.py",
+        "app/services/memory_curator.py", "app/services/memory_file_ops.py",
+        "app/services/user_identity.py", "app/services/agent_reflection.py",
+        "app/services/memory_service.py", "app/services/memory_extractor.py",
         "app/services/memory_capture_outbox_service.py", "app/api/memories.py",
         "app/api/documents.py", "app/api/ingest.py", "app/mcp_server.py",
         "app/api/chat.py", "app/modules/chat/router.py",
-        "app/agent/agent_runner.py",
+        "app/agent/agent_runner.py", "app/api/ws_realtime.py",
     ]
+    # `app/agent/tool_executor.py` is deliberately NOT on the list. It is a
+    # 3,500-line file whose memory tools are a few dozen of those lines, and
+    # the scan is per-MODULE: adding it means the guard trips on an image
+    # provider's content-policy log line, which has nothing to do with memory.
+    # The memory tools there hand the curator a string and log its RESULT
+    # (an op count and a file slug), which is what this rule asks for.
     SAFE = ("describe_memory", "memory_fingerprint", "len", "type")
 
     def test_no_logger_call_receives_memory_content(self):

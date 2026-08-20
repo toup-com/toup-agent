@@ -1,12 +1,13 @@
-"""
-Scheduled Tasks for Memory System
-
-This module sets up periodic background tasks for:
-1. Memory Decay - Apply Ebbinghaus forgetting curve
-2. Memory Consolidation - Promote episodic to semantic
+"""Platform-side scheduled tasks.
 
 Uses APScheduler for in-process scheduling. For production deployments
 with multiple workers, consider using Celery or a dedicated job queue.
+
+The memory jobs this module was named for — decay (the Ebbinghaus curve
+over `memories.strength`) and consolidation (episodic → semantic) — are
+DELETED in v3 with the engines behind them. What remains here is platform
+maintenance: the day-archival pass, Gmail watch refresh, credit renewal,
+account purge and the container reaper.
 """
 
 import asyncio
@@ -21,8 +22,6 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import async_session_maker, User
-from app.services.decay_service import get_decay_service
-from app.services.consolidation_service import get_consolidation_service
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,75 +31,16 @@ logger = logging.getLogger("toup.scheduler")
 scheduler: Optional[AsyncIOScheduler] = None
 
 
-async def run_decay_for_all_users():
-    """
-    Run memory decay for all active users.
-    This task applies the Ebbinghaus forgetting curve to reduce memory strength over time.
-    """
-    logger.info("Starting scheduled decay task...")
-    
-    async with async_session_maker() as db:
-        # Get all active users
-        result = await db.execute(
-            select(User.id).where(User.is_active == True)
-        )
-        user_ids = [row[0] for row in result.fetchall()]
-        
-        total_processed = 0
-        total_updated = 0
-        
-        for user_id in user_ids:
-            try:
-                # Create a new session for each user to avoid long transactions
-                async with async_session_maker() as user_db:
-                    decay_service = get_decay_service(user_db)
-                    processed, updated = await decay_service.apply_decay_to_user(user_id)
-                    total_processed += processed
-                    total_updated += updated
-            except Exception as e:
-                logger.error(f"Error running decay for user {user_id}: {e}")
-        
-        logger.info(
-            f"Decay task complete: {total_updated} of {total_processed} memories updated "
-            f"across {len(user_ids)} users"
-        )
-
-
-async def run_consolidation_for_all_users():
-    """
-    Run memory consolidation for all active users.
-    This task groups similar episodic memories into semantic memories.
-    """
-    logger.info("Starting scheduled consolidation task...")
-    
-    async with async_session_maker() as db:
-        # Get all active users
-        result = await db.execute(
-            select(User.id).where(User.is_active == True)
-        )
-        user_ids = [row[0] for row in result.fetchall()]
-        
-        total_considered = 0
-        total_groups = 0
-        total_consolidated = 0
-        
-        for user_id in user_ids:
-            try:
-                async with async_session_maker() as user_db:
-                    consolidation_service = get_consolidation_service(user_db)
-                    considered, groups, consolidated = await consolidation_service.run_consolidation(user_id)
-                    total_considered += considered
-                    total_groups += groups
-                    total_consolidated += consolidated
-            except Exception as e:
-                logger.error(f"Error running consolidation for user {user_id}: {e}")
-        
-        logger.info(
-            f"Consolidation task complete: {total_consolidated} memories consolidated "
-            f"into {total_groups} groups from {total_considered} candidates "
-            f"across {len(user_ids)} users"
-        )
-
+# v3: `run_decay_for_all_users` and `run_consolidation_for_all_users` are
+# DELETED with `decay_service` and `consolidation_service`
+# (docs/memory/rebuild-2026-08-v3.md §1.1). Both walked every active user's
+# `memories` rows to adjust `strength` and to promote episodic rows into
+# semantic ones — a per-row engine whose output no client can see any more.
+#
+# Worth knowing for anyone grepping: the AGENT scheduler registered
+# `run_memory_file_maintenance` under the SAME job id, `memory_consolidation`
+# (agent_main.py). They ran against different databases, so a reader looking
+# for that id found this retired implementation first. Now there is only one.
 
 async def run_health_check():
     """
@@ -128,42 +68,10 @@ async def run_health_check():
         )
 
 
-async def run_retrieval_feedback_analysis():
-    """
-    Weekly retrieval quality analysis for the self-improvement feedback loop (Phase 5).
-    Analyzes retrieval events, generates quality reports, and logs improvement suggestions.
-    """
-    logger.info("Starting weekly retrieval feedback analysis...")
-    
-    async with async_session_maker() as db:
-        result = await db.execute(
-            select(User.id).where(User.is_active == True)
-        )
-        user_ids = [row[0] for row in result.fetchall()]
-    
-    for user_id in user_ids:
-        try:
-            async with async_session_maker() as user_db:
-                from app.services.retrieval_feedback import get_retrieval_feedback
-                feedback = get_retrieval_feedback(user_db)
-                report = await feedback.generate_weekly_report(user_id)
-                
-                grade = report.get("health_grade", "N/A")
-                metrics = report.get("metrics", {})
-                suggestions = report.get("suggestions", [])
-                
-                logger.info(
-                    f"Feedback report for user {user_id}: "
-                    f"grade={grade}, events={metrics.get('total_events', 0)}, "
-                    f"recall={metrics.get('recall_estimate', 0):.1%}, "
-                    f"precision={metrics.get('precision_estimate', 0):.1%}, "
-                    f"suggestions={len(suggestions)}"
-                )
-        except Exception as e:
-            logger.error(f"Error running feedback analysis for user {user_id}: {e}")
-    
-    logger.info(f"Retrieval feedback analysis complete for {len(user_ids)} users")
-
+# `run_retrieval_feedback_analysis` is DELETED with `retrieval_events`. It
+# graded retrieval quality from per-turn telemetry that sentence retrieval
+# produced; v3 injects whole files and logs no such events, so the weekly
+# report had no feeder and would have graded an empty table forever.
 
 # Process-level lock guarding the archival pass. Prevents a second invocation
 # from starting while the previous one is still running (e.g. if an hourly run
@@ -985,18 +893,21 @@ async def run_deferred_grant_reconciliation(limit: int = 500) -> dict:
 
 
 def setup_scheduler(
+    health_check_interval_minutes: int = 60,
+    # Accepted and ignored. v3 deleted the decay and consolidation jobs; the
+    # kwargs stay so an out-of-tree caller (or an old deploy overlapping a
+    # new image) does not TypeError its way out of starting the scheduler
+    # AT ALL, which would take the Gmail watch refresh and credit renewal
+    # with it.
     decay_interval_hours: int = 6,
     consolidation_interval_hours: int = 24,
-    health_check_interval_minutes: int = 60
 ) -> AsyncIOScheduler:
     """
-    Set up the APScheduler with memory maintenance tasks.
-    
+    Set up the APScheduler with platform maintenance tasks.
+
     Args:
-        decay_interval_hours: How often to run decay (default: every 6 hours)
-        consolidation_interval_hours: How often to run consolidation (default: daily)
-        health_check_interval_minutes: How often to run health check (default: hourly)
-    
+        health_check_interval_minutes: How often to run health check (hourly)
+
     Returns:
         Configured scheduler instance
     """
@@ -1012,38 +923,6 @@ def setup_scheduler(
     # APScheduler also means a scheduler-start failure can't take the
     # notification pipeline down with it.
 
-    # Memory Decay — fixed clock times, NOT an elapsed-time interval.
-    #
-    # This was `IntervalTrigger(hours=6)`, whose first fire is six hours
-    # after the scheduler STARTS. The agent fleet is recreated on every
-    # merge to main under `backend/**` — 178 such commits in the 14 days
-    # to 2026-08-10, median gap 0.3h, only 13 of 177 gaps reaching six
-    # hours. Every recreation reset the timer, so the first fire kept
-    # being cancelled by the next deploy and decay never ran once:
-    # `last_decayed_at` was NULL for every memory on every tenant checked.
-    #
-    # Wall-clock slots survive restarts — the same reason the
-    # consolidation job below has always used CronTrigger. Four slots
-    # preserve the ~6-hourly cadence `decay_interval_hours` asks for, and
-    # 02:00 lands before consolidation at 03:00 so strengths are current
-    # when episodic memories are summarised.
-    scheduler.add_job(
-        run_decay_for_all_users,
-        trigger=CronTrigger(hour="2,8,14,20", minute=0),
-        id="memory_decay",
-        name="Memory Decay (Ebbinghaus Curve)",
-        replace_existing=True,
-    )
-    
-    # Memory Consolidation - runs daily at 3 AM
-    scheduler.add_job(
-        run_consolidation_for_all_users,
-        trigger=CronTrigger(hour=3, minute=0),  # 3:00 AM
-        id="memory_consolidation",
-        name="Memory Consolidation (Episodic→Semantic)",
-        replace_existing=True,
-    )
-    
     # Health Check - runs every hour
     scheduler.add_job(
         run_health_check,
@@ -1053,15 +932,6 @@ def setup_scheduler(
         replace_existing=True,
     )
     
-    # Phase 5: Retrieval Feedback Analysis — runs weekly (Sundays at 4 AM)
-    scheduler.add_job(
-        run_retrieval_feedback_analysis,
-        trigger=CronTrigger(day_of_week="sun", hour=4, minute=0),
-        id="retrieval_feedback_analysis",
-        name="Retrieval Quality Analysis (Weekly)",
-        replace_existing=True,
-    )
-
     # Account Purge — runs daily at 4:30 AM, hard-deletes accounts that were
     # anonymized >30 days ago. Honors the Privacy Policy retention promise.
     scheduler.add_job(
@@ -1174,10 +1044,8 @@ def setup_scheduler(
         logger.warning("Could not register day_archival job: %s", e)
 
     logger.info(
-        f"Scheduler configured: decay every {decay_interval_hours}h, "
-        f"consolidation daily at 3AM, "
-        f"health check every {health_check_interval_minutes}min, "
-        f"feedback analysis weekly (Sun 4AM)"
+        "Scheduler configured: health check every %dmin",
+        health_check_interval_minutes,
     )
 
     return scheduler
@@ -1237,18 +1105,9 @@ def schedule_one_shot(func, kwargs: dict, job_id: str, delay_s: int = 0):
 if __name__ == "__main__":
     async def main():
         print("Running scheduled tasks manually...")
-        
-        print("\n1. Running decay...")
-        await run_decay_for_all_users()
-        
-        print("\n2. Running consolidation...")
-        await run_consolidation_for_all_users()
-        
-        print("\n3. Running health check...")
+
+        print("\n1. Running health check...")
         await run_health_check()
-        
-        print("\n4. Running retrieval feedback analysis...")
-        await run_retrieval_feedback_analysis()
         
         print("\nDone!")
     

@@ -252,22 +252,16 @@ async def test_top_of_the_ranking_is_kept_not_the_tail(session_maker, monkeypatc
 
     `scored_memories` is sorted by `final_score` desc immediately above the
     trim; slicing the wrong end would still return `limit` rows and pass the
-    length assertions.  Also pins the auto-reinforce loop's input: it takes
-    `scored_memories[:5]`, which for limit>=5 is byte-identical before and
-    after the trim.
+    length assertions.
+
+    v3: the auto-reinforce loop this test used to neutralise is GONE with
+    `decay_service`, so the two searches no longer interfere and there is
+    nothing left to patch. The truncation itself is unchanged and still
+    matters — `hybrid_search` remains the document/media leg's ranking.
     """
     from app.config import settings
-    from app.services.decay_service import DecayService
 
     monkeypatch.setattr(settings, "enable_reranker", False, raising=False)
-    # Two searches over the SAME rows: without this the first call's
-    # auto-reinforcement would bump `last_accessed_at` on its top 5 and give
-    # them a recency boost in the second, making the comparison depend on
-    # scoring side effects rather than on the truncation under test.
-    async def _no_reinforce(*_a, **_kw):
-        return None
-
-    monkeypatch.setattr(DecayService, "reinforce_memory", _no_reinforce)
     user_id = await _seed(session_maker, 12)
 
     async with session_maker() as db:
@@ -284,8 +278,6 @@ async def test_top_of_the_ranking_is_kept_not_the_tail(session_maker, monkeypatc
     assert len(wide) == 12  # every seeded row — nothing to trim
     assert len(narrow) == 6
     assert [r["id"] for r in narrow] == [r["id"] for r in wide[:6]]
-    # The reinforce slice sees the same five rows either way.
-    assert [r["id"] for r in narrow[:5]] == [r["id"] for r in wide[:5]]
 
 
 # ── 3. The re-ranker paths are unchanged ──────────────────────────────

@@ -98,10 +98,14 @@ def test_snap_target_no_longer_exists_in_wire_order():
 def test_prod_log_counts_reproduce_before_the_fix_shape():
     """The prod line said `tools=14` / `allowed=19`. Documented, not pinned:
     the new numbers are what the fix produces (14 - 7 exporters + 3 work
-    tracking = 10 intent tools; the runner adds the always-included set on
-    top). If someone re-merges TOOLS_DOCGEN into TOOLS_WEB this fails."""
+    tracking = 10 intent tools, +1 for memory v3's `memory_read_file`; the
+    runner adds the always-included set on top). If someone re-merges
+    TOOLS_DOCGEN into TOOLS_WEB this fails."""
     intent = classify_query_intent(INCIDENT_MESSAGE)
-    assert len(intent.tool_names) == 10, sorted(intent.tool_names)
+    # 11 since memory v3: `memory_read_file` joined TOOLS_MEMORY. The index
+    # in `# User Brain` names the user's files on every non-trivial turn,
+    # so any intent can end up holding a slug it needs to open.
+    assert len(intent.tool_names) == 11, sorted(intent.tool_names)
     assert not (TOOLS_DOCGEN & intent.tool_names)
 
 

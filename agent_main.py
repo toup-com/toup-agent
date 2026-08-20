@@ -1069,47 +1069,60 @@ async def lifespan(app: FastAPI):
             and cron_service.scheduler
         ):
             from apscheduler.triggers.cron import CronTrigger as _MMCron
-            from apscheduler.triggers.interval import IntervalTrigger as _MMIvl
 
             _mm_jobs = []
             try:
-                from app.scripts.scheduled_tasks import (
-                    run_decay_for_all_users,
-                    run_retrieval_feedback_analysis,
-                    run_end_of_day_archival,
+                from app.scripts.scheduled_tasks import run_end_of_day_archival
+                from app.services.current_context import (
+                    run_context_rollover as _context_rollover,
                 )
-                from app.services.memory_file_migration import (
-                    run_memory_file_maintenance,
-                )
+                from app.services.memory_file_ops import run_memory_maintenance
+
                 _mm_jobs = [
                     (
-                        "memory_decay",
-                        run_decay_for_all_users,
+                        # v3 (docs/memory/rebuild-2026-08-v3.md §1.1): the two
+                        # jobs that used to sit here are DELETED with the row
+                        # engine. `memory_decay` walked `memories.strength`
+                        # through an Ebbinghaus curve; `memory_consolidation`
+                        # ran `run_memory_file_maintenance`, an LLM curation
+                        # pass over ROWS grouped into files. Neither has an
+                        # output any client can see.
+                        #
+                        # One cheap slot replaces both, and it keeps the id
+                        # `memory_consolidation` so a redeploy REPLACES the
+                        # old registration on a scheduler that survived
+                        # (replace_existing=True keys on the id) rather than
+                        # leaving an orphan pointing at a deleted function.
+                        # WS-5's migration hooks in here.
+                        "memory_consolidation",
+                        run_memory_maintenance,
                         # CRON, not interval (rebuild-2026-08 RC3.1): an
                         # interval's first fire is measured from scheduler
                         # start, and the fleet is recreated on every merge to
-                        # main (median gap 0.3h at the 2026-08 audit) — so
-                        # this job never fired once. A cron fires at wall-
-                        # clock times regardless of restarts; same fix the
-                        # platform copy got in scheduled_tasks.py.
-                        _MMCron(hour="2,8,14,20", minute=0),
-                    ),
-                    (
-                        "memory_consolidation",
-                        # File-based curation (rebuild-2026-08 §3.7): merges
-                        # duplicates IN PLACE under the strict ops contract.
-                        # Replaces run_consolidation_for_all_users, whose
-                        # additive pass wrote a new semantic row and retired
-                        # nothing (dry run 2026-08-10: "0 rows rewritten or
-                        # retired") — half of how 89 unmerged factlets happened.
-                        run_memory_file_maintenance,
+                        # main (median gap 0.3h at the 2026-08 audit) — so an
+                        # interval job never fired once.
                         _MMCron(hour=settings.consolidation_cron_hour, minute=0),
                     ),
+                    # Current context's day rollover (memory v3 §6). HOURLY
+                    # and CRON — hourly because a fleet of users in every
+                    # timezone crosses midnight at 24 different UTC hours, so
+                    # a daily job would age half of them a day late; cron
+                    # rather than interval for the same RC3.1 reason as the
+                    # slot above. Cheap: it reads one row and returns unless
+                    # the user's LOCAL date has actually advanced.
                     (
-                        "retrieval_feedback_analysis",
-                        run_retrieval_feedback_analysis,
-                        _MMCron(day_of_week="sun", hour=4, minute=0),
+                        "current_context_rollover",
+                        _context_rollover,
+                        _MMCron(minute=5),
                     ),
+                    # retrieval_feedback_analysis is RETIRED with sentence
+                    # retrieval (memory v3 §3.1). It read `retrieval_events`,
+                    # whose only feeder was the runner's per-turn
+                    # `log_retrieval_feedback` call — and that call's input
+                    # was hybrid_search's results, which the file model no
+                    # longer produces. A weekly job over a table nothing
+                    # writes is not observability, it is a cron that always
+                    # reports zero.
                 ]
                 # Hourly archival summaries — same enable_day_recall gate as
                 # platform_main's setup_scheduler (forced ON in the agent
@@ -1146,14 +1159,17 @@ async def lifespan(app: FastAPI):
             try:
                 from datetime import datetime as _dt, timedelta as _td
                 from apscheduler.triggers.date import DateTrigger as _MMDate
+                from app.services.memory_file_ops import (
+                    run_memory_maintenance as _mm_boot,
+                )
                 cron_service.scheduler.add_job(
-                    run_memory_file_maintenance,
+                    _mm_boot,
                     trigger=_MMDate(run_date=_dt.now() + _td(seconds=180)),
                     id="memory_file_migration_boot",
-                    name="Memory Maintenance: boot organize+curate",
+                    name="Memory Maintenance: boot system files",
                     replace_existing=True,
                 )
-                print("🧠 Memory file organize/curate scheduled for T+180s")
+                print("🧠 Memory system-file check scheduled for T+180s")
             except Exception as e:
                 print(f"⚠️ Could not schedule memory file migration: {e}")
 

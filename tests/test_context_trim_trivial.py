@@ -1,6 +1,6 @@
 """Regression test for TKT-LAT-019 — context trim for trivial queries.
 
-Drops portrait + hybrid_search + entity_search + active_tasks when
+Drops the whole memory-files block when
 the message is a greeting, acknowledgment, or simple time/date
 question. Motivated by 24 548-token "what time is it?" turn taking
 11.6 s — that's portrait + memories + entities + tasks all loaded
@@ -96,14 +96,16 @@ def test_config_flag_defaults_to_on():
     assert "context_trim_for_trivial_queries: bool = True" in src
 
 
-def test_agent_runner_gates_memory_retrieval_on_skip_flag():
+def test_agent_runner_gates_the_memory_block_on_skip_flag():
     src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "agent_runner.py").read_text()
     # The flag is computed once at the top of _build_system_prompt.
     assert "_skip_deep_context = bool(" in src
-    # And the memory_retrieval block is gated on it.
-    assert 'logger.info("[PERF] memory_retrieval_skipped reason=trivial_query")' in src
-    # And active_tasks is gated on it.
-    assert 'logger.debug("[AGENT] active_tasks skipped (trivial query)")' in src
+    # And the memory block is gated on it. Memory v3 (§3.1) replaced the
+    # retrieval fan-out with ONE memory-files load, and retired the
+    # active_tasks block with the `active_task` rows it rendered — so
+    # there is one gated block here now, not two.
+    assert 'logger.info("[PERF] memory_files_skipped reason=trivial_query")' in src
+    assert "active_tasks skipped" not in src
 
 
 def test_agent_runner_emits_perf_log_with_depth():

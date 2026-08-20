@@ -194,50 +194,20 @@ async def test_partial_unique_allows_null_ref(memory_user, requires_agent_tables
         await db.commit()  # No conflict — null ref_id is unconstrained.
 
 
-def test_mcp_memory_create_defaults_are_valid_enum_values():
-    """Invariant #3 — the MCP tool's default values must be valid in
-    the Pydantic enums they map to. The original bug: memory_type
-    default was 'episodic', which is a MemoryLevel value, not a
-    MemoryType value. The agent inherited that mis-default and
-    propagated it.
-
-    This test pins the agreement: introspect the tool signature, pull
-    the defaults, and validate each against its enum.
-    """
-    import inspect
-    from app import mcp_server
-    from app.schemas import MemoryType, MemoryLevel
-
-    sig = inspect.signature(mcp_server.memory_create.fn)
-    params = sig.parameters
-
-    assert params["memory_type"].default in [t.value for t in MemoryType], (
-        f"memory_create default memory_type "
-        f"({params['memory_type'].default!r}) is not a valid MemoryType "
-        f"enum value. This is exactly the Ticket 2.1 drift."
-    )
-    assert params["memory_level"].default in [l.value for l in MemoryLevel], (
-        f"memory_create default memory_level "
-        f"({params['memory_level'].default!r}) is not a valid MemoryLevel "
-        f"enum value."
-    )
-
-
-@pytest.mark.asyncio
-async def test_mcp_memory_create_rejects_layer_in_type_slot():
-    """When the agent passes a layer name (e.g. 'semantic') as
-    `memory_type`, the tool must reject FAST with a useful error
-    message distinguishing the two concepts. This is what prevents
-    repeat of the 3.1s validation-error round-trip."""
-    from app import mcp_server
-
-    # Direct call to the underlying function bypasses MCP transport.
-    result = await mcp_server.memory_create.fn(
-        content="test",
-        category="context",
-        memory_type="semantic",  # WRONG SLOT — semantic is a level
-    )
-    assert "error" in result, result
-    assert "memory_type" in result["error"]
-    # Error must guide the LLM toward `memory_level`.
-    assert "memory_level" in result["error"]
+# ── RETIRED: the MCP `memory_create` enum guards (v3 §2.1.6) ──────────
+#
+# `test_mcp_memory_create_defaults_are_valid_enum_values` and
+# `test_mcp_memory_create_rejects_layer_in_type_slot` pinned that the MCP
+# tool validated `memory_type` / `memory_level` against their enums before
+# the Pydantic round trip, with an error message that distinguished the two
+# concepts so a model could not put "semantic" (a LEVEL) in the TYPE slot.
+#
+# The tool is deleted. v3's MCP write is `memory_remember(instruction)` — a
+# sentence in plain language, routed to the curator, which chooses the file.
+# There is no type, no level and no category for a model to conflate, which
+# is a stronger guarantee than validating them was. Its replacement is
+# pinned in tests/test_curator_producers.py::
+# test_no_mcp_tool_proxies_a_deleted_route.
+#
+# The three DB-level tests ABOVE stay: `ix_memories_ref_unique` is still on
+# the legacy table, which v3 leaves on disk untouched as the rollback.

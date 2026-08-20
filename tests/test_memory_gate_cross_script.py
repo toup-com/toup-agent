@@ -156,25 +156,11 @@ def _call_arg_blocks(src: str, needle: str) -> list:
         i = k
 
 
-def test_dedup_adjudication_calls_are_pinned_to_temperature_zero():
-    """The three adjudication call sites in memory_dedup_service inherited
-    the CHAT default temperature of 0.7 (config.py) — an accident for a
-    classifier whose verdicts retire rows (#517). Pin all of them at 0.0, and
-    pin the COUNT so a fourth call site cannot appear unpinned."""
-    src = (
-        Path(__file__).resolve().parent.parent
-        / "app" / "services" / "memory_dedup_service.py"
-    ).read_text()
-    blocks = _call_arg_blocks(src, "complete_with_json(")
-    assert len(blocks) == 3, (
-        f"expected exactly 3 complete_with_json call sites, found {len(blocks)} "
-        "— if you added one, pin its temperature and update this count"
-    )
-    unpinned = [b for b in blocks if "temperature=0.0" not in b]
-    assert not unpinned, (
-        f"{len(unpinned)} adjudication call site(s) missing temperature=0.0: "
-        f"{unpinned}"
-    )
+# `test_dedup_adjudication_calls_are_pinned_to_temperature_zero` RETIRED with
+# `memory_dedup_service` (v3 §1.1). Its subject was the three adjudication
+# call sites in that service. The property it protected — a memory decision
+# must not be SAMPLED — survives at the one remaining decision point and is
+# pinned in tests/test_memory_curator.py::test_the_writer_is_never_sampled.
 
 
 # ── B12: one shared token is not the user gesturing at a claim ───────────

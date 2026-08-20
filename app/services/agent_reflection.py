@@ -1,9 +1,18 @@
-"""Agent-brain producer — what the agent learns about working with a user.
+"""The `learned` file's producer — what the agent learns about working with
+a user.
 
-This is what the app's "Learned" tab shows. Until 2026-07-29 that tab was
+This is the file the Memory page shows under "Learned" and the block the
+prompt injects as "how to work with this user". Until 2026-07-29 it was
 permanently empty: `brain_type='agent'` had no producer anywhere in the
 codebase (0 rows across all 54 production containers) and no consumer either,
 since the runtime discarded agent-brain rows during retrieval.
+
+v3: this module still owns the CHEAP GATE and the extraction call — a regex
+sweep on every turn, a model call only on turns that look like a correction —
+and hands the result to `memory_curator.instruct_file(LEARNED_SLUG, …)`. It
+no longer writes rows, chooses categories, or talks to the dedup service:
+the curator is the one writer, and a second one with its own idea of the
+rules is exactly what v3 exists to remove.
 
 Scope is deliberately narrow. The agent's IDENTITY (its name, personality,
 voice) is owned by SoulConfig and is NOT memory — an earlier `agent_soul`
@@ -28,14 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.memory_taxonomy import (
-    AgentCategory,
-    BrainType,
-    build_agent_category_prompt_block,
-    normalize_category,
-)
-from app.schemas import MemoryCreate, MemoryLevel, MemoryType
-
+from app.memory_files import LEARNED_SLUG
 from app.services.memory_log import describe_memory
 
 logger = logging.getLogger(__name__)
@@ -97,9 +99,6 @@ USER MESSAGE:
 ASSISTANT RESPONSE (what the user was reacting to):
 {assistant_response}
 
-## Categories
-{build_agent_category_prompt_block()}
-
 ## Rules
 - Write each note as an instruction to the assistant, in the second person:
   "Send reminders to the current chat, not Telegram." / "Keep answers short unless asked."
@@ -115,12 +114,7 @@ ASSISTANT RESPONSE (what the user was reacting to):
 Return ONLY valid JSON:
 {{
   "notes": [
-    {{
-      "content": "Second-person instruction, one standalone sentence",
-      "category": "one of the category values above",
-      "importance": 0.8,
-      "confidence": 0.9
-    }}
+    {{"content": "Second-person instruction, one standalone sentence"}}
   ]
 }}
 
@@ -159,16 +153,7 @@ async def extract_agent_reflections(
         if _SELF_PRAISE.search(content):
             logger.info("[agent_reflection] dropped self-praise: %s", describe_memory(content))
             continue
-        try:
-            importance = float(item.get("importance", 0.7))
-        except (TypeError, ValueError):
-            importance = 0.7
-        notes.append({
-            "content": content,
-            "category": normalize_category(item.get("category"), brain_type=BrainType.AGENT.value),
-            "importance": min(1.0, max(0.0, importance)),
-            "confidence": float(item.get("confidence", 0.8) or 0.8),
-        })
+        notes.append({"content": content})
     return notes
 
 
@@ -178,60 +163,52 @@ async def store_agent_reflections(
     notes: List[Dict[str, Any]],
     api_key: Optional[str] = None,
 ) -> int:
-    """Persist reflection notes as agent-brain memories. Returns count stored.
+    """Write the notes into the `learned` FILE, through the curator.
 
-    Goes through MemoryDedupService so a repeated correction reinforces the
-    existing note instead of stacking duplicates. Dedup is brain-scoped, so
-    these can never be absorbed into a user-brain row.
+    v3: corrections are bullets in one agent-facing file, not agent-brain
+    rows. The call is scoped with `instruct_file(LEARNED_SLUG, …)` — the
+    same entry the Learned page's own input box uses — so a reflection can
+    never land in you/profile or invent a people/ file, and the writer's
+    merge rule applies: a correction the user has made before rewrites the
+    existing bullet instead of stacking a second one.
+
+    Returns the number of ops applied (0 is the ordinary answer).
     """
     if not notes:
         return 0
 
-    from app.services.memory_dedup_service import MemoryDedupService
+    from app.services import memory_curator
 
-    dedup = MemoryDedupService(db, api_key=api_key)
-    stored = 0
-    for note in notes:
-        try:
-            memory_data = MemoryCreate(
-                content=note["content"],
-                summary=None,
-                brain_type=BrainType.AGENT,
-                category=note["category"],
-                memory_type=MemoryType.PREFERENCE,
-                importance=note["importance"],
-                confidence=note["confidence"],
-                memory_level=MemoryLevel.SEMANTIC,
-                emotional_salience=0.4,
-                tags=["agent_brain", "reflection"],
-                metadata={"brain_type": BrainType.AGENT.value, "extracted_by": "reflection"},
-                source_type="agent_reflection",
-                # Behavioural rules are durable by design: the user said "always
-                # do X". They are superseded by a later correction, not by time.
-                expires_at=None,
-            )
-            memory, action = await dedup.smart_create_memory(
-                new_memory=memory_data, user_id=user_id
-            )
-            if memory is None:
-                # Refused by the write gate. Not an error, and not a store.
-                logger.info(
-                    "[agent_reflection] %s: %s", action,
-                    describe_memory(note["content"]),
-                )
-                continue
-            stored += 1
-            logger.info(
-                "[agent_reflection] %s",
-                describe_memory(note["content"], action=action,
-                                category=note["category"]),
-            )
-        except Exception as e:
-            logger.warning(
-                "[agent_reflection] store failed for %s: %s: %s",
-                describe_memory(note["content"]), type(e).__name__, str(e)[:200],
-            )
-    return stored
+    # ONE call for all of them. The notes come from a single turn about a
+    # single correction; three separate calls would let the second and third
+    # dedupe against a file the first had already changed, which is the same
+    # ordering hazard the ops engine's single-walk simulation exists to
+    # remove.
+    instruction = (
+        "The user just corrected you or told you how they want things done. "
+        "Record what you should do differently from now on:\n"
+        + "\n".join(f"- {n['content']}" for n in notes)
+    )
+    try:
+        result = await memory_curator.instruct_file(
+            db, user_id, LEARNED_SLUG, instruction, api_key=api_key,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "[agent_reflection] curator call failed: %s: %s",
+            type(e).__name__, str(e)[:200],
+        )
+        return 0
+
+    applied = int(result.get("applied", 0))
+    if applied:
+        logger.info(
+            "[agent_reflection] learned x%d: %s", applied,
+            describe_memory(notes[0]["content"]),
+        )
+    elif result.get("rejected"):
+        logger.info("[agent_reflection] declined: %s", result["rejected"][:2])
+    return applied
 
 
 async def _resolve_tenant_api_key(db: AsyncSession, user_id: str) -> Optional[str]:

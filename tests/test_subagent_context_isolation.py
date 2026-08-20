@@ -109,21 +109,23 @@ _NON_TRIVIAL_MSG = "research competitor pricing pages for acme corp and summariz
 async def test_subagent_profile_never_calls_retrieval_or_active_tasks(monkeypatch, tmp_path):
     from app.agent.prompt_profile import PromptProfile
     from app.db import async_session_maker
-    import app.services.active_task_service as at_svc
     from app.services.memory_service import MemoryService
 
-    calls = {"hybrid": 0, "active": 0}
+    calls = {"hybrid": 0, "active": 0, "brain": 0}
 
     async def _spy_hybrid(self, **kwargs):
         calls["hybrid"] += 1
         return []
 
-    async def _spy_active(db, user_id):
-        calls["active"] += 1
-        return []
+    import app.services.memory_file_ops as _mfo
+    _real_load_brain = _mfo.load_brain
+
+    async def _spy_brain(db, user_id, query="", **kwargs):
+        calls["brain"] += 1
+        return await _real_load_brain(db, user_id, query, **kwargs)
 
     monkeypatch.setattr(MemoryService, "hybrid_search", _spy_hybrid)
-    monkeypatch.setattr(at_svc, "get_active_tasks", _spy_active)
+    monkeypatch.setattr(_mfo, "load_brain", _spy_brain)
 
     user_id = await _make_user()
     runner = _make_runner(str(tmp_path))
@@ -138,38 +140,44 @@ async def test_subagent_profile_never_calls_retrieval_or_active_tasks(monkeypatc
             subagent_task_label="research task",
         )
 
-    assert calls["hybrid"] == 0, "SUBAGENT must not run hybrid_search — output is discarded"
-    assert calls["active"] == 0, "SUBAGENT must not load active_tasks — output is discarded"
-    assert runner._memory_health["retrieved"] == 0
-    assert runner._memory_health["active_tasks"] == 0
+    # v3: the memory block is ONE `load_brain` call, and the SUBAGENT
+    # branch skips it rather than computing-then-dropping. hybrid_search
+    # and active_tasks are no longer on this path at all — asserted as 0
+    # in BOTH profiles below, so a re-added retrieval fan-out is caught
+    # here rather than in production token spend.
+    assert calls["hybrid"] == 0, "SUBAGENT must not run hybrid_search"
+    assert calls["active"] == 0, "SUBAGENT must not load active_tasks"
+    assert runner._memory_health["files"] == 0
+    assert runner._memory_health["brain"] == ""
     assert "# User Brain" not in prompt
 
 
 @pytest.mark.asyncio
-async def test_full_profile_still_calls_retrieval_and_active_tasks(monkeypatch, tmp_path):
-    """Control: the short-circuit must not leak into FULL."""
+async def test_full_profile_still_loads_the_memory_block(monkeypatch, tmp_path):
+    """Control: the short-circuit must not leak into FULL.
+
+    v3 changes WHAT is loaded, not whether: the anti-vacuity control is now
+    that `load_brain` runs once for FULL and zero times for SUBAGENT — and
+    that neither profile revives the retrieval fan-out."""
     from app.agent.prompt_profile import PromptProfile
     from app.db import async_session_maker
-    import app.services.active_task_service as at_svc
     from app.services.memory_service import MemoryService
-    from app.services.user_portrait_service import UserPortraitService
 
-    calls = {"hybrid": 0, "active": 0}
+    calls = {"hybrid": 0, "active": 0, "brain": 0}
 
     async def _spy_hybrid(self, **kwargs):
         calls["hybrid"] += 1
         return []
 
-    async def _spy_active(db, user_id):
-        calls["active"] += 1
-        return []
+    import app.services.memory_file_ops as _mfo
+    _real_load_brain = _mfo.load_brain
 
-    async def _no_portrait(self, user_id):
-        return None
+    async def _spy_brain(db, user_id, query="", **kwargs):
+        calls["brain"] += 1
+        return await _real_load_brain(db, user_id, query, **kwargs)
 
     monkeypatch.setattr(MemoryService, "hybrid_search", _spy_hybrid)
-    monkeypatch.setattr(at_svc, "get_active_tasks", _spy_active)
-    monkeypatch.setattr(UserPortraitService, "get_or_build_portrait", _no_portrait)
+    monkeypatch.setattr(_mfo, "load_brain", _spy_brain)
 
     user_id = await _make_user()
     runner = _make_runner(str(tmp_path))
@@ -183,8 +191,9 @@ async def test_full_profile_still_calls_retrieval_and_active_tasks(monkeypatch, 
             prompt_profile=PromptProfile.FULL,
         )
 
-    assert calls["hybrid"] == 1, "FULL must still run memory retrieval"
-    assert calls["active"] == 1, "FULL must still load active_tasks"
+    assert calls["hybrid"] == 0, "v3 retires sentence retrieval from the turn"
+    assert calls["active"] == 0, "v3 retires the active_tasks block"
+    assert calls["brain"] == 1, "FULL must still load the user's memory files"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -220,22 +229,16 @@ def _quiet_prompt_build(monkeypatch):
     database has no pgvector — so without this the run dies on the
     embedding column rather than on the thing under test.
     """
-    import app.services.active_task_service as at_svc
     from app.services.memory_service import MemoryService
-    from app.services.user_portrait_service import UserPortraitService
 
     async def _no_hybrid(self, **kwargs):
         return []
 
-    async def _no_active(db, user_id):
-        return []
-
-    async def _no_portrait(self, user_id):
-        return None
-
+    # v3: `active_task_service` and `user_portrait_service` are deleted —
+    # neither the active-task block nor the portrait is on the prompt path,
+    # so there is nothing left to neutralise. `hybrid_search` is patched
+    # only because sqlite has no pgvector.
     monkeypatch.setattr(MemoryService, "hybrid_search", _no_hybrid)
-    monkeypatch.setattr(at_svc, "get_active_tasks", _no_active)
-    monkeypatch.setattr(UserPortraitService, "get_or_build_portrait", _no_portrait)
 
 
 async def _run_with_fake(monkeypatch, tmp_path, *, profile, session_id, user_id):

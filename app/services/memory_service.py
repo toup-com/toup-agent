@@ -2247,29 +2247,25 @@ class MemoryService:
         confidence: float = 0.7,
         properties: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Store an entity-entity relationship in the knowledge graph.
-        
-        Uses the dedicated entity_relationships table for efficient graph traversal.
-        Also creates/updates a Memory record for backward compatibility and
-        vector search (so the relationship is discoverable via semantic search too).
+        """Store an entity-entity relationship in the KNOWLEDGE GRAPH.
 
-        Ordering is load-bearing and is split into three phases:
+        Writes `entities` and the `entity_relationships` edge, and nothing
+        else. v3 removed the Memory MIRROR this function used to write
+        alongside the edge — see the note where it used to be for why (it
+        was the largest single junk producer measured, and rows are retired
+        from the product anyway).
 
-          1. PURE — render the sentence, screen it for never-store secrets,
-             and run the half of the mirror gate that needs no database. Not
-             one statement is issued on `self.db`.
-          2. EMBED — one embedding call, still with the session untouched.
-          3. SESSION — every read and write, using the vector from phase 2.
+        Consumers of what remains: the MCP `entity_search` / `graph_traverse`
+        tools and `app/api/graph.py`. Its one writer is the MCP
+        `entity_relationship_create` tool; the conversation path no longer
+        calls it, because the curator writes what the user SAID rather than
+        a triple a second extractor emitted.
 
-        Phase 2 sits where it does on purpose: this function used to embed the
-        identical string TWICE (once inside `find_similar_memories`, once
-        directly before the INSERT), synchronously, and both times after
-        `_upsert_entity` had already FLUSHED an `entities` INSERT. That held
-        row locks and a pooled connection across two network round-trips while
-        blocking the event loop — the same shape as #407/#408, where awaiting a
-        network call with an open transaction pinned a pgbouncer connection and
-        turned every chat turn into a PendingRollbackError 500.
+        Two phases now, both cheap: a PURE never-store screen (no statement
+        touches `self.db`), then pure SQL. There is no embedding call left on
+        this path, so the #407/#408 hazard — awaiting a provider round-trip
+        with an open transaction, pinning a pgbouncer connection — is gone by
+        construction rather than by ordering.
         """
         # ── Phase 1: pure. Nothing here touches `self.db`. ────────────────
         #
@@ -2283,23 +2279,12 @@ class MemoryService:
         relationship_content = humanize_relationship(
             source_name, relationship, target_name
         )
-        # Two older phrasings of the same edge, kept ONLY so the forgotten
-        # check below still matches rows written before each format change:
-        # the third-person prose era ("USER lives in Toronto") and the raw
-        # predicate era ("USER lives_in Toronto" with underscores spaced).
-        third_person_content = humanize_relationship(
-            source_name, relationship, target_name, second_person=False
-        )
-        legacy_content = f"{source_name} {relationship.replace('_', ' ')} {target_name}"
-
         # ── Never-store backstop ─────────────────────────────────────────
         #
-        # This was the ONE Memory INSERT in the codebase with no content
-        # screen at all. Every other write path runs `memory_gate_reason` or
-        # the `create_memory` storage backstop; this one was guarded only by
-        # `relationship_gate_reason`, which judges the SHAPE of a triple
-        # (tautology, scaffolding, world knowledge) and has no opinion about
-        # its VALUES. `("USER", "has_api_key", "sk-…")` is a perfectly
+        # The graph write has no content screen of its own:
+        # `relationship_gate_reason` judged the SHAPE of a triple (tautology,
+        # scaffolding, world knowledge) and had no opinion about its VALUES —
+        # and it retired with the mirror it gated. `("USER", "has_api_key", "sk-…")` is a perfectly
         # well-shaped, user-endpointed edge, so it sailed through — and
         # `entity_relationship_create` is a model-callable MCP tool, so the
         # payload is not even hypothetical.
@@ -2315,10 +2300,10 @@ class MemoryService:
         #
         # Detection lives in memory_gate and is not duplicated here.
         #
-        # Unlike the mirror gate below, this refusal aborts the WHOLE write,
-        # graph edge included. A secret must not be reachable through the
-        # entity graph either: the names are stored verbatim in `entities.name`
-        # and rendered back into `entity_relationships.relationship_label`.
+        # This refusal aborts the WHOLE write. A secret must not be reachable
+        # through the entity graph: the names are stored verbatim in
+        # `entities.name` and rendered back into
+        # `entity_relationships.relationship_label`.
         for _candidate in (
             relationship_content,
             f"{source_name} {relationship} {target_name}",
@@ -2331,63 +2316,17 @@ class MemoryService:
                 )
                 return
 
-        from app.services.memory_gate import relationship_gate_reason
-
-        # ── Alias-independent half of the mirror gate ────────────────────
+        # ── Phase 2 is GONE with the mirror ──────────────────────────────
         #
-        # Called with no aliases, `relationship_gate_reason` runs only the
-        # rules that need no identity — scaffolding, tautology/degenerate,
-        # agent-talking-about-itself, negated predicate — because the
-        # user-endpoint rule below them FAILS OPEN when identity is unknown
-        # (`_identity_is_known`). So a verdict returned here is one the
-        # alias-aware call in phase 3 would return too, whatever this tenant's
-        # display name turns out to be. It can only ever under-reject.
-        #
-        # Its only job is to spare the embedding for a payload already known
-        # to be junk. Rows rejected *later*, by the alias-aware
-        # `no_user_endpoint` rule, do pay for one embedding they never use —
-        # the price of getting the network call out of the transaction, and
-        # still a large net saving because every mirrored row now embeds once
-        # instead of twice.
-        early_gate_reason = relationship_gate_reason(
-            source_name,
-            relationship,
-            target_name,
-            user_aliases=None,
-            rendered=relationship_content,
-        )
-
-        # ── Phase 2: ONE embedding, session still untouched ──────────────
-        #
-        # No statement has been executed on `self.db` at this point, so there
-        # is no open transaction of this function's making, no flushed INSERT,
-        # and no row lock held while we wait on the provider.
-        #
-        # `embed_async` alone would NOT have been the fix: it is only a thread
-        # wrapper (`run_in_executor`), so it unblocks the event loop while
-        # leaving the round-trip exactly where it was. Position is the fix;
-        # `embed_async` is what keeps the loop free during it.
-        embedding: Optional[List[float]] = None
-        if not early_gate_reason:
-            # An embedding failure must never error the relationship write —
-            # same W1.5 mirror rule `create_memory` follows. Agent images ship
-            # without sentence-transformers, so a "local" provider raises
-            # ImportError, and the OpenAI path can fail transiently. Store the
-            # mirror unembedded instead; keyword and graph retrieval still find
-            # it. Before this reordering the raise happened after the graph
-            # edge was staged, so it also took the edge down with it.
-            try:
-                embedding = await self.embedding_service.embed_async(
-                    relationship_content, api_key=self.api_key
-                )
-            except Exception as e:
-                from app.services.embedding_service import record_embed_degrade
-                record_embed_degrade(e)
-                logger.warning(
-                    "[MEMORY] relationship embedding failed, mirroring without vector: %s",
-                    e,
-                )
-                embedding = None
+        # This used to embed `relationship_content` so the Memory mirror row
+        # could be found by vector search. There is no mirror row any more,
+        # so there is nothing to embed — and the phase existed at all only to
+        # keep that provider round-trip OUT of the transaction the entity
+        # upserts open (#407/#408: awaiting a network call with an open
+        # transaction pinned a pgbouncer connection and turned every chat turn
+        # into a PendingRollbackError 500). Deleting the write deletes the
+        # hazard: phase 3 below is now pure SQL from first statement to
+        # commit.
 
         # ── Phase 3: everything that touches the session ─────────────────
         # Upsert source and target entities
@@ -2428,180 +2367,31 @@ class MemoryService:
             )
             self.db.add(new_rel)
         
-        # Also maintain backward-compatible relationship memory for vector search
+        # ── The Memory MIRROR is GONE (v3 §1.1) ──────────────────────────
         #
-        # ── Write-time gate on the Memory MIRROR only ─────────────────────
-        # The graph edge above is already committed and is NOT gated: every
-        # traversal, entity map and graph query keeps full fidelity. What is
-        # gated is whether this edge also becomes a row the user reads on the
-        # Memory screen and that competes for space in the retrieval corpus.
+        # Everything above this line still runs: the entities, the
+        # `entity_relationships` edge, its humanized label, its mention
+        # count. Those have live consumers — the MCP `entity_search` and
+        # `graph_traverse` tools, and `memory_search`'s graph strategy.
         #
-        # 59 of the 73 junk memories on the founder's tenant came through
-        # here, because this path had no quality check of any kind — it
-        # rendered whatever triple the LLM emitted and INSERTed it.
+        # What used to follow was a second write: the same edge, rendered as
+        # a sentence, INSERTed as a `Memory` row so it would show up in the
+        # user's memory UI and compete in the retrieval corpus. It was the
+        # single largest junk producer measured — 59 of the 73 junk rows on
+        # the founder's tenant — because it bypassed MemoryDedupService
+        # entirely and had, at first, no quality check of any kind. The gate,
+        # the alias resolver, the `_endpoint_in_user_world` graph override,
+        # the 0.85 similarity probe, the same-predicate supersede and the
+        # forgotten-relationship guard were all built to make that ONE write
+        # survivable, and all retire with it.
         #
-        # The alias-independent rules already ran in phase 1; the alias lookup
-        # is a DB read, so its half of the verdict waits until here.
-        gate_reason = early_gate_reason or relationship_gate_reason(
-            source_name,
-            relationship,
-            target_name,
-            user_aliases=await self._user_aliases(user_id),
-            rendered=relationship_content,
-        )
-        # "no_user_endpoint" is the one verdict that needs the GRAPH to decide.
-        # The extraction prompt's actual rule is "the USER, *or someone/
-        # something in the USER's life*, must be one end of the edge" — the
-        # pure gate can only implement the first half, so on its own it was
-        # rejecting "Majid Tajik works at Microsoft" (the user's tutor),
-        # "Brother lives in Tehran", and even "Toup uses React Native" — the
-        # user's OWN product, which the prompt explicitly lists as valid
-        # (Project → Technology).
-        if gate_reason == "no_user_endpoint" and await self._endpoint_in_user_world(
-            user_id, source_name, target_name
-        ):
-            gate_reason = None
-
-        if gate_reason:
-            logger.info(
-                "[memory_gate] relationship not mirrored (%s): %s",
-                gate_reason, describe_memory(relationship_content),
-            )
-            return
-
-        # Reuses the phase-2 vector, so this is pure SQL: no provider call is
-        # made from inside the transaction the entity upserts just opened.
-        # When the embedding degraded to None the similarity probe is skipped
-        # rather than allowed to embed for itself — the same trade `create_memory`
-        # makes ("dedup needs the vector"). The exact-content forget guard below
-        # is unaffected, so a forgotten relationship still stays forgotten.
-        existing: List[Tuple[Memory, float]] = []
-        if embedding is not None:
-            existing = await self.find_similar_memories(
-                user_id=user_id,
-                content=relationship_content,
-                limit=1,
-                min_similarity=0.85,
-                brain_type="user",
-                embedding=embedding,
-            )
-
-        # A relationship the user has explicitly forgotten must stay forgotten.
-        # find_similar_memories excludes soft-deleted rows, so without this
-        # check the next mention of the same edge would resurrect it as a
-        # brand-new memory — and there is no restore route to undo that.
-        # Both phrasings are checked: see _relationship_was_forgotten.
-        if not existing and await self._relationship_was_forgotten(
-            user_id, relationship_content, third_person_content, legacy_content
-        ):
-            return
-
-        if existing:
-            mem, _ = existing[0]
-            mem.access_count += 1
-            mem.strength = min(1.0, mem.strength + 0.1)
-            mem.last_accessed_at = datetime.utcnow()
-            mem.confidence = max(mem.confidence, confidence)
-        else:
-            # Supersede the previous value of this same relationship.
-            #
-            # The mirror bypasses MemoryDedupService entirely — its only check
-            # is the 0.85 similarity probe above, which asks "have I seen this
-            # exact sentence?" and never "does this contradict something I
-            # already believe?". So when a user moved city, the brain ended up
-            # holding "USER lives in Toronto" AND "USER lives in Vancouver",
-            # both active, with nothing to tell the model which is current.
-            #
-            # The triple is stored structurally in metadata_json, so the stale
-            # row can be found exactly — same user, same source entity, same
-            # predicate, different target — with no LLM call and no guessing.
-            # Superseding (rather than deleting) matches the extracted-memory
-            # contradiction path: the old row keeps its id and its trail.
-            stale_rows = (
-                await self.db.execute(
-                    select(Memory).where(
-                        and_(
-                            Memory.user_id == user_id,
-                            Memory.source_type == "entity_extraction",
-                            Memory.is_active == True,  # noqa: E712
-                            Memory.is_deleted == False,  # noqa: E712
-                            Memory.metadata_json.isnot(None),
-                        )
-                    )
-                )
-            ).scalars().all()
-            for row in stale_rows:
-                try:
-                    meta = json.loads(row.metadata_json or "{}")
-                except (ValueError, TypeError):
-                    continue
-                if (
-                    meta.get("relationship_type") == relationship
-                    and (meta.get("source_entity") or "").strip().lower()
-                    == (source_name or "").strip().lower()
-                    and (meta.get("target_entity") or "").strip().lower()
-                    != (target_name or "").strip().lower()
-                ):
-                    row.is_active = False
-                    row.updated_at = datetime.utcnow()
-                    logger.info(
-                        "[MEMORY] relationship mirror superseded: %s",
-                        describe_memory(row.content),
-                    )
-
-            # (the vector was computed once, in phase 2, before this
-            # transaction existed — see the docstring)
-            rel_memory = Memory(
-                id=str(uuid.uuid4()),
-                user_id=user_id,
-                content=relationship_content,
-                # summary was `f"{source} → {rel} → {target}"`. The mobile card
-                # renders `summary || content`, so that machine format was what
-                # users actually saw ("Bunker → performed_by → Baltazar") even
-                # though the readable sentence sat on the same row. The triple
-                # is still fully preserved, structured, in metadata_json below.
-                summary=None,
-                brain_type="user",
-                # was: "people" if source_type == "person" else "knowledge" —
-                # a hardcoded binary that produced two of the three categories
-                # ever seen in production.
-                category=category_for_relationship(source_type, target_type),
-                memory_type="fact",
-                memory_level="episodic",
-                embedding_json=json.dumps(embedding) if embedding is not None else None,
-                embedding=embedding,
-                importance=0.6,
-                confidence=confidence,
-                strength=1.0,
-                emotional_salience=0.3,
-                source_type="entity_extraction",
-                tags_json=json.dumps([source_type, target_type, "relationship"]),
-                metadata_json=json.dumps({
-                    "relationship_type": relationship,
-                    "source_entity": source_name,
-                    "target_entity": target_name,
-                    "extracted_by": "llm",
-                }),
-            )
-            self.db.add(rel_memory)
-            await self.db.flush()
-            
-            # Link memory to both entities
-            source_link = EntityLink(
-                id=str(uuid.uuid4()),
-                memory_id=rel_memory.id,
-                entity_id=source_entity.id,
-                role="subject",
-            )
-            target_link = EntityLink(
-                id=str(uuid.uuid4()),
-                memory_id=rel_memory.id,
-                entity_id=target_entity.id,
-                role="object",
-            )
-            self.db.add(source_link)
-            self.db.add(target_link)
-        
+        # v3 does not need any of it. A relationship worth the user reading
+        # is a bullet the curator writes from what the user SAID, in a file
+        # about that person — not a triple the graph happened to emit. So the
+        # row write, its gate and its supersede logic are deleted together;
+        # rows never reach a client payload again, so a mirror could not be
+        # read even if it were written.
+        #
         await self.db.commit()
     
     async def _upsert_entity(
@@ -3363,27 +3153,11 @@ class MemoryService:
         # off the request path, on its own background session, and only for the
         # memories the finished response actually cited. See config.py
         # (memory_reinforce_on_retrieval / memory_reinforce_on_cite).
-        try:
-            from app.config import settings as _reinforce_settings
-            _reinforce_on_retrieval = bool(
-                getattr(_reinforce_settings, "memory_reinforce_on_retrieval", False)
-            )
-        except Exception:
-            _reinforce_on_retrieval = False
-
-        if _reinforce_on_retrieval:
-            try:
-                from app.services.decay_service import DecayService
-                decay_svc = DecayService(self.db)
-                for mem in scored_memories[:5]:
-                    await decay_svc.reinforce_memory(
-                        memory_id=mem["id"],
-                        user_id=user_id,
-                        access_context="retrieval",
-                        similarity_score=mem.get("similarity_score", 0.5),
-                    )
-            except Exception as e:
-                logger.warning(f"[HYBRID] Auto-reinforcement failed (non-fatal): {e}")
+        #
+        # v3: BOTH are gone. Reinforcement raised `strength`, and `strength`
+        # is retired with the row engine — `decay_service` no longer exists.
+        # The flags stay in config for one release so a stale env var does
+        # not fail settings validation; nothing reads them.
 
         return scored_memories
 
@@ -4058,6 +3832,7 @@ class MemoryService:
         categories: Optional[List[str]] = None,
         created_after: Optional[datetime] = None,
         created_before: Optional[datetime] = None,
+        source_types: Optional[List[str]] = None,
     ) -> List[dict]:
         """
         Search memories using a pre-computed embedding.
@@ -4072,6 +3847,10 @@ class MemoryService:
             categories: Optional list of categories to filter by
             created_after: Optional temporal filter — only memories created after this datetime
             created_before: Optional temporal filter — only memories created before this datetime
+            source_types: Optional list of source_type values. v3 §3.4: the
+                document/media leg of `memory_search` scopes to
+                ('document','media'), which is the ONLY remaining reader of
+                `memories` rows in the product. Nothing else may pass it.
         
         Returns:
             List of memory dicts with similarity scores
@@ -4099,6 +3878,8 @@ class MemoryService:
             conditions.append(Memory.created_at >= created_after)
         if created_before:
             conditions.append(Memory.created_at <= created_before)
+        if source_types:
+            conditions.append(Memory.source_type.in_(source_types))
         
         scored_memories = []
         
