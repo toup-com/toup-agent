@@ -2470,6 +2470,13 @@ _REPLY_LANG_NAMES = {
     "zh": "Mandarin Chinese",
     "ja": "Japanese",
     "ko": "Korean",
+    # English is here for the PIN only. It is never INFERRED — `script_evidence`
+    # answers `_LATIN` for Latin script and Latin alone cannot tell English from
+    # Spanish, which is why the inference side has no English code. But a user
+    # who sets Voice language to English has said something the inference side
+    # cannot: "this call is in English", and the directive has to be able to say
+    # it back.
+    "en": "English",
 }
 
 # ── Which language is this turn in, and who gets to say so ────────────────
@@ -4182,21 +4189,38 @@ async def realtime_voice_ws(
                                     instr2 = applied_ctx["instr"]
                                     if want:
                                         lang_name = _REPLY_LANG_NAMES[want]
-                                        # Phrased as a rule with the audio on
-                                        # top, never as a standing fact. The
-                                        # old wording ("The user is speaking
-                                        # Persian right now") outlived the turn
-                                        # that produced it and beat the model's
-                                        # own ears on every turn after.
-                                        instr2 += (
-                                            "\n\n# Current speech language\n"
-                                            f"Their last utterance was in {lang_name}, so "
-                                            f"{lang_name} is the expected reply language. "
-                                            "If the utterance you are answering RIGHT NOW is "
-                                            "in a different language, answer in that one "
-                                            "instead — what you actually heard always wins "
-                                            "over this note."
-                                        )
+                                        if _pinned_lang:
+                                            # A PIN does not defer. The user has
+                                            # set this in Settings; "match what
+                                            # you heard" is the behaviour they
+                                            # turned OFF, and a directive that
+                                            # still yields to the audio would
+                                            # make the setting a suggestion.
+                                            instr2 += (
+                                                "\n\n# Reply language\n"
+                                                f"This user has SET their voice language to "
+                                                f"{lang_name}. Reply in {lang_name} for the "
+                                                "whole call, even when they speak to you in "
+                                                "another language. This is their explicit "
+                                                "choice, not an inference."
+                                            )
+                                        else:
+                                            # Inferred: phrased as a rule with
+                                            # the audio on top, never as a
+                                            # standing fact. The old wording
+                                            # ("The user is speaking Persian
+                                            # right now") outlived the turn that
+                                            # produced it and beat the model's
+                                            # own ears on every turn after.
+                                            instr2 += (
+                                                "\n\n# Current speech language\n"
+                                                f"Their last utterance was in {lang_name}, so "
+                                                f"{lang_name} is the expected reply language. "
+                                                "If the utterance you are answering RIGHT NOW is "
+                                                "in a different language, answer in that one "
+                                                "instead — what you actually heard always wins "
+                                                "over this note."
+                                            )
                                     await openai_ws.send(json.dumps(_session_config(
                                         instr2, applied_ctx["tools"], applied_ctx["language"])))
                                     applied_ctx["directive"] = want

@@ -130,10 +130,51 @@ def test_a_corroborated_language_survives_the_model_slipping_once():
 
 def test_the_pin_outranks_every_inference():
     corroborated: set = set()
-    # Pinned English: no directive, whatever the transcript claims.
-    assert next_reply_directive(FA, "سلام خوبم ممنون از تو", corroborated, pinned="en") is None
+    # Pinned English: English, even on a turn whose transcript says Persian.
+    # It used to return None here, which left the STATIC "answer in the language
+    # they just spoke" rule in charge — i.e. pinning English still allowed a
+    # Farsi reply, which is the behaviour the setting exists to turn off.
+    assert next_reply_directive(FA, "سلام خوبم ممنون از تو", corroborated, pinned="en") == "en"
     # Pinned Farsi: the directive stands even on an English-looking turn.
     assert next_reply_directive(EN, "Here you go.", corroborated, pinned="fa") == "fa"
+    # A pin never corroborates — it is a statement, not evidence.
+    assert corroborated == set()
+
+
+def test_english_is_a_PIN_target_and_never_an_inference():
+    """`script_evidence` can answer `_LATIN`, never "en".
+
+    Latin script cannot tell English from Spanish, so the inference side has no
+    English code by design. The PIN side needs one, because a user who sets
+    Voice language to English has said something the inference cannot.
+    """
+    assert "en" in ws_realtime._REPLY_LANG_NAMES
+    assert script_evidence(EN) == _LATIN != "en"
+    # ...and nothing may infer it: an un-pinned Latin turn makes no claim.
+    assert next_reply_directive(EN, "Sure — here it is.", set()) is None
+
+
+def test_a_pinned_directive_does_not_defer_to_the_audio():
+    """The two wordings are different on purpose.
+
+    An INFERRED directive must yield to what the model actually heard — that is
+    the whole round-ten fix. A PINNED one must not: "match what you heard" is
+    precisely the behaviour the user switched off, and a directive that still
+    yields would make the setting a suggestion.
+    """
+    src = inspect.getsource(ws_realtime)
+    # Anchor on the directive's own heading, not on `if _pinned_lang:` — that
+    # string first appears on the CONNECT path, where there is no else branch.
+    built = src[src.index('lang_name = _REPLY_LANG_NAMES[want]'):]
+    built = built[: built.index("await openai_ws.send")]
+    pinned, inferred = built.split("# Current speech language", 1)
+    # Fragments that sit on ONE source line — "explicit choice" spans a string
+    # concatenation and never appears contiguously in the source.
+    assert "has SET their voice language" in pinned
+    assert "whole call" in pinned
+    assert "not an inference" in pinned
+    assert "always wins" not in pinned, "the pinned wording defers to the audio"
+    assert "always wins" in inferred, "the inferred wording stopped deferring"
 
 
 def test_a_farsi_then_english_then_farsi_session_tracks_every_switch():
