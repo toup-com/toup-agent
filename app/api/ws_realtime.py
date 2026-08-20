@@ -1150,7 +1150,10 @@ async def _vps_api(
 # This relays the agent's live SSE frames onto the phone wire.
 _INNER_MAX_ROWS    = 24
 _INNER_DETAIL_MAX  = 200
-_INNER_SOURCES_MAX = 5
+# 6, matching the agent's `_VS_SRC_MAX`. It was 5, which silently threw away
+# the agent's sixth source at the relay for no stated reason; the phone renders
+# them as cards now and the extra one is a card, not a chip on a strip.
+_INNER_SOURCES_MAX = 6
 _INNER_PREVIEW_MAX = 240
 _INNER_FRAME_BYTES = 2048
 
@@ -1165,6 +1168,68 @@ _STREAM_IDLE_S   = 30.0     # per-chunk read timeout — NOT the turn budget
 def _stream_ok(agent_url: str) -> bool:
     ts = _stream_skew.get(agent_url)
     return ts is None or (time.monotonic() - ts) > _STREAM_SKEW_TTL
+
+
+def _shrink_frame(frame: dict, limit: int) -> None:
+    """Bring an oversized `tool.end` under `limit` bytes IN PLACE, giving up
+    the least valuable thing first.
+
+    The old rule was one line — `frame.pop("sources", None)` — and it is a real
+    defect, not a conservative default: at the shipped caps a single source can
+    be 120 chars of title plus 300 of URL, so **six sources of ordinary search
+    results are ~2.6 KB against a 2 KB budget** and the phone gets NO
+    provenance at all. Not rarely: the URLs that blow the budget are search-hit
+    URLs with tracking query strings, which is most of them. The symptom is a
+    turn that visibly searched the web and shows nothing for it, and it is
+    indistinguishable from a parse miss.
+
+    So the budget is spent rather than abandoned, in the order that costs the
+    user least. The preview is first out because it is a derived one-line
+    summary of the very list being kept; the query string is next because it is
+    tracking bytes; a source is dropped only once nothing else can give, and
+    **never all of them** — one source is provenance, zero is none.
+    """
+    def size() -> int:
+        return len(json.dumps(frame))
+
+    # 1. The preview. When sources survive, the cards ARE the preview.
+    if size() > limit and frame.get("sources"):
+        frame["result_preview"] = ""
+    if size() <= limit:
+        return
+    srcs = frame.get("sources")
+    if not isinstance(srcs, list) or not srcs:
+        frame["result_preview"] = str(frame.get("result_preview", ""))[:200]
+        return
+
+    # 2. Query strings and fragments. The client shows a domain and a title and
+    #    opens the URL in a sheet; a tracking tail is bytes nobody reads.
+    for src in srcs:
+        u = src.get("url")
+        if isinstance(u, str) and ("?" in u or "#" in u):
+            src["url"] = u.split("#", 1)[0].split("?", 1)[0]
+    if size() <= limit:
+        return
+
+    # 3. Titles, in two steps. 80 chars is still a readable page title on a
+    #    two-line card; 48 is a recognisable fragment.
+    for cap in (80, 48):
+        for src in srcs:
+            t = src.get("title")
+            if isinstance(t, str) and len(t) > cap:
+                src["title"] = t[:cap].rstrip()
+        if size() <= limit:
+            return
+
+    # 4. Drop from the END — the agent orders results by rank, so the last one
+    #    is the least useful. Never below one.
+    while len(srcs) > 1 and size() > limit:
+        srcs.pop()
+    if size() > limit:
+        frame["result_preview"] = ""
+        for src in srcs:
+            src["title"] = str(src.get("title", ""))[:48]
+            src["url"] = str(src.get("url", ""))[:120]
 
 
 class _InnerToolRelay:
@@ -1193,8 +1258,7 @@ class _InnerToolRelay:
             return False
         try:
             if len(json.dumps(frame)) > _INNER_FRAME_BYTES:
-                frame.pop("sources", None)
-                frame["result_preview"] = str(frame.get("result_preview", ""))[:200]
+                _shrink_frame(frame, _INNER_FRAME_BYTES)
             await self._ws.send_json(frame)
             return True
         except Exception:

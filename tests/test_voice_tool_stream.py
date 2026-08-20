@@ -159,15 +159,62 @@ class TestFraming:
         assert out.startswith("data: ") and out.endswith("\n\n")
         assert out.count("\n\n") == 1
 
-    def test_oversized_frame_sheds_payload_but_stays_valid(self):
+    def test_oversized_frame_sheds_the_preview_and_KEEPS_the_sources(self):
+        """The whole point of the round-nine change.
+
+        This assertion used to read `"sources" not in parsed` — the frame shed
+        its entire provenance for one byte over budget. That is not a
+        conservative default, it is the defect: the preview is a one-line
+        summary DERIVED from the very list being thrown away, and the phone is
+        left showing a turn that searched the web and names nothing.
+        """
         import json
         frame = {"type": "tool.end", "call_id": "c", "name": "web_search",
                  "sources": [{"title": "t" * 500, "url": "u" * 500, "domain": "d"} for _ in range(6)],
                  "preview": "p" * 4000}
         out = _vs_sse(frame)
         parsed = json.loads(out[len("data: "):].strip())
-        assert "sources" not in parsed and "preview" not in parsed
         assert parsed["type"] == "tool.end"
+        assert "preview" not in parsed          # the derived summary goes first
+        assert parsed["sources"], "provenance must never be shed wholesale"
+        assert len(out) - len("data: \n\n") <= 4096
+
+    def test_realistic_six_sources_survive_intact(self):
+        """The case the old rule actually hit in production.
+
+        Six ordinary search hits — a ~110-char title and a ~180-char URL with
+        the tracking tail every engine adds — are ~2.6 KB. Under the old rule
+        the phone got NOTHING; the fix pays for them out of the preview and the
+        query strings, and every title survives.
+        """
+        import json
+        frame = {
+            "type": "tool.end", "call_id": "c", "name": "web_search",
+            "preview": "6 sources · a.com · b.com · c.com",
+            "sources": [
+                {"title": f"Best universities for NLP and LLM research — ranking {i} of the year",
+                 "url": f"https://rankings-{i}.example.com/best/nlp/professors"
+                        f"?utm_source=x&utm_medium=y&utm_campaign=z&ref={'q' * 80}",
+                 "domain": f"rankings-{i}.example.com"}
+                for i in range(6)
+            ],
+        }
+        parsed = json.loads(_vs_sse(frame)[len("data: "):].strip())
+        # At the AGENT's 4096-byte budget they fit untouched — which is the
+        # point: nothing is shed until something has to be. The 2048-byte
+        # RELAY budget is where the ladder actually runs; see
+        # TestRelayShrink below.
+        assert len(parsed["sources"]) == 6
+        assert all(s["title"] for s in parsed["sources"])
+        assert parsed["preview"]
+
+    def test_a_frame_with_no_sources_still_sheds(self):
+        """No provenance to protect — the old behaviour is still correct."""
+        import json
+        frame = {"type": "tool.end", "call_id": "c", "name": "web_fetch",
+                 "preview": "p" * 9000}
+        parsed = json.loads(_vs_sse(frame)[len("data: "):].strip())
+        assert "preview" not in parsed
 
     def test_done_frame_is_never_shed(self):
         import json
@@ -185,3 +232,95 @@ class TestClean:
 
     def test_empty_input_is_safe(self):
         assert _vs_clean("") == "" and _vs_clean(None) == ""
+
+
+# ── The relay's own copy of the ladder ───────────────────────────────────
+# `ws_realtime._shrink_frame` runs against a 2048-byte budget — a quarter of
+# what six realistic sources need — so it is the half that decides whether the
+# phone gets provenance at all. The caps are duplicated on purpose (neither
+# side trusts the other's), so the behaviour is tested on both sides too.
+class TestRelayShrink:
+    @staticmethod
+    def _frame(n, title_len=110, tail=80):
+        return {
+            "type": "tool_call.completed",
+            "call_id": "resp_ABCdefGHI0123456789:toolu_01ABCdefGHIjklMNO",
+            "parent_call_id": "resp_ABCdefGHI0123456789",
+            "name": "web_search", "ok": True, "elapsed_ms": 1240,
+            "result_preview": "6 sources · a.com · b.com · c.com",
+            "sources": [
+                {"title": ("Best universities for NLP and LLM research worldwide " * 4)[:title_len],
+                 "url": f"https://rankings-{i}.example.com/best/nlp/professors"
+                        f"?utm_source=x&utm_medium=y&ref={'q' * tail}",
+                 "domain": f"rankings-{i}.example.com"}
+                for i in range(n)
+            ],
+        }
+
+    def test_six_realistic_sources_all_survive(self):
+        """The production case. Before the fix this frame arrived with
+        `sources` popped — six searches' worth of provenance, gone, because the
+        budget was one number and the rule was one line."""
+        import json
+        from app.api.ws_realtime import _shrink_frame, _INNER_FRAME_BYTES
+        f = self._frame(6)
+        assert len(json.dumps(f)) > _INNER_FRAME_BYTES, "fixture must actually be over budget"
+        _shrink_frame(f, _INNER_FRAME_BYTES)
+        assert len(json.dumps(f)) <= _INNER_FRAME_BYTES
+        assert len(f["sources"]) == 6
+        assert all(s["title"] for s in f["sources"])
+        assert all("?" not in s["url"] for s in f["sources"])
+        assert f["result_preview"] == ""    # the derived summary paid for them
+
+    def test_never_sheds_the_last_source(self):
+        """Zero sources is a turn that searched the web and names nothing. One
+        is provenance. The ladder may reach one; it may not reach none."""
+        import json
+        from app.api.ws_realtime import _shrink_frame, _INNER_FRAME_BYTES
+        f = self._frame(6, title_len=118, tail=900)
+        _shrink_frame(f, _INNER_FRAME_BYTES)
+        assert len(f["sources"]) >= 1
+        assert f["sources"][0]["domain"]
+
+    def test_a_frame_with_no_sources_still_trims_its_preview(self):
+        import json
+        from app.api.ws_realtime import _shrink_frame, _INNER_FRAME_BYTES
+        f = {"type": "tool_call.completed", "call_id": "c", "name": "web_fetch",
+             "ok": True, "result_preview": "p" * 5000}
+        _shrink_frame(f, _INNER_FRAME_BYTES)
+        assert len(f["result_preview"]) <= 200
+
+    def test_relay_cap_matches_the_agent_cap(self):
+        """5 → 6. A relay cap below the producer's silently drops the agent's
+        last source with nothing to say about it."""
+        from app.api.ws_realtime import _INNER_SOURCES_MAX
+        from app.api.api_v1 import _VS_SRC_MAX
+        assert _INNER_SOURCES_MAX == _VS_SRC_MAX
+
+
+# ── The `domains` fallback ───────────────────────────────────────────────
+class TestDomainsFallback:
+    def test_bare_domains_become_sources_when_the_parse_finds_nothing(self):
+        """`agent_runner` puts `domains`/`urls` on the very event dict this
+        module receives and it was never read — so a search tier whose text
+        does not match `_vs_sources`' `N. Title / url` shape shipped no
+        provenance at all, with the metadata sitting unread in the payload."""
+        from app.api.api_v1 import _vs_sources_from_domains
+        out = _vs_sources_from_domains({
+            "domains": ["edurank.org", "aimultiple.com"],
+            "urls": ["https://edurank.org/cs/nlp/", "https://research.aimultiple.com/llm/"],
+        })
+        assert [s["domain"] for s in out] == ["edurank.org", "aimultiple.com"]
+        assert out[0]["url"] == "https://edurank.org/cs/nlp/"
+        # Titles are structurally absent — `extract_web_refs` is a URL regex.
+        assert all(s["title"] == "" for s in out)
+
+    def test_a_domain_with_no_matching_url_still_ships(self):
+        from app.api.api_v1 import _vs_sources_from_domains
+        out = _vs_sources_from_domains({"domains": ["substack.com"], "urls": []})
+        assert out and out[0]["domain"] == "substack.com" and out[0]["url"] == ""
+
+    def test_no_domains_is_empty_not_an_error(self):
+        from app.api.api_v1 import _vs_sources_from_domains
+        assert _vs_sources_from_domains({}) == []
+        assert _vs_sources_from_domains({"domains": None}) == []

@@ -632,6 +632,51 @@ def _vs_sources(name: str, tool_input: dict, result: str) -> list:
     return out
 
 
+def _vs_sources_from_domains(ev: dict) -> list:
+    """Bare-domain sources from the runner's own `domains`, as a FALLBACK.
+
+    `agent_runner` stamps an ordered, deduped host list on every web tool call
+    (`WEB_DOMAIN_TOOLS` / `extract_web_refs`) and puts it on the very
+    `on_tool_event` payload this module receives — and this module has never
+    read it, re-deriving provenance from scratch by re-parsing the rendered
+    text instead. That parse (`_vs_sources`) is anchored to the search
+    gateway's `N. Title / url / description` block, so it returns [] for any
+    tier that renders differently and for any result whose title line was
+    reflowed. When that happens the phone shows a turn that searched the web
+    and names nothing.
+
+    Titles are structurally absent here — `extract_web_refs` is a URL regex —
+    so this is strictly the weaker answer and is used only when the parse found
+    nothing at all. The client already renders a source with a domain and no
+    title as a one-line card."""
+    doms = ev.get("domains")
+    urls = ev.get("urls")
+    if not isinstance(doms, list) or not doms:
+        return []
+    by_host: dict = {}
+    if isinstance(urls, list):
+        for u in urls:
+            if not isinstance(u, str):
+                continue
+            try:
+                h = (urlparse(u).hostname or "").lower()
+            except Exception:  # noqa: BLE001
+                continue
+            if h.startswith("www."):
+                h = h[4:]
+            by_host.setdefault(h, u)
+    out: list = []
+    for d in doms[:_VS_SRC_MAX]:
+        if not isinstance(d, str) or not d:
+            continue
+        out.append({
+            "title": "",
+            "url": str(by_host.get(d, ""))[:_VS_SRC_URL_MAX],
+            "domain": d[:_VS_SRC_DOMAIN_MAX],
+        })
+    return out
+
+
 def _vs_args(name: str, tool_input: dict) -> dict:
     keys = _VS_ARG_ALLOW.get(name)
     if not keys or not isinstance(tool_input, dict):
@@ -649,11 +694,50 @@ def _vs_args(name: str, tool_input: dict) -> dict:
     return out
 
 
+def _vs_shrink(frame: dict) -> None:
+    """Bring an oversized frame under `_VS_FRAME_BYTES_MAX` IN PLACE, giving up
+    the least valuable thing first.
+
+    This used to be `frame.pop("sources"); frame.pop("preview")`, i.e. the
+    whole provenance for one byte over. At the caps here a source can be 120
+    chars of title plus 300 of URL, so six of them are ~2.6 KB, and a turn
+    whose results carry long tracking URLs shipped the phone nothing to show
+    for a search it visibly ran. Same ladder as the relay's `_shrink_frame`
+    (ws_realtime.py) — deliberately a second copy, because neither side trusts
+    the other's caps and a version skew in either direction must not be able to
+    flood the phone's audio socket."""
+    def size() -> int:
+        return len(json.dumps(frame, separators=(",", ":"), ensure_ascii=False))
+
+    if size() > _VS_FRAME_BYTES_MAX and frame.get("sources"):
+        frame.pop("preview", None)
+    if size() <= _VS_FRAME_BYTES_MAX:
+        return
+    srcs = frame.get("sources")
+    if not isinstance(srcs, list) or not srcs:
+        frame.pop("preview", None)
+        frame.pop("sources", None)
+        return
+    for src in srcs:
+        u = src.get("url")
+        if isinstance(u, str) and ("?" in u or "#" in u):
+            src["url"] = u.split("#", 1)[0].split("?", 1)[0]
+    for cap in (80, 48):
+        if size() <= _VS_FRAME_BYTES_MAX:
+            return
+        for src in srcs:
+            t = src.get("title")
+            if isinstance(t, str) and len(t) > cap:
+                src["title"] = t[:cap].rstrip()
+    # Never all of them: one source is provenance, zero is none.
+    while len(srcs) > 1 and size() > _VS_FRAME_BYTES_MAX:
+        srcs.pop()
+
+
 def _vs_sse(frame: dict) -> str:
     blob = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
     if len(blob) > _VS_FRAME_BYTES_MAX and frame.get("type") != "done":
-        frame.pop("sources", None)
-        frame.pop("preview", None)
+        _vs_shrink(frame)
         blob = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
     return f"data: {blob}\n\n"
 
@@ -734,7 +818,7 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                     # naive startswith("ERROR") test reports a failed search ok.
                     "ok": not body.strip().upper().startswith("ERROR"),
                     "elapsed_ms": int(ev.get("elapsed_ms") or 0),
-                    "sources": _vs_sources(name, inp, raw),
+                    "sources": _vs_sources(name, inp, raw) or _vs_sources_from_domains(ev),
                 }
                 if name in _VS_PREVIEW_ALLOW:
                     frame["preview"] = _vs_clean(body)[:_VS_PREVIEW_MAX]
