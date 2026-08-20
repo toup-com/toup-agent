@@ -165,14 +165,25 @@ def test_session_message_schema_accepts_media():
 
 
 def test_create_session_message_writes_metadata_json():
+    """Media must land in metadata_json under "media" — the exact field chat
+    writes and the only one the client renders a card from.
+
+    Asserted through the writer rather than by grepping the route for a
+    literal: round ten added a second key to the same blob (`tool_events`, so
+    a voice RUN reaches the thread), and the two used to evict each other
+    because media replaced the whole document. The property is the shape of
+    what gets stored, not the spelling of the line that stores it.
+    """
     import inspect
+    import json as _json
     from app.api import sessions
 
+    stored = _json.loads(sessions._build_metadata({"type": "youtube"}, None))
+    assert stored == {"media": {"type": "youtube"}}
+
+    # And the route must actually use that writer for the message it builds.
     src = inspect.getsource(sessions.create_session_message)
-    assert 'metadata_json=json.dumps({"media": media})' in src, (
-        "media must land in metadata_json — the exact field chat writes and the "
-        "only one the client renders a card from"
-    )
+    assert "metadata_json=_build_metadata(media, tool_events)" in src
 
 
 # ── Never guess an artist ───────────────────────────────────────────────

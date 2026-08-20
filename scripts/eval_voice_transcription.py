@@ -15,7 +15,17 @@ What it does:
   2. Runs each utterance through /v1/audio/transcriptions under each
      candidate config (model × prompt × language pin).
   3. Scores keyword recovery (did "Grok" survive as a recognizable token?)
-     and prints every transcript so the numbers can be eyeballed.
+     and SCRIPT DRIFT (did English audio come back in Persian script?), and
+     prints every transcript so the numbers can be eyeballed.
+
+Script drift is the round-ten failure and it is a different axis from keyword
+recovery: a config can recover every keyword and still be unusable, because
+the two consumers downstream read the SCRIPT, not the words. The relay's
+reply-language directive flips the whole session to Persian on one Persian
+transcript, and the app's `detectLang` latches its UI to Farsi on one Persian
+sample — so a single drifted English utterance makes the agent answer an
+English speaker in Farsi for the rest of the call. Drift on an `en` utterance
+is therefore scored as a hard failure, not a quality score.
 
 Usage:
     python3 scripts/eval_voice_transcription.py --env-file /path/to/.env
@@ -46,6 +56,8 @@ CACHE = Path(__file__).parent / ".voice-eval-cache"
 # Keywords are scored LOOSELY: any listed variant counts, so «گراک» (a fair
 # Persian rendering of Grok) scores where «پاک پات» does not. The point is
 # recoverability of the term, not romanization policy.
+# `lang` is the language the audio is ACTUALLY in — the ground truth script
+# drift is measured against. Unmarked entries are Farsi.
 UTTERANCES = [
     {
         "id": "fa-grok-bot",
@@ -75,7 +87,33 @@ UTTERANCES = [
         "id": "en-only",
         "text": "Tell me about Grok bot, the assistant from xAI.",
         "keywords": [["grok"], ["xai", "x ai", "x.ai"]],
+        "lang": "en",
         "note": "English control",
+    },
+    # ── The round-ten cases: English audio from a Persian-speaking account ──
+    # This is the reported bug's exact input. The account resolves to a `fa`
+    # hint from its own voice history (it is a Persian speaker), so every
+    # config below that biases toward Persian is applied to THIS audio.
+    {
+        "id": "en-search",
+        "text": "search me what is the strongest model for video generating?",
+        "keywords": [["strongest"], ["video"]],
+        "lang": "en",
+        "note": "the 2026-08-20 recording, verbatim — answered in Farsi",
+    },
+    {
+        "id": "en-short",
+        "text": "what time is it?",
+        "keywords": [["time"]],
+        "lang": "en",
+        "note": "short English — the case a per-utterance rule must still get right",
+    },
+    {
+        "id": "en-accented-names",
+        "text": "Play something by Ebi and then tell me the news.",
+        "keywords": [["ebi", "ebbi"], ["news"]],
+        "lang": "en",
+        "note": "English carrying a Persian proper noun — must NOT flip the sentence",
     },
 ]
 
@@ -87,16 +125,29 @@ PROMPT_FA = (
     f"اصطلاح‌های انگلیسی مانند {BIAS_TERMS}."
 )
 PROMPT_EN = f"A user talking to an AI assistant. May mention: {BIAS_TERMS}."
+# The round-ten candidate. PROMPT_FA asserts the audio IS colloquial Persian,
+# which is a true statement about the SPEAKER and a false one about half their
+# utterances — and the transcriber obeys the prompt over the audio. This one
+# describes the repertoire instead and forbids translation outright, in both
+# scripts so the model has both in context.
+PROMPT_BI = (
+    "A bilingual speaker talking to an AI assistant. They speak Persian "
+    "(Farsi) and English, sometimes mixing them in one sentence. Transcribe "
+    "each utterance in the language it was ACTUALLY spoken in — Persian "
+    "speech in Persian script, English speech in English. Never translate.\n"
+    "گویندهٔ دوزبانه است: فارسی محاوره‌ای و انگلیسی. هر جمله را دقیقاً به همان "
+    "زبانی بنویس که گفته شده؛ هرگز ترجمه نکن.\n"
+    f"May mention: {BIAS_TERMS}."
+)
 
 CONFIGS = [
     # (label, model, prompt, language)
     ("whisper-1 · pin=fa (V1 prod)", "whisper-1", None, "fa"),
-    ("whisper-1 · prompt · no pin", "whisper-1", PROMPT_FA, None),
     ("gpt-realtime-whisper · pin=fa (V2 prod)", "gpt-realtime-whisper", None, "fa"),
-    ("gpt-4o-mini-transcribe · prompt", "gpt-4o-mini-transcribe", PROMPT_FA, None),
     ("gpt-4o-transcribe · bare", "gpt-4o-transcribe", None, None),
-    ("gpt-4o-transcribe · prompt", "gpt-4o-transcribe", PROMPT_FA, None),
-    ("gpt-4o-transcribe · prompt · pin=fa", "gpt-4o-transcribe", PROMPT_FA, "fa"),
+    ("gpt-4o-transcribe · promptFA (R9 prod)", "gpt-4o-transcribe", PROMPT_FA, None),
+    ("gpt-4o-transcribe · promptBI (R10)", "gpt-4o-transcribe", PROMPT_BI, None),
+    ("gpt-4o-transcribe · promptFA · pin=fa", "gpt-4o-transcribe", PROMPT_FA, "fa"),
 ]
 
 
@@ -172,6 +223,27 @@ def score(transcript: str, keywords: list[list[str]]) -> tuple[int, int]:
     return hit, len(keywords)
 
 
+# Mirrors app.api.voice.detect_script_language's Arabic-script range, which is
+# what the relay and the app both actually test. Measured over LETTERS only,
+# so punctuation and digits cannot dilute a wholly-Persian sentence.
+_ARABIC = tuple(range(0x0600, 0x0700)) + tuple(range(0x0750, 0x0780)) + tuple(range(0xFB50, 0xFE00))
+_ARABIC_SET = set(_ARABIC)
+
+
+def persian_share(transcript: str) -> float:
+    """Share of the transcript's LETTERS that are Arabic-script.
+
+    This is the number both consumers key off: the relay flips the session's
+    reply language when it clears its threshold, and the app latches its whole
+    UI to Farsi on any of it at all. For English audio the correct value is 0.
+    """
+    letters = [c for c in transcript if c.isalpha()]
+    if not letters:
+        return 0.0
+    fa = sum(1 for c in letters if ord(c) in _ARABIC_SET)
+    return fa / len(letters)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--env-file", help="read OPENAI_API_KEY from this file")
@@ -184,10 +256,13 @@ def main() -> None:
     print(f"audio ready in {CACHE}\n")
 
     totals: dict[str, list[int]] = {}
+    drifts: dict[str, list[int]] = {}
     for label, model, prompt, language in CONFIGS:
         print(f"═══ {label} ═══")
         got = 0
         of = 0
+        drifted = 0
+        en_count = 0
         dead = False
         for u in UTTERANCES:
             wav = (CACHE / f"{u['id']}.wav").read_bytes()
@@ -199,16 +274,32 @@ def main() -> None:
             h, n = score(text, u["keywords"])
             got += h
             of += n
-            print(f"  {u['id']}: {h}/{n}  «{text.strip()}»")
+            # Drift is only meaningful where we know the audio's language.
+            mark = ""
+            if u.get("lang") == "en":
+                en_count += 1
+                share = persian_share(text)
+                if share > 0:
+                    drifted += 1
+                    mark = f"  ⚠ DRIFT fa={share:.0%}"
+            print(f"  {u['id']}: {h}/{n}  «{text.strip()}»{mark}")
         if not dead:
             totals[label] = [got, of]
-            print(f"  → keyword recovery {got}/{of}\n")
+            drifts[label] = [drifted, en_count]
+            print(f"  → keyword recovery {got}/{of} · English drifted to Persian "
+                  f"script {drifted}/{en_count}\n")
         else:
             print()
 
-    print("═══ SUMMARY (keyword recovery) ═══")
-    for label, (g, o) in sorted(totals.items(), key=lambda kv: -kv[1][0]):
-        print(f"  {g:2d}/{o}  {label}")
+    print("═══ SUMMARY ═══")
+    print("  drift  keywords  config")
+    # Sorted by drift FIRST. A config that drifts is disqualified whatever its
+    # keyword score: the downstream consumers read the script, not the words.
+    for label in sorted(totals, key=lambda k: (drifts[k][0], -totals[k][0])):
+        g, o = totals[label]
+        d, e = drifts[label]
+        flag = "  " if d == 0 else " ⚠"
+        print(f"{flag} {d}/{e}    {g:2d}/{o}     {label}")
 
 
 if __name__ == "__main__":

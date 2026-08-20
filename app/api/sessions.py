@@ -537,6 +537,46 @@ async def get_session_messages(
     ]
 
 
+# ── Persisted tool records off an untrusted body ──────────────────────────
+# This route is reached with the user's own credentials from the platform
+# relay, so the body is not hostile — but it is not the agent runner either,
+# and `metadata_json` is read back by every client. Keep only the keys
+# `day_chats._serialize_tool_events` and the clients actually read, bound the
+# list, and require the two fields that function requires — a record missing
+# them is dropped there anyway, so admitting it here only stores garbage.
+_TOOL_EVENT_KEYS = {
+    "tool", "started_at_ms", "completed_at_ms", "summary",
+    "step_index", "url", "domains", "urls", "sources", "ok",
+}
+_TOOL_EVENTS_MAX = 40
+
+
+def _clean_tool_events(events) -> Optional[list]:
+    if not isinstance(events, list) or not events:
+        return None
+    out = []
+    for e in events[:_TOOL_EVENTS_MAX]:
+        if not isinstance(e, dict) or "tool" not in e or "started_at_ms" not in e:
+            continue
+        out.append({k: v for k, v in e.items() if k in _TOOL_EVENT_KEYS})
+    return out or None
+
+
+def _build_metadata(media, tool_events) -> Optional[str]:
+    """The message's metadata_json, in AgentRunner._save_messages' shape.
+
+    One writer for both keys: they used to be mutually exclusive here (media
+    replaced the whole blob), so a voice turn that played a song AND used a
+    tool could only ever persist one of them.
+    """
+    meta = {}
+    if media:
+        meta["media"] = media
+    if tool_events:
+        meta["tool_events"] = tool_events
+    return json.dumps(meta) if meta else None
+
+
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
 async def create_session_message(
     session_id: str,
@@ -562,12 +602,14 @@ async def create_session_message(
     import uuid as _uuid
 
     media = None
+    tool_events = None
     if body is not None:
         role = body.role or role
         content = body.content or content
         model_used = body.model_used or model_used
         day_chat_id = body.day_chat_id or day_chat_id
         media = body.media or None
+        tool_events = _clean_tool_events(body.tool_events)
 
     # Verify session ownership
     session_query = select(Conversation).where(
@@ -622,8 +664,10 @@ async def create_session_message(
         channel=session.channel,
         # Same shape AgentRunner._save_messages writes, so the clients need no
         # new rendering path: a voice-started song gets the same Toup card a
-        # chat-started one does.
-        metadata_json=json.dumps({"media": media}) if media else None,
+        # chat-started one does, and a voice RUN gets the same steps, actions
+        # and sources a typed run does (`day_chats._serialize_tool_events`
+        # reads both through one function).
+        metadata_json=_build_metadata(media, tool_events),
     )
     db.add(msg)
 
@@ -653,6 +697,11 @@ async def create_session_message(
             _frame["day_chat_id"] = _day_chat_id
         if media:
             _frame["media"] = media
+        if tool_events:
+            # Live delivery carries the run too, or an open thread shows the
+            # voice turn as a bare bubble until the next resync and then
+            # silently grows a run card under the reader.
+            _frame["tool_events"] = tool_events
         import asyncio as _asyncio
         _asyncio.create_task(broadcast_to_user(current_user.id, _frame))
     except Exception:

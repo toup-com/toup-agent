@@ -746,6 +746,14 @@ class SessionMessageCreate(BaseModel):
     # song the agent actually started looked, on reopening the app, like it had
     # never happened. Body-only (a nested object can't ride the query shim).
     media: Optional[dict] = None
+    # What the turn's tools did, persisted into Message.metadata_json as
+    # {"tool_events": [...]} — the exact key AgentRunner._save_messages writes
+    # for a chat turn, so `day_chats._serialize_tool_events` reads a voice run
+    # and a typed run through one path and the clients need no second
+    # renderer. Without it a voice turn that searched nineteen pages landed in
+    # the thread as a bare sentence: no steps, no actions, no sources, nothing
+    # openable. Body-only (a list of objects can't ride the query shim).
+    tool_events: Optional[List[Dict[str, Any]]] = None
 
 
 class SessionResponse(BaseModel):

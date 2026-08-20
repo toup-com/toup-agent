@@ -1154,6 +1154,14 @@ _INNER_DETAIL_MAX  = 200
 # the agent's sixth source at the relay for no stated reason; the phone renders
 # them as cards now and the extra one is a card, not a chip on a strip.
 _INNER_SOURCES_MAX = 6
+
+# What a PERSISTED record may carry into the day chat. Separate from the wire
+# caps above: the frame budget exists because the phone's audio socket must not
+# be flooded mid-call, while these bound a row in the database that is read
+# once, on a thread load. Sources are capped at the same six the surface shows.
+_PERSIST_SUMMARY_MAX = 400
+_PERSIST_SOURCES_MAX = 6
+_PERSIST_TITLE_MAX = 160
 _INNER_PREVIEW_MAX = 240
 _INNER_FRAME_BYTES = 2048
 
@@ -1239,7 +1247,7 @@ class _InnerToolRelay:
     agent talking to an older platform can never flood the audio WS.
     """
 
-    def __init__(self, websocket, outer_call_id: str):
+    def __init__(self, websocket, outer_call_id: str, sink: Optional[list] = None):
         self._ws = websocket
         self._outer = outer_call_id
         self._open: dict = {}        # inner call_id → row call_id
@@ -1248,6 +1256,68 @@ class _InnerToolRelay:
         self._pending: Optional[tuple] = None
         self._rows = 0
         self.alive = True
+        # ── What the turn DID, for the chat thread it writes into ──────────
+        # The phone renders these frames live and then throws them away, so a
+        # voice run that read nineteen pages landed in the day chat as a bare
+        # sentence with a mic icon: no steps, no actions, no sources, nothing
+        # openable. A typed run in the same thread carries all of it, because
+        # agent_runner persists `tool_events` into the message's metadata.
+        # This is the same record, from the same frames, so the clients need
+        # no second rendering path — see `_save_voice_messages`.
+        #
+        # Keyed by ROW call_id so a completion updates the record its start
+        # opened, and ordered by insertion so the thread reads in call order.
+        self._sink = sink
+        self._rec: dict = {}
+
+    def _open_rec(self, cid: str, name: str) -> None:
+        if self._sink is None or cid in self._rec:
+            return
+        rec = {"tool": name, "started_at_ms": int(time.time() * 1000)}
+        self._rec[cid] = rec
+        self._sink.append(rec)
+
+    def _close_rec(self, cid: str, name: str, ok: bool, preview: str,
+                   srcs: list, elapsed_ms: int) -> None:
+        rec = self._rec.get(cid)
+        if rec is None:
+            return
+        if name:
+            rec["tool"] = name
+        rec["completed_at_ms"] = (
+            rec["started_at_ms"] + elapsed_ms if elapsed_ms
+            else int(time.time() * 1000)
+        )
+        if preview:
+            rec["summary"] = preview[:_PERSIST_SUMMARY_MAX]
+        if not ok:
+            rec["ok"] = False
+        if srcs:
+            # `domains` is what the clients' favicon resolver reads (round
+            # four) and `_serialize_tool_events` back-fills it for records
+            # that lack it — stamping it here means a voice row wears the
+            # same site marks a chat row does with no read-time work.
+            kept = srcs[:_PERSIST_SOURCES_MAX]
+            doms, urls = [], []
+            for s in kept:
+                d = str(s.get("domain") or "")
+                u = str(s.get("url") or "")
+                if d and d not in doms:
+                    doms.append(d)
+                if u and u not in urls:
+                    urls.append(u)
+            if doms:
+                rec["domains"] = doms
+            if urls:
+                rec["urls"] = urls
+            # The titles too, which `domains` alone cannot carry — this is
+            # what makes the persisted run's source list the same list the
+            # call showed, rather than a row of bare hostnames.
+            rec["sources"] = [
+                {k: str(s.get(k) or "")[:_PERSIST_TITLE_MAX]
+                 for k in ("title", "url", "domain") if s.get(k)}
+                for s in kept
+            ]
 
     def _cid(self, inner: str) -> str:
         # Namespaced so inner ids can never collide with OpenAI's outer ids.
@@ -1289,6 +1359,7 @@ class _InnerToolRelay:
             cid = self._cid(f"intent{self._rows}")
             self._pending = (name, cid)
             self._rows += 1
+            self._open_rec(cid, name)
             title, _ = _tool_activity(name, {})
             return await self._send({
                 "type": "tool_call.started",
@@ -1318,6 +1389,7 @@ class _InnerToolRelay:
                 self._rows += 1
                 cid = self._cid(inner)
             self._open[inner] = cid
+            self._open_rec(cid, name)
             return await self._send({
                 "type": "tool_call.started",
                 "call_id": cid,
@@ -1336,6 +1408,14 @@ class _InnerToolRelay:
                 doms = [str(s.get("domain") or "") for s in srcs if s.get("domain")]
                 if doms:
                     preview = f"{len(srcs)} sources · " + " · ".join(doms[:3])
+            # Recorded BEFORE the send, and unconditionally: `_send` gives up
+            # the moment the phone is gone (`self.alive`), and a call the user
+            # walked away from is exactly the one whose record has to survive
+            # in the thread.
+            self._close_rec(
+                cid, str(ev.get("name", ""))[:64], bool(ev.get("ok", True)),
+                preview, srcs, int(ev.get("elapsed_ms") or 0),
+            )
             return await self._send({
                 "type": "tool_call.completed",
                 "call_id": cid, "parent_call_id": self._outer,
@@ -1658,6 +1738,7 @@ def _message_payload(
     content: str,
     model: Optional[str] = None,
     media: Optional[dict] = None,
+    tool_events: Optional[list] = None,
 ):
     """Build (json_body, query_params) for POST /api/sessions/{id}/messages.
 
@@ -1675,6 +1756,15 @@ def _message_payload(
     body = {"role": role, "content": content}
     if model:
         body["model_used"] = model
+    if tool_events:
+        # Body-only for the same reason media is: a list of objects cannot ride
+        # the query shim. An agent old enough to only read query params has no
+        # handling for this either — it stores the text and drops the record,
+        # which is exactly today's behaviour rather than a regression.
+        body["tool_events"] = tool_events
+        if media:
+            body["media"] = media
+        return body, None
     if media:
         # Body-only from here: a nested object cannot ride the query shim, and
         # an agent old enough to only read query params has no media column
@@ -1694,6 +1784,7 @@ async def _save_voice_messages(
     assistant_text: str,
     model: str = "gpt-4o-realtime",
     media: Optional[dict] = None,
+    tool_events: Optional[list] = None,
 ) -> None:
     """Persist a user/assistant message pair to VPS via HTTP API.
 
@@ -1717,15 +1808,16 @@ async def _save_voice_messages(
     saved = 0
     lost = 0
 
-    for _role, _text, _model, _media in (
-        ("user", user_text, None, None),
-        # Media rides the ASSISTANT row, matching how a chat turn persists a
-        # play — the card belongs to the reply that started it.
-        ("assistant", assistant_text, model, media),
+    for _role, _text, _model, _media, _tools in (
+        ("user", user_text, None, None, None),
+        # Media and the tool record both ride the ASSISTANT row, matching how a
+        # chat turn persists them — the card and the run belong to the reply
+        # they produced.
+        ("assistant", assistant_text, model, media, tool_events),
     ):
         if not _text:
             continue
-        body, params = _message_payload(_role, _text, _model, _media)
+        body, params = _message_payload(_role, _text, _model, _media, _tools)
         result = await _vps_api(
             agent_url, agent_api_key, "POST",
             f"/api/sessions/{session_id}/messages",
@@ -2380,6 +2472,128 @@ _REPLY_LANG_NAMES = {
     "ko": "Korean",
 }
 
+# ── Which language is this turn in, and who gets to say so ────────────────
+# Round ten, and this is the P0 the round exists for. Reported symptom: the
+# user speaks ENGLISH and the agent answers in Farsi. Traced end to end:
+#
+#   1. `_detect_voice_language` reads the account's own voice history, sees
+#      Persian (true — they ARE a Persian speaker), and returns "fa".
+#   2. That makes the session's transcription prompt the Farsi one, which
+#      asserts the audio IS colloquial Persian.
+#   3. English audio under that prompt comes back rendered in Persian script.
+#      (The same failure the `language` pin produced outright — see the note
+#      on `transcription_prompt`; the prompt is a softer push in the same
+#      direction, not a different mechanism.)
+#   4. The reply-language reinforcement below read that transcript, found
+#      Persian script, and issued "The user is speaking Persian right now.
+#      Reply in Persian." — a STANDING instruction.
+#   5. The model, which had heard perfectly good English, obeyed the
+#      instruction over its own ears. The app's `detectLang` latched its whole
+#      UI to Farsi off the same corrupt transcript.
+#
+# Every step after (3) is this file's, and every one of them treated a
+# side-channel transcript as ground truth for a fact the realtime model knew
+# better. So the rule now:
+#
+#   THE DIRECTIVE IS SET ONLY WHEN BOTH HALVES OF A TURN AGREE.
+#
+# The user transcript comes from the transcriber and can be wrong about the
+# language. The assistant reply comes from the model that HEARD THE AUDIO. A
+# turn where the transcript says Persian and the model answered in English is
+# not evidence of a Persian speaker — it is the signature of exactly the
+# mis-transcription above, and it must not move the session.
+#
+# There is no latch and no carry-over: the directive is re-derived from each
+# turn and CLEARED when that turn does not support it. A prior turn's language
+# can never govern the current one, which is the property the bug violated.
+#
+# The tie-break for (transcript=fa, reply=en) — which is also what "the model
+# slipped and answered a Persian turn in English" looks like, the 2026-08-17
+# defect this directive was originally built for — is per-CALL corroboration:
+# a language earns the benefit of the doubt only once both halves have agreed
+# on it at least once in this call. A first turn can therefore never flip the
+# session on the transcriber's word alone, which is the reported bug, while a
+# call that has already established Persian keeps the reinforcement it needs.
+_LANG_DECISIVE_SHARE = 0.60
+_LANG_DECISIVE_CHARS = 8
+# Latin letters that make a turn decisively Latin-script. Low on purpose: the
+# old rule kept a stale Persian directive through any turn under EIGHT Latin
+# letters, so "next", "stop it" and "what time is it" all inherited it.
+_LANG_LATIN_MIN = 4
+# The sentinel for "written in the Latin alphabet". Not a language — Latin
+# script alone cannot tell English from Spanish, and it does not need to: the
+# static REPLY LANGUAGE rule already covers every Latin-script language, so
+# all this side has to do is refuse to claim a non-Latin one.
+_LATIN = "latin"
+
+
+def script_evidence(text: str) -> Optional[str]:
+    """What script this text is decisively written in, or None for "no claim".
+
+    Returns a `_REPLY_LANG_NAMES` code, `_LATIN`, or None. None is the common
+    and correct answer for short or mixed utterances — "no evidence" is a
+    third outcome here, not a synonym for English.
+    """
+    if not text:
+        return None
+    code = detect_script_language(
+        text, min_share=_LANG_DECISIVE_SHARE, min_chars=_LANG_DECISIVE_CHARS,
+    )
+    if code in _REPLY_LANG_NAMES:
+        return code
+    latin = sum(1 for c in text if c.isascii() and c.isalpha())
+    if latin >= _LANG_LATIN_MIN and not code:
+        return _LATIN
+    return None
+
+
+def next_reply_directive(
+    user_text: str,
+    reply_text: str,
+    corroborated: set,
+    pinned: Optional[str] = None,
+) -> Optional[str]:
+    """The reply-language directive for the NEXT turn — pure, so it is tested.
+
+    `corroborated` is the set of language codes both halves of some earlier
+    turn in THIS CALL have agreed on; this call mutates it. `pinned` is the
+    user's explicit choice and outranks all evidence.
+
+    Returns a `_REPLY_LANG_NAMES` code, or None for "no directive" (which
+    leaves the static turn-by-turn rule in charge — the correct state for
+    every Latin-script language, and the safe state whenever the evidence
+    disagrees with itself).
+    """
+    if pinned:
+        return pinned if pinned in _REPLY_LANG_NAMES else None
+
+    said = script_evidence(user_text)
+    heard = script_evidence(reply_text)
+
+    # Both halves agree on a non-Latin language: the strongest evidence there
+    # is, and the only thing that earns corroboration.
+    if said is not None and said == heard and said != _LATIN:
+        corroborated.add(said)
+        return said
+
+    # The transcript names a non-Latin language the model did not confirm.
+    # Read BEFORE the rule below, because the two cases are textually
+    # identical and only this set separates them: "the transcriber invented
+    # Persian for English audio" (round ten's bug) and "the model answered a
+    # Persian turn in English" (the 2026-08-17 defect the directive exists
+    # for) both look like said=fa, heard=latin. Corroboration is the whole
+    # tie-break — before this call has proven the language once, the safe
+    # reading is the first; after, it is the second.
+    if said in corroborated and said != _LATIN:
+        return said
+
+    # The model answered in Latin script and nothing has vouched for another
+    # language. It heard the audio; believe it over the transcriber.
+    if heard == _LATIN:
+        return None
+
+    return None
+
 
 # ── Transcription language hint ───────────────────────────────────────
 # Whisper re-detects the language of EVERY utterance independently, and on a
@@ -2400,6 +2614,10 @@ _REPLY_LANG_NAMES = {
 # User, AgentConfig or SoulConfig, and every non-UTC User.timezone in production
 # is America/Toronto — including the Persian speaker's — so timezone resolves
 # him to English, i.e. straight into the hallucination case above.
+# What the client may pin voice language to. "auto" is the default and is
+# deliberately absent — it is spelled by sending nothing, so "no pin" has one
+# representation rather than two.
+_VOICE_LANG_PINS = {"en", "fa"}
 _LANG_HINT_ENV = "VOICE_TRANSCRIPTION_LANGUAGE_HINT"
 # Days of history to scan, newest first. Only days the agent reports as having
 # voice traffic are fetched, so this is a ceiling, not a cost.
@@ -2697,26 +2915,49 @@ _TRANSCRIPTION_BIAS_TERMS = (
 )
 
 
-def transcription_prompt(language: Optional[str]) -> str:
+def transcription_prompt(language: Optional[str], pinned: bool = False) -> str:
     """The transcription side-channel's bias prompt.
 
-    Written in the SESSION's language: a Farsi prompt tells the model the
-    audio is colloquial Persian with English terms mixed in — which is what
-    code-switching is, and what a hard `language` pin cannot express (a pin
-    forces one language and came back with English utterances TRANSLATED into
-    Farsi in the eval). Keep the term list in sync with
-    scripts/eval_voice_transcription.py, which is the regression harness.
+    A hard `language` pin forces one language and came back with English
+    utterances TRANSLATED into Farsi (eval, en-only · pin=fa), so the session
+    language rides this prompt instead — it biases without forbidding.
+
+    But the round-nine wording asserted the audio *is* colloquial Persian,
+    which is a true statement about the SPEAKER and a false one about half
+    their utterances. This account types English and speaks both; the
+    assertion pushed English audio into Persian script, and everything
+    downstream reads the script (see the note above `script_evidence`). So an
+    INFERRED language describes the repertoire and forbids translation
+    outright, in both scripts so the model has both in context. A PINNED
+    language is the user's own statement about themselves and may be asserted.
+
+    Keep the term list in sync with scripts/eval_voice_transcription.py, the
+    regression harness — its `promptBI` config is this string, and it scores
+    script drift on English audio, which is the failure this wording exists to
+    prevent.
     """
     if language == "fa":
+        if pinned:
+            return (
+                "گفت‌وگوی کاربر با یک دستیار هوشمند. فارسی محاوره‌ای، همراه با "
+                f"نام‌ها و اصطلاح‌های انگلیسی مانند {_TRANSCRIPTION_BIAS_TERMS}."
+            )
         return (
-            "گفت‌وگوی کاربر با یک دستیار هوشمند. فارسی محاوره‌ای، همراه با "
-            f"نام‌ها و اصطلاح‌های انگلیسی مانند {_TRANSCRIPTION_BIAS_TERMS}."
+            "A bilingual speaker talking to an AI assistant. They speak "
+            "Persian (Farsi) and English, sometimes mixing them in one "
+            "sentence. Transcribe each utterance in the language it was "
+            "ACTUALLY spoken in — Persian speech in Persian script, English "
+            "speech in English. Never translate.\n"
+            "گویندهٔ دوزبانه است: فارسی محاوره‌ای و انگلیسی. هر جمله را دقیقاً "
+            "به همان زبانی بنویس که گفته شده؛ هرگز ترجمه نکن.\n"
+            f"May mention: {_TRANSCRIPTION_BIAS_TERMS}."
         )
     return f"A user talking to an AI assistant. May mention: {_TRANSCRIPTION_BIAS_TERMS}."
 
 
 def build_session_config(
     instr: str, tools: list, voice: str, language: Optional[str] = None,
+    pinned: bool = False,
 ) -> dict:
     """The session.update payload. Module-level (not a closure) so tests can
     pin the exact V1/V2 shapes without a socket."""
@@ -2742,7 +2983,7 @@ def build_session_config(
         # forbidding.
         transcription = {
             "model": settings.voice_realtime_transcription_model,
-            "prompt": transcription_prompt(language),
+            "prompt": transcription_prompt(language, pinned),
         }
     else:
         turn_detection = {
@@ -2958,6 +3199,7 @@ async def realtime_voice_ws(
     token: str = Query(None),
     session_id: Optional[str] = Query(None),
     onboarding: bool = Query(False),
+    lang: Optional[str] = Query(None),
 ):
     """WebSocket proxy to OpenAI Realtime API for ChatGPT-speed voice conversation."""
 
@@ -3349,7 +3591,9 @@ async def realtime_voice_ws(
 
     # ── 6. Configure session: cached-or-base config now, full context behind ──
     def _session_config(instr: str, tools: list, language: Optional[str] = None) -> dict:
-        return build_session_config(instr, tools, voice, language)
+        return build_session_config(
+            instr, tools, voice, language, pinned=_pinned_lang is not None,
+        )
 
     _cached = _instr_cache.get(user_id)
     _cache_hit = bool(
@@ -3365,7 +3609,26 @@ async def realtime_voice_ws(
     # Cache-only read: a first-ever connect goes out on auto-detect and the
     # hint lands with the full-context update below, rather than holding
     # `ready` behind history reads.
-    _first_language = _cached_voice_language(user_id) if _lang_hint_enabled() else None
+    # ── The user's own choice, and it outranks every inference ──────────
+    # On the URL rather than in the `config` frame because the first
+    # session.update is built on the CONNECT path, before the message loop
+    # reads a frame — a pin that arrived later would lose the race with the
+    # very thing it exists to override. "auto" and anything unrecognised mean
+    # "no pin", which is the default and today's behaviour exactly.
+    #
+    # Device-side rather than a DB column, deliberately: the comment on
+    # `_LANG_HINT_ENV` rules out inferring this from locale or timezone, but a
+    # SETTING is a statement, not an inference, and voice language is a
+    # property of how someone is using this phone right now.
+    _pinned_lang = lang if lang in _VOICE_LANG_PINS else None
+    _first_language = (
+        _pinned_lang if _pinned_lang and _pinned_lang != "en"
+        else None if _pinned_lang == "en"
+        else _cached_voice_language(user_id) if _lang_hint_enabled()
+        else None
+    )
+    if _pinned_lang:
+        logger.info("[REALTIME] Voice language PINNED to %s by the user", _pinned_lang)
 
     try:
         await openai_ws.send(json.dumps(
@@ -3424,6 +3687,14 @@ async def realtime_voice_ws(
         full_context_applied.set()
 
     applied_ctx: dict = {"instr": None, "tools": None, "language": None, "directive": None}
+    # Languages both halves of some turn in THIS CALL have agreed on. Scoped to
+    # the call on purpose: it is corroboration, not a profile, and a profile is
+    # exactly what must not decide the current utterance.
+    reply_lang_corroborated: set = set()
+    # What this turn's tools did, for the assistant row that will carry it into
+    # the day chat. Reset per turn beside `response_text_accum`, and drained by
+    # the persist below — see `_InnerToolRelay._open_rec`.
+    turn_tool_events: list = []
 
     async def _apply_full_context() -> None:
         # shield(): a timeout here abandons the wait, not the underlying
@@ -3875,6 +4146,7 @@ async def realtime_voice_ws(
                                 await _save_voice_messages(
                                     user_id, db_session_id, "", full_text,
                                     model=turn_model, media=pending_media,
+                                    tool_events=turn_tool_events or None,
                                 )
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save assistant message")
@@ -3885,6 +4157,59 @@ async def realtime_voice_ws(
                         # that follows it. Clearing on the first would drop the
                         # card before the row that should carry it is written.
                         pending_media = None
+                        # Cleared with the media and for the same reason: a
+                        # tool turn fires response.done TWICE (the function-call
+                        # response, then the spoken reply), and only the second
+                        # one persists. Clearing with the resets below would
+                        # drop the record before the row that carries it exists.
+                        turn_tool_events = []
+
+                        # ── Reply-language directive (see `next_reply_directive`) ──
+                        # HERE, not at the transcript, because the decision
+                        # needs both halves: what the transcriber wrote and
+                        # what the model — which heard the audio — answered in.
+                        # It governs the NEXT turn, which is what the old
+                        # placement achieved too (transcription is a
+                        # side-channel and loses the race with the in-flight
+                        # response), so nothing is decided later than before.
+                        if applied_ctx["instr"]:
+                            want = next_reply_directive(
+                                last_user_text, full_text,
+                                reply_lang_corroborated, _pinned_lang,
+                            )
+                            if want != applied_ctx["directive"]:
+                                try:
+                                    instr2 = applied_ctx["instr"]
+                                    if want:
+                                        lang_name = _REPLY_LANG_NAMES[want]
+                                        # Phrased as a rule with the audio on
+                                        # top, never as a standing fact. The
+                                        # old wording ("The user is speaking
+                                        # Persian right now") outlived the turn
+                                        # that produced it and beat the model's
+                                        # own ears on every turn after.
+                                        instr2 += (
+                                            "\n\n# Current speech language\n"
+                                            f"Their last utterance was in {lang_name}, so "
+                                            f"{lang_name} is the expected reply language. "
+                                            "If the utterance you are answering RIGHT NOW is "
+                                            "in a different language, answer in that one "
+                                            "instead — what you actually heard always wins "
+                                            "over this note."
+                                        )
+                                    await openai_ws.send(json.dumps(_session_config(
+                                        instr2, applied_ctx["tools"], applied_ctx["language"])))
+                                    applied_ctx["directive"] = want
+                                    logger.info(
+                                        "[REALTIME] Reply-language directive -> %s "
+                                        "(said=%s heard=%s pinned=%s)",
+                                        want or "cleared",
+                                        script_evidence(last_user_text),
+                                        script_evidence(full_text),
+                                        _pinned_lang or "-",
+                                    )
+                                except Exception:
+                                    logger.warning("[REALTIME] Reply-language session.update failed")
 
                         # Auto-extract memories from this conversation turn (background)
                         if last_user_text and full_text and settings.auto_extract_memories:
@@ -3931,35 +4256,11 @@ async def realtime_voice_ws(
                             except Exception as e:
                                 logger.exception("[REALTIME] Failed to save user transcript")
                         last_user_text = user_text
-                        # ── Reply-language reinforcement (see _REPLY_LANG_NAMES) ──
-                        # Usually lands AFTER the in-flight response started —
-                        # transcription is a side-channel and loses that race —
-                        # so this makes the NEXT turn deterministic rather than
-                        # rescuing this one. Fires only on a state CHANGE.
-                        if applied_ctx["instr"]:
-                            code = detect_script_language(user_text, min_share=0.5, min_chars=3)
-                            latin_letters = sum(1 for c in user_text if c.isascii() and c.isalpha())
-                            want = (
-                                code if code in _REPLY_LANG_NAMES
-                                else None if latin_letters >= 8
-                                else applied_ctx["directive"]
-                            )
-                            if want != applied_ctx["directive"]:
-                                try:
-                                    instr2 = applied_ctx["instr"]
-                                    if want:
-                                        lang_name = _REPLY_LANG_NAMES[want]
-                                        instr2 += (
-                                            "\n\n# Current speech language\n"
-                                            f"The user is speaking {lang_name} right now. "
-                                            f"Reply in {lang_name}."
-                                        )
-                                    await openai_ws.send(json.dumps(_session_config(
-                                        instr2, applied_ctx["tools"], applied_ctx["language"])))
-                                    applied_ctx["directive"] = want
-                                    logger.info("[REALTIME] Reply-language directive -> %s", want or "cleared")
-                                except Exception:
-                                    logger.warning("[REALTIME] Reply-language session.update failed")
+                        # The reply-language directive is NOT decided here any
+                        # more. It needs both halves of the turn — the
+                        # transcript and the reply the model produced from the
+                        # AUDIO — and only one of them exists at this point.
+                        # See `next_reply_directive`; it runs at response.done.
 
                 # ── VAD: user started speaking (barge-in) ──
                 elif etype == "input_audio_buffer.speech_started":
@@ -4036,7 +4337,7 @@ async def realtime_voice_ws(
                         # ── Think: delegate reasoning to best model ──
                         elif func_name == "think":
                             task = arguments.get("task", "")
-                            _relay = _InnerToolRelay(websocket, call_id)
+                            _relay = _InnerToolRelay(websocket, call_id, sink=turn_tool_events)
                             result, turn_model_used = await _think(
                                 user_id, task, db_session_id, relay=_relay)
                             turn_model = turn_model_used
