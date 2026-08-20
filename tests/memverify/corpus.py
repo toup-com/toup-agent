@@ -163,10 +163,24 @@ CAPTURE: List[Scenario] = [
             "band 7.5 overall.",
             "Booked for Aug 30, 2026 — noted, and 7.5 overall is the target.",
         )],
-        must_capture=[Capture(
-            "P07", ["ielts", "7.5"], section="areas",
-            note="an ongoing project, with the date resolved absolutely",
-        )],
+        # TWO markers, not one fused marker. `find_capture` requires all of a
+        # marker's tokens in ONE bullet, and the exam's date and the band
+        # target are two facts — §1.3's own rule says they belong in two
+        # bullets. The original ["ielts", "7.5"] therefore scored correct
+        # curation as MISSED on CI run 32429017640, which produced exactly
+        # "IELTS exam booked for Aug 30, 2026" and "targeting band 7.5
+        # overall" in areas/ielts. Both assertions the scenario name makes —
+        # an area file, and the date resolved absolutely — are kept.
+        must_capture=[
+            Capture(
+                "P07-date", ["aug 30, 2026"], section="areas",
+                note="the exam date, resolved absolutely from 'August 30th'",
+            ),
+            Capture(
+                "P07-band", ["7.5"], section="areas",
+                note="the target band, in the same area file",
+            ),
+        ],
     ),
     Scenario(
         id="P08-a-standing-routine-is-ONE-line",

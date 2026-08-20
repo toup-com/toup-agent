@@ -54,24 +54,36 @@ TOP_K_BODIES = 6
 
 OPS_CONTRACT = """Reply with ONLY valid JSON: {"ops": [...]}. Allowed ops:
 
-- {"op":"create_file","section":"people|topics|areas","slug":"people/majid-tajik","title":"Majid Tajik","description":"..."}
+- {"op":"create_file","section":"people|topics|areas","slug":"people/quill-marsden","title":"Quill Marsden","description":"..."}
 - {"op":"update_description","slug":"areas/ielts","description":"..."}
 - {"op":"add","slug":"areas/ielts","bullet":"...","change":"..."}
 - {"op":"rewrite","slug":"areas/ielts","match":"<the existing bullet, EXACTLY>","bullet":"...","change":"..."}
 - {"op":"remove","slug":"areas/ielts","match":"<the existing bullet, EXACTLY>","change":"..."}
-- {"op":"link","slug":"areas/ielts","links":["people/majid-tajik"]}
+- {"op":"link","slug":"areas/ielts","links":["people/quill-marsden"]}
 - {"op":"delete_file","slug":"topics/old-thing","change":"..."}
 
 BULLET VOICE — subjectless telegraphic third person, one complete fact per bullet:
   GOOD  "uses an Android phone"
-  GOOD  "IELTS exam booked for Aug 30, 2026"
-  GOOD  "took an IELTS course with tutor Majid Tajik, Dec 23 2025 - Jul 23 2026 (over Teams)"
   BAD   "You use an Android phone"        (the subject is implied, never restated)
   BAD   "The user prefers dark mode"      (never "the user")
   BAD   "wants to"                        (a truncation, not a fact)
+- A longer bullet still holds ONE fact: the thing itself, anyone in it by full
+  name, every date absolute, and the modality in parentheses — clauses joined
+  with a semicolon rather than split into fragments.
+
+EVERY SPECIFIC IN A BULLET COMES FROM THE CONVERSATION, AND NOWHERE ELSE.
+The slugs, titles and phrasings printed anywhere in this prompt show SHAPE.
+They are not evidence. Never copy a name, date, number, place, course or
+institution out of them into a bullet, a title or a description. If you did
+not read it in the conversation above, you may not write it down.
+
 - The file's subject is implied. In a people/ file the subject is THAT PERSON.
-- Name other people normally ("Majid Tajik"). Resolve relative time to absolute
-  dates ("Aug 19, 2026"). Preserve every name, number, date and time EXACTLY.
+- Name other people normally, in full. Resolve relative time to absolute dates
+  ("Aug 19, 2026"). Preserve every name, number, date and time EXACTLY.
+- WRITE IN THE LANGUAGE THE PERSON USED. A Persian conversation produces
+  Persian bullets, an Arabic one Arabic bullets. Their memory is read back to
+  them in their own words; translating it into English loses the person. The
+  voice rule above still holds — subjectless, telegraphic, one fact.
 - Record an unresolved contradiction explicitly ("calendar says X while the app
   says Y - discrepancy unresolved") rather than picking a side.
 - Never store internal ids, tool names, tool parameters, or UUIDs.
@@ -86,9 +98,27 @@ as the first separator, a semicolon before "read when", and a trailing period:
   "<what this is> — <scope>; read when <trigger>."
   e.g. "Your IELTS preparation — tutor, dates and band targets; read when IELTS or the exam comes up."
 
-`change` is one short sentence for the user's memory log: "Added Music: likes
-Googoosh.", "Removed the old job from Toup." It is REQUIRED on add, rewrite,
-remove and delete_file.
+`change` is one short sentence for the user's memory log, naming the file and
+what moved: "Added Cycling: rides to work on Tuesdays.", "Removed the old job
+from Work." It is REQUIRED on add, rewrite, remove and delete_file.
+
+WHERE A FACT GOES — pick the one most specific file, then commit to it:
+- you/profile — who they ARE: name, languages, where they live, health, family,
+  the devices and accounts they use, and standing arrangements as one line each.
+  Identity, not a catch-all. A subject with a life of its own leaves profile.
+- people/<person> — a fact about ANOTHER person, and everything about how they
+  relate to this one. Create the file on the first durable fact about them, and
+  put the facts about them IN it; an area file may reference them as [[slug]],
+  but it is not where they live.
+- areas/<subject> — an ongoing commitment with a state that moves: a study goal,
+  an exam, a job hunt, a health programme, a project.
+- topics/<subject> — a taste, interest or domain they return to: music, film,
+  food, a language, a technology.
+- Open the area or topic file as soon as its subject has ONE durable fact and
+  will plainly gather more. A taste in music is `topics/music`, not a line in
+  profile. Parking a real subject in profile because it is small today is the
+  single most common routing mistake — the generic catch-all files this system
+  replaced were built exactly one small fact at a time.
 
 RULES:
 - Prefer rewrite over add when a bullet already covers the fact. Merge, do not
@@ -97,6 +127,52 @@ RULES:
 - Never create a people/ file for the person whose memory this is.
 - If nothing should change, reply {"ops": []}.
 """
+
+#: Specifics that appear in this module's prompts as TEACHING EXHIBITS and
+#: nowhere in any real conversation. The first live model run (2026-08-20, CI
+#: run 32429017640) copied the tutor exhibit into a user's memory verbatim —
+#: the name AND the date range invented to illustrate the shape — because that
+#: conversation happened to mention a tutor teaching over Teams. An exhibit is
+#: the one kind of prompt text a model can mistake for evidence, so provenance
+#: is enforced structurally and not only asked for: `leaked_exhibit` refuses a
+#: bullet carrying one of these unless the turn itself contains it. Root cause
+#: #1 was the writer being unable to tell the user's words from machine text;
+#: this is that same defect arriving from the other side of the prompt.
+#:
+#: DATES ARE DELIBERATELY NOT IN THIS LIST, and must never be added. The
+#: contract REQUIRES the writer to resolve time absolutely ("August 30th 2026"
+#: -> "Aug 30, 2026"), so a correct bullet's date is normalised and by
+#: construction does not appear verbatim in the evidence. Listing one here
+#: refuses the very rewriting the contract demands — measured while building
+#: this guard: "Aug 30, 2026" tripped against a source reading "August 30th
+#: 2026". Only spellings a writer has no licence to change belong here.
+#: Every entry must be a spelling whose ONLY plausible origin is this prompt.
+#: A real name fails that test in both directions: the leak is real, but so is
+#: the false positive — a Persian speaker writing "گوگوش" would have the Latin
+#: bullet refused for having no source, and a silently dropped true fact is
+#: worse than the leak. So the exhibits themselves were made synthetic instead,
+#: and the guard covers those.
+CONTRACT_EXHIBIT_SPECIFICS: tuple[str, ...] = (
+    "quill marsden",
+    "quill-marsden",
+    "old-thing",
+    "rides to work on tuesdays",
+)
+
+
+def leaked_exhibit(text: str, *, source_text: str) -> Optional[str]:
+    """The exhibit specific this text carries and its source does not, if any.
+
+    `source_text` is everything the ops were legitimately derived from — the
+    turn, or the batch of rows a migration is re-curating. A specific present
+    there is the user's, however much it looks like an exhibit.
+    """
+    hay = (text or "").casefold()
+    src = (source_text or "").casefold()
+    for specific in CONTRACT_EXHIBIT_SPECIFICS:
+        if specific in hay and specific not in src:
+            return specific
+    return None
 
 
 def _identity_block(identity: UserIdentity) -> str:
@@ -272,6 +348,47 @@ async def propose_ops(llm_service, prompt: str) -> List[Dict]:
     return (await propose_plan(llm_service, prompt)).get("ops", [])
 
 
+#: The op fields that end up in front of the user — three stored, one in the
+#: memory log. A leaked exhibit in any of them is a fabricated fact.
+_LEAK_CHECKED_FIELDS = ("bullet", "title", "description", "change")
+
+
+def _refuse_leaks(raw_ops: Any, source_text: str) -> Tuple[Any, List[str]]:
+    """Drop ops that carry a prompt exhibit the evidence never mentioned.
+
+    `source_text` is the evidence, NOT the prompt: the prompt contains the
+    exhibits by construction, so checking against it would pass everything.
+    """
+    if not isinstance(raw_ops, list) or not source_text:
+        return raw_ops, []
+    kept: List[Any] = []
+    complaints: List[str] = []
+    for op in raw_ops:
+        if not isinstance(op, dict):
+            kept.append(op)
+            continue
+        hit = next(
+            (
+                leak for leak in (
+                    leaked_exhibit(str(op.get(f) or ""), source_text=source_text)
+                    for f in _LEAK_CHECKED_FIELDS
+                ) if leak
+            ),
+            None,
+        )
+        if hit:
+            complaints.append(
+                f"dropped a change carrying \"{hit}\" — that is an example from "
+                "the instructions, not something this conversation said"
+            )
+            logger.warning(
+                "[memory_curator] refused a prompt-exhibit leak: %r", hit,
+            )
+            continue
+        kept.append(op)
+    return kept, complaints
+
+
 async def _run_ops(
     db: AsyncSession,
     user_id: str,
@@ -280,14 +397,17 @@ async def _run_ops(
     api_key: Optional[str],
     identity: UserIdentity,
     scope_slug: Optional[str] = None,
+    source_text: str = "",
 ) -> Dict[str, Any]:
     """Propose → validate → (retry once with the complaints) → apply."""
     llm_service = _llm(api_key)
     raw_ops = await propose_ops(llm_service, prompt)
 
     existing = await ops._all_files(db, user_id)
+    raw_ops, leak_complaints = _refuse_leaks(raw_ops, source_text)
     scoped, out_of_scope = _scope(raw_ops, scope_slug)
     plan = ops.validate_ops(scoped, existing, identity=identity)
+    plan.complaints.extend(leak_complaints)
     if out_of_scope:
         # Say so. Dropping silently is how a user types two things, sees
         # "Saved 1 change", and never learns the other one went nowhere.
@@ -306,8 +426,13 @@ async def _run_ops(
               "them and reply again:\n- " + "\n- ".join(plan.complaints)
         )
         raw_ops = await propose_ops(llm_service, retry)
+        # The retry is a fresh proposal from the same prompt, so it can leak
+        # the same way the first one did. A guard the retry path walks past
+        # is not a guard.
+        raw_ops, retry_leaks = _refuse_leaks(raw_ops, source_text)
         scoped, _ = _scope(raw_ops, scope_slug)
         plan = ops.validate_ops(scoped, existing, identity=identity)
+        plan.complaints.extend(retry_leaks)
 
     result = await ops.apply_ops(db, user_id, plan)
     return {
@@ -392,6 +517,9 @@ async def instruct_file(
     )
     result = await _run_ops(
         db, user_id, prompt, api_key=api_key, identity=identity, scope_slug=slug,
+        # The evidence is what the user typed plus the body they are editing —
+        # a bullet already in the file is theirs, whatever it resembles.
+        source_text=f"{instruction}\n{target.body_md or ''}",
     )
     result["note"] = _note(result)
     logger.info(
@@ -422,7 +550,12 @@ async def instruct_global(
         bodies=_bodies_block(bodies),
         today=await _today_for(db, user_id),
     )
-    result = await _run_ops(db, user_id, prompt, api_key=api_key, identity=identity)
+    result = await _run_ops(
+        db, user_id, prompt, api_key=api_key, identity=identity,
+        source_text="\n".join(
+            [instruction] + [(r.body_md or "") for r in bodies]
+        ),
+    )
     result["note"] = _note(result)
     logger.info(
         "[curator] instruct global user=%s applied=%d rejected=%d files=%s",
@@ -680,7 +813,14 @@ async def curate_turn(
         bodies=_bodies_block(bodies),
         today=today,
     )
-    result = await _run_ops(db, user_id, prompt, api_key=api_key, identity=identity)
+    result = await _run_ops(
+        db, user_id, prompt, api_key=api_key, identity=identity,
+        # The turn, plus the bodies already on file: a fact the corpus already
+        # holds is the user's, and a rewrite must be free to restate it.
+        source_text="\n".join(
+            [text, assistant_text or ""] + [(r.body_md or "") for r in bodies]
+        ),
+    )
     result["skipped"] = None
     logger.info(
         "[curator] turn user=%s channel=%s ops=%d rejected=%d files=%s",
@@ -824,9 +964,15 @@ async def curate_migration_batch(
         today=today,
         extra=extra_instructions or "",
     )
+    # The evidence for a migration batch is the rows being re-curated plus the
+    # bodies already written by earlier batches — nothing else.
+    evidence = entries + "\n" + "\n".join(
+        (getattr(f, "body_md", "") or "") for f in existing
+    )
     reply = await propose_plan(llm_service, prompt)
-    raw_ops = reply.get("ops", [])
+    raw_ops, leak_complaints = _refuse_leaks(reply.get("ops", []), evidence)
     plan = ops.validate_ops(raw_ops, existing, identity=identity)
+    plan.complaints.extend(leak_complaints)
 
     if allow_retry and plan.complaints and not plan.accepted and raw_ops:
         # Same single retry the conversational paths take, with the
@@ -839,8 +985,9 @@ async def curate_migration_batch(
               "them and reply again:\n- " + "\n- ".join(plan.complaints)
         )
         reply = await propose_plan(llm_service, retry)
-        raw_ops = reply.get("ops", [])
+        raw_ops, retry_leaks = _refuse_leaks(reply.get("ops", []), evidence)
         plan = ops.validate_ops(raw_ops, existing, identity=identity)
+        plan.complaints.extend(retry_leaks)
 
     applied = 0
     changed_files: List[str] = []

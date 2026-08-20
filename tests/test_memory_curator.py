@@ -506,3 +506,91 @@ async def test_today_is_resolved_in_the_users_own_timezone(fake_llm):
     from zoneinfo import ZoneInfo
     local = _dt.datetime.now(ZoneInfo("Pacific/Kiritimati")).strftime("%A, %B %d, %Y")
     assert f"Today is {local}" in llm.prompts[0]
+
+
+# ── The prompt's own exhibits must never become the user's facts ──────
+#
+# CI run 32429017640 was the first live-model run of the v3 suite, and it
+# caught this: the contract carried
+#
+#   GOOD  "took an IELTS course with tutor Majid Tajik, Dec 23 2025 - Jul 23
+#          2026 (over Teams)"
+#
+# and scenario P06 — whose conversation says only "My IELTS tutor is Majid
+# Tajik. He teaches over Teams." — produced that sentence verbatim, invented
+# date range and all, in the user's memory. An exhibit is the one kind of
+# prompt text a model can mistake for evidence. The exhibits are synthetic
+# now; this is the structural half, so a future exhibit cannot do it again.
+
+LEAK_OPS = json.dumps({"ops": [
+    {"op": "create_file", "section": "people", "slug": "people/quill-marsden",
+     "title": "Quill Marsden",
+     "description": "A colleague — how they work together; read when they come up."},
+    {"op": "add", "slug": "you/profile",
+     "bullet": "took a course with tutor Quill Marsden (over Teams)",
+     "change": "Added Profile: a tutor."},
+]})
+
+
+def test_an_exhibit_absent_from_the_evidence_is_named():
+    assert curator.leaked_exhibit(
+        "took a course with tutor Quill Marsden",
+        source_text="I am studying for an exam",
+    ) == "quill marsden"
+
+
+def test_the_same_words_are_fine_when_the_person_said_them():
+    """The guard is about PROVENANCE, not about a blocklist of strings."""
+    assert curator.leaked_exhibit(
+        "tutor Quill Marsden teaches over Teams",
+        source_text="My tutor is Quill Marsden. He teaches over Teams.",
+    ) is None
+
+
+def test_a_resolved_date_is_never_treated_as_a_leak():
+    """A date can never be provenance-checked by substring, because the
+    contract REQUIRES it to be rewritten: "August 30th 2026" must become
+    "Aug 30, 2026", so a correct bullet's date is absent from its evidence by
+    construction. Guarding one refuses the rewriting the contract demands."""
+    assert curator.leaked_exhibit(
+        "exam booked for Aug 30, 2026",
+        source_text="My exam is booked for August 30th 2026",
+    ) is None
+
+
+async def test_a_leaked_exhibit_is_dropped_and_reported(fake_llm):
+    db, user_id = await _session()
+    fake_llm(LEAK_OPS)
+    result = await curator.curate_turn(
+        db, user_id,
+        user_text="I signed up for a pottery class that runs on Saturdays",
+        assistant_text="Noted.",
+    )
+    assert result["applied"] == 0, "a fabricated exhibit reached a file body"
+    assert any("Quill Marsden".casefold() in c.casefold() for c in result["rejected"]), (
+        f"the drop was silent: {result['rejected']}"
+    )
+    files = await ops._all_files(db, user_id)
+    bodies = "\n".join((f.body_md or "") for f in files)
+    assert "Quill Marsden" not in bodies
+    assert not any(f.slug == "people/quill-marsden" for f in files)
+
+
+async def test_the_retry_cannot_walk_the_guard_past(fake_llm):
+    """`_run_ops` re-proposes once when the whole plan is refused. That second
+    proposal comes from the SAME prompt, so it can leak the same way — a guard
+    the retry path steps around is not a guard."""
+    refused = json.dumps({"ops": [
+        {"op": "rewrite", "slug": "you/profile", "match": "nothing matches this",
+         "bullet": "keeps bees", "change": "Updated Profile."},
+    ]})
+    db, user_id = await _session()
+    fake_llm(refused, LEAK_OPS)
+    result = await curator.curate_turn(
+        db, user_id,
+        user_text="I signed up for a pottery class that runs on Saturdays",
+        assistant_text="Noted.",
+    )
+    files = await ops._all_files(db, user_id)
+    bodies = "\n".join((f.body_md or "") for f in files)
+    assert "Quill Marsden" not in bodies, "the retry re-introduced the exhibit"

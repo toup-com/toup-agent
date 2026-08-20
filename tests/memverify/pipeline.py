@@ -128,13 +128,27 @@ def find_capture(
     One BULLET, not one file: §1.3 says one complete self-contained fact per
     bullet, so a marker whose tokens are scattered across two bullets has
     not been captured as a fact — it has been captured as two fragments.
+
+    A CORRECTLY ROUTED hit wins over any other. Cross-referencing is the
+    reference behaviour, not a defect — the Ielts file naming the tutor and a
+    Majid Tajik file existing are both right — so scanning `bodies` in dict
+    order and reporting the first hit made a well-curated corpus read as
+    misrouted purely on slug alphabetisation. Measured on CI run 32429017640:
+    P06 was scored MISROUTED to `areas/ielts` while `people/majid-tajik`
+    existed in the very same run. Misroute means "the fact is NOT in the file
+    the label names", so the routed file has to be looked for before the
+    verdict is written.
     """
+    fallback: Optional[Tuple[str, str]] = None
     for slug, body in bodies.items():
         for bullet in bullets_of(body):
             n = norm(bullet)
             if all(norm(tok) in n for tok in marker.all_of):
-                return slug, bullet
-    return None
+                if capture_is_routed(marker, slug):
+                    return slug, bullet
+                if fallback is None:
+                    fallback = (slug, bullet)
+    return fallback
 
 
 def capture_is_routed(marker: Capture, slug: str) -> bool:
