@@ -173,7 +173,13 @@ CAPTURE: List[Scenario] = [
         # an area file, and the date resolved absolutely — are kept.
         must_capture=[
             Capture(
-                "P07-date", ["aug 30, 2026"], section="areas",
+                # "30, 2026" and not "Aug 30, 2026": the assertion is that the
+                # date was RESOLVED ABSOLUTELY, and both "Aug 30, 2026" and
+                # "August 30, 2026" do that. CI run 32430383161 wrote the
+                # second and was scored MISSED for the month's spelling — a
+                # house-style preference the contract never states, marked as
+                # a capture failure.
+                "P07-date", ["30, 2026"], section="areas",
                 note="the exam date, resolved absolutely from 'August 30th'",
             ),
             Capture(

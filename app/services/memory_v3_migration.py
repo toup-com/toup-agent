@@ -1151,9 +1151,28 @@ async def migrate_user(
             )
 
     # ── Prune the empty shells ───────────────────────────────────────
-    # A batch may create a file and then lose its only bullet to the lint.
-    # Left behind, that is a file the user opens to find nothing in, with a
-    # "Migrated from your earlier memory" line pointing at it.
+    # Two kinds, and the second was missed for a whole release.
+    #
+    # (1) A batch may create a file and then lose its only bullet to the lint.
+    #     Left behind, that is a file the user opens to find nothing in, with
+    #     a "Migrated from your earlier memory" line pointing at it.
+    #
+    # (2) THE ROUND-8 SHELLS. Round 8 stored files too, and the migration
+    #     moves their ROWS into the v3 file set without touching the old file
+    #     records — so `people/user`, `areas/work` ("Work & goals"),
+    #     `knowledge`, `preferences` and `people` survive their own contents,
+    #     empty, and keep rendering in the sectioned list. Verified on the
+    #     founder's own tenant after the first real run (2026-08-20 23:41):
+    #     Profile had migrated correctly and People still listed "User", which
+    #     is acceptance criterion #1 of the rebuild failing in production while
+    #     every batch reported success. The generic catch-alls this system
+    #     exists to retire cannot outlive the migration that empties them.
+    #
+    # Emptiness is the whole test, so this cannot take content with it, and
+    # SYSTEM_FILES are exempt because they are created empty ON PURPOSE and
+    # filled later by the curator and the rollover.
+    from app.db.models.memory import MemoryFile as _MF
+
     orphans = [s for s in run.created_ops if s not in run.files_filled]
     if orphans:
         run.notes.append(
@@ -1161,19 +1180,36 @@ async def migrate_user(
             + " — created by the writer but every bullet it proposed for them "
               "was refused"
         )
-        if dry_run:
-            virtuals = [f for f in virtuals if f.slug not in set(orphans)]
-        else:
-            from app.db.models.memory import MemoryFile as _MF
-
-            for row in (await db.execute(
-                select(_MF).where(
-                    _MF.user_id == user_id, _MF.slug.in_(orphans)
-                )
-            )).scalars().all():
-                if not (row.body_md or "").strip() and row.slug not in SYSTEM_FILES:
-                    await db.delete(row)
-            await db.commit()
+    if dry_run:
+        drop = {s for s in orphans}
+        drop |= {
+            f.slug for f in virtuals
+            if not (getattr(f, "body_md", "") or "").strip()
+            and f.slug not in SYSTEM_FILES
+        }
+        if drop - set(orphans):
+            run.notes.append(
+                "retired the empty "
+                + ", ".join(sorted(drop - set(orphans)))
+                + " — the earlier file kept its name after its contents moved"
+            )
+        virtuals = [f for f in virtuals if f.slug not in drop]
+    else:
+        retired: List[str] = []
+        for row in (await db.execute(
+            select(_MF).where(_MF.user_id == user_id)
+        )).scalars().all():
+            if (row.body_md or "").strip() or row.slug in SYSTEM_FILES:
+                continue
+            if row.slug not in orphans:
+                retired.append(row.slug)
+            await db.delete(row)
+        if retired:
+            run.notes.append(
+                "retired the empty " + ", ".join(sorted(retired))
+                + " — the earlier file kept its name after its contents moved"
+            )
+        await db.commit()
 
     # ── The change log, one line per file this actually filled ───────
     if not dry_run and run.files_filled:

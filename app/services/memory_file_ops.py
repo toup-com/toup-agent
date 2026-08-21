@@ -171,6 +171,44 @@ def _sort_key(row: MemoryFile) -> Tuple[int, int, str]:
     )
 
 
+async def prune_empty_files(db: AsyncSession, user_id: str) -> List[str]:
+    """Delete non-system files with no body. Returns the slugs removed.
+
+    Round 8 stored FILES as well as rows, and the v3 migration moves the rows
+    into the new file set without touching the old file records — so
+    `people/user`, `areas/work` ("Work & goals"), `knowledge`, `preferences`
+    and `people` survive their own contents and keep rendering, empty, in the
+    sectioned list. Found on the founder's tenant after the first real
+    migration (2026-08-20 23:41): Profile had migrated correctly and People
+    still listed "User", which is acceptance criterion #1 of the rebuild
+    failing in production while every batch reported success.
+
+    It lives in the MAINTENANCE slot rather than only at the end of the
+    migration because the migration is marker-guarded and every already-
+    migrated tenant has that marker set: a fix that only runs inside the
+    migration would never reach the tenants that most need it.
+
+    Emptiness is the entire test, so this cannot take content with it, and it
+    is idempotent — the ordinary result is an empty list. SYSTEM_FILES are
+    exempt: they are created empty ON PURPOSE, before the writer has ever run.
+    """
+    rows = (await db.execute(
+        select(MemoryFile).where(MemoryFile.user_id == user_id)
+    )).scalars().all()
+    removed: List[str] = []
+    for row in rows:
+        if row.slug in SYSTEM_FILES or (row.body_md or "").strip():
+            continue
+        removed.append(row.slug)
+        await db.delete(row)
+    if removed:
+        logger.info(
+            "[memory_files] retired %d empty file(s) for user=%s: %s",
+            len(removed), str(user_id)[:8], ", ".join(sorted(removed)),
+        )
+    return removed
+
+
 async def ensure_system_files(db: AsyncSession, user_id: str) -> List[MemoryFile]:
     """Create the three fixed files if they are missing. Agent-side only.
 
@@ -1061,6 +1099,19 @@ async def run_memory_maintenance() -> Dict[str, Any]:
         logger.error("[memory_files] v3 migration slot raised: %s", exc)
         migration = {"status": "failed", "error": str(exc)[:400]}
 
+    # Retire the shells the migration empties (see `prune_empty_files`). It
+    # runs UNCONDITIONALLY, not inside the migration, because the migration is
+    # marker-guarded and every tenant that has already run it would otherwise
+    # keep its empty `people/user` forever. Its own failure must not take the
+    # slot down either.
+    pruned: List[str] = []
+    try:
+        async with async_session_maker() as db:
+            pruned = await prune_empty_files(db, user_id)
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[memory_files] empty-file prune skipped: %s", exc)
+
     # Current context's day rollover (v3 §6). It has its own HOURLY cron —
     # this is the boot pass, so a container that came up after midnight ages
     # the file at T+180s instead of waiting for the next hour, and a fleet
@@ -1076,5 +1127,6 @@ async def run_memory_maintenance() -> Dict[str, Any]:
     return {
         "system_files_created": len(created),
         "memory_v3_migration": migration,
+        "empty_files_retired": pruned,
         "context_rollover": rollover,
     }

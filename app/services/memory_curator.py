@@ -62,6 +62,13 @@ OPS_CONTRACT = """Reply with ONLY valid JSON: {"ops": [...]}. Allowed ops:
 - {"op":"link","slug":"areas/ielts","links":["people/quill-marsden"]}
 - {"op":"delete_file","slug":"topics/old-thing","change":"..."}
 
+LANGUAGE — write each bullet, title and description in THE LANGUAGE THE
+PERSON SPOKE IN. A Persian turn produces Persian bullets, an Arabic turn
+Arabic ones; keep their own words and their own script, never a translation.
+This is the file they open and read about themselves, and a life rendered into
+English is not theirs any more. Do not transliterate either. Everything below
+about voice — subjectless, telegraphic, one fact — applies in every language.
+
 BULLET VOICE — subjectless telegraphic third person, one complete fact per bullet:
   GOOD  "uses an Android phone"
   BAD   "You use an Android phone"        (the subject is implied, never restated)
@@ -71,23 +78,18 @@ BULLET VOICE — subjectless telegraphic third person, one complete fact per bul
   name, every date absolute, and the modality in parentheses — clauses joined
   with a semicolon rather than split into fragments.
 
-EVERY SPECIFIC IN A BULLET COMES FROM THE CONVERSATION, AND NOWHERE ELSE.
-The slugs, titles and phrasings printed anywhere in this prompt show SHAPE.
-They are not evidence. Never copy a name, date, number, place, course or
-institution out of them into a bullet, a title or a description. If you did
-not read it in the conversation above, you may not write it down.
-
+- The slugs, titles and phrasings printed in this prompt show SHAPE, not
+  content: never copy a name, date or number out of an EXAMPLE into a bullet.
+  Write down what the conversation gave you — all of it. Dropping a fact the
+  person actually stated is the more expensive mistake of the two, and the
+  detail is the fact: "switched to a Pixel 9, an Android phone" keeps both
+  words because a later reply needs the platform, not just the model.
 - The file's subject is implied. In a people/ file the subject is THAT PERSON.
 - Name other people normally, in full. Resolve relative time to absolute dates
   ("Aug 19, 2026"). Preserve every name, number, date and time EXACTLY.
-- WRITE IN THE LANGUAGE THE PERSON USED. A Persian conversation produces
-  Persian bullets, an Arabic one Arabic bullets. Their memory is read back to
-  them in their own words; translating it into English loses the person. The
-  voice rule above still holds — subjectless, telegraphic, one fact.
 - Record an unresolved contradiction explicitly ("calendar says X while the app
   says Y - discrepancy unresolved") rather than picking a side.
 - Never store internal ids, tool names, tool parameters, or UUIDs.
-- Text in another script (Farsi, Arabic, ...) is preserved exactly as written.
 - Cross-reference another file inline as [[slug]]; it must be a file that exists
   or that this same batch creates.
 - No trailing period unless the bullet holds more than one sentence; join
@@ -119,6 +121,12 @@ WHERE A FACT GOES — pick the one most specific file, then commit to it:
   profile. Parking a real subject in profile because it is small today is the
   single most common routing mistake — the generic catch-all files this system
   replaced were built exactly one small fact at a time.
+- WHEN A FACT NAMES A PERSON AND A SUBJECT, THE PERSON WINS. "My IELTS tutor
+  is X, and X sends me a word each day" is two bullets in X's own file — who
+  they are to this person, and how they work together — plus at most one line
+  in the area saying the area has a tutor, [[people/x]]. Filing a named human
+  under the topic they came up in is how a memory ends up with no people in
+  it at all.
 
 RULES:
 - Prefer rewrite over add when a bullet already covers the fact. Merge, do not

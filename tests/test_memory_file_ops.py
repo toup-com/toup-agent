@@ -605,3 +605,79 @@ async def test_an_empty_file_is_not_advertised_in_the_index():
     brain = await ops.load_brain(db, user_id, "ielts")
     assert brain.index == []
     assert brain.file_count == 4
+
+
+# ── Retiring the shells the migration empties ─────────────────────────
+#
+# Round 8 stored FILES as well as rows. The v3 migration moves the rows into
+# the new file set and leaves the old file records alone, so the generic
+# catch-alls survive their own contents. Found in production on the founder's
+# tenant right after the first real run (2026-08-20 23:41): you/profile had
+# migrated correctly and the People section still listed an empty "User" —
+# acceptance criterion #1 failing while every batch reported success.
+
+
+async def _file(db, user_id, slug, section, title, body=""):
+    row = MemoryFile(
+        user_id=user_id, slug=slug, section=section, title=title,
+        description=GOOD_DESC, body_md=body,
+    )
+    db.add(row)
+    await db.commit()
+    return row
+
+
+async def test_the_empty_round_8_shells_are_retired():
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    await _file(db, user_id, "people/user", "people", "User")
+    await _file(db, user_id, "areas/work", "areas", "Work & goals")
+
+    removed = await ops.prune_empty_files(db, user_id)
+    await db.commit()
+
+    assert sorted(removed) == ["areas/work", "people/user"]
+    slugs = {f.slug for f in await ops._all_files(db, user_id)}
+    assert "people/user" not in slugs
+    assert "areas/work" not in slugs
+
+
+async def test_a_file_with_content_is_never_touched():
+    """Emptiness is the entire test — this must not be able to lose a fact."""
+    db, user_id = await _session()
+    await _file(db, user_id, "topics/music", "topics", "Music",
+                body="- listens to Persian pop")
+
+    assert await ops.prune_empty_files(db, user_id) == []
+    slugs = {f.slug for f in await ops._all_files(db, user_id)}
+    assert "topics/music" in slugs
+
+
+async def test_the_three_system_files_are_exempt_while_still_empty():
+    """They are created empty ON PURPOSE, before the writer has ever run; the
+    curator and the rollover fill them later. Pruning them would delete the
+    two files injected into every single reply."""
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+
+    assert await ops.prune_empty_files(db, user_id) == []
+    slugs = {f.slug for f in await ops._all_files(db, user_id)}
+    assert {PROFILE_SLUG, CURRENT_CONTEXT_SLUG, LEARNED_SLUG} <= slugs
+
+
+async def test_the_prune_is_idempotent():
+    db, user_id = await _session()
+    await _file(db, user_id, "people/user", "people", "User")
+
+    assert await ops.prune_empty_files(db, user_id) == ["people/user"]
+    await db.commit()
+    assert await ops.prune_empty_files(db, user_id) == []
+
+
+async def test_whitespace_is_not_content():
+    db, user_id = await _session()
+    await _file(db, user_id, "knowledge", "areas", "Knowledge", body="\n  \n")
+
+    assert await ops.prune_empty_files(db, user_id) == ["knowledge"]
