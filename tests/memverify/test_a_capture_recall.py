@@ -121,7 +121,17 @@ def test_farsi_is_stored_byte_exact(labeled_run):
     hit = res.captured.get("P02")
     assert hit, "\n" + res.describe()
     slug, bullet = hit
-    assert "می‌دوم" in bullet, bullet
+    # The STEM, not "می‌دوم". That spelling is first person ("I run") and the
+    # contract requires subjectless third person, which Persian carries in the
+    # verb ending — the correct bullet says "می‌دود". This assertion demanded
+    # the one form the house voice forbids, the same way the corpus marker
+    # did; CI 32436100481 produced
+    #   هر روز صبح ساعت ۷ می‌دود و بعدش صبحانه می‌خورد
+    # and was failed for obeying the voice rule. The stem survives any
+    # conjugation.
+    assert "می‌دو" in bullet, bullet
+    # Persian digits must not have been rewritten as ASCII on the way in.
+    assert "۷" in bullet, bullet
     # No bidi control characters, no HTML entities, no mojibake.
     assert "‏" not in bullet and "‫" not in bullet, repr(bullet)
     assert "&#" not in bullet, bullet
