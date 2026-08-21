@@ -378,3 +378,23 @@ def test_only_the_FIRST_dash_is_promoted():
 def test_something_that_is_not_a_description_is_still_refused():
     """The repair is punctuation only. It cannot invent the shape."""
     assert description_problem(normalize_description("a tutor")) is not None
+
+
+def test_an_em_dash_without_spaces_is_spaced():
+    assert normalize_description(
+        "Their IELTS tutor—how they teach; read when IELTS comes up."
+    ) == "Their IELTS tutor — how they teach; read when IELTS comes up."
+
+
+def test_a_capitalised_read_when_is_lowered():
+    assert description_problem(normalize_description(
+        "Their IELTS tutor — how they teach; Read when IELTS comes up."
+    )) is None
+
+
+def test_the_complaint_shows_what_was_actually_written():
+    """Twice in this rebuild the fix for this complaint had to be guessed at,
+    because the message named the shape it wanted and never the string it
+    got."""
+    problem = description_problem("a tutor")
+    assert problem and "'a tutor'" in problem, problem

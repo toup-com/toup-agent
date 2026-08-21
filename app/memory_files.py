@@ -204,11 +204,19 @@ def normalize_description(text: Optional[str]) -> str:
     t = (text or "").strip()
     if not t:
         return t
+    # An em dash written without its spaces ("tutor—how they teach"). The
+    # regex wants " — "; this is the same character, so it cannot change
+    # meaning. Done first so the hyphen rule below sees a consistent shape.
+    t = re.sub(r"\s*—\s*", " — ", t, count=1)
     # A spaced hyphen or en dash where the em dash belongs — first one only,
     # because later dashes are part of the prose.
-    t = re.sub(r"\s+[-–]\s+", " — ", t, count=1)
+    if " — " not in t:
+        t = re.sub(r"\s*[-–]\s*", " — ", t, count=1)
     # "…, read when …" — a comma where the semicolon belongs.
-    t = re.sub(r",\s+read when ", "; read when ", t, count=1)
+    t = re.sub(r",\s+[Rr]ead when ", "; read when ", t, count=1)
+    # "; Read when …" — the regex is case-sensitive and the trigger clause is
+    # lower case in every worked example.
+    t = re.sub(r";\s+Read when ", "; read when ", t, count=1)
     if not t.endswith("."):
         t += "."
     return t
@@ -224,9 +232,16 @@ def description_problem(text: Optional[str]) -> Optional[str]:
     if len(text) > DESCRIPTION_MAX:
         return f"description over {DESCRIPTION_MAX} chars"
     if not DESCRIPTION_RE.match(text):
+        # SHOW WHAT WAS WRITTEN. Twice in this rebuild the fix for this
+        # complaint had to be guessed at, because the message named the shape
+        # it wanted and never the string it got — and a punctuation refusal
+        # here costs the whole `create_file` plus every op that named the
+        # file. The text is the model's own proposed description, truncated,
+        # and it is the only thing that makes the next failure readable.
         return (
             "description must read '<what this is> — <scope>; read when "
-            "<trigger>.' (em dash, semicolon, trailing period)"
+            "<trigger>.' (em dash, semicolon, trailing period) — got: "
+            f"{text[:120]!r}"
         )
     return None
 
