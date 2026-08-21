@@ -217,8 +217,48 @@ playBtn.onclick = () => { reset(); setInterval(tick, 175); };
 
 ---
 
-## 9. Before you call `present_app`
+## 9. Two ways in, one vocabulary
 
+A control that silently does nothing throws nothing, so no check can see it.
+The way it happens is always the same: two producers feed one lookup with
+different words for the same thing.
+
+Measured on a shipped Snake. The D-pad did this:
+
+```js
+document.querySelectorAll('[data-dir]').forEach(b => b.onclick = () => turn(b.dataset.dir));
+```
+
+…passing `"up"`. The keyboard did this:
+
+```js
+addEventListener('keydown', e => { if (dirs[e.key]) turn(e.key) });
+```
+
+…passing `"ArrowUp"`. `dirs` was `{up, down, left, right}`, so `dirs["ArrowUp"]`
+was `undefined` and **every arrow key was dead** — under a footer the same file
+printed reading `ARROWS MOVE`. The pad worked, the swipe worked, the game
+looked finished, and half its documented controls did nothing.
+
+So: **normalise at the edge, once.** Every input path converts to the same
+vocabulary before it reaches the shared function, and the map is keyed by that
+vocabulary and nothing else.
+
+```js
+const KEYMAP = {ArrowUp:'up', ArrowDown:'down', ArrowLeft:'left', ArrowRight:'right',
+                w:'up', s:'down', a:'left', d:'right'};
+addEventListener('keydown', e => { const d = KEYMAP[e.key]; if (d) { e.preventDefault(); turn(d); } });
+```
+
+And **say only what you wired.** A hint line claiming a control the code does
+not implement is worse than no hint: it sends the user to look for a fault in
+themselves.
+
+---
+
+## 10. Before you call `present_app`
+
+- [ ] Every control the UI mentions actually works — keys AND taps AND swipe
 - [ ] Nothing that can be lost, missed or timed out is running at first paint
 - [ ] A game/timer/quiz opens on a start screen with an explicit start control
 - [ ] Opens at 360 px with no horizontal scroll
