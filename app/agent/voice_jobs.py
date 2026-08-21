@@ -584,8 +584,8 @@ class VoiceTurnJob:
         long since in, and the relay writes the spoken reply immediately
         after, so the card lands between them: exactly where chat puts it.
         """
-        import json as _json
         from sqlalchemy import select as _sel
+        from app.api.message_cards import job_marker_content
         from app.db.database import async_session_maker
         from app.db.message_helpers import resolve_day_chat_id_for_now
         from app.db.models import Message as _Msg
@@ -605,9 +605,16 @@ class VoiceTurnJob:
                     conversation_id=self._conversation_id,
                     day_chat_id=await resolve_day_chat_id_for_now(db, self._user_id),
                     role="job",
-                    content=_json.dumps({
-                        "job_id": self._job_id, "job_name": self._title,
-                    }),
+                    # The marker, through the ONE writer — never a local
+                    # json.dumps, whose default `ensure_ascii=True` is what
+                    # rendered this row's Persian title as a run of
+                    # backslash-u escapes on the day a reader printed the
+                    # marker instead of the card (Round 16). The readers
+                    # blank it now; the shared writer is the second lock on
+                    # the same door.
+                    content=job_marker_content(
+                        self._job_id, self._title, self._job_type(),
+                    ),
                 ))
                 await db.commit()
         except Exception:  # noqa: BLE001 — the card is not worth a raise

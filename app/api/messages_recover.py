@@ -37,6 +37,12 @@ from app.api.day_chats import (
     _serialize_admin_notice, _serialize_attachments, _serialize_media,
     _serialize_tool_events,
 )
+from app.api.message_cards import (
+    attach_run_to_cards,
+    job_card_fields,
+    load_build_jobs,
+    public_text,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/messages", tags=["messages"])
@@ -198,11 +204,12 @@ async def messages_since(
         db, [msg for msg, _ in rows]
     )
 
-    return JSONResponse(content=[
+    build_jobs = await load_build_jobs(db, [msg for msg, _ in rows])
+    return JSONResponse(content=attach_run_to_cards([
         {
             "id": msg.id,
             "role": msg.role,
-            "content": msg.content,
+            "content": public_text(msg.role, msg.content),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "channel": channel or "web",
             "conversation_id": msg.conversation_id,
@@ -212,6 +219,7 @@ async def messages_since(
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
+            **job_card_fields(msg, build_jobs),
         }
         for msg, channel in rows
-    ])
+    ]))

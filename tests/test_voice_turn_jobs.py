@@ -388,7 +388,18 @@ async def test_the_card_has_a_row_in_the_thread(monkeypatch, tmp_path):
     assert row is not None
     assert row.role == "job"
     assert row.conversation_id == out["resp"].session_id
-    assert json.loads(row.content) == {"job_id": job.id, "job_name": job.title}
+    # Round 16: the marker gained `job_type` (the clients' card
+    # discriminator) and is written by the ONE shared writer,
+    # `message_cards.job_marker_content`. Assert the fields, not the exact
+    # object — the marker is allowed to grow, and every reader blanks it
+    # before a client sees it either way.
+    _marker = json.loads(row.content)
+    assert _marker["job_id"] == job.id
+    assert _marker["job_name"] == job.title
+    assert set(_marker) <= {"job_id", "job_name", "job_type"}
+    # …and it is NOT ascii-escaped: a Persian title must stay Persian in
+    # the column, so the one reader that ever fails open fails legibly.
+    assert "\\u" not in row.content
 
 
 @pytest.mark.asyncio

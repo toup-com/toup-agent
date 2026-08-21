@@ -34,6 +34,12 @@ from app.schemas import (
     ChatMessageResponse, SessionMessageCreate
 )
 from app.api.auth import get_current_user
+from app.api.message_cards import (
+    attach_run_to_cards,
+    job_card_fields,
+    load_build_jobs,
+    public_text,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -310,30 +316,13 @@ async def get_session(
     if include_messages and session.messages:
         messages = session.messages[:message_limit]
         # Look up BuildJob status for job card messages
-        build_jobs = {}
-        job_ids = []
-        for m in messages:
-            if m.role == "job":
-                try:
-                    meta = json.loads(m.content) if m.content else {}
-                    jid = meta.get("job_id")
-                    if jid:
-                        job_ids.append(jid)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-        if job_ids:
-            from app.db.models import BuildJob
-            bj_result = await db.execute(
-                select(BuildJob).where(BuildJob.id.in_(job_ids))
-            )
-            for bj in bj_result.scalars().all():
-                build_jobs[bj.id] = bj
+        build_jobs = await load_build_jobs(db, messages)
         from app.agent.reply_quote import resolve_reply_targets_for_serialization
         reply_targets = await resolve_reply_targets_for_serialization(db, messages)
         _channels = {session.id: session.channel}
-        response_dict["messages"] = [
+        response_dict["messages"] = attach_run_to_cards([
             _message_to_response(m, build_jobs, reply_targets, _channels) for m in messages
-        ]
+        ])
     else:
         response_dict["messages"] = []
     
@@ -506,24 +495,7 @@ async def get_session_messages(
     messages = result.scalars().all()
 
     # Look up BuildJob status for any job card messages
-    build_jobs = {}
-    job_ids = []
-    for m in messages:
-        if m.role == "job":
-            try:
-                meta = json.loads(m.content) if m.content else {}
-                jid = meta.get("job_id")
-                if jid:
-                    job_ids.append(jid)
-            except (json.JSONDecodeError, TypeError):
-                pass
-    if job_ids:
-        from app.db.models import BuildJob
-        bj_result = await db.execute(
-            select(BuildJob).where(BuildJob.id.in_(job_ids))
-        )
-        for bj in bj_result.scalars().all():
-            build_jobs[bj.id] = bj
+    build_jobs = await load_build_jobs(db, messages)
 
     # Bulk-resolve reply targets so each row's reply_to card paints
     # immediately instead of flashing the "(message not in current view)"
@@ -531,10 +503,10 @@ async def get_session_messages(
     from app.agent.reply_quote import resolve_reply_targets_for_serialization
     reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
-    return [
+    return attach_run_to_cards([
         _message_to_response(m, build_jobs, reply_targets, conversation_channels)
         for m in messages
-    ]
+    ])
 
 
 # ── Persisted tool records off an untrusted body ──────────────────────────
@@ -694,7 +666,12 @@ async def create_session_message(
             "type": "message",
             "id": msg.id,
             "role": msg.role,
-            "content": msg.content,
+            # LIVE delivery gets the same guard the history readers get.
+            # This body arrives from the platform relay rather than the
+            # agent runner, and a frame is the one message surface that
+            # bypasses every serializer — leaving it raw would have kept
+            # exactly one door open on the way out (see message_cards.py).
+            "content": public_text(msg.role, msg.content),
             "created_at": (msg.created_at.isoformat() + "Z")
             if getattr(msg, "created_at", None) else datetime.utcnow().isoformat() + "Z",
             "channel": session.channel,
@@ -819,7 +796,10 @@ def _message_to_response(
     resp = dict(
         id=message.id,
         role=message.role,
-        content=message.content,
+        # Through the guard, not raw. See api/message_cards.py — a marker
+        # row must never reach a client as text on ANY of the four
+        # readers, and this one only ever blanked the role it knew about.
+        content=public_text(message.role, message.content),
         created_at=message.created_at,
         tokens_prompt=message.tokens_prompt,
         tokens_completion=message.tokens_completion,
@@ -851,43 +831,11 @@ def _message_to_response(
         reply_to=(reply_targets or {}).get(message.id),
     )
 
-    # Enrich job card messages with current BuildJob status
-    if message.role == "job":
-        try:
-            job_meta = json.loads(message.content) if message.content else {}
-        except (json.JSONDecodeError, TypeError):
-            job_meta = {}
-        job_id = job_meta.get("job_id", "")
-        resp["job_id"] = job_id
-        resp["job_name"] = job_meta.get("job_name", "App Build")
-        resp["content"] = ""  # Don't expose raw JSON to frontend
-        if build_jobs and job_id in build_jobs:
-            bj = build_jobs[job_id]
-            resp["job_status"] = bj.status
-            resp["job_app_id"] = bj.app_id
-            # Use title as name if stored name is generic
-            if resp["job_name"] == "App Build" and bj.title:
-                resp["job_name"] = bj.title.replace("Build: ", "")
-            try:
-                steps = json.loads(bj.steps_json) if bj.steps_json else []
-                # `done`, not `completed`. A STEP is pending / running / done /
-                # failed — `job_steps.finish_all_steps`, `_tool_create_job`,
-                # `apps.py` and the app-builder skill all write `done`, and
-                # nothing has ever written `completed` on a step; `completed`
-                # is the JOB's status, one level up. So this counted zero on
-                # every card ever loaded from history, and a finished job
-                # re-rendered as "0/3 steps" the moment the thread was
-                # reloaded. Both spellings are accepted so a hand-edited or
-                # future row cannot regress it the other way.
-                completed = sum(
-                    1 for s in steps if s.get("status") in ("done", "completed")
-                )
-                resp["job_total_steps"] = len(steps)
-                resp["job_completed_steps"] = completed
-            except (json.JSONDecodeError, TypeError):
-                pass
-        else:
-            resp["job_status"] = job_meta.get("job_status", "completed")
+    # Enrich job card messages with current BuildJob status. The projection
+    # itself lives in api/message_cards.py — this route used to be the only
+    # reader that had one, which is exactly why the other three leaked the
+    # marker (see that module's header).
+    resp.update(job_card_fields(message, build_jobs))
 
     return ChatMessageResponse(**resp)
 
@@ -965,28 +913,14 @@ async def get_messages_by_date(
     messages = messages_result.scalars().all()
 
     # Enrich with build job data
-    build_jobs = {}
-    job_ids = []
-    for m in messages:
-        if m.role == "job":
-            try:
-                _jdata = json.loads(m.content) if m.content else {}
-                _jid = _jdata.get("job_id")
-                if _jid:
-                    job_ids.append(_jid)
-            except (json.JSONDecodeError, TypeError):
-                pass
-    job_ids = [j for j in job_ids if j]
-    if job_ids:
-        from app.db.models import BuildJob
-        bj_result = await db.execute(select(BuildJob).where(BuildJob.id.in_(job_ids)))
-        for bj in bj_result.scalars().all():
-            build_jobs[bj.id] = bj
+    build_jobs = await load_build_jobs(db, messages)
 
     from app.agent.reply_quote import resolve_reply_targets_for_serialization
     reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
     return JSONResponse(content=[
-        _message_to_response(m, build_jobs, reply_targets, conversation_channels).model_dump(mode="json")
-        for m in messages
+        r.model_dump(mode="json") for r in attach_run_to_cards([
+            _message_to_response(m, build_jobs, reply_targets, conversation_channels)
+            for m in messages
+        ])
     ])

@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select
 
+from app.api.message_cards import job_marker_content as _job_marker
 from app.config import settings
 from app.services.credit_exhausted import (
     REASON_DAILY_CAP_EXCEEDED,
@@ -2730,10 +2731,11 @@ async def ws_chat(
                                             conversation_id=f"build-{_jid[:8]}",
                                             day_chat_id=_job_dc,
                                             role="job",
-                                            content=json.dumps({
-                                                "job_id": _jid,
-                                                "job_name": event.get("name", "App Build"),
-                                            }),
+                                            content=_job_marker(
+                                                _jid,
+                                                event.get("name", "App Build"),
+                                                event.get("job_type"),
+                                            ),
                                         ))
                                         await _jdb.commit()
                             except Exception as _pe:
@@ -4062,10 +4064,12 @@ async def ws_chat(
                                             conversation_id=response.session_id,
                                             day_chat_id=_job_dc,
                                             role="job",
-                                            content=json.dumps({
-                                                "job_id": _jc["job_id"],
-                                                "job_name": _jc["job_name"],
-                                            }),
+                                            # One marker writer for all three
+                                            # producers — see
+                                            # api/message_cards.py.
+                                            content=_job_marker(
+                                                _jc["job_id"], _jc["job_name"],
+                                            ),
                                         ))
                                 await _jdb.commit()
                                 logger.info(f"[WS] Persisted {len(_pending_job_cards)} job card(s) to session {response.session_id}")

@@ -21,6 +21,12 @@ from app.db import get_db
 from app.db.models import User, Conversation, Message
 from app.db.models.day_chat import DayChat
 from app.api.auth import get_current_user
+from app.api.message_cards import (
+    attach_run_to_cards,
+    job_card_fields,
+    load_build_jobs,
+    public_text,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
@@ -501,11 +507,12 @@ async def get_day_chat_messages(
         from app.agent.reply_quote import resolve_reply_targets_for_serialization
         reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
-        return JSONResponse(content=[
+        build_jobs = await load_build_jobs(db, messages)
+        return JSONResponse(content=attach_run_to_cards([
             {
                 "id": m.id,
                 "role": m.role,
-                "content": m.content,
+                "content": public_text(m.role, m.content),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "channel": channel_map.get(m.conversation_id, "web"),
                 "conversation_id": m.conversation_id,
@@ -515,9 +522,10 @@ async def get_day_chat_messages(
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
+                **job_card_fields(m, build_jobs),
             }
             for m in messages
-        ])
+        ]))
 
     # Day chat exists — load messages via day_chat_id (fast path).
     # Wrapped: if `day_chats` lives on platform DB (legacy artifact) but
@@ -568,11 +576,17 @@ async def get_day_chat_messages(
         db, [msg for msg, _ in rows]
     )
 
-    return JSONResponse(content=[
+    # THE primary history fetch — every client asks this route first and only
+    # falls back to /api/sessions when it fails. It carried no job-card
+    # projection at all, so a `role='job'` row arrived with its raw marker in
+    # `content` and no card fields beside it: the Round 16 P0. See
+    # api/message_cards.py.
+    build_jobs = await load_build_jobs(db, [msg for msg, _ in rows])
+    return JSONResponse(content=attach_run_to_cards([
         {
             "id": msg.id,
             "role": msg.role,
-            "content": msg.content,
+            "content": public_text(msg.role, msg.content),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "channel": channel or "web",
             "conversation_id": msg.conversation_id,
@@ -582,9 +596,10 @@ async def get_day_chat_messages(
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
+            **job_card_fields(msg, build_jobs),
         }
         for msg, channel in rows
-    ])
+    ]))
 
 
 @router.get("/app-conversation/{app_id}")

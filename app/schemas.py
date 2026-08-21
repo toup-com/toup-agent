@@ -854,7 +854,10 @@ class ChatMessageResponse(BaseModel):
     # row records one; the client applies its own default rather than the API
     # guessing (see agent/channel_util.py).
     channel: Optional[str] = None
-    # Job card fields (role == 'job')
+    # Job card fields (role == 'job'). Projected by
+    # api/message_cards.job_card_fields — one implementation for all four
+    # history readers, because three of them had none and returned the row's
+    # raw marker as the message body instead (Round 16 P0).
     job_id: Optional[str] = None
     job_name: Optional[str] = None
     job_status: Optional[str] = None
@@ -862,6 +865,15 @@ class ChatMessageResponse(BaseModel):
     job_total_steps: Optional[int] = None
     job_completed_steps: Optional[int] = None
     job_app_id: Optional[str] = None
+    # `agent_task`, `app_build`, … — the discriminator the clients use to
+    # pick the card's iconography, live and now from history too.
+    job_type: Optional[str] = None
+    # The step list itself, not just its two counts: {id, type, label,
+    # status, started_at, completed_at, duration_ms, durationMs}. Without
+    # it a card rebuilt from history can only draw a progress bar, so a
+    # reopened thread showed a bare title where the live card had shown the
+    # run's steps — the same card, twice as poor.
+    job_steps: Optional[List[dict]] = None
     # Cross-channel reply-to (migration 049): soft pointer to a previous
     # message anywhere in this user's day. Frontend resolves the target
     # client-side from its in-memory day-chat list and renders a quoted

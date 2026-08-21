@@ -45,6 +45,7 @@ test_routines_skill.py  # agent-mode
 test_round4_reminders.py  # agent-mode: routines + users on the agent side, same reason as test_routines_skill.py
 test_round8_stuck_jobs.py  # agent-mode: build_jobs / job_events / agent_notify_outbox / messages are AGENT_ONLY — the end-to-end turn runs the REAL create_job/update_job against them
 test_voice_turn_jobs.py  # agent-mode: build_jobs / job_events / agent_notify_outbox / messages / conversations are AGENT_ONLY — the end-to-end voice turn opens a REAL job against them (test_job_titles.py is the pure half and stays in the platform sweep)
+test_job_card_readers.py  # agent-mode: seeds a real voice turn (messages / conversations / day_chats / build_jobs, all AGENT_ONLY) and calls the three real history routes — the only honest proof a serializer does not leak its job marker (test_job_card_leak.py is the pure half and stays in the platform sweep)
 test_signup_hardening.py  # agent-mode
 test_subagent_context_isolation.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY); 8/8 green under agent, 3 of 4 platform failures were this lane and not staleness
 test_subagent_dispatcher.py  # agent-mode
