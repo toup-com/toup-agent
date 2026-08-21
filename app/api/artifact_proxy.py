@@ -133,6 +133,89 @@ async def mint_artifact_token(slug: str, current_user=Depends(get_current_user))
     }
 
 
+@router.get("")
+@router.get("/")
+async def list_artifacts(
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every single-file app this account has, newest update first.
+
+    The account bearer, not an artifact token: this is the SHELL asking, the
+    way it asks for the file list — an artifact itself can never reach here.
+
+    It exists because the `apps` table cannot answer the question. `AppResponse`
+    has no size (it lives inside an opaque `files_json` blob) and no revision,
+    and the manifest in the container is the only place both are kept. The
+    mobile Files page renders name · modified · size, so without this route an
+    app could only ever be listed without two of its three facts.
+    """
+    return await _agent_json(str(current_user.id), db, "GET", "/")
+
+
+@router.patch("/{slug}")
+async def rename_artifact(
+    slug: str,
+    body: dict,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename an app. The slug — every card's handle — never moves."""
+    out = await _agent_json(
+        str(current_user.id), db, "PATCH", f"/{slug}", body={"title": body.get("title")},
+    )
+    # Keep the `apps` row in step, so the Workspace list and the artifact list
+    # do not disagree about what the same app is called. Best effort: the
+    # manifest is the authority the runner and the card read, and failing the
+    # rename because a mirror row is missing would be the wrong trade.
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import App
+        title = (out or {}).get("title")
+        if title:
+            async with async_session_maker() as s:
+                row = (await s.execute(
+                    select(App).where(App.user_id == str(current_user.id), App.slug == slug)
+                )).scalar_one_or_none()
+                if row is not None:
+                    row.name = title
+                    await s.commit()
+    except Exception:
+        logger.warning("[artifact] apps-row rename mirror failed for %s", slug, exc_info=True)
+    return out
+
+
+@router.delete("/{slug}")
+async def delete_artifact(
+    slug: str,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an app: the file, its history, its state and its manifest row.
+
+    The `apps` row goes with it. Leaving it behind would put a dead app in the
+    Workspace list whose every open answers 404 — which is exactly the "no
+    playlists yet for a full library" failure mode in reverse: a row for
+    something that is gone reads as breakage, not as deletion.
+    """
+    out = await _agent_json(str(current_user.id), db, "DELETE", f"/{slug}")
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import App
+        async with async_session_maker() as s:
+            row = (await s.execute(
+                select(App).where(App.user_id == str(current_user.id), App.slug == slug)
+            )).scalar_one_or_none()
+            if row is not None:
+                await s.delete(row)
+                await s.commit()
+    except Exception:
+        logger.warning("[artifact] apps-row delete mirror failed for %s", slug, exc_info=True)
+    return out
+
+
 @router.get("/{slug}/state")
 async def get_artifact_state(
     slug: str,
@@ -170,18 +253,27 @@ async def _agent_json(user_id: str, db: AsyncSession, method: str,
     from app.services.agent_http import get_agent_http_client
     client = get_agent_http_client()
     url = f"{agent_url}{settings.api_prefix}/artifacts{path}"
+    headers = {"X-Agent-Key": key}
     try:
         if method == "PUT":
-            resp = await client.put(
-                url, headers={"X-Agent-Key": key}, json=body or {}, timeout=15.0,
-            )
+            resp = await client.put(url, headers=headers, json=body or {}, timeout=15.0)
+        elif method == "PATCH":
+            resp = await client.patch(url, headers=headers, json=body or {}, timeout=15.0)
+        elif method == "DELETE":
+            resp = await client.delete(url, headers=headers, timeout=15.0)
         else:
-            resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=15.0)
+            resp = await client.get(url, headers=headers, timeout=15.0)
     except Exception as exc:
-        logger.warning("[artifact] state %s %s failed: %s", method, path, exc)
-        raise HTTPException(502, "artifact state unreachable")
+        logger.warning("[artifact] %s %s failed: %s", method, path, exc)
+        raise HTTPException(502, "artifact store unreachable")
+    # The agent's own status is passed through where it is MEANINGFUL: a 404
+    # for an app that is gone must reach the client as a 404 (the Files list
+    # drops the row) rather than as a generic 502 (which reads as "the network
+    # is down, try again" for something that will never come back).
+    if resp.status_code == 404:
+        raise HTTPException(404, "no such app")
     if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, "artifact state error")
+        raise HTTPException(resp.status_code, "artifact store error")
     return resp.json()
 
 

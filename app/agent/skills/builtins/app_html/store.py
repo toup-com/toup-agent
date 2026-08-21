@@ -413,6 +413,30 @@ def upsert_record(slug: str, title: str, size_bytes: int, *,
         return rec
 
 
+def retitle_record(slug: str, title: str) -> Optional[AppRecord]:
+    """Rename an app WITHOUT touching its file, its revision or its slug.
+
+    The title is a display name; the slug is the identity every chat card,
+    every runner and the ``apps`` row key on. Renaming must therefore move
+    exactly one field — a rename that bumped the revision would make every
+    open runner reload, and one that moved the slug would orphan every card
+    already in the thread.
+    """
+    clean = " ".join((title or "").split())[:120]
+    if not clean:
+        raise AppStoreError("a name is required")
+    with _MANIFEST_LOCK:
+        records = read_manifest()
+        rec = records.get(slug)
+        if rec is None:
+            return None
+        rec.title = clean
+        rec.updated_at = _now()
+        records[slug] = rec
+        _write_manifest(records)
+        return rec
+
+
 def forget_record(slug: str) -> bool:
     with _MANIFEST_LOCK:
         records = read_manifest()
@@ -519,7 +543,14 @@ def read_app(slug: str) -> str:
 
 
 def delete_app(slug: str) -> bool:
-    """Remove the file, its history and its manifest row."""
+    """Remove the file, its history, its saved state and its manifest row.
+
+    The state file is not optional cleanup. Slugs are reusable — the model
+    picks them from the app's name — so a `snake` deleted today and a `snake`
+    built next week are the same path, and state left behind means the new app
+    opens holding a stranger's saved game. It is also the user's data for an
+    app they just asked to be rid of.
+    """
     removed = False
     try:
         path = app_path(slug)
@@ -531,6 +562,10 @@ def delete_app(slug: str) -> bool:
     try:
         shutil.rmtree(_versions_dir(slug), ignore_errors=True)
     except AppStoreError:
+        pass
+    try:
+        os.unlink(_state_path(slug))
+    except (OSError, AppStoreError):
         pass
     forget_record(normalise_slug(slug))
     return removed

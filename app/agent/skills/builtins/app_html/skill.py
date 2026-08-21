@@ -303,7 +303,13 @@ class AppHtmlSkill(Skill):
             "Loop: app_html__create_app_file (one big write) → app_html__edit_app_file "
             "(small exact-string edits; view_app_file first) → app_html__bash_app "
             "(verify) → app_html__present_app (show the user). Never hand-scaffold an "
-            "app with exec/write_file."
+            "app with exec/write_file.\n"
+            "Do NOT call create_job for a build. This pipeline opens its own job "
+            "and reports every phase into it, so a second one is the same build "
+            "announced twice — the user sees two progress cards for one app.\n"
+            "Never paste a tool's output, an exit code or an error dump into your "
+            "reply. If a step fails, say what happened in one plain sentence and "
+            "what you are doing about it."
         )
 
     # ------------------------------------------------------------------
@@ -517,7 +523,7 @@ class AppHtmlSkill(Skill):
         )
         await steps_mod.finish_job(ctx.user_id, job_id)
         await steps_mod.announce_ready(
-            user_id=ctx.user_id, job_id=job_id, app_id=app_id, title=title,
+            user_id=ctx.user_id, job_id=job_id, app_id=app_id, title=title, slug=slug,
         )
 
         return (

@@ -282,13 +282,23 @@ async def upsert_app_row(
 
 async def announce_ready(
     *, user_id: str, job_id: Optional[str], app_id: Optional[str], title: str,
+    slug: Optional[str] = None,
 ) -> None:
-    """The artifact card. Same frame the Expo pipeline emits on completion."""
+    """The artifact card. Same frame the Expo pipeline emits on completion.
+
+    ``slug`` is the app's IDENTITY — the handle the chat card stores, the
+    runner opens and ``/api/artifacts/{slug}`` serves. Without it a client can
+    only get there by fetching the ``apps`` row to translate ``app_id`` back
+    into a slug, which is a round-trip between the reply landing and the card
+    appearing. ``kind`` already tells a client which pipeline this is; the slug
+    is what lets it act.
+    """
     await _broadcast(user_id, {
         "type": "app_ready",
         "job_id": job_id,
         "app_id": app_id,
         "id": app_id,
         "name": title,
+        "slug": slug,
         "kind": SOURCE_HTML_ARTIFACT,
     })

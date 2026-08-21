@@ -81,6 +81,25 @@ async def get_artifact_meta(slug: str) -> Dict[str, Any]:
     return d
 
 
+@router.patch("/{slug}")
+async def rename_artifact(slug: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Change an app's display name. Nothing else moves.
+
+    Deliberately NOT a re-write: no new revision, no snapshot, no touch of the
+    .html. The slug stays the identity that every chat card and every open
+    runner is keyed on, so a rename cannot orphan a card the way a slug change
+    would.
+    """
+    try:
+        slug = store.normalise_slug(slug)
+        rec = store.retitle_record(slug, str(body.get("title") or ""))
+    except store.AppStoreError as exc:
+        raise HTTPException(400, str(exc))
+    if rec is None:
+        raise HTTPException(404, f"no artifact named {slug!r}")
+    return rec.to_dict()
+
+
 @router.get("/{slug}/state")
 async def get_artifact_state(slug: str) -> Dict[str, Any]:
     """The app's persisted state blob (see store.read_state)."""
