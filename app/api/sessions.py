@@ -870,7 +870,18 @@ def _message_to_response(
                 resp["job_name"] = bj.title.replace("Build: ", "")
             try:
                 steps = json.loads(bj.steps_json) if bj.steps_json else []
-                completed = sum(1 for s in steps if s.get("status") == "completed")
+                # `done`, not `completed`. A STEP is pending / running / done /
+                # failed — `job_steps.finish_all_steps`, `_tool_create_job`,
+                # `apps.py` and the app-builder skill all write `done`, and
+                # nothing has ever written `completed` on a step; `completed`
+                # is the JOB's status, one level up. So this counted zero on
+                # every card ever loaded from history, and a finished job
+                # re-rendered as "0/3 steps" the moment the thread was
+                # reloaded. Both spellings are accepted so a hand-edited or
+                # future row cannot regress it the other way.
+                completed = sum(
+                    1 for s in steps if s.get("status") in ("done", "completed")
+                )
                 resp["job_total_steps"] = len(steps)
                 resp["job_completed_steps"] = completed
             except (json.JSONDecodeError, TypeError):

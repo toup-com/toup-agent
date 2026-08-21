@@ -391,6 +391,31 @@ async def test_the_card_has_a_row_in_the_thread(monkeypatch, tmp_path):
     assert json.loads(row.content) == {"job_id": job.id, "job_name": job.title}
 
 
+@pytest.mark.asyncio
+async def test_the_reloaded_card_shows_the_steps_it_finished(monkeypatch, tmp_path):
+    """The history serializer counted `status == "completed"` on STEPS — a
+    value nothing has ever written (`job_steps`, `_tool_create_job`, `apps.py`
+    and the app-builder skill all write `done`; `completed` is the JOB's
+    status). Every card ever loaded from history therefore re-rendered a
+    finished job as "0/N steps". Chat's cards had it too; the voice card this
+    round adds would have shipped straight into it."""
+    from app.api.sessions import _message_to_response
+    from app.db import async_session_maker
+    from app.db.models import BuildJob, Message
+
+    out = await _run_turn(monkeypatch, tmp_path)
+    job = (await _jobs_for(out["user_id"]))[0]
+    async with async_session_maker() as db:
+        row = await db.get(Message, f"job-{job.id}")
+        bj = await db.get(BuildJob, job.id)
+        resp = _message_to_response(row, {job.id: bj})
+    assert resp.job_total_steps == 3
+    assert resp.job_completed_steps == 3, (
+        "a completed job must not re-render as 0/3 the moment the thread "
+        "is reloaded"
+    )
+
+
 # ── What must NOT happen ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

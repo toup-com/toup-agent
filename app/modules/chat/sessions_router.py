@@ -436,7 +436,12 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
             # Parse steps for progress
             try:
                 steps = json.loads(bj.steps_json) if bj.steps_json else []
-                completed = sum(1 for s in steps if s.get("status") == "completed")
+                # `done`, not `completed` — see the same fix in api/sessions.py.
+                # This module is not mounted today; corrected in place so a
+                # revival cannot bring the defect back with it.
+                completed = sum(
+                    1 for s in steps if s.get("status") in ("done", "completed")
+                )
                 resp["job_total_steps"] = len(steps)
                 resp["job_completed_steps"] = completed
                 # Find current step
