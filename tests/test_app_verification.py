@@ -834,3 +834,53 @@ def test_the_app_is_driven_before_the_report_is_believed():
     assert i_settle < i_start < i_close
     # …and AFTER the untouched watch, whose whole claim is "nothing pressed".
     assert src.index("_ended_itself") < i_start
+
+
+# ── 9. A published app has to be READABLE by the shell that checks it ──
+#
+# `bash_app` is the model's only way to look at what it wrote, and it runs
+# DROPPED to an unprivileged uid (`sandbox_preexec`) while the skill writes
+# as root. `tempfile.mkstemp` creates its file 0600 and `os.replace` carries
+# that mode onto the published file — so every `bash_app` check on the app
+# was "Permission denied", for `wc -c` as much as for `grep`.
+#
+# Seen end to end on a device: asked to grep its own app, the agent answered
+# "the app file is permission-blocked in the app sandbox (Permission
+# denied)". The directory had been given this exact care and the file had
+# not: a readable directory full of unreadable files.
+
+
+def test_a_written_app_is_readable_by_a_different_uid(skill, apps_dir):
+    import stat
+    call(skill, "create_app_file", slug="snake", title="Nokia Snake",
+         html=snake_html())
+    mode = stat.S_IMODE((apps_dir / "snake.html").stat().st_mode)
+    assert mode & stat.S_IRGRP, oct(mode)
+    assert mode & stat.S_IROTH, oct(mode)
+    # …and never writable by anyone but the owner.
+    assert not (mode & stat.S_IWGRP) and not (mode & stat.S_IWOTH), oct(mode)
+
+
+def test_the_manifest_is_readable_too(skill, apps_dir):
+    # Same writer, same trap: a manifest only root can read makes the store
+    # unlistable from the shell for exactly the same reason.
+    import stat
+    call(skill, "create_app_file", slug="snake", title="Nokia Snake",
+         html=snake_html())
+    manifest = apps_dir / "apps.json"
+    if manifest.exists():
+        mode = stat.S_IMODE(manifest.stat().st_mode)
+        assert mode & stat.S_IROTH, oct(mode)
+
+
+def test_a_rewrite_keeps_the_mode(skill, apps_dir):
+    # The mode is set on the TEMP file before `os.replace`, so it has to
+    # survive a second revision — a fix applied only to first creation would
+    # look right and regress on the first edit.
+    import stat
+    call(skill, "create_app_file", slug="snake", title="Nokia Snake",
+         html=snake_html())
+    call(skill, "create_app_file", slug="snake", title="Nokia Snake",
+         html=snake_html(storage=True))
+    mode = stat.S_IMODE((apps_dir / "snake.html").stat().st_mode)
+    assert mode & stat.S_IROTH, oct(mode)

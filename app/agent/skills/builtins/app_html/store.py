@@ -120,6 +120,21 @@ def apps_root() -> str:
 #: found it, having reported that it fixed something.
 _DIR_MODE = 0o775
 
+#: Mode every file this store writes is repaired to before it is published.
+#:
+#: `tempfile.mkstemp` creates its file 0600 — owner only, by design — and
+#: `os.replace` preserves the temp file's mode, so the app file inherited it.
+#: The skill runs as root and `bash_app` runs DROPPED to an unprivileged uid
+#: (`sandbox_preexec`), so the verification shell could not read the app it had
+#: just written. Observed end to end on a device: the model was asked to grep
+#: its own app and answered "the app file is permission-blocked in the app
+#: sandbox (Permission denied)". Every `bash_app` check on the file — `wc -c`,
+#: `grep`, `node --check` — has been failing that way.
+#:
+#: The directory got this care (`_DIR_MODE` above) and the file did not, which
+#: is the whole bug: a readable directory full of unreadable files.
+_FILE_MODE = 0o644
+
 
 def repair_permissions(path: str) -> bool:
     """Try to make ``path`` writable by this process. True if it now is.
@@ -423,6 +438,13 @@ def _atomic_write(path: str, data: bytes, *, prefix: str = ".tmp-") -> None:
                 fh.write(data)
                 fh.flush()
                 os.fsync(fh.fileno())
+            # BEFORE the replace, while the name is still ours: `os.replace`
+            # carries the temp file's 0600 over, and a file nobody but root can
+            # read is not a published app.
+            try:
+                os.chmod(tmp, _FILE_MODE)
+            except OSError as exc:  # pragma: no cover - never worth failing a write
+                logger.warning("[app_html] could not set the mode on %s: %s", tmp, exc)
             os.replace(tmp, path)
             return
         except PermissionError:
