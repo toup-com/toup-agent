@@ -131,6 +131,51 @@ def decode_access_token(token: str) -> Optional[str]:
         return None
 
 
+ARTIFACT_SCOPE = "artifact"
+
+
+def create_artifact_token(user_id: str, slug: str) -> str:
+    """Mint a short-lived token that fetches exactly ONE HTML artifact.
+
+    Deliberately a DIFFERENT scope from ``app_preview`` rather than a reuse
+    of it. An ``app_preview`` token is accepted by
+    ``/api/apps/{id}/chat`` — i.e. it can talk to the user's agent. An
+    artifact token must only ever pull static bytes, so a copy of it lifted
+    out of an iframe URL (referrer, history, a screenshot) buys the holder
+    one HTML file and nothing else. General auth rejects both.
+    """
+    expire = datetime.utcnow() + timedelta(
+        minutes=settings.artifact_token_expire_minutes)
+    to_encode = {
+        "sub": user_id,
+        "exp": expire,
+        "iat": datetime.utcnow(),
+        "jti": str(uuid.uuid4()),
+        "scope": ARTIFACT_SCOPE,
+        "artifact": str(slug),
+    }
+    return jwt.encode(
+        to_encode, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_artifact_token(token: str, slug: str) -> Optional[str]:
+    """Return the user_id iff ``token`` is an artifact token for ``slug``.
+
+    Exact scope match and exact slug match. A full account token is NOT
+    accepted — an artifact origin must never be reachable with the account
+    credential, or the whole point of the separate origin is lost."""
+    try:
+        payload = jwt.decode(
+            token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    except JWTError:
+        return None
+    if payload.get("scope") != ARTIFACT_SCOPE:
+        return None
+    if str(payload.get("artifact")) != str(slug):
+        return None
+    return payload.get("sub") or None
+
+
 def create_preview_token(user_id: str, app_id: str) -> str:
     """Mint a short-lived, single-app token for the in-app preview iframe.
 

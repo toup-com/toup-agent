@@ -706,14 +706,32 @@ async def lifespan(app: FastAPI):
         builder_skill = None
         app_gateway = None
 
+        # Round 12: the legacy Expo pipeline is feature-gated. When it is
+        # off we skip the ENTIRE block — AppManager, the restore sweep, the
+        # 30s watchdog loop and both skills — not just the tool
+        # registration. Leaving AppManager alive with no skills would keep a
+        # background task polling ports for apps nothing can create, and
+        # would keep `restore_on_startup` re-launching Metro processes on
+        # every boot. The single-file HTML pipeline (`app_html`) is loaded
+        # by `skill_loader.load_all()` above and needs none of this.
+        from app.agent.tool_entitlements import pipeline_enabled as _pipeline_enabled
+        _expo_on = _pipeline_enabled("expo")
+        if not _expo_on:
+            print(
+                "🏗️ Expo app pipeline disabled (APP_BUILDER_EXPO_ENABLED=0) — "
+                "apps build as single-file HTML artifacts",
+                flush=True,
+            )
+
         # Step 1: Create AppManager
-        try:
-            from app.agent.app_manager import AppManager
-            app_manager = AppManager()
-            set_app_manager(app_manager)
-            print("📱 App Manager created")
-        except Exception as e:
-            logger.error(f"[INIT] AppManager construction failed: {e}", exc_info=True)
+        if _expo_on:
+            try:
+                from app.agent.app_manager import AppManager
+                app_manager = AppManager()
+                set_app_manager(app_manager)
+                print("📱 App Manager created")
+            except Exception as e:
+                logger.error(f"[INIT] AppManager construction failed: {e}", exc_info=True)
 
         # Step 2: Restore previously-running apps (non-fatal).
         # Skipped during blue-green passive boot — see _bg_passive_active
@@ -770,45 +788,51 @@ async def lifespan(app: FastAPI):
             logger.error("[INIT] AppBuilderSkill NOT registered — AppManager is None")
 
         # Step 4: Register AppGatewaySkill + load existing apps
-        try:
-            from app.agent.skills.builtins.app_builder.app_gateway_skill import AppGatewaySkill
-            app_gateway = AppGatewaySkill()
+        # Gated with the rest of the Expo pipeline. Without this guard the
+        # gateway would still be constructed and handed to /api/apps while
+        # `register_dynamic` silently refused it — 13 tools listed as the
+        # app surface with no execution path behind them, which is exactly
+        # the half-gated state SkillLoader._register warns about.
+        if _expo_on:
+            try:
+                from app.agent.skills.builtins.app_builder.app_gateway_skill import AppGatewaySkill
+                app_gateway = AppGatewaySkill()
 
-            # Load existing apps into the gateway (non-fatal per app)
-            if app_manager:
-                try:
-                    from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
-                    from app.db.models import App
-                    from sqlalchemy import select as sa_select
-                    async with async_session_maker() as _db:
-                        result = await _db.execute(
-                            sa_select(App).where(App.status.in_(["running", "ready", "stopped"]))
-                        )
-                        db_apps = result.scalars().all()
-                        for db_app in db_apps:
-                            try:
-                                fs_skill = AppFsSkill(
-                                    app_id=db_app.id,
-                                    app_name=db_app.name,
-                                    app_slug=db_app.slug,
-                                    app_dir=db_app.app_dir,
-                                    app_manager=app_manager,
-                                )
-                                app_gateway.register_app(db_app.slug, fs_skill)
-                            except Exception as e:
-                                logger.debug(f"[AppGateway] Skipping app {db_app.id}: {e}")
-                    if db_apps:
-                        print(f"📱 App Gateway: {len(db_apps)} app(s) loaded")
-                except Exception as e:
-                    logger.warning(f"[INIT] App Gateway loading error (non-fatal): {e}", exc_info=True)
+                # Load existing apps into the gateway (non-fatal per app)
+                if app_manager:
+                    try:
+                        from app.agent.skills.builtins.app_builder.app_fs_skill import AppFsSkill
+                        from app.db.models import App
+                        from sqlalchemy import select as sa_select
+                        async with async_session_maker() as _db:
+                            result = await _db.execute(
+                                sa_select(App).where(App.status.in_(["running", "ready", "stopped"]))
+                            )
+                            db_apps = result.scalars().all()
+                            for db_app in db_apps:
+                                try:
+                                    fs_skill = AppFsSkill(
+                                        app_id=db_app.id,
+                                        app_name=db_app.name,
+                                        app_slug=db_app.slug,
+                                        app_dir=db_app.app_dir,
+                                        app_manager=app_manager,
+                                    )
+                                    app_gateway.register_app(db_app.slug, fs_skill)
+                                except Exception as e:
+                                    logger.debug(f"[AppGateway] Skipping app {db_app.id}: {e}")
+                        if db_apps:
+                            print(f"📱 App Gateway: {len(db_apps)} app(s) loaded")
+                    except Exception as e:
+                        logger.warning(f"[INIT] App Gateway loading error (non-fatal): {e}", exc_info=True)
 
-            await skill_loader.register_dynamic(app_gateway)
-            if builder_skill:
-                builder_skill._app_gateway = app_gateway
-            set_app_gateway(app_gateway)
-            print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools)")
-        except Exception as e:
-            logger.error(f"[INIT] AppGatewaySkill registration failed: {e}", exc_info=True)
+                await skill_loader.register_dynamic(app_gateway)
+                if builder_skill:
+                    builder_skill._app_gateway = app_gateway
+                set_app_gateway(app_gateway)
+                print(f"📱 App Gateway skill registered ({len(app_gateway.get_tools())} tools)")
+            except Exception as e:
+                logger.error(f"[INIT] AppGatewaySkill registration failed: {e}", exc_info=True)
 
         # ── Store module refs for hot-restart ────────────────
         import agent_main as _self
@@ -1812,6 +1836,14 @@ try:
 except ImportError as _e:
     print(f"⚠️ jobs_events router not loaded: {_e}", flush=True)
 app.include_router(apps_router, prefix=settings.api_prefix)
+# Single-file HTML artifacts (round 12) — raw bytes for the platform's
+# artifact_proxy, which adds the browser-facing CSP. Behind the global
+# X-Agent-Key middleware like every other /api route here.
+try:
+    from app.api.artifacts import router as artifacts_router
+    app.include_router(artifacts_router, prefix=settings.api_prefix)
+except ImportError as _e:
+    print(f"⚠️ artifacts router not loaded: {_e}", flush=True)
 # Netflix streaming (HLS)
 try:
     from app.api.ws_netflix import router as netflix_stream_router

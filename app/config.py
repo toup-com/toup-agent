@@ -106,6 +106,47 @@ class Settings(BaseSettings):
     # an agent-authored, same-origin preview page, so it must never be a full
     # account credential — keep the TTL tight to bound a leak.
     preview_token_expire_minutes: int = 60 * 6  # 6 hours
+    # HTML-artifact token (round 12). Fetches ONE static .html and nothing
+    # else — see auth_service.create_artifact_token for why it is a separate
+    # scope from app_preview rather than a reuse of it.
+    artifact_token_expire_minutes: int = 60 * 6  # 6 hours
+
+    # ── HTML artifacts (round 12) ────────────────────────────────────
+    # Origin that serves agent-authored app HTML. It MUST NOT be an origin
+    # that holds Toup auth cookies: the page is untrusted, model-authored
+    # markup, and same-origin means it can read anything the SPA can. Point
+    # this at a dedicated host (e.g. "https://artifacts.toup.ai") in prod.
+    #
+    # Empty = same-origin fallback for local dev. The route itself never
+    # reads or writes cookies either way, and the frame is sandboxed WITHOUT
+    # allow-same-origin, so an unset value degrades one layer of defence
+    # rather than removing all of them — but it is logged as a warning on
+    # every boot with a real base URL configured.
+    artifact_origin: str = ""
+    # Origins allowed to frame an artifact (CSP frame-ancestors). Anything
+    # not listed cannot embed the page at all. Never "*".
+    artifact_frame_ancestors: list[str] = [
+        "https://toup.ai",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ]
+    # The ONE external origin an artifact may load code/styles from.
+    artifact_cdn_origin: str = "https://cdnjs.cloudflare.com"
+
+    # ── App-builder pipeline selection (round 12) ────────────────────
+    # `app_builder_expo_enabled` gates the LEGACY React-Native/Expo pipeline
+    # (npx create-expo-app + npm install + Metro: 452 MiB and 27k files per
+    # app, measured 2026-08-20 — MIGRATION_INVENTORY.md §3). Off means the
+    # AppBuilderSkill / AppGatewaySkill pair is not registered, so its 19
+    # tool defs and its system-prompt section leave the wire array too.
+    #
+    # Container-stable by construction: read once at boot in agent_main, on
+    # the same terms as AGENT_TOOL_FAMILIES. Flipping it is a restart, which
+    # is what keeps it from forking a provider cache lineage mid-life.
+    app_builder_expo_enabled: bool = True
+    # `app_html_enabled` gates the replacement. Both on = both available
+    # (the canary posture); expo off + html on = migrated.
+    app_html_enabled: bool = True
 
     # API
     api_prefix: str = "/api"

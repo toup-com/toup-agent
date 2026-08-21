@@ -4491,8 +4491,14 @@ class AgentRunner:
             "slug; to find which file holds something, `memory_search`. When "
             "they ask you to remember something explicitly, `memory_store`.\n\n"
             "### Apps you build (live at `/workspace`)\n"
-            "You can BUILD real React apps for the user via the app_builder "
-            "skill. Apps are deployed and previewable at "
+            # Deliberately does NOT name a tool. Two app pipelines exist
+            # (round 12) and a tenant may run either; the concrete tool names
+            # and the build loop live in the owning skill's own prompt
+            # section, which is present only when that skill is loaded.
+            # Naming one here would advertise a tool half the fleet cannot
+            # see — the defect `_pipeline_redirect_msg` exists to avoid.
+            "You can BUILD real apps for the user with your app-building "
+            "tools. Apps are previewable at "
             "`/workspace/apps/<slug>`. Use this when:\n"
             "- They ask for a tool ('make me a habit tracker', 'build a "
             "calorie counter', 'I need a quote generator').\n"
@@ -4565,7 +4571,7 @@ class AgentRunner:
             "- 'remember <fact>' / 'I'm working on <project>' → call `memory_store`, give a one-line confirmation\n"
             "- 'what do you know about <X>' → the index in `# User Brain` names every file; call `memory_read_file` on the one that fits, or `memory_search` when none obviously does\n"
             "- 'show me my memories' / 'take me to my brain' → call `navigate_to` with path `/brain`\n"
-            "- 'make me a <tool/app>' / 'I need a <thing>' → use the app_builder skill\n"
+            "- 'make me a <tool/app>' / 'I need a <thing>' → build them an app\n"
             + ("- 'search the web' / 'find <X> for me' / 'look up <X>' → call `web_search`, then `web_fetch` on the two or three results worth reading. `browser` is for pages you must OPERATE (sign in, fill a form, click through a flow) or 'book <X>' — it drives a real headless browser and costs tens of seconds per step, so it is the wrong tool for a question that a search answers. If they should watch a browser session, drop `[[navigate:/browser]]`\n")
             +
             "- 'remind me at <Y>' / 'in N minutes remind me' / 'every morning at 7 nudge me' → call `routines__remind` ONCE ('in N minutes/seconds' → `in_seconds`, never a computed clock time)\n"
@@ -4593,7 +4599,7 @@ class AgentRunner:
             + "\n"
             "- 'where's my account' / 'change password' / 'billing' → call `navigate_to` with path `/account`\n"
             "- 'show me the dashboard' / 'metrics' → call `navigate_to` with path `/dashboard`\n"
-            "- 'build me an app' (then they want to see it) → app_builder, then offer `[[open_app:<slug>]]` chip\n\n"
+            "- 'build me an app' (then they want to see it) → build it, then offer `[[open_app:<slug>]]` chip\n\n"
             "## What you should NEVER make the user do\n"
             "- Hunt through menus to find a feature you can navigate them to. Just take them.\n"
             "- Repeat themselves between channels — it's all one thread.\n"
@@ -5379,7 +5385,7 @@ class AgentRunner:
                 "The user is in a live IDE workspace watching you code. They see a code editor on the left and chat on the right.\n\n"
                 "## ABSOLUTE RULES\n"
                 "1. **START CODING IMMEDIATELY.** Do NOT plan, do NOT write long explanations, do NOT create roadmaps.\n"
-                "2. **FORBIDDEN:** app_builder__build_app and all app_builder__* tools.\n"
+                "2. **FORBIDDEN:** every app-building tool — all app_builder__* and all app_html__* tools.\n"
                 "3. **FORBIDDEN:** [[option]] buttons, numbered direction cards, multi-choice menus.\n"
                 "4. **FORBIDDEN:** Long text responses. Max 2-3 short sentences between tool calls.\n"
                 "5. **FORBIDDEN:** Architecture documents, phased plans, MVP roadmaps, or design specs as text output.\n"
@@ -5949,10 +5955,14 @@ class AgentRunner:
     # ------------------------------------------------------------------
     @staticmethod
     def _has_builder_context(messages: List[Dict[str, Any]]) -> bool:
-        """Check if conversation history contains app_builder interactions.
+        """Check if conversation history contains app-builder interactions.
 
-        Detects both tool_use blocks (app_builder__*) and the [[button]] syntax
-        that the builder's direction cards / question cards use.
+        Detects tool_use blocks from EITHER app pipeline (app_builder__* for
+        Expo, app_html__* for the single-file HTML artifacts) plus the
+        [[button]] syntax the direction / question cards use. Missing the
+        second prefix would silently stop the intent override the moment the
+        Expo pipeline was switched off — a mid-build turn would drop back to
+        a narrow tool set with no visible cause.
         """
         for msg in messages:
             if msg.get("role") != "assistant":
@@ -5965,7 +5975,9 @@ class AgentRunner:
                 for block in content:
                     if not isinstance(block, dict):
                         continue
-                    if block.get("type") == "tool_use" and block.get("name", "").startswith("app_builder__"):
+                    if block.get("type") == "tool_use" and block.get("name", "").startswith(
+                        ("app_builder__", "app_html__")
+                    ):
                         return True
                     if block.get("type") == "text":
                         t = block.get("text", "")

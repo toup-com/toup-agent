@@ -126,7 +126,15 @@ FAMILIES: Dict[str, _Family] = {
             # 128-tool cap, where the overflow is TRUNCATED, so the tools
             # this family fails to withhold are paid for by dropping
             # whichever tools sort last.
-            skills=("app_builder", "app"),
+            #
+            # `app_html` (round 12) is the single-file HTML artifact
+            # pipeline that replaces the Expo one. It belongs to the SAME
+            # family for the same reason the two Expo skills do: a tenant
+            # who withholds "the app builder" means "I cannot build apps",
+            # not "I keep whichever half is newer". It is 5 tool defs
+            # against the Expo path's 19, so the family also gets ~3x
+            # cheaper once `app_builder_expo_enabled` is off.
+            skills=("app_builder", "app", "app_html"),
         ),
         _Family(
             "toup",
@@ -201,8 +209,49 @@ def family_enabled(family_id: str) -> bool:
     return family_id in entitled_families()
 
 
+# ── Pipeline selection (round 12) ─────────────────────────────────────
+# Orthogonal to the family gate above. A family answers "may this tenant
+# build apps at all?"; this answers "with WHICH pipeline?" — the legacy
+# Expo one (`app_builder` + `app`), the single-file HTML one (`app_html`),
+# or both during the canary.
+#
+# Same container-stability rule: resolved once, no per-turn input, flipping
+# it is a restart. A pipeline that appeared or vanished mid-life would fork
+# the provider cache lineage exactly like a family that did.
+_EXPO_PIPELINE_SKILLS: FrozenSet[str] = frozenset({"app_builder", "app"})
+_HTML_PIPELINE_SKILLS: FrozenSet[str] = frozenset({"app_html"})
+
+_PIPELINES: Optional[Dict[str, bool]] = None
+
+
+def _resolved_pipelines() -> Dict[str, bool]:
+    global _PIPELINES
+    if _PIPELINES is None:
+        try:
+            from app.config import settings
+            expo = bool(getattr(settings, "app_builder_expo_enabled", True))
+            html = bool(getattr(settings, "app_html_enabled", True))
+        except Exception:  # pragma: no cover - settings must never break boot
+            expo, html = True, True
+        _PIPELINES = {"expo": expo, "html": html}
+        logger.info(
+            "[entitlements] app pipelines — expo=%s html=%s", expo, html,
+        )
+    return _PIPELINES
+
+
+def pipeline_enabled(name: str) -> bool:
+    """`name` \u2208 {"expo", "html"}. Unknown names are enabled."""
+    return _resolved_pipelines().get(name, True)
+
+
 def skill_enabled(skill_name: str) -> bool:
-    """True unless `skill_name` belongs to a family that is withheld."""
+    """True unless `skill_name` is withheld by a family OR by pipeline
+    selection."""
+    if skill_name in _EXPO_PIPELINE_SKILLS and not pipeline_enabled("expo"):
+        return False
+    if skill_name in _HTML_PIPELINE_SKILLS and not pipeline_enabled("html"):
+        return False
     for fam in FAMILIES.values():
         if skill_name in fam.skills and fam.id not in entitled_families():
             return False
@@ -249,5 +298,6 @@ def reset_cache_for_tests() -> None:
     Production must never call this: re-resolving mid-life is precisely the
     turn-conditional array this module exists to prevent.
     """
-    global _RESOLVED
+    global _RESOLVED, _PIPELINES
     _RESOLVED = None
+    _PIPELINES = None

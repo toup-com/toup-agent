@@ -594,6 +594,37 @@ _PIPELINE_REDIRECT_MSG = (
 )
 
 
+_HTML_PIPELINE_REDIRECT_MSG = (
+    "BLOCKED: You are trying to scaffold an app project. Toup apps are not "
+    "projects — an app is ONE self-contained .html file, so there is nothing "
+    "to scaffold and nothing to install.\n\n"
+    "Use `app_html__create_app_file(slug, title, html)` instead: inline all "
+    "CSS and JS, load libraries only from https://cdnjs.cloudflare.com, then "
+    "verify with `app_html__bash_app` and publish with "
+    "`app_html__present_app`.\n\n"
+    "Do NOT use exec, write_file, or edit_file to create app projects."
+)
+
+
+def _pipeline_redirect_msg() -> str:
+    """Point the model at the pipeline that actually exists on this tenant.
+
+    The guard's whole output is a redirect, so it has to name a tool the
+    model can see. Round 12 makes that two possible tools: `app_html__*` is
+    the live pipeline, `app_builder__build_app` the legacy one, and a tenant
+    can be running either or both. Naming the wrong one reproduces the
+    original defect this guard was fixed for — blocked, redirected to
+    something absent, refused again.
+    """
+    try:
+        from app.agent.tool_entitlements import pipeline_enabled
+        if not pipeline_enabled("expo") and pipeline_enabled("html"):
+            return _HTML_PIPELINE_REDIRECT_MSG
+    except Exception:  # pragma: no cover — the guard must never break exec
+        pass
+    return _PIPELINE_REDIRECT_MSG
+
+
 def _pipeline_guard_active() -> bool:
     """False when this tenant has no app builder to be redirected to.
 
@@ -610,10 +641,16 @@ def _pipeline_guard_active() -> bool:
 
     Unknown families default to entitled, so this is a no-op for every tenant
     on the default `AGENT_TOOL_FAMILIES="*"`.
+
+    Round 12 adds the pipeline axis: the family can be entitled while BOTH
+    pipelines are switched off, which is the same dead end by a different
+    route. The guard stands down unless at least one of them is live.
     """
     try:
-        from app.agent.tool_entitlements import family_enabled
-        return family_enabled("app_builder")
+        from app.agent.tool_entitlements import family_enabled, pipeline_enabled
+        if not family_enabled("app_builder"):
+            return False
+        return pipeline_enabled("expo") or pipeline_enabled("html")
     except Exception:  # pragma: no cover — the guard must never break exec
         return True
 
@@ -1352,7 +1389,7 @@ class ToolExecutor:
         # Pipeline guard — block app scaffolding commands
         if _pipeline_guard_active() and _is_app_building_exec(command):
             logger.warning(f"[PIPELINE-GUARD] Blocked app-building exec: {command[:100]}")
-            return _PIPELINE_REDIRECT_MSG
+            return _pipeline_redirect_msg()
 
         # Destructive command check — requires explicit user confirmation
         confirmed = inp.get("confirmed", False)
@@ -1626,7 +1663,7 @@ class ToolExecutor:
         # Pipeline guard — block manual app file creation
         if _pipeline_guard_active() and _is_app_building_write(path, content):
             logger.warning(f"[PIPELINE-GUARD] Blocked app-building write_file: {path}")
-            return _PIPELINE_REDIRECT_MSG
+            return _pipeline_redirect_msg()
 
         # Document placement contract — see _normalize_document_write_path.
         path, doc_redirected = self._normalize_document_write_path(path)
@@ -2026,6 +2063,14 @@ class ToolExecutor:
         "generate_docx": "doc_gen_docx",
         "generate_xlsx": "doc_gen_xlsx",
         "generate_pptx": "doc_gen_pptx",
+        # Round 12 — the HTML-artifact app pipeline. These reach this map
+        # because `_meter_flat_tool` sits AFTER the whole if/elif dispatch in
+        # `execute()`, so it runs on the skill branch too. `create` is deep
+        # work (a whole document in one generation), `edit` is a surgical
+        # replacement; `view`/`bash`/`present` are unpriced because they only
+        # read back what those two produced.
+        "app_html__create_app_file": "app_html_create",
+        "app_html__edit_app_file": "app_html_edit",
     }
 
     async def _meter_flat_tool(self, tool_name: str, result: str) -> None:

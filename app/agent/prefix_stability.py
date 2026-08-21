@@ -45,6 +45,14 @@ def tool_name(tool: Dict[str, Any]) -> str:
     return tool.get("name", "") or (tool.get("function", {}) or {}).get("name", "") or ""
 
 
+#: Both app-building pipelines. `app_html__` joins the strip in round 12 for
+#: the same reason `app_builder__` was there: on `vibecoding` the user is
+#: already in a build surface, and on `app` the caller IS a built app — an
+#: app that can build apps is a recursion, not a feature. Missing it would
+#: have made the strip a no-op the moment the Expo pipeline was switched off.
+_APP_BUILD_PREFIXES = ("app_builder__", "app_html__")
+
+
 def strip_tools_for_channel(
     tools: List[Dict[str, Any]],
     channel: str,
@@ -64,11 +72,14 @@ def strip_tools_for_channel(
     """
     stripped = strip_vault_tool_for_channel(list(tools), channel)
     if channel == "vibecoding":
-        stripped = [t for t in stripped if not tool_name(t).startswith("app_builder__")]
+        stripped = [
+            t for t in stripped
+            if not tool_name(t).startswith(_APP_BUILD_PREFIXES)
+        ]
     elif channel == "app":
         stripped = [
             t for t in stripped
-            if not tool_name(t).startswith("app_builder__")
+            if not tool_name(t).startswith(_APP_BUILD_PREFIXES)
             and tool_name(t) not in ("write_file", "edit_file", "exec", "pty_exec", "apply_patch")
         ]
     return stripped

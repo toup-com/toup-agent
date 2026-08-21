@@ -229,6 +229,12 @@ FLAT_FEES: dict[str, dict] = {
     "doc_gen_xlsx":        {"bucket": BUCKET_MESSAGE,     "credits": Decimal("1.0")},
     "doc_gen_pptx":        {"bucket": BUCKET_MESSAGE,     "credits": Decimal("1.0")},
     "reminder_fire":       {"bucket": BUCKET_MESSAGE,     "credits": Decimal("0.1")},
+    # Round 12 — single-file HTML app pipeline. Writing a whole app is deep
+    # work (the model emits the entire document in one turn); a surgical
+    # edit is a fraction of that, so it is priced a fraction of that.
+    # view/bash/present are free: they read what the paid calls produced.
+    "app_html_create":     {"bucket": BUCKET_MESSAGE,     "credits": Decimal("5.0")},
+    "app_html_edit":       {"bucket": BUCKET_MESSAGE,     "credits": Decimal("0.5")},
 }
 
 
