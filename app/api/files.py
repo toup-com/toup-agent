@@ -8,6 +8,13 @@ Auth: JWT via existing get_current_user dependency. The endpoint verifies
 that the requested attachment belongs to a conversation owned by the
 caller — cross-user access returns 404 (not 403, to avoid leaking
 attachment existence).
+
+Caching: an attachment id is a fresh uuid4 minted by
+`doc_generators._persist`, and nothing ever rewrites the storage key it
+names. The bytes behind one of these URLs are therefore IMMUTABLE for the
+life of the row, which is what lets both routes send a strong `ETag` plus
+`max-age=31536000, immutable` and answer a conditional GET with a bodyless
+304. See `attachment_etag` for why the validator needs no read.
 """
 
 from __future__ import annotations
@@ -32,6 +39,108 @@ from app.services.file_storage import get_storage_backend, stream_file
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/files", tags=["Files"])
+
+
+# ── Cache validators ────────────────────────────────────────────────────
+#
+# The inline card was re-downloading the same picture on every visit to a
+# thread. `private, max-age=3600` and no validator means the browser has
+# exactly two states for a 2.4 MB PNG: fresh for an hour, then a full
+# unconditional re-fetch. There was nothing in between, because there was
+# no ETag to revalidate WITH — so an image looked at on Monday was pulled
+# down again on Tuesday, and the card showed a spinner for it.
+#
+# A chat attachment cannot change, so `immutable` is not an optimism here,
+# it is the fact: `_persist` mints a new uuid4 per file and writes it once.
+
+_ATTACHMENT_CACHE = "private, max-age=31536000, immutable"
+
+# A DERIVED rendering (DOCX/PPTX → PDF via LibreOffice) is deterministic in
+# its source but not in the renderer, so it revalidates hourly rather than
+# being pinned for a year. The ETag still turns that revalidation into a
+# 304 instead of a re-transfer.
+_DERIVED_CACHE = "private, max-age=3600"
+
+
+def attachment_etag(attachment_id: str, size: int, variant: str = "") -> str:
+    """Strong validator for one attachment's bytes — computed, never read.
+
+    The id IS the content address: `_persist` mints a uuid4 per file, uses it
+    in the storage key, and nothing rewrites that key. So the pair (id, size)
+    names exactly one immutable blob and no hashing is needed to prove it —
+    which matters, because hashing would mean reading the whole file on a
+    request whose entire point is to transfer nothing.
+
+    `variant` separates the inline WebP derivative and the LibreOffice PDF
+    render from the original: they share an id but not their bytes, and one
+    ETag across all three would let a client hold a thumbnail and be told its
+    copy of the full-size image is current.
+    """
+    tag = f"{attachment_id}-{int(size or 0)}"
+    if variant:
+        tag = f"{tag}-{variant}"
+    return f'"{tag}"'
+
+
+def _suffix_etag(etag: Optional[str], suffix: str) -> Optional[str]:
+    """`"abc-12"` + `pdf` → `"abc-12-pdf"`. Names a DERIVATION of the bytes
+    `etag` validates, so a client holding the render and a client holding the
+    source are never told the same thing."""
+    if not etag:
+        return None
+    body = etag[2:] if etag.startswith("W/") else etag
+    return f'{body[:-1]}-{suffix}"' if body.endswith('"') else f'"{body}-{suffix}"'
+
+
+def etag_matches(request: Optional[Request], etag: str) -> bool:
+    """True when the caller already holds `etag` (RFC 9110 If-None-Match).
+
+    Handles the comma-separated list, `*`, and the `W/` prefix — a GET uses
+    the WEAK comparison function, so `W/"x"` and `"x"` match each other.
+    """
+    if request is None or not etag:
+        return False
+    header = request.headers.get("if-none-match") or ""
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    want = etag[2:] if etag.startswith("W/") else etag
+    for candidate in header.split(","):
+        c = candidate.strip()
+        if c.startswith("W/"):
+            c = c[2:]
+        if c and c == want:
+            return True
+    return False
+
+
+def not_modified(etag: str, cache_control: str) -> Response:
+    """A 304 carrying the validators and NOTHING else.
+
+    Starlette omits content-length and content-type for 304 on its own; a
+    body here would be a protocol violation, and clients that do not simply
+    ignore it tend to hang waiting for bytes the framing already ended.
+    """
+    return Response(status_code=304, headers={"ETag": etag, "Cache-Control": cache_control})
+
+
+def _conditional_headers(request: Optional[Request]) -> dict:
+    """The caller's cache validators, to forward upstream.
+
+    Without this the platform proxy strips every conditional a browser
+    sends, so the agent can never answer 304 and the platform — where every
+    real user is — re-transfers the file on each revalidation no matter what
+    the agent's headers say.
+    """
+    if request is None:
+        return {}
+    out = {}
+    for h in ("if-none-match", "if-modified-since"):
+        v = request.headers.get(h)
+        if v:
+            out[h] = v
+    return out
 
 
 async def _get_agent_proxy_info(user_id: str, db: AsyncSession):
@@ -119,9 +228,12 @@ async def _proxy_file(
     accept: Optional[str] = None,
     *,
     read_timeout: float = _PROXY_READ_S,
+    conditional: Optional[dict] = None,
 ):
     """Open a streaming GET to the agent's files endpoint and return an
     (content_iter, headers, status) tuple. Caller wraps into StreamingResponse.
+    A `status` of 304 means the iterator is empty and the caller must answer
+    with a bodyless `Response(304, headers=…)`.
 
     Uses aiter_bytes (decoded) and does NOT forward content-length — any
     intermediate gzip would make that value wrong, and a stale content-length
@@ -133,6 +245,12 @@ async def _proxy_file(
     preview route can tell a browser/WebView navigation (wants an HTML
     fallback page) from a fetch() (wants JSON). Without it httpx sends
     `*/*` and every client would get JSON.
+
+    ``conditional`` carries the caller's If-None-Match / If-Modified-Since.
+    A proxy that drops those turns every revalidation into a full transfer,
+    which is what made caching invisible in production: the agent has spoken
+    Cache-Control since the file routes existed, but on run_mode=platform —
+    where every real user is — no validator ever crossed this hop.
     """
     url = f"{agent_url.rstrip('/')}/api/files/{path}"
     # TKT-LAT-007 (wave 3): shared agent_http client. Streaming response
@@ -144,6 +262,7 @@ async def _proxy_file(
     headers = {"X-Agent-Key": agent_api_key}
     if accept:
         headers["Accept"] = accept
+    headers.update(conditional or {})
     req = client.build_request(
         "GET", url,
         headers=headers,
@@ -174,6 +293,23 @@ async def _proxy_file(
 
         return _one(), err_headers, resp.status_code
 
+    if resp.status_code == 304:
+        # The agent says the caller's copy is current. There is no body to
+        # stream, so close the upstream response here — nobody will iterate
+        # it — and relay only the validators.
+        await resp.aclose()
+        nm_headers = {}
+        for h in ("etag", "cache-control", "vary", "last-modified"):
+            v = resp.headers.get(h)
+            if v:
+                nm_headers[h] = v
+
+        async def _none():
+            return
+            yield b""  # pragma: no cover — makes this a generator
+
+        return _none(), nm_headers, 304
+
     async def _iter():
         try:
             async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
@@ -184,8 +320,11 @@ async def _proxy_file(
     # Only forward content-type and content-disposition. Let chunked transfer
     # encoding handle framing so the browser doesn't wait on a size that may
     # not match (e.g. after transparent gzip decoding in the httpx layer).
+    # `etag` / `last-modified` ride along because a validator the proxy drops
+    # is a validator the browser can never send back.
     passthrough_headers = {}
-    for h in ("content-type", "content-disposition", "cache-control"):
+    for h in ("content-type", "content-disposition", "cache-control",
+              "etag", "last-modified", "vary"):
         v = resp.headers.get(h)
         if v:
             passthrough_headers[h] = v
@@ -316,6 +455,10 @@ async def download_file(
     point of opening one is to inspect the real thing. A missing derivative
     falls through to the original rather than 404ing: it is an optimisation,
     and an image is worth delivering slowly.
+
+    The response carries a strong ETag and `immutable` freshness, and a
+    conditional GET is answered 304 without touching the file — the bytes
+    behind one attachment id never change.
     """
     current_user = await _get_user_for_file(request, token, db)
 
@@ -327,7 +470,10 @@ async def download_file(
         content_iter, headers, status = await _proxy_file(
             proxy[0], proxy[1], f"{message_id}/{attachment_id}",
             {"variant": variant} if variant else {},
+            conditional=_conditional_headers(request),
         )
+        if status == 304:
+            return Response(status_code=304, headers=headers)
         return StreamingResponse(content_iter, status_code=status,
                                  media_type=headers.get("content-type", "application/octet-stream"),
                                  headers=headers)
@@ -345,23 +491,36 @@ async def download_file(
     filename = att.get("filename", "download.bin")
     mime = att.get("mime_type", "application/octet-stream")
 
+    # `served_thumb` tracks what we ACTUALLY serve, not what was asked for: a
+    # request for the derivative that falls through to the original must not
+    # be tagged as the derivative, or a client holding the thumbnail would be
+    # told its copy of the full-size image is current.
+    served_thumb = False
     if (variant or "").lower() == "thumb":
         from app.agent.doc_generators import thumb_key
         tkey = thumb_key(key)
         if backend.exists(tkey):
-            key, mime = tkey, "image/webp"
+            key, mime, served_thumb = tkey, "image/webp", True
+
+    size = backend.size(key)
+    etag = attachment_etag(attachment_id, size, "thumb" if served_thumb else "")
+    if etag_matches(request, etag):
+        return not_modified(etag, _ATTACHMENT_CACHE)
 
     return StreamingResponse(
         stream_file(key),
         media_type=mime,
         headers={
-            "Content-Length": str(backend.size(key)),
+            "Content-Length": str(size),
             "Content-Disposition": f'attachment; filename="{filename}"',
-            # A derivative is content-addressed by the attachment id and never
-            # changes, so it may be cached hard. Revisiting a thread then costs
-            # nothing at all, which is the other half of the latency fix.
-            "Cache-Control": "private, max-age=31536000, immutable"
-            if (variant or "").lower() == "thumb" else "private, max-age=3600",
+            # Original and derivative alike are content-addressed by the
+            # attachment id and never change, so both may be cached hard.
+            # Revisiting a thread then costs nothing at all — which is the
+            # other half of the latency fix, and the half the original was
+            # missing: at max-age=3600 with no validator, an image looked at
+            # yesterday was re-downloaded in full today.
+            "Cache-Control": _ATTACHMENT_CACHE,
+            "ETag": etag,
         },
     )
 
@@ -408,7 +567,10 @@ async def preview_file(
             proxy[0], proxy[1], f"{message_id}/{attachment_id}/preview", {"format": format},
             accept=request.headers.get("accept") if request else None,
             read_timeout=_PREVIEW_READ_S,
+            conditional=_conditional_headers(request),
         )
+        if status == 304:
+            return Response(status_code=304, headers=headers)
         return StreamingResponse(content_iter, status_code=status,
                                  media_type=headers.get("content-type", "text/html"),
                                  headers=headers)
@@ -420,18 +582,21 @@ async def preview_file(
     if not key or not backend.exists(key):
         raise HTTPException(status_code=410, detail="File unavailable")
 
+    size = backend.size(key)
     return await render_preview(
         request,
         stream=lambda: stream_file(key),
         open_file=lambda: backend.open(key),
         path_of=lambda: backend.path(key),
-        size=backend.size(key),
+        size=size,
         backend_key=key,
         mime=mime,
         filename=att.get("filename") or "document",
         download_url=f"{settings.api_prefix}/files/{message_id}/{attachment_id}",
         token=token,
         format=format,
+        etag=attachment_etag(attachment_id, size),
+        cache_control=_ATTACHMENT_CACHE,
     )
 
 
@@ -448,6 +613,8 @@ async def render_preview(
     token: Optional[str] = None,
     format: str = "html",
     backend_key: Optional[str] = None,
+    etag: Optional[str] = None,
+    cache_control: str = _DERIVED_CACHE,
 ) -> Response:
     """Server-side preview for one file — shared by the chat attachment route
     above and the file library (app/api/library.py).
@@ -461,6 +628,18 @@ async def render_preview(
     get the download-only fallback. ``backend_key`` is the file_storage key
     (relative to generated/) when the file lives in the storage backend;
     the LibreOffice DOCX/PPTX → PDF path needs it for its cache entry.
+
+    ``etag`` is the caller's validator for the SOURCE bytes; when given, a
+    matching If-None-Match is answered 304 before any work happens — which
+    for the DOCX/PPTX branch means before LibreOffice is asked for anything.
+    Callers whose bytes can be replaced under a stable URL (the file library)
+    must fold something that changes — size, mtime — into it, and leave
+    ``cache_control`` at the revalidating default. Only chat attachments,
+    whose id is minted per file, may pass `immutable`.
+
+    The HTML branches (mammoth DOCX, XLSX tables) deliberately carry no
+    validator: they are small, generated documents whose markup follows the
+    server, and a 304 on one would pin a layout that shipped months ago.
     """
     mime = mime or "application/octet-stream"
     filename = filename or "document"
@@ -471,19 +650,20 @@ async def render_preview(
     # `attachment`) is what makes an <iframe src=…> display rather than
     # download.
     if mime == "application/pdf" or mime.startswith("image/"):
-        return StreamingResponse(
-            stream(),
-            media_type=mime,
-            headers={
-                "Content-Length": str(int(size or 0)),
-                "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}"',
-                "Cache-Control": "private, max-age=3600",
-                # Nothing on this route is user-authored markup, but a
-                # served image/PDF must never be sniffed into something
-                # executable.
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
+        if etag and etag_matches(request, etag):
+            return not_modified(etag, cache_control)
+        headers = {
+            "Content-Length": str(int(size or 0)),
+            "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}"',
+            "Cache-Control": cache_control,
+            # Nothing on this route is user-authored markup, but a
+            # served image/PDF must never be sniffed into something
+            # executable.
+            "X-Content-Type-Options": "nosniff",
+        }
+        if etag:
+            headers["ETag"] = etag
+        return StreamingResponse(stream(), media_type=mime, headers=headers)
 
     # ── DOCX / PPTX → PDF via LibreOffice ────────────────────────
     # Production-grade faithful rendering. Cached per file.
@@ -491,6 +671,13 @@ async def render_preview(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ):
+        # Its own validator: the render is not the source, and a client
+        # holding the PDF must not be told its copy of the DOCX is current.
+        # Checked BEFORE render_to_pdf — the cheapest conversion measured is
+        # 0.2 s from cache, and a 304 should cost nothing at all.
+        pdf_etag = _suffix_etag(etag, "pdf")
+        if pdf_etag and etag_matches(request, pdf_etag):
+            return not_modified(pdf_etag, _DERIVED_CACHE)
         from app.services.doc_preview import render_to_pdf
         try:
             pdf_bytes = await render_to_pdf(backend_key)
@@ -499,14 +686,13 @@ async def render_preview(
             raise HTTPException(status_code=501, detail=str(e))
         if not pdf_bytes:
             raise HTTPException(status_code=502, detail="LibreOffice conversion failed")
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                "Cache-Control": "private, max-age=3600",
-                "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}.pdf"',
-            },
-        )
+        headers = {
+            "Cache-Control": _DERIVED_CACHE,
+            "Content-Disposition": f'inline; filename="{_ascii_filename(filename)}.pdf"',
+        }
+        if pdf_etag:
+            headers["ETag"] = pdf_etag
+        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
     if format != "html" and format != "png":
         raise HTTPException(status_code=400, detail="format must be 'html' or 'png'")

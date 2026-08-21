@@ -30,12 +30,14 @@ from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
-from app.api.files import get_user_for_file, render_preview
+from app.api.files import (
+    etag_matches, get_user_for_file, not_modified, render_preview,
+)
 from app.config import settings
 from app.db import get_db
 from app.db.models.user_file import ORIGIN_UPLOAD, UserFile, UserFolder
@@ -155,18 +157,43 @@ async def _read_upload(upload: UploadFile) -> bytes:
     return b"".join(chunks)
 
 
-async def _download_response(user_id: str, f: UserFile, *, inline: bool) -> StreamingResponse:
+_LIBRARY_CACHE = "private, max-age=3600"
+
+
+def _library_etag(f: UserFile, path: str) -> str:
+    """Validator for a library file's bytes.
+
+    Unlike a chat attachment, a library file id is a STABLE handle whose
+    bytes a re-upload can replace, so the validator has to move when they do
+    — hence size and mtime, not the id alone. That is also why the library
+    keeps a revalidating `max-age` rather than `immutable`: the ETag makes
+    revalidation free, but it must still happen.
+    """
+    try:
+        st = os.stat(path)
+        return f'"{f.id}-{st.st_size}-{int(st.st_mtime)}"'
+    except OSError:
+        return f'"{f.id}"'
+
+
+async def _download_response(
+    user_id: str, f: UserFile, *, inline: bool, request: Optional[Request] = None
+) -> Response:
     path = lib.file_abspath(user_id, f)
     if not path:
         raise HTTPException(410, "This file is no longer available")
     length = os.path.getsize(path)
+    etag = _library_etag(f, path)
+    if etag_matches(request, etag):
+        return not_modified(etag, _LIBRARY_CACHE)
     return StreamingResponse(
         _stream_path(path),
         media_type=f.mime_type or "application/octet-stream",
         headers={
             "Content-Length": str(length),
             "Content-Disposition": _content_disposition("inline" if inline else "attachment", f.name),
-            "Cache-Control": "private, max-age=3600",
+            "Cache-Control": _LIBRARY_CACHE,
+            "ETag": etag,
             "X-Content-Type-Options": "nosniff",
         },
     )
@@ -403,7 +430,7 @@ async def library_download(
 ):
     user = await get_user_for_file(request, token, db)
     f = await _require_file(db, user.id, file_id)
-    return await _download_response(user.id, f, inline=inline)
+    return await _download_response(user.id, f, inline=inline, request=request)
 
 
 @router.get("/library/files/{file_id}/preview")
@@ -431,6 +458,7 @@ async def library_preview(
         download_url=f"{_api()}/library/files/{f.id}/download",
         token=token,
         format=format,
+        etag=_library_etag(f, path),
     )
 
 
@@ -772,7 +800,7 @@ async def compat_download(
     res = await lib.resolve_virtual_path(db, user.id, path)
     if res is None or res.kind != "file":
         raise HTTPException(404, "File not found")
-    return await _download_response(user.id, res.file, inline=inline)
+    return await _download_response(user.id, res.file, inline=inline, request=request)
 
 
 @router.post("/workspace/file-upload", status_code=201)

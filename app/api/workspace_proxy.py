@@ -128,6 +128,16 @@ async def _forward(request: Request, user_id: str, upstream_path: str, db: Async
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_RESPONSE_HEADERS}
     media_type = resp.headers.get("content-type")
 
+    if resp.status_code == 304:
+        # `if-none-match` has always been forwarded (_FORWARD_REQUEST_HEADERS),
+        # but until the library routes carried an ETag the agent had nothing to
+        # match and this was unreachable. Now that it is reachable, a 304 must
+        # not come back as a StreamingResponse: that frames a body the status
+        # forbids and stamps a content-type on a response that has no content.
+        await resp.aclose()
+        out_headers.pop("content-type", None)
+        return Response(status_code=304, headers=out_headers)
+
     async def _iter():
         try:
             async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):

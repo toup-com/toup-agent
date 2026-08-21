@@ -775,6 +775,14 @@ def _message_to_response(
 
     # Generated-file attachments (JSON column — already a Python list).
     # Strip storage_path — internal key, not for the client.
+    #
+    # The URLs are built by day_chats._attachment_urls, deliberately, not by
+    # hand here. This route is the FALLBACK the mobile client takes whenever
+    # /api/day-chats fails, and an attachment that arrives here missing the
+    # `thumb_url` day-chats advertises loads the multi-megabyte original into
+    # a card sized for a tenth of it — the fallback would be visibly slower
+    # than the path it stands in for, which is the one shape a fallback must
+    # not have. width/height/has_thumb already ride through untouched.
     attachments_list = None
     raw_atts = getattr(message, 'attachments', None)
     # Belt-and-braces: some drivers may return a JSON string even on a JSON column.
@@ -784,8 +792,12 @@ def _message_to_response(
         except (json.JSONDecodeError, TypeError):
             raw_atts = None
     if isinstance(raw_atts, list):
+        from app.api.day_chats import _attachment_urls
         attachments_list = [
-            {k: v for k, v in att.items() if k != "storage_path"}
+            {
+                **{k: v for k, v in att.items() if k != "storage_path"},
+                **_attachment_urls(message.id, att),
+            }
             for att in raw_atts
             if isinstance(att, dict)
         ]
