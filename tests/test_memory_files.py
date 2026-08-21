@@ -13,6 +13,7 @@ import pytest
 
 from app.memory_files import (
     normalize_bullet,
+    normalize_description,
     ALWAYS_INJECTED_SLUGS,
     CAP_PROFILE,
     CURRENT_CONTEXT_LAYERS,
@@ -325,3 +326,55 @@ def test_an_ellipsis_is_left_alone():
 def test_persian_is_unaffected():
     fa = "هر روز صبح ساعت ۷ می‌دود و بعدش صبحانه می‌خورد"
     assert normalize_bullet(fa) == fa
+
+
+# ── Description punctuation is repaired, not fatal ────────────────────
+#
+# CI 32436489185: the writer tried TWICE in one batch to open the person file
+# P06 needs — `people/majid-tajik`, then `people/majid` — and both died on the
+# description punctuation, taking every link that pointed at them with them.
+# The routing was right; a full stop was missing. Third time in this rebuild
+# that a formatting refusal cost the substance.
+
+
+def test_a_missing_full_stop_is_added():
+    assert normalize_description(
+        "Their IELTS tutor — how they teach; read when IELTS comes up"
+    ) == "Their IELTS tutor — how they teach; read when IELTS comes up."
+
+
+def test_a_plain_hyphen_becomes_the_em_dash():
+    assert normalize_description(
+        "Their IELTS tutor - how they teach; read when IELTS comes up."
+    ) == "Their IELTS tutor — how they teach; read when IELTS comes up."
+
+
+def test_a_comma_before_read_when_becomes_a_semicolon():
+    assert normalize_description(
+        "Their IELTS tutor — how they teach, read when IELTS comes up."
+    ) == "Their IELTS tutor — how they teach; read when IELTS comes up."
+
+
+def test_all_three_at_once():
+    assert description_problem(normalize_description(
+        "Their IELTS tutor - how they teach, read when IELTS comes up"
+    )) is None
+
+
+def test_a_conforming_description_is_untouched():
+    good = "Their IELTS tutor — how they teach; read when IELTS comes up."
+    assert normalize_description(good) == good
+
+
+def test_only_the_FIRST_dash_is_promoted():
+    """Later dashes are prose and must survive."""
+    out = normalize_description(
+        "Their tutor - a part-time teacher - who they are; read when it comes up"
+    )
+    assert out.count("—") == 1
+    assert "part-time" in out
+
+
+def test_something_that_is_not_a_description_is_still_refused():
+    """The repair is punctuation only. It cannot invent the shape."""
+    assert description_problem(normalize_description("a tutor")) is not None

@@ -183,6 +183,37 @@ DESCRIPTION_RE = re.compile(r"^.{3,80} — .{3,120}; read when .{3,120}\.$")
 DESCRIPTION_MAX = 400
 
 
+def normalize_description(text: Optional[str]) -> str:
+    """Repair the three punctuation near-misses, and nothing else.
+
+    `DESCRIPTION_RE` wants an EM DASH, a semicolon before "read when", and a
+    trailing full stop. A writer that gets any one of them slightly wrong loses
+    the whole `create_file` — and with it every `add` that named the file and
+    every `link` that pointed at it. CI 32436489185: the writer tried TWICE in
+    one batch to open the person file P06 needs, as `people/majid-tajik` and
+    then `people/majid`, and both died on this punctuation. The routing was
+    right; the full stop was missing.
+
+    This is the third time in this rebuild that a formatting refusal has cost
+    the substance (the prompt exhibit, the bare slug, now this), so it follows
+    `normalize_bullet`: repair what is unambiguous, refuse what is not. Each
+    rewrite below is a pure punctuation swap that cannot change meaning, and
+    the result is handed to `description_problem` exactly as before — if it
+    still does not conform it is still rejected.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    # A spaced hyphen or en dash where the em dash belongs — first one only,
+    # because later dashes are part of the prose.
+    t = re.sub(r"\s+[-–]\s+", " — ", t, count=1)
+    # "…, read when …" — a comma where the semicolon belongs.
+    t = re.sub(r",\s+read when ", "; read when ", t, count=1)
+    if not t.endswith("."):
+        t += "."
+    return t
+
+
 def description_problem(text: Optional[str]) -> Optional[str]:
     """None when the description is well formed, else why it is not."""
     text = (text or "").strip()

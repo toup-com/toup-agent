@@ -55,6 +55,7 @@ from app.memory_files import (
     FileSection,
     bullet_problem,
     normalize_bullet,
+    normalize_description,
     description_problem,
     extract_links,
     is_bullet_list,
@@ -726,7 +727,12 @@ def validate_ops(
             if not title:
                 complaints.append(f"create_file: {slug!r} needs a title")
                 continue
-            problem = description_problem(op.get("description"))
+            # Normalise BEFORE validating, so the same punctuation repair
+            # `normalize_bullet` does for bodies is available here — see
+            # `normalize_description` for why a refusal is the expensive
+            # option on this particular field.
+            desc = normalize_description(op.get("description"))
+            problem = description_problem(desc)
             if problem:
                 complaints.append(f"create_file {slug!r}: {problem}")
                 continue
@@ -738,7 +744,10 @@ def validate_ops(
                 continue
             states[slug] = FileState(
                 slug=slug, section=section.value, title=title,
-                description=(op.get("description") or "").strip(),
+                # The NORMALISED text, not the raw op — validating one string
+                # and storing another is how a body ends up holding what the
+                # lint never saw.
+                description=desc,
                 is_new=True, dirty=True, raw_body="",
             )
             plan.accepted.append({
@@ -768,11 +777,12 @@ def validate_ops(
                     "is fixed — store the fact itself with add or rewrite"
                 )
                 continue
-            problem = description_problem(op.get("description"))
+            desc = normalize_description(op.get("description"))
+            problem = description_problem(desc)
             if problem:
                 complaints.append(f"update_description {state.slug}: {problem}")
                 continue
-            state.description = (op.get("description") or "").strip()
+            state.description = desc
             plan.accepted.append({
                 "op": "update_description", "slug": state.slug,
                 "description": state.description,
