@@ -150,11 +150,19 @@ class Settings(BaseSettings):
     # deliberately NOT deleted: `APP_BUILDER_EXPO_ENABLED=1` on the bridge
     # env is the rollback, one container recreate away.
     #
-    # A default is not a live value. Any container whose env already
-    # carries `APP_BUILDER_EXPO_ENABLED=1` (the canary set it explicitly)
-    # keeps Expo until that variable is cleared on the bridge env and the
-    # container is recreated — `bridge/pool_addon.py::_FEATURE_FLAG_ENVS`
-    # forwards it, and a forwarded value outranks this default.
+    # 2026-08-21 (P0): THIS SETTING IS NOW INERT. A default is not a live
+    # value, and this one had three ways to be overridden — a bridge env
+    # pin the canary set explicitly, an image predating the flip, and a
+    # `AGENT_TOOL_FAMILIES` axis that could not close either gap. So the
+    # gate moved OUT of settings and into code:
+    # `app/agent/tool_entitlements.py::EXPO_PIPELINE_RETIRED`, which forces
+    # `pipeline_enabled("expo")` False no matter what this field says.
+    #
+    # The field is kept — it is what `_resolved_pipelines` reads in order
+    # to LOG that a dead pin is present, which is the only remaining way to
+    # find containers still carrying `APP_BUILDER_EXPO_ENABLED=1` now that
+    # the host's SSH key is rotated. Setting it True does not re-enable
+    # Expo; flip `EXPO_PIPELINE_RETIRED` for that.
     app_builder_expo_enabled: bool = False
     # `app_html_enabled` gates the replacement, and is the ONLY app
     # pipeline a default container now runs. Both on = the old canary

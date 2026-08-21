@@ -225,15 +225,23 @@ def _entitle(value: str) -> None:
 
 
 def _pin_expo_on() -> None:
-    """Force the legacy Expo pipeline on for a FAMILY-axis test.
+    """Set the dead `APP_BUILDER_EXPO_ENABLED` pin. Kept, but it no longer
+    isolates anything — read this before using it.
 
-    `skill_enabled` answers two independent questions — "is this tenant
-    entitled to the family?" and "does this container run that pipeline?" —
-    and since 2026-08-21 the second one says no to `app_builder`/`app` by
-    default. A family test that uses an Expo skill as its specimen would
-    then be measuring the pipeline axis and reporting it as the family axis:
-    the withheld case passes for the wrong reason and the entitled control
-    fails outright. Pinning the pipeline leaves exactly one variable moving.
+    `skill_enabled` answers two independent questions: "is this tenant
+    entitled to the family?" and "does this container run that pipeline?".
+    This helper used to force the second one to yes so a family-axis test
+    could use an Expo skill as its specimen and still move one variable.
+
+    2026-08-21 (P0) ended that. The Expo pipeline is retired IN CODE
+    (`tool_entitlements.EXPO_PIPELINE_RETIRED`), so no setting pins it back
+    on and `app_builder` / `app` are False on every posture. A family-axis
+    test must therefore take its specimen from the family's LIVE member —
+    `app_html`, which is in the same `app_builder` family — or its entitled
+    control asserts something that can no longer happen.
+
+    The call is left in the withheld-case tests below because it proves the
+    withholding is not merely the dead pin's doing.
     """
     settings.app_builder_expo_enabled = True
     te_mod.reset_cache_for_tests()
@@ -707,19 +715,35 @@ async def test_withholding_the_app_builder_withholds_its_gateway_too():
 
 
 @pytest.mark.asyncio
-async def test_an_entitled_tenant_still_gets_the_gateway():
-    """ANTI-VACUITY control for the test above."""
+async def test_an_entitled_tenant_still_gets_the_app_family():
+    """ANTI-VACUITY control for the test above.
+
+    The specimen is `app_html`, not the Expo gateway. Since 2026-08-21 the
+    gateway can NEVER register (see `_pin_expo_on`), so asserting that an
+    entitled tenant gets it would assert something impossible — and the
+    control would fail for a reason that has nothing to do with
+    entitlements. `app_html` is in the same `app_builder` family, so it
+    exercises the same gate on a pipeline that is actually live.
+    """
     from app.agent.skills.builtins.app_builder.app_gateway_skill import (
         AppGatewaySkill,
     )
+    from app.agent.skills.builtins.app_html.skill import AppHtmlSkill
     from app.agent.skills.loader import SkillLoader
 
-    _pin_expo_on()                   # isolate the family axis — see helper
+    _pin_expo_on()
     _entitle("*")
     loader = SkillLoader()
-    assert await loader.register_dynamic(AppGatewaySkill()) is True
+    assert await loader.register_dynamic(AppHtmlSkill()) is True
     names = {t["name"] for t in loader.get_all_tool_definitions()}
-    assert any(n.startswith("app__") for n in names)
+    assert any(n.startswith("app_html__") for n in names)
+
+    # …and the retired half stays out even here, on the most permissive
+    # posture there is. This is the one assertion that would have caught
+    # the P0: an entitled tenant with the pin set still gets no Expo.
+    assert await loader.register_dynamic(AppGatewaySkill()) is False
+    names = {t["name"] for t in loader.get_all_tool_definitions()}
+    assert not any(n.startswith("app__") for n in names), sorted(names)
 
 
 @pytest.mark.asyncio
@@ -783,16 +807,24 @@ def test_every_skill_shipped_under_app_builder_is_named_by_the_family():
 
 def test_skill_enabled_answers_for_the_gateway_by_name():
     """The loader's actual question, asked directly."""
-    _pin_expo_on()                   # isolate the family axis — see helper
+    _pin_expo_on()
     _entitle("doc_generation,toup")
     assert te_mod.skill_enabled("app") is False
     assert te_mod.skill_enabled("app_builder") is False
+    assert te_mod.skill_enabled("app_html") is False
     assert te_mod.skill_enabled("routines") is True
+
     _entitle("*")
-    assert te_mod.skill_enabled("app") is True
-    # And with the pipeline back at its shipped default the same entitled
-    # tenant gets the HTML pipeline instead — "entitled to build apps" has
-    # not become "entitled to nothing".
+    # The retired half stays out even with the family entitled AND the dead
+    # pin set — there is no posture that brings it back.
+    assert te_mod.skill_enabled("app") is False
+    assert te_mod.skill_enabled("app_builder") is False
+    # …while the entitled tenant does get the family's live member, so
+    # "entitled to build apps" has not become "entitled to nothing". This is
+    # the control: without it the assertions above would pass on a
+    # `skill_enabled` that returns False for everything.
+    assert te_mod.skill_enabled("app_html") is True
+
     settings.app_builder_expo_enabled = False
     te_mod.reset_cache_for_tests()
     assert te_mod.skill_enabled("app") is False

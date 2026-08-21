@@ -172,6 +172,12 @@ class SkillLoader:
         builtins_dir = os.path.join(os.path.dirname(__file__), "builtins")
         dirs_to_scan = [builtins_dir] + self._extra_dirs
 
+        # Imported here rather than at module scope for the same reason
+        # `_register` imports `skill_enabled` locally: `tool_entitlements`
+        # reaches into `app.config`, and the loader is constructed early
+        # enough in boot that a top-level import would order-couple the two.
+        from app.agent.tool_entitlements import RETIRED_SKILLS
+
         loaded = 0
         for scan_dir in dirs_to_scan:
             if not os.path.isdir(scan_dir):
@@ -183,6 +189,20 @@ class SkillLoader:
                 skill_file = os.path.join(skill_dir, "skill.py")
 
                 if not os.path.isfile(skill_file):
+                    continue
+
+                # A retired skill is skipped BEFORE the import, not after.
+                # `_register` would reject it anyway, but `_load_skill_from_file`
+                # execs the module to find the Skill subclass, and
+                # `app_builder/skill.py` is 278 KB whose import pulls in the
+                # AppManager/Metro machinery and leaves a `toup_skill_*` entry
+                # in `sys.modules`. Nothing should pay that to load a skill
+                # that cannot register.
+                if entry in RETIRED_SKILLS:
+                    logger.info(
+                        "[SKILLS] Skipping retired skill dir '%s' — not imported",
+                        entry,
+                    )
                     continue
 
                 try:

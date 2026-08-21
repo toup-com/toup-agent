@@ -221,6 +221,46 @@ def family_enabled(family_id: str) -> bool:
 _EXPO_PIPELINE_SKILLS: FrozenSet[str] = frozenset({"app_builder", "app"})
 _HTML_PIPELINE_SKILLS: FrozenSet[str] = frozenset({"app_html"})
 
+# ── The Expo pipeline is RETIRED IN CODE (2026-08-21) ────────────────
+# Not "off by default" — unreachable. `pipeline_enabled("expo")` returns
+# False in every process, and no environment variable, settings value,
+# `AGENT_TOOL_FAMILIES` string or bridge env pin can make it return True.
+#
+# Why a constant and not a default
+# --------------------------------
+# A default is not a live value. The 2026-08-21 default flip
+# (`app_builder_expo_enabled: bool = False`) left THREE ways for a
+# container to go on building Expo apps:
+#
+#   1. the canary set `APP_BUILDER_EXPO_ENABLED=1` explicitly on the
+#      bridge env, and `pool_addon._FEATURE_FLAG_ENVS` forwarded it into
+#      every container it spawned — a forwarded value outranks a default;
+#   2. a container built from an image predating the flip has the old
+#      `= True` compiled in, and keeps it until it is recreated;
+#   3. `AGENT_TOOL_FAMILIES` gates the FAMILY, not the pipeline, so it
+#      could not be used to close the gap either.
+#
+# Telling those three apart takes a shell on the box, and that box's SSH
+# key was rotated on 2026-08-20. So the gate stops being a value to look
+# up and becomes a fact about the build, asserted right here.
+#
+# The Expo code is deliberately NOT deleted — `app_builder/skill.py`,
+# `app_gateway_skill.py`, `app_manager.py` and the 8-phase build_jobs
+# pipeline all still exist, and `/api/apps` still serves apps that were
+# built with them. What is gone is every route that STARTS one. Bringing
+# it back is a code change and a review, which is the right price for a
+# path that costs 452 MiB and 27k inodes per app.
+EXPO_PIPELINE_RETIRED: bool = True
+
+#: Skills that can never register, on any tenant, under any configuration.
+#: Checked first in `skill_enabled`, which `SkillLoader._register` funnels
+#: BOTH filesystem discovery and `register_dynamic()` through — so neither
+#: the builtins scan nor agent_main's late-bound construction can slip one
+#: in past the pipeline gate.
+RETIRED_SKILLS: FrozenSet[str] = (
+    _EXPO_PIPELINE_SKILLS if EXPO_PIPELINE_RETIRED else frozenset()
+)
+
 _PIPELINES: Optional[Dict[str, bool]] = None
 
 
@@ -233,6 +273,21 @@ def _resolved_pipelines() -> Dict[str, bool]:
             html = bool(getattr(settings, "app_html_enabled", True))
         except Exception:  # pragma: no cover - settings must never break boot
             expo, html = True, True
+        if EXPO_PIPELINE_RETIRED:
+            if expo:
+                # Say so out loud. A container whose bridge env still pins
+                # `APP_BUILDER_EXPO_ENABLED=1` is not misconfigured any
+                # more — it is carrying a dead pin — and this is the line
+                # that tells a rollout investigation which ones still have
+                # it without needing a shell on the host.
+                logger.warning(
+                    "[entitlements] ignoring APP_BUILDER_EXPO_ENABLED=1 — the "
+                    "Expo app pipeline is retired in code "
+                    "(EXPO_PIPELINE_RETIRED). Apps build as single-file HTML "
+                    "artifacts. The pin can be cleared from the bridge env; "
+                    "it no longer does anything.",
+                )
+            expo = False
         _PIPELINES = {"expo": expo, "html": html}
         logger.info(
             "[entitlements] app pipelines — expo=%s html=%s", expo, html,
@@ -246,8 +301,13 @@ def pipeline_enabled(name: str) -> bool:
 
 
 def skill_enabled(skill_name: str) -> bool:
-    """True unless `skill_name` is withheld by a family OR by pipeline
-    selection."""
+    """True unless `skill_name` is RETIRED, or withheld by a family OR by
+    pipeline selection."""
+    # First, and unconditional: a retired skill has no configuration that
+    # brings it back. Checked ahead of everything else so that no settings
+    # value, env var or entitlement string is even consulted.
+    if skill_name in RETIRED_SKILLS:
+        return False
     if skill_name in _EXPO_PIPELINE_SKILLS and not pipeline_enabled("expo"):
         return False
     if skill_name in _HTML_PIPELINE_SKILLS and not pipeline_enabled("html"):

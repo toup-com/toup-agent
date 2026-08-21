@@ -720,11 +720,26 @@ async def lifespan(app: FastAPI):
         # value came — a container that inherited the default and one that
         # was pinned by the bridge env look identical in the logs otherwise,
         # and telling them apart is the whole of a rollback investigation.
-        from app.agent.tool_entitlements import pipeline_enabled as _pipeline_enabled
-        _expo_on = _pipeline_enabled("expo")
+        # 2026-08-21 (P0): `EXPO_PIPELINE_RETIRED` makes this False in every
+        # process. It is no longer a flag read — the block below is dead code
+        # kept as the rollback, and the `if _expo_on:` guards on each step are
+        # what document that. The boot line names the PIN when one is present,
+        # because a container carrying a dead `APP_BUILDER_EXPO_ENABLED=1` is
+        # the one fact a rollout investigation cannot get any other way now
+        # that the host's SSH key is rotated.
+        from app.agent.tool_entitlements import (
+            EXPO_PIPELINE_RETIRED as _EXPO_RETIRED,
+            pipeline_enabled as _pipeline_enabled,
+        )
+        _expo_on = _pipeline_enabled("expo") and not _EXPO_RETIRED
         if not _expo_on:
             _pin = os.getenv("APP_BUILDER_EXPO_ENABLED", "")
-            _src = f"APP_BUILDER_EXPO_ENABLED={_pin}" if _pin else "default"
+            if _EXPO_RETIRED:
+                _src = "retired in code"
+                if _pin:
+                    _src += f"; dead pin APP_BUILDER_EXPO_ENABLED={_pin} ignored"
+            else:
+                _src = f"APP_BUILDER_EXPO_ENABLED={_pin}" if _pin else "default"
             print(
                 f"🏗️ Expo app pipeline disabled ({_src}) — "
                 "apps build as single-file HTML artifacts",

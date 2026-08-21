@@ -123,3 +123,23 @@ def test_embeddings_via_proxy_is_forwarded_because_memory_hard_fails_without_it(
     """
     assert "EMBEDDINGS_VIA_PROXY" in _forwarded_flags()
     assert "embeddings_via_proxy" in Settings.model_fields
+
+
+def test_the_retired_expo_flag_is_no_longer_forwarded():
+    """P0 2026-08-21 — the inverse of the test above, and deliberately so.
+
+    `APP_BUILDER_EXPO_ENABLED` was the canary's pipeline switch. The Expo
+    pipeline is now retired in code
+    (`tool_entitlements.EXPO_PIPELINE_RETIRED`), so forwarding it could only
+    ever produce a container that logs a warning and ignores it. Keeping it
+    in the list would leave a stale `=1` from the canary riding into every
+    new container as a variable that looks load-bearing in `docker inspect`
+    and is not.
+
+    Re-adding it does NOT re-enable Expo — that takes a code change — so a
+    reviewer who puts it back is adding confusion, not a rollback.
+    """
+    assert "APP_BUILDER_EXPO_ENABLED" not in _forwarded_flags()
+    # Control: its sibling is still forwarded, so this is not asserting an
+    # empty list.
+    assert "APP_HTML_ENABLED" in _forwarded_flags()

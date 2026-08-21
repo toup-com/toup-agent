@@ -47,7 +47,11 @@ def _restore():
     te.reset_cache_for_tests()
 
 
-def _configure(*, expo: bool = True, html: bool = True, families: str = "*") -> None:
+def _configure(*, expo: bool = False, html: bool = True, families: str = "*") -> None:
+    """Set a posture. NOTE `expo=True` no longer produces an Expo container —
+    it produces a container carrying a DEAD PIN, which `EXPO_PIPELINE_RETIRED`
+    ignores. Tests that pass it are asserting the pin is inert, never that the
+    pipeline came back. See `test_expo_pipeline_retired.py`."""
     settings.app_builder_expo_enabled = expo
     settings.app_html_enabled = html
     settings.agent_tool_families = families
@@ -76,13 +80,19 @@ def test_the_shipped_default_is_html_only(monkeypatch):
     assert fresh.app_html_enabled is True
 
 
-def test_the_expo_default_is_still_overridable(monkeypatch):
-    """The rollback. Expo is disabled, not deleted — `=1` on the bridge env
-    has to bring it back, or the flag is a one-way door."""
+def test_the_env_var_still_parses_but_no_longer_selects(monkeypatch):
+    """The field still reads the env — that is what lets `_resolved_pipelines`
+    LOG a dead pin, the only way left to find containers still carrying
+    `APP_BUILDER_EXPO_ENABLED=1` now that the host's SSH key is rotated.
+
+    What it does NOT do any more is select the pipeline. 2026-08-21 made this
+    a one-way door on purpose: see `test_expo_pipeline_retired.py`.
+    """
     monkeypatch.setenv("APP_BUILDER_EXPO_ENABLED", "1")
-    assert type(settings)().app_builder_expo_enabled is True
-    monkeypatch.setenv("APP_BUILDER_EXPO_ENABLED", "0")
-    assert type(settings)().app_builder_expo_enabled is False
+    assert type(settings)().app_builder_expo_enabled is True   # parsed…
+    settings.app_builder_expo_enabled = True
+    te.reset_cache_for_tests()
+    assert te.pipeline_enabled("expo") is False                # …and ignored.
 
 
 @pytest.mark.asyncio
@@ -106,17 +116,19 @@ async def test_default_settings_load_html_and_not_expo(tmp_path, monkeypatch):
     assert "app_html__present_app" in names
 
 
-# ── 1. Both on (the retired canary posture) ──────────────────────────
+# ── 1. The pin is inert ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_both_pipelines_load_when_expo_is_pinned_back_on(tmp_path, monkeypatch):
+async def test_pinning_expo_back_on_does_not_load_it(tmp_path, monkeypatch):
+    """This test used to assert the opposite — that `=1` brought the Expo
+    skills back. That rollback is now a code change, not an env var."""
     monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(tmp_path / "apps"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
-    _configure()
+    _configure(expo=True)
     loader = await _load(tmp_path)
     assert "app_html" in loader.skills
-    assert "app_builder" in loader.skills
+    assert "app_builder" not in loader.skills
 
 
 @pytest.mark.asyncio
@@ -218,7 +230,9 @@ async def test_html_off_withholds_app_html(tmp_path, monkeypatch):
 
 def test_skill_enabled_reflects_both_axes():
     _configure()
-    assert te.skill_enabled("app_html") and te.skill_enabled("app_builder")
+    assert te.skill_enabled("app_html")
+    # Retired: never enabled, on any posture below.
+    assert not te.skill_enabled("app_builder")
 
     _configure(expo=False)
     assert te.skill_enabled("app_html")
@@ -227,7 +241,7 @@ def test_skill_enabled_reflects_both_axes():
 
     _configure(html=False)
     assert not te.skill_enabled("app_html")
-    assert te.skill_enabled("app_builder")
+    assert not te.skill_enabled("app_builder")
 
     # The family axis still wins independently of the pipeline axis.
     _configure(families="doc_generation")
@@ -245,13 +259,17 @@ def test_family_membership_covers_the_html_tools():
 
 def test_pipeline_resolution_is_memoized():
     """Container-stable, like the family gate: a mid-life flip must not be
-    able to fork the cache lineage."""
-    _configure(expo=True)
-    assert te.pipeline_enabled("expo") is True
-    settings.app_builder_expo_enabled = False   # no reset_cache_for_tests()
-    assert te.pipeline_enabled("expo") is True, "the memo was bypassed"
+    able to fork the cache lineage.
+
+    Keyed on `html`, because `expo` is now a constant and a constant cannot
+    demonstrate memoisation — it would pass with the memo ripped out.
+    """
+    _configure(html=True)
+    assert te.pipeline_enabled("html") is True
+    settings.app_html_enabled = False           # no reset_cache_for_tests()
+    assert te.pipeline_enabled("html") is True, "the memo was bypassed"
     te.reset_cache_for_tests()
-    assert te.pipeline_enabled("expo") is False
+    assert te.pipeline_enabled("html") is False
 
 
 # ── 3. Things that go stale when a pipeline retires ──────────────────
@@ -272,9 +290,13 @@ def test_the_toup_skill_routes_apps_to_the_pipeline_that_exists():
     assert "app_html__create_app_file" in section
     assert "app_builder__build_app" not in section
 
-    _configure(expo=True, html=False)            # rollback posture
+    # Expo pinned on AND html off: the `_APP_ROUTE_EXPO` sentence is now
+    # unreachable, so the section must name NEITHER tool rather than
+    # mandating a retired one. A prompt-mandated tool outside the wire array
+    # is how the model emits a stub call to a name nothing dispatches.
+    _configure(expo=True, html=False)
     section = _toup_section()
-    assert "app_builder__build_app" in section
+    assert "app_builder__build_app" not in section
     assert "app_html__" not in section
 
     # Family withheld entirely: name neither, and don't imply an app is
@@ -298,9 +320,14 @@ def test_the_toup_section_is_constant_within_a_container():
 def test_the_redirect_names_a_tool_that_exists():
     from app.agent.tool_executor import _pipeline_guard_active, _pipeline_redirect_msg
 
-    _configure()
+    # Even with the pin set, the redirect names the HTML tools — the Expo
+    # message is unreachable, and its "Ask the user 10+ clarifying questions"
+    # instruction with it.
+    _configure(expo=True)
     assert _pipeline_guard_active()
-    assert "app_builder__build_app" in _pipeline_redirect_msg()
+    msg = _pipeline_redirect_msg()
+    assert "app_html__create_app_file" in msg
+    assert "app_builder__build_app" not in msg
 
     _configure(expo=False)
     assert _pipeline_guard_active()
@@ -312,6 +339,8 @@ def test_the_redirect_names_a_tool_that_exists():
     # a request with no permitted route.
     _configure(expo=False, html=False)
     assert not _pipeline_guard_active()
+    _configure(expo=True, html=False)
+    assert not _pipeline_guard_active(), "a retired pipeline kept the guard up"
 
     _configure(families="none")
     assert not _pipeline_guard_active()

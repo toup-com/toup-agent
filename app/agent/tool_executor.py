@@ -620,14 +620,23 @@ def _pipeline_redirect_msg() -> str:
     can be running either or both. Naming the wrong one reproduces the
     original defect this guard was fixed for — blocked, redirected to
     something absent, refused again.
+
+    2026-08-21 (P0): with the Expo pipeline retired in code, HTML is the
+    only pipeline that can be live, so it is also the FALLBACK — including
+    on the exception path. `_PIPELINE_REDIRECT_MSG` is reachable only if
+    `EXPO_PIPELINE_RETIRED` is flipped back off. That matters beyond
+    tidiness: its text instructs the model to "Ask the user 10+ clarifying
+    questions", which is precisely the interrogation the HTML pipeline
+    exists to stop. A redirect that resurrects the old flow is the same
+    defect as a tool that does.
     """
     try:
         from app.agent.tool_entitlements import pipeline_enabled
-        if not pipeline_enabled("expo") and pipeline_enabled("html"):
-            return _HTML_PIPELINE_REDIRECT_MSG
+        if pipeline_enabled("expo") and not pipeline_enabled("html"):
+            return _PIPELINE_REDIRECT_MSG
     except Exception:  # pragma: no cover — the guard must never break exec
         pass
-    return _PIPELINE_REDIRECT_MSG
+    return _HTML_PIPELINE_REDIRECT_MSG
 
 
 def _pipeline_guard_active() -> bool:
