@@ -611,3 +611,102 @@ def test_no_step_detail_is_a_command_or_an_exit_code(skill, apps_dir):
         assert "wc -c" not in detail
         assert not detail.startswith("exit ")
         assert "app_html__" not in detail
+
+
+# ── 6. An app that is over before anyone played it ────────────────────
+#
+# The build that prompted this section reported 100%, opened, rendered
+# perfectly, and was on GAME OVER — score 000 — 1.75 s after load, because
+# `reset()` and `setInterval` were the last line of the file. Every existing
+# gate passed it: nothing threw, no console error, the document parsed. The
+# only thing wrong was that the clock was already running when the sheet
+# opened, and that is a question no error handler can be asked.
+
+
+class _FakePage:
+    """A page whose visible text follows a script of (elapsed_ms, text)."""
+
+    def __init__(self, timeline):
+        self._timeline = sorted(timeline)
+        self._now = 0
+
+    async def evaluate(self, _js):
+        text = ""
+        for at, value in self._timeline:
+            if at <= self._now:
+                text = value
+        return text
+
+    async def wait_for_timeout(self, ms):
+        self._now += ms
+
+
+def _watch(timeline, first_text):
+    """Run the real watcher over a scripted page, from the settle onward."""
+    page = _FakePage(timeline)
+    page._now = verify.SMOKE_SETTLE_MS
+    return run(verify._ended_itself(page, first_text))
+
+
+def test_a_game_that_ends_itself_untouched_is_a_finding():
+    # Alive at first paint, over before the watch window closes.
+    assert _watch([(0, "SCORE 000  BEST 000"),
+                   (1800, "GAME OVER\nTHE SNAKE HIT THE WALL.")],
+                  first_text="SCORE 000  BEST 000") == "GAME OVER"
+
+
+def test_a_slow_self_end_is_still_caught_within_the_window():
+    assert _watch([(0, "TIME 30"), (2900, "TIME'S UP")],
+                  first_text="TIME 30") == "TIME'S UP"
+
+
+def test_an_app_that_stays_alive_is_not_a_finding():
+    assert _watch([(0, "SCORE 000"), (2900, "SCORE 040")],
+                  first_text="SCORE 000") is None
+
+
+def test_an_end_state_already_on_screen_at_first_paint_is_not_a_finding():
+    # A leaderboard is entitled to the words "Final score" at rest. The
+    # defect is a verdict that ARRIVES; the baseline is what separates them.
+    assert _watch([(0, "Final score 120"), (2000, "Final score 120")],
+                  first_text="Final score 120") is None
+
+
+@pytest.mark.parametrize("text,terminal", [
+    ("GAME OVER", True),
+    ("Game Over — try again", True),
+    ("You lose!", True),
+    ("Time's up", True),
+    ("Final score", True),
+    # Ordinary states a healthy app shows at rest.
+    ("Score 40  Lives 3", False),
+    ("Round 2 of 5", False),
+    ("Time left 0:42", False),
+    ("Best score", False),
+    ("Start game", False),
+])
+def test_only_a_terminal_verdict_counts(text, terminal):
+    assert bool(verify._TERMINAL_TEXT_RE.search(text)) is terminal
+
+
+def test_the_watch_outlasts_the_settle():
+    # The check exists to see PAST the frame a healthy app has finished
+    # painting on. Equal values would make it a second reading of the same
+    # instant, and the defect it catches lands after that instant.
+    assert verify.SELF_END_WATCH_MS > verify.SMOKE_SETTLE_MS
+
+
+def test_the_finding_is_worded_as_something_to_fix_and_names_no_internals():
+    from app.agent.skills.builtins.app_html import verify as v
+    msg = (
+        f"the app reached “GAME OVER” on its own, "
+        f"{v.SELF_END_WATCH_MS // 1000}s after opening, with nothing "
+        "pressed — so the user sees it already over. Do not start a "
+        "clock, a loop or a countdown at load: open on a start "
+        "screen and begin in the start control's handler."
+    )
+    # It has to survive the same gate every other browser message goes
+    # through, or it is collected and silently dropped.
+    assert v.counts_as_breakage(msg, from_console=False) is True
+    for machinery in ("app_html", "ERROR:", "/app/", "setInterval("):
+        assert machinery not in msg

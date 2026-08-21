@@ -96,6 +96,24 @@ _REAL_BREAKAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Text that means the app reached a state the user LOST, as opposed to any
+#: other thing an app might say. Deliberately narrow: these are terminal
+#: verdicts, not moods. "Time left", "Score", "Round 2" are all states an app
+#: is entitled to be in on load; "GAME OVER" is not.
+_TERMINAL_TEXT_RE = re.compile(
+    r"game\s*over|you\s+(?:lose|lost)|time'?s?\s+up|out\s+of\s+time|"
+    r"you\s+ran\s+out|final\s+score|better\s+luck",
+    re.IGNORECASE,
+)
+
+#: How long the untouched page is watched for a terminal state, measured from
+#: `domcontentloaded`. Must exceed the settle above — the whole point is to
+#: keep watching after the frame where a healthy app has finished painting.
+#: 3 s is chosen from the failure it exists to catch: a 20-cell board at
+#: 175 ms/tick is over at 1.75 s, and doubling that leaves room for a slower
+#: first tick without waiting long enough to annoy anyone.
+SELF_END_WATCH_MS = 3000
+
 
 @dataclass
 class Finding:
@@ -341,6 +359,46 @@ async def smoke_test(html: str, *, timeout: int = SMOKE_TIMEOUT_S) -> Report:
         return report
 
 
+async def _visible_text(page) -> str:
+    """`innerText`, i.e. what a person can actually read.
+
+    `innerText` and not `textContent`: a game-over panel is in the DOM from
+    the first byte and hidden with `display:none`, so `textContent` says
+    "GAME OVER" on a board nobody has touched and would fail every app that
+    has an end state at all. `innerText` respects the cascade, which is the
+    whole distinction being drawn.
+    """
+    try:
+        return str(await page.evaluate("() => document.body ? document.body.innerText : ''"))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _ended_itself(page, first_text: str) -> Optional[str]:
+    """Did the app declare the user finished, with nothing pressed?
+
+    Returns the phrase it reached, or None. Polls rather than sleeping the
+    full window so a fast self-end is reported with its own timing intact and
+    a healthy app costs only the first poll.
+
+    Two things keep this from firing on a working app. The text must be
+    absent at first paint (an app may legitimately *display* "final score"),
+    and it must be a terminal verdict rather than any word a game uses —
+    "score", "lives", "round" are all fine to show at rest.
+    """
+    if _TERMINAL_TEXT_RE.search(first_text or ""):
+        return None
+    elapsed = SMOKE_SETTLE_MS
+    while elapsed < SELF_END_WATCH_MS:
+        hit = _TERMINAL_TEXT_RE.search(await _visible_text(page))
+        if hit:
+            return " ".join(hit.group(0).split())
+        await page.wait_for_timeout(250)
+        elapsed += 250
+    hit = _TERMINAL_TEXT_RE.search(await _visible_text(page))
+    return " ".join(hit.group(0).split()) if hit else None
+
+
 async def _smoke(html: str, report: Report) -> Report:
     try:
         from playwright.async_api import async_playwright  # type: ignore
@@ -384,7 +442,16 @@ async def _smoke(html: str, report: Report) -> Report:
             # fetch, and a slow CDN would spend the whole budget before a
             # single line of the app's own script had run.
             await page.set_content(wrapped, wait_until="domcontentloaded")
+            # First paint, before anything has had time to run itself out.
+            # An app is allowed to SAY "final score" on a leaderboard; the
+            # defect is a terminal verdict that ARRIVES while nobody is
+            # touching it, so the baseline is what makes the two separable.
+            first_text = await _visible_text(page)
             await page.wait_for_timeout(SMOKE_SETTLE_MS)
+            # Everything up to here has been UNTOUCHED — no key, no click.
+            # That is the only window in which this question can be asked, so
+            # it is asked before the input frame below and never after.
+            self_ended = await _ended_itself(page, first_text)
             # One frame of input. A game that only wires its handlers on
             # keydown would otherwise be declared healthy without ever
             # having executed its loop.
@@ -394,6 +461,14 @@ async def _smoke(html: str, report: Report) -> Report:
                 await page.wait_for_timeout(400)
             except Exception:  # noqa: BLE001
                 pass
+            if self_ended:
+                _note("behaviour", (
+                    f"the app reached “{self_ended}” on its own, "
+                    f"{SELF_END_WATCH_MS // 1000}s after opening, with nothing "
+                    "pressed — so the user sees it already over. Do not start a "
+                    "clock, a loop or a countdown at load: open on a start "
+                    "screen and begin in the start control's handler."
+                ))
         finally:
             await browser.close()
     finally:

@@ -177,8 +177,50 @@ apps that are complete on their own.
 
 ---
 
-## 8. Before you call `present_app`
+## 8. Anything that moves waits to be started
 
+An app opens inside a sheet, over a conversation. The moment it appears, the
+person is still looking at the chat behind it — they have not read the board,
+found the controls, or decided to play. **A clock that is already running has
+already run out.**
+
+This is not hypothetical. A Snake game shipped that spawned its snake in the
+middle of a 20×20 grid, heading right, with `setInterval` started from the
+last line of the file. Ten ticks at 175 ms is 1.75 seconds: the app was on
+`GAME OVER — THE SNAKE HIT THE WALL`, score `000`, before the user's eyes had
+reached it. Every other part of it was correct — the D-pad turned the snake,
+the speed ramp was there, the best score persisted — and none of it could be
+reached. Nothing threw, so the browser check passed it.
+
+So:
+
+- **First paint is a start screen**, not a running game. A title, one line of
+  how-to, and one button — `PLAY`, `START`, `BEGIN`. The loop starts in that
+  button's handler and nowhere else.
+- **The same applies to any unattended countdown**: a timer that begins on
+  load, a carousel that advances past the first slide, a quiz that is already
+  timing the answer, a simulation that has stepped before it was watched.
+- **Losing must cost an input.** If the app can reach a terminal state
+  (`game over`, `time's up`, `you lose`) without the user having pressed
+  anything, that is a bug in the app, not a hard difficulty setting.
+- Animation that is purely decorative — a gradient drift, a pulsing dot — is
+  fine on load. The rule is about state the user is judged on.
+
+```js
+// Not this
+reset(); setInterval(tick, 175);
+
+// This
+showStart();                                  // title + PLAY
+playBtn.onclick = () => { reset(); setInterval(tick, 175); };
+```
+
+---
+
+## 9. Before you call `present_app`
+
+- [ ] Nothing that can be lost, missed or timed out is running at first paint
+- [ ] A game/timer/quiz opens on a start screen with an explicit start control
 - [ ] Opens at 360 px with no horizontal scroll
 - [ ] Every button/link/input has hover **and** focus-visible styling
 - [ ] Every text/background pair reaches 4.5:1
