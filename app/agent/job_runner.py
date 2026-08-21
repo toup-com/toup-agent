@@ -145,6 +145,7 @@ class JobRunner:
         status: str = "queued",
         steps_json: Optional[str] = None,
         layer: int = 1,
+        job_id: Optional[str] = None,
     ) -> Any:  # BuildJob — return type imported lazily to keep this
               # module's import surface narrow.
         """Insert a ``BuildJob`` row with the unified-arc columns
@@ -167,6 +168,12 @@ class JobRunner:
         ``steps_json`` is for sources that pre-populate phases at
         create time (``create_job`` tool with a user-supplied
         ``steps`` array). Defaults to ``"[]"``.
+
+        ``job_id`` lets a caller that must know the id BEFORE the row
+        exists supply its own (``voice_jobs.VoiceTurnJob``: the runner
+        stamps ``job_id`` onto the tool frames of the very round that
+        opens the job, while the INSERT runs off the turn's critical
+        path). Everyone else omits it and gets a fresh uuid4.
 
         Callers can distinguish "fresh insert" vs "conflict-hit" by
         comparing the returned row's ``created_at`` to ``now``."""
@@ -192,7 +199,7 @@ class JobRunner:
                     return existing
 
         # ── 2. Fresh insert ──────────────────────────────────────
-        job_id = str(uuid.uuid4())
+        job_id = str(job_id or uuid.uuid4())
         async with self._session_maker() as db:
             # Phase 4 (sub-agent arc): copy spec.config_json onto
             # the BuildJob row so the handler can read its own

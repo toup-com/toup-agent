@@ -710,6 +710,30 @@ def _vs_sources(name: str, tool_input: dict, result: str) -> list:
     return out
 
 
+#: The step-attribution keys the runner stamps on every tool event
+#: (``StepTracker.event_fields``). Flat scalars, all optional.
+_VS_STEP_KEYS = ("job_id", "step_index", "step_name", "steps_total", "job_type")
+
+
+def _vs_step_fields(ev: dict) -> dict:
+    """Round 13: which declared step this action served.
+
+    A chat turn writes these straight onto its persisted tool record, so the
+    run view can bucket actions under steps. Voice's frames dropped them, and
+    the relay therefore had nothing to persist — the same action, on the same
+    job, rendered under "no step". Copied verbatim (a bounded set of flat
+    scalars); ABSENT rather than null when the turn declared no job, so a
+    jobless turn's frame is byte-identical to what shipped before.
+    """
+    out = {}
+    for k in _VS_STEP_KEYS:
+        v = ev.get(k)
+        if v is None:
+            continue
+        out[k] = int(v) if k in ("step_index", "steps_total") else str(v)[:120]
+    return out
+
+
 def _vs_sources_from_domains(ev: dict) -> list:
     """Bare-domain sources from the runner's own `domains`, as a FALLBACK.
 
@@ -882,10 +906,17 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
             name = str(ev.get("name", ""))[:64]
             cid = str(ev.get("call_id", ""))[:64]
             inp = ev.get("input") or {}
+            # Round 13: the step this action served. The runner stamps these
+            # on every tool event (StepTracker.event_fields) and a chat turn
+            # persists them straight onto its tool record — this frame dropped
+            # them, so the identical action arriving over voice reached the
+            # phone with no step to sit under. Absent keys, never nulls, so a
+            # turn with no job is byte-identical to before.
+            _attr = _vs_step_fields(ev)
             if ev.get("phase") == "start":
                 _put({"type": "tool.start", "call_id": cid, "name": name,
                       "args": _vs_args(name, inp),
-                      "started_ms": int(ev.get("started_ms") or 0)})
+                      "started_ms": int(ev.get("started_ms") or 0), **_attr})
             else:
                 raw = ev.get("result") or ""
                 body = _vs_defence(raw)
@@ -897,6 +928,7 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                     "ok": not body.strip().upper().startswith("ERROR"),
                     "elapsed_ms": int(ev.get("elapsed_ms") or 0),
                     "sources": _vs_sources(name, inp, raw) or _vs_sources_from_domains(ev),
+                    **_attr,
                 }
                 if name in _VS_PREVIEW_ALLOW:
                     frame["preview"] = _vs_clean(body)[:_VS_PREVIEW_MAX]

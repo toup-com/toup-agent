@@ -1277,6 +1277,37 @@ _PERSIST_TITLE_MAX = 160
 _INNER_PREVIEW_MAX = 240
 _INNER_FRAME_BYTES = 2048
 
+#: Round 13: the step-attribution keys the agent stamps on every tool frame
+#: (``StepTracker.event_fields``, forwarded by api_v1's SSE sink). They ride
+#: the phone frame AND the persisted record, which is how an action in a voice
+#: run sits under the step it served — exactly as a chat run's does.
+_STEP_ATTR_KEYS = ("job_id", "step_index", "step_name", "steps_total", "job_type")
+
+
+def _step_attr(ev: Optional[dict]) -> dict:
+    """The attribution keys off one agent frame, re-capped here.
+
+    The relay does not trust the agent's caps (same rule as every other field
+    it forwards), and emits ABSENT keys rather than nulls when the turn
+    declared no job — a jobless turn's frame and record stay byte-identical to
+    what shipped before Round 13.
+    """
+    if not isinstance(ev, dict):
+        return {}
+    out: dict = {}
+    for k in _STEP_ATTR_KEYS:
+        v = ev.get(k)
+        if v is None:
+            continue
+        if k in ("step_index", "steps_total"):
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[k] = str(v)[:120]
+    return out
+
 # agent_url → monotonic ts of the last 404/405 on the streaming route. An agent
 # image that predates the route is re-probed after the TTL, so a fleet roll
 # heals itself without a platform-api deploy.
@@ -1382,20 +1413,25 @@ class _InnerToolRelay:
         self._sink = sink
         self._rec: dict = {}
 
-    def _open_rec(self, cid: str, name: str) -> None:
+    def _open_rec(self, cid: str, name: str, ev: Optional[dict] = None) -> None:
         if self._sink is None or cid in self._rec:
             return
         rec = {"tool": name, "started_at_ms": int(time.time() * 1000)}
+        rec.update(_step_attr(ev))
         self._rec[cid] = rec
         self._sink.append(rec)
 
     def _close_rec(self, cid: str, name: str, ok: bool, preview: str,
-                   srcs: list, elapsed_ms: int) -> None:
+                   srcs: list, elapsed_ms: int, ev: Optional[dict] = None) -> None:
         rec = self._rec.get(cid)
         if rec is None:
             return
         if name:
             rec["tool"] = name
+        # A provisional row opened from `tool.intent` carried no attribution
+        # (the agent had not named the call yet). The completion always does,
+        # so fill it in rather than persisting a step-less record.
+        rec.update(_step_attr(ev))
         rec["completed_at_ms"] = (
             rec["started_at_ms"] + elapsed_ms if elapsed_ms
             else int(time.time() * 1000)
@@ -1471,7 +1507,7 @@ class _InnerToolRelay:
             cid = self._cid(f"intent{self._rows}")
             self._pending = (name, cid)
             self._rows += 1
-            self._open_rec(cid, name)
+            self._open_rec(cid, name, ev)
             title, _ = _tool_activity(name, {})
             return await self._send({
                 "type": "tool_call.started",
@@ -1501,13 +1537,18 @@ class _InnerToolRelay:
                 self._rows += 1
                 cid = self._cid(inner)
             self._open[inner] = cid
-            self._open_rec(cid, name)
+            self._open_rec(cid, name, ev)
             return await self._send({
                 "type": "tool_call.started",
                 "call_id": cid,
                 "parent_call_id": self._outer,
                 "name": name, "title": title,
                 "detail": str(detail)[:_INNER_DETAIL_MAX],
+                # Round 13: which step this row belongs under. A provisional
+                # `tool.intent` row carries none (the agent has not named the
+                # call yet); the `tool.start` that adopts it does, and the
+                # client treats a re-arriving call_id as an UPDATE.
+                **_step_attr(ev),
             })
         if t == "tool.end":
             inner = str(ev.get("call_id", ""))
@@ -1526,7 +1567,7 @@ class _InnerToolRelay:
             # in the thread.
             self._close_rec(
                 cid, str(ev.get("name", ""))[:64], bool(ev.get("ok", True)),
-                preview, srcs, int(ev.get("elapsed_ms") or 0),
+                preview, srcs, int(ev.get("elapsed_ms") or 0), ev,
             )
             return await self._send({
                 "type": "tool_call.completed",
@@ -1536,6 +1577,7 @@ class _InnerToolRelay:
                 "result_preview": preview,
                 "sources": srcs,
                 "elapsed_ms": int(ev.get("elapsed_ms") or 0),
+                **_step_attr(ev),
             })
         if t == "status" and ev.get("stage") == "thinking":
             # Deliberately NOT {"type":"state","state":"thinking"} — the shipped

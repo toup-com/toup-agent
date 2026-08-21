@@ -447,6 +447,15 @@ class Settings(BaseSettings):
     # extra_snippets precisely so an answer does not need a web_fetch per
     # source, and web_fetch is where the seconds actually go.
     voice_max_tool_iterations: int = 5
+    # Round 13: open a real job card for a voice turn that does work.
+    # Voice has no `create_job` (prompt_profile.VOICE_DISABLED_TOOLS, and it
+    # stays that way), so the runner opens the card itself — same BuildJob
+    # row, same JobRunner intake, same shared closer, same phone card as a
+    # chat turn's. See app/agent/voice_jobs.py. Default ON: the card is the
+    # whole point of the change and every write is off the turn's critical
+    # path, so there is nothing to canary. The flag exists so the behaviour
+    # can be turned off from the environment without a rollback.
+    voice_turn_jobs: bool = True
     # Max idempotent read-only tools (web_search/web_fetch/extension_*) run
     # concurrently within a single assistant turn. Bounds outbound load so a
     # multi-fetch turn finishes in ~max(individual) latency, not sum.

@@ -6479,7 +6479,16 @@ class ToolExecutor:
         """Create a new job visible in the dashboard and sidebar."""
         import json as _json, uuid as _uuid
 
-        title = inp.get("title", "").strip()
+        # Round 13: through the SHARED normaliser (job_titles.py) — the same
+        # one the runner's voice card uses. A model-written title and a
+        # request-derived one land on the same screen, and one of them keeping
+        # its trailing full stop, its wrapping quotes or its **markdown** is
+        # how two producers become two products. `or` on the raw value, never
+        # an error: the tool's contract is "empty title is the only failure",
+        # and a deliberately terse title ("T") must stay legal.
+        from app.agent.job_titles import normalize_job_title
+        _raw_title = str(inp.get("title") or "").strip()
+        title = normalize_job_title(_raw_title) or _raw_title
         if not title:
             return "ERROR: title is required"
 

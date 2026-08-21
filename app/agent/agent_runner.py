@@ -74,6 +74,11 @@ from app.services.anthropic_service import AnthropicService
 from app.services.model_router import classify_request, RoutingDecision
 from app.agent.hooks import get_hook_bus, HookEvent
 from app.agent.step_tracker import StepTracker
+from app.agent.voice_jobs import (
+    VoiceTurnJob,
+    set_current_voice_job,
+    sweep_current_voice_job,
+)
 from app.agent.turn_timing import BOOKKEEPING_TOOLS, TurnWaterfall
 from app.services.background_tasks import spawn as _spawn_bg
 
@@ -1108,6 +1113,13 @@ class AgentRunner:
             self._sweep_unclosed_created_jobs(
                 kwargs.get("user_id") or (args[1] if len(args) > 1 else None)
             )
+            # Round 13: the same guarantee for the card the RUNNER opened on a
+            # voice turn. It is not in the create_job registry (nothing calls
+            # that tool on voice), so it needs its own line here — and this is
+            # the only place a cancelled voice turn can still be caught, which
+            # on voice is the common ending, not the rare one. Synchronous and
+            # fire-and-forget for the reason above.
+            sweep_current_voice_job()
 
     def _sweep_unclosed_created_jobs(self, user_id: Optional[str]) -> None:
         """Close jobs this turn created but never finished. Never awaits.
@@ -1409,6 +1421,14 @@ class AgentRunner:
         # the create_job/update_job calls as they execute; stamps step_index /
         # job_id on every tool frame that follows.
         _steps = StepTracker()
+        # Round 13: this turn's voice job card, or None on every other
+        # channel. Bound HERE, before anything can branch or raise, and
+        # cleared out of the context in the same breath — the tool loop and
+        # the finalizer both read it, and a name that only exists down one
+        # path is the UnboundLocalError shape that ended every voice call on
+        # 2026-08-20. Opened after the session resolves; see below.
+        _vjob: Optional["VoiceTurnJob"] = None
+        set_current_voice_job(None)
         _tool_start_meta = _accepts_meta(on_tool_start)
         _tool_end_meta = _accepts_meta(on_tool_end)
         # Round 4 (item 7d): the client's live indicator used to wait for the
@@ -1621,6 +1641,29 @@ class AgentRunner:
                 session_id, asst_message_id,
                 turn_started_at=(received_at if received_at else start),
             )
+
+            # ── Round 13: the voice turn's job card ──────────────────
+            # Chat's card is minted by the model (`create_job`). Voice does
+            # not have that tool and must not get it back — see
+            # prompt_profile.VOICE_DISABLED_TOOLS and the 2026-08-01 session
+            # it documents — so the runner mints the card instead, titled
+            # from the request itself. Opened here because it needs the
+            # resolved session_id; `_vjob` itself is bound at the top of the
+            # method, so no path through the turn can reach the tool loop
+            # with the name unbound.
+            if (channel or "").strip().lower() == "voice" and settings.voice_turn_jobs:
+                try:
+                    _vjob = VoiceTurnJob(
+                        user_id=user_id, conversation_id=session_id,
+                        # The `think` task string: what the realtime model
+                        # synthesised from what the user said, and already an
+                        # imperative description of the ask.
+                        request_text=user_message,
+                    )
+                    set_current_voice_job(_vjob)
+                except Exception:  # noqa: BLE001 — never fail a turn on a card
+                    logger.exception("[AGENT] could not open voice job tracker")
+                    _vjob = None
 
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
@@ -3033,6 +3076,14 @@ class AgentRunner:
             # turns are byte-identical to before.
             tool_results: List[Dict[str, Any]] = []
             _parallel_results: Dict[str, Dict[str, Any]] = {}
+            # Round 13: voice has no `create_job` (VOICE_DISABLED_TOOLS), so
+            # the RUNNER opens the card for the work this round is about to
+            # do. Declared here — before the bookkeeping and the web batch —
+            # because a card that appears after the searches come back is a
+            # receipt, not progress. Synchronous and fire-and-forget: the DB
+            # insert and the phone push run off this coroutine (voice_jobs).
+            if _vjob is not None:
+                _vjob.plan(pending_tool_calls, _steps)
             # Round 4 (items 7b/8): job bookkeeping runs FIRST, ahead of the
             # concurrent web batch. The prompt now asks the model to put
             # create_job / update_job in the SAME response as the tools of
@@ -3133,6 +3184,13 @@ class AgentRunner:
 
                 logger.info(f"[AGENT] Tool called: {tc['name']}({json.dumps(tc['input'])[:200]})")
                 all_tool_calls.append(tc)
+                # Round 13: point the tracker at the voice card's step for
+                # THIS call, so its frames and its persisted tool_events carry
+                # the same job_id / step_index / step_name a chat turn's do —
+                # the clients bucket actions under steps from those keys and
+                # have no other way to know which step an action served.
+                if _vjob is not None:
+                    _vjob.attribute(tc["name"], _steps)
                 # Observational only — the return value is intentionally
                 # discarded. For tools pre-executed in the parallel pass above
                 # this fires AFTER execution, so a future handler must NOT rely
@@ -3575,6 +3633,21 @@ class AgentRunner:
             "job": _steps.job_id, "steps_total": _steps.steps_total or None,
         })
         _wf.start("finalize")
+
+        # Round 13: close the voice card. Deliberately BEFORE the create_job
+        # finalizer below and deliberately not part of it — that block awaits
+        # its DB write and its terminal push, and voice pays for every
+        # millisecond between here and the first TTS byte. `seal` schedules
+        # the same shared close (job_reconciler.close_job_completed +
+        # announce_completed) on a background task and returns immediately;
+        # the sweep in run()'s finally is a no-op once it has been called.
+        if _vjob is not None:
+            _vjob.seal(
+                final_text=final_text,
+                total_tokens=total_input + total_output,
+                model=model_used,
+            )
+            set_current_voice_job(None)
 
         # Hook: agent run complete
         await _hb.emit(HookEvent.AGENT_END, {

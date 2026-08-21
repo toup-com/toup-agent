@@ -547,6 +547,12 @@ async def get_session_messages(
 _TOOL_EVENT_KEYS = {
     "tool", "started_at_ms", "completed_at_ms", "summary",
     "step_index", "url", "domains", "urls", "sources", "ok",
+    # Round 13: the rest of the step attribution a CHAT record already
+    # carries (agent_runner stamps StepTracker.event_fields onto every
+    # record). `step_index` alone is an index into a step list the reader
+    # has no other way to find — without the job id and the totals beside
+    # it, a voice record could not be bucketed the way a chat one is.
+    "job_id", "step_name", "steps_total", "job_type", "call_id",
 }
 _TOOL_EVENTS_MAX = 40
 
