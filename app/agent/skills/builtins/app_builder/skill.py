@@ -41,7 +41,7 @@ from app.agent.skills.base import Skill, SkillContext, SkillMeta
 # EXF-3 completion: app-builder subprocesses must scrub secrets AND drop to
 # the toup uid, else npm/expo lifecycle scripts run as root and can read
 # /proc/1/environ (docs/security/audit-2026.md).
-from app.services.exec_env import scrubbed_environ, sandbox_preexec
+from app.services.exec_env import sandbox_environ, sandbox_preexec
 from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
@@ -578,8 +578,10 @@ _PROMPT_DIET_SECTION = (
     "database, platforms. Ask \"Does this plan look good?\" "
     "[[Build it!]] [[Change something]]\n"
     "5. **Build** — ONLY after explicit approval: call "
-    "`app_builder__build_app` with the full context; point the user at the "
-    "**Jobs** tab. `app_builder__get_status` checks progress; "
+    "`app_builder__build_app` with the full context. The build card appears "
+    "in the chat and updates itself — do NOT tell the user to go and "
+    "watch it anywhere, and never emit a navigation chip for it. "
+    "`app_builder__get_status` checks progress; "
     "`app_builder__resume_build` resumes a token-paused build.\n"
     "6. **Iterate**: share the preview, then `app_builder__modify_app` for "
     "changes (regenerates only affected files — faster than a rebuild).\n\n"
@@ -1004,8 +1006,9 @@ class AppBuilderSkill(Skill):
 
         return (
             f"Building '{name}'! Job ID: {job_id}\n\n"
-            f"Track progress in the **Jobs** tab. "
-            f"When done, you'll find it in the **Apps** tab with:\n"
+            f"The build card in this chat updates as it goes — do not send the "
+            f"user anywhere to watch it. When it is done you'll find it in "
+            f"Files and in the Apps list, with:\n"
             f"- QR code for Expo Go (iPhone/iPad)\n"
             f"- Web URL for browser preview\n"
             f"- GitHub repo with all code\n\n"
@@ -1200,7 +1203,7 @@ class AppBuilderSkill(Skill):
             f"Modifying '{app.name}'! Job ID: {job_id}\n\n"
             f"Changes: {changes}\n"
             f"Only affected files will be regenerated — this is faster than a full rebuild.\n"
-            f"Track progress in the **Jobs** tab."
+            f"The build card in this chat updates as it goes."
         )
 
     # ── Sub-Agent Handlers ────────────────────────────────────────
@@ -1384,7 +1387,8 @@ class AppBuilderSkill(Skill):
             "### Step 3: Build (ONLY after explicit approval)\n"
             "Call `app_builder__build_app` with ALL the context from the conversation.\n"
             "Include screens, features, design_notes, and db_type from the discussion.\n"
-            "Tell the user to check the **Jobs** tab for live progress.\n\n"
+            "The build card appears in the chat and updates itself — do NOT send "
+            "the user to another page and do NOT emit a navigation chip.\n\n"
 
             "### Step 4: Preview & Iterate\n"
             "After build completes, share the preview URL and QR code.\n"
@@ -1625,9 +1629,9 @@ class AppBuilderSkill(Skill):
                         await self._update_step(job_id, user_id, "database", "done")
                     except Exception as e:
                         await blog.warn(f"Database setup failed (non-fatal): {e}")
-                        await self._update_step(job_id, user_id, "database", "done", detail=f"Skipped: {e}")
+                        await self._update_step(job_id, user_id, "database", "done")
                 else:
-                    await self._update_step(job_id, user_id, "database", "done", detail="Not needed")
+                    await self._update_step(job_id, user_id, "database", "done")
             else:
                 await blog.info("Database setup already done — skipping")
 
@@ -1659,10 +1663,10 @@ class AppBuilderSkill(Skill):
                             await db.commit()
                     await blog.success(f"GitHub repo created", github_url)
                     await self._update_step(job_id, user_id, "github", "done",
-                                            detail=github_url or "Skipped")
+                                            detail=github_url or "")
                 except Exception as e:
                     await blog.warn(f"GitHub failed (non-fatal): {e}")
-                    await self._update_step(job_id, user_id, "github", "done", detail=f"Skipped: {e}")
+                    await self._update_step(job_id, user_id, "github", "done")
             else:
                 await blog.info("GitHub already done — skipping")
 
@@ -2010,11 +2014,10 @@ class AppBuilderSkill(Skill):
                     await self._update_step(job_id, user_id, "database", "done")
                 except Exception as e:
                     await blog.warn(f"Database setup failed (non-fatal): {e}")
-                    await self._update_step(job_id, user_id, "database", "done",
-                                            detail=f"Skipped: {e}")
+                    await self._update_step(job_id, user_id, "database", "done")
             else:
                 await blog.info("No database needed, skipping")
-                await self._update_step(job_id, user_id, "database", "done", detail="Not needed")
+                await self._update_step(job_id, user_id, "database", "done")
 
             _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database"]
             _checkpoint["current_step"] = "installing"
@@ -2101,7 +2104,7 @@ class AppBuilderSkill(Skill):
                     await self._fail_job(job_id, app_id, f"npm install failed ({classification}): {error_text[:300]}")
                     return
 
-                elif classification in ("transient", "stale", "unknown"):
+                elif classification in ("transient", "stale", "unknown", "permissions"):
                     # Orchestrator-level retry with escalating timeouts and cache clear
                     INSTALL_RETRY_TIMEOUTS = [450, 600]
                     for retry_idx, retry_timeout in enumerate(INSTALL_RETRY_TIMEOUTS, 1):
@@ -2110,6 +2113,16 @@ class AppBuilderSkill(Skill):
                             f"with {retry_timeout}s timeout (was {classification})..."
                         )
                         try:
+                            # Round 15: a permission fault is repaired, not
+                            # waited out. AppManager already tried once inside
+                            # its own loop; this is the wider sweep (the whole
+                            # app tree, not just the paths it touched) before
+                            # the orchestrator's retry.
+                            if classification == "permissions" and self._app_manager:
+                                summary = await asyncio.to_thread(
+                                    self._app_manager.repair_permissions, app_dir,
+                                )
+                                await blog.info(f"[REPAIR] Widened the app workspace: {summary}")
                             # Clear npm cache before retry to avoid corrupted state
                             import shutil as _shutil
                             npm_cache = os.path.join("/tmp", "npm-cache-shared")
@@ -2173,11 +2186,10 @@ class AppBuilderSkill(Skill):
                         await db.commit()
                 await blog.success(f"GitHub repo created", github_url)
                 await self._update_step(job_id, user_id, "github", "done",
-                                        detail=github_url or "Skipped (no gh CLI)")
+                                        detail=github_url or "")
             except Exception as e:
                 await blog.warn(f"GitHub repo creation failed (non-fatal): {e}")
-                await self._update_step(job_id, user_id, "github", "done",
-                                        detail=f"Skipped: {e}")
+                await self._update_step(job_id, user_id, "github", "done")
 
             _checkpoint["completed_steps"] = ["planning", "scaffolding", "writing", "database", "installing", "github"]
             _checkpoint["current_step"] = "starting"
@@ -2245,7 +2257,7 @@ class AppBuilderSkill(Skill):
                                 proc = await asyncio.create_subprocess_exec(
                                     *install_cmd, cwd=app_dir,
                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                                    env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
+                                    env=sandbox_environ(), preexec_fn=sandbox_preexec(),
                                 )
                                 await asyncio.wait_for(proc.communicate(), timeout=120)
                             except Exception as dep_err:
@@ -2337,7 +2349,7 @@ class AppBuilderSkill(Skill):
                                     "npx", "expo", "start", "--clear", "--web", "--port", str(web_port),
                                     cwd=app_dir,
                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                                    env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
+                                    env=sandbox_environ(), preexec_fn=sandbox_preexec(),
                                 )
                                 # Don't wait for it to finish — just start it and let the next round check
                                 await asyncio.sleep(8)
@@ -2369,7 +2381,7 @@ class AppBuilderSkill(Skill):
                                 cwd=app_dir,
                                 stdout=asyncio.subprocess.PIPE,
                                 stderr=asyncio.subprocess.STDOUT,
-                                env=scrubbed_environ(), preexec_fn=sandbox_preexec(),
+                                env=sandbox_environ(), preexec_fn=sandbox_preexec(),
                             )
                             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
                             output = stdout.decode("utf-8", errors="replace") if stdout else ""
@@ -4387,10 +4399,15 @@ const _webDb = {
                     lines.append(f"GitHub: {github_url}")
                 content = "\n".join(lines)
             else:
-                # Trim error to one line max; full error stays on
-                # BuildJob.error_message for the detail drawer.
-                err_short = (error_message or "Build failed").splitlines()[0][:200]
-                content = f"❌ Build failed: **{app_name}** — {err_short}"
+                # `error_message` is ALREADY the translated sentence when it
+                # comes from `_fail_job`. Translating again is idempotent and
+                # covers the callers that reach here with something raw, so
+                # no path can put npm's words in the user's chat.
+                from app.agent.build_errors import friendly_build_error_with_retry
+                content = (
+                    f"I couldn't finish building **{app_name}**.\n"
+                    + friendly_build_error_with_retry(error_message or "")
+                )
 
             async with async_session_maker() as db:
                 day_chat_id = await resolve_day_chat_id_for_now(db, user_id)
@@ -4438,11 +4455,19 @@ const _webDb = {
             )
 
     async def _fail_job(self, job_id: str, app_id: str, error_msg: str):
-        """Mark a job as failed, stop processes, and clean up stuck step statuses."""
+        """Mark a job as failed, stop processes, and clean up stuck step statuses.
+
+        ``error_msg`` is the RAW engineering string every caller has always
+        passed. It stops here: the row, the WS frame and the chat post all
+        carry the translated sentence (``build_errors``), and the raw text
+        goes to the log and ``config_json['raw_error']`` for the operator.
+        """
+        from app.agent.build_errors import friendly_build_error
         from app.db.database import async_session_maker
         from app.db.models import App, BuildJob
 
         logger.error(f"[BUILD] Job {job_id} failed: {error_msg}")
+        user_error = friendly_build_error(error_msg)
 
         # Stop Metro/web processes — no reason to keep them running for a failed build
         if self._app_manager:
@@ -4455,8 +4480,16 @@ const _webDb = {
             job = await db.get(BuildJob, job_id)
             if job:
                 job.status = "failed"
-                job.error_message = error_msg
+                job.error_message = user_error
                 job.completed_at = datetime.utcnow()
+                # Operator surface. The clients read `error_message`; nothing
+                # renders `config_json`, so this is where the real text lives.
+                try:
+                    _cfg = dict(job.config_json or {})
+                    _cfg["raw_error"] = str(error_msg)[:2000]
+                    job.config_json = _cfg
+                except Exception:  # noqa: BLE001 — never fail a fail path
+                    pass
 
                 # Clean up stuck steps: mark any "running" step as "failed"
                 try:
@@ -4506,7 +4539,7 @@ const _webDb = {
                 app_name=_name_for_post,
                 slug=_slug_for_post,
                 terminal_status="failed",
-                error_message=error_msg,
+                error_message=user_error,
             )
 
         # Broadcast failure so frontend updates without a refresh
@@ -4518,7 +4551,7 @@ const _webDb = {
                     "job_id": job_id,
                     "app_id": app_id,
                     "status": "failed",
-                    "error_message": error_msg,
+                    "error_message": user_error,
                 })
             except Exception:
                 pass
@@ -5023,7 +5056,7 @@ const _webDb = {
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"},
+                env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1"},
                 preexec_fn=sandbox_preexec(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -5064,7 +5097,7 @@ const _webDb = {
                 cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"},
+                env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1"},
                 preexec_fn=sandbox_preexec(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)

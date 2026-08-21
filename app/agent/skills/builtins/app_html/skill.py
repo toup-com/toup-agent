@@ -319,7 +319,10 @@ class AppHtmlSkill(Skill):
             "announced twice — the user sees two progress cards for one app.\n"
             "Never paste a tool's output, an exit code or an error dump into your "
             "reply. If a step fails, say what happened in one plain sentence and "
-            "what you are doing about it."
+            "what you are doing about it. "
+            "And do not send the user anywhere to watch it: no `navigate_to` "
+            "call and no `[[navigate:…]]` chip during a build. The card is in "
+            "this chat, in front of them, and it updates itself."
         )
 
     # ------------------------------------------------------------------

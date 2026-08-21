@@ -33,6 +33,25 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^)\s]+)(?:\s+\"[^\"]*\")?\)")
 # Product chips the web/mobile clients render as buttons: [[navigate:/x]],
 # [[open_app:slug]], [[Play TITLE on Netflix]] — meaningless as text.
 _CHIP_RE = re.compile(r"\[\[[^\]]*\]\]")
+# Round 15: the HOLE a chip leaves. Removing "[[navigate:/jobs]]" from
+# "You can watch it in [[navigate:/jobs]]." shipped "You can watch it in ."
+# to a real user; this surface (push bodies, Telegram, SMS) would have sent
+# the same sentence, because it strips chips with the same blunt sub. Two
+# rules, matching `frontend/src/modules/chat/chipDirectives.ts`:
+#   1. a chip at the END takes the clause that introduced it;
+#   2. punctuation and whitespace close back up around the gap.
+# Rule 1 is anchored to a chip actually having been there — the same trailing
+# word in ordinary prose ("the toggle is on.") must survive.
+_CHIP_TAIL_RE = re.compile(
+    r"[ \t]*\b(?:in|at|on|to|from|into|under|via|inside|over|here|below|above)\b"
+    r"[ \t]*[.:;,!?…]*[ \t]*(?=\n|$)",
+    re.IGNORECASE,
+)
+_CHIP_AT_END_RE = re.compile(r"\[\[[^\]]*\]\][ \t.,;:!?…]*(?=\n|$)")
+_GAP_SPACE_RE = re.compile(r"[ \t]{2,}")
+_GAP_PUNCT_RE = re.compile(r"[ \t]+([.,;:!?…])")
+
+
 _HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.MULTILINE)
 _HEADING_TRAIL_RE = re.compile(r"[ \t]+#{1,6}[ \t]*$", re.MULTILINE)
 _BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}>[ \t]?", re.MULTILINE)
@@ -77,6 +96,26 @@ def _latex_inline_repl(m: "re.Match[str]") -> str:
     return m.group(0)
 
 
+def _strip_chips(s: str) -> str:
+    """Remove chips AND the residue they leave, line by line."""
+    out = []
+    for line in s.split("\n"):
+        if "[[" not in line:
+            out.append(line)
+            continue
+        at_end = bool(_CHIP_AT_END_RE.search(line))
+        line = _CHIP_RE.sub("", line)
+        line = _GAP_SPACE_RE.sub(" ", line)
+        line = _GAP_PUNCT_RE.sub(r"\1", line)
+        if at_end:
+            trimmed = _CHIP_TAIL_RE.sub("", line).rstrip()
+            if trimmed != line.rstrip():
+                line = f"{trimmed}." if trimmed.strip() and trimmed[-1] not in ".!?…:" else trimmed
+        # A line reduced to punctuation is residue, not content.
+        out.append("" if line.strip() and not re.sub(r"[.,;:!?…\s]", "", line) else line)
+    return "\n".join(out)
+
+
 def strip_markdown(text: Optional[str], *, collapse_whitespace: bool = False) -> str:
     """Return ``text`` with markdown syntax removed and its words intact.
 
@@ -100,7 +139,7 @@ def strip_markdown(text: Optional[str], *, collapse_whitespace: bool = False) ->
         s = _LATEX_INLINE_RE.sub(_latex_inline_repl, s)
         s = _IMAGE_RE.sub(lambda m: m.group(1), s)
         s = _LINK_RE.sub(lambda m: m.group(1), s)
-        s = _CHIP_RE.sub("", s)
+        s = _strip_chips(s)
         s = _HTML_TAG_RE.sub("", s)
         s = _TABLE_SEP_RE.sub("", s)
         if "|" in s:

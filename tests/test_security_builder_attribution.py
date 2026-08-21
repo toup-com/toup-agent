@@ -323,11 +323,22 @@ def test_doctor_output_scrubbed_and_no_key_fragment():
 
 
 def test_app_builder_subprocess_env_scrubbed():
-    """Every app_manager child gets a scrubbed env (no raw os.environ spawn)."""
+    """Every app_manager child gets a scrubbed env (no raw os.environ spawn).
+
+    Round 15: the import is `sandbox_environ`, which IS `scrubbed_environ`
+    plus a HOME matching the uid the child is dropped to. The scrub is
+    unchanged — it is the same function underneath — and the addition is what
+    stopped npm running as uid 1000 against root's home. Asserting the old
+    name here would force a revert of that fix.
+    """
     src = (_BACKEND / "app" / "agent" / "app_manager.py").read_text()
-    assert "from app.services.exec_env import scrubbed_environ" in src
+    assert "from app.services.exec_env import sandbox_environ" in src
+    assert "scrubbed_environ(" not in src, "must not bypass the sandbox HOME"
     # No spawn should splat the full os.environ into a child.
     assert "{**os.environ," not in src
+    env_src = (_BACKEND / "app" / "services" / "exec_env.py").read_text()
+    assert "env = scrubbed_environ(base)" in env_src, \
+        "sandbox_environ must still scrub — it is the only env app children get"
 
 
 def test_telegram_sibling_commands_alias_model():

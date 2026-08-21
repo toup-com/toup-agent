@@ -219,8 +219,18 @@ def _isolate_entitlements():
 
 
 def _entitle(value: str) -> None:
-    """Set this tenant's entitlement the way the container env would."""
+    """Set this tenant's entitlement the way the container env would.
+
+    Round 15: `skill_enabled` now answers on TWO orthogonal axes — the tool
+    FAMILY ("may this tenant build apps at all?") and the PIPELINE ("with
+    which one?"). This file is about the family, so it pins the pipeline on;
+    otherwise the shipped default (Expo retired) withholds `app`/`app_builder`
+    for the other reason and the anti-vacuity controls here — the ones that
+    prove the family gate can say YES — would pass while measuring nothing.
+    Pipeline selection has its own suite (`test_app_pipeline_gate.py`).
+    """
     settings.agent_tool_families = value
+    settings.app_builder_expo_enabled = True
     te_mod.reset_cache_for_tests()
 
 

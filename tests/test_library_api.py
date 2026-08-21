@@ -186,15 +186,158 @@ async def _folders(api, headers):
 # The clean library
 # ═════════════════════════════════════════════════════════════════════
 
-async def test_root_is_three_system_folders_and_no_internals(api, agent_headers, tenant):
+async def test_root_is_the_system_folders_and_no_internals(api, agent_headers, tenant):
     body = await _list(api, agent_headers)
     assert body["base"] == "/" and body["curated"] is True and body["path"] == ""
     names = [f["name"] for f in body["files"]]
-    assert names == ["Documents", "Images", "Uploads"]
+    # Round 15 adds Apps: an app the agent built is a thing the user owns,
+    # so it lives beside their documents rather than only in the Apps list.
+    assert names == ["Documents", "Images", "Apps", "Uploads"]
     for f in body["files"]:
         assert f["type"] == "dir" and f["size"] == 0 and f["modified"].endswith("Z")
-        assert f["system"] in ("documents", "images", "uploads")
+        assert f["system"] in ("documents", "images", "apps", "uploads")
     _assert_clean(body, tenant["uid"])
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Apps (round 15)
+# ═════════════════════════════════════════════════════════════════════
+
+def _present_app(root: str, slug: str, title: str, html: str) -> None:
+    """What `app_html__present_app` leaves on disk."""
+    apps = os.path.join(root, "apps")
+    os.makedirs(os.path.join(apps, ".versions", slug), exist_ok=True)
+    with open(os.path.join(apps, f"{slug}.html"), "w") as fh:
+        fh.write(html)
+    with open(os.path.join(apps, ".versions", slug, "1-x.html"), "w") as fh:
+        fh.write(html)
+    with open(os.path.join(apps, "manifest.json"), "w") as fh:
+        json.dump({"version": 1, "apps": {slug: {
+            "slug": slug, "title": title,
+            "created_at": "2026-08-21T00:00:00Z", "updated_at": "2026-08-21T00:00:00Z",
+            "revision": 2, "size_bytes": len(html),
+            "presented_at": "2026-08-21T00:00:01Z",
+        }}}, fh)
+
+
+@pytest.fixture
+def snake(tenant, monkeypatch):
+    """An app the agent built and presented, in the tenant's app root."""
+    root = tenant["root"]
+    monkeypatch.setenv("TOUP_HTML_APPS_DIR", os.path.join(root, "apps"))
+    html = ("<!doctype html><html><head><title>Snake</title>"
+            "<style>body{background:#9ead86}</style></head><body>"
+            "<canvas id=g></canvas><script>var s=[];function step(){}</script>"
+            "</body></html>" + "<!-- pad -->" * 200)
+    _present_app(root, "nokia-snake-classic", "Nokia Snake Classic", html)
+    return {"slug": "nokia-snake-classic", "title": "Nokia Snake Classic",
+            "size": len(html), "root": root}
+
+
+async def test_a_built_app_is_in_files_under_its_title(api, agent_headers, tenant, snake):
+    """The whole of item 5, through the HTTP surface a client actually calls."""
+    body = await _list(api, agent_headers, "Apps")
+    names = [f["name"] for f in body["files"]]
+    assert names == [snake["title"]], names
+
+    entry = body["files"][0]
+    assert entry["kind"] == "app"
+    assert entry["size"] == snake["size"] and entry["size_label"]
+    assert entry["modified"].endswith("Z")
+    # The handle for the sandboxed runner, and nothing else internal.
+    assert entry["app_slug"] == snake["slug"]
+    assert ".html" not in entry["name"] and ".html" not in entry["path"]
+    _assert_clean(body, tenant["uid"])
+
+
+async def test_the_app_root_bookkeeping_is_not_in_files(api, agent_headers, tenant, snake):
+    """`manifest.json` and `.versions/` are machinery. A legacy Expo project
+    under the same root stays denied too — `_DENIED_DIRS` is unchanged."""
+    body = await _list(api, agent_headers, "Apps")
+    names = [f["name"] for f in body["files"]]
+    assert "manifest.json" not in names and "App.tsx" not in names
+    assert len(names) == 1
+
+    r = await api.get("/api/library/files", params={"folder": "all", "limit": 200},
+                      headers=agent_headers)
+    assert r.status_code == 200
+    all_names = [f["name"] for f in r.json()["items"]]
+    assert "manifest.json" not in all_names and "App.tsx" not in all_names
+
+
+async def test_an_app_cannot_be_served_by_the_file_routes(api, agent_headers, tenant, snake):
+    """Model-authored HTML with model-authored script may only ever be served
+    by the artifact route — a cookieless origin, a strict CSP, and a frame
+    sandboxed without allow-same-origin. Every route here answers on an origin
+    that carries the account's session."""
+    body = await _list(api, agent_headers, "Apps")
+    fid = body["files"][0]["id"]
+    path = body["files"][0]["path"]
+
+    for r in (
+        await api.get(f"/api/library/files/{fid}/download", headers=agent_headers),
+        await api.get(f"/api/library/files/{fid}/preview", headers=agent_headers),
+        await api.get(f"/api/library/files/{fid}/content", headers=agent_headers),
+        await api.put(f"/api/library/files/{fid}/content", headers=agent_headers,
+                      json={"content": "<html>evil</html>"}),
+        await api.get("/api/workspace/file-content", params={"path": path}, headers=agent_headers),
+        await api.get("/api/workspace/file-download", params={"path": path}, headers=agent_headers),
+    ):
+        assert r.status_code == 415, (r.request.url, r.status_code, r.text[:200])
+
+    # Anti-vacuity: an ordinary document downloads perfectly well, so the
+    # 415s above are about apps and not about a broken harness.
+    docs = await _list(api, agent_headers, "Documents")
+    doc_ids = [f["id"] for f in docs["files"] if f["type"] == "file"]
+    assert doc_ids, [f["name"] for f in docs["files"]]
+    assert (await api.get(f"/api/library/files/{doc_ids[0]}/download",
+                          headers=agent_headers)).status_code == 200
+
+
+async def test_kind_filters_put_an_app_in_exactly_one_bucket(api, agent_headers, tenant, snake):
+    """`?kind=` is how a client builds tabs. An app has no extension and a
+    text/html mime, so before the storage-root check it fell through EVERY
+    extension rule into `other` — "where did my snake game go?" answered
+    with "Other"."""
+    async def by_kind(kind: str) -> list[str]:
+        r = await api.get("/api/library/files",
+                          params={"folder": "all", "kind": kind, "limit": 200},
+                          headers=agent_headers)
+        assert r.status_code == 200, r.text
+        return [f["name"] for f in r.json()["items"]]
+
+    assert await by_kind("app") == [snake["title"]]
+    for other in ("document", "image", "audio", "video", "archive", "other"):
+        assert snake["title"] not in await by_kind(other), other
+
+    # Anti-vacuity: the other buckets are not simply empty.
+    assert await by_kind("image"), "no images — the filter may be broken, not the app rule"
+
+
+async def test_renaming_an_app_in_files_renames_the_app(api, agent_headers, tenant, snake):
+    body = await _list(api, agent_headers, "Apps")
+    fid = body["files"][0]["id"]
+
+    r = await api.patch(f"/api/library/files/{fid}", headers=agent_headers,
+                        json={"name": "Serpent Deluxe"})
+    assert r.status_code == 200, r.text
+    assert r.json()["name"] == "Serpent Deluxe"
+    assert lib.app_title(snake["slug"]) == "Serpent Deluxe"
+    # The bytes never move: the slug, the artifact URL and the chat card's
+    # link all keep working.
+    assert os.path.isfile(os.path.join(snake["root"], "apps", f"{snake['slug']}.html"))
+
+
+async def test_deleting_an_app_in_files_retires_it_everywhere(api, agent_headers, tenant, snake):
+    body = await _list(api, agent_headers, "Apps")
+    fid = body["files"][0]["id"]
+
+    assert (await api.delete(f"/api/library/files/{fid}",
+                             headers=agent_headers)).status_code in (200, 204)
+
+    assert not os.path.isfile(os.path.join(snake["root"], "apps", f"{snake['slug']}.html"))
+    assert snake["slug"] not in lib.app_manifest()
+    assert (await _list(api, agent_headers, "Apps"))["files"] == []
 
 
 async def test_junk_and_internals_never_appear_anywhere(api, agent_headers, tenant):
@@ -650,7 +793,7 @@ async def test_compat_tree_is_the_virtual_tree(api, agent_headers, tenant):
     assert r.status_code == 200
     body = r.json()
     names = [e["name"] for e in body["tree"]]
-    assert names[:3] == ["Documents", "Images", "Uploads"]
+    assert names[:4] == ["Apps", "Documents", "Images", "Uploads"]
     assert "IMG_3145.jpg" in names and "uoft-events.docx" in names
     for e in body["tree"]:
         assert e["modified"] and e["modified"].endswith("Z")

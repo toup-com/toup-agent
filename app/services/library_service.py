@@ -54,6 +54,7 @@ from app.db.models.user_file import (
     FILE_ORIGINS,
     ORIGIN_AGENT,
     ORIGIN_UPLOAD,
+    SYSTEM_FOLDER_APPS,
     SYSTEM_FOLDER_DOCUMENTS,
     SYSTEM_FOLDER_IMAGES,
     SYSTEM_FOLDER_UPLOADS,
@@ -74,8 +75,14 @@ KIND_IMAGE = "image"
 KIND_AUDIO = "audio"
 KIND_VIDEO = "video"
 KIND_ARCHIVE = "archive"
+#: An app the agent built — one self-contained HTML file. NOT a document,
+#: even though it is .html: a document is opened to be read, an app is opened
+#: to be RUN, and it can only be run inside the sandboxed artifact frame. The
+#: kind is what tells a client which of the two to do.
+KIND_APP = "app"
 KIND_OTHER = "other"
-KINDS = (KIND_DOCUMENT, KIND_IMAGE, KIND_AUDIO, KIND_VIDEO, KIND_ARCHIVE, KIND_OTHER)
+KINDS = (KIND_DOCUMENT, KIND_IMAGE, KIND_AUDIO, KIND_VIDEO, KIND_ARCHIVE,
+         KIND_APP, KIND_OTHER)
 
 _KIND_BY_EXT: dict[str, str] = {}
 for _ext in ("pdf", "doc", "docx", "odt", "rtf", "txt", "md", "markdown", "csv", "tsv",
@@ -140,6 +147,20 @@ def kind_of(name: str, mime: str = "") -> str:
     if m.startswith("text/") or m == "application/pdf":
         return KIND_DOCUMENT
     return KIND_OTHER
+
+
+def kind_of_row(f) -> str:
+    """Kind for a manifest ROW, which knows where its bytes live.
+
+    An app's display name has no extension ("Nokia Snake Classic") and its
+    mime is text/html, so `kind_of` alone would call it a document and every
+    client would offer to READ it. The storage root is the only thing that
+    still knows it is an app.
+    """
+    key = getattr(f, "storage_key", "") or ""
+    if key.startswith(ROOT_APP + ":"):
+        return KIND_APP
+    return kind_of(getattr(f, "name", "") or "", getattr(f, "mime_type", "") or "")
 
 
 def guess_mime(name: str, fallback: str = "") -> str:
@@ -356,7 +377,13 @@ def is_junk(name: str, size: int, *, path_for_sniff: Optional[str] = None) -> bo
 ROOT_GEN = "gen"
 ROOT_UWS = "uws"
 ROOT_WS = "ws"
-_ROOT_TAGS = (ROOT_GEN, ROOT_UWS, ROOT_WS)
+#: The HTML-app root (`app_html.store.apps_root()`). A separate tag rather
+#: than a path under `ws:` because `apps/` is in `_DENIED_DIRS` — it holds a
+#: build tree, not deliverables — and must stay denied for the generic walk.
+#: What belongs in the library is the ONE presented `<slug>.html` per app,
+#: never `.versions/`, never `manifest.json`.
+ROOT_APP = "app"
+_ROOT_TAGS = (ROOT_GEN, ROOT_UWS, ROOT_WS, ROOT_APP)
 
 # Directory names that are never descended into, wherever they appear.
 _DENIED_DIRS = {"apps", "vibecoding", "toup-code", "node_modules", "__pycache__",
@@ -369,6 +396,20 @@ def workspace_root() -> str:
     return os.path.realpath(getattr(settings, "agent_workspace_dir", None) or "./workspace")
 
 
+def apps_root() -> str:
+    """The HTML-app root, asked of the store that owns it.
+
+    Imported lazily and with a fallback: the library must keep listing
+    documents on a container where the app pipeline is switched off and the
+    skill was never loaded.
+    """
+    try:
+        from app.agent.skills.builtins.app_html.store import apps_root as _r
+        return os.path.realpath(_r())
+    except Exception:
+        return os.path.realpath(os.path.join(workspace_root(), "apps"))
+
+
 def _root_dir(tag: str, user_id: str) -> str:
     ws = workspace_root()
     if tag == ROOT_GEN:
@@ -377,6 +418,8 @@ def _root_dir(tag: str, user_id: str) -> str:
         return os.path.join(ws, user_id)
     if tag == ROOT_WS:
         return ws
+    if tag == ROOT_APP:
+        return apps_root()
     raise ValueError(f"unknown storage root {tag!r}")
 
 
@@ -480,6 +523,75 @@ def _is_tenant_owner(user_id: str) -> bool:
     return not owner or owner == user_id
 
 
+def app_manifest() -> dict:
+    """``{slug: record}`` from the HTML-app store, or ``{}``. Never raises."""
+    try:
+        from app.agent.skills.builtins.app_html import store as _store
+        return _store.read_manifest() or {}
+    except Exception:
+        return {}
+
+
+def app_slug_of(key: str) -> Optional[str]:
+    """The app slug behind an ``app:`` storage key, else None."""
+    try:
+        tag, rel = split_key(key)
+    except ValueError:
+        return None
+    if tag != ROOT_APP or not rel.endswith(".html"):
+        return None
+    return rel[: -len(".html")]
+
+
+def app_title(slug: str) -> str:
+    """The human name for an app: the title the model gave it, falling back
+    to a de-slugged version. Never the slug and never the filename — those
+    are addresses, not names.
+
+    The equality check is not paranoia. ``AppRecord.from_dict`` substitutes
+    the slug for a missing title, so a record can arrive here carrying
+    "nokia-snake-classic" in the `title` field and look perfectly valid. The
+    slug is disqualified as a name wherever it turns up.
+    """
+    rec = app_manifest().get(slug)
+    title = (getattr(rec, "title", "") or "") if rec is not None else ""
+    if not title and isinstance(rec, dict):
+        title = rec.get("title") or ""
+    title = title.strip()
+    if not title or title == slug:
+        return slug.replace("-", " ").title()
+    return title
+
+
+def _iter_app_candidates(budget: list[int]) -> Iterator[_Candidate]:
+    """One candidate per PRESENTED app: ``<apps_root>/<slug>.html``.
+
+    Depth 0 only, `.html` only. That excludes `manifest.json` (bookkeeping)
+    and `.versions/` (history, and a dot-directory anyway) without relying on
+    the junk rules to catch them later.
+
+    Only apps the model actually called `present_app` on are listed: a
+    half-written file the model abandoned mid-turn is not something the user
+    asked to keep, and it would appear in Files before it appeared anywhere
+    else.
+    """
+    root = apps_root()
+    if not os.path.isdir(root):
+        return
+    manifest = app_manifest()
+    for c in _iter_dir_files(root, ROOT_APP, "", recursive_depth=0, budget=budget):
+        slug = app_slug_of(c.key)
+        if not slug:
+            continue
+        rec = manifest.get(slug)
+        presented = getattr(rec, "presented_at", None) if rec is not None else None
+        if presented is None and isinstance(rec, dict):
+            presented = rec.get("presented_at")
+        if not presented:
+            continue
+        yield c
+
+
 def iter_physical_candidates(user_id: str) -> Iterator[_Candidate]:
     """The allow-list. Yields every file the library MAY show (junk rules
     still apply), most-authoritative root first so dedupe keeps the
@@ -487,6 +599,12 @@ def iter_physical_candidates(user_id: str) -> Iterator[_Candidate]:
     ws = workspace_root()
     budget = [_MAX_SCAN_ENTRIES]
     owner = _is_tenant_owner(user_id)
+
+    # 0. app:<slug>.html — the apps the agent has PRESENTED. Yielded first so
+    #    that if a copy of the same bytes exists anywhere else, the app entry
+    #    is the one that survives dedupe.
+    if owner:
+        yield from _iter_app_candidates(budget)
 
     # 1. gen:<user_id>/… and gen:shared/… — the storage backend scopes that
     #    are ours. Everything non-junk here is a deliverable or an upload.
@@ -643,6 +761,10 @@ def _parse_iso(s: Optional[str]) -> Optional[datetime]:
 
 
 def default_system_key(origin: str, kind: str) -> str:
+    # Apps first: an app is always agent-made and always an app, whatever
+    # the origin heuristics would otherwise say about an .html file.
+    if kind == KIND_APP:
+        return SYSTEM_FOLDER_APPS
     if origin == ORIGIN_UPLOAD:
         return SYSTEM_FOLDER_UPLOADS
     if kind == KIND_IMAGE:
@@ -818,7 +940,7 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
                     row.size_bytes = c.size
                     row.modified_at = _dt_from_ts(c.mtime)
                     row.created_at = row.created_at or _dt_from_ts(c.mtime)
-                    row.folder_id = _placement(row.origin, kind_of(row.name, row.mime_type), row.folder_id)
+                    row.folder_id = _placement(row.origin, kind_of_row(row), row.folder_id)
                     row.name = _uniquify(row.name, row.folder_id, taken)
                     taken.add((row.folder_id, row.name.lower()))
                     counts["restored"] += 1
@@ -833,7 +955,15 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
             continue
 
         # New file.
-        if att is not None:
+        if tag == ROOT_APP:
+            # An app's display name is the TITLE the model gave it ("Nokia
+            # Snake Classic"), not `nokia-snake-classic.html`. The slug lives
+            # on in the storage key, where the user never sees it.
+            name = app_title(app_slug_of(c.key) or base)
+            mime = "text/html"
+            origin = ORIGIN_AGENT
+            created = _dt_from_ts(c.mtime)
+        elif att is not None:
             name = display_name(att.get("filename") or base)
             mime = guess_mime(name, att.get("mime_type") or "")
             origin = ORIGIN_UPLOAD if att.get("role") == "user" else ORIGIN_AGENT
@@ -843,8 +973,8 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
             mime = guess_mime(name)
             origin = ORIGIN_AGENT
             created = _dt_from_ts(c.mtime)
-        kind = kind_of(name, mime)
-        if (name.lower(), int(c.size)) in known_sig and _is_duplicate(user_id, c, name, by_key, hashes):
+        kind = KIND_APP if tag == ROOT_APP else kind_of(name, mime)
+        if tag != ROOT_APP and (name.lower(), int(c.size)) in known_sig and _is_duplicate(user_id, c, name, by_key, hashes):
             # The same bytes again — the image tools drop a workspace copy
             # next to the attachment, Telegram/routine paths persist the same
             # generation repeatedly, a deleted or denied file has a twin at
@@ -952,7 +1082,7 @@ async def list_folders(db: AsyncSession, user_id: str, parent_id: Optional[str])
     q = select(UserFolder).where(UserFolder.user_id == user_id)
     q = q.where(UserFolder.parent_id.is_(None)) if parent_id is None else q.where(UserFolder.parent_id == parent_id)
     rows = (await db.execute(q)).scalars().all()
-    # System folders first (Documents, Images, Uploads), then user folders A→Z.
+    # System folders first, in SYSTEM_FOLDERS order, then user folders A→Z.
     order = {k: i for i, k in enumerate(SYSTEM_FOLDERS)}
     return sorted(rows, key=lambda f: (0 if f.system_key in order else 1,
                                        order.get(f.system_key, 99), f.name.lower()))
@@ -1120,18 +1250,57 @@ def _escape_like(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+#: An app row in SQL. Mirrors `kind_of_row`: the storage ROOT is the only
+#: thing that knows an app is an app, because its display name has no
+#: extension and its mime is the same text/html a saved web page would have.
+_IS_APP_SQL = UserFile.storage_key.like(f"{ROOT_APP}:%")
+
+
 def _kind_filter(kind: str):
-    """SQL predicate mirroring kind_of(): extension first, MIME family second."""
+    """SQL predicate mirroring kind_of_row(): storage root first, then
+    extension, then MIME family."""
+    if kind == KIND_APP:
+        return _IS_APP_SQL
     exts = [e for e, k in _KIND_BY_EXT.items() if k == kind]
     conds = [func.lower(UserFile.name).like(f"%.{e}") for e in exts]
     prefix = {KIND_IMAGE: "image/", KIND_AUDIO: "audio/", KIND_VIDEO: "video/"}.get(kind)
     if prefix:
         conds.append(UserFile.mime_type.like(f"{prefix}%"))
     if kind == KIND_OTHER:
+        # Without the app exclusion this bucket SWALLOWS every app: a name
+        # with no extension and a text/html mime is neither a known ext nor
+        # an image/audio/video, so "Other" would quietly be where the user's
+        # apps went.
         known = [func.lower(UserFile.name).like(f"%.{e}") for e in _KIND_BY_EXT]
         return and_(~or_(*known), ~UserFile.mime_type.like("image/%"),
-                    ~UserFile.mime_type.like("audio/%"), ~UserFile.mime_type.like("video/%"))
-    return or_(*conds)
+                    ~UserFile.mime_type.like("audio/%"), ~UserFile.mime_type.like("video/%"),
+                    ~_IS_APP_SQL)
+    # Every other kind is extension- or MIME-derived, and an app matches
+    # neither — but `document` would catch one if its title ever ended in a
+    # known extension ("Budget.xlsx" as an app NAME is legal). Exclude
+    # explicitly rather than relying on names.
+    return and_(or_(*conds), ~_IS_APP_SQL)
+
+
+async def _rename_app_everywhere(db: AsyncSession, slug: str, title: str) -> None:
+    """An app renamed in Files is renamed in the chat card and the Apps list
+    too — one app, one name. Best-effort: a rename that lands in the library
+    and nowhere else is still better than a rename that fails."""
+    try:
+        from app.agent.skills.builtins.app_html import store as _store
+        rec = _store.read_manifest().get(slug)
+        if rec is not None:
+            _store.upsert_record(slug, title, int(getattr(rec, "size_bytes", 0) or 0),
+                                 bump_revision=False)
+    except Exception:
+        logger.warning("[library] app manifest rename failed for %s", slug, exc_info=True)
+    try:
+        from app.db.models import App
+        row = (await db.execute(select(App).where(App.slug == slug))).scalar_one_or_none()
+        if row is not None:
+            row.name = title
+    except Exception:
+        logger.warning("[library] app row rename failed for %s", slug, exc_info=True)
 
 
 async def update_file(db: AsyncSession, user_id: str, f: UserFile, *, name: Optional[str] = None,
@@ -1146,8 +1315,12 @@ async def update_file(db: AsyncSession, user_id: str, f: UserFile, *, name: Opti
             raise LookupError("Destination folder not found")
     if new_name.lower() != f.name.lower() or new_folder != f.folder_id:
         await _assert_free_name(db, user_id, new_folder, new_name, ignore_file=f.id)
+    renamed = new_name != f.name
     f.name = new_name
     f.folder_id = new_folder
+    slug = app_slug_of(f.storage_key)
+    if renamed and slug:
+        await _rename_app_everywhere(db, slug, new_name)
     await db.commit()
     await db.refresh(f)
     return f
@@ -1175,6 +1348,30 @@ def _unlink_quiet(user_id: str, key: str) -> bool:
     return True
 
 
+async def _forget_app(db: AsyncSession, slug: str) -> None:
+    """Retire an app everywhere the moment its file is deleted from Files.
+
+    A half-delete is worse than no delete: the bytes would be gone while the
+    Apps list still offered it and `/api/artifacts/<slug>` still answered
+    from the manifest, so "open" would produce an error the user cannot
+    explain. Best-effort, and the library row is tombstoned either way.
+    """
+    try:
+        from app.agent.skills.builtins.app_html import store as _store
+        # Takes the revision history with it. `delete_file` has already
+        # unlinked the current file; this call is idempotent about that.
+        _store.delete_app(slug)
+    except Exception:
+        logger.warning("[library] app manifest delete failed for %s", slug, exc_info=True)
+    try:
+        from app.db.models import App
+        row = (await db.execute(select(App).where(App.slug == slug))).scalar_one_or_none()
+        if row is not None:
+            row.status = "deleted"
+    except Exception:
+        logger.warning("[library] app row retire failed for %s", slug, exc_info=True)
+
+
 async def delete_file(db: AsyncSession, user_id: str, f: UserFile) -> None:
     """Remove the bytes, then tombstone. If the bytes cannot be removed the
     row stays live and the caller sees an error — never a ghost row that
@@ -1191,6 +1388,9 @@ async def delete_file(db: AsyncSession, user_id: str, f: UserFile) -> None:
                 os.unlink(cache)
         except OSError:
             pass
+    slug = app_slug_of(f.storage_key)
+    if slug:
+        await _forget_app(db, slug)
     f.deleted_at = _utcnow()
     await db.commit()
 
@@ -1361,8 +1561,8 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 
 
 def file_entry(f: UserFile, path: str, *, api_prefix: str = "/api") -> dict:
-    kind = kind_of(f.name, f.mime_type)
-    return {
+    kind = kind_of_row(f)
+    entry = {
         "id": f.id,
         "name": f.name,
         "ext": ext_of(f.name),
@@ -1378,6 +1578,21 @@ def file_entry(f: UserFile, path: str, *, api_prefix: str = "/api") -> dict:
         "download_url": f"{api_prefix}/library/files/{f.id}/download",
         "preview_url": f"{api_prefix}/library/files/{f.id}/preview",
     }
+    if kind == KIND_APP:
+        # `app_slug` is the handle the client exchanges for a slug-scoped
+        # artifact token (`POST /api/artifacts/{slug}/token`) and renders in
+        # the sandboxed frame. It is NOT for display — `name` is the name,
+        # and no client shows a path, an id or a slug for an app.
+        #
+        # It has to be the slug specifically: the artifact route is the ONLY
+        # way these bytes may be opened. Serving them through the ordinary
+        # preview/download routes would put model-authored script on an
+        # origin that holds the account's session.
+        slug = app_slug_of(f.storage_key)
+        if slug:
+            entry["app_slug"] = slug
+            entry["preview_url"] = None
+    return entry
 
 
 def folder_entry(fo: UserFolder, path: str, *, file_count: int = 0, folder_count: int = 0) -> dict:
@@ -1405,8 +1620,14 @@ def compat_dir_entry(fo: UserFolder, path: str) -> dict:
 
 def compat_file_entry(f: UserFile, path: str) -> dict:
     e = file_entry(f, path)
-    return {
+    row = {
         "name": f.name, "type": "file", "size": e["size"], "modified": e["modified"],
         "id": f.id, "mime": f.mime_type, "kind": e["kind"], "size_label": e["size_label"],
         "origin": f.origin, "path": path, "system": None,
     }
+    # An app is openable only through the artifact frame, so the handle for
+    # that has to reach the path-based surface too — the shipped mobile
+    # client reads this shape, not `file_entry`.
+    if e.get("app_slug"):
+        row["app_slug"] = e["app_slug"]
+    return row

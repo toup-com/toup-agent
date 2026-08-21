@@ -254,11 +254,22 @@ async def test_flag_on_failed_posts_error_summary(
         )).scalars().all()
         assert len(msgs) == 1
         content = msgs[0].content or ""
-        # Failure marker + first line of error.
-        assert "failed" in content.lower() or "❌" in content
-        assert "Metro port 4001 busy" in content
-        # Long trace stays OUT of the chat surface — only first line.
+        # It says the build did not finish, by name.
+        assert "couldn't finish building" in content.lower()
+        assert "Test App" in content
+        # Round 15 REVERSED the old rule here. This used to assert that the
+        # error's FIRST LINE reached chat ("Metro port 4001 busy") and only
+        # the rest was withheld. That is how a user asking for a snake game
+        # was shown "npm install failed (stale): … exit 243 … EACCES".
+        #
+        # Now NOTHING of the raw text reaches the chat surface: one plain
+        # sentence plus a retry, with the original on the job row's
+        # `config_json.raw_error` for the operator.
+        assert "Metro" not in content and "4001" not in content
         assert "Full stack trace" not in content
+        assert "stack" not in content.lower()
+        # And it ends with something the reader can DO.
+        assert content.rstrip().endswith("[[Try again]]")
 
 
 # ──────────────────────────────────────────────────────────────────────

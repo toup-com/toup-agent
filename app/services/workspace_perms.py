@@ -97,6 +97,47 @@ def shared_makedirs(path: str) -> None:
         cur = os.path.dirname(cur)
 
 
+def share_tree(root: str, *, max_entries: int = _SWEEP_MAX_ENTRIES,
+               skip_dirs: tuple = ("node_modules", ".git")) -> dict:
+    """Make one arbitrary subtree writable by the sandbox uid. Bounded.
+
+    ``sweep_workspace_perms`` only covers subtrees of the tenant workspace,
+    but the Expo app root is ``$TOUP_APPS_DIR`` (``/opt/toup-agent/apps`` by
+    default), outside it. Round 15: the agent writes an app's files as ROOT
+    and then runs ``npm`` dropped to uid 1000, so without this the install
+    fails ``EACCES``/exit 243 on ``mkdir node_modules``.
+
+    ``node_modules`` is skipped by default — it is npm's own output, already
+    owned by the uid that will rewrite it, and walking 27k files to re-chmod
+    them is the exact cost this pipeline exists to avoid.
+
+    chmod, never chown: the container runs with CapDrop=ALL, so chown needs a
+    capability it does not have, while chmod only needs ownership — and root
+    owns everything it just wrote.
+    """
+    changed = 0
+    seen = 0
+    truncated = False
+    if not root or not os.path.isdir(root):
+        return {"root": root, "entries": 0, "changed": 0, "truncated": False}
+    if _chmod(root, _DIR_MODE):
+        changed += 1
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in dirnames:
+            seen += 1
+            if _chmod(os.path.join(dirpath, name), _DIR_MODE):
+                changed += 1
+        for name in filenames:
+            seen += 1
+            if _chmod(os.path.join(dirpath, name), _FILE_MODE):
+                changed += 1
+        if seen >= max_entries:
+            truncated = True
+            break
+    return {"root": root, "entries": seen, "changed": changed, "truncated": truncated}
+
+
 def workspace_root() -> str:
     from app.config import settings
 

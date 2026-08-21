@@ -256,10 +256,27 @@ def test_debt_is_not_growing_silently():
     mutations confirmed red. The entry is deleted rather than re-laned: the
     file runs clean under RUN_MODE=platform, so the sweep picks it up.
 
+    2026-08-21 (round 15): 68. Two ROUTING entries, not excuses — the same
+    kind as the media one at 74, and the argument is the same. Both files run,
+    in the agent-mode step, and both fail under RUN_MODE=platform for a reason
+    that is a mis-invocation rather than a defect:
+    `test_app_build_one_card` drives `build_jobs` (the pipeline adopting the
+    turn's job row) and `test_apps_in_files` drives `user_files`/`user_folders`
+    (an agent-built app appearing in the file library) — all AGENT_ONLY tables
+    that `init_db()` does not create under platform. The three other new files
+    from that round carry no debt line at all: they touch no database, pass in
+    both lanes, and the platform sweep picks them up.
+
+    Checked rather than assumed: CI's own lane arithmetic was replayed against
+    this list, and it puts these two in the agent-mode step and the other three
+    in the platform sweep. A file listed here but absent from the agent-mode
+    step WOULD be a test nobody runs, which is what this ceiling exists to
+    catch.
+
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 66
+    CEILING = 68
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

@@ -45,9 +45,16 @@ from .base import Base
 SYSTEM_FOLDER_DOCUMENTS = "documents"
 SYSTEM_FOLDER_IMAGES = "images"
 SYSTEM_FOLDER_UPLOADS = "uploads"
+# Round 15: an app the agent built is a thing the user owns, so it belongs in
+# the same place as everything else they own. Before this it existed only in
+# the Apps list — the library's scanner explicitly refused to descend into
+# `apps/` — so "where did my snake game go?" had a different answer from
+# "where did my report go?".
+SYSTEM_FOLDER_APPS = "apps"
 SYSTEM_FOLDERS: dict[str, str] = {
     SYSTEM_FOLDER_DOCUMENTS: "Documents",
     SYSTEM_FOLDER_IMAGES: "Images",
+    SYSTEM_FOLDER_APPS: "Apps",
     SYSTEM_FOLDER_UPLOADS: "Uploads",
 }
 

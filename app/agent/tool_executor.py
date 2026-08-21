@@ -30,7 +30,7 @@ import httpx
 from app.config import settings
 from app.agent.tool_entitlements import refusal_for_tool as _tool_entitlement_refusal
 from app.services.background_tasks import spawn as _spawn_bg
-from app.services.exec_env import scrubbed_environ, sandbox_preexec
+from app.services.exec_env import sandbox_environ, sandbox_preexec
 from app.services.workspace_perms import share_path, shared_makedirs
 
 logger = logging.getLogger(__name__)
@@ -421,6 +421,16 @@ def _created_job_registry() -> list:
         reg = []
         _CREATED_JOB_IDS_CTX.set(reg)
     return reg
+
+
+def created_job_ids() -> tuple:
+    """Job ids the `create_job` tool opened this turn, read-only.
+
+    Module-level so a SKILL can see them without a handle on the executor —
+    the app pipeline adopts this turn's job rather than opening a second card
+    beside it (`app_html.steps._adopt_turn_job`). Reads the shared list in
+    place; never replaces it (see _CREATED_JOB_IDS_CTX)."""
+    return tuple(_created_job_registry())
 # The assistant message id this turn's answer will be persisted under.
 # AgentRunner pre-mints it at run start (so generate_* attachments can
 # reference it before the row exists) and hands it to set_session_id();
@@ -1448,7 +1458,7 @@ class ToolExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=workdir,
-                env={**scrubbed_environ(), "TERM": "dumb"},
+                env={**sandbox_environ(), "TERM": "dumb"},
                 preexec_fn=sandbox_preexec(),
             )
             try:
@@ -1541,7 +1551,7 @@ class ToolExecutor:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 cwd=workdir,
-                env={**scrubbed_environ(), "TERM": "xterm-256color", "COLUMNS": str(cols), "LINES": str(rows)},
+                env={**sandbox_environ(), "TERM": "xterm-256color", "COLUMNS": str(cols), "LINES": str(rows)},
                 preexec_fn=sandbox_preexec(),
             )
             os.close(slave_fd)
@@ -4419,7 +4429,7 @@ class ToolExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=workdir,
-                env={**scrubbed_environ(), "TERM": "dumb"},
+                env={**sandbox_environ(), "TERM": "dumb"},
                 preexec_fn=sandbox_preexec(),
             )
         except Exception as e:

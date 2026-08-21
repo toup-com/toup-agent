@@ -28,6 +28,27 @@ def test_strip_markdown_removes_syntax_and_keeps_words():
     assert strip_markdown("use `gpt-5.6-terra` *today* _ok_ ~~old~~") == "use gpt-5.6-terra today ok old"
     assert strip_markdown("## Summary\n\n- **a**: b\n1. c\n> q") == "Summary\n\na: b\nc\nq"
     assert strip_markdown("```py\nprint(1)\n```\nDone [[navigate:/jobs]] [[Play X on Netflix]]") == "print(1)\n\nDone"
+
+
+def test_a_chip_leaves_no_hole_behind():
+    """Round 15. Cutting a chip out with a blunt `sub` shipped a real user
+    "You can watch it in ." — in chat, and this surface (push bodies, Live
+    Activity strings, SMS) strips chips the same way, so it would have sent
+    the same sentence to their lock screen.
+
+    Mirrors `frontend/src/modules/chat/chipDirectives.ts`; the two must agree,
+    because the same message goes out on both."""
+    # The clause whose object was the chip goes with it.
+    assert strip_markdown("You can watch it in [[navigate:/jobs]].") == "You can watch it."
+    assert strip_markdown("Watch it at [[navigate:/jobs]]") == "Watch it."
+    # A line that was only a chip leaves nothing, not a stray full stop.
+    assert strip_markdown("[[navigate:/jobs]].") == ""
+    # The gap mid-sentence closes up.
+    assert strip_markdown("Done! [[Looks great!]]") == "Done!"
+    assert strip_markdown("It is on. [[Change it]] and tell me") == "It is on. and tell me"
+    # Ordinary prose ending in the same word is untouched — no chip was cut.
+    assert strip_markdown("The toggle is on.") == "The toggle is on."
+    assert strip_markdown("Everyone is here") == "Everyone is here"
     assert strip_markdown("| Model | Score |\n|---|---|\n| Fable 5 | 91 |") == "Model Score\n\nFable 5 91"
     assert strip_markdown("<b>bold</b><br>x") == "boldx"
 

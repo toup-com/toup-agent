@@ -420,6 +420,28 @@ async def library_delete_file(
     return {"success": True, "id": file_id}
 
 
+def _refuse_if_app(f) -> None:
+    """An app's bytes are model-authored HTML with model-authored script.
+
+    They may be served ONLY by the artifact route, which puts them on a
+    cookieless origin under a strict CSP and inside a frame sandboxed
+    without `allow-same-origin` (`api/artifact_proxy.py`). Every other
+    route here answers on an origin that carries the account's session, so
+    rendering an app through one would hand injected app code the account —
+    the exact thing the artifact origin exists to prevent.
+
+    Round 15 put apps in the library, which is what made these routes
+    reachable for them. 415 with the route to take instead: this is a
+    permanent property of the file, not a transient failure.
+    """
+    if lib.kind_of_row(f) == lib.KIND_APP:
+        raise HTTPException(
+            415,
+            "An app can only be opened in the sandboxed app viewer. "
+            "Use its artifact URL, not the file routes.",
+        )
+
+
 @router.get("/library/files/{file_id}/download")
 async def library_download(
     file_id: str,
@@ -430,6 +452,7 @@ async def library_download(
 ):
     user = await get_user_for_file(request, token, db)
     f = await _require_file(db, user.id, file_id)
+    _refuse_if_app(f)
     return await _download_response(user.id, f, inline=inline, request=request)
 
 
@@ -443,6 +466,7 @@ async def library_preview(
 ):
     user = await get_user_for_file(request, token, db)
     f = await _require_file(db, user.id, file_id)
+    _refuse_if_app(f)
     path = lib.file_abspath(user.id, f)
     if not path:
         raise HTTPException(410, "This file is no longer available")
@@ -470,6 +494,7 @@ async def library_get_content(
 ):
     uid = current_user.id
     f = await _require_file(db, uid, file_id)
+    _refuse_if_app(f)
     text = await _text_of(uid, f)
     folders, paths = await _folder_paths(db, uid)
     e = lib.file_entry(f, _file_path(f, paths), api_prefix=_api())
@@ -486,6 +511,10 @@ async def library_put_content(
 ):
     uid = current_user.id
     f = await _require_file(db, uid, file_id)
+    # Not read-only prudishness: an app's bytes are edited by the model
+    # through `app_html__edit_app_file`, which validates the result is still
+    # a document and keeps a revision. A raw PUT here would bypass both.
+    _refuse_if_app(f)
     data = body.content.encode("utf-8")
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "Content too large")
@@ -624,6 +653,7 @@ async def compat_file_content(
         f = await lib.resolve_legacy_physical_path(db, uid, path)
     if f is None:
         raise HTTPException(404, "File not found")
+    _refuse_if_app(f)
     text = await _text_of(uid, f)
     folders, paths = await _folder_paths(db, uid)
     return _content_payload(f, _file_path(f, paths), text)
@@ -665,6 +695,7 @@ async def compat_file_write(
     res = await lib.resolve_virtual_path(db, uid, body.path)
     try:
         if res is not None and res.kind == "file":
+            _refuse_if_app(res.file)
             f = await lib.overwrite_file_bytes(db, uid, res.file, data)
         elif res is not None:
             raise HTTPException(409, "A folder with that name exists")
@@ -800,6 +831,7 @@ async def compat_download(
     res = await lib.resolve_virtual_path(db, user.id, path)
     if res is None or res.kind != "file":
         raise HTTPException(404, "File not found")
+    _refuse_if_app(res.file)
     return await _download_response(user.id, res.file, inline=inline, request=request)
 
 

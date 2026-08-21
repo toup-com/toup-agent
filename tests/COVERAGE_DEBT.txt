@@ -27,6 +27,8 @@ memverify/  # live Postgres+pgvector + RUN_MODE=agent; own runner, not the unit 
 # --- run under RUN_MODE=agent (see the agent-mode step) ---
 test_agent_notify_outbox.py  # agent-mode
 test_agent_runner_subagent_params.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY). TRIAGED 2026-08-20 — the two untriaged failures were stale source probes (the `asyncio.create_task` spawn form, and an import matched by TEXT that a reflow broke); the third was a dead Phase-3 invariant. 17/17 green under agent, so it is back in a sweep instead of quarantined.
+test_app_build_one_card.py  # agent-mode: build_jobs + users are AGENT_ONLY (the pipeline adopts the turn's job row)
+test_apps_in_files.py  # agent-mode: user_files/user_folders are AGENT_ONLY, same reason as test_library_api.py
 test_autopilot_approvals.py  # agent-mode
 test_autopilot_engine.py  # agent-mode
 test_autopilot_tick_hygiene.py  # agent-mode

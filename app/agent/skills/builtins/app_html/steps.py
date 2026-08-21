@@ -70,11 +70,124 @@ async def _broadcast(user_id: str, payload: Dict[str, Any]) -> None:
         logger.debug("[app_html] ws broadcast failed (non-fatal)", exc_info=True)
 
 
+async def _existing_job_for_app(app_id: str) -> Optional[str]:
+    """The job already backing this app, if any. Any status: a second card
+    for an app that has one is the defect, whether the first is running or
+    finished three turns ago."""
+    try:
+        from sqlalchemy import select
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+        async with async_session_maker() as db:
+            row = (await db.execute(
+                select(BuildJob.id)
+                .where(BuildJob.app_id == app_id)
+                .order_by(BuildJob.created_at.desc())
+                .limit(1)
+            )).first()
+            return row[0] if row else None
+    except Exception:
+        logger.debug("[app_html] existing-job lookup failed", exc_info=True)
+        return None
+
+
+async def _adopt_turn_job(user_id: str, app_id: str, title: str) -> Optional[str]:
+    """Take over the job the MODEL opened for this turn, instead of adding
+    a second one beside it.
+
+    Round 15. A build showed the user two cards: "Building your app" and
+    "Build: Nokia Snake Classic". The first is the model narrating its own
+    work through the ordinary `create_job` tool; the second is this pipeline
+    opening the card it drives. Both are legitimate on their own and together
+    they are one build rendered twice, with two progress bars that disagree.
+
+    One job wins, and it is the one already on screen. The row is retyped to
+    an app build — `job_type` is the column every surface discriminates on,
+    so this is what moves the card from "task" rendering to "build"
+    rendering — and its steps are replaced with this pipeline's phases.
+
+    Four conditions, each preventing a different way of getting this wrong:
+
+    * **Created this turn.** The registry is per-turn, so an older job can
+      never be swept up.
+    * **Exactly one.** A turn that opened two or more jobs is tracking two or
+      more things, and guessing which one is the build is worse than a second
+      card. "Build me a snake game and research X" must not retitle the
+      research.
+    * **No app of its own.** Otherwise the second app of a turn would hijack
+      the first one's card.
+    * **Nothing reported against it yet** — no step marked `done`. A job the
+      model has already been ticking off is work in progress; replacing its
+      steps with this pipeline's would erase what the user watched happen.
+      (`create_job` opens step 0 as *running*, not done, so a genuinely fresh
+      job passes.)
+    """
+    try:
+        from app.agent.tool_executor import created_job_ids
+        candidates = created_job_ids()
+    except Exception:
+        return None
+    if len(candidates) != 1:
+        return None
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+        async with async_session_maker() as db:
+            for jid in candidates:
+                job = await db.get(BuildJob, jid)
+                if job is None or job.user_id != user_id:
+                    continue
+                if job.status not in ("queued", "running"):
+                    continue
+                if job.app_id:
+                    continue  # already drives some app's card
+                try:
+                    existing_steps = json.loads(job.steps_json) if job.steps_json else []
+                except (TypeError, ValueError):
+                    existing_steps = []
+                if any(s.get("status") == "done" for s in existing_steps
+                       if isinstance(s, dict)):
+                    continue  # real progress already recorded against it
+                job.app_id = app_id
+                job.job_type = "auto_builder"
+                job.layer = 1
+                job.title = f"Build: {title}"
+                job.steps_json = json.dumps(initial_steps())
+                # NOT source_id/idempotency_key: those carry a composite
+                # UNIQUE, and stamping this pipeline's pair onto an adopted
+                # row would collide with the row of an earlier build of the
+                # same slug. `app_id` is what the surfaces join on.
+                cfg = dict(job.config_json or {})
+                cfg["pipeline"] = SOURCE_HTML_ARTIFACT
+                cfg["adopted_by"] = "app_html"
+                job.config_json = cfg
+                await db.commit()
+                logger.info(
+                    "[app_html] adopted this turn's job %s as the build card "
+                    "for %s", jid[:8], app_id[:8],
+                )
+                return job.id
+    except Exception:
+        logger.debug("[app_html] job adoption failed (non-fatal)", exc_info=True)
+    return None
+
+
 async def ensure_job(user_id: str, slug: str, title: str) -> Optional[str]:
-    """Find-or-create the BuildJob backing this app's card. Returns job id."""
+    """Find-or-create the ONE BuildJob backing this app's card.
+
+    Order matters: an app that already has a job keeps it (so an edit three
+    turns later updates the same card), otherwise this turn's model-created
+    job is adopted, and only if there is neither do we open a new one.
+    """
+    app_id = app_id_for(user_id, slug)
+    existing = await _existing_job_for_app(app_id)
+    if existing:
+        return existing
+    adopted = await _adopt_turn_job(user_id, app_id, title)
+    if adopted:
+        return adopted
     try:
         from app.agent.job_runner import JobRunner, TaskSpec
-        app_id = app_id_for(user_id, slug)
         spec = TaskSpec(
             user_id=user_id,
             channel="app_builder",

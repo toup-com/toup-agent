@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import shutil
+import stat
 import time
 import uuid
 from collections import deque
@@ -23,9 +24,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # the agent writes package.json, so a lifecycle script (postinstall) runs
 # arbitrary code — it must not inherit provider keys / TOUP_TOKEN /
 # POOL_ADMIN_TOKEN / bot tokens (docs/security/audit-2026.md EXF-3, round-2
-# follow-up). scrubbed_environ() preserves PATH/HOME/npm/proxy/git vars so
+# follow-up). sandbox_environ() preserves PATH/HOME/npm/proxy/git vars so
 # builds are unaffected; DATABASE_URL is kept.
-from app.services.exec_env import scrubbed_environ, sandbox_preexec
+from app.services.exec_env import sandbox_environ, sandbox_preexec
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,70 @@ NPM_CI_TIMEOUT = 180       # seconds — npm ci is faster, tighter budget
 NPM_INSTALL_TIMEOUT = 300  # seconds — npm install for first-time installs
 NPM_FLAGS = ["--no-audit", "--no-fund", "--loglevel=error"]
 NPM_RETRY_TRANSIENT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "EAI_AGAIN", "network", "FETCH_ERROR", "503", "timed out"]
+
+# One npm cache for every app on the box: the same ~400 MB of react-native /
+# expo tarballs otherwise download once per build. Shared across UIDS too —
+# the agent is root and npm runs dropped to the sandbox uid — so the mode
+# matters as much as the path (see _ensure_npm_cache).
+NPM_CACHE_DIR = "/tmp/npm-cache-shared"
+
+# EACCES / EPERM anywhere in npm's output. Split out of the old "stale"
+# bucket (round 15) because the two need OPPOSITE handling: a stale tree is
+# fixed by deleting it, a permission fault is fixed by widening modes, and
+# lumping them together meant the real failure was never repaired and never
+# retried. `npm install` exits 243 on EACCES — reproduced 2026-08-21 by
+# running it in a directory the calling uid cannot write.
+NPM_PERMISSION_PATTERNS = [
+    "EACCES", "EPERM", "PERMISSION DENIED", "OPERATION NOT PERMITTED",
+    "ROOT-OWNED FILES",  # npm's own "Your cache folder contains root-owned files"
+]
+
+
+# ── Sandbox-uid writability ───────────────────────────────────────
+# Every child in this module runs dropped to `exec_sandbox_user` (uid 1000)
+# while the agent that writes the files is root. Anything root creates lands
+# root-owned, and npm then cannot write beside it.
+
+
+def _share(path: str) -> None:
+    """Make one path writable by the dropped uid. Never raises."""
+    try:
+        from app.services.workspace_perms import share_path
+        share_path(path)
+    except Exception:  # pragma: no cover - perms are best-effort by design
+        logger.debug("[APP] share_path failed for %s", path, exc_info=True)
+
+
+def _share_tree(path: str) -> dict:
+    """Bounded recursive widen (skips node_modules). Never raises."""
+    try:
+        from app.services.workspace_perms import share_tree
+        return share_tree(path)
+    except Exception:  # pragma: no cover
+        logger.debug("[APP] share_tree failed for %s", path, exc_info=True)
+        return {}
+
+
+def _ensure_npm_cache() -> str:
+    """The shared npm cache, guaranteed to exist and be writable by any uid.
+
+    Whichever uid ran npm FIRST on this box owns the cache tree. When that
+    was root — a boot-time restore, a build from before the exec drop was
+    enabled — every later install as uid 1000 dies with npm's "Your cache
+    folder contains root-owned files" EACCES. 0777 makes the two agree.
+    """
+    try:
+        os.makedirs(NPM_CACHE_DIR, exist_ok=True)
+        os.chmod(NPM_CACHE_DIR, 0o777)
+        # `_cacache` and `_logs` are npm's own children; widening just the
+        # parent is not enough once they exist root-owned.
+        for sub in ("_cacache", "_logs"):
+            p = os.path.join(NPM_CACHE_DIR, sub)
+            if os.path.isdir(p):
+                os.chmod(p, 0o777)
+    except OSError:
+        logger.debug("[INSTALL] could not widen the npm cache", exc_info=True)
+    return NPM_CACHE_DIR
 
 
 @dataclass
@@ -67,11 +132,19 @@ class AppManager:
         os.makedirs(APPS_DIR, exist_ok=True)
         # The dropped app-builder uid (toup, 1000) must be able to write here;
         # APPS_DIR is created by the root agent (audit EXF-3 completion).
+        #
+        # chown FIRST, chmod ALWAYS. The chown is best-effort by design: a
+        # container started with CapDrop=ALL has no CAP_CHOWN, so it raises
+        # PermissionError and — before round 15 — that was the end of it,
+        # leaving a root-owned 0755 root that the dropped uid could read and
+        # not write. chmod needs no capability when you own the file, and
+        # root owns what it just created, so it is the one that actually
+        # lands on a hardened container.
         try:
             os.chown(APPS_DIR, 1000, 1000)
         except (PermissionError, OSError):
             pass
-
+        _share(APPS_DIR)
 
     async def _resolve_app_dir(self, app_id: str, app_dir: Optional[str] = None) -> str:
         """Resolve the canonical app directory for a given app.
@@ -131,6 +204,12 @@ class AppManager:
             shutil.rmtree(app_dir)
 
         logger.info(f"[APP] Scaffolding {app_name} at {app_dir}")
+        _share(APPS_DIR)
+        # `npx` uses npm's DEFAULT cache ($HOME/.npm), not our --cache flag,
+        # so it needs a HOME the dropped uid owns. sandbox_environ() is what
+        # supplies one; before round 15 this child ran as uid 1000 with
+        # HOME=/root and failed here, which is what pushed every build into
+        # the root-owned fallback directory below.
         # Create with npx create-expo-app
         safe_name = re.sub(r"[^a-zA-Z0-9-]", "-", app_name.lower()).strip("-")[:30] or "app"
         proc = await asyncio.create_subprocess_exec(
@@ -140,7 +219,8 @@ class AppManager:
             cwd=APPS_DIR,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={**scrubbed_environ(), "npm_config_yes": "true"},
+            env={**sandbox_environ(), "npm_config_yes": "true",
+                 "npm_config_cache": _ensure_npm_cache()},
             preexec_fn=sandbox_preexec(),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
@@ -157,6 +237,12 @@ class AppManager:
 
         # Create storage directory
         os.makedirs(os.path.join(app_dir, "storage"), exist_ok=True)
+
+        # Whoever created the tree — npx as the dropped uid, or this process
+        # as root down the fallback branch — npm must be able to write into
+        # it on the next step. This is the line whose absence produced
+        # "npm install failed (exit 243): npm error code EACCES".
+        _share_tree(app_dir)
 
         logger.info(f"[APP] Scaffolded {app_name} at {app_dir}")
         return app_dir
@@ -184,6 +270,13 @@ class AppManager:
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            # Written by ROOT, rewritten by the dropped uid: npm rewrites
+            # package.json/package-lock.json, and a later edit_file goes
+            # through exec. Widen each file and the directory that holds it
+            # as we go — cheaper and more precise than sweeping the tree
+            # afterwards, which by `modify` time contains node_modules.
+            _share(full_path)
+            _share(os.path.dirname(full_path))
         logger.info(f"[APP] Wrote {len(files)} files to {app_dir}")
 
     async def install_deps(self, app_id: str, deps: Optional[List[str]] = None, app_dir: Optional[str] = None) -> str:
@@ -204,7 +297,8 @@ class AppManager:
         # Install extra deps using `npx expo install` for version compatibility
         if deps:
             cmd2 = ["npx", "expo", "install"] + deps
-            env = {**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1"}
+            env = {**sandbox_environ(), "EXPO_NO_TELEMETRY": "1",
+                   "npm_config_cache": _ensure_npm_cache()}
             proc2 = await asyncio.create_subprocess_exec(
                 *cmd2, cwd=app_dir,
                 stdout=asyncio.subprocess.PIPE,
@@ -222,10 +316,44 @@ class AppManager:
         logger.info("[INSTALL] Deps installed for %s", app_id[:8])
         return output[:2000]
 
+    @staticmethod
+    def repair_permissions(app_dir: str) -> dict:
+        """Detect → repair, for the failure class that produced exit 243.
+
+        Widens the app tree AND the shared npm cache so the dropped uid can
+        write both. Returns what changed, for the log line — a repair that
+        silently changed nothing is the tell that the diagnosis was wrong,
+        and it must be visible in that case rather than inferred.
+        """
+        cache_before = None
+        try:
+            cache_before = stat.S_IMODE(os.stat(NPM_CACHE_DIR).st_mode)
+        except OSError:
+            pass
+        _ensure_npm_cache()
+        summary = _share_tree(app_dir)
+        summary["npm_cache_mode_before"] = (
+            oct(cache_before) if cache_before is not None else "absent"
+        )
+        return summary
+
     async def _npm_install_with_retry(self, app_id: str, app_dir: str) -> str:
-        """Run npm install with clean state and one retry on transient failure."""
+        """npm install with clean state, self-repair, and one retry.
+
+        Three failure classes are recoverable and each gets its OWN remedy —
+        the point of classifying at all:
+
+          transient   → retry in place (network blip)
+          permissions → widen the tree + cache, then retry  (round 15)
+          stale       → the next attempt already rmtree's node_modules
+
+        `permissions` used to live inside `stale`, which was not retried at
+        all: the fleet's dominant install failure was diagnosed correctly,
+        never repaired, and surfaced raw.
+        """
         last_error = ""
-        for attempt in range(2):
+        repaired = False
+        for attempt in range(3):
             try:
                 return await self._npm_install_clean(app_id, app_dir, attempt)
             except RuntimeError as e:
@@ -238,6 +366,17 @@ class AppManager:
                 if classification == "transient" and attempt == 0:
                     logger.info("[INSTALL] Retrying %s after transient failure...", app_id[:8])
                     continue
+                if classification == "permissions" and not repaired:
+                    repaired = True
+                    summary = await asyncio.to_thread(self.repair_permissions, app_dir)
+                    logger.warning(
+                        "[INSTALL] Permission fault for %s — repaired %s, retrying",
+                        app_id[:8], summary,
+                    )
+                    continue
+                if classification == "stale" and attempt == 0:
+                    logger.info("[INSTALL] Retrying %s with a clean tree...", app_id[:8])
+                    continue
                 raise
         raise RuntimeError(last_error)
 
@@ -248,12 +387,24 @@ class AppManager:
         # Use a shared npm cache across all apps so repeated deps (react-native,
         # expo, etc.) are fetched once and reused. Previous per-app cache meant
         # every build downloaded ~400MB of the same packages.
-        npm_cache = os.path.join("/tmp", "npm-cache-shared")
+        npm_cache = _ensure_npm_cache()
 
         # Always clean node_modules for a deterministic install
         if os.path.isdir(nm_path):
             logger.info("[INSTALL] Cleaning node_modules in %s (attempt %d)", app_dir, attempt + 1)
             shutil.rmtree(nm_path, ignore_errors=True)
+
+        # npm runs dropped to the sandbox uid and its first act is
+        # `mkdir node_modules` INSIDE app_dir — which needs write on the
+        # DIRECTORY, not on the files in it. Cheap enough to assert on every
+        # attempt rather than trusting that scaffold_app got there first: a
+        # tree restored from a volume, or written by an older image, has
+        # never been through that path.
+        _share(app_dir)
+        for f in ("package.json", "package-lock.json"):
+            p = os.path.join(app_dir, f)
+            if os.path.exists(p):
+                _share(p)
 
         # Use npm ci if lock file exists (faster, deterministic), npm install otherwise
         if os.path.isfile(lock_path):
@@ -273,7 +424,7 @@ class AppManager:
             *cmd, cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=scrubbed_environ(),
+            env=sandbox_environ(),
             preexec_fn=sandbox_preexec(),
         )
 
@@ -310,11 +461,13 @@ class AppManager:
         """Classify an npm install error for auto-repair routing.
 
         Returns one of:
-          transient — network blip, registry timeout (retry in place)
-          bad_dep   — 404, version conflict, peer dep mismatch (regenerate package.json)
-          disk      — ENOSPC, ENOMEM (fail loudly, don't retry)
-          stale     — corrupted node_modules (clean and retry)
-          unknown   — unclassified (fail with raw error)
+          transient   — network blip, registry timeout (retry in place)
+          bad_dep     — 404, version conflict, peer dep mismatch (regenerate package.json)
+          disk        — ENOSPC, ENOMEM (fail loudly, don't retry)
+          permissions — EACCES/EPERM: the uid npm runs as cannot write the
+                        tree or the cache (repair modes, then retry)
+          stale       — corrupted/missing node_modules (clean and retry)
+          unknown     — unclassified (fail, still without showing the user raw npm)
         """
         upper = error_text.upper()
 
@@ -331,8 +484,14 @@ class AppManager:
         if any(s in upper for s in ["ENOSPC", "ENOMEM", "NO SPACE LEFT"]):
             return "disk"
 
+        # Permission faults — checked BEFORE `stale`, which used to swallow
+        # EACCES/EPERM and then not retry them. This is the class that took
+        # the fleet down: root writes the tree, npm runs as uid 1000.
+        if any(s in upper for s in NPM_PERMISSION_PATTERNS):
+            return "permissions"
+
         # Stale state
-        if any(s in upper for s in ["ENOENT", "EACCES", "EPERM", "LOCK"]):
+        if any(s in upper for s in ["ENOENT", "LOCK"]):
             return "stale"
 
         return "unknown"
@@ -366,7 +525,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
             preexec_fn=sandbox_preexec(),
         )
 
@@ -406,7 +565,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
             preexec_fn=sandbox_preexec(),
         )
 
@@ -543,7 +702,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
+            env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1", "CI": "1"},
             preexec_fn=sandbox_preexec(),
         )
         managed.metro_port = metro_port
@@ -557,7 +716,7 @@ class AppManager:
             cwd=app_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={**scrubbed_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
+            env={**sandbox_environ(), "EXPO_NO_TELEMETRY": "1", "BROWSER": "none"},
             preexec_fn=sandbox_preexec(),
         )
         managed.web_port = web_port
@@ -809,7 +968,7 @@ export default supabase;
         await self._run_cmd(
             ["git", "commit", "-m", f"Initial commit: {app_name}"],
             cwd=app_dir,
-            env={**scrubbed_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+            env={**sandbox_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
                  "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
         )
 
@@ -841,7 +1000,7 @@ export default supabase;
         await self._run_cmd(
             ["git", "commit", "-m", f"Update app ({time.strftime('%Y-%m-%d %H:%M')})"],
             cwd=app_dir,
-            env={**scrubbed_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
+            env={**sandbox_environ(), "GIT_AUTHOR_NAME": "Toup Agent", "GIT_AUTHOR_EMAIL": "agent@toup.ai",
                  "GIT_COMMITTER_NAME": "Toup Agent", "GIT_COMMITTER_EMAIL": "agent@toup.ai"},
         )
         result = await self._run_cmd(["git", "push"], cwd=app_dir, timeout=30)

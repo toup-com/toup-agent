@@ -20,7 +20,7 @@ Three independent gates, each of which alone would be defeatable:
     the app root, so ``cat ../../etc/shadow`` and ``> /etc/cron.d/x`` are
     refused even though ``cat`` and ``>`` are fine in principle.
 
-The child then runs with ``cwd=<app root>``, ``scrubbed_environ()`` and
+The child then runs with ``cwd=<app root>``, ``sandbox_environ()`` and
 ``sandbox_preexec()`` — the same hardening ``AppManager`` applies to npm
 children — under a wall-clock timeout, with capped output.
 """
@@ -183,8 +183,10 @@ async def run_in_app_dir(
     os.makedirs(root, exist_ok=True)
 
     try:
-        from app.services.exec_env import scrubbed_environ, sandbox_preexec
-        env = scrubbed_environ()
+        from app.services.exec_env import sandbox_environ, sandbox_preexec
+        # sandbox_environ, not scrubbed_environ: with an explicit ``env=`` the
+        # preexec's HOME fix never reaches the child (round 15).
+        env = sandbox_environ()
         preexec = sandbox_preexec()
     except Exception:  # pragma: no cover - never block on hardening import
         env, preexec = dict(os.environ), None

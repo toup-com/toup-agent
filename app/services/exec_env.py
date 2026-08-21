@@ -99,6 +99,66 @@ def sandbox_preexec() -> Optional[Callable[[], None]]:
         except Exception:
             pass
         os.setuid(uid)
+        # Only reaches the child when the caller passed NO ``env=``. With an
+        # explicit env dict, subprocess hands that dict straight to execve and
+        # this mutation is discarded — which is why every caller that passes
+        # ``env=`` must build it with :func:`sandbox_environ`. Kept for the
+        # env-less callers, where it is the only thing that sets HOME.
         os.environ["HOME"] = home
 
     return _drop
+
+
+def sandbox_home() -> Optional[str]:
+    """Home directory of the configured ``exec_sandbox_user``, or None.
+
+    None means "no drop is happening" — either the feature is off or the user
+    does not exist in this image — in which case the child keeps the agent's
+    own HOME, which it can actually write to.
+    """
+    user = (getattr(settings, "exec_sandbox_user", "") or "").strip()
+    if not user:
+        return None
+    try:
+        import pwd  # POSIX-only
+        return pwd.getpwnam(user).pw_dir
+    except Exception:
+        return None
+
+
+def sandbox_environ(base: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+    """:func:`scrubbed_environ` **plus** a HOME that matches the uid the child
+    will actually run as.
+
+    Every app-builder / exec child is spawned as::
+
+        create_subprocess_exec(..., env=<dict>, preexec_fn=sandbox_preexec())
+
+    and that combination silently dropped the HOME fix for as long as it has
+    existed. ``preexec_fn`` runs in the forked child *before* ``execve``, but
+    CPython passes the ``env=`` mapping to ``execve`` directly — so mutating
+    ``os.environ`` inside the preexec has no effect on the environment the
+    program is exec'd with. Proven, not assumed::
+
+        env=... + preexec mutation -> child HOME=/root      (the mutation lost)
+        no env=  + preexec mutation -> child HOME=<sandbox>  (the mutation kept)
+
+    Result: npm/npx ran as uid 1000 with ``HOME=/root`` — mode 0700, owned by
+    root. npm's default cache is ``$HOME/.npm``, so ``npx create-expo-app``
+    and ``npx expo install`` hit EACCES before doing anything, the scaffold
+    fell back to a root-owned directory, and the follow-up ``npm install``
+    then failed ``EACCES``/exit 243 trying to ``mkdir node_modules`` in it.
+
+    USER/LOGNAME come along because tools that derive a config path from them
+    (git, some CLIs) would otherwise disagree with HOME.
+    """
+    env = scrubbed_environ(base)
+    home = sandbox_home()
+    if not home:
+        return env
+    user = (getattr(settings, "exec_sandbox_user", "") or "").strip()
+    env["HOME"] = home
+    if user:
+        env["USER"] = user
+        env["LOGNAME"] = user
+    return env
