@@ -400,18 +400,24 @@ async def test_a_description_that_is_not_the_pattern_kills_the_create():
     assert any("read when" in c for c in plan.complaints)
 
 
-async def test_the_section_comes_from_the_slug_not_from_the_model():
+async def test_a_slug_that_disagrees_with_the_declared_section_is_refused():
+    """When the two CONFLICT, the slug decides — and the op is refused rather
+    than silently re-filed, because the writer has said two different things
+    about where a fact belongs and only it knows which it meant.
+
+    This used to also assert that a BARE slug ("music", section "topics") was
+    refused for having no section. That half is deliberately gone: there is no
+    conflict there, the declared section is the only information in the op,
+    and refusing it cost eight ops and a whole turn on CI run 32433614861.
+    See `test_a_bare_slug_is_repaired_from_the_declared_section`."""
     db, user_id = await _session()
     plan, _ = await _apply(db, user_id, [
         {"op": "create_file", "section": "areas", "slug": "topics/music",
          "title": "Music",
          "description": "Music — taste and artists; read when music comes up."},
-        {"op": "create_file", "section": "topics", "slug": "music",
-         "title": "Music",
-         "description": "Music — taste and artists; read when music comes up."},
     ])
     assert any("is a topics file, not 'areas'" in c for c in plan.complaints)
-    assert any("has no section" in c for c in plan.complaints)
+    assert plan.accepted == []
 
 
 async def test_the_per_file_cap_rejects_the_op_that_would_overflow_it():
@@ -751,3 +757,101 @@ async def test_the_stored_bullet_is_the_normalised_one():
     )
 
     assert plan.accepted[0]["bullet"] == "listens to Googoosh constantly"
+
+
+# ── A bare slug whose section the op already declares ─────────────────
+
+
+async def test_a_bare_slug_is_repaired_from_the_declared_section():
+    """CI run 32433614861. The writer finally proposed the person file P06 had
+    been missing — as `majid-tajik`, without the `people/`. `create_file`
+    carries `section` as its own field, so that is not ambiguous; it is
+    `people/majid-tajik` with the prefix left off. Refusing it cost the whole
+    batch: the following `add` and `link` named `areas/ielts`, whose own
+    `create_file` was refused the same way, so all EIGHT ops died and the turn
+    stored nothing at all."""
+    db, user_id = await _session()
+    identity = await resolve_user_identity(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "create_file", "section": "people", "slug": "majid-tajik",
+          "title": "Majid Tajik", "description": GOOD_DESC}],
+        await ops._all_files(db, user_id), identity=identity,
+    )
+
+    assert plan.accepted, plan.complaints
+    assert plan.accepted[0]["slug"] == "people/majid-tajik"
+    assert plan.accepted[0]["section"] == "people"
+
+
+async def test_the_repair_unblocks_the_ops_that_named_the_full_slug():
+    """The reason the repair is safe rather than a guess: the model's OWN
+    later ops already use the namespaced form."""
+    db, user_id = await _session()
+    identity = await resolve_user_identity(db, user_id)
+
+    plan = ops.validate_ops(
+        [
+            {"op": "create_file", "section": "areas", "slug": "ielts",
+             "title": "Ielts", "description": GOOD_DESC},
+            {"op": "add", "slug": "areas/ielts",
+             "bullet": "exam booked for Aug 30, 2026",
+             "change": "Added Ielts: the exam date."},
+        ],
+        await ops._all_files(db, user_id), identity=identity,
+    )
+
+    assert [o["op"] for o in plan.accepted] == ["create_file", "add"]
+    assert plan.complaints == []
+
+
+async def test_a_bare_slug_with_no_declared_section_is_still_refused():
+    """The repair reads the op's own `section`; it does not invent one."""
+    db, user_id = await _session()
+    identity = await resolve_user_identity(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "create_file", "slug": "majid-tajik", "title": "Majid Tajik",
+          "description": GOOD_DESC}],
+        await ops._all_files(db, user_id), identity=identity,
+    )
+
+    assert plan.accepted == []
+    assert any("no section" in c for c in plan.complaints), plan.complaints
+
+
+async def test_a_bare_slug_cannot_be_repaired_into_a_system_section():
+    """`you` and `learned` are not repairable prefixes. The section holds
+    exactly two files, both system files, and repairing a bare slug into it
+    would let the writer open a THIRD — a file injected into every reply that
+    nothing in `SYSTEM_FILES` declares.
+
+    Deliberately not `profile`: that slug would be caught by the already-exists
+    check instead, so the test would pass while the prefix restriction did
+    nothing. A mutation proved exactly that."""
+    db, user_id = await _session()
+    identity = await resolve_user_identity(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "create_file", "section": "you", "slug": "hobbies",
+          "title": "Hobbies", "description": GOOD_DESC}],
+        await ops._all_files(db, user_id), identity=identity,
+    )
+
+    assert plan.accepted == [], "a third you/ file was created"
+    assert any("no section" in c for c in plan.complaints), plan.complaints
+
+
+async def test_the_repair_still_refuses_the_owner_as_a_person():
+    """A bare slug must not become a way around the self-person guard."""
+    db, user_id = await _session("Nariman Hosseini")
+    identity = await resolve_user_identity(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "create_file", "section": "people", "slug": "nariman-hosseini",
+          "title": "Nariman Hosseini", "description": GOOD_DESC}],
+        await ops._all_files(db, user_id), identity=identity,
+    )
+
+    assert plan.accepted == []
+    assert any("whose memory this is" in c for c in plan.complaints), plan.complaints

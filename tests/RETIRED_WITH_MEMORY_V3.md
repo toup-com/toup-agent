@@ -304,6 +304,35 @@ tests catch it.
   each keeps the half whose subject survives and drops the half whose subject
   does not; the drops are annotated in the file.
 
+## Deleted memverify LANES — and the coverage that went with them
+
+Nine lanes of `tests/memverify/` were deleted when the suite was rebuilt
+file-shaped, and **none of them was recorded here until 2026-08-21.** They were
+found by diffing the tree against the base rather than by reading this file,
+which is exactly the failure this ledger exists to prevent: the rule is that a
+test may only be deleted with its subject, and for seven of these nine the
+subject still ships.
+
+Recorded as DEBT, not as coverage. Do not read this section as "handled".
+
+| lane | what it protected | v3 status |
+|---|---|---|
+| `test_e_updates_forget.py` | contradiction → newest wins; forgetting | **COVERED.** `P04-contradiction-newest-wins` in the v3 corpus makes the same assertion against the file body. |
+| `test_f_dedup.py` | dedup + consolidation over rows | **COVERED / subject gone.** `memory_dedup_service` and `consolidation_service` are deleted; merge-in-place is `P03-merge-does-not-append`. |
+| `test_c_retrieval.py` | the `hybrid_search` call `agent_runner` makes, at the production limit and similarity floor | **GAP.** Row-level hybrid search is retired, but v3 still SELECTS which files to inject (`_pick_bodies`, the index, `MAX_RELEVANT_FILES`). That selection has deterministic unit tests and no eval-level lane. Storing a fact is still worthless if the right turn does not surface it. |
+| `test_d_persistence.py` | sessions, engine disposal (a process restart from the DB's point of view), both client surfaces | **GAP.** Not row-specific. `test_g_isolation.py` covers per-tenant separation, not restart survival. |
+| `test_h_scale.py` | one user with a thousand facts still retrieves the right one; injected context stays bounded | **PARTIAL.** The caps themselves (`CAP_PROFILE`, `CAP_CURRENT_CONTEXT`, `MAX_INDEX_LINES`, `truncate_body`) are unit-tested and `truncate_body` cuts on bullet boundaries. Nothing exercises a thousand-fact corpus end to end. |
+| `test_i_concurrency.py` | races | **PARTIAL.** `apply_ops` is atomic and the migration is single-flighted per (user, channel), both unit-tested. No concurrent-writer lane. |
+| `test_l_resilience.py` | capture is best-effort and must NEVER take the conversation down; retrieval degrades leg by leg | **GAP, and the most valuable of the nine.** The property still holds by construction — `curate_turn` runs in background post-processing and every caller wraps it — but nothing proves it under injected failure any more. |
+| `test_m_performance.py` | latency budgets (e.g. retrieval_db_p95 ≤ 150 ms) | **GAP.** No budget is enforced anywhere in v3. |
+| `test_n_soak.py` | randomized soak, opt-in via `MEMVERIFY_SOAK` | **GAP**, but it was opt-in and off in CI. |
+
+The two headline numbers this costs: there is no measured retrieval quality and
+no measured latency for v3. `capture`, `precision`, `lint` and `misroute` all
+describe the WRITE path. Nothing in the current suite asks whether the right
+file reaches the prompt at the right moment, which is the other half of a
+memory system.
+
 ## New
 
 * `test_curator_producers.py` — the structural guard that every producer

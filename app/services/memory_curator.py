@@ -138,7 +138,8 @@ RULES:
   accumulate.
 - `match` must be the existing bullet text CHARACTER FOR CHARACTER.
 - WHEN A TURN NAMES SOMEONE THE PERSON KNOWS, `create_file` FOR THEM IN THE
-  SAME BATCH, and put what you learned about them in THAT file. It is not
+  SAME BATCH — slug `people/<their-name-slugged>`, ALWAYS with the `people/`
+  on the front — and put what you learned about them in THAT file. It is not
   optional and it does not wait for a second mention: "my IELTS tutor is
   <name>" is already a durable fact about a human being. Add the area file too
   if the subject earns one, and link them — but the area gets the SUBJECT, the

@@ -69,6 +69,12 @@ from app.services.user_identity import UserIdentity
 
 logger = logging.getLogger(__name__)
 
+#: The sections `create_file` may open a file in, and therefore the only
+#: prefixes a bare slug can be repaired with. `you` and `learned` are not here:
+#: their three files are system files, created by `ensure_system_files`, and a
+#: writer asking to create one is a different error that must still be refused.
+_SECTION_PREFIXES = ("people", "topics", "areas")
+
 MAX_OPS = 40
 MAX_LINKS_PER_FILE = 8
 MAX_CHANGE_CHARS = 300
@@ -685,6 +691,19 @@ def validate_ops(
             slug = (op.get("slug") or "").strip() if isinstance(op.get("slug"), str) else ""
             title = (op.get("title") or "").strip() if isinstance(op.get("title"), str) else ""
             declared = (op.get("section") or "").strip() if isinstance(op.get("section"), str) else ""
+            # REPAIR a bare slug whose section the op already declares. The op
+            # carries `section` as its own field, so "slug: majid-tajik,
+            # section: people" is not ambiguous — it is `people/majid-tajik`
+            # with the prefix left off, and refusing it is pedantry that costs
+            # the whole batch. CI run 32433614861: the writer finally proposed
+            # the person file P06 had been missing, as `majid-tajik`, and the
+            # refusal cascaded — its `add` and `link` named `areas/ielts`,
+            # whose own `create_file` was refused the same way, so all EIGHT
+            # ops died and the turn stored nothing. The model's own later ops
+            # used the namespaced form, which is what makes the repair safe
+            # rather than a guess.
+            if slug and "/" not in slug and declared in _SECTION_PREFIXES:
+                slug = f"{declared}/{slug}"
             if not is_valid_slug(slug):
                 complaints.append(f"create_file: {slug!r} is not a valid slug")
                 continue
