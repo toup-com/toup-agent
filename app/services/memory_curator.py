@@ -142,9 +142,12 @@ RULES:
   on the front — and put what you learned about them in THAT file. It is not
   optional and it does not wait for a second mention: "my IELTS tutor is
   <name>" is already a durable fact about a human being. Add the area file too
-  if the subject earns one, and link them — but the area gets the SUBJECT, the
-  person gets the PERSON. A corpus with a tutor in it and no tutor file is the
-  failure this rule exists to stop.
+  if the subject earns one, and link them — but the area gets the SUBJECT and
+  the person gets the PERSON. Who they are, how they work with this person,
+  how they teach, what they are like, when they meet: all of that is the
+  PERSON and goes in THEIR file, even though the subject is what brought them
+  up. The area keeps one line saying it involves them, [[people/x]]. A corpus
+  with a tutor in it and no tutor file is the failure this rule exists to stop.
 - Never create a people/ file for the person whose memory this is.
 - If nothing should change, reply {"ops": []}.
 """

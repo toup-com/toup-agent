@@ -165,7 +165,21 @@ CAPTURE: List[Scenario] = [
                  "sentence with it, then he corrects it.", "That's a nice method."),
         ],
         must_capture=[Capture(
-            "P06", ["majid"], section="people",
+            # NOT ["majid"]. The contract says "the file's subject is implied
+            # — in a people/ file the subject is THAT PERSON", so a bullet in
+            # `people/majid-tajik` must not restate his name; the marker
+            # required the one thing the house voice forbids, exactly as
+            # P02's did. CI 32434234265 created the file, filled it, passed
+            # the cardinality check with 0 violations, and was still scored
+            # MISROUTED because the only bullet containing "majid" was the
+            # cross-reference in areas/ielts.
+            #
+            # The method is what Section 1's reference puts in the person's
+            # own file ("method: sends an upgraded word, Nariman writes a
+            # sentence with it, Majid corrects"), so that is what the marker
+            # asks for. His EXISTENCE is asserted separately and more
+            # strongly by `exactly_one_in_section`.
+            "P06", ["upgraded word"], section="people",
             note="a real second person, with at least one durable fact",
         )],
         exactly_one_in_section="people",
