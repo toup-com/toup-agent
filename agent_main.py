@@ -714,11 +714,19 @@ async def lifespan(app: FastAPI):
         # would keep `restore_on_startup` re-launching Metro processes on
         # every boot. The single-file HTML pipeline (`app_html`) is loaded
         # by `skill_loader.load_all()` above and needs none of this.
+        #
+        # 2026-08-21: off is now the DEFAULT, so this is the normal path and
+        # the block below is the exception. The boot line says which way the
+        # value came — a container that inherited the default and one that
+        # was pinned by the bridge env look identical in the logs otherwise,
+        # and telling them apart is the whole of a rollback investigation.
         from app.agent.tool_entitlements import pipeline_enabled as _pipeline_enabled
         _expo_on = _pipeline_enabled("expo")
         if not _expo_on:
+            _pin = os.getenv("APP_BUILDER_EXPO_ENABLED", "")
+            _src = f"APP_BUILDER_EXPO_ENABLED={_pin}" if _pin else "default"
             print(
-                "🏗️ Expo app pipeline disabled (APP_BUILDER_EXPO_ENABLED=0) — "
+                f"🏗️ Expo app pipeline disabled ({_src}) — "
                 "apps build as single-file HTML artifacts",
                 flush=True,
             )

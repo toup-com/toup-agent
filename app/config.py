@@ -143,9 +143,22 @@ class Settings(BaseSettings):
     # Container-stable by construction: read once at boot in agent_main, on
     # the same terms as AGENT_TOOL_FAMILIES. Flipping it is a restart, which
     # is what keeps it from forking a provider cache lineage mid-life.
-    app_builder_expo_enabled: bool = True
-    # `app_html_enabled` gates the replacement. Both on = both available
-    # (the canary posture); expo off + html on = migrated.
+    #
+    # 2026-08-21: the canary is over — this now defaults OFF, so every
+    # container built from here on builds apps as single-file HTML
+    # artifacts and the Expo path is dead code behind a flag. The code is
+    # deliberately NOT deleted: `APP_BUILDER_EXPO_ENABLED=1` on the bridge
+    # env is the rollback, one container recreate away.
+    #
+    # A default is not a live value. Any container whose env already
+    # carries `APP_BUILDER_EXPO_ENABLED=1` (the canary set it explicitly)
+    # keeps Expo until that variable is cleared on the bridge env and the
+    # container is recreated — `bridge/pool_addon.py::_FEATURE_FLAG_ENVS`
+    # forwards it, and a forwarded value outranks this default.
+    app_builder_expo_enabled: bool = False
+    # `app_html_enabled` gates the replacement, and is the ONLY app
+    # pipeline a default container now runs. Both on = the old canary
+    # posture; expo off + html on = migrated, which is the default below.
     app_html_enabled: bool = True
 
     # API

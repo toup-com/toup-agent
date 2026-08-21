@@ -28,12 +28,22 @@ from app.agent.skills.loader import SkillLoader
 from app.config import settings
 
 
+# Restore the SHIPPED defaults, not True/True. `settings` is a process-wide
+# singleton, so whatever this fixture leaves behind is what every later test
+# module in the same worker sees. Putting `expo=True` back would hand the rest
+# of the suite a posture no container runs any more — and any test that
+# depends on the Expo pipeline being gone would then pass or fail on file
+# ordering.
+_DEFAULT_EXPO = type(settings)().app_builder_expo_enabled
+_DEFAULT_HTML = type(settings)().app_html_enabled
+
+
 @pytest.fixture(autouse=True)
 def _restore():
     yield
     settings.agent_tool_families = "*"
-    settings.app_builder_expo_enabled = True
-    settings.app_html_enabled = True
+    settings.app_builder_expo_enabled = _DEFAULT_EXPO
+    settings.app_html_enabled = _DEFAULT_HTML
     te.reset_cache_for_tests()
 
 
@@ -50,10 +60,56 @@ async def _load(tmp_path) -> SkillLoader:
     return loader
 
 
-# ── 1. Both on (today's default) ─────────────────────────────────────
+# ── 0. The shipped default ───────────────────────────────────────────
+# 2026-08-21: HTML is the only pipeline a default container runs. This is
+# the one test in the file that reads config instead of setting it — every
+# other one configures a posture explicitly, so none of them would notice
+# the default drifting back.
+
+def test_the_shipped_default_is_html_only(monkeypatch):
+    """A fresh Settings, with no pipeline env set, must build HTML apps and
+    no Expo ones."""
+    monkeypatch.delenv("APP_BUILDER_EXPO_ENABLED", raising=False)
+    monkeypatch.delenv("APP_HTML_ENABLED", raising=False)
+    fresh = type(settings)()
+    assert fresh.app_builder_expo_enabled is False
+    assert fresh.app_html_enabled is True
+
+
+def test_the_expo_default_is_still_overridable(monkeypatch):
+    """The rollback. Expo is disabled, not deleted — `=1` on the bridge env
+    has to bring it back, or the flag is a one-way door."""
+    monkeypatch.setenv("APP_BUILDER_EXPO_ENABLED", "1")
+    assert type(settings)().app_builder_expo_enabled is True
+    monkeypatch.setenv("APP_BUILDER_EXPO_ENABLED", "0")
+    assert type(settings)().app_builder_expo_enabled is False
+
 
 @pytest.mark.asyncio
-async def test_both_pipelines_load_by_default(tmp_path, monkeypatch):
+async def test_default_settings_load_html_and_not_expo(tmp_path, monkeypatch):
+    """End of the same wire: the default config, run through the real skill
+    loader, yields the five HTML tools and zero Expo ones."""
+    monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(tmp_path / "apps"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("APP_BUILDER_EXPO_ENABLED", raising=False)
+    monkeypatch.delenv("APP_HTML_ENABLED", raising=False)
+    (tmp_path / "home").mkdir()
+    fresh = type(settings)()
+    _configure(expo=fresh.app_builder_expo_enabled, html=fresh.app_html_enabled)
+    loader = await _load(tmp_path)
+    assert "app_html" in loader.skills
+    assert "app_builder" not in loader.skills
+    assert "app" not in loader.skills
+    names = {t["name"] for t in loader.get_all_tool_definitions()}
+    assert not any(n.startswith(("app_builder__", "app__")) for n in names)
+    assert "app_html__create_app_file" in names
+    assert "app_html__present_app" in names
+
+
+# ── 1. Both on (the retired canary posture) ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_both_pipelines_load_when_expo_is_pinned_back_on(tmp_path, monkeypatch):
     monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(tmp_path / "apps"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
@@ -199,6 +255,45 @@ def test_pipeline_resolution_is_memoized():
 
 
 # ── 3. Things that go stale when a pipeline retires ──────────────────
+
+def _toup_section() -> str:
+    from app.agent.skills.builtins.toup.skill import ToupSkill
+
+    return ToupSkill().get_system_prompt_section()
+
+
+def test_the_toup_skill_routes_apps_to_the_pipeline_that_exists():
+    """`toup` is a SEPARATE family and survives Expo's retirement, so its
+    prompt outlives the tool it used to name. A prompt that mandates a tool
+    outside the wire array is how the model emits a call nothing dispatches.
+    """
+    _configure(expo=False)                       # the shipped posture
+    section = _toup_section()
+    assert "app_html__create_app_file" in section
+    assert "app_builder__build_app" not in section
+
+    _configure(expo=True, html=False)            # rollback posture
+    section = _toup_section()
+    assert "app_builder__build_app" in section
+    assert "app_html__" not in section
+
+    # Family withheld entirely: name neither, and don't imply an app is
+    # something this tenant can ask for.
+    _configure(families="toup")
+    section = _toup_section()
+    assert "app_builder__build_app" not in section
+    assert "app_html__" not in section
+    # Control — the rest of the section is still there, so the assertions
+    # above are not passing on an empty string.
+    assert "toup__scaffold" in section
+
+
+def test_the_toup_section_is_constant_within_a_container():
+    """Same cache invariant as the app_html section: two reads, one process,
+    identical bytes."""
+    _configure(expo=False)
+    assert _toup_section() == _toup_section()
+
 
 def test_the_redirect_names_a_tool_that_exists():
     from app.agent.tool_executor import _pipeline_guard_active, _pipeline_redirect_msg

@@ -209,16 +209,33 @@ def _isolate_entitlements():
     own value, and restore the process default afterwards."""
     original = getattr(settings, "agent_tool_families", "*")
     original_doc_flag = getattr(settings, "feature_doc_generation", True)
+    original_expo = getattr(settings, "app_builder_expo_enabled", False)
     te_mod.reset_cache_for_tests()
     yield
     settings.agent_tool_families = original
     settings.feature_doc_generation = original_doc_flag
+    settings.app_builder_expo_enabled = original_expo
     te_mod.reset_cache_for_tests()
 
 
 def _entitle(value: str) -> None:
     """Set this tenant's entitlement the way the container env would."""
     settings.agent_tool_families = value
+    te_mod.reset_cache_for_tests()
+
+
+def _pin_expo_on() -> None:
+    """Force the legacy Expo pipeline on for a FAMILY-axis test.
+
+    `skill_enabled` answers two independent questions — "is this tenant
+    entitled to the family?" and "does this container run that pipeline?" —
+    and since 2026-08-21 the second one says no to `app_builder`/`app` by
+    default. A family test that uses an Expo skill as its specimen would
+    then be measuring the pipeline axis and reporting it as the family axis:
+    the withheld case passes for the wrong reason and the entitled control
+    fails outright. Pinning the pipeline leaves exactly one variable moving.
+    """
+    settings.app_builder_expo_enabled = True
     te_mod.reset_cache_for_tests()
 
 
@@ -674,6 +691,7 @@ async def test_withholding_the_app_builder_withholds_its_gateway_too():
     from app.agent.skills.builtins.routines.skill import RoutinesSkill
     from app.agent.skills.loader import SkillLoader
 
+    _pin_expo_on()                   # isolate the family axis — see helper
     _entitle("doc_generation,toup")  # app_builder withheld
     loader = SkillLoader()
     assert await loader.register_dynamic(AppBuilderSkill()) is False
@@ -696,11 +714,32 @@ async def test_an_entitled_tenant_still_gets_the_gateway():
     )
     from app.agent.skills.loader import SkillLoader
 
+    _pin_expo_on()                   # isolate the family axis — see helper
     _entitle("*")
     loader = SkillLoader()
     assert await loader.register_dynamic(AppGatewaySkill()) is True
     names = {t["name"] for t in loader.get_all_tool_definitions()}
     assert any(n.startswith("app__") for n in names)
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_stays_out_when_only_the_pipeline_says_no():
+    """The other axis, on its own. Entitled to the family, but this
+    container does not run the Expo pipeline — which is the shipped default
+    since 2026-08-21. Without this, the two tests above would agree on
+    every posture the fleet actually runs and neither would notice."""
+    from app.agent.skills.builtins.app_builder.app_gateway_skill import (
+        AppGatewaySkill,
+    )
+    from app.agent.skills.loader import SkillLoader
+
+    settings.app_builder_expo_enabled = False
+    _entitle("*")
+    loader = SkillLoader()
+    assert te_mod.family_enabled("app_builder") is True, "family axis moved"
+    assert await loader.register_dynamic(AppGatewaySkill()) is False
+    names = {t["name"] for t in loader.get_all_tool_definitions()}
+    assert not any(n.startswith("app__") for n in names), sorted(names)
 
 
 def test_every_skill_shipped_under_app_builder_is_named_by_the_family():
@@ -744,9 +783,17 @@ def test_every_skill_shipped_under_app_builder_is_named_by_the_family():
 
 def test_skill_enabled_answers_for_the_gateway_by_name():
     """The loader's actual question, asked directly."""
+    _pin_expo_on()                   # isolate the family axis — see helper
     _entitle("doc_generation,toup")
     assert te_mod.skill_enabled("app") is False
     assert te_mod.skill_enabled("app_builder") is False
     assert te_mod.skill_enabled("routines") is True
     _entitle("*")
     assert te_mod.skill_enabled("app") is True
+    # And with the pipeline back at its shipped default the same entitled
+    # tenant gets the HTML pipeline instead — "entitled to build apps" has
+    # not become "entitled to nothing".
+    settings.app_builder_expo_enabled = False
+    te_mod.reset_cache_for_tests()
+    assert te_mod.skill_enabled("app") is False
+    assert te_mod.skill_enabled("app_html") is True

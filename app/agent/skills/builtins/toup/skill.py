@@ -333,6 +333,60 @@ class ToupSkill(Skill):
     # ------------------------------------------------------------------
     # System prompt
     # ------------------------------------------------------------------
+    # This used to read "All app creation MUST go through the App Builder" —
+    # an unconditional instruction pointing at a tool that is not on every
+    # tenant's plan. Where the app_builder family is withheld it switched off
+    # `toup__scaffold`, which really does write fastapi/nextjs/fullstack
+    # projects, in favour of a tool the model could not call.
+    #
+    # Round 12 turned "not on every plan" into "not on any plan by default":
+    # with `APP_BUILDER_EXPO_ENABLED=0` the Expo builder is gone and an app is
+    # ONE self-contained .html file. So the sentence has to name whichever
+    # pipeline this container actually loaded, not a fixed one — a
+    # prompt-mandated tool outside the wire array is how the model ends up
+    # emitting a stub call to a name nothing dispatches.
+    _APP_ROUTE_HTML = (
+        "**When the user asks for an app**, build it with the `app_html__*` "
+        "tools — an app here is ONE self-contained .html file, and "
+        "`app_html__create_app_file` starts it. Do NOT reach for "
+        "`toup__scaffold` for that: it writes a multi-file project the user "
+        "would have to run themselves. "
+    )
+    _APP_ROUTE_EXPO = (
+        "**When the user asks for a full mobile or Expo app** and "
+        "`app_builder__build_app` is available, prefer it — it handles "
+        "scaffolding, dependency install, a repo and a live preview end to "
+        "end, which `toup__scaffold` does not. "
+    )
+    _APP_ROUTE_NONE = ""
+    _SCAFFOLD_ROUTE = (
+        "For a backend, a web project or a scaffold the user wants to own "
+        "outright, `toup__scaffold` is the right tool. Use the rest of these "
+        "for planning and reviewing software rather than generating it."
+    )
+
+    @classmethod
+    def _app_route_sentence(cls) -> str:
+        """The app-building sentence for the pipeline this container runs.
+
+        Constant for the life of the process: every input is memoized in
+        ``tool_entitlements`` precisely so a prompt section cannot change
+        shape mid-life and fork the provider cache lineage.
+        """
+        try:
+            from app.agent.tool_entitlements import family_enabled, skill_enabled
+
+            if not family_enabled("app_builder"):
+                return cls._APP_ROUTE_NONE
+            if skill_enabled("app_html"):
+                return cls._APP_ROUTE_HTML
+            if skill_enabled("app_builder"):
+                return cls._APP_ROUTE_EXPO
+            return cls._APP_ROUTE_NONE
+        except Exception:  # pragma: no cover — a prompt must never break boot
+            logger.warning("[toup] pipeline lookup failed", exc_info=True)
+            return cls._APP_ROUTE_NONE
+
     def get_system_prompt_section(self) -> Optional[str]:
         return (
             "# Toup Skill — Software Engineering Tools\n"
@@ -342,20 +396,8 @@ class ToupSkill(Skill):
             "- `toup__changeset` — Plan code changes as a structured changeset\n"
             "- `toup__review_diff` — Review a code diff for bugs, security, style\n"
             "- `toup__plan_sprint` — Break an epic into sprint tasks\n\n"
-            # This used to read "All app creation MUST go through the App
-            # Builder" — an unconditional instruction pointing at a tool that
-            # is not on every tenant's plan. Where the app_builder family is
-            # withheld it switched off `toup__scaffold`, which really does
-            # write fastapi/nextjs/fullstack projects, in favour of a tool the
-            # model could not call. Scoped to the case it is actually about:
-            # a full mobile/Expo app, which the builder alone can produce.
-            "**When the user asks for a full mobile or Expo app** and "
-            "`app_builder__build_app` is available, prefer it — it handles "
-            "scaffolding, dependency install, a repo and a live preview end to "
-            "end, which `toup__scaffold` does not. For a backend, a web project "
-            "or a scaffold the user wants to own outright, `toup__scaffold` is "
-            "the right tool. Use the rest of these for planning and reviewing "
-            "software rather than generating it."
+            + self._app_route_sentence()
+            + self._SCAFFOLD_ROUTE
         )
 
     # ------------------------------------------------------------------
