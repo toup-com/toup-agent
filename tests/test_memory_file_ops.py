@@ -731,3 +731,23 @@ async def test_an_ordinary_file_description_is_still_editable():
 
     assert len(plan.accepted) == 1
     assert plan.accepted[0]["description"] == GOOD_DESC
+
+
+async def test_the_stored_bullet_is_the_normalised_one():
+    """Normalisation happens BEFORE the lint, so what is linted is what is
+    stored — and a later `rewrite`, which must match CHARACTER FOR CHARACTER
+    against the rendered body, is matching the same string."""
+    db, user_id = await _session()
+    await _file(db, user_id, "topics/music", "topics", "Music",
+                body="- listens to Persian pop")
+    identity = await resolve_user_identity(db, user_id)
+    files = await ops._all_files(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "add", "slug": "topics/music",
+          "bullet": "listens to Googoosh constantly.",
+          "change": "Added Music: a favourite singer."}],
+        files, identity=identity,
+    )
+
+    assert plan.accepted[0]["bullet"] == "listens to Googoosh constantly"

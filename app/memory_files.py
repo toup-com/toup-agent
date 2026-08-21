@@ -225,6 +225,40 @@ _HEX_ID_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
 _PARAM_RE = re.compile(r"\b[\w.]+=[\w.\"'-]+")
 
 
+def normalize_bullet(text: Optional[str]) -> str:
+    """Drop the full stop a single-sentence bullet must not carry.
+
+    The contract has always said "no trailing period unless the bullet holds
+    more than one sentence", and nothing enforced it — so the rule was a
+    preference the model followed about half the time. The founder's migrated
+    Profile came back as four capitalised sentences each ending in a period
+    while the same writer's turn path produces "listens to Googoosh and Ebi
+    constantly", and one corpus in two voices is what acceptance criterion
+    "one consistent voice" forbids.
+
+    NORMALISED, not rejected. A rejection costs the retry and can lose the
+    fact outright — the lesson of CI 32430971208, where four turns were
+    answered with a description and nothing was stored. Punctuation is not
+    worth a fact.
+
+    CASE IS DELIBERATELY LEFT ALONE. Lower-casing the first character cannot
+    be done safely: "IELTS exam booked …" and "Nariman's sister …" both open
+    on a word that must keep its capital, and no rule separates those from an
+    ordinary verb without guessing. The prompt asks; this does not enforce.
+    """
+    t = (text or "").rstrip()
+    if not t.endswith("."):
+        return t
+    body = t[:-1]
+    # Any earlier terminator means the bullet really does hold more than one
+    # sentence and the final stop belongs there. This also covers a trailing
+    # "..." — the second dot is an earlier terminator — so an ellipsis needs
+    # no clause of its own. One was written, and a mutation proved it dead.
+    if any(ch in body for ch in ".!?"):
+        return t
+    return body
+
+
 def bullet_problem(text: Optional[str]) -> Optional[str]:
     """None when the bullet passes the deterministic voice lint."""
     text = (text or "").strip()

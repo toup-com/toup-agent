@@ -51,17 +51,37 @@ async def drive_turn(
     return result
 
 
-async def drive_conversation(db, user_id: str, turns: Sequence[Turn]) -> int:
+async def drive_conversation(
+    db, user_id: str, turns: Sequence[Turn], sink: Optional[List[str]] = None,
+) -> int:
     applied = 0
     for t in turns:
         res = await drive_turn(
             db, user_id, t.user, t.assistant, trivial=t.trivial,
         )
         applied += int(res.get("applied", 0))
+        _collect(res, sink)
     return applied
 
 
-async def drive_conversation_dirty(db, user_id: str, turns: Sequence[Turn]) -> int:
+def _collect(res: Dict[str, Any], sink: Optional[List[str]]) -> None:
+    """Keep the writer's own account of what it refused.
+
+    Without this a scenario that stores nothing is indistinguishable from one
+    whose every op was rejected, and the two have opposite fixes. Three
+    rounds of this rebuild were diagnosed by guessing between them.
+    """
+    if sink is None:
+        return
+    if res.get("skipped"):
+        sink.append(f"pre-gate skipped the turn: {res['skipped']}")
+    for complaint in (res.get("rejected") or []):
+        sink.append(str(complaint))
+
+
+async def drive_conversation_dirty(
+    db, user_id: str, turns: Sequence[Turn], sink: Optional[List[str]] = None,
+) -> int:
     """The BELT: hand the writer the string ws_chat actually builds.
 
     Production never does this — `agent_runner` passes
@@ -78,6 +98,7 @@ async def drive_conversation_dirty(db, user_id: str, turns: Sequence[Turn]) -> i
             trivial=t.trivial,
         )
         applied += int(res.get("applied", 0))
+        _collect(res, sink)
     return applied
 
 
@@ -243,6 +264,8 @@ class ScenarioResult:
     slugs: List[str] = field(default_factory=list)
     bodies: Dict[str, str] = field(default_factory=dict)
     changes: List[str] = field(default_factory=list)
+    #: What the writer itself said it refused, plus any pre-gate skip.
+    rejected: List[str] = field(default_factory=list)
     applied: int = 0
 
     def describe(self) -> str:
@@ -256,6 +279,9 @@ class ScenarioResult:
         if self.misrouted:
             lines.append("  MISROUTED (captured, wrong file):")
             lines += [f"    - {m}" for m in self.misrouted]
+        if self.rejected:
+            lines.append("  THE WRITER REFUSED:")
+            lines += [f"    - {r}" for r in self.rejected]
         if self.junk:
             lines.append("  JUNK (must NOT be stored, was):")
             lines += [f"    - {j}" for j in self.junk]
@@ -277,9 +303,10 @@ class ScenarioResult:
 async def run_scenario(db, user_id: str, sc: Scenario, *, dirty: bool = False):
     from app.memory_files import SYSTEM_FILES, section_of_slug
 
+    rejected: List[str] = []
     applied = (
-        await drive_conversation_dirty(db, user_id, sc.turns) if dirty
-        else await drive_conversation(db, user_id, sc.turns)
+        await drive_conversation_dirty(db, user_id, sc.turns, rejected) if dirty
+        else await drive_conversation(db, user_id, sc.turns, rejected)
     )
 
     files = await all_files(db, user_id)
@@ -290,6 +317,7 @@ async def run_scenario(db, user_id: str, sc: Scenario, *, dirty: bool = False):
         slugs=sorted(bodies),
         bodies=bodies,
         changes=await change_summaries(db, user_id),
+        rejected=rejected,
         lint=lint_files(files),
     )
 

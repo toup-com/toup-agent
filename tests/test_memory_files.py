@@ -12,6 +12,7 @@ pinned here is the slug namespace, which is.
 import pytest
 
 from app.memory_files import (
+    normalize_bullet,
     ALWAYS_INJECTED_SLUGS,
     CAP_PROFILE,
     CURRENT_CONTEXT_LAYERS,
@@ -285,3 +286,42 @@ def test_the_round_8_map_survives_only_behind_the_legacy_prefix():
     assert not hasattr(canon, "USER_CATEGORY_SECTION")
     assert not hasattr(canon, "default_slug_for")
     assert not hasattr(canon, "section_for")
+
+
+# ── One sentence takes no full stop ───────────────────────────────────
+#
+# The contract has always said so and nothing enforced it, so the rule was a
+# preference the writer kept about half the time. The founder's migrated
+# Profile came back as four sentences each ending in a period while the same
+# writer's turn path produces "listens to Googoosh and Ebi constantly" — one
+# corpus in two voices, which is what "one consistent voice" forbids.
+
+
+def test_a_single_sentence_loses_its_full_stop():
+    assert normalize_bullet("uses an Android phone.") == "uses an Android phone"
+
+
+def test_a_bullet_without_one_is_untouched():
+    assert normalize_bullet("uses an Android phone") == "uses an Android phone"
+
+
+def test_two_sentences_keep_theirs():
+    """The rule is "unless the bullet holds more than one sentence"."""
+    text = "exam booked for Aug 30, 2026. Targeting band 7.5 overall."
+    assert normalize_bullet(text) == text
+
+
+def test_a_semicolon_join_is_still_one_sentence():
+    assert normalize_bullet(
+        "runs every morning at 7; eats breakfast afterwards."
+    ) == "runs every morning at 7; eats breakfast afterwards"
+
+
+def test_an_ellipsis_is_left_alone():
+    """A trailing "..." is not a full stop and truncation must stay visible."""
+    assert normalize_bullet("wants to...") == "wants to..."
+
+
+def test_persian_is_unaffected():
+    fa = "هر روز صبح ساعت ۷ می‌دود و بعدش صبحانه می‌خورد"
+    assert normalize_bullet(fa) == fa

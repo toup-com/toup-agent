@@ -54,6 +54,7 @@ from app.memory_files import (
     SYSTEM_FILES,
     FileSection,
     bullet_problem,
+    normalize_bullet,
     description_problem,
     extract_links,
     is_bullet_list,
@@ -640,7 +641,10 @@ def validate_ops(
         return False
 
     def _check_bullet(op_name: str, raw: Any, state: FileState) -> Optional[str]:
-        text = (raw or "").strip() if isinstance(raw, str) else ""
+        # Normalise BEFORE linting, so what is linted is what is stored — and
+        # so a later `rewrite` matching CHARACTER FOR CHARACTER against the
+        # rendered body is matching the same string.
+        text = normalize_bullet(raw) if isinstance(raw, str) else ""
         problem = bullet_problem(text)
         if problem:
             complaints.append(f"{op_name} on {state.slug}: {problem}")
