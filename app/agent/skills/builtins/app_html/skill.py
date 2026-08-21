@@ -351,9 +351,12 @@ class AppHtmlSkill(Skill):
                     "and posts the app card in chat. Call this once the app is "
                     "finished — and again after a round of edits so the user sees the "
                     "new version.\n"
-                    "The app is opened in a real browser first and refused if anything "
-                    "throws, so this is also the check that it works. If it comes back "
-                    "with problems, fix them with edit_app_file and call this again."
+                    "The app is opened in a real browser at 390x844 first and refused "
+                    "if anything throws OR if a control renders under 44x44, text "
+                    "under 12px, or the page scrolls sideways — so this is also the "
+                    "check that it works and can be used with a thumb. If it comes "
+                    "back with problems, fix them with edit_app_file and call this "
+                    "again."
                 ),
                 "input_schema": {
                     "type": "object",

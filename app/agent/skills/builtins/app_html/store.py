@@ -740,6 +740,90 @@ def restore_latest_version(slug: str) -> bool:
         return False
 
 
+def reconcile(slug: str, *, allow_purge: bool = True) -> str:
+    """Make one manifest record agree with the disk. ``ok``/``restored``/``purged``.
+
+    The Files page lists the MANIFEST, and every other entry point in this
+    skill self-heals a missing file (`_existing_title` calls
+    :func:`restore_latest_version`) while the list route did not. So a record
+    whose ``.html`` went away — an interrupted write, a volume restored under a
+    running container, a cleanup script that took the file and left the index —
+    stayed in the list forever as a row with a name, a stale size, and nothing
+    behind it. On a device that renders as "Couldn't show this item", sitting
+    between two apps that work.
+
+    Two outcomes, in this order:
+
+    * **restored** — a snapshot exists in ``.versions/``. That is not a missing
+      app, it is a missing filename, and it is the same repair the skill path
+      already performs.
+    * **purged** — no file and no snapshot. The record is a tombstone for bytes
+      that are never coming back, and keeping it costs the user a row they can
+      never open. Its state blob goes with it: slugs are reusable, so leaving
+      it behind means the next app of the same name opens holding a stranger's
+      saved game.
+    """
+    if exists(slug):
+        return "ok"
+    # Restore is attempted unconditionally: it only ever puts a file BACK, so
+    # it cannot be the wrong call on a volume that is merely late.
+    if restore_latest_version(slug):
+        return "restored"
+    if not allow_purge:
+        return "ok"
+    logger.warning(
+        "[app_html] %s is in the manifest with no file and no history — "
+        "removing the row", slug,
+    )
+    try:
+        os.unlink(_state_path(slug))
+    except (OSError, AppStoreError):
+        pass
+    forget_record(slug)
+    return "purged"
+
+
+def reconcile_all() -> Dict[str, str]:
+    """Reconcile every record. Returns only the slugs that MOVED.
+
+    Called from the list route, so the repair reaches every user the first time
+    they open Files — there is no migration to run and no fleet to sweep.
+
+    **The wholesale-absence brake is the whole safety story, and it guards the
+    PURGE only.** If a volume is late mounting or half restored, every record
+    looks fileless at once, and an unguarded purge would take a user's entire
+    library on a transient. So: a library of several apps in which NOT ONE file
+    is on disk is a storage fault, not a verdict about the apps, and nothing is
+    dropped. One app missing beside others that are present is genuinely
+    missing — and a single-app library is not evidence of anything either way,
+    so it is treated normally rather than left permanently unrepairable.
+
+    Restores are never gated. Putting a file back from history cannot lose
+    data, so it is the right call even on a volume that is merely late.
+    """
+    records = read_manifest()
+    if not records:
+        return {}
+    present = [s for s in records if exists(s)]
+    wholesale = len(records) > 1 and not present
+    if wholesale:
+        logger.warning(
+            "[app_html] all %d apps are missing their files — treating this as "
+            "a storage fault: restoring what has history, dropping nothing",
+            len(records),
+        )
+    moved: Dict[str, str] = {}
+    for slug in list(records):
+        try:
+            outcome = reconcile(slug, allow_purge=not wholesale)
+        except (OSError, AppStoreError):
+            logger.debug("[app_html] reconcile failed for %s", slug, exc_info=True)
+            continue
+        if outcome != "ok":
+            moved[slug] = outcome
+    return moved
+
+
 def list_versions(slug: str) -> List[str]:
     try:
         vdir = _versions_dir(slug)

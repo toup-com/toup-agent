@@ -445,6 +445,143 @@ async def _press_start(page) -> Optional[str]:
         return None
 
 
+#: Minimum rendered size, in CSS px, for anything a thumb has to hit. Apple
+#: HIG 44pt, Material 48dp, WCAG 2.2 SC 2.5.5 44×44. The design skill has said
+#: this since round 19 and nothing measured it — a 32 px D-pad throws nothing
+#: and renders perfectly, which is exactly why it kept shipping.
+MIN_TARGET_PX = 44
+
+#: Below this, text is unreadable on a phone regardless of contrast.
+MIN_TEXT_PX = 12
+
+#: Most findings of one kind to report. A grid of forty undersized keys is one
+#: mistake, and forty lines of it would bury everything else in the report.
+MAX_PER_KIND = 4
+
+#: Measures the laid-out page the way a person meets it. Everything here is
+#: read from `getBoundingClientRect` and `getComputedStyle` AFTER the app has
+#: rendered — the whole point is that it is the rendered geometry, not the
+#: stylesheet, that decides whether a control can be hit.
+_LAYOUT_JS = """
+(opts) => {
+  const SEL = 'button,[role="button"],a,input,select,textarea,summary,[onclick]';
+  const seen = [], small = [], tiny = [];
+  const vw = window.innerWidth, vh = window.innerHeight;
+
+  const label = (el) => (
+    (el.getAttribute('aria-label') || el.innerText || el.value ||
+     el.getAttribute('title') || el.className || el.tagName) || ''
+  ).toString().trim().replace(/\\s+/g, ' ').slice(0, 32);
+
+  for (const el of document.querySelectorAll(SEL)) {
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+    const b = el.getBoundingClientRect();
+    if (!b.width || !b.height) continue;              // not laid out
+    if (b.bottom < 0 || b.top > vh * 3) continue;     // far off-screen
+    // WCAG 2.5.8 exempts a link inline in a sentence — a 20px-tall <a> inside
+    // a paragraph is typography, not a control, and failing it would make the
+    // gate a nuisance that gets turned off.
+    if (el.tagName === 'A' && cs.display.indexOf('inline') === 0) continue;
+    if (el.tagName === 'INPUT' &&
+        ['hidden','radio','checkbox'].indexOf(el.type) >= 0) continue;
+    seen.push(1);
+    const side = Math.min(b.width, b.height);
+    if (side + 0.5 < opts.minTarget) {
+      small.push({ label: label(el), w: Math.round(b.width), h: Math.round(b.height) });
+    }
+  }
+
+  for (const el of document.querySelectorAll('body *')) {
+    if (!el.childNodes.length) continue;
+    let hasText = false;
+    for (const n of el.childNodes) {
+      if (n.nodeType === 3 && n.textContent.trim().length > 3) { hasText = true; break; }
+    }
+    if (!hasText) continue;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+    const px = parseFloat(cs.fontSize);
+    if (px && px + 0.5 < opts.minText) {
+      tiny.push({ label: (el.innerText || '').trim().slice(0, 24), px: Math.round(px) });
+    }
+  }
+
+  const doc = document.documentElement;
+  return {
+    controls: seen.length,
+    small: small.slice(0, opts.max),
+    smallTotal: small.length,
+    tiny: tiny.slice(0, opts.max),
+    tinyTotal: tiny.length,
+    overflowPx: Math.max(0, Math.round(doc.scrollWidth - doc.clientWidth)),
+    vw, vh,
+  };
+}
+"""
+
+
+def layout_findings(m: dict) -> List[Finding]:
+    """Turn one layout measurement into findings the model can act on.
+
+    Split out from the browser so the thresholds can be tested without one —
+    the same reason `counts_as_breakage` is its own function. Every message
+    names the element AND the number, because "make your buttons bigger" is not
+    something anyone can act on and "PLAY is 120×32, needs 44 tall" is.
+    """
+    out: List[Finding] = []
+    for s in m.get("small") or []:
+        out.append(Finding(kind="layout", message=(
+            f"the control “{s['label']}” renders {s['w']}×{s['h']}px — under the "
+            f"{MIN_TARGET_PX}px minimum a thumb can reliably hit. Give it "
+            f"min-width/min-height:{MIN_TARGET_PX}px (a control used "
+            f"continuously — a D-pad key, a paddle — wants 64-88px)."
+        )))
+    extra = int(m.get("smallTotal") or 0) - len(m.get("small") or [])
+    if extra > 0:
+        out.append(Finding(kind="layout", message=(
+            f"…and {extra} more control{'' if extra == 1 else 's'} under "
+            f"{MIN_TARGET_PX}px. Fix the shared rule, not each element."
+        )))
+    for t in m.get("tiny") or []:
+        out.append(Finding(kind="layout", message=(
+            f"the text “{t['label']}” renders at {t['px']}px — under {MIN_TEXT_PX}px "
+            f"it is unreadable on a phone. Body text wants 16px."
+        )))
+    if int(m.get("overflowPx") or 0) > 2:
+        out.append(Finding(kind="layout", message=(
+            f"the page scrolls sideways by {m['overflowPx']}px at "
+            f"{m.get('vw')}px wide — something is wider than the screen. Find the "
+            f"fixed width and make it max-width:100%."
+        )))
+    return out
+
+
+def layout_enabled() -> bool:
+    """Off only if an operator turns it off, like the smoke test itself."""
+    return (os.environ.get("TOUP_APP_LAYOUT_GATE", "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+async def _measure_layout(page) -> List[Finding]:
+    if not layout_enabled():
+        return []
+    try:
+        m = await page.evaluate(
+            _LAYOUT_JS,
+            {"minTarget": MIN_TARGET_PX, "minText": MIN_TEXT_PX, "max": MAX_PER_KIND},
+        )
+    except Exception:  # noqa: BLE001 - a measurement that cannot run is not a verdict
+        logger.debug("[app_html] layout measurement failed", exc_info=True)
+        return []
+    if not isinstance(m, dict) or not m.get("controls"):
+        # No laid-out controls at all: either the app is a pure display, or it
+        # never rendered. Both are somebody else's finding, not this one's.
+        return []
+    return layout_findings(m)
+
+
 async def _smoke(html: str, report: Report) -> Report:
     try:
         from playwright.async_api import async_playwright  # type: ignore
@@ -498,6 +635,11 @@ async def _smoke(html: str, report: Report) -> Report:
             # That is the only window in which this question can be asked, so
             # it is asked before the input frame below and never after.
             self_ended = await _ended_itself(page, first_text)
+            # Measure the START SCREEN's geometry before pressing anything —
+            # its PLAY button is a control a thumb has to hit too — then
+            # measure again below, once the app proper is on screen, because
+            # that is where the D-pad lives.
+            layout = await _measure_layout(page)
             # Now DRIVE it. An app that opens on a start screen has run almost
             # none of its own code yet, so everything above this line has
             # verified a title and a button.
@@ -511,6 +653,12 @@ async def _smoke(html: str, report: Report) -> Report:
                 await page.wait_for_timeout(400)
             except Exception:  # noqa: BLE001
                 pass
+            # The playing screen. Its controls are the ones used hundreds of
+            # times, so this measurement is the one that matters most — and it
+            # is only reachable after the start control has been pressed.
+            for f in await _measure_layout(page):
+                if not any(f.message == g.message for g in layout):
+                    layout.append(f)
             if self_ended:
                 _note("behaviour", (
                     f"the app reached “{self_ended}” on its own, "
@@ -536,6 +684,12 @@ async def _smoke(html: str, report: Report) -> Report:
         return report
 
     report.findings.extend(errors)
+    # Layout findings ride the same report, so an undersized D-pad refuses the
+    # publish exactly the way a ReferenceError does. Added AFTER the blocked-CDN
+    # downgrade above: a page whose stylesheet never arrived has no geometry
+    # worth measuring, and blaming the model for this container's lack of
+    # egress is the one way to make the gate worth turning off.
+    report.findings.extend(layout)
     return report
 
 

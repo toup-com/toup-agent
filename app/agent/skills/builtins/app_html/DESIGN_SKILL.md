@@ -442,5 +442,19 @@ unless the stage above it can shrink.
 anything throws. A refusal is a list of things to fix, not a dead end: fix
 them with `edit_app_file` and call it again.
 
-None of the sizing above is checkable by a machine — a 32 px D-pad throws
-nothing and renders perfectly. It is checked here or it is not checked.
+**Three of the boxes above are now measured, not trusted.** At 390×844, before
+and again after the start control is pressed, the gate reads every laid-out
+control's `getBoundingClientRect` and refuses the publish over:
+
+- any interactive element rendering under **44 × 44** (an inline link in a
+  sentence is exempt — that is typography, not a control),
+- any text under **12 px**,
+- **sideways scroll** at 390 px wide.
+
+It names the element and the number — "the control “^” renders 34×30px" — so
+the fix is a one-line change to a shared rule. Write to the sizes in §4 and you
+will never meet it.
+
+The rest of the list is still yours: thumb reach, the interactive share of the
+screen, contrast, the signature element, real copy. A 32 px D-pad now throws;
+a D-pad marooned at the top of the screen under a 200 px title still does not.

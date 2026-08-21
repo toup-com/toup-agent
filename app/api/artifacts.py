@@ -26,16 +26,37 @@ router = APIRouter(prefix="/artifacts", tags=["Artifacts"])
 
 @router.get("/")
 async def list_artifacts() -> Dict[str, Any]:
-    """Every registered single-file app, newest update first."""
+    """Every single-file app that is really there, newest update first.
+
+    Reconciled against the disk BEFORE it is serialised. This route reports the
+    manifest, and the manifest is an index — a record whose ``.html`` went away
+    was listed anyway, with its last known size, as a row the user could tap and
+    never open. `store.reconcile_all` restores it from ``.versions/`` where it
+    can and drops the row where it cannot, so a broken entry repairs itself the
+    first time anyone opens Files rather than needing a fleet-wide migration.
+
+    ``size_bytes`` is then re-read from the FILE rather than trusted from the
+    record: a size is a fact about bytes on disk, and reporting a remembered one
+    is how a row comes to look healthy while being empty.
+    """
+    repaired = store.reconcile_all()
+    if repaired:
+        logger.info("[app_html] list repaired %s", repaired)
+
     records = store.read_manifest()
     items: List[Dict[str, Any]] = []
     for slug, rec in records.items():
         d = rec.to_dict()
         d["exists"] = store.exists(slug)
         d["versions"] = len(store.list_versions(slug))
+        try:
+            d["size_bytes"] = os.path.getsize(store.app_path(slug))
+        except (OSError, store.AppStoreError):
+            d["size_bytes"] = 0
         items.append(d)
     items.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
-    return {"apps": items, "root": store.apps_root(), "count": len(items)}
+    return {"apps": items, "root": store.apps_root(), "count": len(items),
+            "repaired": repaired}
 
 
 @router.get("/{slug}")

@@ -31,7 +31,7 @@ import stat
 import pytest
 
 from app.agent.skills.base import SkillContext
-from app.agent.skills.builtins.app_html import runtime, store
+from app.agent.skills.builtins.app_html import runtime, store, verify
 from app.agent.skills.builtins.app_html import steps as steps_mod
 from app.agent.skills.builtins.app_html.skill import AppHtmlSkill
 
@@ -687,6 +687,319 @@ def test_a_disabled_account_gets_nothing(platform, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         _serve({"authorization": f"Bearer {create_access_token('user-1')}"})
     assert exc.value.status_code == 401
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 7. The row you could tap and never open
+# ═════════════════════════════════════════════════════════════════════
+#
+# Reported from a device: a Files row reading "Couldn't show this item",
+# sitting between two apps that worked. The list route reports the MANIFEST —
+# every other entry point in this skill self-heals a missing file, and the one
+# the Files page calls did not. So a record whose .html went away was listed
+# forever, with its last known size, as a row with nothing behind it.
+
+
+def _break(slug):
+    os.unlink(store.app_path(slug))
+
+
+def test_a_row_with_no_file_and_no_history_is_purged(skill, apps_dir):
+    from app.api.artifacts import list_artifacts
+
+    _create(skill, slug="snake-deluxe")
+    _create(skill, slug="gone")
+    _create(skill, slug="habit-dashboard")
+    _break("gone")
+
+    out = run(list_artifacts())
+
+    assert out["repaired"] == {"gone": "purged"}
+    assert sorted(a["slug"] for a in out["apps"]) == [
+        "habit-dashboard", "snake-deluxe",
+    ]
+    assert "gone" not in store.read_manifest()
+
+
+def test_a_row_whose_file_can_be_restored_is_restored_not_purged(skill, apps_dir):
+    """A snapshot in `.versions/` means this is a missing FILENAME, not a
+    missing app — the same repair the skill path already performs."""
+    from app.api.artifacts import list_artifacts
+
+    _create(skill)
+    run(skill.execute_tool("app_html__edit_app_file", {
+        "slug": "snake", "old_string": "width:44px;height:44px",
+        "new_string": "width:76px;height:76px",
+    }, CTX))                                    # leaves a snapshot behind
+    _break("snake")
+
+    out = run(list_artifacts())
+
+    assert out["repaired"] == {"snake": "restored"}
+    assert store.exists("snake")
+    assert [a["slug"] for a in out["apps"]] == ["snake"]
+
+
+def test_an_unreadable_volume_is_not_a_reason_to_delete_anything(skill, apps_dir):
+    """The guard that makes this a self-heal rather than a data-loss bug.
+
+    A volume that is late mounting or half restored makes EVERY record look
+    fileless at once. Purging on that would take a user's whole library on a
+    transient, so a library in which not one file is present drops nothing.
+    Kills the mutation that reconciles without the brake.
+    """
+    from app.api.artifacts import list_artifacts
+
+    _create(skill, slug="snake-deluxe")
+    _create(skill, slug="habit-dashboard")
+    _break("snake-deluxe")
+    _break("habit-dashboard")
+
+    out = run(list_artifacts())
+
+    assert out["repaired"] == {}
+    assert set(store.read_manifest()) == {"snake-deluxe", "habit-dashboard"}
+
+
+def test_the_size_is_read_from_the_file_not_remembered(skill, apps_dir):
+    """A size is a fact about bytes on disk. Reporting a remembered one is how
+    a row comes to look healthy while being empty."""
+    from app.api.artifacts import list_artifacts
+
+    _create(skill)
+    with open(store.app_path("snake"), "w", encoding="utf-8") as fh:
+        fh.write("<!doctype html><html><body>tiny</body></html>")
+
+    row = run(list_artifacts())["apps"][0]
+
+    assert row["size_bytes"] == os.path.getsize(store.app_path("snake"))
+    assert row["size_bytes"] != store.read_manifest()["snake"].size_bytes
+
+
+def test_the_repair_is_idempotent(skill, apps_dir):
+    from app.api.artifacts import list_artifacts
+
+    _create(skill, slug="snake-deluxe")
+    _create(skill, slug="gone")
+    _break("gone")
+
+    assert run(list_artifacts())["repaired"] == {"gone": "purged"}
+    assert run(list_artifacts())["repaired"] == {}
+
+
+def test_purging_takes_the_saved_state_with_it(skill, apps_dir):
+    """Slugs are reusable — the model picks them from the app's name — so a
+    state blob left behind means the next `snake` opens holding a stranger's
+    saved game."""
+    from app.api.artifacts import list_artifacts
+
+    _create(skill, slug="snake-deluxe")
+    _create(skill, slug="gone")
+    store.write_state("gone", {"best": "9001"})
+    _break("gone")
+
+    run(list_artifacts())
+
+    assert store.read_state("gone") == {}
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 8. The D-pad is now measured, not trusted
+# ═════════════════════════════════════════════════════════════════════
+#
+# The design skill has said 44×44 since this round and nothing checked it. A
+# 32 px D-pad throws nothing and renders perfectly, which is precisely why it
+# kept shipping — the strongest gate in the pipeline had no opinion about the
+# one thing wrong with the app. Same shape as round 18's complaint, one layer
+# further out.
+
+def test_an_undersized_control_is_a_finding():
+    findings = verify.layout_findings({
+        "controls": 6,
+        "small": [{"label": "^", "w": 34, "h": 30}],
+        "smallTotal": 1, "tiny": [], "tinyTotal": 0, "overflowPx": 0,
+        "vw": 390, "vh": 844,
+    })
+    assert len(findings) == 1
+    # The element AND the number: "make your buttons bigger" is not actionable.
+    assert "“^”" in findings[0].message
+    assert "34×30px" in findings[0].message
+    assert "44px" in findings[0].message
+
+
+def test_a_control_exactly_at_the_minimum_passes():
+    """44 is the floor, not the first failing value. An off-by-one here would
+    fail every app that followed the rule exactly."""
+    assert verify.layout_findings({
+        "controls": 1,
+        "small": [], "smallTotal": 0, "tiny": [], "tinyTotal": 0,
+        "overflowPx": 0, "vw": 390, "vh": 844,
+    }) == []
+
+
+def test_the_overflow_beyond_the_cap_is_summarised_not_listed():
+    """A D-pad with forty undersized keys is ONE mistake in a shared rule.
+
+    This covers the SUMMARY LINE only — the cap itself is applied in the
+    browser, so it is pinned by `test_a_keypad_does_not_bury_the_report`
+    against a real layout. (Asserting the cap here would be asserting against
+    a dict this test had already sliced itself.)
+    """
+    small = [{"label": f"k{i}", "w": 30, "h": 30}
+             for i in range(verify.MAX_PER_KIND)]
+    findings = verify.layout_findings({
+        "controls": 40, "small": small, "smallTotal": 40,
+        "tiny": [], "tinyTotal": 0, "overflowPx": 0, "vw": 390, "vh": 844,
+    })
+    assert len(findings) == verify.MAX_PER_KIND + 1
+    assert f"{40 - verify.MAX_PER_KIND} more controls" in findings[-1].message
+    assert "Fix the shared rule" in findings[-1].message
+
+
+def test_tiny_text_and_sideways_scroll_are_findings():
+    findings = verify.layout_findings({
+        "controls": 2, "small": [], "smallTotal": 0,
+        "tiny": [{"label": "ARROWS MOVE", "px": 9}], "tinyTotal": 1,
+        "overflowPx": 130, "vw": 390, "vh": 844,
+    })
+    messages = " ".join(f.message for f in findings)
+    assert "9px" in messages and "12px" in messages
+    assert "130px" in messages and "390px" in messages
+
+
+def test_a_page_with_no_controls_is_not_this_gates_business(monkeypatch):
+    """A pure display, or a page that never rendered. Both are somebody else's
+    finding — reporting "no controls" as a layout defect would fail every
+    chart and every report the agent writes."""
+    assert verify.layout_findings({
+        "controls": 0, "small": [], "smallTotal": 0, "tiny": [],
+        "tinyTotal": 0, "overflowPx": 0, "vw": 390, "vh": 844,
+    }) == []
+
+
+def test_the_gate_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv("TOUP_APP_LAYOUT_GATE", "0")
+    assert verify.layout_enabled() is False
+    monkeypatch.setenv("TOUP_APP_LAYOUT_GATE", "1")
+    assert verify.layout_enabled() is True
+
+
+# ── The real browser ──────────────────────────────────────────────────
+# Everything above tests the thresholds. These two run the REAL measurement
+# against a REAL layout engine, because the whole claim is about rendered
+# geometry and a test over a dict cannot see a CSS mistake.
+
+# The pad is BEHIND the start screen, which is what §8 tells the model to
+# build — so the undersized D-pad only exists after PLAY is pressed. That makes
+# the post-press measurement load-bearing rather than incidental, and it is the
+# real shape of the reported build.
+_UNDERSIZED = """<!doctype html><html><head><meta charset="utf-8"><title>S</title>
+<style>body{margin:0;font:16px system-ui}.key{width:34px;height:30px}
+.hint{font-size:9px}.wide{width:520px;height:8px}
+.pad{display:none}.playing .pad{display:block}</style></head><body>
+<h1>SNAKE</h1><button id="play" style="width:120px;height:56px">PLAY</button>
+<div class="wide"></div>
+<div class="pad"><button class="key">^</button><button class="key">v</button></div>
+<p class="hint">Arrows move the snake around the board</p>
+<script>document.getElementById('play').onclick=function(){
+  document.body.classList.add('playing');
+};</script>
+</body></html>"""
+
+# An inline link inside a sentence is typography, not a control. WCAG 2.5.8
+# exempts it explicitly, and failing it would make the gate a nuisance that
+# gets switched off — so the exemption is pinned with a real layout.
+_INLINE_LINK = """<!doctype html><html><head><meta charset="utf-8"><title>S</title>
+<style>body{margin:0;font:16px system-ui}
+button{min-width:44px;min-height:44px}</style></head><body>
+<h1>Budget</h1>
+<p>Rent 1,850.00 on Sep 1 — see <a href="#detail">the breakdown</a> for more.</p>
+<button style="width:200px;height:64px">Add expense</button>
+<script>void 0;</script></body></html>"""
+
+_CORRECT = """<!doctype html><html><head><meta charset="utf-8"><title>S</title>
+<style>body{margin:0;font:16px system-ui}.key{width:76px;height:76px}
+button{min-width:44px;min-height:44px}</style></head><body>
+<h1>SNAKE</h1><button id="play" style="width:200px;height:64px">PLAY</button>
+<div class="pad"><button class="key">^</button><button class="key">v</button></div>
+<p>Arrows move the snake around the board</p>
+<script>document.getElementById('play').onclick=function(){};</script>
+</body></html>"""
+
+
+def _browser_available() -> bool:
+    import importlib.util
+    return any(
+        importlib.util.find_spec(name) is not None
+        for name in ("playwright.async_api", "patchright.async_api")
+    )
+
+
+needs_browser = pytest.mark.skipif(
+    not _browser_available(), reason="no headless browser in this image",
+)
+
+
+@needs_browser
+def test_a_real_undersized_dpad_refuses_the_publish(monkeypatch):
+    monkeypatch.delenv("TOUP_APP_SMOKE_TEST", raising=False)
+    report = run(verify.verify_app(_UNDERSIZED, deep=True))
+    if "runtime" not in report.ran:
+        pytest.skip("the browser pass could not run here")
+    text = report.as_error()
+    assert "34×30px" in text, text          # measured, not read off the CSS
+    assert "9px" in text
+    assert "scrolls sideways" in text
+    assert not report.ok
+
+
+_KEYPAD = """<!doctype html><html><head><meta charset="utf-8"><title>Calc</title>
+<style>body{margin:0;font:16px system-ui}
+.k{width:30px;height:30px}</style></head><body>
+<h1>Calculator</h1><div id="pad">""" + "".join(
+    f'<button class="k">{i}</button>' for i in range(16)
+) + """</div><script>void 0;</script></body></html>"""
+
+
+@needs_browser
+def test_a_keypad_does_not_bury_the_report(monkeypatch):
+    """Sixteen undersized keys must not produce sixteen findings.
+
+    The cap is applied in the page, so this is the only test that can see it —
+    kills the `MAX_PER_KIND = 999` mutation, which a dict-level test cannot.
+    A report the model has to wade through is a report it acts on badly.
+    """
+    monkeypatch.delenv("TOUP_APP_SMOKE_TEST", raising=False)
+    report = run(verify.verify_app(_KEYPAD, deep=True))
+    if "runtime" not in report.ran:
+        pytest.skip("the browser pass could not run here")
+    named = [f for f in report.findings if "renders" in f.message]
+    assert len(named) == verify.MAX_PER_KIND, [f.message for f in named]
+    assert any("more controls under" in f.message for f in report.findings)
+
+
+@needs_browser
+def test_an_inline_link_in_a_sentence_is_not_a_control(monkeypatch):
+    """The exemption, against a real layout engine. A 19px-tall <a> in a
+    paragraph is how prose looks; refusing to publish over it would train
+    everyone to turn the gate off."""
+    monkeypatch.delenv("TOUP_APP_SMOKE_TEST", raising=False)
+    report = run(verify.verify_app(_INLINE_LINK, deep=True))
+    if "runtime" not in report.ran:
+        pytest.skip("the browser pass could not run here")
+    assert report.ok, report.as_error()
+
+
+@needs_browser
+def test_a_real_correct_app_is_not_bothered(monkeypatch):
+    """The control. A gate that fails everything is not a gate — and this is
+    the app the design skill's §4 tells the model to write."""
+    monkeypatch.delenv("TOUP_APP_SMOKE_TEST", raising=False)
+    report = run(verify.verify_app(_CORRECT, deep=True))
+    if "runtime" not in report.ran:
+        pytest.skip("the browser pass could not run here")
+    assert report.ok, report.as_error()
+    assert report.summary() == "opened it — no errors"
 
 
 def test_the_guidance_still_reaches_the_prompt_without_its_frontmatter(prompt):
