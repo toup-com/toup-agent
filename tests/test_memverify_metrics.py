@@ -503,12 +503,25 @@ def test_baseline_marks_an_unrecorded_bound_as_unrecorded():
 
 
 def test_the_repo_baseline_still_gates_a_regressed_run():
-    """End-to-end over the REAL committed file: a run that misses one fact,
-    stores one junk entry and writes one badly-voiced bullet must not pass."""
+    """End-to-end over the REAL committed file: a run that misses a THIRD of
+    the corpus, stores junk and writes a badly-voiced bullet must not pass.
+
+    The fixture used to set capture_pct to 90.91 — one missed fact — and
+    assert that was gated. Three consecutive attempts of one unchanged build
+    then measured 83.33 / 91.67 / 91.67 (CI 32434760036), so missing one fact
+    of twelve is the writer's ordinary variance at temperature 0, not a
+    regression, and `capture_pct` was rebaselined to a measured floor of 75.0.
+    A test asserting that normal variance is a failure would make the suite
+    red on roughly every other run and teach everyone to ignore it.
+
+    8/12 = 66.67% is a real regression and is what this now asserts. Junk and
+    lint stay where they were: those two are deterministic and have never
+    moved off 100% in nine live runs, so any drop at all is a defect.
+    """
     m = _metrics()
     bad = _clean_measured()
     bad.update({
-        "capture_pct": 90.91,
+        "capture_pct": 66.67,
         "precision_pct": 97.3,
         "lint_clean_pct": 97.5,
         "misroute_pct": 9.09,
