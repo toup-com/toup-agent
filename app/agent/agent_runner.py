@@ -5994,8 +5994,28 @@ class AgentRunner:
         # The app this turn handed over. One field, one key, read by every
         # message serializer — as opposed to a slug that had to be regexed
         # back out of a tool's prose, which is what it replaces.
+        #
+        # Round 19: the slug alone was not enough. A client hydrating this
+        # thread from history learns WHICH app the turn produced and nothing
+        # about WHICH VERSION, so its registry starts at revision 0 for an app
+        # that is on revision 4 — and every staleness check downstream is a
+        # comparison against that zero. The revision travels with the slug, in
+        # the same field, for the same reason the slug stopped being a regex.
         if presented_app_slug:
-            _meta["app_artifact"] = {"slug": presented_app_slug}
+            _art: Dict[str, Any] = {"slug": presented_app_slug}
+            try:
+                from app.agent.skills.builtins.app_html import (
+                    steps as _app_steps,
+                )
+                _art = _app_steps.artifact_payload(presented_app_slug) or _art
+            except Exception:  # noqa: BLE001
+                # The manifest is an index over the files, and an unreadable
+                # one must cost the revision, never the card: a payload of
+                # just the slug is exactly what this field used to be.
+                logger.debug(
+                    "[app_html] artifact payload lookup failed", exc_info=True,
+                )
+            _meta["app_artifact"] = _art
         _asst_kwargs = dict(
             conversation_id=session_id,
             day_chat_id=_day_chat_id,

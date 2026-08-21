@@ -540,19 +540,75 @@ async def upsert_app_row(
         return None
 
 
+def artifact_payload(slug: str) -> Dict[str, Any]:
+    """The app's HANDLE — everything a card needs and no body.
+
+    ``revision`` is the field this whole round turns on. It is what a client
+    compares to decide that the app in front of it is stale: the mobile
+    registry drops its cached body when the number moves
+    (``appArtifacts.upsertArtifact``) and the runner keys its WebView on it, so
+    a revision that never arrives is a runner that never reloads.
+
+    Deliberately NO ``html``. The body is 10–60 KB and would ride every frame
+    AND every persisted message; the clients fetch it once, at open time, which
+    is the contract they were written to. What must travel is the number that
+    tells them the fetch is now worth making.
+    """
+    from app.agent.skills.builtins.app_html import store
+
+    rec = store.read_manifest().get(slug)
+    if rec is None:
+        return {"slug": slug}
+    return {
+        "slug": slug,
+        "title": rec.title or slug,
+        "revision": rec.revision,
+        "updated_at": rec.updated_at or None,
+        "size_bytes": rec.size_bytes,
+    }
+
+
 async def announce_ready(
     *, user_id: str, job_id: Optional[str], app_id: Optional[str], title: str,
     slug: Optional[str] = None,
 ) -> None:
-    """The artifact card. Same frame the Expo pipeline emits on completion.
+    """The artifact card, and the fact that it moved.
 
-    ``slug`` is the app's IDENTITY — the handle the chat card stores, the
-    runner opens and ``/api/artifacts/{slug}`` serves. Without it a client can
-    only get there by fetching the ``apps`` row to translate ``app_id`` back
-    into a slug, which is a round-trip between the reply landing and the card
-    appearing. ``kind`` already tells a client which pipeline this is; the slug
-    is what lets it act.
+    TWO frames, because they answer two different questions and the second one
+    had no answer at all until now.
+
+    ``app_ready`` closes the build card. It carries ``slug`` because the app's
+    IDENTITY is the handle the chat card stores, the runner opens and
+    ``/api/artifacts/{slug}`` serves — without it a client can only get there by
+    translating ``app_id`` back into a slug.
+
+    ``app_artifact`` says WHICH VERSION is now live. Both clients were built
+    against it — ``AppArtifactCard`` redraws from the registry on it,
+    ``AppRunner`` bumps the WebView key when the revision moves, and
+    ``AppArtifactFrame`` refetches its token — and nothing has ever sent it. So
+    an edit could report "revision 2, republished", be genuinely on disk, be
+    genuinely what ``/api/artifacts/{slug}`` served on the next request, and
+    still leave the person looking at revision 1: no surface had been told a
+    revision 2 existed, and the runner had no reason to ask again.
+
+    Order matters. ``app_artifact`` goes FIRST so the registry already holds the
+    new revision when ``app_ready`` makes a client draw the card — the reverse
+    order draws it from the previous revision and corrects it a frame later.
     """
+    if slug:
+        try:
+            payload = artifact_payload(slug)
+        except Exception:  # noqa: BLE001 - fail-open, like everything here
+            # An unreadable manifest costs the revision, never the card: the
+            # slug alone is exactly what this used to carry.
+            logger.debug("[app_html] artifact payload failed", exc_info=True)
+            payload = {"slug": slug}
+        await _broadcast(user_id, {
+            "type": "app_artifact",
+            "job_id": job_id,
+            "app_id": app_id,
+            "artifact": payload,
+        })
     await _broadcast(user_id, {
         "type": "app_ready",
         "job_id": job_id,

@@ -74,6 +74,38 @@ async def get_artifact(slug: str) -> Response:
     )
 
 
+@router.get("/{slug}/source")
+async def get_artifact_source(slug: str) -> Dict[str, Any]:
+    """The app's handle AND its body, exactly as the model wrote it.
+
+    Round 19. A client that has been told "revision 4 is live" needs somewhere
+    to go and get revision 4, and neither existing route answers that:
+    ``/{slug}`` returns the RUNTIME-WRAPPED document (right for a browser
+    frame, wrong for a client that applies its own sandbox wrapper — it would
+    install two storage shims over each other), and ``/{slug}/meta`` returns
+    the numbers without the file.
+
+    So this returns the unwrapped bytes beside the revision they belong to, in
+    one request. ``revision`` and ``html`` come from the same read, which is
+    the property that matters: a client cannot cache a body under a revision
+    that was current at a different moment.
+    """
+    try:
+        slug = store.normalise_slug(slug)
+        html = store.read_app(slug)
+    except store.AppStoreError as exc:
+        raise HTTPException(404, str(exc))
+    rec = store.read_manifest().get(slug)
+    return {
+        "slug": slug,
+        "title": (rec.title if rec else slug) or slug,
+        "revision": rec.revision if rec else 1,
+        "updated_at": (rec.updated_at if rec else None) or None,
+        "size_bytes": len(html.encode("utf-8")),
+        "html": html,
+    }
+
+
 @router.get("/{slug}/meta")
 async def get_artifact_meta(slug: str) -> Dict[str, Any]:
     try:

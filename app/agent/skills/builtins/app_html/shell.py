@@ -38,7 +38,11 @@ from typing import List, Optional, Tuple
 
 # Absolute, for the same reason as skill.py: the loader imports these
 # modules by path under a top-level name, where a relative import fails.
-from app.agent.skills.builtins.app_html.store import AppStoreError, apps_root
+from app.agent.skills.builtins.app_html.store import (
+    AppStoreError,
+    apps_root,
+    repair_file_modes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +297,17 @@ async def run_in_app_dir(
     cmd = validate_command(command)
     root = os.path.realpath(apps_root())
     os.makedirs(root, exist_ok=True)
+    # The child runs DROPPED to an unprivileged uid, and every file written
+    # before the write-time mode fix is still 0600 root-only — so on an
+    # upgraded container the model can read the app it built today and gets
+    # "Permission denied" for the one it built last week. Repaired here, not
+    # only at `ensure_root`, because `bash_app` is the one tool in this skill
+    # that reaches a container which may never create another app.
+    #
+    # READ, not write: the sweep sets 0644. It cannot give the dropped uid —
+    # or the sandboxed page, which has no filesystem at all — any new power
+    # over an app beyond looking at it.
+    repair_file_modes(root)
 
     try:
         from app.services.exec_env import sandbox_environ, sandbox_preexec

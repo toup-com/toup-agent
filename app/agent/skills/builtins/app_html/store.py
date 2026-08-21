@@ -136,6 +136,92 @@ _DIR_MODE = 0o775
 _FILE_MODE = 0o644
 
 
+#: Ceiling on how many files one sweep will look at. The root holds one file
+#: per app plus a manifest, and `.versions/` holds at most
+#: MAX_VERSIONS_PER_APP per app — a couple of hundred entries for a heavy
+#: user. The cap exists so a volume that has been used for something else
+#: entirely cannot turn a tool call into a directory walk.
+_REPAIR_SCAN_LIMIT = 2000
+
+
+def repair_file_modes(root: Optional[str] = None) -> int:
+    """chmod every stored file to :data:`_FILE_MODE`. Returns how many moved.
+
+    ``_FILE_MODE`` is applied to the temp file inside :func:`_atomic_write`,
+    which fixes every file written from that commit onward and **no file
+    written before it**. Every app already on a tenant's volume is still 0600,
+    so on an upgraded container the model can build a new app and grep it, and
+    cannot grep the app it built last week — the same "Permission denied", now
+    with a shape that reads like a per-app fault.
+
+    So the repair has to be a sweep, and it has to run somewhere a container
+    that never builds anything new still reaches it (see
+    :func:`shell.run_in_app_dir`, which calls this before it spawns).
+
+    Deliberately narrow:
+
+    * **chmod, not chown.** The container drops CAP_CHOWN, so a chown repair
+      raises EPERM and reports that it fixed something (round 15).
+    * **0644, not 0666.** The dropped uid needs to READ what it is verifying.
+      Making these files writable by other would hand the sandboxed shell —
+      and anything else running as that uid — the ability to rewrite a
+      published app behind the store's back. Read is the whole requirement.
+    * **Regular files inside the root only.** Symlinks are skipped rather than
+      followed: `chmod` follows a link to its target, and the one link this
+      layout has (``~/apps`` → the root) points at a directory.
+    """
+    root = os.path.realpath(root or apps_root())
+    moved = 0
+    scanned = 0
+    try:
+        directories = [root, os.path.join(root, VERSIONS_DIR),
+                       os.path.join(root, STATE_DIR)]
+        # One level under `.versions/` is a directory per slug.
+        try:
+            vroot = os.path.join(root, VERSIONS_DIR)
+            directories.extend(
+                os.path.join(vroot, name) for name in os.listdir(vroot)
+                if os.path.isdir(os.path.join(vroot, name))
+            )
+        except OSError:
+            pass
+        for directory in directories:
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                continue
+            for name in names:
+                if scanned >= _REPAIR_SCAN_LIMIT:
+                    logger.warning(
+                        "[app_html] permission sweep stopped at %d files",
+                        _REPAIR_SCAN_LIMIT,
+                    )
+                    return moved
+                path = os.path.join(directory, name)
+                scanned += 1
+                try:
+                    if os.path.islink(path) or not os.path.isfile(path):
+                        continue
+                    mode = os.stat(path).st_mode & 0o7777
+                    if mode == _FILE_MODE:
+                        continue
+                    os.chmod(path, _FILE_MODE)
+                    moved += 1
+                except OSError as exc:
+                    # A file owned by another uid cannot be chmodded by us and
+                    # never will be; log it once at debug and keep going, so
+                    # one bad entry does not cost the other forty.
+                    logger.debug("[app_html] could not chmod %s: %s", path, exc)
+    except OSError:  # pragma: no cover - defensive; the loops swallow their own
+        logger.debug("[app_html] permission sweep failed", exc_info=True)
+    if moved:
+        logger.warning(
+            "[app_html] repaired the mode on %d app file(s) under %s — they "
+            "were written before the mode was set at write time", moved, root,
+        )
+    return moved
+
+
 def repair_permissions(path: str) -> bool:
     """Try to make ``path`` writable by this process. True if it now is.
 
@@ -197,6 +283,11 @@ def ensure_root() -> str:
         repair_permissions(versions)
     except OSError:
         logger.warning("[app_html] could not create %s", versions, exc_info=True)
+    # The directory was given this care and the files were not, which left a
+    # readable directory full of unreadable files on every volume that
+    # predates the write-time fix. Cheap and idempotent: a root whose modes
+    # are already right does one stat per file and changes nothing.
+    repair_file_modes(root)
 
     home_apps = os.path.abspath(os.path.expanduser("~/apps"))
     if home_apps != root:

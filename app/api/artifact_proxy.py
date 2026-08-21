@@ -28,6 +28,7 @@ import logging
 from typing import Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
@@ -277,6 +278,35 @@ async def _agent_json(user_id: str, db: AsyncSession, method: str,
     return resp.json()
 
 
+async def _bearer_user_id(request: Request, db: AsyncSession) -> Optional[str]:
+    """The account behind an ``Authorization: Bearer`` header, or None.
+
+    **Header only.** ``get_current_user`` also honours the SSO cookie, and that
+    is precisely what this module refuses to do: a cookie is attached by the
+    browser to any request any page can cause, so honouring one here would let
+    an attacker's ``<img>``/``<iframe>``/``fetch`` reach a victim's artifact on
+    their ambient session. A Bearer header cannot be attached by a third-party
+    page, which is what makes this branch unforgeable in the same way the
+    scoped token is.
+    """
+    header = request.headers.get("authorization") or ""
+    scheme, _, raw = header.partition(" ")
+    if scheme.lower() != "bearer" or not raw.strip():
+        return None
+    try:
+        from app.services.auth_service import decode_access_token, get_user_by_id
+        user_id = decode_access_token(raw.strip())
+        if not user_id:
+            return None
+        user = await get_user_by_id(db, user_id)
+        if user is None or not getattr(user, "is_active", True):
+            return None
+        return str(user.id)
+    except Exception:  # noqa: BLE001 - a bad token is not a server error
+        logger.debug("[artifact] bearer decode failed", exc_info=True)
+        return None
+
+
 @router.get("/{slug}")
 async def serve_artifact(
     slug: str,
@@ -284,18 +314,40 @@ async def serve_artifact(
     token: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """Serve one artifact's HTML, sandboxed.
+    """Serve one artifact — the document to a frame, the handle to a client.
 
-    Auth is the query token ONLY. Cookies are never consulted — on the
-    same-origin dev fallback the browser will still *send* the session
-    cookie, and honouring it would mean an attacker-supplied ``<iframe
-    src=".../artifacts/x">`` on another site renders a victim's app with
-    their ambient session. Requiring the scoped token makes the request
-    unforgeable regardless of what the browser attaches.
+    Two callers, one URL, told apart by HOW they authenticate:
+
+    * **``?token=``** → the sandboxed HTML document. This is the iframe/WebView
+      src. Auth is the query token ONLY; cookies are never consulted, because
+      on the same-origin dev fallback the browser will still *send* the session
+      cookie and honouring it would mean an attacker-supplied ``<iframe
+      src=".../artifacts/x">`` on another site renders a victim's app with
+      their ambient session. Requiring the scoped token makes the request
+      unforgeable regardless of what the browser attaches.
+    * **``Authorization: Bearer``, no token** → JSON: slug, title, revision,
+      updated_at and the unwrapped body. This is the shape the mobile client
+      has always asked this URL for (``api.getAppArtifact``), and answering it
+      with 401 is half of why an edit never reached the user: told that
+      revision 2 existed, the runner dropped its cached body, asked here for
+      the new one, and was refused — so it kept showing revision 1. The body is
+      the file as the model wrote it, NOT the runtime-wrapped document, because
+      this caller applies its own sandbox wrapper.
+
+    A request with neither is refused, and a request with both takes the token
+    branch — the narrower credential wins, so a page cannot upgrade itself to
+    the account's view by also sending a header.
     """
     from app.services.auth_service import decode_artifact_token
 
     user_id = decode_artifact_token(token or "", slug)
+    if not user_id and not token:
+        account_id = await _bearer_user_id(request, db)
+        if account_id:
+            return JSONResponse(
+                await _agent_json(account_id, db, "GET", f"/{slug}/source"),
+                headers={"Cache-Control": "no-store"},
+            )
     if not user_id:
         # No WWW-Authenticate: this origin must never trigger a browser
         # credential prompt on an untrusted page.

@@ -99,15 +99,110 @@ Never remove an outline without replacing it. `outline:none` alone is a bug.
 
 ---
 
-## 4. Mobile-first, three real breakpoints
+## 4. It is played with a thumb, on a phone, inside a sheet
 
-Write the 360 px layout first, then widen. Test all three mentally before you
-finish:
+This is the section that gets ignored, so it comes with its numbers.
+
+Your app opens full-screen on a phone, in a sheet over a conversation. There
+is no mouse, no hover, and no second hand — one thumb, arriving from the
+bottom corner. Every layout decision below follows from that.
+
+### 4a. Minimum touch target: 44 × 44 CSS px. Not negotiable, not a maximum.
+
+Apple's HIG says 44 × 44 pt. Material says 48 × 48 dp. WCAG 2.2 SC 2.5.5 says
+44 × 44 CSS px (its AA fallback, SC 2.5.8, allows 24 — that is a legal floor
+for a dense web table, not a target for something you are designing now). They
+agree closely enough that there is one rule: **nothing interactive is smaller
+than 44 × 44, and controls are separated by at least 8 px.**
+
+A 32 px icon button is not exempt — give it padding until the *hit area* is 44,
+even if the glyph stays small:
+
+```css
+.icon-btn{min-width:44px;min-height:44px;display:grid;place-items:center;
+          padding:var(--s-2);touch-action:manipulation}
+```
+
+`touch-action:manipulation` on every control: without it iOS holds a 300 ms
+double-tap-to-zoom delay, and a game control that answers a third of a second
+late reads as a dropped input.
+
+### 4b. The control you play with is not a button. Size it accordingly.
+
+44 is the floor for a *link in a list*. The primary control of the app — the
+one the person holds their thumb on and uses continuously — is far bigger:
+
+| Control | Minimum | Aim for |
+|---|---|---|
+| Link / row / secondary action | 44 × 44 | 48 × 48 |
+| Primary action (Add, Roll, Submit, Fire) | 56 tall | 64 tall, full width of its column |
+| **Game control: D-pad key, paddle, joystick** | **64 × 64** | **72–88 × 72–88**, with an 8–12 px gap |
+| Whole D-pad cluster | 200 × 200 | 240 × 240, or ~60% of the viewport width |
+
+This is where a first build goes wrong. A Snake shipped whose D-pad was sized
+like a row of toolbar buttons, under a board that took most of the screen: the
+game logic was correct, every control was wired, and it was still unpleasant
+to play, because the thing being pressed hundreds of times was smaller than
+the thumb pressing it. **If the app has one thing you do over and over, that
+thing gets the generous size and everything else gets the floor.**
+
+On a phone, a directional game takes **both** a D-pad and a swipe on the
+playfield — they cost one extra listener between them and they suit different
+hands. Wire them through the one vocabulary in §9, and put the pad beside or
+under the board, never on top of it: a control overlapping the thing it
+controls hides the state the player is reacting to.
+
+### 4c. The thumb reaches the bottom. Put the controls there.
+
+On a 390 × 844 phone held one-handed, the comfortable arc is roughly the
+**bottom third**; the top corners need a second hand. So:
+
+- Primary and repeated controls live in the bottom ~30% of the viewport.
+- The top is for the title, the score, the state — things you READ.
+- Never put a repeated control (a D-pad, a keypad, +/−) at the top of the
+  screen, and never put destructive and primary actions adjacent.
+
+### 4d. The interactive part is the majority of the screen
+
+An app is the thing you do, not the chrome around it. **The playfield plus its
+controls take at least ~70% of the viewport height**; header, title, footer and
+hints share what is left. If your title block is 120 px tall and the board is
+240 px, the layout is upside down.
+
+```css
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;
+     /* dvh, not vh: vh is the tallest-possible viewport, so a page sized in
+        it sits under the browser UI on a phone and the bottom row of your
+        D-pad is off screen. */
+     min-height:100dvh;
+     /* The sheet runs under the notch and the home indicator. */
+     padding:env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+     box-sizing:border-box}
+.stage{flex:1 1 auto;min-height:0;display:grid;place-items:center}  /* the app */
+.controls{flex:0 0 auto;padding-block:var(--s-4)}                   /* the thumb */
+```
+
+`min-height:0` on the flex child is load-bearing: without it a grid/canvas
+child refuses to shrink and pushes the controls off the bottom.
+
+### 4e. Both orientations, three widths
+
+Nothing may be reachable only in portrait. Turn the phone and the controls must
+still be on screen — which usually means the same flex column becomes a row:
+
+```css
+@media (orientation:landscape) and (max-height:520px){
+  body{flex-direction:row}
+  .controls{display:grid;place-content:center}
+}
+```
 
 | Width | Must be true |
 |---|---|
-| **360** | One column. Nothing clipped, nothing horizontally scrolling. Tap targets ≥ 44×44 px. Text ≥ 16 px so iOS does not zoom on focus. |
-| **768** | Two columns where it helps. Navigation can go horizontal. |
+| **360** | One column. Nothing clipped, nothing scrolling sideways. Every target ≥ 44. Text ≥ 16 px so iOS does not zoom on focus. |
+| **768** | Two columns where it helps. Controls stay thumb-side. |
 | **1280** | Content capped (`max-width` ~1100 px) and centred — full-bleed text at 1280 px is unreadable. |
 
 ```css
@@ -116,17 +211,45 @@ finish:
 @media (min-width:1280px){.wrap{max-width:1100px;margin-inline:auto}}
 ```
 
-Always include `<meta name="viewport" content="width=device-width,initial-scale=1">`.
+Always include
+`<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">`
+— without `viewport-fit=cover` the safe-area variables above are all zero.
 
 ---
 
-## 5. Contrast is non-negotiable
+## 5. Legible, spaced, and it answers when you touch it
 
-Every text/background pair must reach **≥ 4.5:1** (≥ 3:1 for text at 24 px or
-18.66 px bold, and for the borders of interactive controls). Muted greys are
-where this fails: `#A1A1AA` on `#0B0B0F` passes; `#71717A` on `#16161D` does
-not. Check before you ship, and never encode meaning in colour alone — pair
-every colour cue with a shape, an icon or a label.
+Three checks that fail quietly, in the order they get skipped.
+
+**Contrast.** Every text/background pair reaches **≥ 4.5:1** (≥ 3:1 for text at
+24 px, or 18.66 px bold, and for the borders of interactive controls). Muted
+greys are where this fails: `#A1A1AA` on `#0B0B0F` passes; `#71717A` on
+`#16161D` does not. Never encode meaning in colour alone — pair every colour
+cue with a shape, an icon or a label.
+
+**Legibility.** Body text ≥ 16 px (below that iOS zooms the page on focus and
+the layout you designed is gone). Nothing below 12 px, ever. Line length
+45–75 characters; line-height ≥ 1.4 for body, ~1.1 for display. Numbers that
+change in place — a score, a timer, a total — get
+`font-variant-numeric:tabular-nums`, or the whole row jitters on every tick.
+
+**Spacing.** Every gap comes from the scale in §1. Touching controls get ≥ 8 px
+between them; unrelated groups get ≥ 24 px. If two things are the same
+distance apart, they are the same kind of thing — so the spacing is what says
+"this row of buttons is one object and that one is another".
+
+**State feedback.** Every touch is answered within ~100 ms, visibly:
+
+```css
+.key{transition:transform .08s ease,background-color .08s ease}
+.key:active{transform:scale(.94);background:var(--accent)}
+```
+
+`:hover` alone is not feedback on a phone — there is no hover. A control that
+does not visibly change on `:active` reads as a control that missed the tap,
+and the person presses it again. Anything that takes more than ~300 ms shows
+that it is working (a disabled state, a spinner, a progress bar) rather than
+looking inert.
 
 ---
 
@@ -256,14 +379,58 @@ themselves.
 
 ---
 
-## 10. Before you call `present_app`
+## 10. Changing an app someone is already holding
+
+A change request is about the thing the person was *using*, and they will
+describe it with the shortest word that fits. "Make the button bigger", said
+about a game, means the buttons they were pressing to play it.
+
+This went wrong exactly that way: asked to make the button bigger on a Snake
+with a D-pad, the edit landed on the start screen's `PLAY` button — pressed
+once, already large enough, and the element in the file that most literally
+answers to the word "button". The D-pad, pressed hundreds of times and
+genuinely too small, was untouched. The app came back with the same defect and
+a message saying it had been fixed.
+
+So, before you edit:
+
+1. **Re-read the file.** `view_app_file` first, every time — the element the
+   request is about is chosen from what is in the app, not from what you
+   remember writing.
+2. **Ask which element the complaint could have come from.** In a game the
+   controls are the D-pad / paddle / fire button; `PLAY`, `RESTART` and menu
+   items are chrome. In a form it is the field, not the legend.
+3. **If more than one answer is reasonable, change them all** — every control
+   of that kind, the same way, in one round of edits. Widening the change is
+   nearly free; guessing wrong costs the person another turn. Do not ask them
+   which one they meant.
+4. **Fix the class, not the instance.** If the D-pad keys are too small, the
+   shared `.key` rule changes — not `#up`.
+
+And a size change is a *layout* change: after it, §4 still has to hold.
+A D-pad grown from 44 to 76 px pushes something off the bottom of the screen
+unless the stage above it can shrink.
+
+---
+
+## 11. Before you call `present_app`
 
 - [ ] Every control the UI mentions actually works — keys AND taps AND swipe
 - [ ] Nothing that can be lost, missed or timed out is running at first paint
 - [ ] A game/timer/quiz opens on a start screen with an explicit start control
+- [ ] **Every interactive element is ≥ 44 × 44 CSS px, with ≥ 8 px between**
+- [ ] **The main control — D-pad key, paddle, primary action — is ≥ 64 px**
+- [ ] **Repeated controls sit in the bottom third; the top is for reading**
+- [ ] **Playfield + controls take ~70% or more of the viewport height**
+- [ ] **Sized in `dvh`, padded with `env(safe-area-inset-*)`, and
+      `viewport-fit=cover` is in the viewport meta**
+- [ ] **Nothing is reachable only in portrait — check landscape too**
 - [ ] Opens at 360 px with no horizontal scroll
-- [ ] Every button/link/input has hover **and** focus-visible styling
-- [ ] Every text/background pair reaches 4.5:1
+- [ ] Every control answers a touch within ~100 ms (`:active`, not just
+      `:hover` — a phone has no hover)
+- [ ] Every button/link/input has focus-visible styling
+- [ ] Every text/background pair reaches 4.5:1; body text ≥ 16 px
+- [ ] Changing numbers use `tabular-nums`
 - [ ] No placeholder copy anywhere; seeded with realistic data
 - [ ] No external origin except cdnjs
 - [ ] No `fetch` / `XMLHttpRequest` / WebSocket anywhere
@@ -274,3 +441,6 @@ themselves.
 `present_app` opens the app in a real browser and refuses to publish it if
 anything throws. A refusal is a list of things to fix, not a dead end: fix
 them with `edit_app_file` and call it again.
+
+None of the sizing above is checkable by a machine — a 32 px D-pad throws
+nothing and renders perfectly. It is checked here or it is not checked.

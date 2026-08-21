@@ -296,7 +296,11 @@ class AppHtmlSkill(Skill):
                     "refused and nothing is written, so include enough surrounding "
                     "lines to be unique. Prefer several small edits over rewriting the "
                     "file. Copy old_string from view_app_file output, including "
-                    "indentation and line breaks."
+                    "indentation and line breaks.\n"
+                    "The file is read back from disk afterwards and the reply says "
+                    "whether the change is actually in it, and whether the script still "
+                    "parses. Do not describe a change to the user on weaker evidence "
+                    "than that line — and not before present_app has published it."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -396,6 +400,31 @@ class AppHtmlSkill(Skill):
             "If a check comes back with problems, FIX THEM AND CALL AGAIN. That is "
             "the whole recovery procedure — do not report a failure to the user "
             "and stop, and never present an app that has not come back clean.\n"
+            "## Changing an app that is already open\n"
+            "\"Make the button bigger\" is about the control the person was USING "
+            "when they said it. In a game that is the thing they play with — the "
+            "D-pad, the fire button, the paddle — not the PLAY button on the "
+            "start screen, which they pressed once. Ask yourself which element "
+            "the complaint could have come from, and if more than one answer is "
+            "reasonable, CHANGE THEM ALL: every control of that kind, in the same "
+            "way, in one round of edits. A person who says a control is too small "
+            "and gets a bigger menu button has been answered with the wrong "
+            "object, and has to ask again. Widening the change is nearly free; "
+            "guessing wrong costs a whole turn. Never ask which button they "
+            "meant.\n"
+            "When the request names no element at all (\"make it nicer\", \"too "
+            "cramped\"), read the file first and change the thing the words are "
+            "actually about, not the first match for them.\n"
+            "## Never say it is done until it is\n"
+            "app_html__edit_app_file reads the file back and tells you whether "
+            "your change is in it. app_html__present_app opens the app in a real "
+            "browser and tells you whether it still runs. Both of those come back "
+            "BEFORE you write a word to the user about the change. An edit that "
+            "was written is not an edit the person can see: publishing is what "
+            "puts it in front of them, so \"done\" means present_app returned "
+            "clean, not that a write returned. If a read-back or a publish "
+            "reports a problem, fix it and go round again — do not narrate the "
+            "problem and do not claim the change.\n"
             "Do NOT call create_job for a build. This pipeline opens its own job "
             "and reports every phase into it, so a second one is the same build "
             "announced twice — the user sees two progress cards for one app.\n"
@@ -630,24 +659,83 @@ class AppHtmlSkill(Skill):
                 status="failed", detail=_short(exc),
             )
             raise
+        # ── Read it back ──────────────────────────────────────────────
+        # An edit used to report success on the strength of `_atomic_write`
+        # not having raised. That is a claim about a syscall, and the thing
+        # the model then tells the user — "I made the button bigger" — is a
+        # claim about the file. They are not the same claim, and the whole
+        # class of bug where one is offered as the other is what this round is
+        # about. So the file is opened again, from disk, and asked.
+        new_string = args.get("new_string", "")
+        try:
+            on_disk = store.read_app(slug)
+        except AppStoreError:
+            on_disk = ""
+        landed = bool(new_string) and new_string in on_disk
+        if new_string and not landed:
+            # The write returned, the file does not contain it. Something
+            # else is writing this path, or the volume lied about the flush.
+            # Never report this as an edit: the model would go on to tell the
+            # user about a change that is not in the app they will open.
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="edit",
+                status="failed", detail="the change did not land on disk",
+            )
+            raise AppStoreError(
+                f"the edit was written but {slug}.html does not contain the "
+                f"new text when read back — the change did NOT take effect. "
+                f"Do not tell the user it did. Call view_app_file to see the "
+                f"current file and try again."
+            )
+
+        # Syntax, on every edit, not only on create. `create_app_file` has
+        # parsed its own JavaScript since round 18; an edit could break the
+        # same script and nothing looked until `present_app` — so a model that
+        # edited and then answered the user shipped a dead script with a
+        # success message on top of it.
+        report = await verify_mod.verify_app(on_disk or "", deep=False)
+
         # `+0 bytes` was the old detail for a same-length edit — a change the
         # user could see in the app, described to them as nothing having
         # happened. The reason the model gave for the edit is both true and
         # worth reading; the revision is the fallback when it gave none.
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="edit",
-            status="done", detail=reason or f"revision {rec.revision}",
+            status="failed" if report.findings else "done",
+            detail=(report.summary() if report.findings
+                    else (reason or f"revision {rec.revision}")),
         )
 
+        # A deletion has no new text to find, so the proof is the other half:
+        # the old text is gone. Both are read from the file, not inferred.
+        confirmed = ("the new text is in the file" if landed
+                     else "the old text is gone from the file")
         out = (
             f"Edited {slug}.html — {delta:+,} bytes, now {rec.size_bytes:,} "
             f"(revision {rec.revision}).\n"
+            f"Read back from disk: {confirmed}.\n"
         )
         for w in getattr(rec, "warnings", []) or []:
             out += f"  - warning: {w}\n"
+        if report.findings:
+            out += (
+                "But the script no longer parses, so the app will render and "
+                "do nothing:\n" + report.as_error() + "\n"
+                "Fix that before you say anything to the user about this "
+                "change.\n"
+            )
+        else:
+            out += (
+                "The change is on disk and the script still parses. It is NOT "
+                "in front of the user until app_html__present_app publishes "
+                "it — call that before you describe the change.\n"
+            )
         return ToolResult(
             out.rstrip(),
-            display=f"Updated the app: {reason}" if reason else "Updated the app.",
+            display=("Updated the app — the script needs a fix."
+                     if report.findings
+                     else (f"Updated the app: {reason}" if reason
+                           else "Updated the app.")),
         )
 
     async def _bash(self, args: Dict[str, Any], ctx: SkillContext) -> str:
