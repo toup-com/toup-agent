@@ -107,7 +107,22 @@ CAPTURE: List[Scenario] = [
             "باشه، یادم می‌ماند.",
         )],
         must_capture=[Capture(
-            "P02", ["می‌دوم"], section="you",
+            # The stem, the noun and the Persian digit — NOT "می‌دوم".
+            # "می‌دوم" is FIRST PERSON ("I run"), and the contract requires
+            # subjectless third person, which in Persian is carried by the
+            # verb ending: the correct bullet says "می‌دود". CI run
+            # 32430971208 wrote
+            #   هر روز صبح ساعت ۷ می‌دود و بعدش صبحانه می‌خورد
+            # — Persian script, Persian digits, house voice — and was scored
+            # MISSED for obeying the voice rule. The marker demanded the one
+            # spelling the contract forbids.
+            #
+            # What this scenario is actually for is that Persian survives the
+            # writer at all: no translation, no transliteration, no Latin
+            # digits. The stem proves the verb is there through any
+            # conjugation, the noun cannot conjugate, and ۷ proves the digits
+            # were not rewritten as "7".
+            "P02", ["می‌دو", "صبحانه", "۷"], section="you",
             note="Persian is stored raw; bidi isolation is a RENDER concern",
         )],
         lang="fa",

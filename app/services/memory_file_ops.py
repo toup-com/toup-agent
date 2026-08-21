@@ -729,6 +729,22 @@ def validate_ops(
             state = _target("update_description", op.get("slug"))
             if state is None:
                 continue
+            if state.slug in SYSTEM_FILES:
+                # The three fixed files' descriptions are CANON: they are
+                # declared in `SYSTEM_FILES`, written by `ensure_system_files`
+                # and repaired there whenever they drift. Letting the writer
+                # restate them is drift by definition — and it was costing the
+                # fact. CI run 32430971208: "I switched to an Android phone
+                # last month, a Pixel 9" produced applied=1, every body empty,
+                # and the single op was "Updated what Profile is for." Four
+                # scenarios failed that same way. A turn has a small op budget
+                # and a description rewrite is the one op that can consume it
+                # while recording nothing.
+                complaints.append(
+                    f"update_description {state.slug}: this file's description "
+                    "is fixed — store the fact itself with add or rewrite"
+                )
+                continue
             problem = description_problem(op.get("description"))
             if problem:
                 complaints.append(f"update_description {state.slug}: {problem}")

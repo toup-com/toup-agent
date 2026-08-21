@@ -681,3 +681,53 @@ async def test_whitespace_is_not_content():
     await _file(db, user_id, "knowledge", "areas", "Knowledge", body="\n  \n")
 
     assert await ops.prune_empty_files(db, user_id) == ["knowledge"]
+
+
+# ── The fixed files' descriptions are canon ───────────────────────────
+
+
+async def test_a_system_file_description_cannot_be_rewritten():
+    """CI run 32430971208: "I switched to an Android phone last month, a Pixel
+    9" produced applied=1, every body empty, and the one op was "Updated what
+    Profile is for." Four scenarios failed that way in a single run. A turn has
+    a small op budget, and a description rewrite is the one op that can spend
+    it while recording nothing — so this is a capture bug wearing a drift bug's
+    clothes. `SYSTEM_FILES` declares these three descriptions and
+    `ensure_system_files` repairs them; the writer has no business restating
+    them."""
+    db, user_id = await _session()
+    await ops.ensure_system_files(db, user_id)
+    await db.commit()
+    identity = await resolve_user_identity(db, user_id)
+    files = await ops._all_files(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "update_description", "slug": PROFILE_SLUG,
+          "description": GOOD_DESC}],
+        files, identity=identity,
+    )
+
+    assert plan.accepted == []
+    assert any("fixed" in c for c in plan.complaints), plan.complaints
+    row = next(f for f in await ops._all_files(db, user_id)
+               if f.slug == PROFILE_SLUG)
+    assert row.description == SYSTEM_FILES[PROFILE_SLUG]["description"]
+
+
+async def test_an_ordinary_file_description_is_still_editable():
+    """The refusal is scoped to the three fixed files — every other file's
+    description is generated and must stay regenerable."""
+    db, user_id = await _session()
+    await _file(db, user_id, "areas/ielts", "areas", "Ielts",
+                body="- exam booked for Aug 30, 2026")
+    identity = await resolve_user_identity(db, user_id)
+    files = await ops._all_files(db, user_id)
+
+    plan = ops.validate_ops(
+        [{"op": "update_description", "slug": "areas/ielts",
+          "description": GOOD_DESC}],
+        files, identity=identity,
+    )
+
+    assert len(plan.accepted) == 1
+    assert plan.accepted[0]["description"] == GOOD_DESC

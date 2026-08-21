@@ -129,6 +129,12 @@ WHERE A FACT GOES — pick the one most specific file, then commit to it:
   it at all.
 
 RULES:
+- A FACT IS STORED WITH `add` OR `rewrite`. Nothing else records anything.
+  `update_description` changes only what a file is FOR, and is worth an op
+  only when a body change has made the old one wrong. `you/profile`,
+  `you/current-context` and `learned` have FIXED descriptions — never send
+  one. If a turn gives you a fact and you reply with a description, you have
+  thrown the fact away.
 - Prefer rewrite over add when a bullet already covers the fact. Merge, do not
   accumulate.
 - `match` must be the existing bullet text CHARACTER FOR CHARACTER.
