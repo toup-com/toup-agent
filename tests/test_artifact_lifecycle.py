@@ -118,19 +118,23 @@ async def test_present_passes_the_slug_through(apps_dir, monkeypatch):
 
     assert seen.get("slug") == "budget"
 
-    # ── The two anchors the clients read out of this string ──────────
-    # The result rides `tool_end.summary` live and `tool_events[].summary`
-    # once persisted, and that record is the ONLY durable link between a turn
-    # and the app it handed over — nothing writes an `app_artifact` field on a
-    # message. The mobile client recovers the slug from either of these, so a
-    # thread reopened tomorrow still shows the card where the app was given.
+    # ── Where the slug lives now ─────────────────────────────────────
+    # This used to assert that the RESULT STRING contained
+    # `/api/artifacts/budget` and `[[open_app:budget]]`, because those two
+    # anchors were the only durable record of which app a turn handed over —
+    # the clients regexed the slug back out of the tool's prose.
     #
-    # It is prose written for the model, and prose gets rewritten. Hence two,
-    # one of which is a ROUTE and cannot move without the client moving too.
-    assert "/api/artifacts/budget" in out
-    assert "[[open_app:budget]]" in out
-    # Both inside the 200-character cut agent_runner applies to a live summary.
-    assert "/api/artifacts/budget" in out[:200]
+    # The cost of that was paid by the user: both anchors are rendered in
+    # chat, so every published app put an internal route and a directive
+    # token in the transcript, and the chip drew a second Open button under a
+    # card that already had one (round 18, items 2 and 6).
+    #
+    # The slug now rides a field — `app_artifact` on the assistant message,
+    # `app_slug` on the tool record — so the prose does not have to carry it,
+    # and this test asserts the prose does NOT.
+    assert "/api/artifacts" not in out
+    assert "[[" not in out
+    assert "Budget Tracker" in out
 
 
 # ── 2. The manifest answers the questions the apps table cannot ──────

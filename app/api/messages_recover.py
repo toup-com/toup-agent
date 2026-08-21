@@ -34,7 +34,8 @@ from app.db import get_db
 from app.db.models import User, Conversation, Message
 from app.api.auth import get_current_user
 from app.api.day_chats import (
-    _serialize_admin_notice, _serialize_attachments, _serialize_media,
+    _serialize_admin_notice, _serialize_app_artifact, _serialize_attachments,
+    _serialize_media,
     _serialize_tool_events,
 )
 from app.api.message_cards import (
@@ -215,6 +216,7 @@ async def messages_since(
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
+            "app_artifact": _serialize_app_artifact(msg),
             "admin_notice": _serialize_admin_notice(msg),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),

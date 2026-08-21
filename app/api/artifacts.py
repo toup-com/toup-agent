@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Response
 
-from app.agent.skills.builtins.app_html import store
+from app.agent.skills.builtins.app_html import runtime, store
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +40,20 @@ async def list_artifacts() -> Dict[str, Any]:
 
 @router.get("/{slug}")
 async def get_artifact(slug: str) -> Response:
-    """Return one app's HTML verbatim.
+    """Return one app's HTML, wrapped for the sandbox it is about to run in.
 
     ``text/html; charset=utf-8`` explicitly: WKWebView decides encoding from
     the HTTP header before it parses ``<meta charset>``, and defaults to
     ASCII when the header omits it — which is how emoji turn into mojibake
     (the same trap the Expo preview proxy documents).
+
+    :func:`runtime.wrap_for_runtime` is applied HERE and not at write time.
+    The file on disk stays byte-for-byte what the model wrote, so
+    ``view_app_file`` shows the truth, ``edit_app_file``'s exact-string match
+    still lands, and the size on the card is the app's own size. What the
+    browser gets additionally is a storage shim that cannot throw, error hooks
+    that report the real message instead of ``"Script error."``, and
+    ``crossorigin`` on the cdnjs tags that made that masking possible.
     """
     try:
         slug = store.normalise_slug(slug)
@@ -55,7 +63,7 @@ async def get_artifact(slug: str) -> Response:
 
     rec = store.read_manifest().get(slug)
     return Response(
-        content=html.encode("utf-8"),
+        content=runtime.wrap_for_runtime(html).encode("utf-8"),
         media_type="text/html; charset=utf-8",
         headers={
             "Cache-Control": "no-store",

@@ -39,6 +39,11 @@ def apps_dir(tmp_path, monkeypatch):
     root = tmp_path / "apps"
     monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(root))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # The browser pass is real and it is slow — a headless Chromium launch per
+    # `present_app` would put minutes on this file. It has its own tests
+    # (`test_app_verification.py`), which turn it back on deliberately; here
+    # the syntax pass is what every present is gated on.
+    monkeypatch.setenv("TOUP_APP_SMOKE_TEST", "0")
     (tmp_path / "home").mkdir()
     store.ensure_root()
     return root
@@ -349,12 +354,22 @@ def test_bash_nonzero_exit_is_information_not_an_error(skill):
 
 # ── 5. present_app ───────────────────────────────────────────────────
 
-def test_present_marks_the_record_and_returns_an_open_chip(skill, apps_dir):
+def test_present_marks_the_record_and_says_nothing_internal(skill, apps_dir):
+    """Round 18. This used to assert the OPPOSITE — that the result carried
+    `[[open_app:ship-it]]` and `/api/artifacts/ship-it`.
+
+    Both were rendered to the user as the agent's own words: a directive token
+    nobody outside this codebase can read, and an internal route. The chip
+    also drew a SECOND open button under an app card that already has one. The
+    test asserted the leak because the leak was the design.
+    """
     call(skill, "create_app_file", slug="ship-it", title="Ship It", html=good_html())
     out = call(skill, "present_app", slug="ship-it")
     assert not out.startswith("ERROR:"), out
-    assert "[[open_app:ship-it]]" in out
-    assert "/api/artifacts/ship-it" in out
+    assert "[[" not in out
+    assert "/api/" not in out
+    assert "Tell the user" not in out
+    assert "Ship It" in out
     assert store.read_manifest()["ship-it"].presented_at
 
 

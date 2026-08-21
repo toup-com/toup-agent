@@ -26,6 +26,20 @@ Two layers, deliberately, because either alone is insufficient:
    the tool has been converted. There are ~100 tools; a convention that depends
    on each one being updated is a convention that leaks the day someone adds
    the 101st. This is the guarantee, `display` is the quality.
+
+Round 18 proved the second half of that claim by breaking it. The app builder
+shipped without `display` on any of its five tools, and its results were
+written to be read by a model, so a person who asked for a snake game was
+shown, as the agent's own words: `app_html__bash_app`, the route
+`/api/artifacts/nokia-snake`, the directive `[[open_app:nokia-snake]]`, and the
+sentence "Tell the user what it does in one or two sentences". Every one of
+those is a shape the redactor had no rule for — it knew about storage paths and
+UUIDs, which is what had leaked the time before.
+
+So this round adds `display` to those five tools (the quality layer) AND
+teaches the redactor the three shapes it did not know (the guarantee layer):
+directive tokens, `<skill>__<tool>` identifiers, and the YAML frontmatter that
+opens a skill file.
 """
 
 from __future__ import annotations
@@ -99,6 +113,30 @@ _PLUMBING_SENTENCE = re.compile(
     re.IGNORECASE,
 )
 
+# `[[open_app:nokia-snake]]`, `[[navigate:/files]]`, `[[Try again]]`. A chip
+# directive is a token the CHAT renderer understands; a tool summary is
+# rendered as plain text, so here it is only ever the literal brackets on
+# screen. Bounded length so a stray `[[` cannot eat the rest of the string.
+_CHIP_DIRECTIVE = re.compile(r"\[\[[^\[\]\n]{0,120}\]\]")
+
+# `app_html__bash_app`, `routines__create`, `gmail__list_messages`. The wire
+# name of a tool, which is an identifier by construction — a user cannot act
+# on it and it is exactly the thing round 16 established must not be printed.
+_TOOL_IDENTIFIER = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)*__[a-z0-9_]+\b")
+
+# The head of a skill file: `---\nname: …\ndescription: …\n---`. Reading a
+# skill's markdown yields its frontmatter as the first thing in the result, so
+# this is the first thing a dump of one shows.
+_FRONTMATTER = re.compile(r"\A\s*---\s*\n.*?\n---\s*\n", re.DOTALL)
+
+# Stage direction. A tool result that tells the model how to talk to the user
+# reads, when shown to the user, as the agent being coached mid-sentence.
+_STAGE_DIRECTION = re.compile(
+    r"[^.\n]*\b(?:tell the user|do not paste|say to the user|"
+    r"offer the \[\[|inform the user)\b[^.\n]*\.?\s*",
+    re.IGNORECASE,
+)
+
 
 def sanitize_for_client(text: Optional[str]) -> str:
     """Strip anything that describes how this system is built.
@@ -121,7 +159,11 @@ def sanitize_for_client(text: Optional[str]) -> str:
         stripped = out.strip()
         if stripped[:1] in "{[" and _is_json(stripped):
             return stripped
+        out = _FRONTMATTER.sub("", out)
+        out = _STAGE_DIRECTION.sub("", out)
         out = _PLUMBING_SENTENCE.sub("", out)
+        out = _CHIP_DIRECTIVE.sub("", out)
+        out = _TOOL_IDENTIFIER.sub("", out)
         out = _WORKSPACE_CLAUSE.sub("", out)
         out = _STORAGE_PATH.sub(r"\1", out)
         out = _ABS_PATH.sub("", out)
@@ -160,3 +202,29 @@ def _is_json(text: str) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+# ── Live status line ─────────────────────────────────────────────────────
+# What a client shows WHILE a call is in flight. It has no result to describe
+# yet, only a name, so without a label it can do nothing but humanise the
+# identifier — and `app_html__create_app_file` humanises to "App html", which
+# then sat on a lock screen for nine seconds and became "App html — still
+# going". The tool knows what it is doing; it should say so.
+_LIVE_LABELS = {
+    "app_html__create_app_file": "Building your app",
+    "app_html__view_app_file": "Reading your app",
+    "app_html__edit_app_file": "Updating your app",
+    "app_html__bash_app": "Checking your app",
+    "app_html__present_app": "Finishing your app",
+}
+
+
+def public_label(tool_name: str) -> Optional[str]:
+    """A human status line for a tool, or None when we have none.
+
+    Deliberately a lookup and not a derivation: an absent label leaves the
+    client on its own existing fallback, which is a known quantity. A DERIVED
+    label is how an identifier reaches a screen, and this function exists
+    because that happened.
+    """
+    return _LIVE_LABELS.get(tool_name or "")

@@ -821,6 +821,12 @@ class ChatMessageResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     # Media metadata (YouTube/Netflix cards)
     media: Optional[dict] = None
+    # The single-file app this turn handed over: {"slug": "nokia-snake"}.
+    # Declared here or it is dropped — and the app card in a reopened
+    # thread is drawn from it (round 18; before it existed the client had
+    # to regex the slug out of `present_app`'s prose, which is why that
+    # prose contained an internal route and a chip directive).
+    app_artifact: Optional[dict] = None
     # ToolPillRow records ({tool, started_at_ms, completed_at_ms, summary}).
     # Serializer parity with /api/day-chats — the clients fall back to the
     # session routes, and a field emitted by only one serializer vanishes on

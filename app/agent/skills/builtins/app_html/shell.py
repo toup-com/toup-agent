@@ -15,7 +15,9 @@ Three independent gates, each of which alone would be defeatable:
     ``sudo``/``chmod``/``systemctl`` (privilege), and ``env``/``printenv``
     (the container's injected secrets).
 2.  **Substitution ban** — backticks and ``$(...)`` are refused outright,
-    because they hide a binary from gate 1.
+    because they hide a binary from gate 1. Both this gate and the segmenter
+    read a QUOTE-AWARE mask of the command (:func:`_masks`), so shell syntax
+    is only recognised where the shell would actually act on it.
 3.  **Path jail** — every token that looks like a path must resolve inside
     the app root, so ``cat ../../etc/shadow`` and ``> /etc/cron.d/x`` are
     refused even though ``cat`` and ``>`` are fine in principle.
@@ -32,7 +34,7 @@ import logging
 import os
 import re
 import shlex
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # Absolute, for the same reason as skill.py: the loader imports these
 # modules by path under a top-level name, where a relative import fails.
@@ -59,11 +61,10 @@ ALLOWED_COMMANDS = frozenset({
     "node", "python3", "python", "jq", "tidy", "xmllint",
 })
 
-#: Shell operators we split on to find each segment's leading binary.
-_SEGMENT_SPLIT = re.compile(r"\|\||&&|[;|\n]")
-
 #: Refused outright — each hides the real command from the allowlist, or
-#: detaches it from our timeout.
+#: detaches it from our timeout. Scanned against the EXPANSION mask (see
+#: :func:`_masks`), so a literal ``$(`` inside single quotes — ``awk
+#: '{print $(NF)}'``, ``grep '${VAR}'`` — is not mistaken for one.
 _FORBIDDEN_SYNTAX: Tuple[Tuple[str, str], ...] = (
     ("`", "backtick command substitution"),
     ("$(", "$( ) command substitution"),
@@ -92,11 +93,119 @@ def _refuse(reason: str) -> "ShellRefusal":
     )
 
 
+class UnbalancedQuote(ShellRefusal):
+    """The command's quoting does not close. Message is user-facing."""
+
+
+def _masks(cmd: str) -> Tuple[str, str]:
+    """Two blanked copies of ``cmd``, for two different scans.
+
+    Round 18. The segmenter used to be ``re.split(r"\\|\\||&&|[;|\\n]", cmd)``,
+    which reads a shell command as if quotes did not exist. The single most
+    common verification command a model writes is a grep alternation::
+
+        grep -c "requestAnimationFrame\\|setInterval" snake.html
+        grep -nE "gameOver|restart" snake.html
+
+    The regex split that on the ``|`` INSIDE the pattern, handed the front
+    half — ``grep -nE "gameOver`` — to :func:`shlex.split`, and got back
+    ``ValueError: No closing quotation``. The model saw
+    ``could not parse the command (No closing quotation)`` for a command that
+    is perfectly well formed, could not tell what was wrong with it, and the
+    build stalled on a check that was never going to run.
+
+    Both masks replace characters with spaces so every index in the result
+    still lines up with ``cmd``:
+
+    * ``ops`` blanks everything inside quotes of EITHER kind, plus every
+      backslash-escaped character. Operators (``| ; && || &``) are inert in
+      all three positions, so this is what the segmenter and the
+      backgrounding check must look at.
+    * ``expand`` blanks single-quoted runs and escapes only. Parameter and
+      command substitution ARE live inside double quotes, so those must stay
+      visible to :data:`_FORBIDDEN_SYNTAX`, while ``'$(NF)'`` must not.
+
+    Raises :class:`UnbalancedQuote` if a quote never closes — the one case
+    where the model really did write something unrunnable, and now gets a
+    sentence that says so instead of a :mod:`shlex` exception.
+    """
+    ops: List[str] = []
+    expand: List[str] = []
+    quote: Optional[str] = None
+    i, n = 0, len(cmd)
+    while i < n:
+        ch = cmd[i]
+        # A backslash escape hides the NEXT character from every scan. Inside
+        # single quotes it is literal (POSIX), so it escapes nothing there.
+        if ch == "\\" and quote != "'" and i + 1 < n:
+            ops.append("  ")
+            expand.append("  ")
+            i += 2
+            continue
+        if quote:
+            closing = ch == quote
+            ops.append(" ")
+            expand.append(ch if quote == '"' else " ")
+            if closing:
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            ops.append(" ")
+            expand.append(" ")
+            i += 1
+            continue
+        ops.append(ch)
+        expand.append(ch)
+        i += 1
+    if quote:
+        raise UnbalancedQuote(
+            f"the command has an unclosed {quote} quote. Close it, or drop the "
+            f"quotes if the pattern has no spaces — e.g. "
+            f"grep -n \"function move\" app.html"
+        )
+    return "".join(ops), "".join(expand)
+
+
+def split_segments(cmd: str, ops_mask: str) -> List[str]:
+    """Split ``cmd`` on UNQUOTED ``| || && ; newline`` using ``ops_mask``.
+
+    Slices come from ``cmd``, so each segment keeps its original quoting and
+    can be handed to :func:`shlex.split` intact.
+    """
+    out: List[str] = []
+    start = 0
+    i, n = 0, len(cmd)
+    while i < n:
+        two = ops_mask[i:i + 2]
+        if two in ("||", "&&"):
+            out.append(cmd[start:i])
+            i += 2
+            start = i
+            continue
+        if ops_mask[i] in ";|\n":
+            out.append(cmd[start:i])
+            i += 1
+            start = i
+            continue
+        i += 1
+    out.append(cmd[start:])
+    return out
+
+
 def _tokens_of(segment: str) -> List[str]:
     try:
         return shlex.split(segment, comments=False, posix=True)
-    except ValueError as exc:
-        raise _refuse(f"could not parse the command ({exc})") from None
+    except ValueError:
+        # Unreachable for a segment produced by split_segments (quotes are
+        # balanced by construction) — kept because validate_command is not the
+        # only possible caller and a raw ValueError here would reach the model
+        # as a traceback rather than as an instruction.
+        raise UnbalancedQuote(
+            "the command has an unclosed quote. Close it, or drop the quotes "
+            "if the pattern has no spaces."
+        ) from None
 
 
 def _check_paths(tokens: List[str], root: str) -> None:
@@ -128,17 +237,20 @@ def validate_command(command: str) -> str:
     if len(cmd) > 4000:
         raise _refuse("the command is over 4000 characters")
 
+    ops_mask, expand_mask = _masks(cmd)
+
     for needle, what in _FORBIDDEN_SYNTAX:
-        if needle in cmd:
+        if needle in expand_mask:
             raise _refuse(f"{what} is not allowed")
     # A trailing/embedded `&` backgrounds the child out from under the
-    # timeout. `&&` is legitimate, so only refuse a lone one.
-    if re.search(r"(?<!&)&(?!&)", cmd):
+    # timeout. `&&` is legitimate, so only refuse a lone one — and only an
+    # UNQUOTED one, or `grep -o "a&b"` would be refused as backgrounding.
+    if re.search(r"(?<!&)&(?!&)", ops_mask):
         raise _refuse("backgrounding with & is not allowed")
 
     root = os.path.realpath(apps_root())
     saw_segment = False
-    for segment in _SEGMENT_SPLIT.split(cmd):
+    for segment in split_segments(cmd, ops_mask):
         segment = segment.strip()
         if not segment:
             continue

@@ -136,24 +136,37 @@ def _js_string_literals(text: str) -> set:
 
 
 def test_host_and_client_agree_on_the_message_envelope():
-    host = FRAME_TSX.read_text()
-    doc = DESIGN_MD.read_text()
+    """Round 18 moved the client half of this protocol.
 
-    # The two channel names. Swapping either half breaks persistence
-    # silently — the app just never gets a reply and falls back to memory.
+    It used to be a snippet in the design skill that the model was asked to
+    copy into every app it wrote — so the protocol held only as long as the
+    model reproduced it, in a document it had to be told to read first. It is
+    now `runtime.storage_shim()`, injected by the server into every artifact
+    it serves, and the model writes plain `localStorage` calls.
+
+    The lockstep requirement is unchanged and now has one fewer way to fail:
+    a name renamed on the host and not in the shim breaks persistence
+    silently, and the app falls back to memory with no error anywhere.
+    """
+    from app.agent.skills.builtins.app_html import runtime
+
+    host = FRAME_TSX.read_text()
+    client = runtime.storage_shim()
+
     for name in ("toup-storage", "toup-storage-host"):
         assert name in host, f"{name} missing from the host"
-        assert name in doc, f"{name} missing from the client snippet"
+        assert name in client, f"{name} missing from the injected shim"
 
     host_literals = _js_string_literals(host)
-    doc_literals = _js_string_literals(doc)
-    # Envelope fields and ops the host branches on must exist in the snippet.
+    client_literals = _js_string_literals(client)
     for field in ("id", "op", "key", "value", "ok"):
         assert field in host, field
-        assert field in doc, f"client snippet never mentions {field!r}"
-    for op in ("get", "set"):
+        assert field in client, f"the shim never mentions {field!r}"
+    # The host services get/set/remove/all; the shim must only ever issue ops
+    # the host branches on, or a write is accepted and dropped.
+    for op in ("set", "remove", "all"):
         assert op in host_literals, op
-        assert op in doc_literals, f"client snippet cannot issue op {op!r}"
+        assert op in client_literals, f"the shim cannot issue op {op!r}"
 
 
 def test_the_host_identifies_the_frame_by_source_not_by_origin():
@@ -165,18 +178,40 @@ def test_the_host_identifies_the_frame_by_source_not_by_origin():
     assert "event.source !== frame.contentWindow" in host
 
 
-def test_the_client_snippet_never_touches_storage_unguarded():
-    """The single most common way a generated app renders blank: an
-    unguarded localStorage call on the first line of the script, in a frame
-    where it throws."""
-    doc = DESIGN_MD.read_text()
-    assert "localStorage" in doc
-    for m in re.finditer(r"localStorage\.\w+\(", doc):
-        window = doc[max(0, m.start() - 220): m.start()]
-        assert "try" in window, (
-            f"unguarded localStorage call at offset {m.start()} in the design skill"
-        )
-    assert "THROW" in doc or "throw" in doc
+def test_an_unguarded_storage_call_cannot_kill_a_generated_app():
+    """The single most common way a generated app rendered blank.
+
+    `localStorage` on an opaque origin throws on ACCESS, so one unguarded
+    `localStorage.getItem('highScore')` at the top of a script took the whole
+    script with it — no render, no handlers, no game loop. The page looked
+    perfect and did nothing, which is exactly what round 18 was reported as.
+
+    The old defence was a rule in a document ("always wrap"), enforced by a
+    test that grepped that document for `try` near every storage call. A rule
+    the model has to remember on every line of every app is not a defence,
+    and this one had already failed in production.
+
+    The defence now is that the property is replaced before app code runs, so
+    the call cannot throw whatever the model wrote. That is what is asserted
+    here — on the SERVED bytes, which is what the browser executes.
+    """
+    from app.agent.skills.builtins.app_html import runtime
+
+    hostile = (
+        "<!doctype html><html><head><title>x</title></head><body>"
+        "<script>var best = localStorage.getItem('highScore');"
+        "document.cookie = 'a=b';</script></body></html>"
+    )
+    served = runtime.wrap_for_runtime(hostile)
+
+    # The shim is installed, and it is installed BEFORE the app's own script.
+    assert runtime.MARKER in served
+    assert served.index(runtime.MARKER) < served.index("localStorage.getItem")
+    # defineProperty, not assignment: `window.localStorage = x` is a no-op
+    # against an accessor whose getter throws.
+    assert "defineProperty" in served
+    for prop in ("localStorage", "sessionStorage", "cookie"):
+        assert prop in served, prop
 
 
 def test_the_shipped_design_skill_matches_the_repo_copy():

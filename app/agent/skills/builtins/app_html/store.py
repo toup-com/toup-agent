@@ -112,16 +112,76 @@ def apps_root() -> str:
     return os.path.abspath(os.path.join(workspace, "apps"))
 
 
+#: Mode the app root and its subdirectories are repaired to. rwx for owner
+#: and group, rx for other. Round 15's lesson applies here in miniature: the
+#: fix for "a directory the process cannot write" is **chmod, not chown** —
+#: the container drops every capability including CAP_CHOWN, so a chown
+#: repair raises EPERM and leaves the directory exactly as unusable as it
+#: found it, having reported that it fixed something.
+_DIR_MODE = 0o775
+
+
+def repair_permissions(path: str) -> bool:
+    """Try to make ``path`` writable by this process. True if it now is.
+
+    Called before a write and again after one fails with EACCES. Both are
+    needed: the first turns a directory created by an earlier image's root
+    process into a usable one before the build starts, and the second catches
+    the case where the directory was fine and a stale file inside it was not.
+    """
+    try:
+        if not os.path.isdir(path):
+            return False
+        if os.access(path, os.W_OK | os.X_OK):
+            return True
+        mode = os.stat(path).st_mode & 0o7777
+        os.chmod(path, mode | _DIR_MODE)
+        return os.access(path, os.W_OK | os.X_OK)
+    except OSError as exc:
+        logger.warning("[app_html] could not repair %s: %s", path, exc)
+        return False
+
+
+def _unwritable(path: str) -> "AppStoreError":
+    """The one sentence a caller gets when the volume will not take a write.
+
+    Names no errno, no uid and no container path — the model cannot fix any
+    of those, and the string ends up in a step detail. It says the one true
+    thing: this is not something the model did wrong.
+    """
+    logger.error("[app_html] app root is not writable: %s", path)
+    return AppStoreError(
+        "the app folder can't be written to right now, so nothing was saved. "
+        "This is a workspace problem, not a problem with your file — say so "
+        "plainly and offer to try again."
+    )
+
+
 def ensure_root() -> str:
     """Create the root (and ``.versions/``) and point ``~/apps`` at it.
 
     The symlink is best-effort: on a box where ``$HOME`` is read-only, or
     where ``~/apps`` is already a real directory belonging to something else,
     we leave it alone and keep working off the real root.
+
+    Raises :class:`AppStoreError` if the root cannot be made writable, rather
+    than returning a path that every subsequent write will fail on — a build
+    that cannot store anything should stop at its first step with a reason,
+    not four steps later with an errno.
     """
     root = apps_root()
-    os.makedirs(root, exist_ok=True)
-    os.makedirs(os.path.join(root, VERSIONS_DIR), exist_ok=True)
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError:
+        logger.warning("[app_html] could not create %s", root, exc_info=True)
+    if not os.path.isdir(root) or not repair_permissions(root):
+        raise _unwritable(root)
+    versions = os.path.join(root, VERSIONS_DIR)
+    try:
+        os.makedirs(versions, exist_ok=True)
+        repair_permissions(versions)
+    except OSError:
+        logger.warning("[app_html] could not create %s", versions, exc_info=True)
 
     home_apps = os.path.abspath(os.path.expanduser("~/apps"))
     if home_apps != root:
@@ -292,12 +352,16 @@ def validate_html(html: str) -> List[str]:
             )
         warnings.append(f"<link> to {host} will not load in the sandbox")
 
-    if "localstorage" in low and "try" not in low:
-        warnings.append(
-            "localStorage is used without a try/catch — it THROWS in the "
-            "sandboxed frame (opaque origin). Wrap it and fall back to the "
-            "toup-storage postMessage bridge."
-        )
+    # There is deliberately no "you used localStorage without a try/catch"
+    # warning any more. The old one tested `"try" not in html` — one `try`
+    # anywhere in a 40 KB document silenced it, so in practice it fired never,
+    # and when it did fire it asked the model to hand-write a guard on every
+    # storage call forever. Round 18 closes the class at the other end
+    # instead: `runtime.storage_shim` replaces localStorage, sessionStorage
+    # and document.cookie with objects that cannot throw, injected at serve
+    # time, so unguarded storage in generated code is no longer a way to kill
+    # a page. A warning about a hazard that no longer exists is noise in a
+    # tool result the model has to read.
     return warnings
 
 
@@ -337,6 +401,57 @@ class AppRecord:
         )
 
 
+def _atomic_write(path: str, data: bytes, *, prefix: str = ".tmp-") -> None:
+    """Write ``data`` to ``path`` via a temp file in the same directory.
+
+    On EACCES/EPERM the directory's mode is repaired and the write is retried
+    ONCE — the self-heal for a workspace whose apps folder was created by a
+    different uid (an older image, a restored volume). If it still fails the
+    caller gets :func:`_unwritable`'s sentence, never an errno.
+
+    A partially written file is never left behind: the temp file is unlinked
+    on any failure, and ``os.replace`` is atomic, so a reader either sees the
+    whole previous revision or the whole new one.
+    """
+    directory = os.path.dirname(path)
+    for attempt in (0, 1):
+        fd = tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+            with os.fdopen(fd, "wb") as fh:
+                fd = None  # now owned by the file object
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            _cleanup(fd, tmp)
+            if attempt == 0 and repair_permissions(directory):
+                logger.warning(
+                    "[app_html] repaired permissions on %s and retrying the write",
+                    directory,
+                )
+                continue
+            raise _unwritable(directory) from None
+        except OSError:
+            _cleanup(fd, tmp)
+            raise
+
+
+def _cleanup(fd: Optional[int], tmp: Optional[str]) -> None:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _manifest_path() -> str:
     return os.path.join(apps_root(), MANIFEST_NAME)
 
@@ -370,25 +485,17 @@ def read_manifest() -> Dict[str, AppRecord]:
 
 def _write_manifest(records: Dict[str, AppRecord]) -> None:
     """Atomic replace — a torn manifest is worse than a stale one."""
-    root = ensure_root()
+    ensure_root()
     payload = {
         "version": 1,
         "updated_at": _now(),
         "apps": {slug: rec.to_dict() for slug, rec in sorted(records.items())},
     }
-    fd, tmp = tempfile.mkstemp(dir=root, prefix=".manifest-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, _manifest_path())
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write(
+        _manifest_path(),
+        json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+        prefix=".manifest-",
+    )
 
 
 def upsert_record(slug: str, title: str, size_bytes: int, *,
@@ -485,6 +592,41 @@ def _prune_versions(vdir: str) -> None:
         pass
 
 
+def restore_latest_version(slug: str) -> bool:
+    """Put the newest kept revision back at ``<slug>.html``. True if it worked.
+
+    The self-heal for a manifest that knows about an app whose file is not
+    there: an interrupted write, a volume restored from under a running
+    container, a cleanup script that took the .html and left the index. The
+    alternative is telling someone their app does not exist while a copy of it
+    sits in ``.versions/`` — which is not a missing app, it is a missing
+    filename.
+
+    Snapshots are named ``<revision>-<epoch>.html``, zero-padded, so the last
+    entry in sorted order is the newest. Best-effort by design: a failure here
+    leaves exactly the state we found.
+    """
+    try:
+        versions = list_versions(slug)
+        if not versions:
+            return False
+        newest = os.path.join(_versions_dir(slug), versions[-1])
+        with open(newest, "rb") as fh:
+            data = fh.read()
+        if not data:
+            return False
+        ensure_root()
+        _atomic_write(app_path(slug), data, prefix=f".{slug}-")
+        logger.warning(
+            "[app_html] %s.html was missing — restored it from %s",
+            slug, versions[-1],
+        )
+        return True
+    except (OSError, AppStoreError) as exc:
+        logger.warning("[app_html] could not restore %s: %s", slug, exc)
+        return False
+
+
 def list_versions(slug: str) -> List[str]:
     try:
         vdir = _versions_dir(slug)
@@ -507,19 +649,7 @@ def write_app(slug: str, title: str, html: str) -> Tuple[AppRecord, List[str]]:
 
     path = app_path(slug)
     data = html.encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{slug}-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write(path, data, prefix=f".{slug}-")
 
     rec = upsert_record(
         slug,
@@ -618,19 +748,7 @@ def write_state(slug: str, state: Dict[str, Any]) -> int:
             f"limit for one app"
         )
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".state-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write(path, payload, prefix=".state-")
     return len(payload)
 
 
@@ -684,19 +802,7 @@ def edit_app(slug: str, old_string: str, new_string: str) -> Tuple[AppRecord, in
 
     path = app_path(slug)
     data = updated.encode("utf-8")
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{slug}-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _atomic_write(path, data, prefix=f".{slug}-")
 
     title = rec_before.title if rec_before else slug
     rec = upsert_record(slug, title, len(data), bump_revision=True)

@@ -26,6 +26,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
+from app.agent.tool_display import ToolResult
 
 # ABSOLUTE imports, not `from . import store`. SkillLoader discovers builtins
 # by path and loads them with
@@ -37,6 +38,7 @@ from app.agent.skills.base import Skill, SkillContext, SkillMeta
 # through the real SkillLoader rather than importing the class directly.)
 from app.agent.skills.builtins.app_html import steps as steps_mod
 from app.agent.skills.builtins.app_html import store
+from app.agent.skills.builtins.app_html import verify as verify_mod
 from app.agent.skills.builtins.app_html.shell import (
     DEFAULT_TIMEOUT_SECONDS,
     ShellRefusal,
@@ -63,6 +65,70 @@ def _packaged_design_skill() -> str:
             return fh.read()
     except OSError:
         return ""
+
+
+def _design_guidance() -> str:
+    """The design skill's body, ready to be part of the system prompt.
+
+    Round 18. This used to be delivered by telling the model, in a tool
+    description AND in the prompt, to call
+    ``read_file(path='/app/skills/toup-frontend-design.md')`` first. Two
+    things came of that, and they were both bad.
+
+    The visible one: a tool result is shown to the user, and this tool result
+    is 8 KB of markdown. A person who asked for a snake game was shown the
+    document's YAML frontmatter, its anti-slop checklist and its CSS token
+    block, inside their own chat, as though the agent were talking to them.
+
+    The quiet one: it made a mandatory step out of a file read that can fail.
+    ``on_load`` writes the file to whichever of two directories is writable;
+    if neither was, the first tool call of a fresh chat got "File not found"
+    for a path the prompt had just insisted on — the cold-start failure this
+    round was also asked to fix.
+
+    Both go away by putting the guidance where guidance belongs. It costs
+    tokens in the stable prefix, where they are cached, instead of a round
+    trip and a rendered dump on every single build.
+
+    The frontmatter is stripped: ``name:``/``description:`` are how a skill
+    FILE is indexed, and mean nothing inside a prompt.
+    """
+    body = _packaged_design_skill()
+    if body.startswith("---"):
+        end = body.find("\n---", 3)
+        if end != -1:
+            body = body[end + 4:]
+    # The instruction to "read this before you write any UI" is addressed to
+    # a reader who had to go and fetch it. In the prompt it is already read.
+    body = body.replace(
+        "Read this **before** you write any UI. It is the difference between "
+        "an app\nsomeone keeps and an app that looks like every other "
+        "generated page.",
+        "This is the difference between an app someone keeps and an app that "
+        "looks\nlike every other generated page.",
+    )
+    return body.strip()
+
+
+def _short(exc: Exception) -> str:
+    """A failure, in one clause, for a step's detail line.
+
+    Tool-result prose and step details have different readers and different
+    lengths. `store.edit_app`'s "old_string appears 3 times in snake.html — it
+    must match exactly once. Include more surrounding lines to make it
+    unique." is exactly right for the model and far too long, and about the
+    wrong subject, for a line under a progress bar. First sentence only, and
+    never the shell's allowlist, which alone runs to 300 characters of binary
+    names.
+    """
+    text = " ".join(str(exc).split())
+    text = text.split(" bash_app is a verification shell")[0]
+    for stop in (". ", " — "):
+        head = text.split(stop)[0]
+        if len(head) >= 12:
+            text = head
+            break
+    return text[:120]
 
 
 def _writable(directory: str) -> bool:
@@ -112,6 +178,11 @@ class AppHtmlSkill(Skill):
 
     def __init__(self) -> None:
         self._design_path: str = design_skill_path()
+        # Read ONCE, from the image, in __init__ — before `get_tools()` and
+        # before `on_load()`, both of which the loader calls later. The bytes
+        # are therefore fixed for the life of the process, which is the cache
+        # invariant `get_system_prompt_section` has to hold.
+        self._design_guidance: str = _design_guidance()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -123,9 +194,16 @@ class AppHtmlSkill(Skill):
         an image upgrade actually ships the new guidance instead of leaving a
         stale copy on the volume forever.
         """
+        # AppStoreError as well as OSError: `ensure_root` now REFUSES an
+        # unwritable root instead of returning it, and boot is the one caller
+        # that must not care. A skill whose on_load raises does not load, and
+        # a workspace that is unwritable at boot is very often writable by the
+        # time someone asks for an app (`_create` calls this again, and the
+        # repair runs there too). Losing the whole pipeline over it would turn
+        # a transient into a permanent.
         try:
             store.ensure_root()
-        except OSError:
+        except (OSError, AppStoreError):
             logger.warning("[app_html] could not create the app root", exc_info=True)
 
         content = _packaged_design_skill()
@@ -154,7 +232,6 @@ class AppHtmlSkill(Skill):
     # Tool definitions
     # ------------------------------------------------------------------
     def get_tools(self) -> List[Dict[str, Any]]:
-        design = self._design_path
         return [
             {
                 "name": "app_html__create_app_file",
@@ -167,14 +244,13 @@ class AppHtmlSkill(Skill):
                     "libraries ONLY from https://cdnjs.cloudflare.com (React needs "
                     "react, react-dom and babel-standalone from cdnjs, with "
                     "<script type=\"text/babel\">). Mobile-first: design 360px first, "
-                    "then 768 and 1280. NEVER touch localStorage/cookies/fetch without "
-                    "a try/catch — the app runs in a sandboxed opaque origin where they "
-                    "throw.\n"
-                    f"BEFORE writing any UI, read the design skill: "
-                    f"read_file(path='{design}'). Do not skip it — it is what stops the "
-                    "app looking generated.\n"
+                    "then 768 and 1280.\n"
+                    "The JavaScript is parsed the moment you write it and the result "
+                    "comes back in this tool's reply, so a truncated or unbalanced "
+                    "script is caught here rather than by the user opening a dead "
+                    "page.\n"
                     "WORKFLOW: one big write here, then surgical edit_app_file changes, "
-                    "then bash_app to verify, then present_app. Calling this again for "
+                    "then present_app. Calling this again for "
                     "the same slug replaces the file (the previous revision is kept)."
                 ),
                 "input_schema": {
@@ -268,9 +344,12 @@ class AppHtmlSkill(Skill):
                 "name": "app_html__present_app",
                 "description": (
                     "Publish the app to the user: registers it, refreshes the preview "
-                    "and posts the app card in chat. Call this once the app is finished "
-                    "and verified — and again after a round of edits so the user sees "
-                    "the new version."
+                    "and posts the app card in chat. Call this once the app is "
+                    "finished — and again after a round of edits so the user sees the "
+                    "new version.\n"
+                    "The app is opened in a real browser first and refused if anything "
+                    "throws, so this is also the check that it works. If it comes back "
+                    "with problems, fix them with edit_app_file and call this again."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -294,9 +373,10 @@ class AppHtmlSkill(Skill):
             "package install. Inline all CSS and JS. External libraries ONLY from "
             "https://cdnjs.cloudflare.com (React = react + react-dom + "
             "babel-standalone from cdnjs). Mobile-first: 360px, then 768, then 1280. "
-            "It runs in a sandboxed frame on an opaque origin, so localStorage, "
-            "cookies and network calls THROW — guard every one and keep state in "
-            "memory.\n"
+            "It runs in a sandboxed frame on an opaque origin: there is no network, "
+            "no navigation and no parent page. Storage cannot throw (the runner "
+            "replaces it), but it is not durable within a first paint either, so "
+            "seed the UI from in-memory defaults and reconcile after.\n"
             "BUILD IT IMMEDIATELY. Do NOT ask the user questions first, do not "
             "offer directions to choose between, do not present a plan and wait, "
             "and do not announce what you are about to do — go straight to "
@@ -307,22 +387,29 @@ class AppHtmlSkill(Skill):
             "never to narrow scope, confirm taste or gather requirements. When "
             "the app is up, say in one line what you built and what you can "
             "change; refinement happens on a working app, not on a questionnaire.\n"
-            f"ALWAYS read the design skill before writing UI: "
-            f"read_file(path='{self._design_path}'). It is what keeps an app from "
-            "looking generated.\n"
             "Loop: app_html__create_app_file (one big write) → app_html__edit_app_file "
-            "(small exact-string edits; view_app_file first) → app_html__bash_app "
-            "(verify) → app_html__present_app (show the user). Never hand-scaffold an "
-            "app with exec/write_file.\n"
+            "(small exact-string edits; view_app_file first) → app_html__present_app "
+            "(show the user). app_html__bash_app is there when you want to look "
+            "something up in the file; it is not a required step, because the "
+            "write and the publish check the app themselves. Never hand-scaffold "
+            "an app with exec/write_file.\n"
+            "If a check comes back with problems, FIX THEM AND CALL AGAIN. That is "
+            "the whole recovery procedure — do not report a failure to the user "
+            "and stop, and never present an app that has not come back clean.\n"
             "Do NOT call create_job for a build. This pipeline opens its own job "
             "and reports every phase into it, so a second one is the same build "
             "announced twice — the user sees two progress cards for one app.\n"
-            "Never paste a tool's output, an exit code or an error dump into your "
-            "reply. If a step fails, say what happened in one plain sentence and "
-            "what you are doing about it. "
-            "And do not send the user anywhere to watch it: no `navigate_to` "
-            "call and no `[[navigate:…]]` chip during a build. The card is in "
-            "this chat, in front of them, and it updates itself."
+            "## What you say when it is done\n"
+            "One or two plain sentences: what it is, and what you can change next. "
+            "Nothing else goes in that message — no link, no file path, no "
+            "`[[open_app:…]]` chip and no `[[navigate:…]]` chip. The app card is "
+            "already in the chat with its own Open button, and a second one beside "
+            "it is a second button for the same thing. Never paste a tool's "
+            "output, an exit code, a byte count or an error dump into your reply; "
+            "if something went wrong, say what happened in one sentence and what "
+            "you are doing about it.\n"
+            "\n"
+            f"{self._design_guidance}"
         )
 
     # ------------------------------------------------------------------
@@ -345,10 +432,41 @@ class AppHtmlSkill(Skill):
             return await handler(args, ctx)
         except (AppStoreError, ShellRefusal) as exc:
             # Expected, model-fixable. No traceback — the message IS the fix.
-            return f"ERROR: {exc}"
+            #
+            # `display` is what the user is shown instead. The model's copy of
+            # a refusal is a paragraph: what was wrong, why, and the exact
+            # call to make next, sometimes with the shell allowlist attached.
+            # None of that is the user's problem and all of it was rendering
+            # in their chat, so they get the first clause of it and nothing
+            # else. Failures are never silently prettified into success —
+            # `_FAILED_DISPLAY` says plainly that something did not work.
+            return ToolResult(
+                f"ERROR: {exc}",
+                display=self._failure_display(tool_name, exc),
+            )
         except OSError as exc:
             logger.warning("[app_html] %s filesystem error", tool_name, exc_info=True)
-            return f"ERROR: filesystem error: {exc}"
+            return ToolResult(
+                f"ERROR: filesystem error: {exc}",
+                display="Couldn't save that — the workspace didn't accept the write.",
+            )
+
+    #: What a user is told when a phase of the build fails. One sentence per
+    #: tool, because "what went wrong" is a different sentence depending on
+    #: what was being attempted, and "Error" is not an answer.
+    _FAILED_DISPLAY = {
+        "app_html__create_app_file": "Couldn't write the app",
+        "app_html__view_app_file": "Couldn't read the app",
+        "app_html__edit_app_file": "Couldn't update the app",
+        "app_html__bash_app": "That check couldn't run",
+        "app_html__present_app": "The app isn't ready yet",
+    }
+
+    @staticmethod
+    def _failure_display(tool_name: str, exc: Exception) -> str:
+        head = AppHtmlSkill._FAILED_DISPLAY.get(tool_name, "That didn't work")
+        detail = _short(exc)
+        return f"{head} — {detail}" if detail else f"{head}."
 
     # ------------------------------------------------------------------
     # Tools
@@ -364,6 +482,11 @@ class AppHtmlSkill(Skill):
         typo, and the card would never resolve because nothing is building.
         """
         record = store.read_manifest().get(slug)
+        # A record with no file is a repairable state, not a missing app —
+        # the last kept revision IS the app. Try that before telling the
+        # model (and through it the user) that the thing does not exist.
+        if record is not None and not store.exists(slug):
+            store.restore_latest_version(slug)
         if record is None or not store.exists(slug):
             known = ", ".join(sorted(store.read_manifest())) or "none yet"
             raise AppStoreError(
@@ -371,6 +494,19 @@ class AppHtmlSkill(Skill):
                 f"Use create_app_file to make a new one."
             )
         return record.title or slug
+
+    @staticmethod
+    def _size_detail(size_bytes: int) -> str:
+        """A size a person reads, for the step's detail line.
+
+        `9299 bytes` was appearing as a step's own label. It is not a label,
+        and at four significant figures it is not even a useful number — the
+        only question it answers is "did something get written", which
+        `9.3 KB` answers just as well and does not read as a memory dump.
+        """
+        if size_bytes < 1024:
+            return f"{size_bytes} bytes"
+        return f"{size_bytes / 1024:.1f} KB"
 
     async def _create(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
@@ -380,40 +516,62 @@ class AppHtmlSkill(Skill):
         # Validate BEFORE opening the job. A stub call or a blocked CDN
         # reference is a call that never should have happened; minting a job
         # for it would leave a permanently failed "Build: …" card in chat
-        # for an app that was never started.
+        # for an app that was never started. `ensure_root` joins it for the
+        # same reason and one more: it is the cold-start repair (create the
+        # directory, fix its mode), and a workspace that cannot be written to
+        # should stop the build before there is a card to strand.
         store.validate_html(html)
+        store.ensure_root()
 
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="create",
-            label=f"Creating file: {title}", status="running",
+            status="running",
         )
         try:
             record, warnings = store.write_app(slug, title, html)
         except AppStoreError as exc:
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="create",
-                label=f"Creating file: {title}", status="failed", detail=str(exc),
+                status="failed", detail=_short(exc),
             )
             raise
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="create",
-            label=f"Creating file: {title}", status="done",
-            detail=f"{record.size_bytes} bytes",
+            status="done", detail=self._size_detail(record.size_bytes),
+        )
+
+        # Parse the script NOW. A generation that ran out of room mid-function
+        # produces a file that is a perfectly valid HTML document with a dead
+        # script inside it — `validate_html` passes it, the card goes green,
+        # and the first person to find out is the user, looking at a board
+        # that will not move. Syntax only here: it is milliseconds and offline,
+        # and the expensive real-browser pass belongs at the publish gate
+        # where it runs once instead of once per edit.
+        report = await verify_mod.verify_app(html, deep=False)
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="verify",
+            status="failed" if report.findings else "done",
+            detail=report.summary(),
         )
 
         out = (
             f"Wrote {slug}.html ({record.size_bytes:,} bytes, revision "
-            f"{record.revision}) to the app directory.\n"
+            f"{record.revision}).\n"
         )
         if warnings:
             out += "Warnings:\n" + "".join(f"  - {w}\n" for w in warnings)
-        out += (
-            "Next: verify with app_html__bash_app, make any fixes with "
-            "app_html__edit_app_file, then call app_html__present_app to show "
-            "the user."
+        if report.findings:
+            out += (
+                "The script does not parse, so the app will render but do "
+                "nothing:\n" + report.as_error() + "\n"
+                "Fix that before anything else.\n"
+            )
+        return ToolResult(
+            out.rstrip(),
+            display=("Wrote the app — the script needs a fix."
+                     if report.findings else "Wrote the app."),
         )
-        return out
 
     async def _view(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
@@ -422,41 +580,45 @@ class AppHtmlSkill(Skill):
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="review",
-            label="Reading current app before editing", status="running",
+            status="running",
         )
         content = store.read_app(slug)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="review",
-            label="Reading current app before editing", status="done",
-            detail=f"{len(content)} chars",
+            status="done", detail=self._size_detail(len(content.encode("utf-8"))),
         )
 
+        # `display` matters more here than anywhere else in this file: the
+        # model-facing result is the ENTIRE app, and the client renders the
+        # first couple of kilobytes of whatever it is given. Without it, a
+        # routine read-before-edit puts the user's own doctype, meta tags and
+        # CSS custom properties in their chat as the agent's reply.
         if len(content) <= VIEW_INLINE_LIMIT:
             # Raw, no line numbers: edit_app_file matches byte-for-byte, and
             # a "  42\t" gutter is exactly the kind of thing that ends up
             # copied into old_string and never matches.
-            return content
+            return ToolResult(content, display="Read the app.")
         head = content[:VIEW_HEAD_CHARS]
         tail = content[-VIEW_TAIL_CHARS:]
         omitted = len(content) - VIEW_HEAD_CHARS - VIEW_TAIL_CHARS
-        return (
+        return ToolResult(
             f"{head}\n\n"
             f"[… {omitted:,} characters omitted — {slug}.html is {len(content):,} "
             f"chars. Use app_html__bash_app with grep -n to locate the exact text "
             f"you want to edit in the omitted region …]\n\n"
-            f"{tail}"
+            f"{tail}",
+            display="Read the app.",
         )
 
     async def _edit(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
         reason = (args.get("reason") or "").strip()
         title = self._existing_title(slug)
-        label = f"Editing file: {reason}" if reason else "Editing file"
 
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="edit",
-            label=label, status="running",
+            status="running", detail=reason,
         )
         try:
             rec, delta = store.edit_app(
@@ -465,12 +627,16 @@ class AppHtmlSkill(Skill):
         except AppStoreError as exc:
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="edit",
-                label=label, status="failed", detail=str(exc),
+                status="failed", detail=_short(exc),
             )
             raise
+        # `+0 bytes` was the old detail for a same-length edit — a change the
+        # user could see in the app, described to them as nothing having
+        # happened. The reason the model gave for the edit is both true and
+        # worth reading; the revision is the fallback when it gave none.
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="edit",
-            label=label, status="done", detail=f"{delta:+d} bytes",
+            status="done", detail=reason or f"revision {rec.revision}",
         )
 
         out = (
@@ -479,8 +645,10 @@ class AppHtmlSkill(Skill):
         )
         for w in getattr(rec, "warnings", []) or []:
             out += f"  - warning: {w}\n"
-        out += "Call app_html__present_app when the change is ready to show."
-        return out
+        return ToolResult(
+            out.rstrip(),
+            display=f"Updated the app: {reason}" if reason else "Updated the app.",
+        )
 
     async def _bash(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
@@ -488,43 +656,78 @@ class AppHtmlSkill(Skill):
         title = self._existing_title(slug)
 
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
+        # No `detail=command`. The command is the model's working note —
+        # `wc -c nokia-snake.html` was appearing where the user is told what
+        # is happening to their app.
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="verify",
-            label="Verifying changes", status="running", detail=command[:120],
+            status="running",
         )
         try:
             code, output = await run_in_app_dir(
                 command, timeout=DEFAULT_TIMEOUT_SECONDS,
             )
-        except ShellRefusal as exc:
+        except ShellRefusal:
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="verify",
-                label="Verifying changes", status="failed", detail=str(exc)[:200],
+                status="failed", detail="that check couldn't run",
             )
             raise
+        # The step is "did this inspection happen", and it did. A non-zero
+        # exit means grep found nothing — a normal, useful answer — and
+        # marking the step FAILED for it is how a card came to carry a red ✗
+        # for a check that worked perfectly. The exit code still goes to the
+        # model, which is the only reader that can interpret it.
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="verify",
-            label="Verifying changes", status="done" if code == 0 else "failed",
-            detail=f"exit {code}",
+            status="done",
         )
         body = output.rstrip() or "(no output)"
-        # A non-zero exit is INFORMATION (grep found nothing), not a tool
-        # failure — do not prefix it with ERROR:, or the model reads a
-        # successful negative check as a broken tool.
-        return f"exit {code}\n{body}"
+        # The model gets the exit code and the raw output — that is the whole
+        # point of the tool. The user gets neither: "exit 1" and a grep dump
+        # are not a status, and both were appearing as one.
+        return ToolResult(f"exit {code}\n{body}", display="Checked the app.")
 
     async def _present(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
         title = self._existing_title(slug)
         html_path = store.app_path(slug)
+
+        job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
+
+        # ── The gate ──────────────────────────────────────────────────
+        # Publishing is the moment the app stops being the model's problem
+        # and becomes the user's, so it is the right and only place to
+        # insist that it works. Round 18's whole complaint — a card reading
+        # "100% · App built" over a game that could not be played — was
+        # possible because nothing between generation and this line had ever
+        # opened the file in a browser.
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="verify",
+            status="running",
+        )
+        report = await verify_mod.verify_app(store.read_app(slug), deep=True)
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="verify",
+            status="failed" if report.findings else "done",
+            detail=report.summary(),
+        )
+        if report.findings:
+            # Not presented, so no app card, no completed job and no "Built"
+            # badge. The model gets the errors with their real line numbers
+            # and the instruction to come back.
+            raise AppStoreError(
+                "the app is not working yet, so it was not published:\n"
+                + report.as_error()
+                + "\nFix these with edit_app_file and call present_app again."
+            )
+
         size = os.path.getsize(html_path)
         record = store.upsert_record(slug, title, size, bump_revision=False,
                                      presented=True)
-
-        job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="present",
-            label="Presented app", status="running",
+            status="running",
         )
         app_id = await steps_mod.upsert_app_row(
             user_id=ctx.user_id, slug=slug, title=title,
@@ -532,17 +735,25 @@ class AppHtmlSkill(Skill):
         )
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="present",
-            label="Presented app", status="done", detail=f"revision {record.revision}",
+            status="done", detail=f"revision {record.revision}",
         )
         await steps_mod.finish_job(ctx.user_id, job_id)
         await steps_mod.announce_ready(
             user_id=ctx.user_id, job_id=job_id, app_id=app_id, title=title, slug=slug,
         )
 
-        return (
-            f"Presented '{title}' — the app card is now in the chat and the app "
-            f"is live at /api/artifacts/{slug} ({size:,} bytes, revision "
-            f"{record.revision}).\n"
-            f"Tell the user what it does in one or two sentences and offer the "
-            f"[[open_app:{slug}]] chip. Do not paste the HTML or the file path."
+        # Round 18, items 2 and 6. This used to hand back an internal URL
+        # path, an `[[open_app:…]]` chip and two sentences of stage direction
+        # ("Tell the user what it does…", "Do not paste the HTML…"). All
+        # three were rendered to the user as the agent's own words: an
+        # internal route, a token nobody outside this codebase can read, and
+        # instructions addressed to a model. The chip also produced a SECOND
+        # open button under the card that already has one.
+        #
+        # What replaces it is one sentence of fact. Everything the model is
+        # supposed to do next lives in the system prompt, where the user
+        # cannot be shown it.
+        return ToolResult(
+            f"Published '{title}'. The app card is in the chat, ready to open.",
+            display=f"{title} is ready.",
         )

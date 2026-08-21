@@ -145,58 +145,35 @@ every colour cue with a shape, an icon or a label.
 
 ---
 
-## 7. Never assume `localStorage`
+## 7. Storage is safe, but it is not instant
 
-The app runs in a sandboxed frame with an **opaque origin**. `localStorage`,
-`sessionStorage`, `indexedDB` and `document.cookie` all **throw** there.
-Touching them unguarded kills your script on line one and the page renders
-blank.
+The app runs in a sandboxed frame with an **opaque origin**, where
+`localStorage`, `sessionStorage` and `document.cookie` would normally
+**throw** on the first access and take your whole script down with them.
 
-Always wrap, always keep an in-memory fallback, and prefer the host bridge
-for anything that must survive a reload:
+They do not, here. The runner replaces all three before your code runs, with
+objects that cannot throw and that mirror what you write back to the Toup
+shell — so `localStorage.setItem('highScore', 12)` is safe to call directly,
+with no `try`, and the value survives a reload.
 
-```html
-<script>
-const Store = (() => {
-  const mem = new Map();
-  let local = null;
-  try { localStorage.setItem('__t','1'); localStorage.removeItem('__t'); local = localStorage; }
-  catch (_) { local = null; }                    // sandboxed: expected, not an error
+The one thing that is NOT true is that a value is there on line one. The
+restore is a round-trip to the host, so a read taken during first paint
+returns `null` even when a value exists. Seed the UI from defaults
+immediately and reconcile when the data lands:
 
-  // Host bridge — the Toup shell persists on our behalf over postMessage.
-  const pending = new Map(); let seq = 0;
-  addEventListener('message', e => {
-    const m = e.data;
-    if (!m || m.source !== 'toup-storage-host') return;
-    const r = pending.get(m.id); if (!r) return;
-    pending.delete(m.id); r(m.ok ? m.value : null);
-  });
-  const ask = (op, key, value) => new Promise(res => {
-    if (parent === self) return res(null);
-    const id = ++seq; pending.set(id, res);
-    parent.postMessage({ source:'toup-storage', v:1, id, op, key, value }, '*');
-    setTimeout(() => { if (pending.delete(id)) res(null); }, 1500);
-  });
-
-  return {
-    get(k){ if (mem.has(k)) return mem.get(k);
-            try { return local ? JSON.parse(local.getItem(k)) : null } catch(_) { return null } },
-    set(k,v){ mem.set(k,v);
-              try { local && local.setItem(k, JSON.stringify(v)) } catch(_) {}
-              ask('set', k, v); },
-    async load(k){ const v = await ask('get', k); if (v != null) mem.set(k, v);
-                   return v != null ? v : this.get(k); },
-  };
-})();
-</script>
+```js
+let best = 0;                                   // paint with this
+render();
+addEventListener('toup-storage-ready', () => {  // fires once, after restore
+  best = Number(localStorage.getItem('highScore') || 0);
+  render();
+});
 ```
 
-Seed the UI from in-memory defaults immediately, then reconcile with
-`await Store.load(key)` — never block first paint on storage.
-
-Also unavailable in the sandbox: network requests (`connect-src 'self'` from
-an opaque origin blocks everything), top-level navigation, popups, and the
-parent page. Build apps that are complete on their own.
+Still genuinely unavailable in the sandbox: network requests (`fetch`,
+`XMLHttpRequest`, WebSocket — `connect-src 'self'` from an opaque origin
+blocks everything), top-level navigation, popups, and the parent page. Build
+apps that are complete on their own.
 
 ---
 
@@ -207,6 +184,11 @@ parent page. Build apps that are complete on their own.
 - [ ] Every text/background pair reaches 4.5:1
 - [ ] No placeholder copy anywhere; seeded with realistic data
 - [ ] No external origin except cdnjs
-- [ ] No unguarded `localStorage` / `cookie` / `fetch`
+- [ ] No `fetch` / `XMLHttpRequest` / WebSocket anywhere
+- [ ] Nothing reads storage expecting a value during first paint
 - [ ] The signature element appears at least three times
 - [ ] Nothing on the anti-slop checklist ticks
+
+`present_app` opens the app in a real browser and refuses to publish it if
+anything throws. A refusal is a list of things to fix, not a dead end: fix
+them with `edit_app_file` and call it again.

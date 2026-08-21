@@ -133,6 +133,16 @@ WEB_DOMAIN_TOOLS: frozenset = frozenset({
     "extension_research", "browser", "browser_action",
 })
 
+# Tools that hand a finished app to the user. A successful call means this
+# turn has an artifact to show, and its `slug` argument is that artifact's
+# identity — persisted as `app_artifact` on the assistant message and stamped
+# on the tool record, so a reopened thread can draw the app card without
+# parsing a slug back out of the tool's prose. Both pipelines are listed: the
+# Expo builder is retired but its rows are still in people's history.
+APP_PRESENTING_TOOLS: frozenset = frozenset({
+    "app_html__present_app", "present_app",
+})
+
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"'()\[\]]+")
 
 
@@ -750,6 +760,7 @@ OnToolEvent = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
 from app.agent.tool_display import client_summary
+from app.agent.tool_display import public_label as _tool_public_label
 
 
 def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
@@ -2281,6 +2292,10 @@ class AgentRunner:
         # paying a few hundred KB just so a click-to-expand pill can
         # show a giant raw blob.
         tool_event_records: List[Dict[str, Any]] = []
+        #: Slugs of apps this turn published, in order. Persisted on the
+        #: assistant message as `app_artifact`, which is what draws the app
+        #: card in a thread reopened tomorrow.
+        _presented_apps: List[str] = []
         final_text = ""
         model_used = ""
 
@@ -3266,9 +3281,38 @@ class AgentRunner:
                     "summary": _record_summary,
                     **_step_fields,
                 }
+                # The same human label the live frame carries, so a row
+                # re-rendered from history reads identically to the one the
+                # user watched instead of falling back to a humanised
+                # identifier ("Building your app" vs "create app file").
+                _label = _tool_public_label(tc["name"])
+                if _label:
+                    _rec["label"] = _label
                 if _domains:
                     _rec["domains"] = _domains
                     _rec["urls"] = _urls
+                # Round 18. Which app this turn handed over, as a FIELD.
+                #
+                # It was previously recoverable only by running two regexes
+                # over the tool's prose — one looking for `/api/artifacts/
+                # <slug>`, one for `[[open_app:<slug>]]` — because those were
+                # the only durable trace and nothing wrote the slug anywhere
+                # structured. Which meant the app card in a reopened thread
+                # depended on an internal route and a directive token staying
+                # inside a 200-character cut of a sentence written for the
+                # model. They were also, for the same reason, being SHOWN to
+                # the user; removing them (see app_html/skill.py `_present`)
+                # is only safe once the slug has somewhere real to live.
+                #
+                # Taken from the call's own input, not parsed back out of its
+                # output: the slug is what the model passed in.
+                if tc["name"] in APP_PRESENTING_TOOLS and not (
+                    isinstance(result, str) and result.startswith("ERROR:")
+                ):
+                    _slug = (tc.get("input") or {}).get("slug")
+                    if isinstance(_slug, str) and _slug.strip():
+                        _rec["app_slug"] = _slug.strip()
+                        _presented_apps.append(_slug.strip())
                 tool_event_records.append(_rec)
                 if on_tool_end:
                     # The tool's USER-facing sentence, never its model-facing
@@ -3438,6 +3482,7 @@ class AgentRunner:
                     asst_message_id=asst_message_id,
                     channel=channel,
                     tool_event_records=tool_event_records,
+                    presented_app_slug=_presented_apps[-1] if _presented_apps else None,
                 )
                 await db.commit()
             logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
@@ -5828,6 +5873,7 @@ class AgentRunner:
         # key in metadata_json → frontend renders the saved message
         # exactly like before.
         tool_event_records: Optional[List[Dict[str, Any]]] = None,
+        presented_app_slug: Optional[str] = None,
     ):
         if tool_event_records is None:
             tool_event_records = []
@@ -5921,6 +5967,11 @@ class AgentRunner:
             _meta["tool_events"] = tool_event_records
         if pending_action_meta:
             _meta["pending_action"] = pending_action_meta
+        # The app this turn handed over. One field, one key, read by every
+        # message serializer — as opposed to a slug that had to be regexed
+        # back out of a tool's prose, which is what it replaces.
+        if presented_app_slug:
+            _meta["app_artifact"] = {"slug": presented_app_slug}
         _asst_kwargs = dict(
             conversation_id=session_id,
             day_chat_id=_day_chat_id,

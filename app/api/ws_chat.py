@@ -3538,6 +3538,13 @@ async def ws_chat(
                         # own create_job/update_job has not run yet) — the
                         # tool_end frame's values are authoritative.
                         _frame: dict = {"type": "tool_start", "tool": tool_name}
+                        # Round 18: a human status line, when we have one.
+                        # Without it a client can only humanise the identifier
+                        # — which is where "App html — still going" came from.
+                        from app.agent.tool_display import public_label
+                        _lbl = public_label(tool_name)
+                        if _lbl:
+                            _frame["label"] = _lbl
                         if meta:
                             for _k in ("call_id", "step_index", "step_name", "steps_total", "job_id", "job_type"):
                                 if meta.get(_k) is not None:
@@ -3612,6 +3619,13 @@ async def ws_chat(
                     _tprint(f"{_DIM}  ✓ {tool_name}: {short}{_RESET}")
                     try:
                         event: dict = {"type": "tool_end", "tool": tool_name, "summary": summary}
+                        # Round 18: the same human status line tool_start
+                        # carries, so a client can label a settled row without
+                        # falling back to humanising the identifier.
+                        from app.agent.tool_display import public_label
+                        _lbl = public_label(tool_name)
+                        if _lbl:
+                            event["label"] = _lbl
                         # Round 4 (items 1/8): pairing id, timing, step
                         # attribution (authoritative), and the domains/urls
                         # the call touched so the client can show favicons.

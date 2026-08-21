@@ -111,6 +111,34 @@ def _serialize_media(msg: Message) -> Optional[dict]:
     return media if isinstance(media, dict) else None
 
 
+def _serialize_app_artifact(msg: Message) -> Optional[dict]:
+    """The app this turn handed over. Shape: ``{"slug": "nokia-snake"}``.
+
+    Round 18. Before this key existed the clients recovered the slug by
+    regexing the `present_app` tool result for `/api/artifacts/<slug>` or
+    `[[open_app:<slug>]]` — which meant an internal route and a directive
+    token had to survive inside a 200-character cut of a sentence written for
+    the model, and had to keep being SHOWN to the user for the card to work at
+    all. The slug now rides its own field, so the prose is free to be prose.
+
+    Emitted by all four message readers for the reason api/message_cards.py
+    documents at length: a field carried by one serializer and not the others
+    disappears the moment a client takes its fallback path.
+    """
+    import json as _json
+    raw = getattr(msg, "metadata_json", None)
+    if not raw:
+        return None
+    try:
+        parsed = _json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    art = parsed.get("app_artifact")
+    return art if isinstance(art, dict) and art.get("slug") else None
+
+
 def _serialize_admin_notice(msg: Message) -> Optional[dict]:
     """Extract the operator notice persisted in metadata_json by
     app/agent/admin_message_writer.py. Shape: {dispatch_id, mode,
@@ -518,6 +546,7 @@ async def get_day_chat_messages(
                 "conversation_id": m.conversation_id,
                 "attachments": _serialize_attachments(m),
                 "media": _serialize_media(m),
+                "app_artifact": _serialize_app_artifact(m),
                 "admin_notice": _serialize_admin_notice(m),
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
@@ -592,6 +621,7 @@ async def get_day_chat_messages(
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
+            "app_artifact": _serialize_app_artifact(msg),
             "admin_notice": _serialize_admin_notice(msg),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),

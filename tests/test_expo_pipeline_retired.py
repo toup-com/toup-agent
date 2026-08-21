@@ -235,9 +235,28 @@ async def test_the_html_prompt_forbids_asking_questions_first(tmp_path, monkeypa
     assert "Do NOT ask the user questions first" in section
     assert "cdnjs.cloudflare.com" in section
     assert "app_html__create_app_file" in section
-    # The design pass is mandatory and names a real path.
-    assert "read_file(path=" in section
-    assert "toup-frontend-design.md" in section
+    # The design pass is mandatory and IS the prompt.
+    #
+    # This used to assert `read_file(path=` and `toup-frontend-design.md` —
+    # the prompt told the model to go and read an 8 KB markdown file before
+    # writing any UI. Round 18 removed that, twice over: a tool result is
+    # rendered to the user, so every build put the document's YAML
+    # frontmatter and its CSS token block in someone's chat; and it made a
+    # mandatory step out of a file read that fails on a container where
+    # neither candidate directory was writable, which is the cold-start
+    # failure this round was also asked to fix.
+    #
+    # The guidance is now inlined here, so the pass cannot be skipped, cannot
+    # fail, and cannot be shown to anyone.
+    assert "read_file(path=" not in section
+    assert "/app/skills" not in section
+    for rule in ("anti-slop", "focus-visible", "4.5:1", "cdnjs"):
+        assert rule in section, rule
+    # And the design body is really the packaged file, not a paraphrase that
+    # can drift from the copy a reviewer reads.
+    from app.agent.skills.builtins.app_html.skill import _packaged_design_skill
+    assert "Commit to a look before you write markup" in _packaged_design_skill()
+    assert "Commit to a look before you write markup" in section
 
 
 def test_the_exec_guard_can_never_emit_the_expo_redirect(monkeypatch):

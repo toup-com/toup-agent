@@ -35,18 +35,71 @@ logger = logging.getLogger(__name__)
 #: restarts and container recreations without a lookup table.
 _APP_NS = uuid.UUID("6f1d5f2e-9b3c-4a71-8d55-0c9a2f7e41b0")
 
-#: The five phases, in the order the pipeline walks them. Types are stable
-#: identifiers; labels are defaults that a call may override with detail
-#: ("Creating file: Budget Tracker").
-STEP_TYPES: List[tuple] = [
-    ("create", "Creating file"),
-    ("review", "Reading current app"),
-    ("edit", "Editing file"),
-    ("verify", "Verifying changes"),
-    ("present", "Presented app"),
-]
+#: The five phases, in the order the pipeline walks them.
+#:
+#: Round 18. A caller used to pass its own ``label=`` and the card rendered
+#: whatever it got, which is how a build came to show a step called
+#: ``9299 bytes``, one called ``exit 1``, one called ``revision 2`` and one
+#: called ``wc -c nokia-snake.html``. Those are a size, a POSIX status, a
+#: counter and a shell command — four kinds of machine output presented to
+#: someone who asked for a snake game, in the slot reserved for "what is
+#: happening now".
+#:
+#: So labels are no longer an argument. :func:`phase_label` owns every word
+#: that can appear on a step, keyed on the phase and its state; a caller may
+#: contribute a ``detail``, which the card shows only when the row is opened.
+#: There is no code path left through which a byte count can become a label.
+_PHASE_WORDS: Dict[str, Dict[str, str]] = {
+    "create":  {"pending": "Write the app",     "running": "Writing the app",
+                "done": "Wrote the app file",   "failed": "Couldn't write the app file"},
+    "review":  {"pending": "Read the app",      "running": "Reading the app",
+                "done": "Read the app",         "failed": "Couldn't read the app"},
+    "edit":    {"pending": "Update the app",    "running": "Updating the app",
+                "done": "Updated the app",      "failed": "Couldn't update the app"},
+    "verify":  {"pending": "Check the app",     "running": "Checking the app",
+                "done": "Checked the app",      "failed": "The app needs a fix"},
+    "present": {"pending": "Publish the app",   "running": "Publishing the app",
+                "done": "Published the app",    "failed": "Couldn't publish the app"},
+}
+
+STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "present"]
 
 SOURCE_HTML_ARTIFACT = "html_artifact"
+
+
+#: What the card says under the header when a phase fails.
+#:
+#: ``BuildJob.user_message`` is the ONLY error text the clients are allowed to
+#: render, and this pipeline never wrote one — so a failed app build fell
+#: through to the mobile card's fallback, which reads:
+#:
+#:     The build stopped partway. Nothing was changed.
+#:
+#: For a build whose `create` phase had already written the file, that is
+#: simply false, and it is false in the direction that matters: it tells
+#: someone their work is gone when it is on disk and one edit from working.
+#: A phase knows what it was doing, so it can say what actually happened.
+_PHASE_USER_MESSAGE: Dict[str, str] = {
+    "create":  "The app file couldn't be saved. Try again.",
+    "review":  "I couldn't read the app back just now. Try again.",
+    "edit":    "That change didn't go in — the app is exactly as it was.",
+    "verify":  "The app has a problem in its code, so I haven't shown it to "
+               "you yet. Ask me to fix it.",
+    "present": "The app isn't ready to open yet — it needs a fix first.",
+}
+
+#: Closed enum, from job_status. A phase of the pipeline failing IS a tool
+#: failure; inventing a new class would give every reader a value it does not
+#: route.
+_ERROR_CLASS = "tool_failure"
+
+
+def phase_label(step_type: str, status: str) -> str:
+    """The ONE place a step's user-visible words are chosen."""
+    words = _PHASE_WORDS.get(step_type)
+    if not words:
+        return "Working on your app"
+    return words.get(status) or words["running"]
 
 
 def app_id_for(user_id: str, slug: str) -> str:
@@ -55,8 +108,9 @@ def app_id_for(user_id: str, slug: str) -> str:
 
 def initial_steps() -> List[Dict[str, Any]]:
     return [
-        {"id": str(uuid.uuid4()), "type": t, "label": label, "status": "pending"}
-        for t, label in STEP_TYPES
+        {"id": str(uuid.uuid4()), "type": t,
+         "label": phase_label(t, "pending"), "status": "pending"}
+        for t in STEP_TYPES
     ]
 
 
@@ -221,18 +275,19 @@ async def emit_step(
     user_id: str,
     job_id: Optional[str],
     step_type: str,
-    label: str,
     status: str,
     detail: str = "",
 ) -> None:
     """Mark one phase and push it to the chat card + activity feed.
 
-    ``status`` ∈ {running, done, failed}. Mirrors
-    ``AppBuilderSkill._update_step`` so the two pipelines produce
-    indistinguishable feed rows during the migration window.
+    ``status`` ∈ {running, done, failed}. The label is derived from
+    ``step_type`` and ``status`` (see :func:`phase_label`) and is NOT a
+    parameter — see the note on :data:`_PHASE_WORDS`.
     """
     if not job_id:
         return
+    label = phase_label(step_type, status)
+    detail = (detail or "").strip()[:200]
     try:
         from app.db.database import async_session_maker
         from app.db.models import BuildJob, JobEvent
@@ -273,10 +328,36 @@ async def emit_step(
                 return
 
             job.steps_json = json.dumps(steps)
-            if status == "failed":
+            # Read off the steps, not latched from this one emit. A `verify`
+            # that failed and was then repaired and re-run is not a failed
+            # build — the retry overwrites the same row (steps are keyed by
+            # type), so the only honest reading of "is this job failing" is
+            # "is any step failing RIGHT NOW".
+            #
+            # A `completed` job is deliberately left alone when nothing is
+            # failing: an edit three turns later re-opens the same card, and
+            # flipping it back to *running* on a `view_app_file` that is never
+            # followed by a `present_app` would leave a finished build
+            # spinning forever.
+            any_failed = any(s.get("status") == "failed" for s in steps
+                             if isinstance(s, dict))
+            if any_failed:
                 job.status = "failed"
-            elif job.status in ("queued", "failed"):
-                job.status = "running"
+                # Say which phase, in the field the clients are allowed to
+                # render. Cleared below when the repair lands, so a card that
+                # recovered does not keep an explanation of a fixed problem.
+                if hasattr(job, "user_message"):
+                    job.user_message = _PHASE_USER_MESSAGE.get(
+                        step_type, "Something went wrong building this app. "
+                                   "Try again.")
+                if hasattr(job, "error_class"):
+                    job.error_class = _ERROR_CLASS
+            else:
+                if job.status in ("queued", "failed"):
+                    job.status = "running"
+                if getattr(job, "error_class", None) == _ERROR_CLASS:
+                    job.error_class = None
+                    job.user_message = None
 
             try:
                 meta: Dict[str, Any] = {"phase_type": step_type, "pipeline": "html_artifact"}
@@ -315,20 +396,68 @@ async def emit_step(
         logger.debug("[app_html] emit_step failed (non-fatal)", exc_info=True)
 
 
-async def finish_job(user_id: str, job_id: Optional[str]) -> None:
+async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
+    """Close the card, and make its arithmetic true.
+
+    Two things were wrong with the finished card and they were the same bug
+    seen from both ends. It always opened with all five phases pending, but a
+    plain build only ever walks three of them (write, check, publish) — so the
+    steps list settled at "3/5" while the header said *Built* and the bar was
+    hard-coded to 100%. The user could read 100%, 3 of 5, and a row with no
+    tick, all in one card.
+
+    Phases that never happened are dropped here rather than counted as
+    outstanding: they are not work left undone, they are work the build did
+    not need. What is left is every phase that actually ran, all of them
+    ``done``, which is a card whose bar, whose count and whose ticks agree.
+
+    Returns the final status, so the caller can tell a finished build from one
+    that closed with a phase still broken.
+    """
     if not job_id:
-        return
+        return None
+    final = "completed"
     try:
         from app.db.database import async_session_maker
         from app.db.models import BuildJob
         async with async_session_maker() as db:
             job = await db.get(BuildJob, job_id)
-            if job:
-                job.status = "completed"
-                job.completed_at = datetime.utcnow()
-                await db.commit()
+            if not job:
+                return None
+            try:
+                steps = json.loads(job.steps_json) if job.steps_json else []
+            except (TypeError, ValueError):
+                steps = []
+            walked = [s for s in steps
+                      if isinstance(s, dict) and s.get("status") != "pending"]
+            # A phase left `running` at the end never reported back. Calling
+            # it done would be inventing a result; calling it failed would be
+            # inventing a diagnosis. It is dropped for the same reason a
+            # pending one is — nothing is known about it.
+            walked = [s for s in walked if s.get("status") != "running"]
+            if any(s.get("status") == "failed" for s in walked):
+                final = "failed"
+            job.steps_json = json.dumps(walked or steps)
+            job.status = final
+            job.completed_at = datetime.utcnow()
+            title = (job.title or "").replace("Build: ", "")
+            await db.commit()
+
+        total = len(walked)
+        await _broadcast(user_id, {
+            "type": "job_update",
+            "job_id": job_id,
+            "name": title,
+            "status": final,
+            "step": phase_label("present", "done") if final == "completed" else "",
+            "total_steps": total,
+            "completed_steps": sum(
+                1 for s in walked if s.get("status") == "done"
+            ),
+        })
     except Exception:
         logger.debug("[app_html] finish_job failed (non-fatal)", exc_info=True)
+    return final
 
 
 async def upsert_app_row(

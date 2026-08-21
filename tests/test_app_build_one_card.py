@@ -83,7 +83,10 @@ async def test_the_pipeline_adopts_the_turns_job_instead_of_adding_one(test_user
     assert job.layer == 1
     assert job.app_id == steps_mod.app_id_for(test_user_id, "nokia-snake-classic")
     steps = json.loads(job.steps_json)
-    assert [s["type"] for s in steps] == [t for t, _ in steps_mod.STEP_TYPES]
+    # `STEP_TYPES` is a list of phase names since round 18 — the labels that
+    # used to ride alongside them moved into `phase_label`, because a caller
+    # being able to supply its own is how `9299 bytes` became a step's name.
+    assert [s["type"] for s in steps] == list(steps_mod.STEP_TYPES)
     assert (job.config_json or {}).get("adopted_by") == "app_html"
 
 

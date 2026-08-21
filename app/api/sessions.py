@@ -525,6 +525,13 @@ _TOOL_EVENT_KEYS = {
     # has no other way to find — without the job id and the totals beside
     # it, a voice record could not be bucketed the way a chat one is.
     "job_id", "step_name", "steps_total", "job_type", "call_id",
+    # Round 18: the human status line the backend chose for this tool, and
+    # the app a `present_app` record handed over. Both are written by
+    # `agent_runner` onto a chat record; an allowlist that omits them makes
+    # a record ingested through this route render differently from the same
+    # work done in chat — a row labelled "create app file" beside one
+    # labelled "Building your app".
+    "label", "app_slug",
 }
 _TOOL_EVENTS_MAX = 40
 
@@ -807,6 +814,12 @@ def _message_to_response(
         memories_retrieved=memories_retrieved,
         processing_time_ms=message.processing_time_ms,
         media=msg_metadata.get("media") if msg_metadata else None,
+        # The app this turn published ({"slug": …}). Same parity rule as
+        # every other metadata key on this row: the mobile client reads
+        # `m.app_artifact?.slug` FIRST and only falls back to parsing the
+        # tool prose, so a serializer that omits it sends the client back
+        # to the string it is no longer given.
+        app_artifact=msg_metadata.get("app_artifact") if msg_metadata else None,
         pending_action=msg_metadata.get("pending_action") if msg_metadata else None,
         # Operator notice (admin dispatch). The clients fall back from
         # /api/day-chats/.../messages to these session routes whenever
