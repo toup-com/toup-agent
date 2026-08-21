@@ -2351,6 +2351,46 @@ class Settings(BaseSettings):
     # images per calendar month; paid users and admins are unlimited. 0 = off.
     free_tier_monthly_image_limit: int = 10
 
+    # Prompt construction (`image_prompt.build_scene_prompt` /
+    # `build_image_spec`, via `_expand_scene`). These three were read with
+    # `getattr(settings, ..., default)` and never declared, so the defaults
+    # were the only reachable values — an undeclared field is not populated
+    # from the environment, which makes it un-tunable in production.
+    image_prompt_model: str = "gpt-4o-mini"
+    image_prompt_timeout_s: float = 20.0
+    # 600, not 300: a scene description is a few sentences, but a full
+    # specification names subject, setting, medium, composition, lighting and
+    # negative constraints. A prompt cut off mid-sentence is worse than the
+    # terse one it replaced.
+    image_prompt_max_tokens: int = 600
+
+    # ── Round 17: what surrounds the render ────────────────────────
+    # Four small model calls wrap every image job — look the named things up,
+    # describe the source, write a full spec, then check the result. Each is
+    # separately flag-killable and each fails open: a helper step must never
+    # cost a picture the user has already been charged for. Together they add
+    # roughly 6-10s to a job whose render alone is 25-400s.
+    #
+    # Vision model for the source description and the output check. gpt-4o
+    # rather than -mini: the check exists to catch an ABSENT subject ("Morty is
+    # not in this picture"), which is exactly where the cheaper model is least
+    # reliable, and it costs well under 1% of the image itself.
+    image_vision_model: str = "gpt-4o"
+    image_vision_timeout_s: float = 20.0
+    image_verify_timeout_s: float = 25.0
+    # Describe the edit source before writing the prompt. This is the medium
+    # lock — off, a cartoon edit is free to come back as a photograph.
+    image_source_describe_enabled: bool = True
+    # Look at the delivered image and report what is actually in it, so the
+    # agent describes the result instead of restating the request.
+    image_verify_enabled: bool = True
+    # Look named characters/objects/styles up on the web (TEXT only — retrieved
+    # images are never fetched and never used as a source) before writing the
+    # prompt. Routes through the same search gateway web_search uses.
+    image_grounding_enabled: bool = True
+    image_grounding_max_terms: int = 2
+    image_grounding_timeout_s: float = 8.0
+
     # Strip whitespace from API key fields on load (users often paste with spaces)
     _KEY_FIELDS = {
         "openai_api_key", "anthropic_api_key", "google_api_key",

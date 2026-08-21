@@ -615,6 +615,11 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "logo, icon, artwork, poster, or diagram. The image is delivered "
                 "to the user automatically as an inline attachment and also saved "
                 "to the workspace (so you can send_photo or reference it later). "
+                "The result states an `image_id` — pass it as edit_image's "
+                "`source_image_id` to change THIS picture afterwards — and a "
+                "description of what the finished picture actually contains. "
+                "Describe the picture to the user from that description, never "
+                "from what you asked for. "
                 "Do NOT use this to describe/read an existing image — that's "
                 "analyze_image. Higher quality and larger sizes cost more credits."
             ),
@@ -658,17 +663,23 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             "name": "edit_image",
             "description": (
                 "Edit / modify an EXISTING image from a text instruction. "
-                "Use this whenever the user attaches a photo (or "
-                "references one they sent) and asks you to change, modify, edit, "
-                "add, remove, replace, recolor, restyle, retouch, or transform it "
-                "— e.g. 'make the sky purple', 'remove the person in the back', "
-                "'add sunglasses', 'turn this into a watercolor'. By default it "
-                "edits the image the user most recently uploaded in the "
-                "conversation; pass `image` to target a specific workspace file or "
-                "URL. If the user references a photo they already sent (even a few "
-                "turns ago), just CALL this tool — it automatically finds their "
-                "most recently uploaded image. Do NOT ask them to re-upload first; "
-                "only ask if this returns an error saying no image is on record. "
+                "Use this whenever the user attaches a photo, or references any "
+                "picture already in this conversation — including one YOU just "
+                "generated — and asks you to change, modify, edit, add, remove, "
+                "replace, recolor, restyle, retouch, or transform it: 'make the "
+                "sky purple', 'remove the person in the back', 'add sunglasses', "
+                "'now make him hold a sword'. "
+                "WHICH IMAGE: every generate_image and edit_image result states "
+                "an `image_id`. When the user means a specific picture — almost "
+                "always the one you most recently made or they most recently "
+                "sent — pass that id as `source_image_id`. It is the only way to "
+                "be certain which picture you are editing. With no id this edits "
+                "the most recent image in THIS conversation whoever made it, "
+                "which is usually right but is a guess. Pass `image` instead for "
+                "a workspace file path or an https URL. "
+                "If the user references a picture from earlier in this chat, just "
+                "CALL this tool — do NOT ask them to re-upload; only ask if it "
+                "returns an error saying there is no image in this conversation. "
                 "The result is delivered inline and saved to the workspace. "
                 "Do NOT use this to create a picture from scratch (that's "
                 "generate_image) or to merely describe one (that's analyze_image). "
@@ -685,12 +696,24 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                             "sunset' or 'make the car red instead of blue'."
                         ),
                     },
+                    "source_image_id": {
+                        "type": "string",
+                        "description": (
+                            "The `image_id` of the picture to edit, as stated by "
+                            "the generate_image / edit_image result that produced "
+                            "it. PREFER THIS whenever you know which picture the "
+                            "user means — it is exact, where the default is a "
+                            "best guess at 'the most recent one'. An id that is "
+                            "not in this conversation is an error, never a "
+                            "silent substitution."
+                        ),
+                    },
                     "image": {
                         "type": "string",
                         "description": (
                             "Optional. A workspace file path or https image URL to "
-                            "edit. Omit to edit the user's most recently uploaded "
-                            "image in the conversation."
+                            "edit. Use only for a file that is not a chat "
+                            "attachment; otherwise prefer source_image_id."
                         ),
                     },
                     "size": {

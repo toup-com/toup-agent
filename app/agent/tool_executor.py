@@ -296,9 +296,10 @@ except Exception:  # pragma: no cover - depends on optional native wheel
 # stay exactly as shot. This steers the model to change only what was asked and
 # preserve the source's real texture/grain/lighting, while still deferring to an
 # explicit style request (e.g. "make it a cartoon").
-from app.agent.tool_display import ToolResult
+from app.agent.tool_display import ToolResult, display_of
 from app.agent.image_prompt import (
-    SCENE_SYSTEM_PROMPT, build_scene_prompt, check_clothing_guard, realism_suffix,
+    SCENE_SYSTEM_PROMPT, build_image_spec, build_scene_prompt,
+    check_clothing_guard, detect_medium, realism_suffix,
 )
 
 _EDIT_REALISM_SUFFIX = (
@@ -491,8 +492,12 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "send_file": 1_000,
     "send_photo": 1_000,
     "analyze_image": 10_000,
-    "generate_image": 1_000,
-    "edit_image": 1_000,
+    # Round 17: these carry the image_id, which source was used, and what a
+    # vision model saw in the result. At 1_000 the head-cut landed inside the
+    # observation — the one part of the result the agent must not answer
+    # without. Still tiny; an image tool returns prose, never a payload.
+    "generate_image": 4_000,
+    "edit_image": 4_000,
     "spawn": 1_000,
     "process": 10_000,
     "tts": 1_000,
@@ -1119,7 +1124,15 @@ class ToolExecutor:
                 limit = TOOL_OUTPUT_LIMITS.get(tool_name, DEFAULT_OUTPUT_LIMIT)
                 if len(result) > limit:
                     truncated_bytes = len(result) - limit
+                    # Slicing a `str` SUBCLASS returns a plain `str`, so the
+                    # naive form silently dropped the tool's `display` and the
+                    # user-facing pill fell back to the redacted model text.
+                    # Nothing hit the cap when every ToolResult was short; the
+                    # image tools now return prose that can.
+                    _display = display_of(result)
                     result = result[:limit] + f"\n\n[truncated, {truncated_bytes} more bytes]"
+                    if _display:
+                        result = ToolResult(result, display=_display)
 
             # Fence external/ingested tool output as untrusted DATA so injected
             # instructions inside a fetched page / email / DOM can't be executed
@@ -3528,10 +3541,15 @@ class ToolExecutor:
         return _b64.b64decode(b64)
 
     async def _persist_deliver_image(self, img_bytes: bytes, filename: str,
-                                     mime: str = "image/png") -> str:
-        """Persist an image attachment + drop a workspace copy; return the
-        delivery summary. Shared finish step for the Kie image path (the OpenAI
-        path keeps its own inline persist so its BYO credit self-report stays)."""
+                                     mime: str = "image/png"):
+        """Persist an image attachment + drop a workspace copy; return
+        ``(summary, attachment_id)``. Shared finish step for the Kie image path
+        (the OpenAI path keeps its own inline persist so its BYO credit
+        self-report stays).
+
+        The id comes back because it is the handle a follow-up edit needs: it
+        is minted here, it is what the tool result must name, and there is no
+        second place to look it up from before the turn is saved."""
         from app.agent.doc_generators import _persist
         uid = self._current_user_id or ""
         att = await _persist(img_bytes, filename, mime, uid or self._user_scope())
@@ -3540,7 +3558,172 @@ class ToolExecutor:
                 f.write(img_bytes)
         except Exception:
             logger.debug("image workspace copy skipped", exc_info=True)
-        return await self._register_attachment(att)
+        return await self._register_attachment(att), att.id
+
+    # ── Image grounding / description / verification ──────────────────
+    # Three small model calls wrapped around every image render. Each one is
+    # optional, individually flagged, individually timed out, and fails open:
+    # a picture the user has already paid for must never be lost to a helper
+    # step. See image_grounding.py, image_prompt.py and image_review.py for
+    # what each exists to fix.
+
+    def _image_thread_scope(self) -> str:
+        """Cache partition for per-conversation image lookups."""
+        return _SESSION_ID_CTX.get() or (self._current_user_id or "anon")
+
+    async def _image_vision(self, img_bytes: bytes, mime: str, system: str,
+                            question: str, *, timeout: float,
+                            max_tokens: int = 500) -> str:
+        """One vision call over raw bytes. Returns "" on any failure.
+
+        `_tool_analyze_image` takes a path or a URL; every caller here holds
+        bytes that are not on disk yet (the render's output, a source loaded
+        from object storage), so this is the bytes-shaped sibling rather than a
+        detour through a temp file.
+        """
+        try:
+            import base64 as _b64
+            from app.services.bundle_client import make_openai_client
+            from app.services.key_provider import keys
+            client = make_openai_client(byok_key=(keys.openai or None))
+            if client is None:
+                return ""
+            data = _b64.b64encode(img_bytes).decode("utf-8")
+            resp = await client.chat.completions.create(
+                model=getattr(settings, "image_vision_model", "gpt-4o") or "gpt-4o",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": question},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mime or 'image/png'};base64,{data}"}},
+                    ]},
+                ],
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception:  # noqa: BLE001 — advisory step, never fails a picture
+            logger.info("image vision call failed", exc_info=True)
+            return ""
+
+    _SOURCE_DESCRIBE_SYSTEM = (
+        "Describe an image that is about to be edited, for the model that will "
+        "edit it. In two or three plain sentences state: the MEDIUM and art "
+        "style (photograph, 2D cartoon, anime, 3D render, oil painting, pencil "
+        "sketch, flat vector, screenshot); every person or character visible, "
+        "with their distinctive features, hair, build and clothing; and the "
+        "setting and framing. Name the medium first and always. Describe only "
+        "what you can see."
+    )
+
+    async def _describe_image_source(self, img_bytes: bytes, mime: str) -> str:
+        """What the edit source actually is. "" when unavailable.
+
+        This is what locks the medium: without it the edit prompt's realism
+        suffix says "if the source is a real photograph, keep it
+        photorealistic" — a conditional the renderer resolves toward realism
+        whatever the source is, which is how a cartoon came back as a photo.
+        """
+        if not getattr(settings, "image_source_describe_enabled", True):
+            return ""
+        return await self._image_vision(
+            img_bytes, mime, self._SOURCE_DESCRIBE_SYSTEM,
+            "Describe this image for the model that is about to edit it.",
+            timeout=float(getattr(settings, "image_vision_timeout_s", 20.0)),
+            max_tokens=350,
+        )
+
+    async def _ground_image_terms(self, instruction: str) -> str:
+        """Reference notes for named things in `instruction`. "" when off/none.
+
+        Wires the image path into the same search gateway `web_search` uses —
+        tier 0 of which is a 7-minute shared result cache, on top of this
+        module's own per-conversation cache — so a run of edits on one
+        character costs one lookup.
+        """
+        if not getattr(settings, "image_grounding_enabled", True):
+            return ""
+        from app.agent import image_grounding
+
+        async def _search(query: str, count: int) -> str:
+            return str(await self._tool_web_search({"query": query, "count": count}))
+
+        notes = await image_grounding.ground_terms(
+            instruction,
+            scope=self._image_thread_scope(),
+            search=_search,
+            max_terms=int(getattr(settings, "image_grounding_max_terms", 2)),
+            timeout_s=float(getattr(settings, "image_grounding_timeout_s", 8.0)),
+        )
+        if notes:
+            logger.info("[IMAGE] grounded %d term(s) for this prompt", len(notes))
+        return image_grounding.format_reference_notes(notes)
+
+    async def _verify_image_output(self, img_bytes: bytes, request: str, *,
+                                   source_description: str = "",
+                                   operation: str = "image"):
+        """Look at what was rendered. Returns an `image_review.Verdict`.
+
+        An unavailable verdict is a real answer here — `render_for_model` says
+        "not verified" rather than implying a clean check, because an agent
+        told nothing is an agent that restates the request.
+        """
+        from app.agent.image_review import (
+            VERIFY_SYSTEM_PROMPT, Verdict, parse_verdict, verify_question,
+        )
+        if not getattr(settings, "image_verify_enabled", True):
+            return Verdict()
+        raw = await self._image_vision(
+            img_bytes, "image/png", VERIFY_SYSTEM_PROMPT,
+            verify_question(request, source_description=source_description or None),
+            timeout=float(getattr(settings, "image_verify_timeout_s", 25.0)),
+            max_tokens=500,
+        )
+        verdict = parse_verdict(raw)
+        if verdict.diverged:
+            logger.info("[IMAGE] %s diverged from the request: missing=%s",
+                        operation, verdict.missing)
+        return verdict
+
+    @staticmethod
+    def _image_display(verb: str, filename: str, *, grounded: bool = False,
+                       verdict=None, source: str = "") -> str:
+        """The USER-facing sentence for the tool pill / job card.
+
+        This is the only place the extra work becomes visible to the person
+        waiting: which picture was used as the source, whether the agent had
+        to look something up, and whether the result came back different from
+        what was asked for. There is no per-tool sub-step frame — the clients
+        render one line per tool call — so the line has to carry it.
+        """
+        head = f"{verb} {filename}"
+        if source:
+            head = f"{verb} {filename} from {source}"
+        bits = []
+        if grounded:
+            bits.append("looked up the reference first")
+        if verdict is not None and getattr(verdict, "diverged", False):
+            bits.append("result differs from the request")
+        return f"{head} — {'; '.join(bits)}" if bits else head
+
+    @staticmethod
+    def _image_result_block(*, attachment_id: str, source_line: str,
+                            verdict, operation: str, summary: str) -> str:
+        """The model-facing tail every image tool now returns.
+
+        Order is deliberate: the id first (a follow-up edit needs it and must
+        not have to parse prose for it), then what the source was, then what
+        the picture actually shows. The attachment summary goes last because
+        it is the only part the model never has to reason about.
+        """
+        from app.agent.image_review import render_for_model
+        parts = [f"image_id: {attachment_id} — pass this as source_image_id to edit THIS picture."]
+        if source_line:
+            parts.append(f"source: {source_line}")
+        parts.append(render_for_model(verdict, operation=operation).lstrip("\n"))
+        parts.append(summary)
+        return "\n".join(p for p in parts if p)
 
     async def _openai_generate_image(self, client, model, prompt, size, quality):
         """Call OpenAI images.generate for `model`; return base64 PNG string.
@@ -3580,10 +3763,13 @@ class ToolExecutor:
         prompt = (inp.get("prompt") or "").strip()
         if not prompt:
             return "ERROR: 'prompt' is required — describe the image to generate."
+        request = prompt  # what the USER asked for; verification judges against this
 
         # Same rule on both paths, one implementation. A generated image has no
         # source subject to undress, but "generate a nude portrait of <person>"
-        # is the same product decision and the same refusal.
+        # is the same product decision and the same refusal. Run it on the raw
+        # request BEFORE spending anything on grounding or expansion, and again
+        # on the constructed prompt below.
         _ok, _refusal = check_clothing_guard(prompt)
         if not _ok:
             return f"ERROR: {_refusal}"
@@ -3599,6 +3785,20 @@ class ToolExecutor:
         filename = _safe_filename(raw_name, "png")
         if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
             filename = f"{filename}.png"
+
+        # ── Ground, then construct ─────────────────────────────────────
+        # A renderer never says "I don't know what that looks like"; it draws
+        # something. So look the named things up first, and hand the spec
+        # builder prose instead of a name it can only echo.
+        _notes = await self._ground_image_terms(prompt)
+        _grounded = bool(_notes)
+        prompt, _expanded = await build_image_spec(
+            prompt, mode="generate", reference_notes=_notes or None,
+            expand=self._expand_scene,
+        )
+        _ok, _refusal = check_clothing_guard(prompt)
+        if not _ok:
+            return f"ERROR: {_refusal}"
 
         # PRIMARY: Nano Banana (Kie) for the highest-quality natural result.
         # Charging + the free-tier cap happen platform-side. On the free cap we
@@ -3622,14 +3822,24 @@ class ToolExecutor:
                 logger.warning("generate_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
                 _kb = None
             if _kb:
-                summary = await self._persist_deliver_image(_kb, filename, "image/png")
+                summary, _att_id = await self._persist_deliver_image(_kb, filename, "image/png")
+                _verdict = await self._verify_image_output(
+                    _kb, request, operation="generated image")
                 # White-label (audit-2026 re-audit round 7): never surface the
                 # underlying image engine name to the model/user.
                 # The user-facing half names the picture and nothing else — the
                 # model still receives the full sentence. See tool_display.py.
                 return ToolResult(
-                    f"Image generated and delivered to the user. {summary}",
-                    display=f"Created {filename}",
+                    "Image generated and delivered to the user.\n"
+                    + self._image_result_block(
+                        attachment_id=_att_id,
+                        source_line="",
+                        verdict=_verdict,
+                        operation="generated image",
+                        summary=summary,
+                    ),
+                    display=self._image_display(
+                        "Created", filename, grounded=_grounded, verdict=_verdict),
                 )
 
         # ONE client factory for both bundle (→ platform LLM proxy, which also
@@ -3728,10 +3938,20 @@ class ToolExecutor:
             logger.exception("generate_image credit report failed (non-fatal)")
 
         summary = await self._register_attachment(att)
+        verdict = await self._verify_image_output(
+            img_bytes, request, operation="generated image")
         return ToolResult(
             f"Image generated ({size}, {quality} quality) and "
-            f"delivered to the user. {summary}",
-            display=f"Created {filename}",
+            f"delivered to the user.\n"
+            + self._image_result_block(
+                attachment_id=att.id,
+                source_line="",
+                verdict=verdict,
+                operation="generated image",
+                summary=summary,
+            ),
+            display=self._image_display(
+                "Created", filename, grounded=_grounded, verdict=verdict),
         )
 
     # ------------------------------------------------------------------
@@ -3739,9 +3959,16 @@ class ToolExecutor:
     # ------------------------------------------------------------------
     async def _expand_scene(self, system: str, instruction: str) -> str:
         """One small model call that turns a short instruction into a coherent
-        scene. Deliberately cheap and deliberately optional — `build_scene_prompt`
-        falls back to the user's own words on any failure, because a broken
-        expander must never stop someone editing a photograph."""
+        scene, and (Round 17) into a full specification. Deliberately cheap and
+        deliberately optional — both `build_scene_prompt` and `build_image_spec`
+        fall back to the user's own words on any failure, because a broken
+        expander must never stop someone editing a photograph.
+
+        The token ceiling is 600, not the original 300: a scene description is
+        two to four sentences, but a specification names subject, setting,
+        medium, composition, lighting and negative constraints. At 300 the
+        answer stops mid-sentence, and a prompt that ends mid-sentence is a
+        worse prompt than the terse one it replaced."""
         from app.services.bundle_client import make_openai_client
         from app.services.key_provider import keys
         client = make_openai_client(byok_key=(keys.openai or None))
@@ -3753,7 +3980,7 @@ class ToolExecutor:
                 {"role": "system", "content": system},
                 {"role": "user", "content": instruction},
             ],
-            max_tokens=300,
+            max_tokens=int(getattr(settings, "image_prompt_max_tokens", 600)),
             temperature=0.4,
             timeout=getattr(settings, "image_prompt_timeout_s", 20.0),
         )
@@ -3782,53 +4009,15 @@ class ToolExecutor:
             raise RuntimeError("OpenAI response did not include b64_json")
         return b64
 
-    async def _recent_uploaded_image(self) -> Optional[Dict[str, Any]]:
-        """Most-recently-uploaded image attachment from conversation history.
-
-        edit_image's per-turn ``_inbound_media`` is empty when the user asks to
-        edit a photo they sent on an EARLIER turn ("edit my image" with no new
-        attachment). Inbound uploads are persisted to ``Message.attachments``
-        (WS handler / PR #246), so scan recent user messages for the newest
-        image and return its attachment dict — the same
-        ``{storage_path, filename, mime_type, ...}`` shape the inbound path
-        uses. Returns None when the user has no uploaded image on record.
-        """
-        try:
-            from app.db.database import async_session_maker
-            from app.db.models import Conversation, Message
-            from sqlalchemy import select, and_
-
-            user_id = self._current_user_id
-            stmt = select(Message)
-            if user_id:
-                # Scope to this user (the agent DB is per-tenant, but the join
-                # keeps us correct on any shared-DB deployment).
-                stmt = stmt.join(
-                    Conversation, Message.conversation_id == Conversation.id
-                ).where(Conversation.user_id == user_id)
-            stmt = (
-                stmt.where(
-                    and_(Message.role == "user", Message.attachments.isnot(None))
-                )
-                .order_by(Message.created_at.desc())
-                .limit(25)
-            )
-            async with async_session_maker() as db:
-                rows = (await db.execute(stmt)).scalars().all()
-            # rows are newest-first; within a message, the last image is the
-            # most recent — mirrors the per-turn `_inbound[-1]` selection.
-            for _m in rows:
-                imgs = [
-                    a for a in (_m.attachments or [])
-                    if isinstance(a, dict)
-                    and str(a.get("mime_type", "")).startswith("image/")
-                    and a.get("storage_path")
-                ]
-                if imgs:
-                    return imgs[-1]
-        except Exception:
-            logger.exception("edit_image: recent-image history lookup failed")
-        return None
+    # `_recent_uploaded_image` used to live here. It returned the newest image
+    # on a ``role == "user"`` message, across EVERY conversation the user has.
+    # Both halves were wrong and together they are the Round 16 defect: a
+    # picture the agent had just generated rides an ASSISTANT message and so
+    # could never be a candidate, while the pointer that did win reached out of
+    # the thread for a selfie from another chat. Selection now lives in
+    # `app.agent.image_artifacts` — thread-scoped, both roles, and shared by
+    # the implicit and by-id paths so they cannot disagree about what is
+    # addressable.
 
     @staticmethod
     def _normalize_edit_source(src_bytes: bytes, src_name: str, src_mime: str):
@@ -3867,6 +4056,7 @@ class ToolExecutor:
         prompt = (inp.get("prompt") or "").strip()
         if not prompt:
             return "ERROR: 'prompt' is required — describe how to change the image."
+        request = prompt  # what the USER asked for; verification judges against this
 
         size = (inp.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")).strip()
         quality = (inp.get("quality") or getattr(settings, "image_gen_default_quality", "high")).strip().lower()
@@ -3874,6 +4064,9 @@ class ToolExecutor:
         import base64
         import uuid as _uuid
         from app.agent.doc_generators import _safe_filename, _persist
+        from app.agent.image_artifacts import (
+            choices_hint, resolve_by_id, resolve_implicit, thread_images,
+        )
 
         _EXT_MIME = {
             ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -3881,11 +4074,41 @@ class ToolExecutor:
         }
 
         # ── Resolve the SOURCE image bytes ─────────────────────────────
+        # Three ways in, in order of how explicit they are. An id that does not
+        # resolve is an ERROR, never a fall-through to "the newest image":
+        # silently editing a different picture than the one named is exactly
+        # the failure this round exists to end.
         src_bytes = None
         src_name = "source.png"
         src_mime = "image/png"
+        src_art = None
+        source_line = ""
         _img_arg = (inp.get("image") or "").strip()
-        if _img_arg:
+        _img_id = (inp.get("source_image_id") or inp.get("image_id") or "").strip()
+
+        if _img_id:
+            src_art = await resolve_by_id(
+                _img_id,
+                conversation_id=_SESSION_ID_CTX.get(),
+                user_id=self._current_user_id,
+                pending_attachments=self.pending_attachments,
+                inbound_media=self._inbound_media,
+            )
+            if src_art is None:
+                _all = await thread_images(
+                    conversation_id=_SESSION_ID_CTX.get(),
+                    user_id=self._current_user_id,
+                )
+                _hint = choices_hint(_all)
+                return (
+                    f"ERROR: No image with id {_img_id} in this conversation. "
+                    "Do not guess a different image — every generate_image / "
+                    "edit_image result states its own image_id, so use one of "
+                    "those, or omit source_image_id to edit the most recent "
+                    "image in this conversation."
+                    + (f"\n{_hint}" if _hint else "")
+                )
+        elif _img_arg:
             # Explicit workspace-relative path or https URL (mirrors analyze_image).
             try:
                 if _img_arg.lower().startswith(("http://", "https://")):
@@ -3914,29 +4137,37 @@ class ToolExecutor:
             except Exception as exc:
                 return f"ERROR: Could not read the image to edit ({_img_arg}): {exc}"
         else:
-            # Default: the user's most-recently-uploaded image. Prefer THIS
-            # turn's upload (no DB hit); otherwise fall back to the most recent
-            # image in conversation history, so "edit the photo I sent earlier"
-            # works without forcing a re-attach (inbound uploads are persisted
-            # to Message.attachments — see the WS handler / PR #246).
-            _inbound = [a for a in self._inbound_media
-                        if str(a.get("mime_type", "")).startswith("image/")]
-            _att = _inbound[-1] if _inbound else await self._recent_uploaded_image()
-            if not _att:
+            # "it" / "the image" / "that pic" — the newest image in THIS
+            # conversation, whoever put it there. Not "the user's newest upload
+            # anywhere", which is what Round 16 edited.
+            src_art = await resolve_implicit(
+                conversation_id=_SESSION_ID_CTX.get(),
+                user_id=self._current_user_id,
+                pending_attachments=self.pending_attachments,
+                inbound_media=self._inbound_media,
+            )
+            if src_art is None:
                 return (
-                    "ERROR: No image to edit — you haven't sent one yet. Attach a "
-                    "photo (this turn or an earlier one), or pass 'image' (a "
-                    "workspace file path or an image URL)."
+                    "ERROR: There is no image in this conversation to edit. Ask "
+                    "the user to attach the photo they mean, or generate one "
+                    "first. Do NOT reach for a picture from a different chat."
                 )
+
+        if src_art is not None:
             try:
                 from app.services.file_storage import get_storage_backend
-                with get_storage_backend().open(_att["storage_path"]) as _f:
+                with get_storage_backend().open(src_art.storage_path) as _f:
                     src_bytes = _f.read()
-                src_name = _att.get("filename") or "source.png"
-                src_mime = _att.get("mime_type") or "image/png"
+                src_name = src_art.filename
+                src_mime = src_art.mime_type
             except Exception as exc:
                 logger.exception("edit_image: failed to load source image")
                 return f"ERROR: Could not load the image to edit: {exc}"
+            source_line = f"{src_art.describe()}, image_id {src_art.id}"
+            logger.info("[IMAGE] edit source: origin=%s scope=%s id=%s",
+                        src_art.origin, src_art.turn_scope, src_art.id[:8])
+        elif _img_arg:
+            source_line = f"the file you named explicitly ({src_name})"
 
         if not src_bytes:
             return "ERROR: No image bytes to edit."
@@ -3945,17 +4176,35 @@ class ToolExecutor:
         # successfully FOUND doesn't then fail at OpenAI on its declared type.
         src_bytes, src_name, src_mime = self._normalize_edit_source(src_bytes, src_name, src_mime)
 
-        # ── Scene coherence, then the guard ────────────────────────────
-        # "Put me in the pool" is not satisfied by moving the subject: the old
-        # suffix said "make ONLY the change described / preserve the rest
-        # exactly", which is literally the instruction that kept a t-shirt and
-        # a sun hat on a man sitting in an infinity pool. When the setting
-        # changes, the dependent changes are required.
+        # ── Look at the source, look things up, then write the prompt ───
+        # These two are independent and both sit on a path a person is waiting
+        # on, so they run together. A gather is safe here precisely because
+        # neither writes a ContextVar — the grounding cache is a module-level
+        # dict for that reason (see image_grounding).
+        _src_desc, _notes = await asyncio.gather(
+            self._describe_image_source(src_bytes, src_mime),
+            self._ground_image_terms(prompt),
+        )
+        _grounded = bool(_notes)
+        _medium = detect_medium(_src_desc)
+
+        # ── Scene coherence, then the full spec, then the guard ────────
+        # `build_scene_prompt` only fires on a SETTING cue (pool, snow, gala…);
+        # "make morty playing with the portal machine" has none, so Round 16's
+        # edit reached the renderer as eleven words. It stays as the scene layer
+        # it was written to be, and `build_image_spec` runs over its output on
+        # every edit — including the ones with no scene cue at all.
         prompt, _scene_changed = await build_scene_prompt(prompt, expand=self._expand_scene)
+        prompt, _expanded = await build_image_spec(
+            prompt, mode="edit",
+            source_description=_src_desc or None,
+            reference_notes=_notes or None,
+            expand=self._expand_scene,
+        )
         _ok, _refusal = check_clothing_guard(prompt)
         if not _ok:
             return f"ERROR: {_refusal}"
-        _suffix = realism_suffix(_scene_changed)
+        _suffix = realism_suffix(_scene_changed, source_medium=_medium)
 
         raw_name = (inp.get("filename") or "").strip() or f"edited_{_uuid.uuid4().hex[:8]}.png"
         filename = _safe_filename(raw_name, "png")
@@ -3990,11 +4239,22 @@ class ToolExecutor:
                 logger.warning("edit_image: Kie failed, falling back to OpenAI (%s)", kie_exc)
                 _kb = None
             if _kb:
-                summary = await self._persist_deliver_image(_kb, filename, "image/png")
+                summary, _att_id = await self._persist_deliver_image(_kb, filename, "image/png")
+                _verdict = await self._verify_image_output(
+                    _kb, request, source_description=_src_desc, operation="edit")
                 # White-label (audit-2026 re-audit round 7): no engine name.
                 return ToolResult(
-                    f"Image edited and delivered to the user. {summary}",
-                    display=f"Edited {filename}",
+                    "Image edited and delivered to the user.\n"
+                    + self._image_result_block(
+                        attachment_id=_att_id,
+                        source_line=source_line,
+                        verdict=_verdict,
+                        operation="edit",
+                        summary=summary,
+                    ),
+                    display=self._image_display(
+                        "Edited", filename, grounded=_grounded, verdict=_verdict,
+                        source=src_art.describe() if src_art else ""),
                 )
 
         # ONE client factory: bundle (→ platform proxy /images/edits, which also
@@ -4084,10 +4344,21 @@ class ToolExecutor:
             logger.exception("edit_image credit report failed (non-fatal)")
 
         summary = await self._register_attachment(att)
+        verdict = await self._verify_image_output(
+            img_bytes, request, source_description=_src_desc, operation="edit")
         return ToolResult(
             f"Image edited ({size}, {quality} quality) and "
-            f"delivered to the user. {summary}",
-            display=f"Edited {filename}",
+            f"delivered to the user.\n"
+            + self._image_result_block(
+                attachment_id=att.id,
+                source_line=source_line,
+                verdict=verdict,
+                operation="edit",
+                summary=summary,
+            ),
+            display=self._image_display(
+                "Edited", filename, grounded=_grounded, verdict=verdict,
+                source=src_art.describe() if src_art else ""),
         )
 
     # ------------------------------------------------------------------

@@ -162,8 +162,33 @@ from app.config import settings
 #
 # Cost accepted a sixth time: no ADDITIONAL re-warm (same release as the
 # fifth).
+#
+# MOVED A SEVENTH TIME, DELIBERATELY, 2026-08-21 (was 4d695a68…1d4f836ba, 61).
+# Round 17. `edit_image` gains ONE optional property, `source_image_id`, and
+# both image tools' descriptions are rewritten. Still 61 definitions; no tool
+# added, removed or reordered.
+#
+# This one is not a wording preference — the old description is a named cause
+# of the incident. It said: "just CALL this tool — it automatically finds
+# their most recently uploaded image. Do NOT ask them to re-upload first."
+# That sentence steers the model AWAY from naming a source, into a resolver
+# that could only return an UPLOAD (it filtered `role == "user"`, and a
+# generated image rides the assistant message) and searched every conversation
+# the user had. So a user who asked to edit the picture the agent had just
+# made got a selfie from another chat, edited into a science-fiction lab.
+#
+# The schema half is load-bearing for the same reason `memory_read_file` was:
+# no description can substitute for a parameter that does not exist. The model
+# cannot name a picture it has no field to name it in, and `image` (a path or
+# URL) is not that field — the attachment id is what the result now returns.
+#
+# The description half has to be on the tool, not the system prompt, because
+# the description is the text the model reads at the moment it decides WHICH
+# picture it is editing.
+#
+# Cost accepted a seventh time: one more prompt-cache re-warm per tenant.
 MAIN_CORE_TOOLS_SHA256 = (
-    "4d695a6856cf9488e1f6def0cd1b7507ff2450a8f125193a079219d1d4f836ba"
+    "31c014773f8467bc3b1425c1470aa794fa297a248793d083906b83e035d92ba2"
 )
 MAIN_CORE_TOOLS_COUNT = 61
 
