@@ -710,3 +710,53 @@ def test_the_finding_is_worded_as_something_to_fix_and_names_no_internals():
     assert v.counts_as_breakage(msg, from_console=False) is True
     for machinery in ("app_html", "ERROR:", "/app/", "setInterval("):
         assert machinery not in msg
+
+
+# ── 7. Which build a turn was, after the app is relaunched ────────────
+#
+# The build card is drawn from a job id, and the job id reached the client
+# only on `job_update` frames — a live-only channel. So a turn that showed
+# one card while it ran came back, on the next launch, as the generic
+# "N actions" rail that this round exists to remove. Measured on a
+# simulator: correct live, degraded on reload.
+#
+# The fix is the same one `app_slug` already got one commit earlier — a
+# FIELD on the tool record — so these assert the two places a field like
+# that gets silently lost: the derivation, and the persistence allowlist.
+
+
+def test_the_build_job_id_survives_the_ingest_allowlist():
+    # `_clean_tool_events` drops every key not named here, so a field the
+    # runner stamps and this set omits reaches chat and not history — which
+    # is indistinguishable, from the client, from never having been sent.
+    from app.api.sessions import _TOOL_EVENT_KEYS
+    assert "job_id" in _TOOL_EVENT_KEYS
+    assert "app_slug" in _TOOL_EVENT_KEYS
+
+
+def test_a_cleaned_tool_event_keeps_the_build_it_belongs_to():
+    from app.api.sessions import _clean_tool_events
+    out = _clean_tool_events([{
+        "tool": "app_html__present_app",
+        "call_id": "call_1",
+        "started_at_ms": 1,
+        "completed_at_ms": 2,
+        "summary": "Tip & Split is ready.",
+        "label": "Finishing your app",
+        "app_slug": "tip-split",
+        "job_id": "c028d8f4-835b-4178-8279-d3c49eb93d8e",
+    }])
+    assert out and out[0]["job_id"] == "c028d8f4-835b-4178-8279-d3c49eb93d8e"
+    assert out[0]["app_slug"] == "tip-split"
+
+
+def test_the_job_id_is_derived_from_the_slug_the_pipeline_owns():
+    # The client must never recompute this: `_APP_NS` and the `user:slug` key
+    # are steps.py's private business, and a client copy would break silently
+    # the day either changed. So the derivation is asserted HERE.
+    from app.agent.skills.builtins.app_html import steps as s
+    a = s.app_id_for("user-1", "tip-split")
+    assert a == s.app_id_for("user-1", "tip-split")        # stable
+    assert a != s.app_id_for("user-2", "tip-split")        # per user
+    assert a != s.app_id_for("user-1", "tip-splits")       # per slug
+    assert s.job_id_for_slug.__doc__ and "client" in s.job_id_for_slug.__doc__

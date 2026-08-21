@@ -3313,6 +3313,30 @@ class AgentRunner:
                     if isinstance(_slug, str) and _slug.strip():
                         _rec["app_slug"] = _slug.strip()
                         _presented_apps.append(_slug.strip())
+                        # …and WHICH BUILD it was, for the same reason and by
+                        # the same rule. The card above the artifact is drawn
+                        # from a job id that, until now, existed only on the
+                        # live `job_update` frames — so the turn looked right
+                        # while it ran and lost its build card on the next
+                        # launch, falling back to the "N actions" rail. A
+                        # field, not a regex over prose; resolved by the
+                        # pipeline that owns the key.
+                        try:
+                            from app.agent.skills.builtins.app_html import (
+                                steps as _app_steps,
+                            )
+                            _jid = await _app_steps.job_id_for_slug(
+                                user_id or "", _slug.strip(),
+                            )
+                            if _jid:
+                                _rec["job_id"] = _jid
+                        except Exception:  # noqa: BLE001
+                            # A missing job id costs the build card on reload,
+                            # which is the status quo — never the tool result.
+                            logger.debug(
+                                "[app_html] build-job lookup failed for the "
+                                "tool record", exc_info=True,
+                            )
                 tool_event_records.append(_rec)
                 if on_tool_end:
                     # The tool's USER-facing sentence, never its model-facing

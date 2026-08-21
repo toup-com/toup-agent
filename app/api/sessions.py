@@ -531,7 +531,10 @@ _TOOL_EVENT_KEYS = {
     # a record ingested through this route render differently from the same
     # work done in chat — a row labelled "create app file" beside one
     # labelled "Building your app".
-    "label", "app_slug",
+    # …and, for the same reason, WHICH BUILD produced it: the build card in a
+    # reopened thread is drawn from this id, and dropping it here would make an
+    # ingested record render as the generic "N actions" rail.
+    "label", "app_slug", "job_id",
 }
 _TOOL_EVENTS_MAX = 40
 

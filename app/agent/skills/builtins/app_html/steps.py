@@ -106,6 +106,24 @@ def app_id_for(user_id: str, slug: str) -> str:
     return str(uuid.uuid5(_APP_NS, f"{user_id or 'local'}:{slug}"))
 
 
+async def job_id_for_slug(user_id: str, slug: str) -> Optional[str]:
+    """The build job backing this app, by the key the surfaces join on.
+
+    Exists so the TURN can record which job its build card is, the same way
+    it already records which app it presented. Without it the job id lived
+    only on the `job_update` frames — a live-only channel — so a thread
+    reopened after a relaunch had the artifact card (a persisted field) and
+    no build card, and the row fell back to the generic "N actions" rail
+    that round 18 exists to remove. Verified on a simulator: correct while
+    the turn was on screen, degraded on the next launch.
+
+    The derivation stays HERE rather than in the client, because `_APP_NS`
+    and the `user:slug` key are this module's private business and a client
+    that recomputed them would break silently the day either changed.
+    """
+    return await _existing_job_for_app(app_id_for(user_id, slug))
+
+
 def initial_steps() -> List[Dict[str, Any]]:
     return [
         {"id": str(uuid.uuid4()), "type": t,
