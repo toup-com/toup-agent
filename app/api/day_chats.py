@@ -54,6 +54,10 @@ def _attachment_urls(message_id: str, att: dict) -> dict:
     out = {"download_url": f"{_settings.api_prefix}/files/{message_id}/{aid}"}
     if mime in _PREVIEW_MIMES or mime.startswith("image/"):
         out["preview_url"] = f"{_settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
+    # Reload path: the same inline derivative the live frame advertises, so a
+    # thread opened from history is not slower than one watched live.
+    if att.get("has_thumb"):
+        out["thumb_url"] = f"{_settings.api_prefix}/files/{message_id}/{aid}?variant=thumb"
     return out
 
 

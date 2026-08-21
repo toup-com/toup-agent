@@ -3513,6 +3513,13 @@ async def ws_chat(
                     if att.get("width") and att.get("height"):
                         payload["width"] = att["width"]
                         payload["height"] = att["height"]
+                    # The inline card loads THIS, never the original: a
+                    # generated PNG is ~2.4 MB and the card draws it ~370pt
+                    # wide. Same field-by-field rule as the dimensions above.
+                    if att.get("has_thumb"):
+                        payload["thumb_url"] = (
+                            f"{settings.api_prefix}/files/{message_id}/{aid}?variant=thumb"
+                        )
                     try:
                         await websocket.send_json(payload)
                     except Exception:

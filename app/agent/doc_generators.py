@@ -82,6 +82,7 @@ class Attachment:
     # and the client falls back to measuring the file itself.
     width: Optional[int] = None
     height: Optional[int] = None
+    has_thumb: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -302,6 +303,53 @@ def _image_dimensions(data: bytes, mime_type: str) -> tuple[Optional[int], Optio
         return None, None
 
 
+
+# ── Inline derivative ────────────────────────────────────────────────────
+# The card renders at ~370pt wide; at @3x that is ~1110px. The ORIGINAL of a
+# generated image is a 2.4 MB PNG at 1024–1536px, and the app was loading that
+# whole thing to fill the card — which is the multi-second spinner, not a
+# rendering problem. A WebP at this size lands around a tenth of the bytes with
+# nothing visible lost at the size it is drawn.
+_THUMB_LONG_EDGE = 1280
+_THUMB_QUALITY = 82
+
+
+def thumb_key(key: str) -> str:
+    """Storage key of the inline derivative for `key`. One function, so the
+    writer and both readers cannot drift."""
+    return f"{key}.thumb.webp"
+
+
+async def _write_thumbnail(data: bytes, key: str, mime_type: str) -> bool:
+    """Best-effort inline derivative. Returns whether one was written.
+
+    Never raises: an image that cannot be resized is still an image worth
+    delivering, and the client falls back to the original.
+    """
+    if not (mime_type or "").startswith("image/"):
+        return False
+    try:
+        from PIL import Image as _PILImage
+        with _PILImage.open(io.BytesIO(data)) as im:
+            im.load()
+            if max(im.size) <= _THUMB_LONG_EDGE and len(data) < 400_000:
+                # Already small enough that a second copy buys nothing.
+                return False
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            im.thumbnail((_THUMB_LONG_EDGE, _THUMB_LONG_EDGE), _PILImage.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="WEBP", quality=_THUMB_QUALITY, method=4)
+            out = buf.getvalue()
+        if not out or len(out) >= len(data):
+            return False   # a derivative that is not smaller is not a derivative
+        await get_storage_backend().put(thumb_key(key), out)
+        return True
+    except Exception:
+        logger.debug("attachment: could not write inline derivative", exc_info=True)
+        return False
+
+
 async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) -> Attachment:
     """Write bytes to storage under {user_scope}/{uuid}_{filename} and return an Attachment."""
     att_id = uuid.uuid4().hex
@@ -310,6 +358,7 @@ async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) 
     await backend.put(key, data)
     _prewarm_preview(key, mime_type)
     width, height = _image_dimensions(data, mime_type)
+    has_thumb = await _write_thumbnail(data, key, mime_type)
     return Attachment(
         id=att_id,
         filename=filename,
@@ -319,6 +368,7 @@ async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) 
         created_at=datetime.now(timezone.utc).isoformat(),
         width=width,
         height=height,
+        has_thumb=has_thumb,
     )
 
 

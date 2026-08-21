@@ -296,6 +296,11 @@ except Exception:  # pragma: no cover - depends on optional native wheel
 # stay exactly as shot. This steers the model to change only what was asked and
 # preserve the source's real texture/grain/lighting, while still deferring to an
 # explicit style request (e.g. "make it a cartoon").
+from app.agent.tool_display import ToolResult
+from app.agent.image_prompt import (
+    SCENE_SYSTEM_PROMPT, build_scene_prompt, check_clothing_guard, realism_suffix,
+)
+
 _EDIT_REALISM_SUFFIX = (
     " — Make only the change described above and blend it in seamlessly. "
     "Preserve the rest of the source image exactly: keep its existing style, "
@@ -3531,6 +3536,13 @@ class ToolExecutor:
         if not prompt:
             return "ERROR: 'prompt' is required — describe the image to generate."
 
+        # Same rule on both paths, one implementation. A generated image has no
+        # source subject to undress, but "generate a nude portrait of <person>"
+        # is the same product decision and the same refusal.
+        _ok, _refusal = check_clothing_guard(prompt)
+        if not _ok:
+            return f"ERROR: {_refusal}"
+
         size = (inp.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")).strip()
         quality = (inp.get("quality") or getattr(settings, "image_gen_default_quality", "high")).strip().lower()
 
@@ -3568,7 +3580,12 @@ class ToolExecutor:
                 summary = await self._persist_deliver_image(_kb, filename, "image/png")
                 # White-label (audit-2026 re-audit round 7): never surface the
                 # underlying image engine name to the model/user.
-                return (f"Image generated and delivered to the user. {summary}")
+                # The user-facing half names the picture and nothing else — the
+                # model still receives the full sentence. See tool_display.py.
+                return ToolResult(
+                    f"Image generated and delivered to the user. {summary}",
+                    display=f"Created {filename}",
+                )
 
         # ONE client factory for both bundle (→ platform LLM proxy, which also
         # charges) and manual/BYO (→ api.openai.com direct). See
@@ -3666,14 +3683,37 @@ class ToolExecutor:
             logger.exception("generate_image credit report failed (non-fatal)")
 
         summary = await self._register_attachment(att)
-        return (
+        return ToolResult(
             f"Image generated ({size}, {quality} quality) and "
-            f"delivered to the user. {summary}"
+            f"delivered to the user. {summary}",
+            display=f"Created {filename}",
         )
 
     # ------------------------------------------------------------------
     # 11c. edit_image — modify the user's uploaded image via gpt-image-1 edits
     # ------------------------------------------------------------------
+    async def _expand_scene(self, system: str, instruction: str) -> str:
+        """One small model call that turns a short instruction into a coherent
+        scene. Deliberately cheap and deliberately optional — `build_scene_prompt`
+        falls back to the user's own words on any failure, because a broken
+        expander must never stop someone editing a photograph."""
+        from app.services.bundle_client import make_openai_client
+        from app.services.key_provider import keys
+        client = make_openai_client(byok_key=(keys.openai or None))
+        if client is None:
+            return ""
+        resp = await client.chat.completions.create(
+            model=getattr(settings, "image_prompt_model", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": instruction},
+            ],
+            max_tokens=300,
+            temperature=0.4,
+            timeout=getattr(settings, "image_prompt_timeout_s", 20.0),
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     async def _openai_edit_image(self, client, model, image_file, prompt, size, quality):
         """Call OpenAI images.edit for `model`; return base64 PNG string.
 
@@ -3860,6 +3900,18 @@ class ToolExecutor:
         # successfully FOUND doesn't then fail at OpenAI on its declared type.
         src_bytes, src_name, src_mime = self._normalize_edit_source(src_bytes, src_name, src_mime)
 
+        # ── Scene coherence, then the guard ────────────────────────────
+        # "Put me in the pool" is not satisfied by moving the subject: the old
+        # suffix said "make ONLY the change described / preserve the rest
+        # exactly", which is literally the instruction that kept a t-shirt and
+        # a sun hat on a man sitting in an infinity pool. When the setting
+        # changes, the dependent changes are required.
+        prompt, _scene_changed = await build_scene_prompt(prompt, expand=self._expand_scene)
+        _ok, _refusal = check_clothing_guard(prompt)
+        if not _ok:
+            return f"ERROR: {_refusal}"
+        _suffix = realism_suffix(_scene_changed)
+
         raw_name = (inp.get("filename") or "").strip() or f"edited_{_uuid.uuid4().hex[:8]}.png"
         filename = _safe_filename(raw_name, "png")
         if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -3871,7 +3923,7 @@ class ToolExecutor:
         if (getattr(settings, "image_provider", "openai") or "").strip().lower() == "kie":
             try:
                 _kb = await self._call_kie_image(
-                    "edit", prompt + _EDIT_REALISM_SUFFIX,
+                    "edit", prompt + _suffix,
                     image_bytes=src_bytes, image_mime=src_mime)
             except _KieQuotaExceeded as q:
                 return f"ERROR: {q.message}"
@@ -3895,7 +3947,10 @@ class ToolExecutor:
             if _kb:
                 summary = await self._persist_deliver_image(_kb, filename, "image/png")
                 # White-label (audit-2026 re-audit round 7): no engine name.
-                return (f"Image edited and delivered to the user. {summary}")
+                return ToolResult(
+                    f"Image edited and delivered to the user. {summary}",
+                    display=f"Edited {filename}",
+                )
 
         # ONE client factory: bundle (→ platform proxy /images/edits, which also
         # charges) or manual/BYO (→ api.openai.com direct + self-report below).
@@ -3915,7 +3970,7 @@ class ToolExecutor:
         edit_fallback = fallback if (fallback != model and fallback.lower().startswith("gpt-image")) else ""
         image_file = (src_name, src_bytes, src_mime)
         # Steer away from the plastic "AI" look and preserve the untouched parts.
-        edit_prompt = prompt + _EDIT_REALISM_SUFFIX
+        edit_prompt = prompt + _suffix
         used_model = model
         try:
             b64 = await self._openai_edit_image(client, model, image_file, edit_prompt, size, quality)
@@ -3984,9 +4039,10 @@ class ToolExecutor:
             logger.exception("edit_image credit report failed (non-fatal)")
 
         summary = await self._register_attachment(att)
-        return (
+        return ToolResult(
             f"Image edited ({size}, {quality} quality) and "
-            f"delivered to the user. {summary}"
+            f"delivered to the user. {summary}",
+            display=f"Edited {filename}",
         )
 
     # ------------------------------------------------------------------

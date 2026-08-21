@@ -304,9 +304,19 @@ async def download_file(
     attachment_id: str,
     request: Request,
     token: Optional[str] = Query(None),
+    variant: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream the raw attachment bytes with correct Content-Type + Content-Disposition."""
+    """Stream the attachment bytes with correct Content-Type + Content-Disposition.
+
+    `variant=thumb` serves the inline derivative written at persist time
+    (`doc_generators.thumb_key`) — a WebP sized for the chat card, roughly a
+    tenth of the bytes of a generated PNG. The chat card asks for it; the
+    full-screen viewer and the download button never do, because the whole
+    point of opening one is to inspect the real thing. A missing derivative
+    falls through to the original rather than 404ing: it is an optimisation,
+    and an image is worth delivering slowly.
+    """
     current_user = await _get_user_for_file(request, token, db)
 
     # Platform-side: data lives on the user's agent VPS. Proxy the request.
@@ -315,7 +325,8 @@ async def download_file(
         if not proxy:
             raise HTTPException(status_code=404, detail="No active agent for user")
         content_iter, headers, status = await _proxy_file(
-            proxy[0], proxy[1], f"{message_id}/{attachment_id}", {}
+            proxy[0], proxy[1], f"{message_id}/{attachment_id}",
+            {"variant": variant} if variant else {},
         )
         return StreamingResponse(content_iter, status_code=status,
                                  media_type=headers.get("content-type", "application/octet-stream"),
@@ -334,13 +345,23 @@ async def download_file(
     filename = att.get("filename", "download.bin")
     mime = att.get("mime_type", "application/octet-stream")
 
+    if (variant or "").lower() == "thumb":
+        from app.agent.doc_generators import thumb_key
+        tkey = thumb_key(key)
+        if backend.exists(tkey):
+            key, mime = tkey, "image/webp"
+
     return StreamingResponse(
         stream_file(key),
         media_type=mime,
         headers={
             "Content-Length": str(backend.size(key)),
             "Content-Disposition": f'attachment; filename="{filename}"',
-            "Cache-Control": "private, max-age=3600",
+            # A derivative is content-addressed by the attachment id and never
+            # changes, so it may be cached hard. Revisiting a thread then costs
+            # nothing at all, which is the other half of the latency fix.
+            "Cache-Control": "private, max-age=31536000, immutable"
+            if (variant or "").lower() == "thumb" else "private, max-age=3600",
         },
     )
 

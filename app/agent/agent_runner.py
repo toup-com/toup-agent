@@ -744,6 +744,9 @@ OnStatus = Callable[[str], Coroutine[Any, Any, None]]
 OnToolEvent = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 
+from app.agent.tool_display import client_summary
+
+
 def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
     """Self-metered per-call credit estimate for the in-run budget
     ceiling. No-floor pricing (a 40-call run floored at 0.1/call would
@@ -3184,7 +3187,11 @@ class AgentRunner:
                 # pill UI shows a popover, not a code editor; if you
                 # need the full payload for debugging, pull it from
                 # logs instead of bloating every message row.
-                _record_summary = result if len(result) <= 2048 else (result[:2048] + "…")
+                # PERSISTED summary — read back by day_chats and rendered in the
+                # expanded actions card on reload, so it goes through the same
+                # redaction as the live frame. JSON results pass through
+                # untouched (create_job's job_id binds the card to its turn).
+                _record_summary = client_summary(result, cap=2048)
                 # Round 4 (items 1/8): attribution + favicon refs ride the
                 # persisted record AND the live frame, so a message re-rendered
                 # from history shows the same steps/favicons a live turn did.
@@ -3206,7 +3213,11 @@ class AgentRunner:
                     _rec["urls"] = _urls
                 tool_event_records.append(_rec)
                 if on_tool_end:
-                    summary = result[:200] + "..." if len(result) > 200 else result
+                    # The tool's USER-facing sentence, never its model-facing
+                    # return value. See app/agent/tool_display.py — this line
+                    # used to be `result[:200]` and shipped tenant uuids, the
+                    # storage layout and internal component names into the chat.
+                    summary = client_summary(result, cap=200)
                     if _tool_end_meta:
                         _meta: Dict[str, Any] = {
                             "call_id": tc["id"],
