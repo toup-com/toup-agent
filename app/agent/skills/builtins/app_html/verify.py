@@ -399,6 +399,52 @@ async def _ended_itself(page, first_text: str) -> Optional[str]:
     return " ".join(hit.group(0).split()) if hit else None
 
 
+#: Text on the control that begins an app. Anchored at the START of the label
+#: so "Display settings" and "Restart tour" are not mistaken for one.
+_START_CONTROL_RE = r"^\s*(play|start|begin|new game|go)\b"
+
+#: JS that finds the start control and presses it. A real `.click()` on the
+#: element, not a coordinate: the button sits inside an overlay whose position
+#: depends on the app's own layout, and a blind click at a fixed point is how
+#: this was being missed.
+_PRESS_START_JS = """
+(pattern) => {
+  const re = new RegExp(pattern, 'i');
+  const sel = 'button,[role="button"],a,input[type="button"],input[type="submit"]';
+  for (const el of document.querySelectorAll(sel)) {
+    const label = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (!label || !re.test(label)) continue;
+    const box = el.getBoundingClientRect();
+    if (!box.width || !box.height) continue;   // hidden: not the live one
+    el.click();
+    return label.slice(0, 40);
+  }
+  return null;
+}
+"""
+
+
+async def _press_start(page) -> Optional[str]:
+    """Press the control that begins the app, if the app has one.
+
+    Round 18, second pass. The gate's original "one frame of input" was a
+    keypress plus a click at a fixed point, which was enough while apps ran
+    their loop on load. Then the design rule changed — anything that can be
+    lost now opens on a START SCREEN — and the app's first real code path
+    moved behind a gesture the blind click did not reliably land on. A Snake
+    build published with `classList.add('snake', '')` on its first render,
+    which throws in every browser, and the gate saw a clean page because
+    `render()` had never been called.
+
+    So the gate presses PLAY. A gate that got weaker the day apps got lazier
+    is worse than no gate: it still reports "opened it — no errors".
+    """
+    try:
+        return await page.evaluate(_PRESS_START_JS, _START_CONTROL_RE)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _smoke(html: str, report: Report) -> Report:
     try:
         from playwright.async_api import async_playwright  # type: ignore
@@ -452,9 +498,13 @@ async def _smoke(html: str, report: Report) -> Report:
             # That is the only window in which this question can be asked, so
             # it is asked before the input frame below and never after.
             self_ended = await _ended_itself(page, first_text)
-            # One frame of input. A game that only wires its handlers on
-            # keydown would otherwise be declared healthy without ever
-            # having executed its loop.
+            # Now DRIVE it. An app that opens on a start screen has run almost
+            # none of its own code yet, so everything above this line has
+            # verified a title and a button.
+            if await _press_start(page):
+                # Long enough for a game loop to take several ticks, which is
+                # where a first-render throw actually lands.
+                await page.wait_for_timeout(1200)
             try:
                 await page.keyboard.press("ArrowRight")
                 await page.mouse.click(195, 500)

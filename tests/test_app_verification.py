@@ -760,3 +760,77 @@ def test_the_job_id_is_derived_from_the_slug_the_pipeline_owns():
     assert a != s.app_id_for("user-2", "tip-split")        # per user
     assert a != s.app_id_for("user-1", "tip-splits")       # per slug
     assert s.job_id_for_slug.__doc__ and "client" in s.job_id_for_slug.__doc__
+
+
+# ── 8. The gate has to PLAY the app, not just open it ─────────────────
+#
+# Second pass, and a consequence of section 6. Once "anything that can be
+# lost opens on a start screen" became the rule, an app's first real code
+# path moved behind a gesture — and the gate's one frame of input was a
+# keypress plus a click at a FIXED POINT, which does not reliably land on a
+# button whose position is the app's own business.
+#
+# The build that showed it: a Snake whose first render called
+# `classList.add('snake', '')`. An empty token is a DOMException in every
+# browser. `node --check` parses it, the page loads clean, and the gate said
+# "opened it — no errors" because `render()` had never run. It threw the
+# instant the user pressed PLAY, on a real device.
+#
+# A gate that got weaker the day apps got lazier is worse than no gate.
+
+
+@pytest.mark.parametrize("label,is_start", [
+    ("PLAY", True),
+    ("Play again", True),
+    ("START", True),
+    ("Start game", True),
+    ("Begin", True),
+    ("New game", True),
+    ("GO!", True),
+    # Anchored at the start, so an ordinary control is not mistaken for one.
+    ("Display settings", False),
+    ("Restart tour", False),
+    ("Replay the intro", False),
+    ("Stop", False),
+    ("Cancel", False),
+    ("", False),
+])
+def test_only_a_start_control_is_pressed(label, is_start):
+    import re as _re
+    assert bool(_re.search(verify._START_CONTROL_RE, label, _re.I)) is is_start
+
+
+def test_the_press_script_skips_a_control_with_no_box():
+    # A start screen's button is often one of several in the DOM — the pause
+    # button, the game-over panel's "Play again" — with only one of them
+    # laid out. Pressing a zero-box element is a no-op that looks like a
+    # press, so the script must move on to the next candidate.
+    assert "getBoundingClientRect" in verify._PRESS_START_JS
+    assert "box.width" in verify._PRESS_START_JS and "box.height" in verify._PRESS_START_JS
+    # A real click on the ELEMENT, never a coordinate — that was the defect.
+    assert "el.click()" in verify._PRESS_START_JS
+
+
+def test_an_empty_class_token_would_be_counted_as_breakage():
+    # What the two engines actually say. Both must stop a publish, or the
+    # gate is only as good as the browser the build container happens to run.
+    chromium = ("Failed to execute 'add' on 'DOMTokenList': "
+                "The token provided must not be empty.")
+    webkit = "SyntaxError: The string did not match the expected pattern."
+    for message in (chromium, webkit):
+        assert verify.counts_as_breakage(message, from_console=False) is True
+
+
+def test_the_app_is_driven_before_the_report_is_believed():
+    # ORDER, not presence. `_press_start` has to run inside the browser
+    # block and before it closes, or the errors it provokes are collected
+    # after the handlers are gone. (The guard class CLAUDE.md records: a
+    # check whose precondition something above it destroys.)
+    import inspect
+    src = inspect.getsource(verify._smoke)
+    i_start = src.index("_press_start(page)")
+    i_close = src.index("browser.close()")
+    i_settle = src.index("SMOKE_SETTLE_MS")
+    assert i_settle < i_start < i_close
+    # …and AFTER the untouched watch, whose whole claim is "nothing pressed".
+    assert src.index("_ended_itself") < i_start
