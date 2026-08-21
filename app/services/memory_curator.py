@@ -109,9 +109,14 @@ WHERE A FACT GOES — pick the one most specific file, then commit to it:
   the devices and accounts they use, and standing arrangements as one line each.
   Identity, not a catch-all. A subject with a life of its own leaves profile.
 - people/<person> — a fact about ANOTHER person, and everything about how they
-  relate to this one. Create the file on the first durable fact about them, and
-  put the facts about them IN it; an area file may reference them as [[slug]],
-  but it is not where they live.
+  relate to this one. Create the file on the first durable fact about them.
+  A NAMED HUMAN ALWAYS GETS THEIR OWN FILE, and this beats every rule below
+  it: when a fact names a person AND a subject, the person wins. "My IELTS
+  tutor is X, and X sends me a word each day" is two bullets in X's OWN file —
+  who they are to this person, and how they work together — and at most one
+  line in the area saying it has a tutor, [[people/x]]. Never let the subject
+  swallow the person: filing a named human under the topic they came up in is
+  how a memory ends up with no people in it at all.
 - areas/<subject> — an ongoing commitment with a state that moves: a study goal,
   an exam, a job hunt, a health programme, a project.
 - topics/<subject> — a taste, interest or domain they return to: music, film,
@@ -121,12 +126,6 @@ WHERE A FACT GOES — pick the one most specific file, then commit to it:
   profile. Parking a real subject in profile because it is small today is the
   single most common routing mistake — the generic catch-all files this system
   replaced were built exactly one small fact at a time.
-- WHEN A FACT NAMES A PERSON AND A SUBJECT, THE PERSON WINS. "My IELTS tutor
-  is X, and X sends me a word each day" is two bullets in X's own file — who
-  they are to this person, and how they work together — plus at most one line
-  in the area saying the area has a tutor, [[people/x]]. Filing a named human
-  under the topic they came up in is how a memory ends up with no people in
-  it at all.
 
 RULES:
 - A FACT IS STORED WITH `add` OR `rewrite`. Nothing else records anything.
@@ -698,6 +697,12 @@ will this still be worth knowing about this person in six weeks?
 NEVER store (these are the exact classes that polluted the last version):
 - One-off requests. "play Moo Meshki", "پخش کن …", "put on some jazz" — the
   request, the track, and anything a media tool returned about it.
+  A TASTE IS NOT A REQUEST, and this is the line people get wrong in the
+  cautious direction. "play Googoosh" is a request and dies with the turn;
+  "I listen to Googoosh constantly, Persian pop is my favourite genre" is who
+  they are, and belongs in topics/music. Asking for something once is
+  disposable; saying what they LIKE is one of the most durable things a person
+  ever tells you. The same holds for films, food, books and teams.
 - Reminders, alarms, snoozes, timers, tasks for right now: "wake me 1 minute
   later", "reminder to go to soccer in 2 minutes", "remind me at 5".
 - Transient states: "currently hungry", "feeling tired today", "on the train".
