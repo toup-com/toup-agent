@@ -464,7 +464,9 @@ def validate_narrative(text: Optional[str], *, required: bool) -> str:
                 "control does, and the design decisions (palette, type, "
                 "spacing, signature element) with your reasoning. It is stored "
                 "beside the app, never shown to the user, and it is what you "
-                "will read before every future edit."
+                "will read before every future edit. Nothing was written, so "
+                "call create_app_file again with the SAME html plus the brief "
+                "— do not try to add it afterwards."
             )
         return ""
     if len(body) < MIN_NARRATIVE_CHARS:

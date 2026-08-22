@@ -100,10 +100,86 @@ def test_the_web_and_mobile_runners_agree_about_sound():
     blob:`; the web runner's response header did not. One artifact, two
     runners, two different answers to "can this app make a noise" — and the
     one that said no was the one nobody had written down.
+
+    `worker-src`/`child-src` were the SAME divergence, found while aligning
+    the two: the mobile policy grants `blob:`, the web one fell through to
+    `default-src 'self'`, so a generated app using a blob Worker worked on a
+    phone and was silently dead on the web.
     """
+    from app.artifact_policy import PARITY_DIRECTIVES
     from app.api.artifact_proxy import artifact_csp
 
-    assert "media-src" in artifact_csp()
+    csp = artifact_csp()
+    for directive in PARITY_DIRECTIVES:
+        stated = [d.strip() for d in csp.split(";") if d.strip().startswith(directive + " ")]
+        assert stated, f"{directive} is not stated — it falls back to default-src: {csp}"
+        assert "blob:" in stated[0], stated
+
+
+def test_the_policy_has_exactly_one_definition():
+    """A second copy of the directive list is the same mistake again.
+
+    The bug was two runners disagreeing about one artifact. `artifact_csp`
+    must therefore not compose its own list — it must read the shared one, so
+    the publish gate and the response header cannot drift the way the web and
+    mobile runners did.
+    """
+    import ast
+    import inspect
+    from app.api import artifact_proxy
+    from app.artifact_policy import artifact_cdn_origin, sandbox_csp
+
+    tree = ast.parse(inspect.getsource(artifact_proxy.artifact_csp).lstrip())
+    fn = tree.body[0]
+    # The docstring is allowed to discuss directives at length — it is where
+    # the bug is explained. The CODE may not compose them.
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    literals = [n.value for n in ast.walk(ast.Module(body=body, type_ignores=[]))
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    assert not any("-src" in s for s in literals), (
+        f"artifact_csp is composing directives again instead of reading the "
+        f"shared policy: {literals}")
+    assert "sandbox_csp" in inspect.getsource(artifact_proxy.artifact_csp)
+    # And it really is the shared one, not a coincidence.
+    assert artifact_proxy.artifact_csp().startswith(
+        sandbox_csp(artifact_cdn_origin()).split(";")[0])
+
+
+def test_the_gate_runs_the_app_under_the_policy_the_user_gets():
+    """A canary in a kinder cage than the bird cannot fail.
+
+    The publish gate used to load the app with `set_content` and NO policy, so
+    it was running it in a browser strictly more permissive than the user's —
+    and this round's defect lived exactly in that gap. Measured on one page:
+    with no policy the refused sound is invisible to the gate; with the
+    pre-round-20 directive set the shim records
+    `blocked: ["media-src blocked data"]` and the publish is refused.
+    """
+    from app.artifact_policy import artifact_cdn_origin, sandbox_csp
+
+    html = ("<!doctype html><html><head><title>x</title></head>"
+            "<body><p>hi</p></body></html>")
+    verified = runtime.wrap_for_verification(html)
+    assert "http-equiv=\"Content-Security-Policy\"" in verified
+    assert "media-src" in verified
+    # The policy must be met BEFORE the content it governs — including before
+    # the runtime preamble, which is itself script the policy allows.
+    assert verified.index("Content-Security-Policy") < verified.index(runtime.MARKER)
+    # ...and it must be the same policy, not a hand-written near-copy.
+    assert sandbox_csp(artifact_cdn_origin()) in verified
+    # `frame-ancestors` is header-only; a <meta> ignores it, and emitting a
+    # directive that does nothing is one more thing that looks like
+    # enforcement and is not.
+    assert "frame-ancestors" not in verified
+
+
+def test_serving_an_app_does_not_double_up_the_policy():
+    """The real header is the enforcement on the serve path. A <meta> there
+    would be a second policy to keep in step — the exact failure mode."""
+    html = ("<!doctype html><html><head><title>x</title></head>"
+            "<body><p>hi</p></body></html>")
+    served = runtime.wrap_for_runtime(html)
+    assert "Content-Security-Policy" not in served
 
 
 # ── The shim that resumes it ──────────────────────────────────────────
@@ -134,6 +210,52 @@ def test_the_injected_javascript_parses():
         proc = subprocess.run([shutil.which("node"), "--check", path],
                               capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_every_javascript_sample_in_the_design_skill_parses():
+    """The design skill is IN the system prompt, and models copy from it.
+
+    Caught on the round-20 audio section: the "not this / this" pair shared a
+    block and declared `ctx` twice, so the sample a model would lift did not
+    parse. A doc that ships broken JavaScript in the same prompt that tells the
+    model its script will be parsed is teaching the wrong thing twice.
+
+    Both copies are checked because there ARE two, byte-identical by
+    convention — `app_html/DESIGN_SKILL.md` (packaged, read into the prompt)
+    and `skills/toup-frontend-design.md` (written to the skills volume). A
+    change to one and not the other is its own bug.
+    """
+    import re
+    from app.agent.skills.builtins.app_html import skill as skill_mod
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(skill_mod.__file__)))
+    packaged = os.path.join(
+        os.path.dirname(os.path.abspath(skill_mod.__file__)), "DESIGN_SKILL.md")
+    repo_copy = os.path.abspath(os.path.join(
+        here, "..", "..", "..", "..", "skills", "toup-frontend-design.md"))
+
+    with open(packaged, encoding="utf-8") as fh:
+        body = fh.read()
+    if os.path.isfile(repo_copy):
+        with open(repo_copy, encoding="utf-8") as fh:
+            assert fh.read() == body, (
+                "DESIGN_SKILL.md and skills/toup-frontend-design.md have "
+                "drifted — they are meant to be byte-identical")
+
+    blocks = re.findall(r"```js\n(.*?)```", body, re.DOTALL)
+    assert blocks, "the design skill has no JavaScript samples any more"
+    node = shutil.which("node")
+    for index, block in enumerate(blocks):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, f"sample{index}.js")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(block)
+            proc = subprocess.run([node, "--check", path],
+                                  capture_output=True, text=True)
+        assert proc.returncode == 0, (
+            f"design-skill JS sample {index} does not parse:\n"
+            f"{block[:300]}\n{proc.stderr[-300:]}")
 
 
 def test_the_shim_is_injected_before_the_app_script():

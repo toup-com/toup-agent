@@ -368,11 +368,13 @@ document, in both senses.
   is unusable with the ringer off, which on a phone is most of the time.
 
 ```js
-// Not this — silent, and nothing says so
-const ctx = new AudioContext();
-function bonk() { const o = ctx.createOscillator(); /* … */ o.start(); }
+// Not this — built at load, suspended for ever, and nothing says so
+const eager = new AudioContext();
+function bonkSilently() { const o = eager.createOscillator(); o.start(); }
+```
 
-// This
+```js
+// This — built on the first tap, resumed on every one after
 let ctx;
 function audio() {
   if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();

@@ -365,6 +365,50 @@ def wrap_for_runtime(html: str) -> str:
     return block + html
 
 
+_HEAD_INSERT_RE = re.compile(r"<head\b[^>]*>", re.IGNORECASE)
+
+
+def wrap_for_verification(html: str) -> str:
+    """The runtime wrapper PLUS the policy the browser will really enforce.
+
+    Round 20. The publish gate loaded the app with `page.set_content` and no
+    policy at all, so it was running the app in a browser strictly more
+    permissive than the user's — and this round's bug lived exactly in that
+    gap. Measured, three ways, on the same page: with no policy the refused
+    sound is invisible to the gate (`blocked: []`, `failures: []`); with the
+    current policy it plays; with the policy AS IT WAS BEFORE this round the
+    shim records ``blocked: ["media-src blocked data"]`` and
+    ``failures: ["play(): NotSupportedError"]`` and the publish is refused.
+
+    So the gate would now catch the defect it previously could not see, which
+    is the only version of this check worth having: a canary that runs in a
+    kinder cage than the bird cannot fail.
+
+    A ``<meta>`` rather than a header because `set_content` has no headers —
+    the same mechanism the mobile runner uses, and it is honoured as long as
+    the parser meets it before the content it governs, which is why it goes
+    immediately after ``<head>`` and ahead of the preamble.
+
+    ``frame-ancestors`` is omitted: a ``<meta>`` policy ignores it, and
+    emitting a directive that does nothing would be one more thing that looks
+    like enforcement and is not.
+    """
+    if not html:
+        return html
+    wrapped = wrap_for_runtime(html)
+    try:
+        from app.artifact_policy import artifact_cdn_origin, sandbox_csp
+        csp = sandbox_csp(artifact_cdn_origin())
+    except Exception:  # pragma: no cover - a policy that cannot be built is
+        # not a reason to skip the run; the other passes still apply.
+        return wrapped
+    meta = f'<meta http-equiv="Content-Security-Policy" content="{csp}">'
+    m = _HEAD_INSERT_RE.search(wrapped)
+    if m:
+        return wrapped[:m.end()] + meta + wrapped[m.end():]
+    return meta + wrapped
+
+
 def external_origins(html: str) -> List[str]:
     """Hosts the document loads code or styles from. Diagnostic only."""
     hosts: List[str] = []

@@ -691,7 +691,11 @@ async def _smoke(html: str, report: Report) -> Report:
     except ImportError:  # pragma: no cover - image always ships one of the two
         from patchright.async_api import async_playwright  # type: ignore
 
-    wrapped = runtime.wrap_for_runtime(html)
+    # The wrapper AND the policy. `wrap_for_runtime` alone gave the gate a
+    # browser more permissive than the user's, which is how a sound the runner
+    # refuses could pass a check that claimed to have opened the app. See
+    # `runtime.wrap_for_verification` for the measurement.
+    wrapped = runtime.wrap_for_verification(html)
     errors: List[Finding] = []
     audio: List[Finding] = []
     #: External requests that never arrived. An app whose library did not load

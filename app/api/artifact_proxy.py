@@ -74,22 +74,20 @@ def artifact_csp() -> str:
     is loosened: ``data:`` and ``blob:`` are bytes the page already has,
     reachable with no network, which is why ``img-src`` has granted them
     since the beginning.
+
+    **The directives themselves live in `app.artifact_policy`, not here.**
+    The bug was two runners disagreeing about one artifact, so a second copy
+    of the list — even a correct one — is the same mistake again. That module
+    imports nothing but `app.config` precisely so the agent-side publish gate
+    can load the app under this exact policy; the platform image does not ship
+    `app/agent/` and the agent does not run this router, so the shared thing
+    has to sit above them both.
     """
-    cdn = settings.artifact_cdn_origin
-    ancestors = " ".join(settings.artifact_frame_ancestors) or "'none'"
-    return "; ".join([
-        "default-src 'self'",
-        f"script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: {cdn}",
-        f"style-src 'self' 'unsafe-inline' {cdn}",
-        "img-src 'self' data: blob:",
-        f"media-src 'self' data: blob: {cdn}",
-        f"font-src 'self' data: {cdn}",
-        "connect-src 'self'",
-        "object-src 'none'",
-        "base-uri 'none'",
-        "form-action 'self'",
-        f"frame-ancestors {ancestors}",
-    ])
+    from app.artifact_policy import sandbox_csp
+    return sandbox_csp(
+        settings.artifact_cdn_origin,
+        frame_ancestors=settings.artifact_frame_ancestors,
+    )
 
 
 def artifact_headers() -> dict:
