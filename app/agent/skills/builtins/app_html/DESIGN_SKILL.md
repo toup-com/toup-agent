@@ -325,6 +325,35 @@ Always include
 `<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">`
 — without `viewport-fit=cover` the safe-area variables above are all zero.
 
+### 4f. A control cluster is ONE object, on one grid
+
+Symmetry and alignment are requirements here, not taste. §1's "real design has
+asymmetry" is about *composition* — one thing larger than the rest, deliberate
+empty space. It is never about the inside of a control cluster: a D-pad, a
+keypad, a row of transport buttons is a single object, and any asymmetry
+inside it reads as a defect, because the hand learns its geometry.
+
+- **Siblings share a baseline.** Every control in a row sits at the same
+  height, same size, same gap. If two controls are the same kind of thing,
+  they are drawn as the same thing (§5 already says this about spacing).
+- **A cluster is centred in its own area** — a D-pad sits on its own grid
+  (`▲` centred over `◀ ▼ ▶`), the whole pad centred in the control zone, not
+  shoved into a corner by whatever else happens to be there.
+- **Every control belongs to a group.** Secondary controls — sound, pause,
+  restart — live IN the header/status bar or IN the control bar, aligned with
+  their neighbours. A lone `♪` floating at a third height, belonging to
+  nothing, is the canonical failure (it shipped, on a Snake, next to a hint
+  block bottom-left and a D-pad centre-right: three unrelated verticals in
+  one row).
+- **Nothing decorates the playfield.** No stray glyphs, no orphan symbols, no
+  mark whose function a player cannot infer. If it does nothing, delete it;
+  if it does something, put it in a bar with a hit area.
+
+The layout for a game's control zone is therefore boring on purpose: one
+centred cluster, one status row, everything on the same grid. Spend the
+personality budget on the playfield and the signature element, never on
+scattering the controls.
+
 ---
 
 ## 5. Legible, spaced, and it answers when you touch it
@@ -556,6 +585,23 @@ And **say only what you wired.** A hint line claiming a control the code does
 not implement is worse than no hint: it sends the user to look for a fault in
 themselves.
 
+**And say it for the device in hand.** Keyboard support is welcome — wire it
+through the same vocabulary — but its instructions must never render as UI on
+a phone. `ARROWS / WASD · SPACE PAUSES` printed inside a touch app is a
+manual for hardware the user does not have, in the one slot where they look
+for how to play. The publish gate refuses visible keyboard hints outright.
+If you want the hint for the rare desktop visitor, reveal it only after a
+real `keydown` arrives:
+
+```js
+addEventListener('keydown', () => {
+  document.getElementById('kbd-hint').hidden = false;
+}, { once: true });
+```
+
+On touch, the controls explain themselves: a D-pad is its own manual, and
+"Swipe to steer" is the only hint a touch game should ever need to print.
+
 ---
 
 ## 10. Changing an app someone is already holding
@@ -595,6 +641,11 @@ unless the stage above it can shrink.
 ## 11. Before you call `present_app`
 
 - [ ] Every control the UI mentions actually works — keys AND taps AND swipe
+- [ ] **No keyboard instructions are visible on screen (§9) — a phone has no
+      keyboard, and the gate refuses WASD/arrow-keys/spacebar hints**
+- [ ] **Sibling controls share a baseline; the D-pad/keypad is centred on its
+      own grid; no control floats apart from its cluster (§4f)**
+- [ ] **No stray glyphs — everything on screen has a function or is deleted**
 - [ ] Nothing that can be lost, missed or timed out is running at first paint
 - [ ] A game/timer/quiz opens on a start screen with an explicit start control
 - [ ] **Every interactive element is ≥ 44 × 44 CSS px, with ≥ 8 px between**
@@ -639,6 +690,8 @@ laid-out control's `getBoundingClientRect` and refuses the publish over:
   sentence is exempt — that is typography, not a control),
 - any text under **12 px**,
 - **sideways scroll** at 390 px wide,
+- **visible keyboard instructions** — WASD, "arrow keys", "spacebar",
+  "press space/enter" rendered on either screen (§9),
 - **audio that was built and never played** — a context made, a gesture seen,
   and nothing running (§8a),
 - **a sound the sandbox refused**, which the browser reports as a corrupt
@@ -652,8 +705,10 @@ will never meet it.
 it has just played with, and reviews the picture for what no measurement can
 see: text the same colour as what is behind it, a panel clipped by its own
 container, a modal behind the board, an empty box where content belongs, a
-collapsed layout, placeholder copy that was never replaced. Those refuse the
-publish too, each one named and located.
+collapsed layout, placeholder copy that was never replaced — and the §4f
+failures: a control cluster off its grid, siblings at different heights, a
+control floating apart from the bar it belongs to, a stray glyph on the
+playfield. Those refuse the publish too, each one named and located.
 
 **It is also given the app's purpose, and asked whether the palette fits it**
 (§1b). Not whether the palette is *nice* — taste is still yours, and a plain

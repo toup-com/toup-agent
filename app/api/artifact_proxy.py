@@ -301,6 +301,56 @@ async def get_artifact_icon(
     )
 
 
+@router.get("/{slug}/preview")
+async def get_artifact_preview(
+    slug: str,
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """An app's publish-time snapshot, for a card in the SHELL.
+
+    The account bearer, not an artifact token — same posture as the icon
+    route, and for the same reason: this is Toup's own UI asking for a
+    picture, and an artifact itself has no network at all. A 404 means no
+    publish has stored a snapshot yet; the card shows its placeholder.
+    """
+    agent = await _get_agent(str(current_user.id), db)
+    if not agent:
+        raise HTTPException(503, "agent unavailable")
+    agent_url, key = agent
+    from app.services.agent_http import get_agent_http_client
+    headers = {"X-Agent-Key": key}
+    inm = request.headers.get("if-none-match")
+    if inm:
+        headers["If-None-Match"] = inm
+    try:
+        resp = await get_agent_http_client().get(
+            f"{agent_url}{settings.api_prefix}/artifacts/{slug}/preview",
+            headers=headers, timeout=10.0,
+        )
+    except Exception as exc:
+        logger.warning("[artifact] preview fetch failed for %s: %s", slug, exc)
+        raise HTTPException(502, "preview unreachable")
+    if resp.status_code == 304:
+        return Response(status_code=304, headers={
+            "ETag": resp.headers.get("etag", ""), "Cache-Control": "no-cache"})
+    if resp.status_code == 404:
+        raise HTTPException(404, "no preview")
+    if resp.status_code >= 400:
+        raise HTTPException(502, "preview unreachable")
+    return Response(
+        content=resp.content,
+        media_type="image/png",
+        headers={
+            "Cache-Control": "no-cache",
+            "ETag": resp.headers.get("etag", ""),
+            "X-Content-Type-Options": "nosniff",
+            "Cross-Origin-Resource-Policy": "same-site",
+        },
+    )
+
+
 @router.get("/{slug}/state")
 async def get_artifact_state(
     slug: str,

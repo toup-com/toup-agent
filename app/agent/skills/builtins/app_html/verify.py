@@ -96,6 +96,21 @@ _REAL_BREAKAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Keyboard instructions rendered as UI on a touch device (round 23). The
+#: recorded Snake printed `ARROWS / WASD · SPACE PAUSES` inside a phone app —
+#: instructions for hardware the device does not have, in the slot where the
+#: player looks for how to play. Deliberately narrow, because a false positive
+#: here refuses a working app: `wasd` and "arrow keys" cannot mean anything
+#: else, while a bare "arrows" is a word an archery game is entitled to
+#: ("Arrows left: 5") and is left to the visual review.
+_KEYBOARD_HINT_RE = re.compile(
+    r"\bwasd\b|\barrow keys\b|\bspace ?bar\b|"
+    r"\bpress (?:space|enter|any key)\b|"
+    r"\bspace (?:to )?(?:pause|start|jump|shoot|fire)s?\b|"
+    r"\buse (?:the |your )?keyboard\b",
+    re.IGNORECASE,
+)
+
 #: Text that means the app reached a state the user LOST, as opposed to any
 #: other thing an app might say. Deliberately narrow: these are terminal
 #: verdicts, not moods. "Time left", "Score", "Round 2" are all states an app
@@ -140,6 +155,12 @@ class Report:
     #: the browser pass did not run, which is exactly when the caller must
     #: not claim the app was looked at.
     screenshot: Optional[bytes] = None
+    #: PNG of the app at first paint — the start screen, i.e. the app's FACE.
+    #: Round 23: this is what the card's preview shows (`store.write_preview`
+    #: at publish). Separate from `screenshot` because the two answer
+    #: different questions: the reviewer must judge the screen that was
+    #: played; a card must show the screen a person meets first.
+    cover: Optional[bytes] = None
     #: What `runtime.audio_unlock` recorded: contexts made, contexts running,
     #: whether a gesture was seen, `<audio>` play failures, CSP refusals.
     audio: Optional[dict] = None
@@ -566,6 +587,25 @@ def layout_findings(m: dict) -> List[Finding]:
     return out
 
 
+def keyboard_hint_findings(visible_text: str) -> List[Finding]:
+    """Keyboard instructions on a touch screen, as findings. Testable dry.
+
+    One finding no matter how many phrases match — the fix is one edit (hide
+    or delete the hint line), and three findings for one sentence would bury
+    the rest of the report.
+    """
+    hit = _KEYBOARD_HINT_RE.search(visible_text or "")
+    if not hit:
+        return []
+    phrase = " ".join(hit.group(0).split())
+    return [Finding(kind="layout", message=(
+        f"the screen shows keyboard instructions (“{phrase}”) — this app runs "
+        f"on a phone, where there is no keyboard. Keyboard support may exist, "
+        f"but its instructions must not render as UI on touch: delete the "
+        f"hint, or show it only after a physical key press is detected."
+    ))]
+
+
 def layout_enabled() -> bool:
     """Off only if an operator turns it off, like the smoke test itself."""
     return (os.environ.get("TOUP_APP_LAYOUT_GATE", "1") or "1").strip().lower() not in (
@@ -748,6 +788,11 @@ async def _smoke(html: str, report: Report) -> Report:
             # measure again below, once the app proper is on screen, because
             # that is where the D-pad lives.
             layout = await _measure_layout(page)
+            # The cover: the settled, untouched first screen — the one a
+            # person meets when the app opens, which is what a card preview
+            # must show. Taken here, before any input, for exactly that
+            # reason (the played screenshot below shows a mid-game state).
+            report.cover = await _capture(page)
             # Now DRIVE it. An app that opens on a start screen has run almost
             # none of its own code yet, so everything above this line has
             # verified a title and a button.
@@ -767,6 +812,13 @@ async def _smoke(html: str, report: Report) -> Report:
             for f in await _measure_layout(page):
                 if not any(f.message == g.message for g in layout):
                     layout.append(f)
+            # Keyboard hints, on BOTH screens: the recorded Snake printed its
+            # `ARROWS / WASD` line on the playing screen, but a start screen
+            # ("press SPACE to begin") is just as wrong on a phone.
+            playing_text = await _visible_text(page)
+            layout.extend(
+                keyboard_hint_findings(f"{first_text}\n{playing_text}")
+            )
             # Sound, measured rather than assumed — see `audio_findings`. Read
             # AFTER the gestures above, because "was a gesture seen" is half of
             # what the answer depends on.
@@ -801,8 +853,11 @@ async def _smoke(html: str, report: Report) -> Report:
         # The picture goes too. A screenshot of a page whose stylesheet never
         # arrived would be handed to the visual review as though it were the
         # app, and every finding it produced would be about this container's
-        # egress rather than about anything the model wrote.
+        # egress rather than about anything the model wrote. The cover for
+        # the same reason: a card must not wear a picture of a page whose
+        # stylesheet never arrived.
         report.screenshot = None
+        report.cover = None
         return report
 
     report.findings.extend(errors)
@@ -835,5 +890,6 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     # None here is the honest "there is nothing to look at" the visual review
     # needs in order not to approve a screen it never saw.
     report.screenshot = deep_report.screenshot
+    report.cover = deep_report.cover
     report.audio = deep_report.audio
     return report

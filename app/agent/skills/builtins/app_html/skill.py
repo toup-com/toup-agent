@@ -287,6 +287,12 @@ class AppHtmlSkill(Skill):
                 ),
                 "input_schema": {
                     "type": "object",
+                    # `brief` deliberately PRECEDES `html`. Arguments are
+                    # generated in schema order, so this is what makes the
+                    # plan get written before the code that implements it —
+                    # palette, layout and control placement are committed in
+                    # prose first, and the file is written to that plan
+                    # rather than the plan reverse-engineered from the file.
                     "properties": {
                         "slug": {
                             "type": "string",
@@ -296,26 +302,34 @@ class AppHtmlSkill(Skill):
                             "type": "string",
                             "description": "Human name shown on the app card, e.g. 'Budget Tracker'.",
                         },
-                        "html": {
-                            "type": "string",
-                            "description": "The COMPLETE document: <!doctype html> through </html>, with all CSS and JS inlined. Not a fragment, not a placeholder.",
-                        },
                         "brief": {
                             "type": "string",
                             "description": (
-                                "The app's brief, in markdown — stored beside the app, "
-                                "NEVER shown to the user, and the first thing you will "
-                                "read before every future edit. Cover: what it is and "
-                                "who it is for; the problem it solves; its core flows; "
-                                "every feature, state and control and what each does; "
-                                "and the design decisions (palette, type, spacing, the "
-                                "signature element) WITH your reasoning. Write it now, "
-                                "while you still know why you chose what you chose — in "
-                                "three turns' time this file is all that is left of it."
+                                "Your PLAN, in markdown, written BEFORE the html — "
+                                "stored beside the app, NEVER shown to the user, and "
+                                "the first thing you will read before every future "
+                                "edit. Cover: what it is and who it is for; the "
+                                "problem it solves; its core flows; every feature, "
+                                "state and control and what each does; the layout — "
+                                "where each control cluster sits and how it aligns; "
+                                "and the design decisions (palette, type, spacing, "
+                                "the signature element) WITH your reasoning. The html "
+                                "you write next implements THIS. Write it now, while "
+                                "you still know why you chose what you chose — in "
+                                "three turns' time this file is all that is left of "
+                                "it."
+                            ),
+                        },
+                        "html": {
+                            "type": "string",
+                            "description": (
+                                "The COMPLETE document implementing the brief above: "
+                                "<!doctype html> through </html>, with all CSS and JS "
+                                "inlined. Not a fragment, not a placeholder."
                             ),
                         },
                     },
-                    "required": ["slug", "title", "html", "brief"],
+                    "required": ["slug", "title", "brief", "html"],
                 },
             },
             {
@@ -455,6 +469,17 @@ class AppHtmlSkill(Skill):
             "never to narrow scope, confirm taste or gather requirements. When "
             "the app is up, say in one line what you built and what you can "
             "change; refinement happens on a working app, not on a questionnaire.\n"
+            "When the request names a specific real thing — classic Windows "
+            "Minesweeper, a Nokia 3310, a known board game — you MAY make one "
+            "quick web_search first to ground the design in what that thing "
+            "actually looks like (its colours, its chrome, its rules), then "
+            "build. Research is for accuracy, never for delay: one search, no "
+            "questions, straight into the build.\n"
+            "The `brief` argument is your PLAN and you write it before the "
+            "html: subject grounding, palette with its reasoning, the layout "
+            "with exact control placement and alignment, the input model, the "
+            "screen states, the one signature element. The file implements "
+            "the plan — not the other way round.\n"
             "Loop: app_html__create_app_file (one big write) → app_html__edit_app_file "
             "(small exact-string edits; view_app_file first) → app_html__present_app "
             "(show the user). app_html__bash_app is there when you want to look "
@@ -1114,6 +1139,23 @@ class AppHtmlSkill(Skill):
                 "published:\n" + look.as_error()
                 + "\nFix these with edit_app_file and call present_app again."
             )
+
+        # ── The preview, from the same browser run (round 23) ─────────
+        # The gate has just opened the app at the phone viewport; the frame
+        # it took BEFORE pressing anything — the start screen — is the app's
+        # face, and it becomes the card's preview. This replaces the client
+        # re-rendering the app under its own (mistimed) capture conditions,
+        # which is what produced the recorded full-width-header /
+        # collapsed-left-column cards. Best-effort by contract: a preview is
+        # never worth a publish, and a card with no picture shows its
+        # placeholder rather than a broken frame.
+        try:
+            snap = report.cover or report.screenshot
+            if snap and store.write_preview(slug, snap):
+                logger.info("[app_html] preview for %s: %d bytes", slug, len(snap))
+        except Exception:  # noqa: BLE001 - a picture is never worth a publish
+            logger.warning("[app_html] preview persist failed for %s", slug,
+                           exc_info=True)
 
         size = os.path.getsize(html_path)
         record = store.upsert_record(slug, title, size, bump_revision=False,

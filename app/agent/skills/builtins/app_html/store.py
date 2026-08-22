@@ -32,6 +32,7 @@ imports so it can be unit-tested against a tmpdir with no fixtures.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -175,7 +176,8 @@ def repair_file_modes(root: Optional[str] = None) -> int:
     scanned = 0
     try:
         directories = [root, os.path.join(root, VERSIONS_DIR),
-                       os.path.join(root, STATE_DIR)]
+                       os.path.join(root, STATE_DIR),
+                       os.path.join(root, PREVIEWS_DIR)]
         # One level under `.versions/` is a directory per slug.
         try:
             vroot = os.path.join(root, VERSIONS_DIR)
@@ -780,6 +782,10 @@ def reconcile(slug: str, *, allow_purge: bool = True) -> str:
     except (OSError, AppStoreError):
         pass
     try:
+        os.unlink(_preview_path(slug))
+    except (OSError, AppStoreError):
+        pass
+    try:
         from app.agent.skills.builtins.app_html import appskill, logo
         appskill.delete(slug)
         logo.delete_icon(slug)
@@ -900,6 +906,13 @@ def delete_app(slug: str) -> bool:
         os.unlink(_state_path(slug))
     except (OSError, AppStoreError):
         pass
+    # The preview is a picture of an app that no longer exists — and slugs
+    # are reusable, so leaving it behind would hand next week's `snake` the
+    # dead app's face until its first publish overwrites it.
+    try:
+        os.unlink(_preview_path(slug))
+    except (OSError, AppStoreError):
+        pass
     # The brief and the icon go too, and for the same reason the state does:
     # slugs are reusable. A `snake` deleted today and a `snake` built next
     # week share every path here, so a brief left behind would be read as the
@@ -981,6 +994,88 @@ def merge_state(slug: str, updates: Dict[str, Any]) -> int:
             else:
                 state[str(key)] = value
         return write_state(slug, state)
+
+
+# ── Publish-time preview (round 23) ───────────────────────────────────
+# The card's preview used to be a client-side re-render of the app under
+# capture conditions that don't match the runner's timing (a WebView shot
+# 900 ms after load-end photographs a React app mid-hydration — the recorded
+# full-width-header / collapsed-left-column card). The publish gate already
+# opens the app in a real browser at the phone viewport; the START-SCREEN
+# frame from that run is the app's face, so it is persisted here and served
+# as the card's preview. One mechanism, two consumers: the same browser pass
+# that judges the app also photographs it for the card.
+PREVIEWS_DIR = ".previews"
+#: A 390×844 PNG runs 40–120 KB; anything past this is a full-bleed
+#: photograph and not worth storing per app.
+MAX_PREVIEW_BYTES = 3 * 1024 * 1024
+
+
+def _preview_path(slug: str) -> str:
+    slug = normalise_slug(slug)
+    root = os.path.realpath(apps_root())
+    full = os.path.realpath(os.path.join(root, PREVIEWS_DIR, slug + ".png"))
+    expected = os.path.join(root, PREVIEWS_DIR)
+    if os.path.dirname(full) != expected:
+        raise AppStoreError(f"refusing preview path outside the app root: {slug!r}")
+    return full
+
+
+def write_preview(slug: str, png: bytes) -> bool:
+    """Store the publish-time snapshot. Never worth failing a publish over."""
+    if not png or len(png) > MAX_PREVIEW_BYTES:
+        return False
+    try:
+        path = _preview_path(slug)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _atomic_write(path, png, prefix=".preview-")
+        return True
+    except (OSError, AppStoreError):
+        logger.warning("[app_html] could not write the preview for %s", slug,
+                       exc_info=True)
+        return False
+
+
+def read_preview(slug: str) -> Optional[bytes]:
+    try:
+        with open(_preview_path(slug), "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, AppStoreError) as exc:
+        logger.warning("[app_html] preview unreadable for %s: %s", slug, exc)
+        return None
+
+
+#: (mtime, size) → etag per preview path. The LISTING calls `preview_etag`
+#: once per app per request, and hashing twenty 100 KB PNGs per Files open
+#: would be a self-inflicted tax; a preview only changes by being rewritten,
+#: which moves its stat.
+_preview_etag_cache: Dict[str, Tuple[float, int, str]] = {}
+
+
+def preview_etag(slug: str) -> str:
+    """Content hash of the stored preview, '' when there is none.
+
+    The same value the preview route serves as its ETag, so a client can
+    cache the picture under (slug, etag) and refetch only when a publish
+    actually moved it — the icon's `icon_etag` contract, applied to the
+    snapshot.
+    """
+    try:
+        path = _preview_path(slug)
+        st = os.stat(path)
+    except (OSError, AppStoreError):
+        return ""
+    hit = _preview_etag_cache.get(path)
+    if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    png = read_preview(slug)
+    if not png:
+        return ""
+    etag = hashlib.sha256(png).hexdigest()[:32]
+    _preview_etag_cache[path] = (st.st_mtime, st.st_size, etag)
+    return etag
 
 
 def edit_app(slug: str, old_string: str, new_string: str) -> Tuple[AppRecord, int]:

@@ -75,6 +75,11 @@ async def list_artifacts() -> Dict[str, Any]:
         # icon inline, which would put an SVG per app into every list. A stat,
         # not a read — see `logo.has_icon`.
         d["has_icon"] = logo.has_icon(slug)
+        # Same contract as the icon: a stat-cheap etag so the card can cache
+        # the snapshot under (slug, etag) and refetch only when a publish
+        # moved it. '' for an app published before round 23 — the card falls
+        # back to its local capture.
+        d["preview_etag"] = store.preview_etag(slug)
         try:
             d["size_bytes"] = os.path.getsize(store.app_path(slug))
         except (OSError, store.AppStoreError):
@@ -186,6 +191,49 @@ async def get_artifact_icon(slug: str, request: Request) -> Response:
             "ETag": etag,
             "X-Content-Type-Options": "nosniff",
             "X-Toup-Icon-Source": source or "unknown",
+        },
+    )
+
+
+@router.get("/{slug}/preview")
+async def get_artifact_preview(slug: str, request: Request) -> Response:
+    """The app's publish-time snapshot — its start screen at 390×844.
+
+    Written by the publish gate (`store.write_preview`) from the same browser
+    run that verified the app, so the picture is what a person actually meets
+    when they open it. 404 when no publish has stored one yet — unlike the
+    icon there is no synchronous fallback to draw, and the client's card
+    renders its own placeholder rather than a broken image.
+
+    A PNG is passive content, but the bytes were produced from model-authored
+    markup, so the same ``nosniff`` second lock the icon carries applies.
+    """
+    try:
+        slug = store.normalise_slug(slug)
+    except store.AppStoreError as exc:
+        raise HTTPException(400, str(exc))
+    rec = store.read_manifest().get(slug)
+    if rec is None:
+        raise HTTPException(404, f"no artifact named {slug!r}")
+
+    png = store.read_preview(slug)
+    if not png:
+        raise HTTPException(404, f"no preview stored for {slug!r}")
+
+    etag = '"%s"' % hashlib.sha256(png).hexdigest()[:32]
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag,
+                                                  "Cache-Control": "no-cache"})
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={
+            # Same rationale as the icon: the picture changes only when a
+            # publish moves it, so most requests should cost a 304 — and an
+            # edit's new face must still be visible at once.
+            "Cache-Control": "no-cache",
+            "ETag": etag,
+            "X-Content-Type-Options": "nosniff",
         },
     )
 

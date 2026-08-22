@@ -114,6 +114,25 @@ async def close_job_completed(
     if job is None or job.status != "running" or job.user_id != user_id:
         return None
 
+    # ── An app build is never completed by a watchdog (round 23) ─────
+    # `finish_all_steps` marks every remaining step done — the right shape
+    # for a create_job task whose answer WAS the work. For an html-artifact
+    # build still `running` at turn end, the work is `present_app`, and it
+    # demonstrably never ran: force-greening its rows would paint
+    # "Published the app ✓" on an app that was never published — the exact
+    # overclaim the pipeline's own gates exist to end. Settle it honestly
+    # instead: unreported phases become `skipped`, and the job closes
+    # `cancelled` (the model moved on) or `failed` (a phase had failed).
+    # `finish_job` remains the ONE way a build completes.
+    if (getattr(job, "job_type", None) == "auto_builder"
+            and getattr(job, "app_id", None)):
+        # Own session, own commit: the finalizer only commits its session
+        # when THIS function returned a ClosedJob, so a settle that piggy-
+        # backed on the caller's transaction would silently be thrown away.
+        await _settle_unpublished_build(job_id, user_id=user_id,
+                                        now=now, reason=reason)
+        return None
+
     steps = finish_all_steps(parse_steps(job.steps_json), now,
                              fallback_start=getattr(job, "created_at", None))
     done, total = _step_counts(steps)
@@ -157,6 +176,105 @@ async def close_job_completed(
         job_id=job_id, title=job.title or "", user_id=user_id,
         chat_id=getattr(job, "conversation_id", None), job_type=_job_type_of(job),
         steps_total=total, last_step=last_step, completed_at=now,
+    )
+
+
+async def _settle_unpublished_build(
+    job_id: str, *, user_id: str, now: datetime, reason: str,
+) -> None:
+    """Close a build job whose turn ended without a publish. Never 'completed'.
+
+    Steps that reported a terminal state keep it; phases that never reported
+    back become `skipped` (the same rule the pipeline's own `finish_job`
+    applies). Status is `failed` when a phase had failed, else `cancelled` —
+    "stopped before the app was published" is a stop, not a success and not
+    an invented diagnosis. Opens and commits its OWN session: the finalizer
+    only commits when a job was completed, and this path never returns one.
+    The guarded WHERE re-checks 'running' at write time, so a publish racing
+    this settle wins.
+    """
+    from app.db.database import async_session_maker
+    from app.db.models import BuildJob, JobEvent
+
+    try:
+        from app.agent.skills.builtins.app_html.steps import phase_label
+    except Exception:  # noqa: BLE001 - words are not worth a failed settle
+        def phase_label(_t: str, _s: str) -> str:  # type: ignore[misc]
+            return ""
+
+    final = "cancelled"
+    total = done = 0
+    title = ""
+    try:
+        async with async_session_maker() as db:
+            job = await db.get(BuildJob, job_id)
+            if job is None or job.user_id != user_id or job.status != "running":
+                return
+            steps = parse_steps(job.steps_json)
+            any_failed = False
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                st = s.get("status")
+                if st == "failed":
+                    any_failed = True
+                elif st in ("pending", "running"):
+                    s["status"] = "skipped"
+                    label = phase_label(str(s.get("type") or ""), "skipped")
+                    if label:
+                        s["label"] = label
+            final = "failed" if any_failed else "cancelled"
+            new_msg = getattr(job, "user_message", None) or (
+                "The app isn't ready to open yet — it needs a fix first."
+                if any_failed else
+                "The build stopped before the app was published. Ask me to "
+                "finish it."
+            )
+            cfg = dict(job.config_json or {})
+            cfg["settled_reason"] = f"unpublished_build:{reason}"
+            res = await db.execute(
+                update(BuildJob)
+                .where(BuildJob.id == job_id, BuildJob.user_id == user_id,
+                       BuildJob.status == "running")
+                .values(status=final, completed_at=now,
+                        steps_json=dump_steps(steps), config_json=cfg,
+                        user_message=new_msg)
+                .returning(BuildJob.id)
+            )
+            if res.first() is None:
+                return
+            db.add(JobEvent(
+                job_id=job_id, user_id=user_id, kind="info",
+                level="error" if any_failed else "info",
+                status=final, ts=now,
+                label="Build stopped before publish"[:200],
+                metadata_json=json.dumps({"reason": reason}),
+            ))
+            await db.commit()
+            title = (job.title or "").replace("Build: ", "")
+            total = len(steps)
+            done = sum(1 for s in steps
+                       if isinstance(s, dict) and s.get("status") == "done")
+    except Exception:  # noqa: BLE001 - a failed settle leaves the reaper's net
+        logger.warning("[job_reconciler] build settle failed for %s",
+                       job_id[:8], exc_info=True)
+        return
+    try:
+        from app.api.ws_chat import broadcast_to_user
+        await broadcast_to_user(user_id, {
+            "type": "job_update",
+            "job_id": job_id,
+            "name": title,
+            "status": final,
+            "total_steps": total,
+            "completed_steps": done,
+        })
+    except Exception:  # noqa: BLE001 - the DB row is already honest
+        logger.debug("[job_reconciler] build settle broadcast failed",
+                     exc_info=True)
+    logger.info(
+        "[job_reconciler] settled unpublished build %s as %s (%s)",
+        job_id[:8], final, reason,
     )
 
 

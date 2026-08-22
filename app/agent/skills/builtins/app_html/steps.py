@@ -58,7 +58,8 @@ _PHASE_WORDS: Dict[str, Dict[str, str]] = {
     "edit":    {"pending": "Update the app",    "running": "Updating the app",
                 "done": "Updated the app",      "failed": "Couldn't update the app"},
     "verify":  {"pending": "Check the app",     "running": "Checking the app",
-                "done": "Checked the app",      "failed": "The app needs a fix"},
+                "done": "Checked the app",      "failed": "The app needs a fix",
+                "skipped": "Check the app"},
     # Round 20, item 3. Its own phase, because it answers its own question:
     # `verify` is "does it run", `look` is "does it look right". An app can
     # pass the first and fail the second — white text on a white card throws
@@ -67,20 +68,44 @@ _PHASE_WORDS: Dict[str, Dict[str, str]] = {
     # different checks, one of which involves a model.
     "look":    {"pending": "Look at the app",   "running": "Looking at the app",
                 "done": "Checked the app looks right",
-                "failed": "The app doesn't look right yet"},
+                "failed": "The app doesn't look right yet",
+                # Round 23: a look that never reported back used to be DROPPED
+                # at finish. The brief's rule is the opposite: a planned phase
+                # may be shown as skipped, never vanish — so the skip gets its
+                # own honest words instead of a deleted row.
+                "skipped": "Couldn't look at the app here"},
     # Round 21, item 1. The mark used to be drawn inside the `present` step,
     # so the one phase that involves two model calls had no row of its own and
     # a failed drawing was invisible. It is a phase: it can be slow, it can
     # fail, and the user should see which of the two happened.
     "logo":    {"pending": "Draw the app's icon", "running": "Drawing the app's icon",
                 "done": "Drew the app's icon",
-                "failed": "Kept a plain icon for now"},
+                "failed": "Kept a plain icon for now",
+                "skipped": "Kept a plain icon for now"},
     "present": {"pending": "Publish the app",   "running": "Publishing the app",
-                "done": "Published the app",    "failed": "Couldn't publish the app"},
+                "done": "Published the app",    "failed": "Couldn't publish the app",
+                "skipped": "Publish the app"},
 }
 
 STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "look", "logo",
                          "present"]
+
+#: The phases a build actually WALKS, in order — what the up-front plan shows.
+#:
+#: Round 23. The plan used to be all seven types, and two of them (`review`,
+#: `edit`) are phases a clean first build never enters — so every pristine
+#: build opened with two grey rows that were GUARANTEED to vanish at the end
+#: (the recorded "7 steps became 4"). The plan is now the walk every build
+#: makes; `review`/`edit` rows are appended by `emit_step` at the moment they
+#: actually happen, which is also what makes a later edit round legible as
+#: appended work rather than as rows that were always mysteriously there.
+PLANNED_TYPES: List[str] = ["create", "verify", "look", "logo", "present"]
+
+#: Occurrence guard: the most rows one step type may accumulate on a card.
+#: A re-entered phase appends a fresh row (that is what keeps progress
+#: monotonic), and a model stuck in an edit loop must not append forever —
+#: past this, updates land on the LAST row of the type in place.
+MAX_ROWS_PER_TYPE = 8
 
 SOURCE_HTML_ARTIFACT = "html_artifact"
 
@@ -122,6 +147,10 @@ def phase_label(step_type: str, status: str) -> str:
     words = _PHASE_WORDS.get(step_type)
     if not words:
         return "Working on your app"
+    if status == "skipped":
+        # A skipped phase reads as the thing that DIDN'T happen, never as
+        # the running form ("Writing the app" on a row nothing wrote).
+        return words.get("skipped") or words.get("pending") or words["running"]
     return words.get(status) or words["running"]
 
 
@@ -151,7 +180,7 @@ def initial_steps() -> List[Dict[str, Any]]:
     return [
         {"id": str(uuid.uuid4()), "type": t,
          "label": phase_label(t, "pending"), "status": "pending"}
-        for t in STEP_TYPES
+        for t in PLANNED_TYPES
     ]
 
 
@@ -343,30 +372,65 @@ async def emit_step(
             if not job:
                 return
             steps = json.loads(job.steps_json) if job.steps_json else initial_steps()
-            step_dict = None
-            for s in steps:
-                if s.get("type") != step_type:
-                    continue
-                s["label"] = label
-                s["status"] = status
-                if detail:
-                    s["detail"] = detail
-                if status == "running":
-                    s["started_at"] = datetime.utcnow().isoformat()
-                elif s.get("started_at"):
-                    try:
-                        started = datetime.fromisoformat(s["started_at"])
-                        duration_ms = int(
-                            (datetime.utcnow() - started).total_seconds() * 1000
-                        )
-                        s["duration_ms"] = duration_ms
-                    except ValueError:
-                        pass
-                step_dict = s
-                break
 
-            if step_dict is None:
-                return
+            # ── Occurrence semantics (round 23) ───────────────────────
+            # The recorded regression — "2/7 steps" falling back to "1/7"
+            # with a green check re-spinning — was this function reusing ONE
+            # row per type: the publish gate re-ran `verify` and flipped a
+            # `done` row back to `running`, so the done-count honestly went
+            # backwards. A phase that re-enters after completing now APPENDS
+            # a fresh occurrence (inserted after the last row of its type, so
+            # the card stays grouped by phase with the untouched plan below),
+            # and a completed tick is never taken back: progress is monotonic
+            # by construction, not by a client-side clamp.
+            #
+            # A `failed` row re-entered as `running` is the one deliberate
+            # in-place transition left: that is the retry/fixing state the
+            # card renders, and a fresh row there would leave a permanent ✗
+            # for a problem that was repaired.
+            last_idx = -1
+            occurrences = 0
+            for i, s in enumerate(steps):
+                if isinstance(s, dict) and s.get("type") == step_type:
+                    last_idx = i
+                    occurrences += 1
+            step_dict: Optional[Dict[str, Any]] = None
+            if last_idx >= 0:
+                candidate = steps[last_idx]
+                if (candidate.get("status") == "done" and status == "running"
+                        and occurrences < MAX_ROWS_PER_TYPE):
+                    step_dict = {"id": str(uuid.uuid4()), "type": step_type}
+                    steps.insert(last_idx + 1, step_dict)
+                else:
+                    step_dict = candidate
+            else:
+                # `review`/`edit` are not in the up-front plan — they appear
+                # at the moment they actually happen, inserted in WORK order:
+                # after everything that has started, before the untouched
+                # plan, so the card reads finished-work → this → still-to-do.
+                step_dict = {"id": str(uuid.uuid4()), "type": step_type}
+                insert_at = 0
+                for i, existing in enumerate(steps):
+                    if isinstance(existing, dict) and existing.get("status") != "pending":
+                        insert_at = i + 1
+                steps.insert(insert_at, step_dict)
+
+            s = step_dict
+            s["label"] = label
+            s["status"] = status
+            if detail:
+                s["detail"] = detail
+            if status == "running":
+                s["started_at"] = datetime.utcnow().isoformat()
+            elif s.get("started_at"):
+                try:
+                    started = datetime.fromisoformat(s["started_at"])
+                    duration_ms = int(
+                        (datetime.utcnow() - started).total_seconds() * 1000
+                    )
+                    s["duration_ms"] = duration_ms
+                except ValueError:
+                    pass
 
             job.steps_json = json.dumps(steps)
             # Read off the steps, not latched from this one emit. A `verify`
@@ -469,31 +533,41 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
                 steps = json.loads(job.steps_json) if job.steps_json else []
             except (TypeError, ValueError):
                 steps = []
-            walked = [s for s in steps
-                      if isinstance(s, dict) and s.get("status") != "pending"]
-            # A phase left `running` at the end never reported back. Calling
-            # it done would be inventing a result; calling it failed would be
-            # inventing a diagnosis. It is dropped for the same reason a
-            # pending one is — nothing is known about it.
-            walked = [s for s in walked if s.get("status") != "running"]
-            if any(s.get("status") == "failed" for s in walked):
+            # Round 23. This used to DROP every row still `pending` or
+            # `running` — which is how the recorded card's 7 planned rows
+            # became 4 at the moment of completion, with "Read the app" and
+            # "Look at the app" vanishing without a trace. The rule is now
+            # the brief's: a planned phase may be shown as skipped, never
+            # vanish. A phase left `running` never reported back — calling it
+            # done would invent a result, calling it failed would invent a
+            # diagnosis — so both it and an untouched `pending` row become
+            # `skipped`, with the honest per-phase words from `_PHASE_WORDS`
+            # ("Couldn't look at the app here", "Kept a plain icon for now").
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                if s.get("status") in ("pending", "running"):
+                    s["status"] = "skipped"
+                    s["label"] = phase_label(s.get("type") or "", "skipped")
+            if any(isinstance(s, dict) and s.get("status") == "failed"
+                   for s in steps):
                 final = "failed"
-            job.steps_json = json.dumps(walked or steps)
+            job.steps_json = json.dumps(steps)
             job.status = final
             job.completed_at = datetime.utcnow()
             title = (job.title or "").replace("Build: ", "")
             await db.commit()
 
-        total = len(walked)
         await _broadcast(user_id, {
             "type": "job_update",
             "job_id": job_id,
             "name": title,
             "status": final,
             "step": phase_label("present", "done") if final == "completed" else "",
-            "total_steps": total,
+            "total_steps": len(steps),
             "completed_steps": sum(
-                1 for s in walked if s.get("status") == "done"
+                1 for s in steps
+                if isinstance(s, dict) and s.get("status") == "done"
             ),
         })
     except Exception:
@@ -638,6 +712,15 @@ def artifact_payload(slug: str, *, include_icon: bool = False) -> Dict[str, Any]
         svg = logo.read_icon(slug) or ""
     except Exception:  # noqa: BLE001 - fail-open, like everything here
         svg = ""
+    # The preview follows the icon's contract exactly: an etag on the handle,
+    # bytes behind their own route, cached client-side under (slug, etag) and
+    # refetched only when a publish moved it. Never inline — a PNG is 40–120
+    # KB and this payload rides frames AND persisted messages.
+    preview = ""
+    try:
+        preview = store.preview_etag(slug)
+    except Exception:  # noqa: BLE001 - fail-open, like everything here
+        preview = ""
     out: Dict[str, Any] = {
         "slug": slug,
         "title": rec.title or slug,
@@ -648,6 +731,8 @@ def artifact_payload(slug: str, *, include_icon: bool = False) -> Dict[str, Any]
         "icon_etag": (
             hashlib.sha256(svg.encode("utf-8")).hexdigest()[:32] if svg else ""
         ),
+        "has_preview": bool(preview),
+        "preview_etag": preview,
     }
     if include_icon and svg and len(svg.encode("utf-8")) <= MAX_INLINE_ICON_BYTES:
         out["icon_svg"] = svg
