@@ -49,6 +49,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services import thumbnails as _thumbs
 from app.db.models import Conversation, Message
 from app.db.models.user_file import (
     FILE_ORIGINS,
@@ -210,6 +211,62 @@ def display_name(storage_filename: str) -> str:
     base = storage_filename.rsplit("/", 1)[-1]
     stripped = _STORAGE_PREFIX_RE.sub("", base, count=1)
     return stripped or base
+
+
+#: A trailing uniquifier the image tools append when the model gave no name
+#: (`image_a1b2c3d4.png`, `edited_9f0e1d2c.png` — `uuid4().hex[:8]`). It keeps
+#: two files apart on disk; in a list it is noise, and `_uniquify` already
+#: keeps display names apart.
+#:
+#: Eight characters minimum AND at least one digit, both deliberately: a
+#: six-letter cut would eat the tail of `sunset_facade.png`, and `facade` is a
+#: word, not an id.
+_GENERATED_ID_TAIL_RE = re.compile(
+    r"[_-](?=[0-9a-f]{8,32}$)(?=[0-9a-f]*[0-9])[0-9a-f]{8,32}$", re.IGNORECASE)
+_WORD_SEP_RE = re.compile(r"[_\-]+")
+
+
+def humanise_generated_name(display: str) -> str:
+    """``"A_fox_in_snow.png"`` → ``"A fox in snow.png"``. Round 21, item 6.
+
+    A generated image's filename is minted from the model's `filename`
+    argument, or from a hex uniquifier when it gave none, and lands in a list
+    looking like a variable: `A_fox_in_snow.png`, `image_a1b2c3d4.png`. The
+    separators are not information — they are what a filesystem-safe join
+    left behind — and the hex is an implementation detail of keeping two
+    files apart.
+
+    **A name is only rewritten when it is unambiguously machine-minted.**
+    Three signals, any one of which is enough:
+
+    * a hex id tail was stripped (`image_a1b2c3d4` → `image`);
+    * three or more separator-joined parts (`A_fox_in_snow`);
+    * a lowercase hyphen slug (`muscular-veiny-hand-steering-wheel`).
+
+    `IMG_1100.jpg` and `DSC_0042.jpg` match none of them and come back
+    untouched, which is the point: that is the name the person's camera gave
+    the photo, and "Img 1100" is not an improvement. The caller adds the
+    other half of the guard — this is only ever applied to a file the AGENT
+    produced (see `_sync_locked`).
+    """
+    base = display or ""
+    stem, dot, ext = base.rpartition(".")
+    if not dot or len(ext) > 10:
+        stem, ext = base, ""
+    trimmed = _GENERATED_ID_TAIL_RE.sub("", stem)
+    parts = [p for p in _WORD_SEP_RE.split(trimmed) if p]
+    machine_minted = (
+        trimmed != stem
+        or len(parts) >= 3
+        or ("-" in trimmed and trimmed == trimmed.lower())
+    )
+    if not machine_minted:
+        return base
+    words = " ".join(" ".join(parts).split()).strip() or "Image"
+    # First letter only. "A fox in snow" must not become "A Fox In Snow", and
+    # an all-caps acronym the model chose must survive.
+    words = words[0].upper() + words[1:]
+    return f"{words}.{ext}" if ext else words
 
 
 class InvalidName(ValueError):
@@ -791,8 +848,42 @@ async def ensure_system_folders(db: AsyncSession, user_id: str) -> dict[str, Use
     rows = (await db.execute(
         select(UserFolder).where(UserFolder.user_id == user_id, UserFolder.system_key.isnot(None))
     )).scalars().all()
-    by_key = {r.system_key: r for r in rows if r.system_key in SYSTEM_FOLDERS}
+    by_key: dict[str, UserFolder] = {}
     created = False
+    for r in rows:
+        if r.system_key not in SYSTEM_FOLDERS:
+            continue
+        if r.system_key in by_key:
+            # Two rows claiming the same shelf — a lost insert race, or a
+            # user folder adopted into a role something else already held.
+            # The one at root wins and the other stops being a system
+            # folder; keeping both would put a second "Apps" in the tree.
+            keep, drop = (
+                (by_key[r.system_key], r) if by_key[r.system_key].parent_id is None
+                else (r, by_key[r.system_key])
+            )
+            logger.warning("[library] duplicate system folder %r for user=%s — "
+                           "demoting the copy", r.system_key, user_id)
+            drop.system_key = None
+            # …and give it a name of its own. Two root folders called "Apps"
+            # would leave the second one unaddressable by path
+            # (`resolve_virtual_path` takes the first match), which is a
+            # worse outcome than a slightly ugly name on a row that should
+            # not have existed.
+            if drop.parent_id is None and drop.name == keep.name:
+                drop.name = f"{drop.name} (2)"
+            by_key[keep.system_key] = keep
+            created = True
+            continue
+        if r.parent_id is not None:
+            # Round 21, item 3: a shelf lives at the top level. Whatever put
+            # this one inside another folder, it is put back rather than
+            # listed there.
+            logger.warning("[library] system folder %r was nested for user=%s "
+                           "— returning it to the root", r.system_key, user_id)
+            r.parent_id = None
+            created = True
+        by_key[r.system_key] = r
     for key, name in SYSTEM_FOLDERS.items():
         if key in by_key:
             continue
@@ -952,6 +1043,18 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
                 if row.modified_at != mt or int(row.size_bytes or 0) != int(c.size):
                     row.modified_at = mt
                     row.size_bytes = c.size
+                # Round 21, item 6: give the images imported before this rule
+                # existed their readable names too. Only when the row still
+                # carries exactly the machine name — a row the user renamed is
+                # theirs, and a repair that overwrites a person's chosen name
+                # is worse than the underscores it removes.
+                if row.origin == ORIGIN_AGENT and kind_of_row(row) == KIND_IMAGE:
+                    pretty = humanise_generated_name(row.name)
+                    if row.name == display_name(base) and pretty != row.name:
+                        taken.discard((row.folder_id, row.name.lower()))
+                        row.name = _uniquify(pretty, row.folder_id, taken)
+                        taken.add((row.folder_id, row.name.lower()))
+                        known_sig.add((row.name.lower(), int(c.size)))
             continue
 
         # New file.
@@ -974,7 +1077,20 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
             origin = ORIGIN_AGENT
             created = _dt_from_ts(c.mtime)
         kind = KIND_APP if tag == ROOT_APP else kind_of(name, mime)
-        if tag != ROOT_APP and (name.lower(), int(c.size)) in known_sig and _is_duplicate(user_id, c, name, by_key, hashes):
+        # Round 21, item 6. An image the AGENT made carries a filename minted
+        # for a filesystem; the person who asked for it should see words. The
+        # dedupe signature below is deliberately computed on the machine name
+        # (`known_sig` is built from rows that may predate this rule), so the
+        # rename happens after it.
+        machine_name = name
+        if kind == KIND_IMAGE and origin == ORIGIN_AGENT:
+            name = humanise_generated_name(name)
+        # BOTH names are checked against the known signatures: rows imported
+        # before this rule carry the machine name, rows imported after it
+        # carry the readable one, and the same bytes must be recognised
+        # whichever era the first copy came from.
+        _sigs = {(machine_name.lower(), int(c.size)), (name.lower(), int(c.size))}
+        if tag != ROOT_APP and (_sigs & known_sig) and _is_duplicate(user_id, c, name, by_key, hashes):
             # The same bytes again — the image tools drop a workspace copy
             # next to the attachment, Telegram/routine paths persist the same
             # generation repeatedly, a deleted or denied file has a twin at
@@ -999,6 +1115,9 @@ async def _sync_locked(db: AsyncSession, user_id: str) -> dict:
         db.add(row)
         by_key[c.key] = row
         known_sig.add((name.lower(), int(c.size)))
+        # The machine name too — a workspace copy of these same bytes is
+        # scanned later in this pass and reaches the check above under it.
+        known_sig.add((machine_name.lower(), int(c.size)))
         taken.add((folder_id, name.lower()))
         counts["imported"] += 1
 
@@ -1079,9 +1198,27 @@ async def _assert_free_name(db: AsyncSession, user_id: str, parent_id: Optional[
 
 
 async def list_folders(db: AsyncSession, user_id: str, parent_id: Optional[str]) -> list[UserFolder]:
+    """The folders directly inside ``parent_id`` (None = root).
+
+    Round 21, item 3. **A system folder — Apps, Documents, Images, Uploads —
+    is returned at the ROOT and nowhere else.** They are shelves, not
+    folders: every read path places files into them by kind, `update_folder`
+    refuses to move them, and there is exactly one of each. So an Apps row
+    appearing inside Uploads can only ever be a data fault (a stray
+    `parent_id`, a duplicate `system_key` from a lost insert race), and the
+    listing is the last place that fault should be allowed to surface — a
+    user tapping through their own files should not have to know that
+    "Apps" means two different things depending on where they saw it.
+
+    The filter is belt-and-braces to `ensure_system_folders`, which reparents
+    a stray one back to root. Both, because the invariant is cheap to state
+    and the failure is confusing to look at.
+    """
     q = select(UserFolder).where(UserFolder.user_id == user_id)
     q = q.where(UserFolder.parent_id.is_(None)) if parent_id is None else q.where(UserFolder.parent_id == parent_id)
     rows = (await db.execute(q)).scalars().all()
+    if parent_id is not None:
+        rows = [f for f in rows if not f.system_key]
     # System folders first, in SYSTEM_FOLDERS order, then user folders A→Z.
     order = {k: i for i, k in enumerate(SYSTEM_FOLDERS)}
     return sorted(rows, key=lambda f: (0 if f.system_key in order else 1,
@@ -1282,6 +1419,95 @@ def _kind_filter(kind: str):
     return and_(or_(*conds), ~_IS_APP_SQL)
 
 
+async def register_app_file(db: AsyncSession, user_id: str, slug: str) -> Optional[UserFile]:
+    """Put a just-published app into Files NOW, without waiting for a scan.
+
+    Round 21, item 2. The library is a manifest synced FROM disk, and the
+    sync is throttled (`SYNC_MIN_INTERVAL_S`) and only runs when somebody
+    lists something. So the sequence a user actually performs — publish the
+    app, watch the card appear, tap Files — hit the throttle and showed an
+    Apps folder that did not contain the app they were looking at. Measured
+    before this existed: the listing straight after a publish returned `[]`,
+    and only `?refresh=true` found it.
+
+    Registering at the moment of publication removes the race rather than
+    shortening it. Everything the row needs is known here: the slug is the
+    storage key, the title is the name the model gave it, the size and the
+    mtime come from the file that was just written, and an app always lives
+    in Apps. A later sync finds the key already present and leaves it alone,
+    so this is an accelerator, never a second source of truth.
+
+    Best-effort by contract: the caller is a publish, and a publish must not
+    fail because a manifest row could not be written.
+    """
+    slug = (slug or "").strip()
+    if not slug:
+        return None
+    key = make_key(ROOT_APP, f"{slug}.html")
+    try:
+        path = physical_path(user_id, key)
+    except ValueError:
+        return None
+    st = _stat_file(path)
+    if st is None:
+        # No bytes, no row. `present_app` writes the file before it calls
+        # this, so this is the "someone deleted it mid-publish" arm.
+        return None
+
+    name = app_title(slug)
+    folders = await ensure_system_folders(db, user_id)
+    apps_folder = folders.get(SYSTEM_FOLDER_APPS)
+    folder_id = apps_folder.id if apps_folder else None
+
+    row = (await db.execute(
+        select(UserFile).where(UserFile.user_id == user_id,
+                               UserFile.storage_key == key)
+    )).scalars().first()
+    # Names stay unique per folder — the path surface addresses files by
+    # name, so two "Snake" rows in Apps would make one of them unreachable.
+    taken = {
+        (n or "").lower() for (n,) in (await db.execute(
+            select(UserFile.name).where(
+                UserFile.user_id == user_id, UserFile.folder_id == folder_id,
+                UserFile.deleted_at.is_(None),
+                UserFile.storage_key != key,
+            )
+        )).all()
+    }
+    name = _uniquify(name, folder_id, {(folder_id, n) for n in taken})
+    if row is None:
+        row = UserFile(
+            user_id=user_id,
+            folder_id=folder_id,
+            name=name,
+            mime_type="text/html",
+            size_bytes=int(st.st_size),
+            storage_key=key,
+            origin=ORIGIN_AGENT,
+            created_at=_dt_from_ts(st.st_mtime),
+            modified_at=_dt_from_ts(st.st_mtime),
+        )
+        db.add(row)
+    else:
+        # A republish of an app somebody had deleted from Files brings it
+        # back — the bytes are new and the user asked for them again.
+        row.deleted_at = None
+        if row.folder_id is None:
+            row.folder_id = folder_id
+        # The name is the user's if they renamed it in Files; the manifest
+        # already carries that rename (`_rename_app_everywhere`), so
+        # `app_title` returns it and this stays a no-op in that case.
+        row.name = name or row.name
+        row.size_bytes = int(st.st_size)
+        row.modified_at = _dt_from_ts(st.st_mtime)
+    await db.commit()
+    await db.refresh(row)
+    # The next listing must not be answered from the throttle window with a
+    # manifest older than this write.
+    invalidate_sync(user_id)
+    return row
+
+
 async def _rename_app_everywhere(db: AsyncSession, slug: str, title: str) -> None:
     """An app renamed in Files is renamed in the chat card and the Apps list
     too — one app, one name. Best-effort: a rename that lands in the library
@@ -1331,6 +1557,15 @@ def _unlink_quiet(user_id: str, key: str) -> bool:
         p = physical_path(user_id, key)
     except ValueError:
         return False
+    # Computed BEFORE the unlink — the cache key is (path, size, mtime) and
+    # none of those survive the file. Best-effort: an orphaned 20 KB JPEG is
+    # not worth failing a delete over.
+    try:
+        tkey = _thumbs.cache_key(p)
+        if tkey:
+            os.unlink(_thumbs.cache_path(thumbnails_root(), tkey))
+    except OSError:
+        pass
     try:
         os.unlink(p)
     except FileNotFoundError:
@@ -1560,6 +1795,12 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def thumbnails_root() -> str:
+    """Where derived thumbnails are cached — inside the workspace, dotted, so
+    the candidate walk skips it and it travels with the tenant's volume."""
+    return workspace_root()
+
+
 def file_entry(f: UserFile, path: str, *, api_prefix: str = "/api") -> dict:
     kind = kind_of_row(f)
     entry = {
@@ -1577,6 +1818,16 @@ def file_entry(f: UserFile, path: str, *, api_prefix: str = "/api") -> dict:
         "path": path,
         "download_url": f"{api_prefix}/library/files/{f.id}/download",
         "preview_url": f"{api_prefix}/library/files/{f.id}/preview",
+        # Round 21, item 6. A listing that wants to SHOW an image had only
+        # `preview_url`, which is the original bytes — twenty rows of that is
+        # twenty multi-megabyte decodes for forty-pixel tiles. Present only
+        # for formats there is a thumbnailer for, so a client can treat its
+        # absence as "draw the icon" without probing.
+        "thumbnail_url": (
+            f"{api_prefix}/library/files/{f.id}/thumbnail"
+            if kind == KIND_IMAGE and _thumbs.can_thumbnail(f.mime_type or "", f.name)
+            else None
+        ),
     }
     if kind == KIND_APP:
         # `app_slug` is the handle the client exchanges for a slug-scoped
@@ -1624,6 +1875,10 @@ def compat_file_entry(f: UserFile, path: str) -> dict:
         "name": f.name, "type": "file", "size": e["size"], "modified": e["modified"],
         "id": f.id, "mime": f.mime_type, "kind": e["kind"], "size_label": e["size_label"],
         "origin": f.origin, "path": path, "system": None,
+        # Emitted here too: the shipped mobile client reads THIS shape, and a
+        # field carried by one serializer and not the other is the drift this
+        # module's docstring is about.
+        "thumbnail_url": e.get("thumbnail_url"),
     }
     # An app is openable only through the artifact frame, so the handle for
     # that has to reach the path-based surface too — the shipped mobile

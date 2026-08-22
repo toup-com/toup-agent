@@ -364,9 +364,11 @@ async def test_files_land_in_the_right_system_folder_with_clean_names(api, agent
         "project-management-tools-comparison-2026.md",
     ])
     # two attachments with the same display name → second is uniquified;
-    # the workspace copy of the first is NOT a third entry
+    # the workspace copy of the first is NOT a third entry.
+    # Round 21, item 6: an agent-generated image's slug becomes words.
     assert sorted(f["name"] for f in imgs["files"]) == [
-        "muscular-veiny-hand-steering-wheel (2).png", "muscular-veiny-hand-steering-wheel.png",
+        "Muscular veiny hand steering wheel (2).png",
+        "Muscular veiny hand steering wheel.png",
     ]
     assert sorted(f["name"] for f in ups["files"]) == ["IMG_3145.jpg", "Resume_2.pdf"]
     for f in ups["files"]:
@@ -378,11 +380,11 @@ async def test_files_land_in_the_right_system_folder_with_clean_names(api, agent
 async def test_metadata_is_real(api, agent_headers, tenant):
     imgs = await _list(api, agent_headers, "Images")
     by = {f["name"]: f for f in imgs["files"]}
-    f = by["muscular-veiny-hand-steering-wheel.png"]
+    f = by["Muscular veiny hand steering wheel.png"]
     assert f["type"] == "file" and f["kind"] == "image" and f["mime"] == "image/png"
     assert f["size"] == 3000 and f["size_label"] == "2.9 KB"
     assert f["modified"] == "2026-07-09T23:43:46Z"       # the file's real mtime, UTC, Z
-    assert f["path"] == "Images/muscular-veiny-hand-steering-wheel.png"
+    assert f["path"] == "Images/Muscular veiny hand steering wheel.png"
     assert f["id"] and "/" not in f["id"]
     ups = await _list(api, agent_headers, "Uploads")
     up = {x["name"]: x for x in ups["files"]}["Resume_2.pdf"]

@@ -191,9 +191,16 @@ async def _one(slug: str, user_id: str) -> Optional[str]:
             moved.append("brief")
 
     purpose = purpose_line(slug)
-    if logo.is_stale(slug, title=rec.title or slug, purpose=purpose):
+    # Round 21: the app's own palette is part of what the mark is for, so it
+    # is part of the staleness question too. `html` is already in hand, and
+    # it is handed to `ensure_icon` for the same reason — the file this
+    # backfill just read IS the file the palette comes from.
+    from app.agent.skills.builtins.app_html import palette as palette_mod
+    if logo.is_stale(slug, title=rec.title or slug, purpose=purpose,
+                     palette=palette_mod.extract(html)):
         _svg, source = await logo.ensure_icon(
             slug, title=rec.title or slug, purpose=purpose, user_id=user_id,
+            html=html,
         )
         if source == "model":
             moved.append("icon")

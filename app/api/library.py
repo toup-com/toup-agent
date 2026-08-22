@@ -24,6 +24,7 @@ The platform proxies all of this 1:1 (``app/api/workspace_proxy.py``).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -484,6 +485,80 @@ async def library_preview(
         format=format,
         etag=_library_etag(f, path),
     )
+
+
+#: Derived, tiny, and keyed on the SOURCE bytes (see `thumbnails.cache_key`),
+#: so it can be cached hard. A day, not `immutable`: the id is stable and a
+#: re-upload replaces the bytes under it, and the ETag catches that on the
+#: first revalidation of the next day rather than never.
+_THUMB_CACHE = "private, max-age=86400"
+
+
+async def _thumbnail_response(user_id: str, f: UserFile, request: Optional[Request]) -> Response:
+    """One image's thumbnail, generated on first ask and cached after.
+
+    404 rather than a placeholder when there is nothing to make one from: a
+    client that gets a 404 draws its own icon, whereas a served placeholder
+    would be indistinguishable from a real thumbnail of a blank image.
+    """
+    from app.services import thumbnails
+
+    if lib.kind_of_row(f) != lib.KIND_IMAGE or not thumbnails.can_thumbnail(
+        f.mime_type or "", f.name
+    ):
+        raise HTTPException(415, "No thumbnail for this file type")
+    path = lib.file_abspath(user_id, f)
+    if not path:
+        raise HTTPException(410, "This file is no longer available")
+
+    made = await asyncio.to_thread(thumbnails.ensure, lib.thumbnails_root(), path)
+    if not made:
+        raise HTTPException(404, "No thumbnail available")
+    thumb_path, key = made
+    etag = f'"{key}"'
+    if etag_matches(request, etag):
+        return not_modified(etag, _THUMB_CACHE)
+    return StreamingResponse(
+        _stream_path(thumb_path),
+        media_type=thumbnails.THUMB_MIME,
+        headers={
+            "Content-Length": str(os.path.getsize(thumb_path)),
+            "Content-Disposition": _content_disposition("inline", f.name),
+            "Cache-Control": _THUMB_CACHE,
+            "ETag": etag,
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/library/files/{file_id}/thumbnail")
+async def library_thumbnail(
+    file_id: str,
+    request: Request,
+    token: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await get_user_for_file(request, token, db)
+    f = await _require_file(db, user.id, file_id)
+    _refuse_if_app(f)
+    return await _thumbnail_response(user.id, f, request)
+
+
+@router.get("/workspace/file-thumbnail")
+async def compat_thumbnail(
+    request: Request,
+    path: str = Query(...),
+    token: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """The path-addressed twin, for the shipped mobile shapes."""
+    user = await get_user_for_file(request, token, db)
+    await _synced(db, user.id)
+    res = await lib.resolve_virtual_path(db, user.id, path)
+    if res is None or res.kind != "file":
+        raise HTTPException(404, "File not found")
+    _refuse_if_app(res.file)
+    return await _thumbnail_response(user.id, res.file, request)
 
 
 @router.get("/library/files/{file_id}/content")

@@ -112,6 +112,18 @@ class Brief:
     #: current revision: the gap between the two is exactly how far the
     #: description has drifted from the thing it describes.
     narrative_revision: int = 0
+    #: This DOCUMENT's version, incremented on every write. Round 21, item 4.
+    #:
+    #: Deliberately not the app's revision, which is what it would be easy to
+    #: reuse and wrong to. They count different things and they diverge in
+    #: both directions: a publish, a rename or a backfill updates the brief
+    #: without touching the file, and `create_app_file` replaces the file at
+    #: revision 1 over and over. "Which version of the memory am I reading"
+    #: only has an answer if the memory has its own counter.
+    version: int = 0
+    #: Size of the app, in bytes, as of this version — the baseline the next
+    #: write reports its delta against.
+    app_bytes: int = 0
     updated_at: str = ""
 
     @property
@@ -123,7 +135,9 @@ class Brief:
             "---",
             f"slug: {self.slug}",
             f"title: {self.title or self.slug}",
+            f"version: {self.version}",
             f"narrative_revision: {self.narrative_revision}",
+            f"app_bytes: {self.app_bytes}",
             f"updated_at: {self.updated_at or _now()}",
             "internal: true   # never rendered to the user, never listed in Files",
             "---",
@@ -167,11 +181,11 @@ def parse(text: str, slug: str) -> Brief:
             key, value = key.strip(), value.split("#")[0].strip()
             if key == "title":
                 brief.title = value
-            elif key == "narrative_revision":
+            elif key in ("narrative_revision", "version", "app_bytes"):
                 try:
-                    brief.narrative_revision = int(value)
+                    setattr(brief, key, int(value))
                 except ValueError:
-                    brief.narrative_revision = 0
+                    setattr(brief, key, 0)
             elif key == "updated_at":
                 brief.updated_at = value
         body = body[m.end():]
@@ -227,6 +241,76 @@ def _write(brief: Brief) -> None:
     store._atomic_write(path, payload, prefix=f".brief-{brief.slug}-")
 
 
+_DIGEST_FIELD_RE = re.compile(r"^- \*\*([^:*]+):\*\*\s*(.*)$", re.MULTILINE)
+_BACKTICKED_RE = re.compile(r"`([^`]+)`")
+
+#: Structure-digest fields worth diffing, and the noun each one's items are.
+#: "Size" is excluded on purpose — it is reported from the file itself, in
+#: bytes, and re-deriving it from prose would be a second, worse source.
+_DIFFED_FIELDS: Dict[str, str] = {
+    "Controls": "control",
+    "Main sections": "section",
+    "Element ids": "id",
+    "Design tokens": "token",
+    "Type": "typeface",
+    "Top-level functions": "function",
+    "Events handled": "event",
+    "External libraries": "library",
+}
+
+
+def _digest_fields(structure: str) -> Dict[str, List[str]]:
+    """``{"Controls": ["play", "pause"], …}`` from a rendered digest."""
+    out: Dict[str, List[str]] = {}
+    for label, body in _DIGEST_FIELD_RE.findall(structure or ""):
+        out[label.strip()] = _BACKTICKED_RE.findall(body)
+    return out
+
+
+def _change_summary(before: str, after: str, *, byte_delta: Optional[int]) -> str:
+    """What actually moved between two versions of the app, in one clause.
+
+    Derived, not described. `reason` is the model's account of WHY it made a
+    change — useful, and unverifiable. This is the other half: what the bytes
+    say happened, computed by diffing the structure digest either side of the
+    write, so a history entry cannot claim a change that is not in the file.
+    """
+    parts: List[str] = []
+    old, new = _digest_fields(before), _digest_fields(after)
+    for label, noun in _DIFFED_FIELDS.items():
+        was, now = old.get(label), new.get(label)
+        if was is None and now is None:
+            continue
+        added = [v for v in (now or []) if v not in (was or [])]
+        removed = [v for v in (was or []) if v not in (now or [])]
+        if not added and not removed:
+            continue
+        bits = []
+        if added:
+            bits.append("+" + ", ".join(added[:3]) + ("…" if len(added) > 3 else ""))
+        if removed:
+            bits.append("−" + ", ".join(removed[:3]) + ("…" if len(removed) > 3 else ""))
+        parts.append(f"{noun}s {' '.join(bits)}")
+    if not parts:
+        parts = ["no structural change"]
+    # The size clause leads, because it is the one fact that is true of every
+    # write; "same size" ALONE would read as "nothing happened", which is
+    # wrong for a 30→45 that moved no bytes, so it never travels alone.
+    if byte_delta is not None:
+        parts.insert(0, f"{byte_delta:+,} bytes" if byte_delta else "same size")
+    # Assembled within the budget rather than cut to it: a mid-word slice
+    # ("…; functions +") reads as a fact about the app and is not one.
+    out: List[str] = []
+    used = 0
+    for part in parts:
+        if used + len(part) + 2 > 200:
+            out.append(f"and {len(parts) - len(out)} more")
+            break
+        out.append(part)
+        used += len(part) + 2
+    return "; ".join(out)
+
+
 def save(
     slug: str,
     *,
@@ -241,6 +325,12 @@ def save(
     ``narrative=None`` means "leave the narrative alone" — an edit that did
     not change what the app IS still refreshes the structure and appends to
     the history, and must not blank the description in doing so.
+
+    Round 21, item 4. Every call bumps :attr:`Brief.version` and appends one
+    history entry, and the entry carries BOTH halves of what a later reader
+    needs: the model's reason (why), and a derived summary of what the bytes
+    did (what). The second half is the one that cannot lie — it is computed
+    by diffing the structure digest either side of this write.
     """
     existing = read(slug) or Brief(slug=store.normalise_slug(slug))
     existing.slug = store.normalise_slug(slug)
@@ -251,11 +341,24 @@ def save(
     # ALWAYS re-derived. The structure section describes bytes that just
     # changed; carrying the previous one forward is how a map starts pointing
     # at an element that was renamed two edits ago.
+    previous_structure = existing.structure
+    previous_bytes = int(existing.app_bytes or 0)
     existing.structure = structure_digest(html)
-    if history_line:
-        existing.history.append(
-            f"- r{revision} · {_now()} · {' '.join(history_line.split())[:160]}"
-        )
+    existing.app_bytes = len((html or "").encode("utf-8"))
+
+    existing.version = int(existing.version or 0) + 1
+    changed = _change_summary(
+        previous_structure, existing.structure,
+        byte_delta=(existing.app_bytes - previous_bytes
+                    if previous_bytes else None),
+    )
+    why = " ".join((history_line or "").split())[:160] or "no reason given"
+    # ONE line per version, because `parse` reads history as lines and a
+    # wrapped entry would come back as three entries on the next read.
+    existing.history.append(
+        f"- v{existing.version} · r{revision} · {_now()} · "
+        f"why: {why} · what: {changed}"
+    )
     existing.updated_at = _now()
     _write(existing)
     return existing
@@ -437,13 +540,22 @@ def context_block(slug: str, *, current_revision: int) -> str:
             f"so check it still describes what is there."
         )
     return (
-        f"<app_brief status=\"internal\">\n"
-        f"INTERNAL — this is your own working memory of this app. Never quote "
-        f"it, never paste it into chat and never mention that it exists.{drift}\n"
+        f"<app_brief status=\"internal\" version=\"{brief.version}\">\n"
+        f"INTERNAL — this is your own working memory of this app, at version "
+        f"{brief.version}. Never quote it, never paste it into chat and never "
+        f"mention that it exists.{drift}\n"
         f"Read it before you decide what to change: the request is about the "
         f"app described here, not about the literal words in it. If what you "
         f"have been asked to do would break what this app is for, say so and "
-        f"propose the change that serves the purpose instead.\n\n"
+        f"propose the change that serves the purpose instead.\n"
+        f"The `Change history` below is one line per version, newest last: "
+        f"`why` is the reason the editor gave, `what` is what the file "
+        f"actually did. Read the last few before you touch anything — they "
+        f"are how you find out that the thing you are about to change was "
+        f"changed deliberately two versions ago. Your own edit becomes version "
+        f"{brief.version + 1} automatically; pass `reason` to edit_app_file so "
+        f"the entry says why, and pass `brief` as well whenever the change "
+        f"alters what this app IS.\n\n"
         f"{brief.render()}"
         f"</app_brief>"
     )

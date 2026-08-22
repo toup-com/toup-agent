@@ -53,7 +53,8 @@ _STREAM_READ_S = 120.0
 # downloads) — these accept ?token= through the same explicit-before-ambient
 # ladder as /api/files; everything else needs the normal session auth
 # (Bearer / SSO cookie, with token revocation checks).
-_EMBED_SUFFIXES = ("/download", "/preview", "file-download")
+_EMBED_SUFFIXES = ("/download", "/preview", "file-download", "/thumbnail",
+                   "file-thumbnail")
 # Never relay these to the caller: hop-by-hop, framing (we re-frame as
 # chunked), and anything that could pin the browser to the agent's origin.
 _DROP_RESPONSE_HEADERS = {
@@ -66,7 +67,7 @@ _FORWARD_REQUEST_HEADERS = ("content-type", "accept", "content-length", "if-none
 
 def _is_embed_route(path: str) -> bool:
     p = "/" + path.strip("/")
-    return p.endswith(_EMBED_SUFFIXES[0]) or p.endswith(_EMBED_SUFFIXES[1]) or p.endswith(_EMBED_SUFFIXES[2])
+    return any(p.endswith(s) for s in _EMBED_SUFFIXES)
 
 
 async def _authenticate(request: Request, path: str, credentials: Optional[HTTPAuthorizationCredentials],

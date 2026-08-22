@@ -22,6 +22,7 @@ successful file write into a failed tool call — the lesson
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -67,11 +68,19 @@ _PHASE_WORDS: Dict[str, Dict[str, str]] = {
     "look":    {"pending": "Look at the app",   "running": "Looking at the app",
                 "done": "Checked the app looks right",
                 "failed": "The app doesn't look right yet"},
+    # Round 21, item 1. The mark used to be drawn inside the `present` step,
+    # so the one phase that involves two model calls had no row of its own and
+    # a failed drawing was invisible. It is a phase: it can be slow, it can
+    # fail, and the user should see which of the two happened.
+    "logo":    {"pending": "Draw the app's icon", "running": "Drawing the app's icon",
+                "done": "Drew the app's icon",
+                "failed": "Kept a plain icon for now"},
     "present": {"pending": "Publish the app",   "running": "Publishing the app",
                 "done": "Published the app",    "failed": "Couldn't publish the app"},
 }
 
-STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "look", "present"]
+STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "look", "logo",
+                         "present"]
 
 SOURCE_HTML_ARTIFACT = "html_artifact"
 
@@ -96,6 +105,9 @@ _PHASE_USER_MESSAGE: Dict[str, str] = {
                "you yet. Ask me to fix it.",
     "look":    "The app runs, but something on screen isn't right yet, so I "
                "haven't shown it to you. Ask me to fix it.",
+    # Not a failure the user has to do anything about: the app is published
+    # either way and a later run upgrades the mark.
+    "logo":    "The app is ready — it just has a plain icon for now.",
     "present": "The app isn't ready to open yet — it needs a fix first.",
 }
 
@@ -551,7 +563,42 @@ async def upsert_app_row(
         return None
 
 
-def artifact_payload(slug: str) -> Dict[str, Any]:
+async def register_in_library(*, user_id: str, slug: str) -> bool:
+    """Make the published app a Files row NOW. Never raises.
+
+    Round 21, item 2. `upsert_app_row` above puts the app in the *Apps* list;
+    this puts it in *Files*, which is a different manifest with a different
+    refresh rule — a throttled scan of the disk that only runs when something
+    is listed. Measured before this call existed: list Files immediately
+    after a publish and the Apps folder was empty; only `?refresh=true`
+    found the app.
+
+    Best-effort by contract. The app is published; a manifest row that could
+    not be written is a listing that lags by one sync, which is exactly the
+    behaviour this replaces — never a failed publish.
+    """
+    if not user_id:
+        return False
+    try:
+        from app.db.database import async_session_maker
+        from app.services import library_service as lib
+
+        async with async_session_maker() as db:
+            row = await lib.register_app_file(db, user_id, slug)
+        return row is not None
+    except Exception:  # noqa: BLE001 - a listing is never worth a publish
+        logger.warning("[app_html] could not register %s in Files", slug,
+                       exc_info=True)
+        return False
+
+
+#: Beyond this an inlined mark is not worth the frame it rides on. Real
+#: designed marks measure 1–3 KB; `logo.MAX_ICON_BYTES` allows 24 KB, and a
+#: 24 KB SVG on a WS frame is a worse deal than one conditional GET.
+MAX_INLINE_ICON_BYTES = 8 * 1024
+
+
+def artifact_payload(slug: str, *, include_icon: bool = False) -> Dict[str, Any]:
     """The app's HANDLE — everything a card needs and no body.
 
     ``revision`` is the field this whole round turns on. It is what a client
@@ -570,21 +617,41 @@ def artifact_payload(slug: str) -> Dict[str, Any]:
     rec = store.read_manifest().get(slug)
     if rec is None:
         return {"slug": slug}
-    # A flag, not the drawing. The icon is a few KB of SVG and this payload
-    # rides a WS frame AND a persisted message; what a card needs is to know
-    # that `/api/artifacts/{slug}/icon` is worth one request.
+    # The mark, in two halves, because this payload has two readers with
+    # opposite needs.
+    #
+    # `icon_etag` always. It is the sha of the SVG's bytes — the same value
+    # the icon route sends as its ETag — so a client can cache the drawing
+    # under (slug, etag) forever and refetch on the one event that means
+    # anything: a redraw. Round 20 shipped only `has_icon`, which says an
+    # icon exists but never that it CHANGED, so every surface that wanted to
+    # be correct had to re-request the SVG on every render. That is the
+    # per-app-card request this round was asked to remove.
+    #
+    # `icon_svg` only when asked for, and only for a small one. The live
+    # `app_artifact` frame wants it — the card is about to be drawn and a
+    # second round trip is a visible pop-in — while the copy persisted into
+    # a message's metadata must not carry it, or a thread with thirty app
+    # cards would carry thirty SVGs in its history for ever.
+    svg = ""
     try:
-        has_icon = logo.read_icon(slug) is not None
+        svg = logo.read_icon(slug) or ""
     except Exception:  # noqa: BLE001 - fail-open, like everything here
-        has_icon = False
-    return {
+        svg = ""
+    out: Dict[str, Any] = {
         "slug": slug,
         "title": rec.title or slug,
         "revision": rec.revision,
         "updated_at": rec.updated_at or None,
         "size_bytes": rec.size_bytes,
-        "has_icon": has_icon,
+        "has_icon": bool(svg),
+        "icon_etag": (
+            hashlib.sha256(svg.encode("utf-8")).hexdigest()[:32] if svg else ""
+        ),
     }
+    if include_icon and svg and len(svg.encode("utf-8")) <= MAX_INLINE_ICON_BYTES:
+        out["icon_svg"] = svg
+    return out
 
 
 async def announce_ready(
@@ -616,7 +683,12 @@ async def announce_ready(
     """
     if slug:
         try:
-            payload = artifact_payload(slug)
+            # `include_icon`: this is the frame that makes a client DRAW the
+            # card, so the mark travels with it. Without it the card paints,
+            # then fires a request for `/artifacts/{slug}/icon`, then repaints
+            # — a visible pop-in on the one frame where the drawing is already
+            # in this process's hands.
+            payload = artifact_payload(slug, include_icon=True)
         except Exception:  # noqa: BLE001 - fail-open, like everything here
             # An unreadable manifest costs the revision, never the card: the
             # slug alone is exactly what this used to carry.

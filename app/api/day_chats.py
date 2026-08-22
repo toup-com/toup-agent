@@ -6,9 +6,11 @@ return data if backfill has completed, return empty list if not. Never error on
 the flag being off. This lets the frontend deploy independently of the flag flip.
 """
 
+import json as _json
 import logging
 from datetime import date as Date, datetime, timedelta
 from typing import Optional, List, Tuple
+from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -67,6 +69,51 @@ def _attachment_urls(message_id: str, att: dict) -> dict:
     return out
 
 
+_META_CACHE: "WeakKeyDictionary[Message, dict]" = WeakKeyDictionary()
+
+
+def _metadata(msg: Message) -> dict:
+    """``Message.metadata_json``, parsed ONCE per message.
+
+    Round 21, item 5. Four serializers below want four different keys out of
+    this one column, and each of them used to `json.loads` it independently —
+    so a 500-message history load parsed the same JSON two thousand times,
+    and an assistant turn with a long `tool_events` array paid for all four.
+    Cached on the instance, so the four calls in one row's dict literal cost
+    one parse.
+
+    A WeakKeyDictionary rather than an attribute: `Message` is a SQLAlchemy
+    model and setting an unmapped attribute on one is a habit that ends in a
+    column somebody meant to persist. Entries die with the row.
+
+    **Both cache operations are guarded, not just the write.** Callers pass
+    row-shaped stand-ins — `types.SimpleNamespace` in the serializer tests, a
+    row proxy elsewhere — and neither a weak reference nor a hash can be taken
+    of every one of them. A cache is an optimisation; a serializer that raises
+    because it could not memoise is a history load that 500s.
+    """
+    try:
+        cached = _META_CACHE.get(msg)
+    except TypeError:  # not weak-referenceable — parse and do not cache
+        cached = None
+    if cached is not None:
+        return cached
+    raw = getattr(msg, "metadata_json", None)
+    parsed: dict = {}
+    if raw:
+        try:
+            loaded = _json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(loaded, dict):
+                parsed = loaded
+        except (TypeError, ValueError):
+            parsed = {}
+    try:
+        _META_CACHE[msg] = parsed
+    except TypeError:
+        pass
+    return parsed
+
+
 def _serialize_attachments(msg: Message) -> Optional[List[dict]]:
     """Return Message.attachments as a client-safe list (strip storage_path,
     enrich with download_url + preview_url) or None when there are none.
@@ -97,16 +144,7 @@ def _serialize_media(msg: Message) -> Optional[dict]:
     """Extract the media payload persisted in metadata_json by agent_runner.
     Shape: {"type": "youtube"|"netflix", "video_id": "...", "title": "..."}.
     Returns None when absent or malformed."""
-    import json as _json
-    raw = getattr(msg, "metadata_json", None)
-    if not raw:
-        return None
-    try:
-        parsed = _json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
+    parsed = _metadata(msg)
     media = parsed.get("media")
     return media if isinstance(media, dict) else None
 
@@ -125,16 +163,7 @@ def _serialize_app_artifact(msg: Message) -> Optional[dict]:
     documents at length: a field carried by one serializer and not the others
     disappears the moment a client takes its fallback path.
     """
-    import json as _json
-    raw = getattr(msg, "metadata_json", None)
-    if not raw:
-        return None
-    try:
-        parsed = _json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
+    parsed = _metadata(msg)
     art = parsed.get("app_artifact")
     return art if isinstance(art, dict) and art.get("slug") else None
 
@@ -150,16 +179,7 @@ def _serialize_admin_notice(msg: Message) -> Optional[dict]:
     fallback and the card renders as a bare assistant bubble from the
     agent, which is the one thing the feature exists to prevent.
     """
-    import json as _json
-    raw = getattr(msg, "metadata_json", None)
-    if not raw:
-        return None
-    try:
-        parsed = _json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
+    parsed = _metadata(msg)
     notice = parsed.get("admin_notice")
     return notice if isinstance(notice, dict) else None
 
@@ -171,16 +191,7 @@ def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
     so the frontend ToolPillRow component skips rendering entirely
     for legacy (pre-feature) messages instead of showing an empty
     pill row."""
-    import json as _json
-    raw = getattr(msg, "metadata_json", None)
-    if not raw:
-        return None
-    try:
-        parsed = _json.loads(raw) if isinstance(raw, str) else raw
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
+    parsed = _metadata(msg)
     events = parsed.get("tool_events")
     if not isinstance(events, list) or not events:
         return None

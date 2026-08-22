@@ -485,6 +485,13 @@ class AppHtmlSkill(Skill):
             "and propose the change that serves the purpose — then do it. Pass a "
             "rewritten `brief` on the edit whenever the change alters what the "
             "app is.\n"
+            "The brief is VERSIONED: every write to the app bumps it and adds "
+            "one line saying why the change was made and what the file actually "
+            "did. Those lines are the app's history — read the last few before "
+            "you change anything, because they are where you find out that the "
+            "thing you are about to 'fix' was done deliberately two versions "
+            "ago. Always pass `reason` to app_html__edit_app_file: it is what "
+            "the next editor reads, and 'edited' tells them nothing.\n"
             "If a check comes back with problems, FIX THEM AND CALL AGAIN. That is "
             "the whole recovery procedure — do not report a failure to the user "
             "and stop, and never present an app that has not come back clean.\n"
@@ -750,11 +757,15 @@ class AppHtmlSkill(Skill):
                     narrative: Optional[str], history_line: str) -> None:
         """Write the app's note. Never raises — see the call sites."""
         try:
-            appskill.save(slug, title=title, html=html, revision=revision,
-                          narrative=narrative, history_line=history_line)
+            brief = appskill.save(slug, title=title, html=html,
+                                  revision=revision, narrative=narrative,
+                                  history_line=history_line)
         except Exception:  # noqa: BLE001 - a note is never worth an app
             logger.warning("[app_html] could not write the brief for %s", slug,
                            exc_info=True)
+            return
+        logger.info("[app_html] brief for %s is at version %d", slug,
+                    brief.version)
 
     async def _view(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
@@ -918,6 +929,20 @@ class AppHtmlSkill(Skill):
                 "in front of the user until app_html__present_app publishes "
                 "it — call that before you describe the change.\n"
             )
+        # Round 21, item 4. The memory has just been written and is a version
+        # ahead of anything the model has been shown, so the new version comes
+        # back WITH the result. That is what makes "read it before you edit"
+        # true for every change after the first in a chain, whether or not the
+        # model remembered to call view_app_file — and the copy is never a
+        # duplicate, because a write is what produced it.
+        #
+        # Model-facing only; `display` says nothing about it, which is the
+        # same rule `_view` follows.
+        out += (
+            "\nYour working memory of this app, at the version this edit just "
+            "wrote. Read it before the next change.\n"
+            f"{appskill.context_block(slug, current_revision=rec.revision)}\n"
+        )
         return ToolResult(
             out.rstrip(),
             display=("Updated the app — the script needs a fix."
@@ -1078,32 +1103,74 @@ class AppHtmlSkill(Skill):
         size = os.path.getsize(html_path)
         record = store.upsert_record(slug, title, size, bump_revision=False,
                                      presented=True)
+
+        # ── The mark, BEFORE anything is handed over ──────────────────
+        # Round 21, item 1. This used to be a side effect tucked inside the
+        # `present` step: no phase of its own, so a slow or failed drawing was
+        # invisible, and — the part that showed — the app card and the Files
+        # row could be published while the icon route still had nothing to
+        # answer with. Whatever asked first got the deterministic monogram,
+        # which the route then STORED, and the app wore a holding mark it had
+        # not earned.
+        #
+        # So it is its own step and it happens first. `ensure_icon` reads the
+        # app's palette out of the file and redraws when the app's identity
+        # (title, purpose, colours) has moved — which is what makes an edited
+        # app get an updated mark rather than last week's. It still cannot
+        # fail a publish: a container that cannot reach a model gets the
+        # monogram, recorded as provisional so a later run upgrades it.
         await steps_mod.emit_step(
-            user_id=ctx.user_id, job_id=job_id, step_type="present",
+            user_id=ctx.user_id, job_id=job_id, step_type="logo",
             status="running",
         )
-        # The mark. Drawn when it is missing or when the app has changed what
-        # it IS (title or stated purpose) — not on every edit, which would
-        # spend a model call on a padding change and make the tile flicker
-        # between revisions. It can never fail a publish: a container that
-        # cannot reach a model gets the deterministic monogram, which records
-        # itself as provisional so a later run upgrades it.
+        icon_source = ""
         try:
             _svg, icon_source = await logo_mod.ensure_icon(
                 slug, title=title, purpose=self._purpose_line(existing_brief),
-                user_id=ctx.user_id,
+                user_id=ctx.user_id, html=store.read_app(slug),
             )
             logger.info("[app_html] icon for %s: %s", slug, icon_source)
         except Exception:  # noqa: BLE001 - an icon is never worth a publish
             logger.warning("[app_html] icon step failed for %s", slug, exc_info=True)
+        if icon_source:
+            # `done` for a monogram as well as a designed mark: the app HAS a
+            # mark either way, and `failed` here would flip the whole build
+            # card to failed (see `emit_step`) over something cosmetic that
+            # the next publish upgrades by itself.
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="logo",
+                status="done",
+            )
+        # Left `running` when the drawing raised — the same rule the visual
+        # review follows: a phase that never reported back is not work
+        # outstanding and not work done, and `finish_job` drops it.
 
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="present",
+            status="running",
+        )
         app_id = await steps_mod.upsert_app_row(
             user_id=ctx.user_id, slug=slug, title=title,
             html_path=html_path, size_bytes=size, job_id=job_id,
         )
+        # …and into Files, now, rather than whenever the next listing happens
+        # to fall outside the library sync's throttle window. See
+        # `library_service.register_app_file`.
+        await steps_mod.register_in_library(user_id=ctx.user_id, slug=slug)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="present",
             status="done", detail=f"revision {record.revision}",
+        )
+        # The memory follows the app here too, not only on write. Round 21,
+        # item 4: a publish is the moment the user's copy of this app changes,
+        # so it is exactly the marker the next editor needs in order to tell
+        # "what I changed" from "what they have actually seen". It costs one
+        # version and one line.
+        self._save_brief(
+            slug, title=title, html=store.read_app(slug),
+            revision=record.revision, narrative=None,
+            history_line=f"published revision {record.revision}"
+                         + (f" — {change}" if change else ""),
         )
         await steps_mod.finish_job(ctx.user_id, job_id)
         await steps_mod.announce_ready(

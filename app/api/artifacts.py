@@ -72,8 +72,9 @@ async def list_artifacts() -> Dict[str, Any]:
         d["exists"] = store.exists(slug)
         d["versions"] = len(store.list_versions(slug))
         # The card needs to know an icon is worth fetching; it never needs the
-        # icon inline, which would put an SVG per app into every list.
-        d["has_icon"] = logo.read_icon(slug) is not None
+        # icon inline, which would put an SVG per app into every list. A stat,
+        # not a read — see `logo.has_icon`.
+        d["has_icon"] = logo.has_icon(slug)
         try:
             d["size_bytes"] = os.path.getsize(store.app_path(slug))
         except (OSError, store.AppStoreError):

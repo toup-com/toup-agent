@@ -35,6 +35,15 @@ from app.db.database import async_session_maker
 from app.db.models import App, BuildJob
 from app.services.background_tasks import spawn as _spawn_bg
 
+#: The `App.source` discriminator every read path uses to tell a single-file
+#: HTML artifact from a legacy Expo project. Defined in the pipeline that
+#: writes it (`app_html.steps`); imported lazily so this module still loads
+#: on a build where the app skill is not installed.
+try:  # pragma: no cover - trivial
+    from app.agent.skills.builtins.app_html.steps import SOURCE_HTML_ARTIFACT
+except Exception:  # pragma: no cover
+    SOURCE_HTML_ARTIFACT = "html_artifact"
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/apps", tags=["Apps"])
@@ -169,10 +178,33 @@ def _get_user_id() -> str:
 
 
 async def _app_to_response(app: App) -> AppResponse:
-    """Convert App model to response, enriching with live status and manifest."""
+    """Convert App model to response, enriching with live status and manifest.
+
+    Round 21, item 5. Two things here were per-app work on an UNBOUNDED list,
+    and the app builder is what made the list long: since round 12 every
+    published single-file app writes an `apps` row, so a user who used to
+    have one or two Expo projects now has one row per app they have ever
+    asked for. Twenty-two rows meant:
+
+    * twenty-two `_resolve_app_dir` calls, each of which opens **its own
+      database session** and does a `db.get(App, …)` for a row this function
+      is already holding — a textbook N+1, on a route the phone polls;
+    * twenty-two `load_app_manifest` probes for `lib/agentSkill.json` under
+      an `app_dir` that, for an HTML artifact, is a `.html` FILE. There has
+      never been a manifest to find there and there never will be; each miss
+      also wrote an INFO log line.
+
+    Both are now skipped for `html_artifact` rows and, for the Expo rows that
+    remain, the directory comes from the row instead of a second query.
+    """
+    is_html = (getattr(app, "source", None) or "") == SOURCE_HTML_ARTIFACT
+
     qr_url = None
     web_url = None
-    if _app_manager and app.status == "running":
+    # A single-file artifact has no dev server, no QR and no LAN URL — the
+    # runner opens it through /api/artifacts/{slug}. Asking the app manager
+    # about one is a question with no answer.
+    if _app_manager and app.status == "running" and not is_html:
         qr_url = await _app_manager.get_qr_url(app.id)
         web_url = await _app_manager.get_web_url(app.id)
 
@@ -180,15 +212,18 @@ async def _app_to_response(app: App) -> AppResponse:
 
     # Load agentSkill.json manifest (Checkpoint 4a)
     skill_json = None
-    try:
-        from app.services.app_manifest_loader import load_app_manifest
-        if _app_manager:
-            app_dir = await _app_manager._resolve_app_dir(app.id)
-            manifest = load_app_manifest(app_dir, app_id=app.id)
-            if manifest:
-                skill_json = manifest.model_dump()
-    except Exception as e:
-        logger.debug("Failed to load manifest for %s: %s", app.id[:8], e)
+    if not is_html:
+        try:
+            from app.services.app_manifest_loader import load_app_manifest
+            if _app_manager:
+                # `app.app_dir` is already in hand — passing it is what keeps
+                # `_resolve_app_dir` from opening a session per app.
+                app_dir = await _app_manager._resolve_app_dir(app.id, app.app_dir)
+                manifest = load_app_manifest(app_dir, app_id=app.id)
+                if manifest:
+                    skill_json = manifest.model_dump()
+        except Exception as e:
+            logger.debug("Failed to load manifest for %s: %s", app.id[:8], e)
 
     return AppResponse(
         id=app.id,

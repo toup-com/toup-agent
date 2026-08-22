@@ -165,6 +165,20 @@ def read_icon(slug: str) -> Optional[str]:
         return None
 
 
+def has_icon(slug: str) -> bool:
+    """Is there a mark for this app? A stat, not a read.
+
+    The list route asks this once per app to set a boolean, and it used to do
+    it by reading the whole SVG — up to 24 KB off disk per app, decoded to
+    text, to produce `True`. On a library of twenty-two apps that is half a
+    megabyte of file I/O for twenty-two bits.
+    """
+    try:
+        return os.path.getsize(icon_path(slug)) > 0
+    except (OSError, AppStoreError):
+        return False
+
+
 def read_sidecar(slug: str) -> Dict[str, str]:
     try:
         with open(sidecar_path(slug), "r", encoding="utf-8") as fh:
@@ -186,7 +200,8 @@ def delete_icon(slug: str) -> bool:
 
 
 def _store_icon(slug: str, svg: str, *, source: str, title: str,
-                purpose: str = "", subject: str = "") -> None:
+                purpose: str = "", subject: str = "",
+                palette: Sequence[str] = ()) -> None:
     path = icon_path(slug)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     store.repair_permissions(os.path.dirname(path))
@@ -199,7 +214,7 @@ def _store_icon(slug: str, svg: str, *, source: str, title: str,
             "gen": str(ICON_GENERATION),
             "title": title or slug,
             "subject": subject,
-            "identity": identity_hash(title, purpose),
+            "identity": identity_hash(title, purpose, palette),
         }, sort_keys=True).encode("utf-8"),
         prefix=f".iconmeta-{slug}-",
     )
@@ -427,14 +442,28 @@ _DRAW_SYSTEM = (
 )
 
 
-def identity_hash(title: str, purpose: str) -> str:
-    """What the icon DEPICTS, as a stable key.
+def identity_hash(title: str, purpose: str, palette: Sequence[str] = ()) -> str:
+    """What the icon DEPICTS and what it is PAINTED IN, as a stable key.
 
-    An icon is redrawn when the app changes what it *is*, not when a line of
-    CSS moves: redrawing on every edit would spend a model call on a padding
-    change and make the tile flicker between revisions.
+    Round 21, item 1. Until now this was title + purpose only, which made an
+    icon a fact about the app's *description*: an edit that repainted the
+    whole app — new ground, new accent, a different type of thing on screen —
+    left the tile in last week's colours, and the mark stopped belonging to
+    the app it stands for. The palette is read from the app's own CSS
+    (:mod:`palette`), so it moves exactly when the app's look moves.
+
+    It is still not "redraw on every edit" in the wasteful sense: a padding
+    change, a copy fix or a bug fix leaves title, purpose and palette alone,
+    so the identity is unchanged, the existing mark is kept, and the tile does
+    not flicker between revisions. What changed is that "the app looks
+    different now" is finally one of the things that counts as different.
     """
-    basis = f"{' '.join((title or '').split())}|{' '.join((purpose or '').split())[:200]}"
+    colours = ",".join(palette_mod.normalise(c) for c in (palette or ()))
+    basis = (
+        f"{' '.join((title or '').split())}"
+        f"|{' '.join((purpose or '').split())[:200]}"
+        f"|{colours}"
+    )
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
@@ -442,7 +471,22 @@ def identity_hash(title: str, purpose: str) -> str:
 subject_hash = identity_hash
 
 
-def is_stale(slug: str, *, title: str, purpose: str) -> bool:
+def icon_etag(slug: str) -> str:
+    """A validator for this app's mark, or ``""`` when it has none.
+
+    The same value the ``/artifacts/{slug}/icon`` route sends as its ETag —
+    computed from the bytes, so a redraw changes it and nothing else does. It
+    rides :func:`steps.artifact_payload` so a client can cache the SVG under
+    (slug, etag) indefinitely and re-fetch on the one event that matters.
+    """
+    svg = read_icon(slug)
+    if not svg:
+        return ""
+    return hashlib.sha256(svg.encode("utf-8")).hexdigest()[:32]
+
+
+def is_stale(slug: str, *, title: str, purpose: str,
+             palette: Sequence[str] = ()) -> bool:
     """Does this app need a (re)drawn icon?"""
     if read_icon(slug) is None:
         return True
@@ -455,7 +499,7 @@ def is_stale(slug: str, *, title: str, purpose: str) -> bool:
         # Drawn by an older art direction. Generation 1 is the hash-coloured
         # badge this rewrite exists to remove, so every one of them is stale.
         return True
-    return meta.get("identity") != identity_hash(title, purpose)
+    return meta.get("identity") != identity_hash(title, purpose, palette)
 
 
 async def _ask(system: str, user: str, *, model: str, max_tokens: int,
@@ -565,17 +609,22 @@ async def ensure_icon(
     palette — so callers that have the file should always pass it.
     """
     slug = store.normalise_slug(slug)
-    if not is_stale(slug, title=title, purpose=purpose):
-        existing = read_icon(slug)
-        if existing:
-            return existing, "kept"
-
+    # The palette is read BEFORE the staleness check, not after it: since
+    # round 21 the app's own colours are part of what the mark is FOR, so
+    # "is this mark still right" cannot be answered without them. (It is a
+    # regex over the file the caller usually already holds — cheaper than the
+    # `os.stat` the check does anyway.)
     if not html:
         try:
             html = store.read_app(slug)
         except (OSError, AppStoreError):
             html = ""
     colours = palette_mod.extract(html) if html else []
+
+    if not is_stale(slug, title=title, purpose=purpose, palette=colours):
+        existing = read_icon(slug)
+        if existing:
+            return existing, "kept"
 
     if allow_model:
         from app.agent.skills.builtins.app_html import vision
@@ -590,7 +639,8 @@ async def ensure_icon(
                 if svg:
                     try:
                         _store_icon(slug, svg, source="model", title=title,
-                                    purpose=purpose, subject=key)
+                                    purpose=purpose, subject=key,
+                                    palette=colours)
                     except (OSError, AppStoreError):
                         logger.warning("[app_html] could not store the icon for %s",
                                        slug, exc_info=True)
@@ -611,7 +661,8 @@ async def ensure_icon(
 
     svg = fallback_icon(slug, title, colours)
     try:
-        _store_icon(slug, svg, source="fallback", title=title, purpose=purpose)
+        _store_icon(slug, svg, source="fallback", title=title, purpose=purpose,
+                    palette=colours)
     except (OSError, AppStoreError):
         logger.debug("[app_html] could not store the holding mark for %s", slug,
                      exc_info=True)

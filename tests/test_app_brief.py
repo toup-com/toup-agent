@@ -185,7 +185,8 @@ def test_every_edit_leaves_a_history_line(skill, apps_dir):
          reason="make the round 45 seconds")
     history = appskill.read("whack").history
     assert any("make the round 45 seconds" in h for h in history)
-    assert any(h.startswith("- r2 ") for h in history), history
+    # Round 21 versions the entry: `v<brief version> · r<app revision>`.
+    assert any(h.startswith("- v2 · r2 ") for h in history), history
 
 
 def test_an_edit_may_rewrite_the_narrative_but_need_not(skill, apps_dir):
