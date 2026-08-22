@@ -743,14 +743,29 @@ class AppHtmlSkill(Skill):
         know what they are looking at — an empty board is correct for a chess
         app and a defect for a dashboard, and "Nokia Snake Classic" tells an
         icon model considerably less than the sentence under *What it is*.
+
+        Prose is PREFERRED, not required. A bulleted line is skipped on the
+        first pass because in a markdown brief those are usually the feature
+        list, and a feature is not the purpose. But returning "" when the whole
+        narrative happens to be bulleted costs more than it saves now: round 22
+        made this string the gate on the reviewer's palette judgement (an empty
+        purpose means the reviewer is told nothing and says nothing about
+        colour), and §1a asks the model to open the brief with three answers
+        that it may well write as a list. So the bullets are a fallback rather
+        than a blind spot — still second, still only when there is no prose.
         """
         if brief is None or not brief.narrative:
             return ""
-        for line in brief.narrative.splitlines():
-            line = line.strip().lstrip("#").strip()
-            if line and not line.startswith(("-", "*", "#")) and len(line) > 30:
+        fallback = ""
+        for raw in brief.narrative.splitlines():
+            line = raw.strip().lstrip("#").strip()
+            if not line or len(line) <= 30:
+                continue
+            if not line.startswith(("-", "*", "#")):
                 return line[:400]
-        return ""
+            if not fallback:
+                fallback = line.lstrip("-*").strip()[:400]
+        return fallback
 
     @staticmethod
     def _save_brief(slug: str, *, title: str, html: str, revision: int,

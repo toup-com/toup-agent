@@ -34,6 +34,7 @@ reachable" is the only question these tests can ask.
 
 from __future__ import annotations
 
+import re
 import pytest
 
 from app.agent import tool_entitlements as te
@@ -201,12 +202,23 @@ async def test_no_prompt_section_mentions_the_expo_flow(tmp_path, monkeypatch):
 
     assert blob, "no prompt sections at all — the assertions below are vacuous"
     for banned in (
-        "expo", "react native", "create-expo-app", "npm install",
+        "react native", "create-expo-app", "npm install",
         "app_builder__", "research_category", "direction cards",
-        "github repo", "dev server", "metro", "clarifying questions",
+        "github repo", "dev server", "clarifying questions",
         "agent placeholder", "package.json",
     ):
         assert banned not in blob, f"prompt still mentions {banned!r}"
+
+    # `expo` and `metro` are WORDS here, not substrings, and that distinction is
+    # the whole assertion. As bare `in` tests both were false positives against
+    # ordinary prose the prompt is supposed to contain: `expo` matched
+    # `exponentialRampToValueAtTime` in the design skill's §8a audio sample, and
+    # this test has therefore been red on main since that sample was written —
+    # a permanently-failing guard, which asserts nothing at all. `metro` would
+    # match `metronome`, which an audio sample is entitled to mention.
+    for banned in ("expo", "metro"):
+        assert not re.search(rf"\b{banned}\b", blob), (
+            f"prompt still mentions {banned!r} as a word")
 
     # NOT banned, and deliberately so — checking both keeps this test honest
     # about what it is asserting:
