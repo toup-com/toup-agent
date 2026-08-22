@@ -64,24 +64,39 @@ def test_a_container_with_no_model_still_gets_a_mark(apps_dir):
     assert Path(logo.icon_path("snake")).is_file()
 
 
-def test_the_fallback_is_deterministic(apps_dir):
-    """Same slug, same tile — across containers, restarts and test runs. An
-    app whose colour changes between two opens does not look like one app."""
-    a = logo.fallback_icon("snake", "Nokia Snake Classic")
-    b = logo.fallback_icon("snake", "Nokia Snake Classic")
-    c = logo.fallback_icon("pomodoro", "Pomodoro")
+def test_the_holding_mark_wears_the_app_s_own_colours(apps_dir):
+    """The correction, at the floor.
+
+    The first fallback was a monogram on a square whose hue came from
+    `hash(slug) % 12`. A tile whose colour has no relationship to the app it
+    opens is worse than a plain one — and twenty of them made the library
+    look like a bag of sweets. The holding mark now uses the app's palette
+    and nothing else.
+    """
+    pal = ["#1E2E1C", "#E2703A", "#F4F1E6"]
+    svg = logo.fallback_icon("whack", "Whack a Mole", pal)
+    for colour in pal:
+        assert colour.lower() in svg.lower(), svg
+    # Deterministic: the same app must not change colour between two opens.
+    assert svg == logo.fallback_icon("whack", "Whack a Mole", pal)
+
+
+def test_no_hue_is_invented_for_an_app_that_has_none(apps_dir):
+    """An app with no palette does not ACQUIRE one here. Two apps with no
+    colours of their own get the same neutral holding mark, which is honest;
+    two different invented hues would not be."""
+    a = logo.fallback_icon("alpha", "Alpha", [])
+    b = logo.fallback_icon("beta", "Beta", [])
     assert a == b
-    assert a != c
+    assert "hsl(" not in a
 
 
-def test_the_monogram_reads_the_name_not_the_slug(apps_dir):
-    assert ">NS<" in logo.fallback_icon("nokia-snake", "Nokia Snake")
-    assert ">PO<" in logo.fallback_icon("pomodoro", "Pomodoro")
-    # With no title it falls back to the slug, whose hyphen is a word break:
-    # "BT", not "BU". A monogram of the first two letters of a kebab slug
-    # ("BU", "NO", "PO") reads as a truncation rather than as initials.
-    assert logo.initials("", "budget-tracker") == "BT"
-    assert logo.initials("", "pomodoro") == "PO"
+def test_the_holding_mark_carries_no_lettering(apps_dir):
+    """A monogram is a placeholder glyph, which is the thing being removed."""
+    svg = logo.fallback_icon("nokia-snake", "Nokia Snake", ["#1B2410", "#9BB53F"])
+    assert "<text" not in svg
+    assert not hasattr(logo, "initials")
+    logo.sanitize_svg(svg)          # and it passes the real validator
 
 
 def test_the_icon_lives_where_the_library_cannot_see_it(apps_dir):
@@ -100,6 +115,25 @@ def test_the_icon_lives_where_the_library_cannot_see_it(apps_dir):
 
 
 # ── 2. A placeholder does not become permanent ────────────────────────
+
+def test_generation_1_icons_are_all_stale(apps_dir):
+    """How all 22 existing apps get redrawn: bump `ICON_GENERATION`.
+
+    Every icon on every volume was drawn by the art direction the correction
+    rejects, so every one of them has to go — and the mechanism is the same
+    self-heal that backfills the briefs, not a migration and not a sweep.
+    """
+    logo._store_icon("snake", GOOD, source="model", title="Snake",
+                     purpose="a snake game")
+    assert not logo.is_stale("snake", title="Snake", purpose="a snake game")
+
+    import json as _json
+    meta = logo.read_sidecar("snake")
+    meta["gen"] = "1"                                   # as generation 1 left it
+    with open(logo.sidecar_path("snake"), "w", encoding="utf-8") as fh:
+        _json.dump(meta, fh)
+    assert logo.is_stale("snake", title="Snake", purpose="a snake game")
+
 
 def test_a_fallback_is_always_stale(apps_dir):
     """So the first run that CAN reach a model replaces it. Without this, a
@@ -274,8 +308,122 @@ def test_deleting_an_app_takes_its_icon(apps_dir):
     assert not os.path.exists(logo.sidecar_path("snake"))
 
 
-def test_the_icon_model_is_pinned():
-    assert logo.LOGO_MODEL and logo.LOGO_MODEL != "None"
+def test_both_icon_models_are_pinned():
+    """`model=None` resolves to the tenant's CHAT model, and this runs once
+    per app on a background sweep over the whole library."""
+    for model in (logo.SUBJECT_MODEL, logo.DRAW_MODEL):
+        assert model and model != "None"
+
+
+# ── 4. The colour rule ────────────────────────────────────────────────
+
+def test_a_colour_from_outside_the_palette_is_refused():
+    """The strictest rule in the file, and the one the correction turns on.
+
+    The first icons chose colour from a hash of the slug, so a mole game with
+    a dark-green and burnt-orange screen got a tile in whatever hue its slug
+    landed on. The palette is now read from the app and enforced here — not
+    suggested to the model and hoped for.
+    """
+    pal = ["#2F6B3A", "#F7F4EC", "#C4703A"]
+    assert logo.sanitize_svg(GOOD, pal) == GOOD          # all three are in it
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(GOOD.replace("#C4703A", "#FF00FF"), pal)
+    assert "#ff00ff" in str(exc.value).lower()
+    assert "palette" in str(exc.value)
+
+
+def test_the_palette_rule_is_only_applied_when_there_is_a_palette():
+    """An app with no colours of its own must not have some invented for it,
+    and must not be refused for using any."""
+    assert logo.sanitize_svg(GOOD) == GOOD
+    assert logo.sanitize_svg(GOOD, []) == GOOD
+
+
+def test_gradients_and_none_are_not_stray_colours():
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+        '<defs><linearGradient id="g"><stop offset="0" stop-color="#2F6B3A"/>'
+        '<stop offset="1" stop-color="#C4703A"/></linearGradient></defs>'
+        '<rect width="96" height="96" fill="url(#g)"/>'
+        '<circle cx="50" cy="50" r="30" fill="#F7F4EC"/>'
+        '<path d="M10 80 L90 80 L50 20 Z" fill="none" stroke="#C4703A" '
+        'stroke-width="9"/></svg>')
+    assert logo.sanitize_svg(svg, ["#2F6B3A", "#F7F4EC", "#C4703A"])
+
+
+# ── 5. It has to look like a mark ─────────────────────────────────────
+
+def test_a_mark_floating_on_transparency_is_refused():
+    """Every first-generation icon was a small pictogram on a badge. The
+    full-bleed ground is what makes the set one family instead of stickers."""
+    no_ground = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+        '<circle cx="48" cy="48" r="24" fill="#2F6B3A"/>'
+        '<circle cx="60" cy="40" r="12" fill="#F7F4EC"/>'
+        '<circle cx="30" cy="60" r="10" fill="#C4703A"/></svg>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(no_ground)
+    assert "full-bleed" in str(exc.value)
+
+
+def test_a_ground_with_nothing_on_it_is_refused():
+    bare = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+            '<rect width="96" height="96" fill="#2F6B3A"/>'
+            '<circle cx="48" cy="48" r="20" fill="#F7F4EC"/>'
+            + "<!-- " + "x" * 200 + " -->" + '</svg>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(bare)
+    assert "nothing on it" in str(exc.value)
+
+
+def test_an_illustration_is_refused():
+    """Thirteen shapes is a lattice or a scene; either is mud at 24px."""
+    busy = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+            '<rect width="96" height="96" fill="#2F6B3A"/>'
+            + '<circle cx="10" cy="10" r="4" fill="#F7F4EC"/>' * 20 + '</svg>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(busy)
+    assert "illustration" in str(exc.value)
+
+
+def test_a_hairline_is_refused():
+    thin = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+            '<rect width="96" height="96" fill="#2F6B3A"/>'
+            '<circle cx="48" cy="48" r="30" fill="#F7F4EC"/>'
+            '<path d="M10 10 L90 90" stroke="#C4703A" stroke-width="1.5"/>'
+            + "<!-- " + "x" * 120 + " -->" + '</svg>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(thin)
+    assert "24px" in str(exc.value)
+
+
+def test_lettering_is_refused():
+    """An icon that has to be READ is not an icon — and a monogram is exactly
+    the placeholder glyph this correction removes."""
+    lettered = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+                '<rect width="96" height="96" fill="#2F6B3A"/>'
+                '<circle cx="48" cy="48" r="30" fill="#F7F4EC"/>'
+                '<circle cx="60" cy="60" r="10" fill="#C4703A"/>'
+                '<text x="48" y="52" font-size="40">NS</text></svg>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(lettered)
+    assert "text" in str(exc.value).lower()
+
+
+# ── 6. No two apps share a symbol ─────────────────────────────────────
+
+def test_the_subjects_already_drawn_are_offered_to_the_next_app(apps_dir):
+    store.write_app("a", "A", "<!doctype html><html><head></head><body><p>"
+                    + "x" * 500 + "</p></body></html>")
+    store.write_app("b", "B", "<!doctype html><html><head></head><body><p>"
+                    + "x" * 500 + "</p></body></html>")
+    logo._store_icon("a", GOOD, source="model", title="A", subject="mole and mallet")
+    logo._store_icon("b", GOOD, source="model", title="B", subject="coins cascading")
+
+    assert set(logo.subjects_in_use()) == {"mole and mallet", "coins cascading"}
+    # ...and an app never competes with itself when it is being redrawn.
+    assert logo.subjects_in_use(exclude="a") == ["coins cascading"]
 
 
 def test_a_slug_cannot_escape_the_icon_directory(apps_dir):
@@ -284,3 +432,131 @@ def test_a_slug_cannot_escape_the_icon_directory(apps_dir):
     for bad in ("../outside", "a/b", ".."):
         with pytest.raises(AppStoreError):
             logo.icon_path(bad)
+
+
+# ── 7. Naming the subject is its own step, and it is checked ──────────
+
+def _subject(monkeypatch, answer, used=()):
+    """Run `choose_subject` against a canned model answer."""
+    async def _fake(*_a, **_k):
+        return answer
+    monkeypatch.setattr(logo, "_ask", _fake)
+    return _run(logo.choose_subject(user_id="u", title="Pomodoro Timer",
+                                    purpose="A 25-minute focus timer.",
+                                    used=list(used)))
+
+
+def test_a_named_subject_is_taken(monkeypatch):
+    key, scene = _subject(monkeypatch,
+        "KEY: tomato with time wedge\nSCENE: A ripe tomato with one wedge cut away.")
+    assert key == "tomato with time wedge"
+    assert scene.startswith("A ripe tomato")
+
+
+def test_a_stock_glyph_is_refused_even_when_the_model_offers_it(monkeypatch):
+    """The ban is in the prompt too. This is the half that does not depend on
+    the prompt being obeyed — and it was not: asked to choose and draw in one
+    breath, the model returned a clock for the timer and a document for the
+    budget every single time.
+    """
+    for stock in ("clock face", "a document", "spreadsheet grid", "map pin",
+                  "magnifying glass", "letter p monogram"):
+        key, scene = _subject(monkeypatch, f"KEY: {stock}\nSCENE: A {stock}.")
+        assert (key, scene) == ("", ""), stock
+
+
+def test_a_subject_another_app_already_uses_is_refused(monkeypatch):
+    key, scene = _subject(monkeypatch,
+        "KEY: coins cascading\nSCENE: Coins falling.", used=["coins cascading"])
+    assert (key, scene) == ("", "")
+
+
+def test_an_unparseable_answer_is_not_a_subject(monkeypatch):
+    """"" means "do not draw", never "draw something default"."""
+    for junk in ("Sure! How about a tomato?", "", "KEY: only a key"):
+        assert _subject(monkeypatch, junk) == ("", "")
+
+
+def test_no_subject_means_no_drawing(apps_dir, monkeypatch):
+    """The whole point of naming first: a bad subject costs nothing, because
+    nothing is drawn until the subject survives."""
+    store.write_app("timer", "Pomodoro Timer",
+                    '<!doctype html><html><head><style>:root{--bg:#2B2724;'
+                    '--ink:#C1443A;--paper:#F3EDE4}</style></head><body><p>'
+                    + "x" * 500 + "</p></body></html>")
+
+    drew = []
+
+    async def _never(**_k):
+        drew.append(1)
+        return GOOD
+
+    async def _no_subject(**_k):
+        return "", ""
+
+    monkeypatch.setenv("TOUP_APP_MODEL_CALLS", "1")
+    monkeypatch.setattr(logo, "choose_subject", _no_subject)
+    monkeypatch.setattr(logo, "draw_mark", _never)
+    from app.agent.skills.builtins.app_html import vision
+    monkeypatch.setattr(vision, "can_call_model", lambda: True)
+
+    _svg, source = _run(logo.ensure_icon("timer", title="Pomodoro Timer",
+                                         user_id="u"))
+    assert source == "fallback"
+    assert not drew
+
+
+def test_an_app_with_no_palette_is_never_drawn_in_invented_colours(apps_dir, monkeypatch):
+    """A mark in colours from nowhere is the defect being removed. Better a
+    holding mark that says it is one."""
+    store.write_app("plain", "Plain", "<!doctype html><html><head><style>"
+                    "body{margin:0}</style></head><body><p>" + "x" * 500
+                    + "</p></body></html>")
+    drew = []
+
+    async def _never(**_k):
+        drew.append(1)
+        return GOOD
+
+    async def _subject_ok(**_k):
+        return "a thing", "A thing."
+
+    monkeypatch.setenv("TOUP_APP_MODEL_CALLS", "1")
+    monkeypatch.setattr(logo, "choose_subject", _subject_ok)
+    monkeypatch.setattr(logo, "draw_mark", _never)
+    from app.agent.skills.builtins.app_html import vision
+    monkeypatch.setattr(vision, "can_call_model", lambda: True)
+
+    _svg, source = _run(logo.ensure_icon("plain", title="Plain", user_id="u"))
+    assert source == "fallback"
+    assert not drew
+
+
+def test_a_refused_drawing_is_redrawn_with_the_reason(apps_dir, monkeypatch):
+    """The refusal is written for this reader, so it is handed back verbatim.
+    Measured: two attempts left one app in six on a holding mark, and the
+    refusals were single fixable faults."""
+    seen = []
+
+    async def _ask(system, user, **_k):
+        seen.append(user)
+        if len(seen) == 1:
+            return GOOD.replace("#C4703A", "#FF00FF")     # a stray colour
+        return GOOD
+
+    monkeypatch.setattr(logo, "_ask", _ask)
+    svg = _run(logo.draw_mark(user_id="u", title="Snake", scene="A snake.",
+                              palette=["#2F6B3A", "#F7F4EC", "#C4703A"]))
+    assert svg == GOOD
+    assert len(seen) == 2
+    assert "REJECTED" in seen[1]
+    assert "#ff00ff" in seen[1].lower()
+
+
+def test_a_drawing_that_never_complies_falls_back_rather_than_shipping(apps_dir, monkeypatch):
+    async def _ask(system, user, **_k):
+        return GOOD.replace("#C4703A", "#FF00FF")
+
+    monkeypatch.setattr(logo, "_ask", _ask)
+    assert _run(logo.draw_mark(user_id="u", title="S", scene="A snake.",
+                               palette=["#2F6B3A", "#F7F4EC"])) is None
