@@ -461,6 +461,89 @@ def test_looking_is_its_own_phase_on_the_card():
     assert steps_mod.phase_label("look", "running") == "Looking at the app"
 
 
+def test_a_look_that_did_not_run_leaves_no_tick_on_the_card():
+    """The overclaim, one level up from `Look.ok`.
+
+    Caught by driving the real pipeline on a box with no model: the card read
+    **"Checked the app looks right · couldn't look at it here"** — the `done`
+    label and the reason it had not happened, in the same row, in green. A step
+    that could not run must not carry a label claiming it did, so no terminal
+    step is emitted at all; `finish_job` drops the `running` one, the same way
+    it drops every phase a build did not need.
+    """
+    import asyncio as _asyncio
+    from app.agent.skills.base import SkillContext
+    from app.agent.skills.builtins.app_html import steps as steps_mod, store
+    from app.agent.skills.builtins.app_html.skill import AppHtmlSkill
+
+    emitted = []
+
+    async def _emit(**kw):
+        emitted.append((kw["step_type"], kw["status"]))
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _job(*a, **k):
+        return "job-x"
+
+    async def _row(**k):
+        return "app-x"
+
+    saved = (steps_mod.ensure_job, steps_mod.emit_step, steps_mod.finish_job,
+             steps_mod.upsert_app_row, steps_mod.announce_ready)
+    steps_mod.ensure_job, steps_mod.emit_step = _job, _emit
+    steps_mod.finish_job, steps_mod.upsert_app_row = _noop, _row
+    steps_mod.announce_ready = _noop
+    old_root = os.environ.get("TOUP_HTML_APPS_DIR")
+    old_smoke = os.environ.get("TOUP_APP_SMOKE_TEST")
+    old_calls = os.environ.get("TOUP_APP_MODEL_CALLS")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["TOUP_HTML_APPS_DIR"] = tmp
+            os.environ["TOUP_APP_SMOKE_TEST"] = "0"
+            os.environ["TOUP_APP_MODEL_CALLS"] = "0"   # nothing can look
+            store.ensure_root()
+            html = ("<!doctype html><html><head><title>x</title></head><body>"
+                    "<p>" + "x" * 600 + "</p></body></html>")
+            skill = AppHtmlSkill()
+            _asyncio.new_event_loop().run_until_complete(skill.execute_tool(
+                "app_html__create_app_file",
+                {"slug": "x", "title": "X", "html": html,
+                 "brief": _BRIEF_FOR_STEP_TEST}, SkillContext(user_id="u", session_id="s")))
+            _asyncio.new_event_loop().run_until_complete(skill.execute_tool(
+                "app_html__present_app", {"slug": "x"},
+                SkillContext(user_id="u", session_id="s")))
+    finally:
+        (steps_mod.ensure_job, steps_mod.emit_step, steps_mod.finish_job,
+         steps_mod.upsert_app_row, steps_mod.announce_ready) = saved
+        for key, value in (("TOUP_HTML_APPS_DIR", old_root),
+                           ("TOUP_APP_SMOKE_TEST", old_smoke),
+                           ("TOUP_APP_MODEL_CALLS", old_calls)):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    looks = [status for step, status in emitted if step == "look"]
+    assert looks == ["running"], emitted
+    assert "done" not in looks
+    # ...and the app was still published: a review that could not run is not a
+    # reason to refuse.
+    assert ("present", "done") in emitted, emitted
+
+
+_BRIEF_FOR_STEP_TEST = (
+    "## What it is\n"
+    "A one-screen thing for someone with a spare minute, built so there is "
+    "something to do that needs no account.\n\n"
+    "## Core flows\n- Open it, read it.\n\n"
+    "## Features, states and controls\n- One state; nothing to press.\n\n"
+    "## Design decisions\n- Plain type on a plain field, because the content "
+    "is the only thing on the screen."
+)
+
+
 def test_a_failed_look_tells_the_user_something_true():
     """`user_message` is the only error text the clients render. The generic
     fallback ("The build stopped partway. Nothing was changed.") is false for

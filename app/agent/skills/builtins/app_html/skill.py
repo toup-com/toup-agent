@@ -1047,11 +1047,27 @@ class AppHtmlSkill(Skill):
             purpose=self._purpose_line(existing_brief),
             change=change,
         )
-        await steps_mod.emit_step(
-            user_id=ctx.user_id, job_id=job_id, step_type="look",
-            status="failed" if look.problems else "done",
-            detail=look.summary(),
-        )
+        # A look that did not happen gets NO terminal step. The `done` label is
+        # "Checked the app looks right", and putting that on a card for an app
+        # nobody looked at is precisely the overclaim this round exists to
+        # end — caught by driving the pipeline on a box with no model, where
+        # the card read "Checked the app looks right · couldn't look at it
+        # here" in the same row.
+        #
+        # Left `running`, which `finish_job` drops for exactly this reason: a
+        # phase that never reported back is not work outstanding and not work
+        # done, so it is not shown at all.
+        if look.ran:
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="look",
+                status="failed" if look.problems else "done",
+                detail=look.summary(),
+            )
+        else:
+            logger.info(
+                "[app_html] the visual review did not run for %s: %s",
+                slug, look.reason,
+            )
         if look.problems:
             raise AppStoreError(
                 "the app runs, but it does not look right, so it was not "

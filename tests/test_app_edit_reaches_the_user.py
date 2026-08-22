@@ -65,6 +65,9 @@ def apps_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(root))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("TOUP_APP_SMOKE_TEST", "0")
+    # No model calls from a unit test: the round-20 icon step would otherwise
+    # spend `logo.LOGO_TIMEOUT_S` per publish on a doomed network call.
+    monkeypatch.setenv("TOUP_APP_MODEL_CALLS", "0")
     (tmp_path / "home").mkdir()
     store.ensure_root()
     return root
@@ -93,10 +96,28 @@ def skill(apps_dir, monkeypatch):
     return s
 
 
-def _create(skill, html=APP, slug="snake"):
+#: Round 20 made `brief` a required argument of `create_app_file`: an app whose
+#: purpose was never written down is an app whose next edit is a guess. The
+#: requirement itself is asserted in test_app_brief.py, which passes nothing;
+#: here every app is built the ordinary way.
+BRIEF = (
+    "## What it is\n"
+    "A one-screen arcade game for a spare minute on a phone — something to do "
+    "that needs no account and no explanation.\n\n"
+    "## Core flows\n"
+    "- Press Play, steer, score, lose, press Play again.\n\n"
+    "## Features, states and controls\n"
+    "- Start screen, playing and over; Play starts the loop, the pad steers.\n\n"
+    "## Design decisions\n"
+    "- Near-black field with one warm accent, so the board is the only bright "
+    "thing on the screen."
+)
+
+
+def _create(skill, html=APP, slug="snake", brief=BRIEF):
     return run(skill.execute_tool(
         "app_html__create_app_file",
-        {"slug": slug, "title": "Snake", "html": html}, CTX,
+        {"slug": slug, "title": "Snake", "html": html, "brief": brief}, CTX,
     ))
 
 
