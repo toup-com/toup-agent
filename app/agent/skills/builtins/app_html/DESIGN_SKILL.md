@@ -332,10 +332,19 @@ Always include
 Three checks that fail quietly, in the order they get skipped.
 
 **Contrast.** Every text/background pair reaches **≥ 4.5:1** (≥ 3:1 for text at
-24 px, or 18.66 px bold, and for the borders of interactive controls). Muted
-greys are where this fails: `#A1A1AA` on `#0B0B0F` passes; `#71717A` on
-`#16161D` does not. Never encode meaning in colour alone — pair every colour
-cue with a shape, an icon or a label.
+24 px, or 18.66 px bold, and for the borders of interactive controls). The
+`--muted` you picked in §1d is where this fails, on a light ground and a dark
+one alike — it is chosen to be quiet, and quiet is one step from unreadable:
+
+- on a warm light ground: `#6B6257` on `#F5EFE4` is **5.23** and passes;
+  `#8A7E70` on the same ground is **3.46** and does not.
+- on a deep evening ground: `#8A93AC` on `#0E1424` is **5.99** and passes;
+  `#5D6478` on `#18203A` is **2.72** and does not.
+
+Both directions, deliberately — a worked example in only ONE of them is a
+second copy of §1's old failure, quietly certifying that ground as the
+approved one. Never encode meaning in colour alone: pair every colour cue
+with a shape, an icon or a label.
 
 **Legibility.** Body text ≥ 16 px (below that iOS zooms the page on focus and
 the layout you designed is gone). Nothing below 12 px, ever. Line length
