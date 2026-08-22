@@ -255,8 +255,15 @@ async def test_the_html_prompt_forbids_asking_questions_first(tmp_path, monkeypa
     # And the design body is really the packaged file, not a paraphrase that
     # can drift from the copy a reviewer reads.
     from app.agent.skills.builtins.app_html.skill import _packaged_design_skill
-    assert "Commit to a look before you write markup" in _packaged_design_skill()
-    assert "Commit to a look before you write markup" in section
+    # §1's heading. It was "Commit to a look before you write markup" until
+    # round 22 reordered the section to put the app's PURPOSE ahead of its
+    # palette — so this needle moves whenever §1 is retitled, which is the
+    # point: it is here to prove the prompt carries the real file rather than
+    # a paraphrase, and a heading is the cheapest thing that only the real
+    # file has.
+    heading = "Decide what the app is FOR before you decide what it looks like"
+    assert heading in _packaged_design_skill()
+    assert heading in section
 
 
 def test_the_exec_guard_can_never_emit_the_expo_redirect(monkeypatch):
