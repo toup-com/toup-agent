@@ -25,6 +25,18 @@ without them:
     refuses every publish, and a gate that refuses everything gets turned
     off. The prompt asks for defects a person would call broken, each one
     named and located; taste is explicitly out of scope.
+
+    Round 22 adds ONE judgement to that list and it is not taste: does the
+    palette **contradict the app's stated purpose**. The distinction is the
+    whole reason it is safe to ask. *Is this a nice orange* is taste and stays
+    out of scope forever. *This is a children's counting game and it is
+    black* is a mismatch anyone would name in one sentence without being
+    asked, and it shipped seventeen times out of twenty-five because nothing
+    in the pipeline was allowed to mention it. The bar is deliberately set at
+    "gross and nameable", the reviewer is told to pass when unsure, and it is
+    only ever asked when `purpose` is non-empty — with no stated purpose there
+    is nothing to contradict, and a reviewer guessing the domain from a
+    screenshot is exactly the trigger-happy failure above.
 3.  **The user must never see it.** The findings are the model's repair list.
     They go into the tool result, which is model-facing, and the step's
     detail line says only how many there are.
@@ -86,10 +98,27 @@ _SYSTEM = (
     " - placeholder text that was never replaced (lorem ipsum, TODO, "
     "'Your text here', 'undefined', 'NaN', '[object Object]')\n"
     "\n"
-    "Do NOT report matters of taste. The palette, the font choice, the "
+    "\n"
+    "AND ONE JUDGEMENT ABOUT COLOUR, only when you have been told what the "
+    "app is meant to be:\n"
+    " - the palette CONTRADICTS the app's stated purpose — a children's game "
+    "that opens sombre and near-black, a gym or sports tracker that looks "
+    "funereal rather than energising, a sleep or wind-down app that is loud "
+    "and bright, a cooking app that looks clinical. Report it as: what the "
+    "app is for, what the palette says instead, and the direction to move "
+    "in.\n"
+    " - The bar is HIGH. Only report this when the mismatch is gross and you "
+    "could name it in one sentence to the person who asked for the app. If "
+    "you are weighing whether the hue is quite right, that is taste — say "
+    "nothing. If you were not told what the app is meant to be, say nothing "
+    "about colour at all.\n"
+    "\n"
+    "Do NOT report matters of taste. Whether the palette is attractive, the "
+    "font choice, the "
     "amount of whitespace, whether you would have laid it out differently, "
     "whether it needs more features — none of those are defects. A plain app "
-    "that is legible and correctly laid out is a PASS.\n"
+    "that is legible, correctly laid out, and not at odds with its purpose "
+    "is a PASS.\n"
     "An app showing a start screen, a title and one button is a normal, "
     "correct state — not an empty screen.\n"
     "\n"

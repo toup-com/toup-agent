@@ -14,18 +14,89 @@ step, no bundler, no package manager. Libraries come from
 
 ---
 
-## 1. Commit to a look before you write markup
+## 1. Decide what the app is FOR before you decide what it looks like
 
-Write the token block first, at the top of your `<style>`. Six lines of
-decisions beat six hundred lines of hedging.
+Colour is the first thing the person sees and the last thing you should pick
+from habit. A gym tracker and a sleep aid are not the same app in two hues —
+they exist to produce opposite feelings, and the palette is most of how that
+happens. So the order is fixed: **job, then feeling, then palette, then
+markup.** Not the other way round, and never straight to a token block.
+
+### 1a. Name the job, in writing, before any colour
+
+Three lines. Write them into the brief you pass to `create_app_file`, and
+write them *first* — the brief is the record of why this app looks the way it
+does, and in three turns' time it is all that is left of your reasoning.
+
+1. **What is it for?** — "log a gym session in one tap and see the week fill in"
+2. **What should the person feel when they open it?** — "capable, on a roll,
+   like turning up today is easy"
+3. **What behaviour should it encourage?** — "come back tomorrow; log even a
+   short session"
+
+Answer those and the palette is nearly decided. A tracker whose job is to make
+someone feel *on a roll* cannot be sombre. A wind-down app whose job is to
+lower a heart rate cannot be loud.
+
+### 1b. The palette follows the feeling
+
+Guidance for reasoning, not a lookup table. The app's own character leads —
+a *boxing* gym log and a *yoga* log want different warmth — but if your
+palette contradicts the row it belongs to, you have chosen wrong.
+
+| Domain | Feeling | Palette |
+|---|---|---|
+| Fitness, sport, training, streaks | energised, rewarded, in motion | warm high-energy hues — orange, coral, red, electric lime as an accent — on **bright or warm-neutral grounds**; progress and motion emphasised |
+| Health, wellness, mindfulness, habits | calm, unhurried, cared for | soft greens, sage, warm neutrals; low saturation, generous space |
+| Sleep, evening, wind-down | quiet, dim, slowing | deep muted blues and indigos, warm low-blue accents — **this is where a dark ground genuinely belongs** |
+| Finance, budgeting, invoices | trustworthy, clear, in control | steady blues and greens, restrained accents, numerals legible above all |
+| Food, cooking, recipes | appetising, warm, generous | warm reds, oranges, paprika, cream and paper grounds |
+| Productivity, tools, converters | neutral, out of the way | a neutral ground and **one** confident accent; nothing decorative competing with the data |
+| Kids, play, arcade games | delighted, loud, playful | saturated primaries, high contrast, thick shapes |
+| Focus, deep work, timers | deliberate, undistracted | restrained; either a dim ground *or* a plain warm-neutral one — say which and why |
+| Luxury, premium, editorial | considered, expensive | deep grounds with a single metallic or single-hue accent |
+
+That last row is the one this document used to apply to everything. It is a
+real look and it is right for a watch catalogue. It is wrong for a gym log.
+
+### 1c. A dark ground is a decision you have to defend
+
+**Near-black canvas plus one neon accent is not the house style.** It was the
+example in this document for a long time, so it became the default answer for
+apps it actively harms: a water-intake tracker on `#4f3a2c`, a grocery list on
+`#1b201a`, a calorie counter on dark maroon. Twenty-five apps were built and
+**seventeen came out with a near-black ground** — not because seventeen of
+them were evening apps, but because the example was.
+
+So:
+
+- Dark is available and sometimes correct — §1b names where.
+- If you choose it, **the brief must say why, in terms of the job**: who opens
+  this, where, at what hour, and what a bright screen would do to them. "It
+  looks premium" is not a reason. "It is opened in a dark bedroom sixty
+  seconds before sleep" is.
+- If you cannot write that sentence honestly, the ground is wrong. Choose a
+  light or warm-neutral one and move on.
+
+Also banned outright, for the same reason:
+
+- a palette that contradicts its domain (a sombre gym log, a shouting sleep aid)
+- a logo whose colours are not the app's own palette — see §1e
+
+### 1d. Then commit, in a token block
+
+Now write the tokens, at the top of your `<style>`. Having decided, decide
+completely: six lines of decisions beat six hundred lines of hedging.
 
 ```css
 :root{
-  /* 4–6 colours. No more. */
-  --bg:#0B0B0F; --surface:#16161D; --ink:#F4F4F5; --muted:#A1A1AA;
-  --accent:#FF5C39;                     /* exactly ONE accent */
-  /* type: one display face + one text face, max */
-  --display:"Bricolage Grotesque",Georgia,serif;
+  /* 4–6 colours, from §1b. No more. */
+  --bg:…; --surface:…; --ink:…; --muted:…;
+  --accent:…;                           /* exactly ONE accent */
+  /* type: one display face + one text face, max. SYSTEM STACKS ONLY —
+     a webfont name here does not load (§6), it silently falls back, and
+     the app you designed is not the app that ships. */
+  --display:ui-serif,"Iowan Old Style",Georgia,serif;   /* or rounded, or mono */
   --text:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   /* type scale — pick a ratio and hold it (1.25 here) */
   --t-xs:.75rem; --t-sm:.875rem; --t-md:1rem; --t-lg:1.25rem;
@@ -35,6 +106,37 @@ decisions beat six hundred lines of hedging.
   --r:12px;                             /* one radius, used everywhere */
 }
 ```
+
+Filled in, for three different jobs — note that none of them is the others:
+
+```css
+/* Gym log — energised, rewarded, in motion */
+--bg:#FFF8F0; --surface:#FFFFFF; --ink:#1A1410; --muted:#7A6A5D; --accent:#F0552B;
+/* Sleep wind-down — quiet, dim, slowing */
+--bg:#0E1424; --surface:#18203A; --ink:#E8EAF2; --muted:#8A93AC; --accent:#E3A857;
+/* Weeknight recipes — appetising, warm, generous */
+--bg:#FBF3E6; --surface:#FFFFFF; --ink:#2A1D14; --muted:#8A7460; --accent:#C1452B;
+```
+
+### 1e. The logo is the same decision, drawn
+
+The app's mark is generated from the app's own palette — a colour outside it
+is rejected outright — so §1b decides the logo too. What you still choose is
+the **subject**, and it must depict *this app's* subject: a dumbbell for a gym
+log, a moon for a sleep aid, a pot for a recipe book. Never a generic checkmark,
+clock, document or abstract tile. Logo, app and preview have to read as one
+product.
+
+### 1f. Context and accessibility
+
+- **Cultural meaning** where it is relevant: red is loss in Western finance and
+  gain in much of East Asia; white is mourning in parts of Asia. If the app is
+  culturally specific, say so in the brief.
+- **Never colour alone.** Every state carries a second cue — a label, an icon, a
+  shape, a position. Around 1 in 12 men cannot separate your red from your green.
+- **Distinctions must survive colour-blindness.** Red/green pairs need a
+  difference in lightness too, not just hue.
+- **Body text ≥ 4.5:1** against what is behind it, always. §5 has the numbers.
 
 **Pick one signature element** and let it carry the whole design. A single
 memorable move — a hard offset shadow, a hairline grid ruled across the
@@ -46,6 +148,14 @@ five ideas hedged read as generated.
 **Anti-slop checklist.** If you can tick any of these, start the visual
 direction over:
 
+- [ ] **A near-black ground with one neon accent, for an app §1b does not put
+      there** — the single most common failure of this document
+- [ ] **A palette you could move to a different app without changing a word of
+      it** — if it would suit ten other apps, it is not this app's palette
+- [ ] **A dark ground you cannot justify in one sentence about who opens this
+      and when**
+- [ ] **A webfont name in `--display`** — it will not load (§6); the app you
+      designed is not the app that ships
 - [ ] Purple-to-blue (or teal-to-purple) gradient anywhere
 - [ ] Inter / Roboto / Open Sans as the *display* face, at default weight
 - [ ] Three equal cards in a row, each with an emoji, a bold word, and two
@@ -498,6 +608,13 @@ unless the stage above it can shrink.
 - [ ] **Any `AudioContext` is created in an input handler, and `resume()`d in
       every handler that plays**
 - [ ] **Anything that loops has a mute control, and nothing is `autoplay`**
+- [ ] **The brief names the job, the feeling and the behaviour (§1a)**
+- [ ] **The palette belongs to this app's domain (§1b), and a dark ground —
+      if you chose one — is justified in the brief in one sentence about who
+      opens this and when (§1c)**
+- [ ] **`--display` is a system stack, not a webfont name (§1d)**
+- [ ] **The logo depicts this app's own subject, in this app's palette (§1e)**
+- [ ] **No state is carried by colour alone (§1f)**
 - [ ] The signature element appears at least three times
 - [ ] Nothing on the anti-slop checklist ticks
 
@@ -527,8 +644,14 @@ it has just played with, and reviews the picture for what no measurement can
 see: text the same colour as what is behind it, a panel clipped by its own
 container, a modal behind the board, an empty box where content belongs, a
 collapsed layout, placeholder copy that was never replaced. Those refuse the
-publish too, each one named and located. It has no opinion about your palette
-or your spacing — a plain app that is legible and correctly laid out passes.
+publish too, each one named and located.
+
+**It is also given the app's purpose, and asked whether the palette fits it**
+(§1b). Not whether the palette is *nice* — taste is still yours, and a plain
+app that is legible and correctly laid out passes. But a gym tracker that
+opens sombre and funereal, a sleep aid that opens loud and bright, a children's
+game in luxury monochrome: those are defects, and the reviewer names them the
+same way it names a clipped panel.
 
 The rest of the list is still yours: thumb reach, the interactive share of the
 screen, the signature element, real copy. A 32 px D-pad now throws; a D-pad
