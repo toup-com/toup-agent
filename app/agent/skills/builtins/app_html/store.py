@@ -779,6 +779,12 @@ def reconcile(slug: str, *, allow_purge: bool = True) -> str:
         os.unlink(_state_path(slug))
     except (OSError, AppStoreError):
         pass
+    try:
+        from app.agent.skills.builtins.app_html import appskill, logo
+        appskill.delete(slug)
+        logo.delete_icon(slug)
+    except Exception:  # noqa: BLE001 - cleanup must never fail the repair
+        logger.debug("[app_html] companion purge failed for %s", slug, exc_info=True)
     forget_record(slug)
     return "purged"
 
@@ -894,6 +900,20 @@ def delete_app(slug: str) -> bool:
         os.unlink(_state_path(slug))
     except (OSError, AppStoreError):
         pass
+    # The brief and the icon go too, and for the same reason the state does:
+    # slugs are reusable. A `snake` deleted today and a `snake` built next
+    # week share every path here, so a brief left behind would be read as the
+    # NEW app's purpose by the first edit — the worst possible way for this
+    # feature to fail, because it is confidently wrong rather than absent.
+    #
+    # Imported inside the function: `appskill` and `logo` both import this
+    # module, and doing it at module scope would be a cycle.
+    try:
+        from app.agent.skills.builtins.app_html import appskill, logo
+        appskill.delete(slug)
+        logo.delete_icon(slug)
+    except Exception:  # noqa: BLE001 - cleanup must never fail a delete
+        logger.debug("[app_html] companion cleanup failed for %s", slug, exc_info=True)
     forget_record(normalise_slug(slug))
     return removed
 

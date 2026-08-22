@@ -58,11 +58,20 @@ _PHASE_WORDS: Dict[str, Dict[str, str]] = {
                 "done": "Updated the app",      "failed": "Couldn't update the app"},
     "verify":  {"pending": "Check the app",     "running": "Checking the app",
                 "done": "Checked the app",      "failed": "The app needs a fix"},
+    # Round 20, item 3. Its own phase, because it answers its own question:
+    # `verify` is "does it run", `look` is "does it look right". An app can
+    # pass the first and fail the second — white text on a white card throws
+    # nothing — and folding the two into one row would leave the user
+    # watching a step called "Checking the app" for the length of two
+    # different checks, one of which involves a model.
+    "look":    {"pending": "Look at the app",   "running": "Looking at the app",
+                "done": "Checked the app looks right",
+                "failed": "The app doesn't look right yet"},
     "present": {"pending": "Publish the app",   "running": "Publishing the app",
                 "done": "Published the app",    "failed": "Couldn't publish the app"},
 }
 
-STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "present"]
+STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "look", "present"]
 
 SOURCE_HTML_ARTIFACT = "html_artifact"
 
@@ -85,6 +94,8 @@ _PHASE_USER_MESSAGE: Dict[str, str] = {
     "edit":    "That change didn't go in — the app is exactly as it was.",
     "verify":  "The app has a problem in its code, so I haven't shown it to "
                "you yet. Ask me to fix it.",
+    "look":    "The app runs, but something on screen isn't right yet, so I "
+               "haven't shown it to you. Ask me to fix it.",
     "present": "The app isn't ready to open yet — it needs a fix first.",
 }
 
@@ -554,17 +565,25 @@ def artifact_payload(slug: str) -> Dict[str, Any]:
     is the contract they were written to. What must travel is the number that
     tells them the fetch is now worth making.
     """
-    from app.agent.skills.builtins.app_html import store
+    from app.agent.skills.builtins.app_html import logo, store
 
     rec = store.read_manifest().get(slug)
     if rec is None:
         return {"slug": slug}
+    # A flag, not the drawing. The icon is a few KB of SVG and this payload
+    # rides a WS frame AND a persisted message; what a card needs is to know
+    # that `/api/artifacts/{slug}/icon` is worth one request.
+    try:
+        has_icon = logo.read_icon(slug) is not None
+    except Exception:  # noqa: BLE001 - fail-open, like everything here
+        has_icon = False
     return {
         "slug": slug,
         "title": rec.title or slug,
         "revision": rec.revision,
         "updated_at": rec.updated_at or None,
         "size_bytes": rec.size_bytes,
+        "has_icon": has_icon,
     }
 
 

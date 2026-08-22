@@ -36,9 +36,12 @@ from app.agent.tool_display import ToolResult
 # logs it and moves on, and the skill is simply absent at runtime with no
 # other symptom. (Caught by tests/test_app_pipeline_gate.py, which loads
 # through the real SkillLoader rather than importing the class directly.)
+from app.agent.skills.builtins.app_html import appskill
+from app.agent.skills.builtins.app_html import logo as logo_mod
 from app.agent.skills.builtins.app_html import steps as steps_mod
 from app.agent.skills.builtins.app_html import store
 from app.agent.skills.builtins.app_html import verify as verify_mod
+from app.agent.skills.builtins.app_html import vision as vision_mod
 from app.agent.skills.builtins.app_html.shell import (
     DEFAULT_TIMEOUT_SECONDS,
     ShellRefusal,
@@ -166,6 +169,27 @@ def design_skill_path() -> str:
     return os.path.join(base, DESIGN_SKILL_FILENAME)
 
 
+class InternalRefusal(AppStoreError):
+    """A refusal whose reason the user must never be told.
+
+    `execute_tool` turns an `AppStoreError` into an `ERROR:` string for the
+    model AND a one-clause `display` for the user, built from the same
+    sentence. That is right for almost every refusal here — "old_string
+    appears 3 times" shortens to something a person can live with.
+
+    It is wrong for exactly one class: a refusal that is ABOUT the app's
+    internal brief. "legacy has no brief yet, so it was not published" is a
+    perfectly good instruction to a model and, rendered in a chat, tells
+    someone that a file exists which describes them, which they cannot open,
+    and which they were never meant to know about. So this subclass carries
+    its own user-facing sentence and the detail never reaches it.
+    """
+
+    def __init__(self, message: str, *, display: str) -> None:
+        super().__init__(message)
+        self.display = display
+
+
 class AppHtmlSkill(Skill):
     """Single-file HTML artifact pipeline."""
 
@@ -177,6 +201,14 @@ class AppHtmlSkill(Skill):
     )
 
     def __init__(self) -> None:
+        #: Edit reasons since this app was last published, per slug. Handed to
+        #: the visual review so it can answer "is the change you just made on
+        #: screen" rather than only "does this look broken". In-process on
+        #: purpose: it is context for a review, not a fact about the app, and
+        #: losing it across a restart costs one sentence of prompt, not
+        #: correctness. The durable record of what changed is the brief's own
+        #: history, which `edit_app_file` writes.
+        self._pending_changes: Dict[str, List[str]] = {}
         self._design_path: str = design_skill_path()
         # Read ONCE, from the image, in __init__ — before `get_tools()` and
         # before `on_load()`, both of which the loader calls later. The bytes
@@ -268,17 +300,33 @@ class AppHtmlSkill(Skill):
                             "type": "string",
                             "description": "The COMPLETE document: <!doctype html> through </html>, with all CSS and JS inlined. Not a fragment, not a placeholder.",
                         },
+                        "brief": {
+                            "type": "string",
+                            "description": (
+                                "The app's brief, in markdown — stored beside the app, "
+                                "NEVER shown to the user, and the first thing you will "
+                                "read before every future edit. Cover: what it is and "
+                                "who it is for; the problem it solves; its core flows; "
+                                "every feature, state and control and what each does; "
+                                "and the design decisions (palette, type, spacing, the "
+                                "signature element) WITH your reasoning. Write it now, "
+                                "while you still know why you chose what you chose — in "
+                                "three turns' time this file is all that is left of it."
+                            ),
+                        },
                     },
-                    "required": ["slug", "title", "html"],
+                    "required": ["slug", "title", "html", "brief"],
                 },
             },
             {
                 "name": "app_html__view_app_file",
                 "description": (
-                    "Read an app's current HTML exactly as it is on disk. Call this "
-                    "before every edit_app_file — old_string must match the file "
-                    "byte-for-byte, and you cannot match text you have not looked at "
-                    "in this turn."
+                    "Read an app's current HTML exactly as it is on disk, with the "
+                    "app's own brief above it. Call this before every edit_app_file — "
+                    "old_string must match the file byte-for-byte, and you cannot "
+                    "match text you have not looked at in this turn.\n"
+                    "The brief is what this app is FOR. Read it before you decide what "
+                    "to change: a request is about the app, not about its own wording."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -316,7 +364,17 @@ class AppHtmlSkill(Skill):
                         },
                         "reason": {
                             "type": "string",
-                            "description": "Short phrase for the progress card, e.g. 'add dark mode toggle'.",
+                            "description": "Short phrase for the progress card, e.g. 'add dark mode toggle'. Also recorded in the app's brief as this revision's history line.",
+                        },
+                        "brief": {
+                            "type": "string",
+                            "description": (
+                                "Only when this change alters what the app IS — a new "
+                                "feature, a changed audience, a different look. Pass "
+                                "the app's brief REWRITTEN in full (it replaces the "
+                                "previous one); omit it for an ordinary tweak, whose "
+                                "history line comes from `reason`."
+                            ),
                         },
                     },
                     "required": ["slug", "old_string", "new_string"],
@@ -351,12 +409,15 @@ class AppHtmlSkill(Skill):
                     "and posts the app card in chat. Call this once the app is "
                     "finished — and again after a round of edits so the user sees the "
                     "new version.\n"
-                    "The app is opened in a real browser at 390x844 first and refused "
-                    "if anything throws OR if a control renders under 44x44, text "
-                    "under 12px, or the page scrolls sideways — so this is also the "
-                    "check that it works and can be used with a thumb. If it comes "
+                    "The app is opened in a real browser at 390x844 first, played "
+                    "with, PHOTOGRAPHED and looked at. It is refused if anything "
+                    "throws, if a control renders under 44x44, if text is under 12px, "
+                    "if the page scrolls sideways, if it builds sound that never "
+                    "plays, or if the screenshot shows something broken — unreadable "
+                    "text, a clipped or empty panel, a collapsed layout. If it comes "
                     "back with problems, fix them with edit_app_file and call this "
-                    "again."
+                    "again. It also needs the app's brief to exist; write one with "
+                    "the `brief` argument on create_app_file or edit_app_file."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -400,6 +461,30 @@ class AppHtmlSkill(Skill):
             "something up in the file; it is not a required step, because the "
             "write and the publish check the app themselves. Never hand-scaffold "
             "an app with exec/write_file.\n"
+            "## Sound\n"
+            "An app may make noise, and if it is a game it usually should. Build "
+            "the AudioContext INSIDE the first input handler, never at the top of "
+            "the script, and call `ctx.resume()` at the top of every handler that "
+            "plays something — a context made while the page is loading starts "
+            "suspended, and nothing anywhere reports that the app went silent. "
+            "Synthesise sounds with oscillators; a data: URI works too. Never "
+            "fetch one, never use autoplay, and give anything that loops a way to "
+            "turn it off.\n"
+            "## The app's brief\n"
+            "Every app carries a brief: what it is, who it is for, the problem it "
+            "solves, its flows, what each control does, and why it looks the way "
+            "it does. You write it with the `brief` argument to "
+            "app_html__create_app_file, and app_html__view_app_file hands it back "
+            "to you before every edit. It is INTERNAL — never quote it, never "
+            "paste it into chat, never tell the user it exists, and never mention "
+            "writing one.\n"
+            "Read it before you decide what to change. A request is about the app "
+            "the brief describes, not about its own wording: work out what the "
+            "person is trying to solve and answer THAT. If what you have been "
+            "asked for would break what the app is for, say so in one sentence "
+            "and propose the change that serves the purpose — then do it. Pass a "
+            "rewritten `brief` on the edit whenever the change alters what the "
+            "app is.\n"
             "If a check comes back with problems, FIX THEM AND CALL AGAIN. That is "
             "the whole recovery procedure — do not report a failure to the user "
             "and stop, and never present an app that has not come back clean.\n"
@@ -421,7 +506,9 @@ class AppHtmlSkill(Skill):
             "## Never say it is done until it is\n"
             "app_html__edit_app_file reads the file back and tells you whether "
             "your change is in it. app_html__present_app opens the app in a real "
-            "browser and tells you whether it still runs. Both of those come back "
+            "browser, plays with it, photographs it and LOOKS at the picture — so "
+            "it can tell you the app runs and still refuse it for text nobody can "
+            "read or a panel that came out empty. Both of those come back "
             "BEFORE you write a word to the user about the change. An edit that "
             "was written is not an edit the person can see: publishing is what "
             "puts it in front of them, so \"done\" means present_app returned "
@@ -496,6 +583,10 @@ class AppHtmlSkill(Skill):
 
     @staticmethod
     def _failure_display(tool_name: str, exc: Exception) -> str:
+        # An InternalRefusal brought its own sentence precisely so that this
+        # function never gets to shorten one that must not be shown at all.
+        if isinstance(exc, InternalRefusal):
+            return exc.display
         head = AppHtmlSkill._FAILED_DISPLAY.get(tool_name, "That didn't work")
         detail = _short(exc)
         return f"{head} — {detail}" if detail else f"{head}."
@@ -552,7 +643,13 @@ class AppHtmlSkill(Skill):
         # same reason and one more: it is the cold-start repair (create the
         # directory, fix its mode), and a workspace that cannot be written to
         # should stop the build before there is a card to strand.
+        #
+        # The brief is checked here too, and for exactly the same reason. It
+        # is not paperwork that can be caught up later: the moment to write
+        # down why this app is the way it is, is the moment the model still
+        # knows, and that moment is this call.
         store.validate_html(html)
+        narrative = self._check_brief(args.get("brief"), required=True)
         store.ensure_root()
 
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
@@ -572,6 +669,13 @@ class AppHtmlSkill(Skill):
             user_id=ctx.user_id, job_id=job_id, step_type="create",
             status="done", detail=self._size_detail(record.size_bytes),
         )
+        # No step of its own, ever. The brief is internal: a row reading
+        # "Wrote the app's brief" would tell the user a file exists that they
+        # cannot open and were never meant to know about. It rides the write
+        # that produced it, and a failure to store it is logged, not raised —
+        # losing the note must never lose the app.
+        self._save_brief(slug, title=title, html=html, revision=record.revision,
+                         narrative=narrative, history_line="built")
 
         # Parse the script NOW. A generation that ran out of room mid-function
         # produces a file that is a perfectly valid HTML document with a dead
@@ -605,6 +709,53 @@ class AppHtmlSkill(Skill):
                      if report.findings else "Wrote the app."),
         )
 
+    @staticmethod
+    def _check_brief(raw: Any, *, required: bool) -> str:
+        """`appskill.validate_narrative`, with the user kept out of it.
+
+        The validator's messages are instructions to a model and name the
+        thing they are about — "brief is required", "that is a label, not a
+        brief". `_short` would put the first clause of one of those under a
+        progress bar, which tells the user about the internal file as surely
+        as printing it would. So every refusal from this validator is
+        re-raised with a sentence written for a person; the model still gets
+        the full rule.
+        """
+        try:
+            return appskill.validate_narrative(raw, required=required)
+        except AppStoreError as exc:
+            raise InternalRefusal(
+                str(exc), display="Nearly there — I'm just finishing this off.",
+            ) from None
+
+    @staticmethod
+    def _purpose_line(brief: Optional["appskill.Brief"]) -> str:
+        """One sentence of what the app is, for the reviewer and the icon.
+
+        The first real prose line of the narrative. Both consumers need to
+        know what they are looking at — an empty board is correct for a chess
+        app and a defect for a dashboard, and "Nokia Snake Classic" tells an
+        icon model considerably less than the sentence under *What it is*.
+        """
+        if brief is None or not brief.narrative:
+            return ""
+        for line in brief.narrative.splitlines():
+            line = line.strip().lstrip("#").strip()
+            if line and not line.startswith(("-", "*", "#")) and len(line) > 30:
+                return line[:400]
+        return ""
+
+    @staticmethod
+    def _save_brief(slug: str, *, title: str, html: str, revision: int,
+                    narrative: Optional[str], history_line: str) -> None:
+        """Write the app's note. Never raises — see the call sites."""
+        try:
+            appskill.save(slug, title=title, html=html, revision=revision,
+                          narrative=narrative, history_line=history_line)
+        except Exception:  # noqa: BLE001 - a note is never worth an app
+            logger.warning("[app_html] could not write the brief for %s", slug,
+                           exc_info=True)
+
     async def _view(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
         title = self._existing_title(slug)
@@ -625,15 +776,29 @@ class AppHtmlSkill(Skill):
         # first couple of kilobytes of whatever it is given. Without it, a
         # routine read-before-edit puts the user's own doctype, meta tags and
         # CSS custom properties in their chat as the agent's reply.
+        # The brief goes ABOVE the file, in the model-facing half only.
+        # Round 20: this is the mandatory read, and it is mandatory by being
+        # unavoidable rather than by being instructed. The prompt already
+        # requires view_app_file before every edit; putting the app's purpose
+        # in that same result means an edit cannot be made by a model that
+        # has not been told what the app is for. A separate "read the brief"
+        # tool would be a step that can be skipped, and one more tool name in
+        # the user's actions rail for a file they must never learn about.
+        record = store.read_manifest().get(slug)
+        brief = appskill.context_block(
+            slug, current_revision=record.revision if record else 1,
+        )
+
         if len(content) <= VIEW_INLINE_LIMIT:
             # Raw, no line numbers: edit_app_file matches byte-for-byte, and
             # a "  42\t" gutter is exactly the kind of thing that ends up
             # copied into old_string and never matches.
-            return ToolResult(content, display="Read the app.")
+            return ToolResult(f"{brief}\n\n{content}", display="Read the app.")
         head = content[:VIEW_HEAD_CHARS]
         tail = content[-VIEW_TAIL_CHARS:]
         omitted = len(content) - VIEW_HEAD_CHARS - VIEW_TAIL_CHARS
         return ToolResult(
+            f"{brief}\n\n"
             f"{head}\n\n"
             f"[… {omitted:,} characters omitted — {slug}.html is {len(content):,} "
             f"chars. Use app_html__bash_app with grep -n to locate the exact text "
@@ -646,6 +811,10 @@ class AppHtmlSkill(Skill):
         slug = store.normalise_slug(args.get("slug", ""))
         reason = (args.get("reason") or "").strip()
         title = self._existing_title(slug)
+        # Optional here, required on create: an ordinary tweak does not
+        # change what the app is, and demanding a rewritten brief for every
+        # padding change would guarantee the brief stops being read.
+        narrative = self._check_brief(args.get("brief"), required=False)
 
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
         await steps_mod.emit_step(
@@ -697,6 +866,22 @@ class AppHtmlSkill(Skill):
         # edited and then answered the user shipped a dead script with a
         # success message on top of it.
         report = await verify_mod.verify_app(on_disk or "", deep=False)
+
+        # The note follows the file. The structure section is re-derived from
+        # the bytes that just landed (a map of where things were two edits ago
+        # sends the next edit to the wrong place) and `reason` becomes this
+        # revision's history line — the durable record of what has been
+        # happening to this app, which is what the next editor reads.
+        self._save_brief(
+            slug, title=title, html=on_disk or "", revision=rec.revision,
+            narrative=narrative or None,
+            history_line=reason or "edited",
+        )
+        if reason:
+            pending = self._pending_changes.setdefault(slug, [])
+            if reason not in pending:
+                pending.append(reason)
+            del pending[:-4]
 
         # `+0 bytes` was the old detail for a same-length edit — a change the
         # user could see in the app, described to them as nothing having
@@ -784,6 +969,31 @@ class AppHtmlSkill(Skill):
         title = self._existing_title(slug)
         html_path = store.app_path(slug)
 
+        # ── The brief must exist ──────────────────────────────────────
+        # Checked FIRST, before a browser is launched, because it is the one
+        # requirement that costs nothing to check and cannot be satisfied by
+        # this call. `create_app_file` requires a brief, so only two apps can
+        # reach here without one: an app built before round 20 whose backfill
+        # could not reach a model, and one whose brief write failed. Both are
+        # one `edit_app_file(brief=…)` away, and the message says so.
+        #
+        # This is a gate rather than an instruction on purpose. An app with no
+        # brief is an app whose next edit is a guess, and the round exists to
+        # end that — a rule the model is merely asked to follow is a rule that
+        # holds until the first busy turn.
+        existing_brief = appskill.read(slug)
+        if existing_brief is None or not existing_brief.has_narrative:
+            raise InternalRefusal(
+                f"{slug} has no brief yet, so it was not published. Call "
+                f"edit_app_file with the `brief` argument (any small edit will "
+                f"do, or re-send the file with create_app_file) and describe "
+                f"the app: what it is, who it is for, the problem it solves, "
+                f"its flows, what each control does, and why it looks the way "
+                f"it does. It is internal — the user never sees it — and it is "
+                f"what you will read before every future change.",
+                display="Nearly there — I'm just finishing this off.",
+            )
+
         job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
 
         # ── The gate ──────────────────────────────────────────────────
@@ -813,6 +1023,42 @@ class AppHtmlSkill(Skill):
                 + "\nFix these with edit_app_file and call present_app again."
             )
 
+        # ── Somebody looks at it ──────────────────────────────────────
+        # Round 20, item 3. Everything above this line has established that
+        # the app RUNS. None of it can see that the score is white on white,
+        # that the board is clipped at the bottom, or that the panel the model
+        # was proud of rendered as an empty grey rectangle. Those need an eye,
+        # so the screenshot taken during the run goes to one.
+        #
+        # The findings are the model's repair list and are never shown to the
+        # user; the step's detail says only how many there are. And a look
+        # that could not happen says so — `Look.ran` is false, the step
+        # reports "couldn't look at it here", and the publish is NOT refused
+        # on the strength of a review that never ran.
+        change = "; ".join(self._pending_changes.get(slug, []))
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="look",
+            status="running",
+        )
+        look = await vision_mod.review_screenshot(
+            report.screenshot,
+            user_id=ctx.user_id,
+            title=title,
+            purpose=self._purpose_line(existing_brief),
+            change=change,
+        )
+        await steps_mod.emit_step(
+            user_id=ctx.user_id, job_id=job_id, step_type="look",
+            status="failed" if look.problems else "done",
+            detail=look.summary(),
+        )
+        if look.problems:
+            raise AppStoreError(
+                "the app runs, but it does not look right, so it was not "
+                "published:\n" + look.as_error()
+                + "\nFix these with edit_app_file and call present_app again."
+            )
+
         size = os.path.getsize(html_path)
         record = store.upsert_record(slug, title, size, bump_revision=False,
                                      presented=True)
@@ -820,6 +1066,21 @@ class AppHtmlSkill(Skill):
             user_id=ctx.user_id, job_id=job_id, step_type="present",
             status="running",
         )
+        # The mark. Drawn when it is missing or when the app has changed what
+        # it IS (title or stated purpose) — not on every edit, which would
+        # spend a model call on a padding change and make the tile flicker
+        # between revisions. It can never fail a publish: a container that
+        # cannot reach a model gets the deterministic monogram, which records
+        # itself as provisional so a later run upgrades it.
+        try:
+            _svg, icon_source = await logo_mod.ensure_icon(
+                slug, title=title, purpose=self._purpose_line(existing_brief),
+                user_id=ctx.user_id,
+            )
+            logger.info("[app_html] icon for %s: %s", slug, icon_source)
+        except Exception:  # noqa: BLE001 - an icon is never worth a publish
+            logger.warning("[app_html] icon step failed for %s", slug, exc_info=True)
+
         app_id = await steps_mod.upsert_app_row(
             user_id=ctx.user_id, slug=slug, title=title,
             html_path=html_path, size_bytes=size, job_id=job_id,
@@ -832,6 +1093,10 @@ class AppHtmlSkill(Skill):
         await steps_mod.announce_ready(
             user_id=ctx.user_id, job_id=job_id, app_id=app_id, title=title, slug=slug,
         )
+        # Published, so the edits it contains are no longer pending. Cleared
+        # here and not in `_edit`, because "what changed since the user last
+        # saw this app" is exactly the window between two publishes.
+        self._pending_changes.pop(slug, None)
 
         # Round 18, items 2 and 6. This used to hand back an internal URL
         # path, an `[[open_app:…]]` chip and two sentences of stage direction

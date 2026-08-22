@@ -11,17 +11,28 @@ places to keep in sync and one of them silently wrong.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
-from app.agent.skills.builtins.app_html import runtime, store
+from app.agent.skills.builtins.app_html import appskill, backfill, logo, runtime, store
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/artifacts", tags=["Artifacts"])
+
+#: **There is no route here that returns an app's brief, and there must never
+#: be one.** The brief is the model's working memory of an app — its stated
+#: purpose, its audience, the reasoning behind its design — and it is written
+#: in the second person, to a model. Every route in this module is reachable
+#: from the platform, and the platform's artifact routes are reachable from a
+#: signed-in client, so a route that served it would be one refactor away from
+#: rendering it in somebody's Files list. The only reader is the skill, in
+#: process, through `appskill.read`. See `appskill`'s module docstring for the
+#: other three layers that keep it out of the library.
 
 
 @router.get("/")
@@ -42,6 +53,17 @@ async def list_artifacts() -> Dict[str, Any]:
     repaired = store.reconcile_all()
     if repaired:
         logger.info("[app_html] list repaired %s", repaired)
+    # Round 20's two backfills, in the same place and for the same reason:
+    # every tenant opens Files, so a repair that hangs off this route reaches
+    # the whole fleet with no migration to write and nothing to sweep.
+    #
+    # Two speeds. The derived brief is string work and runs inline, so the
+    # first list after an upgrade already leaves every app with a structure
+    # map. Writing the NARRATIVE and drawing the icon takes a model call per
+    # app, so it goes to the background — nobody should wait for twenty-two
+    # of those to open a list — and runs at most once per container.
+    repaired.update(appskill.backfill_missing())
+    backfill.schedule(_user_id())
 
     records = store.read_manifest()
     items: List[Dict[str, Any]] = []
@@ -49,6 +71,9 @@ async def list_artifacts() -> Dict[str, Any]:
         d = rec.to_dict()
         d["exists"] = store.exists(slug)
         d["versions"] = len(store.list_versions(slug))
+        # The card needs to know an icon is worth fetching; it never needs the
+        # icon inline, which would put an SVG per app into every list.
+        d["has_icon"] = logo.read_icon(slug) is not None
         try:
             d["size_bytes"] = os.path.getsize(store.app_path(slug))
         except (OSError, store.AppStoreError):
@@ -57,6 +82,20 @@ async def list_artifacts() -> Dict[str, Any]:
     items.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
     return {"apps": items, "root": store.apps_root(), "count": len(items),
             "repaired": repaired}
+
+
+def _user_id() -> str:
+    """This container's tenant, for the backfill's LLM accounting.
+
+    Empty on a pool container that has not been bound yet, which is fine:
+    bundle mode authenticates with ``TOUP_TOKEN``, not with this, and the
+    field is only used for the usage row.
+    """
+    try:
+        from app.config import settings
+        return str(getattr(settings, "user_id", "") or "")
+    except Exception:  # pragma: no cover
+        return ""
 
 
 @router.get("/{slug}")
@@ -91,6 +130,61 @@ async def get_artifact(slug: str) -> Response:
             "X-Toup-Artifact-Revision": str(rec.revision if rec else 1),
             "X-Toup-Artifact-Title": (rec.title if rec else slug).encode(
                 "ascii", "replace").decode("ascii"),
+        },
+    )
+
+
+@router.get("/{slug}/icon")
+async def get_artifact_icon(slug: str, request: Request) -> Response:
+    """The app's designed mark, as SVG.
+
+    **Never 404s for an app that exists.** If the designed icon has not been
+    drawn yet — a fresh volume, a container that could not reach a model, an
+    app mid-backfill — the deterministic monogram is generated and stored on
+    the spot. A card rendering a broken image is worse than a card rendering
+    a plain one, and "the icon arrives later" is not something a list view can
+    express.
+
+    ``image/svg+xml`` with ``X-Content-Type-Options: nosniff``: the platform
+    serves this onward from the artifact origin, and the contents were drawn
+    by a model. `logo.sanitize_svg` has already refused script, event
+    attributes and external references — this header is the second lock, so
+    the file cannot be talked into being interpreted as anything else.
+    """
+    try:
+        slug = store.normalise_slug(slug)
+    except store.AppStoreError as exc:
+        raise HTTPException(400, str(exc))
+    rec = store.read_manifest().get(slug)
+    if rec is None:
+        raise HTTPException(404, f"no artifact named {slug!r}")
+
+    svg = logo.read_icon(slug)
+    source = logo.read_sidecar(slug).get("source", "model" if svg else "")
+    if not svg:
+        # Synchronous, deterministic, no model: this route is on the path of
+        # a list view and must never wait on a network call.
+        svg, source = await logo.ensure_icon(
+            slug, title=rec.title or slug, allow_model=False,
+        )
+
+    body = svg.encode("utf-8")
+    etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag,
+                                                  "Cache-Control": "no-cache"})
+    return Response(
+        content=body,
+        media_type="image/svg+xml",
+        headers={
+            # `no-cache` (revalidate), not `no-store`: an icon changes only
+            # when the app changes what it is, so most requests should cost a
+            # 304 rather than 6 KB — and a rename must still be visible at
+            # once, which `no-store` and `max-age` cannot both give.
+            "Cache-Control": "no-cache",
+            "ETag": etag,
+            "X-Content-Type-Options": "nosniff",
+            "X-Toup-Icon-Source": source or "unknown",
         },
     )
 

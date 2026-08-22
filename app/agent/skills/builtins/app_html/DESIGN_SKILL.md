@@ -338,6 +338,64 @@ showStart();                                  // title + PLAY
 playBtn.onclick = () => { reset(); setInterval(tick, 175); };
 ```
 
+### 8a. Sound is built on the first tap, not on load
+
+A whack-a-mole shipped with a mole that made no sound. Nothing was wrong with
+the audio code: the oscillators were correct, the envelope was correct, they
+were connected to the destination and they were started on every hit. The
+`AudioContext` had simply been constructed at the top of the script, and **a
+context created while the page is loading starts `suspended`** — in every
+browser, by design, because a page may not make a noise at a person who has
+not touched it. `resume()` returns a promise that generated code never awaits,
+`oscillator.start()` on a suspended context throws nothing, and the app is
+silent with no error anywhere. It is the quietest failure in this whole
+document, in both senses.
+
+- **Create the `AudioContext` inside the first input handler.** Not at the top
+  of the script, not in an `init()` called on load. One lazy getter, and every
+  sound goes through it.
+- **Call `ctx.resume()` at the top of every handler that plays something.** It
+  is a no-op on a running context and it is the whole fix on a suspended one —
+  including after iOS suspends the context on a phone call or a lock.
+- **Synthesise.** An oscillator plus a gain envelope is a few lines, weighs
+  nothing, and cannot fail to load. A short `data:` URI on an `<audio>` works
+  too. Never `fetch` a sound: there is no network.
+- **Never `autoplay`, and never a sound on a timer.** Both are what the
+  autoplay policy exists to stop, and both fail silently when it does.
+- **Anything that loops or repeats gets a mute control** — a real 44 px one —
+  and the mute state is what your `gain` reads, not an `if` around `play()`.
+- Sound is an accent, never information: an app whose only feedback is audio
+  is unusable with the ringer off, which on a phone is most of the time.
+
+```js
+// Not this — silent, and nothing says so
+const ctx = new AudioContext();
+function bonk() { const o = ctx.createOscillator(); /* … */ o.start(); }
+
+// This
+let ctx;
+function audio() {
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state !== 'running') ctx.resume();     // no-op when already running
+  return ctx;
+}
+function bonk() {
+  if (muted) return;
+  const c = audio(), o = c.createOscillator(), g = c.createGain();
+  o.connect(g); g.connect(c.destination);
+  o.frequency.value = 320;
+  g.gain.setValueAtTime(0.2, c.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.12);
+  o.start(); o.stop(c.currentTime + 0.12);
+}
+mole.addEventListener('pointerdown', () => { bonk(); score++; });
+```
+
+The runner resumes any context it can find on the first gesture, so an app
+written the wrong way will often still make a noise — and `present_app`
+**measures** whether it did. An app that builds audio and has none running
+after a tap is refused, with the count in the message.
+
 ---
 
 ## 9. Two ways in, one vocabulary
@@ -435,6 +493,9 @@ unless the stage above it can shrink.
 - [ ] No external origin except cdnjs
 - [ ] No `fetch` / `XMLHttpRequest` / WebSocket anywhere
 - [ ] Nothing reads storage expecting a value during first paint
+- [ ] **Any `AudioContext` is created in an input handler, and `resume()`d in
+      every handler that plays**
+- [ ] **Anything that loops has a mute control, and nothing is `autoplay`**
 - [ ] The signature element appears at least three times
 - [ ] Nothing on the anti-slop checklist ticks
 
@@ -442,19 +503,31 @@ unless the stage above it can shrink.
 anything throws. A refusal is a list of things to fix, not a dead end: fix
 them with `edit_app_file` and call it again.
 
-**Three of the boxes above are now measured, not trusted.** At 390×844, before
-and again after the start control is pressed, the gate reads every laid-out
-control's `getBoundingClientRect` and refuses the publish over:
+**Several of the boxes above are now measured, not trusted.** At 390×844,
+before and again after the start control is pressed, the gate reads every
+laid-out control's `getBoundingClientRect` and refuses the publish over:
 
 - any interactive element rendering under **44 × 44** (an inline link in a
   sentence is exempt — that is typography, not a control),
 - any text under **12 px**,
-- **sideways scroll** at 390 px wide.
+- **sideways scroll** at 390 px wide,
+- **audio that was built and never played** — a context made, a gesture seen,
+  and nothing running (§8a),
+- **a sound the sandbox refused**, which the browser reports as a corrupt
+  file rather than as a policy decision.
 
 It names the element and the number — "the control “^” renders 34×30px" — so
 the fix is a one-line change to a shared rule. Write to the sizes in §4 and you
 will never meet it.
 
+**And then somebody looks at it.** The gate photographs the app on the screen
+it has just played with, and reviews the picture for what no measurement can
+see: text the same colour as what is behind it, a panel clipped by its own
+container, a modal behind the board, an empty box where content belongs, a
+collapsed layout, placeholder copy that was never replaced. Those refuse the
+publish too, each one named and located. It has no opinion about your palette
+or your spacing — a plain app that is legible and correctly laid out passes.
+
 The rest of the list is still yours: thumb reach, the interactive share of the
-screen, contrast, the signature element, real copy. A 32 px D-pad now throws;
-a D-pad marooned at the top of the screen under a 200 px title still does not.
+screen, the signature element, real copy. A 32 px D-pad now throws; a D-pad
+marooned at the top of the screen under a 200 px title still does not.

@@ -54,6 +54,26 @@ def artifact_csp() -> str:
     ``'self'`` matches nothing. It is the tightest expressible value —
     ``'none'`` is equivalent in effect and breaks same-origin debugging of
     the page outside a frame.
+
+    **``media-src`` is why generated apps were silent (round 20).** There was
+    no ``media-src`` directive, so it fell back to ``default-src 'self'`` —
+    and on an opaque origin ``'self'`` matches nothing, which means every
+    ``data:`` and ``blob:`` sound an app makes was refused. Reproduced with a
+    control: with the directive absent the browser fires
+    ``securitypolicyviolation: media-src`` and the element rejects with
+    ``NotSupportedError — Failed to load because no supported source was
+    found``; with ``media-src 'self' data: blob:`` present, the identical
+    page plays. The error is the reason nobody caught it: it is what a
+    browser says about a CORRUPT FILE, so it reads as a bad sound rather than
+    as a policy decision, and the app's own `play()` rejection is a promise
+    generated code never awaits.
+
+    The mobile runner has always sent ``media-src data: blob:`` in its own
+    ``<meta>`` policy (`appArtifacts.sandboxCsp`); this is the web half
+    catching up, and the two are now the same policy in that respect. Nothing
+    is loosened: ``data:`` and ``blob:`` are bytes the page already has,
+    reachable with no network, which is why ``img-src`` has granted them
+    since the beginning.
     """
     cdn = settings.artifact_cdn_origin
     ancestors = " ".join(settings.artifact_frame_ancestors) or "'none'"
@@ -62,6 +82,7 @@ def artifact_csp() -> str:
         f"script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: {cdn}",
         f"style-src 'self' 'unsafe-inline' {cdn}",
         "img-src 'self' data: blob:",
+        f"media-src 'self' data: blob: {cdn}",
         f"font-src 'self' data: {cdn}",
         "connect-src 'self'",
         "object-src 'none'",
@@ -81,9 +102,17 @@ def artifact_headers() -> dict:
         "Referrer-Policy": "no-referrer",
         "Cross-Origin-Resource-Policy": "same-site",
         "Cross-Origin-Opener-Policy": "same-origin",
+        # `autoplay=(self)` is stated rather than left to the default, which
+        # is the same value. A sound an app makes on a tap is not autoplay in
+        # the sense the policy is about, but the feature gates
+        # `HTMLMediaElement.play()` and `AudioContext` alike — so the one
+        # directive nobody may quietly tighten while debugging a noisy page is
+        # written down, next to the ones that ARE closed. Delegation into the
+        # cross-origin frame is the embedder's half (`AppArtifactFrame`'s
+        # `allow="autoplay"`); this is the document's half.
         "Permissions-Policy": (
             "geolocation=(), microphone=(), camera=(), payment=(), "
-            "usb=(), interest-cohort=()"
+            "usb=(), interest-cohort=(), autoplay=(self)"
         ),
         # An artifact changes under the same URL on every edit. A cached copy
         # would show the user their previous revision after present_app.
@@ -215,6 +244,63 @@ async def delete_artifact(
     except Exception:
         logger.warning("[artifact] apps-row delete mirror failed for %s", slug, exc_info=True)
     return out
+
+
+@router.get("/{slug}/icon")
+async def get_artifact_icon(
+    slug: str,
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """An app's icon, for a card in the SHELL.
+
+    The account bearer, not an artifact token, and deliberately so: this is
+    Toup's own UI asking for a tile, the same way it asks for the file list.
+    An artifact can never reach here — it has no network at all.
+
+    Served with the artifact CSP's spirit but its own, tighter policy: an SVG
+    is a document, and a document served from an origin the shell trusts must
+    not be able to run anything even if `logo.sanitize_svg` were one day
+    fooled. `sandbox` with no allowances and `script-src 'none'` make that
+    structural rather than a matter of the validator being right.
+    """
+    agent = await _get_agent(str(current_user.id), db)
+    if not agent:
+        raise HTTPException(503, "agent unavailable")
+    agent_url, key = agent
+    from app.services.agent_http import get_agent_http_client
+    headers = {"X-Agent-Key": key}
+    inm = request.headers.get("if-none-match")
+    if inm:
+        headers["If-None-Match"] = inm
+    try:
+        resp = await get_agent_http_client().get(
+            f"{agent_url}{settings.api_prefix}/artifacts/{slug}/icon",
+            headers=headers, timeout=10.0,
+        )
+    except Exception as exc:
+        logger.warning("[artifact] icon fetch failed for %s: %s", slug, exc)
+        raise HTTPException(502, "icon unreachable")
+    if resp.status_code == 304:
+        return Response(status_code=304, headers={
+            "ETag": resp.headers.get("etag", ""), "Cache-Control": "no-cache"})
+    if resp.status_code == 404:
+        raise HTTPException(404, "no such app")
+    if resp.status_code >= 400:
+        raise HTTPException(502, "icon unreachable")
+    return Response(
+        content=resp.content,
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-cache",
+            "ETag": resp.headers.get("etag", ""),
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy":
+                "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            "Cross-Origin-Resource-Policy": "same-site",
+        },
+    )
 
 
 @router.get("/{slug}/state")

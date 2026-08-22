@@ -29,6 +29,18 @@ perfectly and whose JavaScript did nothing:
     "ReferenceError: draw is not defined (line 214)" instead of "Script
     error.".
 
+4.  **Round 20: the app made no sound.** An ``AudioContext`` created while
+    the page is loading starts ``suspended`` in every browser, and only a
+    user gesture may resume it. A generated game builds its oscillators at
+    the top of its script, plays them on a hit, and is silent forever —
+    ``play()`` and ``start()`` both return without complaining, so nothing
+    anywhere reports a failure. :func:`audio_unlock` resumes every context
+    the app makes on the first press, whenever that comes, which closes the
+    class for code that was written without thinking about it. It also
+    RECORDS what happened (``window.__TOUP_AUDIO``) so the publish gate can
+    measure whether an app that makes sound actually got any, instead of
+    taking the absence of an error as an answer.
+
 Everything here is injected at SERVE time, never written into the file. The
 model's file stays exactly what the model wrote — ``view_app_file`` shows it,
 ``edit_app_file`` matches against it and the byte count in the card is its
@@ -174,11 +186,123 @@ def error_reporter() -> str:
     )
 
 
+#: Where the audio state lives, for the publish gate and for anyone
+#: debugging a silent app in a real browser.
+AUDIO_GLOBAL = "__TOUP_AUDIO"
+
+
+def audio_unlock() -> str:
+    """Make the app's sound work, and record whether it did.
+
+    Two jobs, and the second is the one that keeps the first honest.
+
+    **Unlocking.** Autoplay policy is per-frame and gesture-based: an
+    ``AudioContext`` constructed during load is ``suspended``, and only a
+    ``resume()`` inside (or after) a user gesture starts it. Generated apps
+    almost always build their audio graph at the top of the script — that is
+    where a person writes it — so the graph exists, the oscillators start,
+    and nothing comes out. ``resume()`` returns a promise nobody awaits, so
+    there is no error to see. The constructor is wrapped so every context the
+    app makes is remembered, and a capture-phase listener on the first
+    ``pointerdown``/``touchend``/``keydown``/``click`` resumes all of them;
+    contexts made AFTER the first gesture are resumed on creation. This never
+    starts audio the user did not ask for — it only resumes on a real
+    gesture, which is exactly the condition the policy is expressing.
+
+    ``<audio>``/``<video>`` elements get the same treatment: a ``play()``
+    that was rejected is retried once on the first gesture. The rejection is
+    recorded either way.
+
+    **Recording.** ``window.__TOUP_AUDIO`` carries ``{contexts, running,
+    unlocked, elements, failures, blocked}``. Without it the gate can only
+    observe that nothing threw, and "nothing threw" is precisely what a
+    silent app looks like. ``blocked`` comes from
+    ``securitypolicyviolation``, which is how a ``media-src`` mistake
+    announces itself: a data:-URI sound refused by the CSP fails with
+    ``NotSupportedError``, which reads exactly like a corrupt file.
+    """
+    return (
+        "(function(){"
+        f"var S={{contexts:0,running:0,unlocked:false,elements:0,failures:[],blocked:[]}};"
+        f"try{{window.{AUDIO_GLOBAL}=S}}catch(e){{}}"
+        "var ctxs=[],pending=[];"
+        "function note(list,msg){try{msg=String(msg||'').slice(0,200);"
+        "if(msg&&list.length<6&&list.indexOf(msg)<0)list.push(msg)}catch(e){}}"
+        # `running` is a COUNT OF THE CURRENT STATE, recomputed, never
+        # incremented. Adding one per successful resume made it climb past
+        # `contexts` — resumeAll() resumes every context including the ones
+        # already running — and the gate reads this number to decide whether
+        # an app that makes sound got any. A tally that can exceed its own
+        # denominator is not a measurement.
+        "function recount(){var n=0;"
+        "for(var i=0;i<ctxs.length;i++){try{if(ctxs[i].state==='running')n++}catch(e){}}"
+        "S.running=n;return S}"
+        # `S.check()` re-reads the contexts and returns the record. The
+        # counters are only refreshed on creation and on resume, so a reader
+        # arriving at an arbitrary moment — the publish gate does exactly
+        # that — must ask for a fresh count rather than trust the last event's.
+        "S.check=recount;"
+        "function resumeAll(){"
+        "for(var i=0;i<ctxs.length;i++){(function(c){try{"
+        "var p=c.resume&&c.resume();if(p&&p.then)p.then(recount,"
+        "function(e){note(S.failures,'AudioContext.resume: '+(e&&e.name||e))})"
+        "}catch(e){note(S.failures,'AudioContext.resume: '+e.message)}})(ctxs[i])}"
+        "recount();"
+        "for(var j=0;j<pending.length;j++){(function(el){try{"
+        "var q=el.play&&el.play();if(q&&q.catch)q.catch(function(){})"
+        "}catch(e){}})(pending[j])}"
+        "pending.length=0;}"
+        "function unlock(){if(S.unlocked)return;S.unlocked=true;resumeAll()}"
+        # Capture phase, so a handler that stops propagation cannot cost the
+        # app its sound. Not `once`: several gesture types are registered and
+        # only the first to fire matters, which `S.unlocked` already handles.
+        "var evs=['pointerdown','touchend','mousedown','keydown','click'];"
+        "for(var k=0;k<evs.length;k++){try{"
+        "window.addEventListener(evs[k],unlock,true)}catch(e){}}"
+        "var AC=window.AudioContext||window.webkitAudioContext;"
+        "if(AC){"
+        # `var`, not a block-level `function` declaration: those are Annex-B
+        # in sloppy mode and hoist differently under strict, and this string
+        # is injected into documents we do not control the mode of.
+        "var Wrapped=function(a,b,c){"
+        "var ctx=arguments.length?new AC(a,b,c):new AC();"
+        "S.contexts++;ctxs.push(ctx);recount();"
+        # Created after the first gesture: resume it now rather than waiting
+        # for a second one that may never come.
+        "if(ctx.state!=='running'&&S.unlocked){try{var p=ctx.resume();"
+        "if(p&&p.then)p.then(recount,"
+        "function(e){note(S.failures,'AudioContext.resume: '+(e&&e.name||e))})}catch(e){}}"
+        "return ctx};"
+        "Wrapped.prototype=AC.prototype;"
+        "try{Object.defineProperty(window,'AudioContext',{value:Wrapped,configurable:true,writable:true})}catch(e){}"
+        "try{Object.defineProperty(window,'webkitAudioContext',{value:Wrapped,configurable:true,writable:true})}catch(e){}"
+        "}"
+        # HTMLMediaElement.play: count it, remember a rejection, and retry
+        # once the gesture arrives. The original promise is still what the
+        # app sees, so an app that handles its own rejection is unaffected.
+        "try{var MP=HTMLMediaElement.prototype,orig=MP.play;"
+        "MP.play=function(){S.elements++;var el=this;var p;"
+        "try{p=orig.apply(this,arguments)}catch(e){"
+        "note(S.failures,'play(): '+e.message);throw e}"
+        "if(p&&p.catch)p.catch(function(e){"
+        "note(S.failures,'play(): '+(e&&e.name||e));"
+        "if(!S.unlocked&&pending.length<8)pending.push(el)});"
+        "return p}}catch(e){}"
+        # A CSP refusal is the other way a sound goes missing, and it is the
+        # one that looks least like itself: the element reports
+        # NotSupportedError, i.e. "bad file", for a policy decision.
+        "try{window.addEventListener('securitypolicyviolation',function(ev){"
+        "note(S.blocked,(ev&&ev.violatedDirective||'csp')+' blocked '+"
+        "String(ev&&ev.blockedURI||'').slice(0,40))},true)}catch(e){}"
+        "})();"
+    )
+
+
 def preamble() -> str:
     """The single ``<script>`` injected ahead of everything the model wrote."""
     return (
         f'<script data-toup="{MARKER}">'
-        f"{error_reporter()}{storage_shim()}"
+        f"{error_reporter()}{storage_shim()}{audio_unlock()}"
         "</script>"
     )
 

@@ -79,8 +79,34 @@ def run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+#: Round 20 made `brief` a required argument of `create_app_file` — an app
+#: whose purpose was never written down is an app whose next edit is a guess.
+#: Tests calling the tool the ordinary way get an ordinary brief; the
+#: requirement itself is asserted in test_app_brief.py, which passes nothing.
+SAMPLE_BRIEF = (
+    "## What it is\n"
+    "A one-screen arcade game for someone with a spare minute on their phone. "
+    "It solves 'I want something to do for sixty seconds that does not need an "
+    "account'.\n\n"
+    "## Core flows\n"
+    "- Press Play, steer with the D-pad, eat, score, lose.\n"
+    "- Press Play again from the game-over card.\n\n"
+    "## Features, states and controls\n"
+    "- States: start screen, playing, over. Play starts the loop; the D-pad "
+    "sets direction; the score reads live.\n\n"
+    "## Design decisions\n"
+    "- Near-black field with one warm accent so the board is the only bright "
+    "thing; 64px D-pad keys because they are pressed continuously."
+)
+
+
+def _with_brief(name, args):
+    if name == "create_app_file" and "brief" not in args:
+        args = {**args, "brief": SAMPLE_BRIEF}
+    return args
+
 def call(skill, name, **args):
-    return run(skill.execute_tool(f"app_html__{name}", args, CTX))
+    return run(skill.execute_tool(f"app_html__{name}", _with_brief(name, args), CTX))
 
 
 def good_html(title="Budget Tracker", extra=""):
@@ -134,9 +160,17 @@ def test_create_writes_one_html_file_and_a_manifest(skill, apps_dir):
 
     # The whole point of the migration: an app is ONE file. Nothing else
     # (no node_modules, no package.json, no lockfile) is created.
+    #
+    # `.skills` and `.icons` are the round-20 companions — the app's internal
+    # brief and its icon. Both are DOT-directories, which is the first of the
+    # three independent reasons the library's scanner cannot list them (it
+    # skips dotted names, walks depth 0, and requires a `.html` suffix).
     entries = {p.name for p in apps_dir.iterdir()}
     assert entries <= {"budget-tracker.html", "manifest.json", ".versions",
-                       "toup-frontend-design.md"}, entries
+                       ".skills", ".icons", "toup-frontend-design.md"}, entries
+    # Nothing the user could ever be shown lives outside the one .html.
+    assert {e for e in entries if not e.startswith(".")} <= {
+        "budget-tracker.html", "manifest.json", "toup-frontend-design.md"}
 
 
 @pytest.mark.parametrize("html,needle", [
@@ -198,9 +232,17 @@ def test_view_returns_bytes_identical_content(skill, apps_dir):
     html = good_html()
     call(skill, "create_app_file", slug="viewme", title="View", html=html)
     out = call(skill, "view_app_file", slug="viewme")
-    # Byte-identical, with NO line-number gutter: edit_app_file matches
-    # exactly, and a gutter is exactly what ends up pasted into old_string.
-    assert out == html
+    # The file half is byte-identical, with NO line-number gutter:
+    # edit_app_file matches exactly, and a gutter is exactly what ends up
+    # pasted into old_string.
+    #
+    # Round 20 prepends the app's own brief, wrapped in <app_brief> so the
+    # model can tell the note from the app. The invariant that matters is
+    # unchanged and is asserted the same way: everything after the wrapper is
+    # the file, byte for byte.
+    assert out.endswith(html)
+    assert out.startswith("<app_brief")
+    assert "</app_brief>" in out
     assert not out.startswith("     1\t")
 
 
@@ -491,6 +533,7 @@ def test_an_app_costs_kilobytes_not_hundreds_of_megabytes(skill, apps_dir):
         for n in names:
             total += os.path.getsize(os.path.join(dirpath, n))
             files += 1
-    assert files <= 12, files
+    # +2 per app for round 20's brief and icon (a few KB in total).
+    assert files <= 24, files
     assert total < 1024 * 1024, total
     assert not any("node_modules" in d for d, _, _ in os.walk(apps_dir))

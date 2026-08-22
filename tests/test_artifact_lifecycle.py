@@ -31,7 +31,7 @@ import os
 
 import pytest
 
-from app.agent.skills.builtins.app_html import steps as steps_mod, store
+from app.agent.skills.builtins.app_html import appskill, steps as steps_mod, store
 from app.agent.skills.builtins.app_html.store import AppStoreError
 
 
@@ -57,9 +57,36 @@ _APP_HTML = (
 )
 
 
-def _make(slug="snake", title="Nokia Snake Classic"):
+def _make(slug="snake", title="Nokia Snake Classic", *, brief=True):
+    """An app on disk, the way `create_app_file` leaves one.
+
+    Round 20 gave every app a brief, and `present_app` refuses to publish one
+    that has none — so a fixture that writes only the .html is no longer a
+    fixture for a normal app, it is a fixture for the pre-round-20 state the
+    backfill exists to repair. `brief=False` reaches that state deliberately.
+    """
     rec, _ = store.write_app(slug, title, _APP_HTML)
+    if brief:
+        appskill.save(slug, title=title, html=_APP_HTML, revision=rec.revision,
+                      narrative=_BRIEF, history_line="built")
     return rec
+
+
+#: What a model writes about an app it has just built. Long enough to pass
+#: `appskill.MIN_NARRATIVE_CHARS`, because a one-line brief is the thing that
+#: rule exists to refuse.
+_BRIEF = (
+    "## What it is\n"
+    "A one-screen arcade game for a spare minute on a phone, for someone who "
+    "wants something to do that needs no account and no explanation.\n\n"
+    "## Core flows\n"
+    "- Press Play, steer, score, lose, press Play again.\n\n"
+    "## Features, states and controls\n"
+    "- Start screen, playing and over; Play starts the loop, the pad steers.\n\n"
+    "## Design decisions\n"
+    "- Near-black field with a single warm accent so the board is the only "
+    "bright thing on screen."
+)
 
 
 # ── 1. The announcement carries the handle ───────────────────────────

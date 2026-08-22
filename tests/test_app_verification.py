@@ -73,8 +73,34 @@ def skill(apps_dir, monkeypatch):
     return s
 
 
+#: Round 20 made `brief` a required argument of `create_app_file` — an app
+#: whose purpose was never written down is an app whose next edit is a guess.
+#: Tests calling the tool the ordinary way get an ordinary brief; the
+#: requirement itself is asserted in test_app_brief.py, which passes nothing.
+SAMPLE_BRIEF = (
+    "## What it is\n"
+    "A one-screen arcade game for someone with a spare minute on their phone. "
+    "It solves 'I want something to do for sixty seconds that does not need an "
+    "account'.\n\n"
+    "## Core flows\n"
+    "- Press Play, steer with the D-pad, eat, score, lose.\n"
+    "- Press Play again from the game-over card.\n\n"
+    "## Features, states and controls\n"
+    "- States: start screen, playing, over. Play starts the loop; the D-pad "
+    "sets direction; the score reads live.\n\n"
+    "## Design decisions\n"
+    "- Near-black field with one warm accent so the board is the only bright "
+    "thing; 64px D-pad keys because they are pressed continuously."
+)
+
+
+def _with_brief(name, args):
+    if name == "create_app_file" and "brief" not in args:
+        args = {**args, "brief": SAMPLE_BRIEF}
+    return args
+
 def call(sk, name, **args):
-    return run(sk.execute_tool(f"app_html__{name}", args, CTX))
+    return run(sk.execute_tool(f"app_html__{name}", _with_brief(name, args), CTX))
 
 
 def snake_html(*, broken: bool = False, storage: bool = False) -> str:

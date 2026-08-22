@@ -134,6 +134,15 @@ class Report:
     #: callers must not read its absence as a pass.
     ran: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
+    #: PNG of the app at 390×844, after the start control was pressed —
+    #: i.e. the screen a person actually plays with, not the title card.
+    #: Round 20: this is what `vision.review_screenshot` looks at. None when
+    #: the browser pass did not run, which is exactly when the caller must
+    #: not claim the app was looked at.
+    screenshot: Optional[bytes] = None
+    #: What `runtime.audio_unlock` recorded: contexts made, contexts running,
+    #: whether a gesture was seen, `<audio>` play failures, CSP refusals.
+    audio: Optional[dict] = None
 
     @property
     def ok(self) -> bool:
@@ -564,6 +573,100 @@ def layout_enabled() -> bool:
     )
 
 
+# ── Did the app actually make a sound? ────────────────────────────────
+
+def audio_findings(state: Optional[dict]) -> List[Finding]:
+    """Turn ``window.__TOUP_AUDIO`` into findings. Testable without a browser.
+
+    Round 20. A silent app is the hardest defect in this pipeline to see,
+    because silence is what success also looks like from every other
+    instrument: the script parses, nothing throws, the layout measures fine.
+    The runtime shim therefore counts what happened, and this reads the count.
+
+    Three ways an app ends up quiet, and all three were reaching users:
+
+    * **The sandbox refused the sound.** ``media-src`` was missing from the
+      artifact CSP, so every ``data:``/``blob:`` sound was blocked and the
+      element reported ``NotSupportedError`` — the browser's phrase for a
+      corrupt file. Named explicitly here, because a policy problem that
+      reads as a broken asset is one a model will "fix" by re-encoding the
+      asset forever.
+    * **Nothing ever resumed the context.** The shim now resumes on the first
+      gesture, so reaching this state after the gate has pressed PLAY and
+      clicked means the app is doing something the shim cannot reach —
+      usually a context it builds per sound, or one it suspends and never
+      restores.
+    * **``play()`` was rejected** and the app never noticed, because
+      generated code does not await that promise.
+
+    Deliberately silent about an app that makes no sound at all: most apps do
+    not, and inventing a finding for them would make this gate a nuisance.
+    """
+    if not isinstance(state, dict):
+        return []
+    out: List[Finding] = []
+    blocked = [str(b) for b in (state.get("blocked") or []) if b]
+    if blocked:
+        out.append(Finding(kind="audio", message=(
+            f"the sandbox blocked something this app loads: {blocked[0]}. "
+            f"Sounds must be inline — a Web Audio oscillator, or a data: URI "
+            f"— never a fetch."
+        )))
+    contexts = int(state.get("contexts") or 0)
+    running = int(state.get("running") or 0)
+    unlocked = bool(state.get("unlocked"))
+    failures = [str(f) for f in (state.get("failures") or []) if f]
+    if contexts and unlocked and not running:
+        out.append(Finding(kind="audio", message=(
+            f"this app builds audio ({contexts} AudioContext) but none of it "
+            f"is running after a tap, so it makes no sound. Create the "
+            f"AudioContext inside the first input handler, and call "
+            f"`ctx.resume()` at the top of every handler that plays "
+            f"something."
+        )))
+    if failures and not out:
+        out.append(Finding(kind="audio", message=(
+            f"a sound failed to play: {failures[0]}. Play sounds from a "
+            f"handler for a real tap or key press, not on load or on a timer."
+        )))
+    return out
+
+
+async def _measure_audio(page) -> Tuple[Optional[dict], List[Finding]]:
+    """Read the shim's record, forcing a fresh count first."""
+    try:
+        state = await page.evaluate(
+            "() => (window.__TOUP_AUDIO && window.__TOUP_AUDIO.check)"
+            " ? JSON.parse(JSON.stringify(window.__TOUP_AUDIO.check()))"
+            " : (window.__TOUP_AUDIO ? JSON.parse(JSON.stringify(window.__TOUP_AUDIO)) : null)"
+        )
+    except Exception:  # noqa: BLE001 - a measurement that cannot run is not a verdict
+        logger.debug("[app_html] audio measurement failed", exc_info=True)
+        return None, []
+    if not isinstance(state, dict):
+        return None, []
+    return state, audio_findings(state)
+
+
+#: Cap on the PNG handed onward. A 390×844 screenshot is 40–120 KB; anything
+#: past this is a full-bleed photograph, and it would be base64'd into an LLM
+#: request. Dropped rather than downscaled: a resized picture is not the
+#: screen, and the review is supposed to be looking at the screen.
+MAX_SCREENSHOT_BYTES = 3 * 1024 * 1024
+
+
+async def _capture(page) -> Optional[bytes]:
+    """A PNG of what is on screen, or None. Never fails the run."""
+    try:
+        png = await page.screenshot(type="png")
+    except Exception:  # noqa: BLE001 - a picture that cannot be taken is not a verdict
+        logger.debug("[app_html] screenshot failed", exc_info=True)
+        return None
+    if not png or len(png) > MAX_SCREENSHOT_BYTES:
+        return None
+    return png
+
+
 async def _measure_layout(page) -> List[Finding]:
     if not layout_enabled():
         return []
@@ -590,6 +693,7 @@ async def _smoke(html: str, report: Report) -> Report:
 
     wrapped = runtime.wrap_for_runtime(html)
     errors: List[Finding] = []
+    audio: List[Finding] = []
     #: External requests that never arrived. An app whose library did not load
     #: is not an app that is broken — it is a verdict this container is not in
     #: a position to give, and blaming the model for its own lack of egress
@@ -659,6 +763,15 @@ async def _smoke(html: str, report: Report) -> Report:
             for f in await _measure_layout(page):
                 if not any(f.message == g.message for g in layout):
                     layout.append(f)
+            # Sound, measured rather than assumed — see `audio_findings`. Read
+            # AFTER the gestures above, because "was a gesture seen" is half of
+            # what the answer depends on.
+            report.audio, audio = await _measure_audio(page)
+            # And the picture. This is the same screen the two measurements
+            # above were taken from, which is the property that matters: a
+            # reviewer arguing with a layout finding must be looking at the
+            # layout that produced it.
+            report.screenshot = await _capture(page)
             if self_ended:
                 _note("behaviour", (
                     f"the app reached “{self_ended}” on its own, "
@@ -681,6 +794,11 @@ async def _smoke(html: str, report: Report) -> Report:
             "its result", blocked[0],
         )
         _downgrade(report, "runtime")
+        # The picture goes too. A screenshot of a page whose stylesheet never
+        # arrived would be handed to the visual review as though it were the
+        # app, and every finding it produced would be about this container's
+        # egress rather than about anything the model wrote.
+        report.screenshot = None
         return report
 
     report.findings.extend(errors)
@@ -690,6 +808,7 @@ async def _smoke(html: str, report: Report) -> Report:
     # worth measuring, and blaming the model for this container's lack of
     # egress is the one way to make the gate worth turning off.
     report.findings.extend(layout)
+    report.findings.extend(audio)
     return report
 
 
@@ -707,4 +826,10 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     report.findings.extend(deep_report.findings)
     report.ran.extend(deep_report.ran)
     report.skipped.extend(deep_report.skipped)
+    # The picture and the audio record belong to the run that produced them.
+    # `_smoke` clears the screenshot when its own result was downgraded, so a
+    # None here is the honest "there is nothing to look at" the visual review
+    # needs in order not to approve a screen it never saw.
+    report.screenshot = deep_report.screenshot
+    report.audio = deep_report.audio
     return report
