@@ -730,10 +730,10 @@ class Settings(BaseSettings):
     # browser_search → when the fast httpx engines return "No results", race
     # Brave Search (search.brave.com, browser-rendered, no key) for real results.
     # browser_fetch → when httpx+trafilatura returns empty (JS-rendered page,
-    # 403, or timeout), render the page in the headless browser. Both rely on the
-    # Chromium binary mounted read-only from the host at /root/.cache/ms-playwright
-    # (host dir /opt/toup/playwright, populated by `patchright install chromium`).
-    # Off → degrade to the httpx-only paths.
+    # 403, or timeout), render the page in the headless browser. Both rely on a
+    # real installed browser (Brave first — see browser.py's discovery and
+    # TOUP_BROWSER_BIN). The old /opt/toup/playwright chromium mount is RETIRED
+    # (2026-08-23); do not re-propose it. No browser → degrade to httpx-only.
     browser_search_enabled: bool = True
     browser_fetch_enabled: bool = True
     skills_dir: str = "/app/skills"  # External skills directory
