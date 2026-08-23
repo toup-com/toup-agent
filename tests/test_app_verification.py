@@ -910,3 +910,53 @@ def test_a_rewrite_keeps_the_mode(skill, apps_dir):
          html=snake_html(storage=True))
     mode = stat.S_IMODE((apps_dir / "snake.html").stat().st_mode)
     assert mode & stat.S_IROTH, oct(mode)
+
+
+# ── Round 23b: a downgraded gate says WHY, on the card ──────────────────────
+#
+# The fleet ran for days with a stale chromium mount (/opt/toup/playwright at
+# revision 1223, patchright wanting 1228). Every verify degraded to the syntax
+# check and every card said "the code checks out" — honest, but silent about
+# the gate being down. The reason now rides the step detail.
+
+def test_a_downgraded_summary_names_its_reason():
+    r = verify.Report()
+    r.ran.append("syntax")
+    r.downgrade_reason = "chromium missing or stale on this host"
+    assert r.summary() == (
+        "the code checks out — couldn't open it "
+        "(chromium missing or stale on this host)"
+    )
+    # Without a reason the old wording stands untouched.
+    r2 = verify.Report()
+    r2.ran.append("syntax")
+    assert r2.summary() == "the code checks out"
+    # A run that DID open the browser never mentions a reason.
+    r3 = verify.Report()
+    r3.ran.extend(["syntax", "runtime"])
+    r3.downgrade_reason = "leftover"
+    assert r3.summary() == "opened it — no errors"
+
+
+def test_downgrade_reason_classifies_the_two_known_infra_faults():
+    stale = Exception(
+        "BrowserType.launch: Executable doesn't exist at "
+        "/root/.cache/ms-playwright/chromium_headless_shell-1228/headless_shell"
+    )
+    assert verify._downgrade_reason_of(stale) == "chromium missing or stale on this host"
+    assert verify._downgrade_reason_of(ImportError("no playwright")) == "playwright not installed"
+    long = Exception("x" * 200)
+    assert len(verify._downgrade_reason_of(long)) <= 60
+
+
+def test_smoke_failure_carries_the_reason_into_the_report(monkeypatch):
+    async def boom(html, report):
+        raise Exception(
+            "BrowserType.launch: Executable doesn't exist at /nope/chromium-1228"
+        )
+    monkeypatch.setattr(verify, "_smoke", boom)
+    rep = asyncio.get_event_loop().run_until_complete(
+        verify.smoke_test("<html></html>")
+    )
+    assert "runtime" in rep.skipped and "runtime" not in rep.ran
+    assert rep.downgrade_reason == "chromium missing or stale on this host"

@@ -164,6 +164,13 @@ class Report:
     #: What `runtime.audio_unlock` recorded: contexts made, contexts running,
     #: whether a gesture was seen, `<audio>` play failures, CSP refusals.
     audio: Optional[dict] = None
+    #: WHY the browser pass was downgraded, when it was — one short clause,
+    #: e.g. "no usable browser". Round 23 on-device: the fleet ran with a
+    #: stale chromium mount for days and every card said "the code checks
+    #: out" — honest, but indistinguishable from a build that simply had no
+    #: JS to run. The reason makes a dead gate legible on the card itself,
+    #: where an operator actually looks, instead of only in a container log.
+    downgrade_reason: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -187,6 +194,8 @@ class Report:
         if "runtime" in self.ran:
             return "opened it — no errors"
         if "syntax" in self.ran:
+            if self.downgrade_reason:
+                return f"the code checks out — couldn't open it ({self.downgrade_reason})"
             return "the code checks out"
         return "could not be checked here"
 
@@ -197,6 +206,24 @@ class Report:
 
 
 # ── Script extraction ─────────────────────────────────────────────────
+
+def _downgrade_reason_of(e: BaseException) -> str:
+    """The exception, as one clause a card can carry.
+
+    The two shapes worth naming are the two infra faults that have actually
+    taken this gate down: the browser binary absent or at the wrong revision
+    (the 2026-08-19 fleet finding — /opt/toup/playwright one revision behind
+    the patchright pin), and playwright itself missing from the image. Both
+    are host/image facts a build cannot fix, so the wording points at the
+    machine, not the app.
+    """
+    text = str(e).split("\n")[0].strip()
+    if "Executable doesn't exist" in text or "executable doesn't exist" in text:
+        return "chromium missing or stale on this host"
+    if isinstance(e, ImportError):
+        return "playwright not installed"
+    return (text[:57] + "…") if len(text) > 58 else (text or type(e).__name__)
+
 
 def _downgrade(report: "Report", pass_name: str) -> None:
     """Move a pass from *ran* to *skipped*.
@@ -373,8 +400,9 @@ async def smoke_test(html: str, *, timeout: int = SMOKE_TIMEOUT_S) -> Report:
         # A page that never finished loading is not a verdict on the app —
         # cdnjs may simply be slow from here.
         _downgrade(report, "runtime")
+        report.downgrade_reason = "page never settled"
         return report
-    except Exception:  # noqa: BLE001 — a missing browser must not fail a build
+    except Exception as e:  # noqa: BLE001 — a missing browser must not fail a build
         # WARNING, not debug. A container where this never runs has silently
         # downgraded its strongest gate to a syntax check, and the only way
         # anyone finds out is if the line is loud enough to notice. (It is
@@ -386,6 +414,7 @@ async def smoke_test(html: str, *, timeout: int = SMOKE_TIMEOUT_S) -> Report:
             "syntax check alone", exc_info=True,
         )
         _downgrade(report, "runtime")
+        report.downgrade_reason = _downgrade_reason_of(e)
         return report
 
 
@@ -892,4 +921,5 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     report.screenshot = deep_report.screenshot
     report.cover = deep_report.cover
     report.audio = deep_report.audio
+    report.downgrade_reason = deep_report.downgrade_reason
     return report
