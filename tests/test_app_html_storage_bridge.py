@@ -27,13 +27,14 @@ Three properties, tested here end to end:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import re
 
+import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from app.agent.skills.builtins.app_html import store
 
@@ -46,6 +47,45 @@ PACKAGED_MD = (
 )
 
 
+
+class _SyncASGIClient:
+    """A synchronous client over an ASGI app, without `TestClient`.
+
+    `fastapi.testclient.TestClient` hands `app=` to `httpx.Client`, and httpx
+    0.28 REMOVED that shortcut — so under this repo's own pins
+    (`fastapi==0.109.0` with `httpx>=0.28.1`, which ship starlette 0.35 and
+    httpx 0.28 together) every test in this file died at fixture setup with
+    `Client.__init__() got an unexpected keyword argument 'app'`. It passed on
+    a developer machine only where the local env had a NEWER fastapi than the
+    pin, i.e. where nobody was running the pinned pair.
+
+    `httpx.ASGITransport` is the pattern the rest of this suite already uses
+    (45 files to this one's 3), and it is version-stable — but it is
+    async-only, while these eleven tests are synchronous. So the async call is
+    driven per-request here rather than rewriting them, which keeps the change
+    to the fixture and leaves every assertion exactly as it was.
+    """
+
+    def __init__(self, app):
+        self._app = app
+
+    def _request(self, method: str, url: str, **kw) -> httpx.Response:
+        async def _go() -> httpx.Response:
+            transport = httpx.ASGITransport(app=self._app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                return await client.request(method, url, **kw)
+
+        return asyncio.run(_go())
+
+    def get(self, url: str, **kw) -> httpx.Response:
+        return self._request("GET", url, **kw)
+
+    def put(self, url: str, **kw) -> httpx.Response:
+        return self._request("PUT", url, **kw)
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("TOUP_HTML_APPS_DIR", str(tmp_path / "apps"))
@@ -56,7 +96,7 @@ def client(tmp_path, monkeypatch):
     from app.api.artifacts import router
     api = FastAPI()
     api.include_router(router, prefix="/api")
-    return TestClient(api)
+    return _SyncASGIClient(api)
 
 
 # ── 1. Persistence ───────────────────────────────────────────────────
