@@ -428,3 +428,33 @@ def test_artifact_payload_carries_the_preview_etag(apps_dir):
     payload = steps_mod.artifact_payload("mines")
     assert payload["has_preview"] is True
     assert payload["preview_etag"] == store.preview_etag("mines")
+
+
+@pytest.mark.asyncio
+async def test_a_rebuild_revives_a_completed_job_and_a_view_does_not():
+    """One card per app: the job row is reused across builds of a slug. A
+    REBUILD (create running) flips the completed job back to running so
+    clients claim it and the card goes live; a later review/bash emit on a
+    completed job leaves it alone (the eternal-spinner rule)."""
+    from app.agent.skills.builtins.app_html import steps as steps_mod
+
+    job_id = await _seed_job()
+    for t in steps_mod.PLANNED_TYPES:
+        await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                                  step_type=t, status="done")
+    final = await steps_mod.finish_job(USER_ID, job_id)
+    assert final == "completed"
+
+    # A review on the finished app must NOT revive it…
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="review", status="running")
+    _, status = await _steps_of(job_id)
+    assert status == "completed"
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="review", status="done")
+
+    # …but a rebuild's CREATE does.
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="create", status="running")
+    _, status = await _steps_of(job_id)
+    assert status == "running"

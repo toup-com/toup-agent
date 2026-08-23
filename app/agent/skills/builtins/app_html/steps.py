@@ -500,6 +500,18 @@ async def emit_step(
             else:
                 if job.status in ("queued", "failed"):
                     job.status = "running"
+                elif job.status == "completed" and step_type == "create" and status == "running":
+                    # A REBUILD of this slug (one card per app: the job row
+                    # is reused). Only the CREATE step revives a completed
+                    # job — a later `view_app_file`/`bash_app` must not (the
+                    # eternal-spinner hazard the leave-completed-alone rule
+                    # above exists for). Without this, the whole rebuild ran
+                    # under status=completed: the client refused to claim
+                    # the job, the live turn kept its generic card, and the
+                    # OLD chip mutated in place (observed b2, 2026-08-23).
+                    job.status = "running"
+                    if hasattr(job, "completed_at"):
+                        job.completed_at = None
                 if getattr(job, "error_class", None) == _ERROR_CLASS:
                     job.error_class = None
                     job.user_message = None
