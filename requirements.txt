@@ -90,7 +90,15 @@ slack-sdk>=3.27.0
 cohere>=5.0.0
 
 # Anthropic
-anthropic>=0.30.0
+# PINNED (round N P0, 2026-08-23): anthropic 1.0.0 migrated its transport to
+# the httpx2 fork and now raises TypeError("Expected an instance of
+# httpx2.AsyncClient") when bundle_client passes its httpx.AsyncClient as
+# http_client. In the agent's bundle-mode init that TypeError was swallowed by
+# the outer startup except: boot reached ready, health stayed green, and every
+# chat turn answered "Agent not available" — the 11:28 PM founder-discovered
+# outage. Reproduced byte-exact in the broken image. Move off this pin only as
+# a deliberate httpx2 migration, never by re-widening the range.
+anthropic==0.122.0
 
 # StoreKit In-App Purchase — Apple's official App Store Server library.
 # Used by app/services/apple_iap_service.py to (a) call the App Store
