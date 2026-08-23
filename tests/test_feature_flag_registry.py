@@ -34,7 +34,9 @@ def cohort(pct: int, salt: str) -> set[str]:
 # ── The registry itself ──────────────────────────────────────────────
 
 def test_registry_holds_both_shipped_flags():
-    assert set(FLAGS) == {"onboarding_v2", "web_mobile_shell"}
+    # Round 26 added `automations` (dark launch, env floor 0). Every
+    # entry here is a published wire name — see the comment below.
+    assert set(FLAGS) == {"onboarding_v2", "web_mobile_shell", "automations"}
     for name, spec in FLAGS.items():
         assert isinstance(spec, FlagSpec)
         # The wire name is what the frontend reads out of

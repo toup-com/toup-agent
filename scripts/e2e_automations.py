@@ -44,7 +44,18 @@ BACKEND = Path(__file__).resolve().parent.parent
 
 _PORT = int(os.environ.get("E2E_PLATFORM_PORT", "8971"))
 _SECRET = "e2e-automations-secret-key-not-production"
-_FERNET = "L39ARTo5DUZC-WWD9cALNEPTH9hAbYjQAxhg-1zd7Ug="  # e2e-only key
+
+
+def _fresh_fernet_key() -> str:
+    # Generated per run, shared with the platform subprocess via env.
+    # Never a committed literal — a secret-shaped constant here would
+    # (rightly) trip test_no_committed_secrets and block the public
+    # mirror sync.
+    from cryptography.fernet import Fernet
+    return Fernet.generate_key().decode()
+
+
+_FERNET = _fresh_fernet_key()
 _DB_PATH = Path(tempfile.mkdtemp(prefix="toup-e2e-")) / "e2e.db"
 _USER_EMAIL = os.environ.get("E2E_USER_EMAIL", "nariman@toup.ai")
 
