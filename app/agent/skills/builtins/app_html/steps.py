@@ -101,13 +101,30 @@ STEP_TYPES: List[str] = ["create", "review", "edit", "verify", "look", "logo",
 #: appended work rather than as rows that were always mysteriously there.
 PLANNED_TYPES: List[str] = ["create", "verify", "look", "logo", "present"]
 
-#: Occurrence guard: the most rows one step type may accumulate on a card.
-#: A re-entered phase appends a fresh row (that is what keeps progress
-#: monotonic), and a model stuck in an edit loop must not append forever —
-#: past this, updates land on the LAST row of the type in place.
-MAX_ROWS_PER_TYPE = 8
-
 SOURCE_HTML_ARTIFACT = "html_artifact"
+
+
+def step_counts(steps: List[Any]) -> "tuple[int, int]":
+    """``(done, total)`` — the ONE step arithmetic, for every surface.
+
+    Skipped rows stay VISIBLE (dashed) but are excluded from BOTH numbers.
+    Counting them anywhere is how one recorded build showed "Done in 5
+    steps", "5/5", six rows and "…/6" at the same time: the ws frame and
+    both REST hydrators used ``len(steps)`` while the clients excluded
+    skipped. Every producer — the live ``job_update`` frame, the closing
+    frame, message_cards hydration, sessions hydration — must call this.
+    """
+    done = total = 0
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        status = s.get("status")
+        if status == "skipped":
+            continue
+        total += 1
+        if status == "done":
+            done += 1
+    return done, total
 
 
 #: What the card says under the header when a phase fails.
@@ -350,9 +367,12 @@ async def emit_step(
 ) -> None:
     """Mark one phase and push it to the chat card + activity feed.
 
-    ``status`` ∈ {running, done, failed}. The label is derived from
-    ``step_type`` and ``status`` (see :func:`phase_label`) and is NOT a
-    parameter — see the note on :data:`_PHASE_WORDS`.
+    ``status`` ∈ {running, done, failed, skipped}. A skip is emitted AT THE
+    MOMENT a phase is known not to run (the skill owns that call) — never
+    deferred to build end, which is how a spinner outlived the rows beneath
+    it. The label is derived from ``step_type`` and ``status`` (see
+    :func:`phase_label`) and is NOT a parameter — see the note on
+    :data:`_PHASE_WORDS`.
     """
     if not job_id:
         return
@@ -373,36 +393,27 @@ async def emit_step(
                 return
             steps = json.loads(job.steps_json) if job.steps_json else initial_steps()
 
-            # ── Occurrence semantics (round 23) ───────────────────────
-            # The recorded regression — "2/7 steps" falling back to "1/7"
-            # with a green check re-spinning — was this function reusing ONE
-            # row per type: the publish gate re-ran `verify` and flipped a
-            # `done` row back to `running`, so the done-count honestly went
-            # backwards. A phase that re-enters after completing now APPENDS
-            # a fresh occurrence (inserted after the last row of its type, so
-            # the card stays grouped by phase with the untouched plan below),
-            # and a completed tick is never taken back: progress is monotonic
-            # by construction, not by a client-side clamp.
-            #
-            # A `failed` row re-entered as `running` is the one deliberate
-            # in-place transition left: that is the retry/fixing state the
-            # card renders, and a fresh row there would leave a permanent ✗
-            # for a problem that was repaired.
+            # ── Retry-in-place (round N correction) ───────────────────
+            # Round 23 APPENDED a fresh row when a completed phase
+            # re-entered running ("occurrence-append") — and EVERY build
+            # re-enters verify, because create runs the checks and the
+            # publish gate runs them again. So every card grew a duplicate
+            # "Checking the app" row mid-run, the plan went 5 → 6, and the
+            # header's percentage regressed 40% → 33% on the recording that
+            # ended the design. A re-run is now a RETRY of the SAME row:
+            # done → running (a visible re-check on a stable step id) and
+            # back. The denominator is stable by construction; the
+            # momentary done-count dip during a retry is clamped by the
+            # clients' high-water display latch — which is where round 23's
+            # "2/7 fell back to 1/7" objection is answered now, at the
+            # display, not by mutating the list.
             last_idx = -1
-            occurrences = 0
             for i, s in enumerate(steps):
                 if isinstance(s, dict) and s.get("type") == step_type:
                     last_idx = i
-                    occurrences += 1
             step_dict: Optional[Dict[str, Any]] = None
             if last_idx >= 0:
-                candidate = steps[last_idx]
-                if (candidate.get("status") == "done" and status == "running"
-                        and occurrences < MAX_ROWS_PER_TYPE):
-                    step_dict = {"id": str(uuid.uuid4()), "type": step_type}
-                    steps.insert(last_idx + 1, step_dict)
-                else:
-                    step_dict = candidate
+                step_dict = steps[last_idx]
             else:
                 # `review`/`edit` are not in the up-front plan — they appear
                 # at the moment they actually happen, inserted in WORK order:
@@ -415,9 +426,38 @@ async def emit_step(
                         insert_at = i + 1
                 steps.insert(insert_at, step_dict)
 
+            # ── Top-to-bottom is structural, not situational ──────────
+            # Nothing may sit spinning while rows beneath it finish — the
+            # recorded card had "Looking at the app" spinning while icon and
+            # publish completed under it, because the look's skip was
+            # deferred to build end. The skill now resolves its own skips at
+            # the moment they happen; this net is for the path nobody
+            # wrote: if a LATER row is being touched while an EARLIER row is
+            # still `running`, that earlier row was abandoned — resolve it
+            # skipped right now and say so loudly, because reaching this
+            # line at all is a pipeline bug.
+            cur_idx = steps.index(step_dict)
+            for earlier in steps[:cur_idx]:
+                if isinstance(earlier, dict) and earlier.get("status") == "running":
+                    earlier["status"] = "skipped"
+                    earlier["label"] = phase_label(earlier.get("type") or "", "skipped")
+                    earlier.setdefault("detail", "the build moved on without it")
+                    earlier["rev"] = int(earlier.get("rev") or 0) + 1
+                    logger.warning(
+                        "[app_html] step %r abandoned running while %r advanced "
+                        "— resolved skipped (pipeline ordering bug)",
+                        earlier.get("type"), step_type,
+                    )
+
             s = step_dict
             s["label"] = label
             s["status"] = status
+            # Per-row write counter: what lets the clients tell a genuine
+            # retry (done → running, HIGHER rev) from a stale poll whose rows
+            # predate the frame that started the retry (older rev). Without
+            # it the clients' rank-merge — correct against races — would
+            # suppress the visible re-check retry-in-place exists to show.
+            s["rev"] = int(s.get("rev") or 0) + 1
             if detail:
                 s["detail"] = detail
             if status == "running":
@@ -485,8 +525,7 @@ async def emit_step(
             await db.commit()
             job_status = job.status
             job_title = (job.title or "").replace("Build: ", "") or label
-            total = len(steps)
-            completed = sum(1 for s in steps if s.get("status") == "done")
+            completed, total = step_counts(steps)
 
         await _broadcast(user_id, {
             "type": "job_update",
@@ -549,6 +588,24 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
                 if s.get("status") in ("pending", "running"):
                     s["status"] = "skipped"
                     s["label"] = phase_label(s.get("type") or "", "skipped")
+                    s.setdefault("detail", "the build finished without it")
+                    s["rev"] = int(s.get("rev") or 0) + 1
+            # A build that closes green around a skipped VERIFICATION is the
+            # false-success pattern — with the browser shipped in the image
+            # this must never fire, so when it does it is an infrastructure
+            # defect and it logs like one. The card stays honest either way:
+            # the row is dashed with its reason, and the counts exclude it.
+            skipped_checks = [
+                s.get("type") for s in steps
+                if isinstance(s, dict) and s.get("status") == "skipped"
+                and s.get("type") in ("verify", "look")
+            ]
+            if skipped_checks:
+                logger.error(
+                    "[app_html] build %s completed with verification skipped: "
+                    "%s — infrastructure defect (renderer unavailable?)",
+                    job_id, ", ".join(skipped_checks),
+                )
             if any(isinstance(s, dict) and s.get("status") == "failed"
                    for s in steps):
                 final = "failed"
@@ -564,11 +621,8 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
             "name": title,
             "status": final,
             "step": phase_label("present", "done") if final == "completed" else "",
-            "total_steps": len(steps),
-            "completed_steps": sum(
-                1 for s in steps
-                if isinstance(s, dict) and s.get("status") == "done"
-            ),
+            "total_steps": step_counts(steps)[1],
+            "completed_steps": step_counts(steps)[0],
         })
     except Exception:
         logger.debug("[app_html] finish_job failed (non-fatal)", exc_info=True)

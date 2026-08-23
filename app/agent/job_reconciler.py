@@ -223,6 +223,7 @@ async def _settle_unpublished_build(
                     label = phase_label(str(s.get("type") or ""), "skipped")
                     if label:
                         s["label"] = label
+                    s["rev"] = int(s.get("rev") or 0) + 1
             final = "failed" if any_failed else "cancelled"
             new_msg = getattr(job, "user_message", None) or (
                 "The app isn't ready to open yet — it needs a fix first."

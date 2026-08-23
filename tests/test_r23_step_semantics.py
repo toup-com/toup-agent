@@ -106,11 +106,20 @@ def test_the_plan_is_the_five_walked_phases():
 # ── Occurrence semantics / monotonic progress ─────────────────────────
 
 @pytest.mark.asyncio
-async def test_a_rerun_check_appends_and_never_untick_a_done_row():
+async def test_a_rerun_check_retries_the_same_row():
+    """Round N correction: a re-run is a RETRY of the SAME row.
+
+    Round 23 appended a second row here, and the 22:05 recording showed
+    where that leads — a duplicate "Checking the app" under the completed
+    one, the plan growing 5 → 6 mid-run, and the header's percentage
+    regressing 40% → 33% because the denominator grew. The re-entered
+    check now flips the SAME row (stable id) back to running: the
+    denominator never moves, and the momentary done-count dip is the
+    clients' high-water latch's problem, not the list's.
+    """
     from app.agent.skills.builtins.app_html import steps as steps_mod
 
     job_id = await _seed_job()
-    counts = []
 
     # The walk the recording showed: create, syntax verify done, then the
     # publish gate re-entering verify.
@@ -118,29 +127,35 @@ async def test_a_rerun_check_appends_and_never_untick_a_done_row():
                               step_type="create", status="running")
     await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
                               step_type="create", status="done")
-    counts.append(_done_count((await _steps_of(job_id))[0]))
     await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
                               step_type="verify", status="done",
                               detail="the code checks out")
-    counts.append(_done_count((await _steps_of(job_id))[0]))
+    steps, _ = await _steps_of(job_id)
+    first_id = next(s["id"] for s in steps if s["type"] == "verify")
     await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
                               step_type="verify", status="running")
     steps, _ = await _steps_of(job_id)
-    counts.append(_done_count(steps))
 
-    # The done count NEVER went backwards — the recorded 2/7 → 1/7.
-    assert counts == sorted(counts), counts
-    # The re-entered check is a NEW row, grouped after its phase…
+    # ONE verify row, the SAME row, visibly re-running.
     verify_rows = [s for s in steps if s["type"] == "verify"]
-    assert len(verify_rows) == 2
-    assert verify_rows[0]["status"] == "done"
-    assert verify_rows[1]["status"] == "running"
-    # …and it sits between the first verify and the untouched plan.
+    assert len(verify_rows) == 1, "a re-run must never append a second row"
+    assert verify_rows[0]["id"] == first_id
+    assert verify_rows[0]["status"] == "running"
+    # The plan never grew: the denominator is stable by construction.
     types = [s["type"] for s in steps]
-    assert types == ["create", "verify", "verify", "look", "logo", "present"]
-    # Distinct stable ids — a client keying rows by id can never conflate
-    # the two occurrences.
-    assert verify_rows[0]["id"] != verify_rows[1]["id"]
+    assert types == ["create", "verify", "look", "logo", "present"]
+    # …and when it lands again, the tick returns on the same row.
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="verify", status="done",
+                              detail="opened it — no errors")
+    steps, _ = await _steps_of(job_id)
+    verify_rows = [s for s in steps if s["type"] == "verify"]
+    assert len(verify_rows) == 1
+    assert verify_rows[0]["status"] == "done"
+    assert verify_rows[0]["id"] == first_id
+    # Every write bumps `rev` — what lets the clients tell this retry
+    # (higher rev) from a stale poll (older rev) and show the re-check.
+    assert verify_rows[0].get("rev", 0) >= 3
 
 
 @pytest.mark.asyncio
@@ -183,18 +198,67 @@ async def test_edit_rows_land_in_work_order():
 
 
 @pytest.mark.asyncio
-async def test_the_occurrence_guard_holds():
-    """A model stuck in a loop must not grow the card forever."""
+async def test_a_check_loop_cannot_grow_the_card_at_all():
+    """Retry-in-place makes the old occurrence cap unnecessary: a model
+    stuck re-checking forever cycles ONE row, and the card never grows."""
     from app.agent.skills.builtins.app_html import steps as steps_mod
 
     job_id = await _seed_job()
-    for _ in range(steps_mod.MAX_ROWS_PER_TYPE + 4):
+    for _ in range(12):
         await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
                                   step_type="verify", status="done")
         await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
                                   step_type="verify", status="running")
     steps, _ = await _steps_of(job_id)
-    assert len([s for s in steps if s["type"] == "verify"]) <= steps_mod.MAX_ROWS_PER_TYPE
+    assert len([s for s in steps if s["type"] == "verify"]) == 1
+    assert len(steps) == len(steps_mod.PLANNED_TYPES)
+
+
+@pytest.mark.asyncio
+async def test_nothing_spins_above_an_advancing_row():
+    """The ordering net: an earlier row abandoned `running` is resolved
+    skipped the moment a later row advances — the recorded card had
+    "Looking at the app" spinning while icon and publish completed
+    beneath it."""
+    from app.agent.skills.builtins.app_html import steps as steps_mod
+
+    job_id = await _seed_job()
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="create", status="done")
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="verify", status="done")
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="look", status="running")
+    # The pipeline bug: logo advances while look never resolved.
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="logo", status="running")
+    steps, _ = await _steps_of(job_id)
+    look = next(s for s in steps if s["type"] == "look")
+    assert look["status"] == "skipped"
+    assert look.get("detail"), "an abandoned row carries a reason"
+    # And the counts exclude it from both numbers.
+    done, total = steps_mod.step_counts(steps)
+    assert (done, total) == (2, 4)
+
+
+@pytest.mark.asyncio
+async def test_a_skip_emitted_by_the_skill_lands_with_its_reason():
+    """The look phase resolves skipped AT THE MOMENT it cannot run —
+    never left spinning for finish_job to settle at build end."""
+    from app.agent.skills.builtins.app_html import steps as steps_mod
+
+    job_id = await _seed_job()
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="look", status="running")
+    await steps_mod.emit_step(user_id=USER_ID, job_id=job_id,
+                              step_type="look", status="skipped",
+                              detail="no browser on this host")
+    steps, status = await _steps_of(job_id)
+    look = next(s for s in steps if s["type"] == "look")
+    assert look["status"] == "skipped"
+    assert look["detail"] == "no browser on this host"
+    assert look["label"] == "Couldn't look at the app here"
+    assert status == "running", "a skip is not a failure"
 
 
 # ── finish_job: skip, never drop ──────────────────────────────────────

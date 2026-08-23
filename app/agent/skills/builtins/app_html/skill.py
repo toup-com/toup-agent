@@ -1029,7 +1029,7 @@ class AppHtmlSkill(Skill):
         # model, which is the only reader that can interpret it.
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="verify",
-            status="done",
+            status="done", detail="looked inside the file",
         )
         body = output.rstrip() or "(no output)"
         # The model gets the exit code and the raw output — that is the whole
@@ -1120,16 +1120,15 @@ class AppHtmlSkill(Skill):
             purpose=self._purpose_line(existing_brief),
             change=change,
         )
-        # A look that did not happen gets NO terminal step. The `done` label is
-        # "Checked the app looks right", and putting that on a card for an app
-        # nobody looked at is precisely the overclaim this round exists to
-        # end — caught by driving the pipeline on a box with no model, where
-        # the card read "Checked the app looks right · couldn't look at it
-        # here" in the same row.
-        #
-        # Left `running`, which `finish_job` drops for exactly this reason: a
-        # phase that never reported back is not work outstanding and not work
-        # done, so it is not shown at all.
+        # A look that did not happen resolves to SKIPPED here, at the moment
+        # it is known — never `done` ("Checked the app looks right" on an app
+        # nobody looked at is the overclaim this pipeline exists to end), and
+        # never left `running`: the recorded card had this row spinning while
+        # icon and publish completed BENEATH it, because the skip used to be
+        # deferred to `finish_job` at build end. A skipped verification is an
+        # infrastructure failure, not a shrug — with the browser shipped in
+        # the image it must simply never happen, so when it does it logs at
+        # error level.
         if look.ran:
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="look",
@@ -1137,9 +1136,19 @@ class AppHtmlSkill(Skill):
                 detail=look.summary(),
             )
         else:
-            logger.info(
-                "[app_html] the visual review did not run for %s: %s",
-                slug, look.reason,
+            skip_reason = look.reason or "couldn't look at it here"
+            if report.downgrade_reason and skip_reason == "no screenshot was captured":
+                # The screenshot is missing BECAUSE the browser pass was
+                # downgraded — name the real cause, not the symptom.
+                skip_reason = report.downgrade_reason
+            logger.error(
+                "[app_html] LOOK SKIPPED for %s — %s (verification did not "
+                "run; infrastructure defect if the renderer is unavailable)",
+                slug, skip_reason,
+            )
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="look",
+                status="skipped", detail=skip_reason,
             )
         if look.problems:
             raise AppStoreError(
@@ -1205,10 +1214,21 @@ class AppHtmlSkill(Skill):
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="logo",
                 status="done",
+                detail=("drew a fresh mark in the app's colours"
+                        if icon_source == "model"
+                        else "kept the mark it already had"
+                        if icon_source == "kept"
+                        else "gave it a simple mark for now"),
             )
-        # Left `running` when the drawing raised — the same rule the visual
-        # review follows: a phase that never reported back is not work
-        # outstanding and not work done, and `finish_job` drops it.
+        else:
+            # The drawing raised. Resolve NOW — a row left `running` sits
+            # spinning while publish completes beneath it (the recorded
+            # bottom-up card); a phase that never reported back is not work
+            # outstanding and not work done, so it is skipped, with words.
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="logo",
+                status="skipped", detail="couldn't draw one this time",
+            )
 
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="present",
@@ -1224,7 +1244,8 @@ class AppHtmlSkill(Skill):
         await steps_mod.register_in_library(user_id=ctx.user_id, slug=slug)
         await steps_mod.emit_step(
             user_id=ctx.user_id, job_id=job_id, step_type="present",
-            status="done", detail=f"revision {record.revision}",
+            status="done",
+            detail=f"revision {record.revision} is live — card and viewer updated",
         )
         # The memory follows the app here too, not only on write. Round 21,
         # item 4: a publish is the moment the user's copy of this app changes,

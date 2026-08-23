@@ -269,15 +269,17 @@ def job_card_fields(
         steps = []
     steps = [s for s in steps if isinstance(s, dict)]
     out["job_steps"] = steps or None
-    out["job_total_steps"] = len(steps)
-    # `done`, not `completed`. A STEP is pending / running / done / failed
-    # — `job_steps.finish_all_steps`, `_tool_create_job`, `apps.py` and the
-    # app-builder skill all write `done`, and nothing has ever written
-    # `completed` on a step; `completed` is the JOB's status, one level up.
-    # Counting the wrong word is what re-rendered every finished card in
-    # history as "0/3 steps" (fixed in f31d2854). Both spellings are
-    # accepted so a hand-edited or future row cannot regress it the other
-    # way.
+    # ONE step arithmetic, shared with the ws frames — skipped rows are
+    # excluded from BOTH numbers (see `app_html.steps.step_counts`; counting
+    # them here while the frame excluded them is how one build showed four
+    # different counts). `done`, not `completed`: a STEP is pending /
+    # running / done / failed / skipped — `completed` is the JOB's status,
+    # one level up; counting the wrong word re-rendered every finished card
+    # as "0/3 steps" (fixed in f31d2854). Both spellings stay accepted so a
+    # hand-edited or future row cannot regress it the other way.
+    out["job_total_steps"] = sum(
+        1 for s in steps if s.get("status") != "skipped"
+    )
     out["job_completed_steps"] = sum(
         1 for s in steps if s.get("status") in ("done", "completed")
     )

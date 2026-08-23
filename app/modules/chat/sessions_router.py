@@ -442,7 +442,11 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
                 completed = sum(
                     1 for s in steps if s.get("status") in ("done", "completed")
                 )
-                resp["job_total_steps"] = len(steps)
+                # Skipped rows are excluded from the total everywhere — the
+                # one step arithmetic (`app_html.steps.step_counts`).
+                resp["job_total_steps"] = sum(
+                    1 for s in steps if s.get("status") != "skipped"
+                )
                 resp["job_completed_steps"] = completed
                 # Find current step
                 for s in steps:
