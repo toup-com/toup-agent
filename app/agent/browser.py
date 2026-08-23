@@ -1305,7 +1305,19 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
                 # CRITICAL: Never use chromium_headless_shell — it's trivially detectable.
                 # Instead, use the FULL Chromium binary with Chrome's own --headless=new flag.
                 # This runs the complete browser engine headlessly = undetectable.
-                real_chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+                # Brave first: it is the only browser the fleet ships (the
+                # patchright chromium mount is retired, 2026-08-23), and it
+                # is a full Chromium under the brand. TOUP_BROWSER_BIN wins
+                # outright so a mounted binary at any path needs no rebuild.
+                _env_bin = (os.environ.get("TOUP_BROWSER_BIN") or "").strip()
+                real_chrome = (
+                    (_env_bin if _env_bin and os.path.exists(_env_bin) else None)
+                    or shutil.which("brave-browser")
+                    or shutil.which("brave-browser-stable")
+                    or shutil.which("brave")
+                    or shutil.which("google-chrome")
+                    or shutil.which("google-chrome-stable")
+                )
                 display = _start_xvfb()
                 use_headed = display is not None
 
@@ -1348,7 +1360,9 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
 
                 # Persistent profile — stores cookies, localStorage, history across sessions.
                 # This dramatically reduces CAPTCHA triggers (sites see a returning user).
-                import os
+                # (`os` must stay the MODULE import: a local `import os` here
+                # made the name function-local and would turn the discovery
+                # above into an UnboundLocalError.)
                 _user_data_dir = os.path.join(
                     os.environ.get("AGENT_DIR", os.getcwd()),
                     "browser_profile",
@@ -1396,7 +1410,8 @@ async def _get_browser(profile: Optional[BrowserProfile] = None,
             return _browser
         except ImportError:
             raise RuntimeError(
-                "Browser not installed. Run: pip install patchright && patchright install chromium"
+                "No browser available. Install Brave (brave-browser) or point "
+                "TOUP_BROWSER_BIN at a Chromium-family binary."
             )
         except Exception as e:
             logger.exception("[BROWSER] Failed to launch browser")

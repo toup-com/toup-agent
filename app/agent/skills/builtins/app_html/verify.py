@@ -42,6 +42,7 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import List, Optional, Tuple
 
 from app.agent.skills.builtins.app_html import runtime
@@ -205,21 +206,62 @@ class Report:
         return "\n".join(f"  - {line}" for line in lines)
 
 
+# ── Browser discovery ─────────────────────────────────────────────────
+
+#: Names tried on PATH, in preference order. Brave first: the fleet's stated
+#: browser (2026-08-23 — the patchright chromium mount is gone for good; the
+#: platform's internet layer is the Brave Search API, and any browser binary
+#: a host carries is Brave). Chrome/Chromium follow for dev machines.
+_BROWSER_BIN_NAMES = (
+    "brave-browser", "brave-browser-stable", "brave",
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+)
+
+#: Absolute fallbacks for installs that do not touch PATH.
+_BROWSER_BIN_PATHS = (
+    "/usr/bin/brave-browser",
+    "/opt/brave.com/brave/brave-browser",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+)
+
+
+def find_browser_bin() -> Optional[str]:
+    """A real installed browser to hand to playwright as ``executable_path``.
+
+    ``TOUP_BROWSER_BIN`` wins outright when it points at something that
+    exists, so a mounted binary at any path works without a rebuild. Returns
+    None when nothing is installed — the caller then lets playwright try its
+    own bundled chromium, which is the legacy path and absent on the fleet.
+    """
+    env = (os.environ.get("TOUP_BROWSER_BIN") or "").strip()
+    if env and os.path.exists(env):
+        return env
+    for name in _BROWSER_BIN_NAMES:
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in _BROWSER_BIN_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 # ── Script extraction ─────────────────────────────────────────────────
 
 def _downgrade_reason_of(e: BaseException) -> str:
     """The exception, as one clause a card can carry.
 
     The two shapes worth naming are the two infra faults that have actually
-    taken this gate down: the browser binary absent or at the wrong revision
-    (the 2026-08-19 fleet finding — /opt/toup/playwright one revision behind
-    the patchright pin), and playwright itself missing from the image. Both
-    are host/image facts a build cannot fix, so the wording points at the
-    machine, not the app.
+    taken this gate down: no launchable browser anywhere (the fleet's normal
+    state since the patchright mount was retired — first seen as the
+    2026-08-19 stale-revision finding), and playwright itself missing from
+    the image. Both are host/image facts a build cannot fix, so the wording
+    points at the machine, not the app.
     """
     text = str(e).split("\n")[0].strip()
     if "Executable doesn't exist" in text or "executable doesn't exist" in text:
-        return "chromium missing or stale on this host"
+        return "no browser on this host"
     if isinstance(e, ImportError):
         return "playwright not installed"
     return (text[:57] + "…") if len(text) > 58 else (text or type(e).__name__)
@@ -635,6 +677,73 @@ def keyboard_hint_findings(visible_text: str) -> List[Finding]:
     ))]
 
 
+#: Elements that never carry an end tag — suppressing on their start tag
+#: would leak the suppression for the rest of the document.
+_VOID_TAGS = frozenset(
+    "area base br col embed hr img input link meta source track wbr".split()
+)
+
+_INLINE_HIDDEN_RE = re.compile(r"display\s*:\s*none", re.I)
+
+
+class _StaticTextExtractor(HTMLParser):
+    """The markup's at-rest text — the browserless stand-in for innerText.
+
+    Scripts, styles and elements hidden at rest (`hidden`, inline
+    `display:none`) contribute nothing, so an app that follows this gate's
+    own advice — keep the keyboard hint out of view until a physical key
+    press — is not re-flagged by the fallback scan. Class-based hiding is
+    invisible to a parser and deliberately NOT modelled: a hint sitting in a
+    class-hidden game screen still reaches the phone's screen when that
+    screen shows, which is exactly what the live scan would catch.
+    """
+
+    _SKIP = frozenset(("script", "style", "template", "noscript"))
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack: List[Tuple[str, bool]] = []
+        self._suppress = 0
+        self.parts: List[str] = []
+
+    def handle_starttag(self, tag, attrs):  # noqa: ANN001 - HTMLParser API
+        if tag in _VOID_TAGS:
+            return
+        hidden = any(
+            k == "hidden" or (k == "style" and v and _INLINE_HIDDEN_RE.search(v))
+            for k, v in attrs
+        )
+        suppressed = tag in self._SKIP or hidden
+        self._stack.append((tag, suppressed))
+        if suppressed:
+            self._suppress += 1
+
+    def handle_endtag(self, tag):  # noqa: ANN001 - HTMLParser API
+        # Tolerant unwinding: generated HTML is usually well-formed, but a
+        # stray close must not wedge the suppression counter forever.
+        while self._stack:
+            t, s = self._stack.pop()
+            if s:
+                self._suppress -= 1
+            if t == tag:
+                break
+
+    def handle_data(self, data):  # noqa: ANN001 - HTMLParser API
+        if not self._suppress and data.strip():
+            self.parts.append(data.strip())
+
+
+def static_visible_text(html: str) -> str:
+    """Testable dry, and the only text source when no browser exists."""
+    p = _StaticTextExtractor()
+    try:
+        p.feed(html or "")
+        p.close()
+    except Exception:  # noqa: BLE001 - a parse failure is not a finding
+        return ""
+    return "\n".join(p.parts)
+
+
 def layout_enabled() -> bool:
     """Off only if an operator turns it off, like the smoke test itself."""
     return (os.environ.get("TOUP_APP_LAYOUT_GATE", "1") or "1").strip().lower() not in (
@@ -784,8 +893,12 @@ async def _smoke(html: str, report: Report) -> Report:
 
     pw = await async_playwright().start()
     try:
+        # An installed browser (Brave on the fleet) beats the bundled
+        # chromium, which no longer exists there. `executable_path=None`
+        # keeps the bundle as the dev-machine fallback.
         browser = await pw.chromium.launch(
             headless=True,
+            executable_path=find_browser_bin(),
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
         try:
@@ -922,4 +1035,10 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     report.cover = deep_report.cover
     report.audio = deep_report.audio
     report.downgrade_reason = deep_report.downgrade_reason
+    if "runtime" not in report.ran:
+        # The hint scan lived inside the browser pass, so a browserless fleet
+        # (the current one: no playwright mount, Brave Search API is the
+        # whole internet layer) shipped keyboard-hint apps unchallenged. The
+        # markup's at-rest text answers the same question dry.
+        report.findings.extend(keyboard_hint_findings(static_visible_text(html)))
     return report

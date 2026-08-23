@@ -922,10 +922,10 @@ def test_a_rewrite_keeps_the_mode(skill, apps_dir):
 def test_a_downgraded_summary_names_its_reason():
     r = verify.Report()
     r.ran.append("syntax")
-    r.downgrade_reason = "chromium missing or stale on this host"
+    r.downgrade_reason = "no browser on this host"
     assert r.summary() == (
         "the code checks out — couldn't open it "
-        "(chromium missing or stale on this host)"
+        "(no browser on this host)"
     )
     # Without a reason the old wording stands untouched.
     r2 = verify.Report()
@@ -943,7 +943,7 @@ def test_downgrade_reason_classifies_the_two_known_infra_faults():
         "BrowserType.launch: Executable doesn't exist at "
         "/root/.cache/ms-playwright/chromium_headless_shell-1228/headless_shell"
     )
-    assert verify._downgrade_reason_of(stale) == "chromium missing or stale on this host"
+    assert verify._downgrade_reason_of(stale) == "no browser on this host"
     assert verify._downgrade_reason_of(ImportError("no playwright")) == "playwright not installed"
     long = Exception("x" * 200)
     assert len(verify._downgrade_reason_of(long)) <= 60
@@ -959,4 +959,65 @@ def test_smoke_failure_carries_the_reason_into_the_report(monkeypatch):
         verify.smoke_test("<html></html>")
     )
     assert "runtime" in rep.skipped and "runtime" not in rep.ran
-    assert rep.downgrade_reason == "chromium missing or stale on this host"
+    assert rep.downgrade_reason == "no browser on this host"
+
+
+# ── Round 23c: the gate on a browserless fleet ──────────────────────────────
+#
+# The patchright chromium mount is retired; the fleet's browser, when one
+# exists at all, is Brave, and most containers have none. Two consequences
+# pinned here: discovery hands playwright a real installed binary (env
+# override first), and the keyboard-hint refusal — which lived inside the
+# browser pass — still fires from the markup alone.
+
+def test_find_browser_bin_prefers_the_env_override(tmp_path, monkeypatch):
+    fake = tmp_path / "brave"
+    fake.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("TOUP_BROWSER_BIN", str(fake))
+    assert verify.find_browser_bin() == str(fake)
+    # A dangling override is ignored, not trusted.
+    monkeypatch.setenv("TOUP_BROWSER_BIN", str(tmp_path / "gone"))
+    assert verify.find_browser_bin() != str(tmp_path / "gone")
+
+
+def test_static_visible_text_reads_at_rest_markup_only():
+    html = (
+        "<html><body>"
+        "<h1>Snake</h1>"
+        "<div hidden>Use arrow keys to move</div>"
+        "<div style='display: none'>press WASD</div>"
+        "<script>var s = 'use the arrow keys';</script>"
+        "<p>Swipe to steer</p>"
+        "</body></html>"
+    )
+    text = verify.static_visible_text(html)
+    assert "Snake" in text and "Swipe to steer" in text
+    assert "arrow" not in text.lower() and "wasd" not in text.lower()
+
+
+def test_browserless_verify_still_refuses_a_keyboard_hint(monkeypatch):
+    # The browser pass downgrades (no browser anywhere) — the hint scan must
+    # come from the markup instead of vanishing with the pass.
+    async def boom(html, report):
+        raise Exception("BrowserType.launch: Executable doesn't exist at /nope")
+    monkeypatch.setattr(verify, "_smoke", boom)
+    hinted = "<html><body><h1>Snake</h1><p>Use arrow keys to move</p></body></html>"
+    rep = asyncio.get_event_loop().run_until_complete(verify.verify_app(hinted))
+    assert any("keyboard" in f.message for f in rep.findings)
+    # A hint the app keeps hidden until a key press is NOT re-flagged.
+    behaved = "<html><body><h1>Snake</h1><p hidden>Use arrow keys to move</p></body></html>"
+    rep2 = asyncio.get_event_loop().run_until_complete(verify.verify_app(behaved))
+    assert not any("keyboard" in f.message for f in rep2.findings)
+
+
+def test_a_live_browser_pass_skips_the_static_hint_scan(monkeypatch):
+    # When the runtime pass RAN, the live scan owns the question — the static
+    # fallback must not double-report or contradict it.
+    async def ran_clean(html):
+        r = verify.Report()
+        r.ran.append("runtime")
+        return r
+    monkeypatch.setattr(verify, "smoke_test", ran_clean)
+    hinted = "<html><body><p>Use arrow keys to move</p></body></html>"
+    rep = asyncio.get_event_loop().run_until_complete(verify.verify_app(hinted))
+    assert not any("keyboard" in f.message for f in rep.findings)
