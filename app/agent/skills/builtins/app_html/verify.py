@@ -54,8 +54,13 @@ logger = logging.getLogger(__name__)
 SYNTAX_TIMEOUT_S = 10
 
 #: Wall-clock ceiling for the browser pass, including launch. A build must
-#: never be held up for longer than a person will wait for one.
-SMOKE_TIMEOUT_S = 20
+#: never be held up for longer than a person will wait for one. 45, not 20
+#: (round N): the FIRST Brave launch in a fresh container builds its whole
+#: profile from nothing and blew the 20s budget — the coin-toss build's
+#: card read "couldn't open it (page never settled)" with a working browser
+#: installed. `warm_browser()` at boot makes the cold launch rare; the
+#: bigger budget makes it survivable. A healthy pass still ends in ~5s.
+SMOKE_TIMEOUT_S = 45
 
 #: How long the page is left running after load, for timers, rAF loops and
 #: whatever the app does on its first frame.
@@ -417,6 +422,34 @@ def smoke_enabled() -> bool:
     return (os.environ.get("TOUP_APP_SMOKE_TEST", "1") or "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
+
+
+async def warm_browser() -> bool:
+    """Launch and close the browser once, so the first BUILD never pays the
+    cold start. Called fire-and-forget from agent boot; failure is logged by
+    the caller and never blocks anything — the smoke test's own downgrade
+    path still owns the honest wording if the browser genuinely cannot run.
+    Returns True when a browser launched.
+    """
+    try:
+        try:
+            from playwright.async_api import async_playwright  # type: ignore
+        except ImportError:  # pragma: no cover
+            from patchright.async_api import async_playwright  # type: ignore
+        pw = await async_playwright().start()
+        try:
+            browser = await pw.chromium.launch(
+                headless=True,
+                executable_path=find_browser_bin(),
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            await browser.close()
+            return True
+        finally:
+            await pw.stop()
+    except Exception as e:  # noqa: BLE001 - warmth is best-effort
+        logger.info("[app_html] browser warm-up did not run: %s", str(e)[:120])
+        return False
 
 
 async def smoke_test(html: str, *, timeout: int = SMOKE_TIMEOUT_S) -> Report:

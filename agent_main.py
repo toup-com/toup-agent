@@ -1568,6 +1568,21 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         print(f"⚠️ dashboard/ cleanup skipped: {_e}")
 
+    # Warm the verify browser in the background (round N): the FIRST Brave
+    # launch in a fresh container builds its profile from nothing and was
+    # eating the app-build smoke budget ("couldn't open it — page never
+    # settled" on a healthy install). Fire-and-forget; never delays ready.
+    try:
+        from app.agent.skills.builtins.app_html.verify import warm_browser as _warm_browser
+
+        async def _warm_and_log():
+            ok = await _warm_browser()
+            print(f"🌡️ Verify browser warm-up: {'ok' if ok else 'unavailable'}")
+
+        asyncio.create_task(_warm_and_log())
+    except Exception as _we:  # noqa: BLE001 — warmth is best-effort
+        print(f"⚠️ Browser warm-up not scheduled: {_we}")
+
     _boot_progress.update(percent=100, phase="ready", ready=True)
     print("🤖 Toup Agent ready.")
     print(f"   Server:  http://0.0.0.0:8001")
