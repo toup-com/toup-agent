@@ -428,6 +428,29 @@ class EmailReceivedHandler:
                 msg_id, model = await self._do_forward_to_telegram(
                     trigger, kept, db,
                 )
+            elif action == "run_automation":
+                # Round 26: hand the fetched, filter-passed batch to the
+                # automations engine. Its own event-dedupe gate makes a
+                # Pub/Sub replay of the same gmail id a no-op even
+                # though this handler already deduped once — belt and
+                # braces across two tables.
+                from app.agent.automations.handlers import (
+                    handle_push_events,
+                )
+                statuses = await handle_push_events(trigger, kept, db)
+                per_event_status.update(statuses)
+                any_ok = any(v == "success" for v in statuses.values())
+                return TriggerResult(
+                    status="success" if any_ok else "success_empty",
+                    per_event_status=per_event_status,
+                    metrics={
+                        "fetched": len(fetched),
+                        "filtered_kept": len(kept),
+                        "automation_runs": sum(
+                            1 for v in statuses.values() if v == "success"
+                        ),
+                    },
+                )
             else:
                 # Unknown action — schema-level enum should have caught
                 # this. Fail safely so the trigger flips to last_status=failed

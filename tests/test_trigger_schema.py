@@ -111,6 +111,9 @@ def test_trigger_enum_constants_pinned():
     assert TRIGGER_KINDS == frozenset({"email_received"})
     assert TRIGGER_ACTIONS == frozenset({
         "summarize_and_post", "notify_only", "forward_to_telegram",
+        # Round 26: system-managed — the automations compiler writes
+        # it; api/triggers._validate_action refuses it from users.
+        "run_automation",
     })
     assert TRIGGER_STATUSES == frozenset({
         "never_fired", "active", "failed", "skipped_reauth",

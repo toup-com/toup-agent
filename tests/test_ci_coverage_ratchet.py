@@ -297,10 +297,21 @@ def test_debt_is_not_growing_silently():
     against this list, and every one of the five new files lands in exactly one
     sweep — none in both, none in neither.
 
+    2026-08-23 (round 26): 74. Two ROUTING entries —
+    `test_automations_setup_cards.py` proves the connector/grant card
+    contract on real Message rows, and
+    `test_automations_engine.py` proves the automations compile→arm→
+    event-dedupe→outbox-claim rails on real `automations`/`build_jobs`
+    rows, and those tables are AGENT_ONLY, so it runs in the agent-mode
+    step. The round's other two new files
+    (`test_automation_spec_validator.py`, pure functions, and
+    `test_automation_grant_gate.py`, platform-only tables) carry no
+    debt line — the platform sweep picks them up.
+
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 72
+    CEILING = 74
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

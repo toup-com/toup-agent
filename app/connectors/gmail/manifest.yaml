@@ -21,13 +21,18 @@ oauth:
   scopes:
     - https://www.googleapis.com/auth/gmail.readonly
     - https://www.googleapis.com/auth/gmail.send
-  scopes_optional: []
+  scopes_optional:
+    # Requested only by the automations connector card in read_write
+    # mode (Round 26) — drafts-only writes. Plain chat connects never
+    # ask for it.
+    - https://www.googleapis.com/auth/gmail.compose
   pkce: true
   refresh: true
 
 scope_descriptions:
   https://www.googleapis.com/auth/gmail.readonly: Read your Gmail messages, threads, and labels.
   https://www.googleapis.com/auth/gmail.send: Send mail on your behalf. We never store the body of messages you send beyond your audit log.
+  https://www.googleapis.com/auth/gmail.compose: Create drafts in your Gmail. Automations only ever write drafts — nothing is sent without you.
 
 health:
   probe: gmail__list_messages
@@ -103,6 +108,32 @@ tools:
       default: allow
       deny: []
 
+  - name: gmail__create_draft
+    description: Create a Gmail DRAFT (never sends). The draft appears in the user's Drafts folder for them to review and send themselves. This is the only mail write automations may perform.
+    input_schema:
+      type: object
+      properties:
+        to:
+          type: string
+          description: Recipient email address.
+        subject:
+          type: string
+        body:
+          type: string
+        cc:
+          type: string
+        bcc:
+          type: string
+      required: [to, subject, body]
+    mutates: true
+    elevation: false
+    output_redaction: ["body", "cc", "bcc"]
+    pii: high
+    rate_limit: "20/min"
+    channel_policy:
+      default: allow
+      deny: []
+
   - name: gmail__search_threads
     description: Search Gmail threads matching a query, returning thread metadata + first-message snippets.
     input_schema:
@@ -123,3 +154,31 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# Gmail is the ONE push-capable connector: events ride the existing
+# Pub/Sub → Trigger pipeline (users.watch, JWT-verified webhook,
+# dedupe on gmail_message_id). The only permitted write is
+# gmail__create_draft — automations never send mail.
+automation:
+  push: true
+  poll: false
+  floor_s: 300
+  rate_budget:
+    per_hour: 30
+    per_day: 200
+  scopes_read:
+    - https://www.googleapis.com/auth/gmail.readonly
+  scopes_write_by_action:
+    gmail__create_draft: ["https://www.googleapis.com/auth/gmail.compose"]
+  target_param_by_action:
+    gmail__create_draft: to
+  events:
+    - key: email_received
+      description: A new email arrives in your inbox.
+      dedupe_field: gmail_message_id
+      fields:
+        message_id: gmail_message_id
+        subject: subject
+        from: from
+        snippet: snippet

@@ -102,8 +102,18 @@ def _validate_kind(kind: str) -> None:
 
 def _validate_action(action: str) -> None:
     from app.db.models import TRIGGER_ACTIONS
+    if action == "run_automation":
+        # System-managed: only the automations compiler writes rows with
+        # this action (same economy as kind='autopilot' being absent
+        # from the routines API's creatable set). Listed in
+        # TRIGGER_ACTIONS so the handler dispatch stays a closed enum.
+        raise HTTPException(
+            status_code=400,
+            detail="Action 'run_automation' is system-managed and cannot "
+                   "be set directly.",
+        )
     if action not in TRIGGER_ACTIONS:
-        allowed = sorted(TRIGGER_ACTIONS)
+        allowed = sorted(TRIGGER_ACTIONS - {"run_automation"})
         raise HTTPException(
             status_code=400,
             detail=f"Unknown trigger action {action!r}. Allowed: {allowed}",

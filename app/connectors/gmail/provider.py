@@ -215,6 +215,34 @@ class GmailProvider(BaseConnectorProvider):
                     "labelIds": result.get("labelIds"),
                 }))
 
+            if tool_name == "gmail__create_draft":
+                to = tool_input.get("to")
+                subject = tool_input.get("subject")
+                body = tool_input.get("body")
+                if not (to and subject and body):
+                    return ConnectorToolError(
+                        message="to/subject/body all required",
+                        retryable=False,
+                    )
+                raw = _b64url_encode(_build_rfc822(
+                    to=to, subject=subject, body=body,
+                    cc=tool_input.get("cc", ""),
+                    bcc=tool_input.get("bcc", ""),
+                ))
+                result = await google_request(
+                    "POST",
+                    f"{GMAIL_API_BASE}/drafts",
+                    access_token=access_token,
+                    json_body={"message": {"raw": raw}},
+                    scope_hint="gmail.compose",
+                )
+                msg = result.get("message") or {}
+                return ConnectorOk(content=json.dumps({
+                    "draft_id": result.get("id"),
+                    "id": msg.get("id"),
+                    "threadId": msg.get("threadId"),
+                }))
+
             if tool_name == "gmail__search_threads":
                 q = tool_input.get("query")
                 if not q:

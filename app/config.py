@@ -1268,6 +1268,18 @@ class Settings(BaseSettings):
     # safe to enable broadly, but staged rollout is still the right call.
     routines_reminders_enabled: bool = False
 
+    # ── Automations engine (Round 26) ────────────────────────────────
+    # Agent-side master switch for the chat-built automations engine:
+    # gates the automations skill (setup tools), the routine kinds
+    # `automation_poll`/`automation_schedule`, the trigger action
+    # `run_automation`, the outbox flush + reconcile sweeps, and every
+    # /api/automations route (404 when off, mirroring routines kinds).
+    # Default False ⇒ zero behavior change: the skill never registers,
+    # so the provider tools array — and with it the cached prompt
+    # prefix — stays byte-identical to today. The platform-side twin is
+    # `automations_rollout_pct` (frontend surface gating).
+    automations_enabled: bool = False
+
     # ── Maintenance / support agent (app.support) ────────────────────
     # Master switch. Off ⇒ every /api/support route 503s. Dark-launched.
     support_agent_enabled: bool = False
@@ -2039,6 +2051,15 @@ class Settings(BaseSettings):
     # deployed this key yet, a failed fetch and a user outside the cohort all
     # resolve the same way. See frontend/src/shared/mobileShell.ts.
     web_mobile_shell_rollout_pct: int = 0
+
+    # `automations.rollout_pct` (0-100) gates the Automations product
+    # surface (Activity page, card rendering, template suggestions) on
+    # the web/app clients. Same storage model as the flags above: this
+    # is the fresh-deploy floor, `platform_settings` the runtime
+    # override, buckets stable across the ramp. DEFAULT 0 IS THE DARK
+    # LAUNCH — pair with the agent-side `automations_enabled` bool
+    # (also default off) for the engine itself.
+    automations_rollout_pct: int = 0
 
     # ── Provisioning bridge (Phase 3, replaces SSH-as-root) ───────
     # mTLS-secured FastAPI service on the VPS. Platform talks to it with a

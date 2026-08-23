@@ -184,6 +184,17 @@ def _serialize_admin_notice(msg: Message) -> Optional[dict]:
     return notice if isinstance(notice, dict) else None
 
 
+def _serialize_automation_card(msg: Message, key: str) -> Optional[dict]:
+    """Round 26 — the two automations setup cards
+    (`automation_connector_card` / `automation_grant_card`), persisted
+    verbatim by app/agent/automations/cards.py. Same four-serializer
+    parity contract as admin_notice above: a card serialized on only
+    one path vanishes when a client takes its fallback."""
+    parsed = _metadata(msg)
+    card = parsed.get(key)
+    return card if isinstance(card, dict) and card.get("id") else None
+
+
 def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
     """Extract the ToolPillRow records persisted in metadata_json by
     agent_runner. Shape per record: {tool, started_at_ms,
@@ -559,6 +570,10 @@ async def get_day_chat_messages(
                 "media": _serialize_media(m),
                 "app_artifact": _serialize_app_artifact(m),
                 "admin_notice": _serialize_admin_notice(m),
+                "automation_connector_card": _serialize_automation_card(
+                    m, "automation_connector_card"),
+                "automation_grant_card": _serialize_automation_card(
+                    m, "automation_grant_card"),
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
@@ -634,6 +649,10 @@ async def get_day_chat_messages(
             "media": _serialize_media(msg),
             "app_artifact": _serialize_app_artifact(msg),
             "admin_notice": _serialize_admin_notice(msg),
+            "automation_connector_card": _serialize_automation_card(
+                msg, "automation_connector_card"),
+            "automation_grant_card": _serialize_automation_card(
+                msg, "automation_grant_card"),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),

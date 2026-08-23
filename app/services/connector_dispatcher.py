@@ -159,6 +159,148 @@ def _lock_for(identity_id: str) -> asyncio.Lock:
     return lock
 
 
+# ─── Automation grant gate (Round 26) ────────────────────────────────
+
+
+async def _resolve_automation_grant(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    connector_id: str,
+    entry,
+    manifest_tool,
+    tool_input: dict,
+    grant_id: Optional[str],
+    approved_action_id: Optional[str],
+):
+    """Verify a mutating automation call against its standing grant.
+
+    Returns the AutomationGrant row when the call may proceed, None for
+    non-mutating calls (or a per-call human approval), or a
+    ConnectorToolError refusing the call. Every refusal is fail-closed
+    and names the reason — an automation that cannot write must say so
+    in its run ledger, not half-succeed.
+
+    Side effect on success: the grant's cadence counters are
+    incremented and committed BEFORE the provider runs. Conservative on
+    purpose — a failed provider call still consumed budget, which is
+    the safe direction for an unattended writer.
+    """
+    from sqlalchemy import select as _select
+    from app.db.models import AutomationGrant
+
+    if not manifest_tool.mutates:
+        return None
+    if approved_action_id is not None:
+        # The human approved exactly this call via the guarded-UPDATE
+        # claim in connector_pending_actions — the strongest per-call
+        # authorization there is. The standing grant (if any) is not
+        # consulted and its cadence budget is not charged.
+        return None
+    if not grant_id:
+        return ConnectorToolError(
+            message=(
+                f"{manifest_tool.name!r} modifies data and no approved "
+                f"permission backs this automation call. Automations "
+                f"fail closed — ask the user for permission first."
+            ),
+            retryable=False,
+        )
+
+    row = (await db.execute(
+        _select(AutomationGrant)
+        .where(AutomationGrant.id == grant_id)
+        .where(AutomationGrant.user_id == user_id)
+    )).scalar_one_or_none()
+    if row is None:
+        return ConnectorToolError(
+            message="The permission backing this automation no longer "
+                    "exists. Nothing was sent.",
+            retryable=False,
+        )
+    if row.status != "approved":
+        return ConnectorToolError(
+            message=f"The permission backing this automation is "
+                    f"{row.status!r}, not approved. Nothing was sent.",
+            retryable=False,
+        )
+    if row.connector_id != connector_id or row.tool_name != manifest_tool.name:
+        return ConnectorToolError(
+            message="The approved permission covers a different action "
+                    "than this call. Nothing was sent.",
+            retryable=False,
+        )
+
+    # Pinned-target check. The param name comes from the manifest's
+    # automation block; a write tool WITHOUT a declared target param
+    # cannot be grant-gated and is refused (the registry lint enforces
+    # the declaration, this is the runtime backstop).
+    auto_block = getattr(entry.manifest, "automation", None)
+    target_param = (
+        auto_block.target_param_by_action.get(manifest_tool.name)
+        if auto_block is not None else None
+    )
+    if not target_param:
+        return ConnectorToolError(
+            message=f"{manifest_tool.name!r} declares no pinned-target "
+                    f"parameter, so no grant can cover it. Nothing was sent.",
+            retryable=False,
+        )
+    try:
+        target = json.loads(row.target_json or "{}")
+    except (ValueError, TypeError):
+        target = {}
+    actual = str(tool_input.get(target_param) or "").strip()
+    pinned = str(target.get("id") or "").strip()
+    if not actual or not pinned or actual != pinned:
+        return ConnectorToolError(
+            message=(
+                f"This automation may only write to "
+                f"{target.get('label') or pinned or 'its approved target'} "
+                f"— the call targeted {actual or 'nothing'} instead. "
+                f"Nothing was sent."
+            ),
+            retryable=False,
+        )
+
+    # Cadence budget. Counters are day/hour-keyed on the row itself; a
+    # new period resets them in the same UPDATE that increments.
+    try:
+        cadence = json.loads(row.cadence_json) if row.cadence_json else {}
+    except (ValueError, TypeError):
+        cadence = {}
+    now = datetime.utcnow()
+    day_key = now.strftime("%Y-%m-%d")
+    hour_key = now.strftime("%Y-%m-%dT%H")
+    if row.uses_day_key != day_key:
+        row.uses_day_key = day_key
+        row.uses_today = 0
+    if row.uses_hour_key != hour_key:
+        row.uses_hour_key = hour_key
+        row.uses_this_hour = 0
+    per_day = cadence.get("per_day")
+    per_hour = cadence.get("per_hour")
+    if per_day is not None and row.uses_today >= int(per_day):
+        await db.rollback()
+        return ConnectorToolError(
+            message=f"This automation's daily budget ({per_day} writes) "
+                    f"is used up — it resets at midnight UTC.",
+            retryable=True,
+        )
+    if per_hour is not None and row.uses_this_hour >= int(per_hour):
+        await db.rollback()
+        return ConnectorToolError(
+            message=f"This automation's hourly budget ({per_hour} writes) "
+                    f"is used up — try again next hour.",
+            retryable=True,
+        )
+    row.uses_today += 1
+    row.uses_this_hour += 1
+    row.last_used_at = now
+    await db.commit()
+    return row
+
+
 # ─── Public refresh helpers (shared with the health-probe scheduler) ─
 #
 # The health probe needs the SAME refresh-on-expiring logic the
@@ -187,6 +329,8 @@ async def execute(
     *,
     agent_request_id: Optional[str] = None,
     approved_action_id: Optional[str] = None,
+    grant_id: Optional[str] = None,
+    exclude_metering: bool = False,
 ) -> ConnectorResult:
     """Run one connector tool call end-to-end.
 
@@ -200,6 +344,14 @@ async def execute(
     `pending → approved` in a single guarded UPDATE). It is keyword-only
     and the MCP tool handler never supplies it, so nothing on the
     agent-facing path can approve its own send.
+
+    `grant_id` (Round 26) names an approved standing AutomationGrant.
+    Only valid with `channel="automation"`, and only the automations
+    RPC endpoint passes it — the MCP handler never does. The gate at
+    step 1.7 verifies status, ownership, action, pinned target and
+    cadence budget against the row, failing closed on any mismatch; a
+    mutating call on the automation channel WITHOUT a verifiable grant
+    is refused outright.
     """
     started = time.monotonic()
     # Phase-level timing breakdown. Logged at the end of `execute`
@@ -246,6 +398,42 @@ async def execute(
                 f"quarantine first. Try again later."
             ),
             retryable=True,  # eligible for retry once lifted
+        )
+
+    # 1.7 Automation-channel gate (Round 26). The automation channel is
+    #     machine-driven with nobody watching, so it does not ride the
+    #     generic channel-policy layer: reads pass the normal gates
+    #     below, and a MUTATING call is legal only when backed by an
+    #     approved standing grant whose pinned target matches the
+    #     actual arguments and whose cadence budget has room. Fail
+    #     closed on every mismatch. `approved_action_id` (a per-call
+    #     human approval, claimed by guarded UPDATE) supersedes the
+    #     standing-grant requirement for exactly that call.
+    automation_grant = None
+    if channel == "automation":
+        gate = await _resolve_automation_grant(
+            db,
+            user_id=user_id,
+            connector_id=connector_id,
+            entry=entry,
+            manifest_tool=manifest_tool,
+            tool_input=tool_input,
+            grant_id=grant_id,
+            approved_action_id=approved_action_id,
+        )
+        if isinstance(gate, ConnectorToolError):
+            _log(user_hash, connector_id, tool_name, channel,
+                 "automation_grant_denied", started)
+            return gate
+        automation_grant = gate
+    elif grant_id is not None:
+        # A grant ref outside the automation channel is a programming
+        # error somewhere above us — refuse rather than half-honor it.
+        _log(user_hash, connector_id, tool_name, channel,
+             "grant_wrong_channel", started)
+        return ConnectorToolError(
+            message="grant_id is only valid on the automation channel",
+            retryable=False,
         )
 
     # 2 + 3. Channel-policy resolution + vault read in PARALLEL.
@@ -366,15 +554,32 @@ async def execute(
     #
     #     `approved_action_id` is keyword-only and the MCP handler never
     #     passes it, so the agent-facing path cannot lift its own gate.
-    if manifest_tool.elevation and approved_action_id is None:
-        if channel not in _CONFIRMABLE_CHANNELS:
+    _needs_card = manifest_tool.elevation and approved_action_id is None
+    if _needs_card and automation_grant is not None and automation_grant.mode == "auto":
+        # Round 26: an approved auto-mode grant IS the user's standing
+        # approval for this exact (tool, pinned target) — the per-call
+        # card would ask a question they already answered.
+        _needs_card = False
+    if (
+        not _needs_card
+        and automation_grant is not None
+        and automation_grant.mode == "confirm"
+        and approved_action_id is None
+    ):
+        # Round 26: a confirm-mode grant previews EVERY fire, even for
+        # write tools the manifest does not mark elevation (drafts).
+        _needs_card = True
+    if _needs_card:
+        if channel not in _CONFIRMABLE_CHANNELS and automation_grant is None:
             # Fail SAFE. Every elevation:true tool today is also
             # `mutates: true`, so the channel policy above has already
             # denied these on voice/telegram/unattended — this is the
             # backstop for a future elevated-but-not-mutating tool, or a
             # new channel added without revisiting this list. Silently
             # executing because we have nowhere to draw a card is the
-            # one outcome that must never happen.
+            # one outcome that must never happen. (A confirm-mode
+            # automation grant is exempt: its card lands in the day
+            # chat + pending list, both real surfaces.)
             _log(user_hash, connector_id, tool_name, channel,
                  "elevation_unconfirmable_channel", started)
             return ConnectorToolError(
@@ -452,35 +657,44 @@ async def execute(
     # ConnectorToolError instead of a successful tool call they can't
     # pay for. Shadow-mode (credit_enforcement_enabled=False) is a
     # no-op here; deduction still happens post-success below.
-    try:
-        from app.services.credit_service import (
-            credit_service as _credit,
-            _flat_fee_for_tool,
-            BUCKET_INTEGRATION,
-        )
-        from app.config import settings as _settings
-        flat_fee = _flat_fee_for_tool(tool_name, tool_input)
-        if getattr(_settings, "credit_enforcement_enabled", False):
-            pre = await _credit.check_balance(
-                db, user_id, BUCKET_INTEGRATION, flat_fee,
-            )
-            if not pre.success:
-                _log(user_hash, connector_id, tool_name, channel,
-                     "credits_insufficient", started)
-                return ConnectorToolError(
-                    message=(
-                        "You're out of integration credits for this month. "
-                        "Upgrade your plan or wait for the next renewal to "
-                        "use connector tools again."
-                    ),
-                    retryable=False,
-                )
-    except Exception as _credit_pre_err:
-        logger.warning(
-            "[credits] connector pre-flight failed user=%s connector=%s tool=%s: %s",
-            user_hash[:8], connector_id, tool_name, _credit_pre_err,
-        )
+    #
+    # `exclude_metering` (Round 26): the automations e2e harness runs
+    # real dispatches that must not land in the ledger. The RPC only
+    # honors mode='e2e' outside production, so this cannot be a
+    # billing bypass for a live tenant.
+    if exclude_metering:
+        # flat_fee=None also disarms the 7.5 post-success charge.
         flat_fee = None
+    else:
+        try:
+            from app.services.credit_service import (
+                credit_service as _credit,
+                _flat_fee_for_tool,
+                BUCKET_INTEGRATION,
+            )
+            from app.config import settings as _settings
+            flat_fee = _flat_fee_for_tool(tool_name, tool_input)
+            if getattr(_settings, "credit_enforcement_enabled", False):
+                pre = await _credit.check_balance(
+                    db, user_id, BUCKET_INTEGRATION, flat_fee,
+                )
+                if not pre.success:
+                    _log(user_hash, connector_id, tool_name, channel,
+                         "credits_insufficient", started)
+                    return ConnectorToolError(
+                        message=(
+                            "You're out of integration credits for this month. "
+                            "Upgrade your plan or wait for the next renewal to "
+                            "use connector tools again."
+                        ),
+                        retryable=False,
+                    )
+        except Exception as _credit_pre_err:
+            logger.warning(
+                "[credits] connector pre-flight failed user=%s connector=%s tool=%s: %s",
+                user_hash[:8], connector_id, tool_name, _credit_pre_err,
+            )
+            flat_fee = None
 
     # 6. Provider call. Catches both raised exceptions AND the
     #    ConnectorResult sum-type (which is the normal return shape).

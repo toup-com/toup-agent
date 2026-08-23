@@ -824,6 +824,17 @@ def _message_to_response(
         # to the string it is no longer given.
         app_artifact=msg_metadata.get("app_artifact") if msg_metadata else None,
         pending_action=msg_metadata.get("pending_action") if msg_metadata else None,
+        # Automations setup cards (Round 26) — same parity rule as the
+        # neighbors above; api/day_chats.py and api/messages_recover.py
+        # carry the same two keys.
+        automation_connector_card=(
+            msg_metadata.get("automation_connector_card")
+            if msg_metadata else None
+        ),
+        automation_grant_card=(
+            msg_metadata.get("automation_grant_card")
+            if msg_metadata else None
+        ),
         # Operator notice (admin dispatch). The clients fall back from
         # /api/day-chats/.../messages to these session routes whenever
         # day-chats fails, so a field emitted by only one serializer

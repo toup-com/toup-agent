@@ -40,3 +40,57 @@ tools:
     channel_policy:
       default: allow
       deny: []
+  - name: stub__list_items
+    description: Deterministic three-item feed for the automations e2e harness.
+    input_schema:
+      type: object
+      properties: {}
+    mutates: false
+    elevation: false
+    output_redaction: []
+    channel_policy:
+      default: allow
+      deny: []
+  - name: stub__post
+    description: Test-only write. Echoes its arguments back; the harness asserts on them.
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+        text:
+          type: string
+      required: [channel, text]
+    mutates: true
+    elevation: false
+    output_redaction: []
+    channel_policy:
+      default: allow
+      deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# The e2e harness's connector: a real poll event and a real pinned
+# write, no network. `status: experimental` keeps all of it out of
+# production registries.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 60
+    per_day: 500
+  scopes_read: []
+  scopes_write_by_action:
+    stub__post: []
+  target_param_by_action:
+    stub__post: channel
+  events:
+    - key: item_created
+      description: A new item appears in the stub feed.
+      source_tool: stub__list_items
+      poll_args: {}
+      items_path: items
+      dedupe_field: id
+      fields:
+        id: id
+        title: title

@@ -847,6 +847,13 @@ class ChatMessageResponse(BaseModel):
     # it went through. Live status comes from
     # GET /api/connectors/pending-actions; this is the anchor.
     pending_action: Optional[dict] = None
+    # Automations (Round 26) — the two setup cards, persisted verbatim
+    # under their metadata keys. Declared here or they are dropped:
+    # this model ignores undeclared keys, and both clients rebuild the
+    # cards from history on reload (live updates ride WS frames of the
+    # same names). Contract shared with the Round-26 app session.
+    automation_connector_card: Optional[dict] = None
+    automation_grant_card: Optional[dict] = None
     # Generated-file attachments (doc-delivery feature). List of
     # {id, filename, mime_type, size_bytes, created_at}. storage_path
     # is stripped server-side — it's an internal key.

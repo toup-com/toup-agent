@@ -392,6 +392,15 @@ async def oauth_connect(
             "Google/GitHub/etc. account without first disconnecting."
         ),
     ),
+    include_optional_scopes: bool = Query(
+        default=False,
+        description=(
+            "Round 26: also request the manifest's scopes_optional "
+            "(e.g. gmail.compose for drafts-only automation writes). "
+            "Honored ONLY while the `automations` flag is on for the "
+            "user — plain-chat connects never widen consent."
+        ),
+    ),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -479,11 +488,21 @@ async def oauth_connect(
     await db.commit()
 
     # 5. Build the authorize URL with the manifest's declared scopes.
+    # Round 26: the automations connector card may ask for the optional
+    # scopes too (drafts-only writes need gmail.compose). Flag-gated so
+    # a dark tenant's consent screen is byte-identical to today's.
+    _scopes = list(entry.manifest.oauth.scopes)
+    if include_optional_scopes and entry.manifest.oauth.scopes_optional:
+        from app.services import feature_flags as _ff
+        if await _ff.is_enabled(db, "automations", str(current_user.id)):
+            for _s in entry.manifest.oauth.scopes_optional:
+                if _s not in _scopes:
+                    _scopes.append(_s)
     authorize_url = _build_authorize_url(
         base_url=app_cfg.authorize_url,
         client_id=app_cfg.client_id,
         redirect_uri=settings.oauth_callback_url,
-        scopes=entry.manifest.oauth.scopes,
+        scopes=_scopes,
         state=state,
         code_challenge=code_challenge,
         use_pkce=app_cfg.use_pkce,
@@ -784,6 +803,30 @@ async def oauth_callback(
         "[oauth.callback] connected user=%s connector=%s",
         payload.user_id[:8], payload.connector_id,
     )
+
+    # 6a. Round 26: tell the tenant agent a connect landed, so any open
+    # automations connector CARD flips to connected in place and the
+    # setup conversation can move on. Fired on EVERY connect (the agent
+    # no-ops when no card is open) and best-effort for the same reason
+    # as 6 — the OAuth flow must succeed regardless.
+    try:
+        from app.api.automations_proxy import _get_agent_target
+        _t = await _get_agent_target(payload.user_id, db)
+        if _t is not None:
+            from app.services.agent_http import get_agent_http_client
+            _resp = await get_agent_http_client().post(
+                f"{_t[0].rstrip('/')}/api/automations/_connector_connected",
+                json={"connector_id": payload.connector_id, "ok": True},
+                headers={"X-Agent-Key": _t[1]},
+                timeout=5.0,
+            )
+            if _resp.status_code not in (200, 404):
+                logger.warning(
+                    "[oauth.callback] automations hook %s for user=%s",
+                    _resp.status_code, payload.user_id[:8],
+                )
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("[oauth.callback] automations hook failed: %s", _e)
 
     # 6b. Gmail post-connect: arm a `users.watch` so any
     # `email_received` trigger the user creates (now or later) starts

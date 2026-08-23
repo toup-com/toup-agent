@@ -57,6 +57,12 @@ TRIGGER_ACTIONS = frozenset({
     "summarize_and_post",     # LLM summary → Day-as-Chat
     "notify_only",            # Raw event → Day-as-Chat, no LLM
     "forward_to_telegram",    # Day-as-Chat + fan-out to Telegram
+    # System-managed (Round 26): hand the deduped event batch to the
+    # automations engine. Never creatable via the triggers API — only
+    # the automations compiler writes it (see api/triggers.py
+    # _validate_action). Gated on settings.automations_enabled at
+    # dispatch; with the flag off a stray row is a logged no-op.
+    "run_automation",
 })
 
 TRIGGER_STATUSES = frozenset({

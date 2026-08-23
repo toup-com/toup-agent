@@ -144,6 +144,65 @@ class ConnectorTool(BaseModel):
     pii: Optional[Literal["low", "medium", "high"]] = None
 
 
+class AutomationEventSpec(BaseModel):
+    """One observable event stream this connector exposes to the
+    automations engine (Round 26).
+
+    For poll-mode connectors, `source_tool` names the read tool the
+    hidden system routine calls, `poll_args` the fixed arguments it
+    passes, and `dedupe_field` the path inside each returned item that
+    becomes the event dedupe key (dot-notation into the JSON result).
+    Push-mode events (Gmail only in v1) ride the existing Trigger
+    pipeline and need no source_tool.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    description: str
+    source_tool: Optional[str] = None
+    poll_args: dict = Field(default_factory=dict)
+    dedupe_field: str
+    # Dot-paths into a result item exposed to params templates as
+    # {{event.<name>}}. Keys are template names, values are paths.
+    fields: dict[str, str] = Field(default_factory=dict)
+    # Dot-path to the list of items inside the tool's JSON result.
+    items_path: Optional[str] = None
+
+
+class AutomationCapability(BaseModel):
+    """Automation capability metadata (Round 26).
+
+    Declares what the automations engine may build on this connector:
+    whether events arrive by push (a real inbound webhook path exists —
+    Gmail Pub/Sub only in v1) or by poll, the minimum poll interval,
+    the rate budget the executor enforces, and — for writes — which
+    scopes each mutating action needs plus which argument pins the
+    target a grant is scoped to. Absent block ⇒ connector is invisible
+    to the automations registry.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    push: bool = False
+    poll: bool = False
+    # Minimum seconds between polls. Lint enforces >= 300 (the global
+    # 5-minute floor); a connector may declare a HIGHER floor.
+    floor_s: int = 300
+    # {per_hour?: int, per_day?: int} — executor-enforced run budget.
+    rate_budget: dict = Field(default_factory=dict)
+    # Scopes sufficient for read/observe automations.
+    scopes_read: list[str] = Field(default_factory=list)
+    # tool_name -> scopes that action needs. Keys must be this
+    # manifest's own mutating tools (lint-checked).
+    scopes_write_by_action: dict[str, list[str]] = Field(default_factory=dict)
+    # tool_name -> the input_schema property that names the pinned
+    # target (e.g. slack__send_message -> "channel"). Required for
+    # every key of scopes_write_by_action (lint-checked).
+    target_param_by_action: dict[str, str] = Field(default_factory=dict)
+    events: list[AutomationEventSpec] = Field(default_factory=list)
+
+
 class ConnectorManifest(BaseModel):
     """Top-level manifest schema (architecture §2.1)."""
 
@@ -160,6 +219,9 @@ class ConnectorManifest(BaseModel):
     oauth: OAuthSpec
     health: HealthSpec
     tools: list[ConnectorTool]
+    # Automation capability metadata (Round 26). Optional — absent
+    # means "not automatable" and the automations registry skips it.
+    automation: Optional[AutomationCapability] = None
     # Per-scope plain-language strings for the OAuth scope-review UI
     # (T2b). Map keys are full scope URIs (Google) or short names
     # (GitHub); values are user-readable. Falls back to the catalog
@@ -235,6 +297,56 @@ class ConnectorRegistry:
             if t.name == tool_name:
                 return t
         return None
+
+    def get_automation_capability(
+        self, connector_id: str,
+    ) -> Optional["AutomationCapability"]:
+        """The Round-26 automation capability block, or None when the
+        connector is not automatable."""
+        entry = self._entries.get(connector_id)
+        if entry is None:
+            return None
+        return entry.manifest.automation
+
+    def automation_registry(self) -> list[dict]:
+        """The automations setup registry: one entry per automatable
+        connector — what can fire, what can be written, and the rails.
+        Consumed by the agent's `automations__get_registry` tool via
+        `GET /api/automations/registry` (platform-native)."""
+        out: list[dict] = []
+        for cid in sorted(self._entries.keys()):
+            entry = self._entries[cid]
+            auto = entry.manifest.automation
+            if auto is None:
+                continue
+            out.append({
+                "connector_id": cid,
+                "name": entry.manifest.name,
+                "icon": entry.manifest.icon,
+                "scope_descriptions": dict(entry.manifest.scope_descriptions),
+                "push": auto.push,
+                "poll": auto.poll,
+                "floor_s": auto.floor_s,
+                "rate_budget": dict(auto.rate_budget),
+                "scopes_read": list(auto.scopes_read),
+                "scopes_write_by_action": {
+                    k: list(v) for k, v in auto.scopes_write_by_action.items()
+                },
+                "target_param_by_action": dict(auto.target_param_by_action),
+                "events": [
+                    {
+                        "key": ev.key,
+                        "description": ev.description,
+                        "source_tool": ev.source_tool,
+                        "poll_args": dict(ev.poll_args),
+                        "items_path": ev.items_path,
+                        "dedupe_field": ev.dedupe_field,
+                        "fields": dict(ev.fields),
+                    }
+                    for ev in auto.events
+                ],
+            })
+        return out
 
     def alarms(self) -> list[_ManifestRejection]:
         """List of manifests rejected during the last `load_all()`.
@@ -422,6 +534,50 @@ class ConnectorRegistry:
                 f"health.probe={manifest.health.probe!r} is not declared "
                 f"among this manifest's tools ({sorted(own_tool_names)})"
             )
+
+        # 9b. Automation capability block (Round 26): every reference
+        #     must resolve within this manifest, and the poll floor may
+        #     only be tightened, never loosened below the global rail.
+        auto = manifest.automation
+        if auto is not None:
+            if auto.floor_s < 300:
+                raise _SkipConnector(
+                    f"automation.floor_s={auto.floor_s} is below the "
+                    f"global 5-minute poll floor"
+                )
+            tools_by_name = {t.name: t for t in manifest.tools}
+            for ev in auto.events:
+                if ev.source_tool is not None and ev.source_tool not in own_tool_names:
+                    raise _SkipConnector(
+                        f"automation event {ev.key!r} source_tool="
+                        f"{ev.source_tool!r} is not declared among this "
+                        f"manifest's tools"
+                    )
+            for action, _scopes in auto.scopes_write_by_action.items():
+                tool = tools_by_name.get(action)
+                if tool is None:
+                    raise _SkipConnector(
+                        f"automation.scopes_write_by_action names unknown "
+                        f"tool {action!r}"
+                    )
+                if not tool.mutates:
+                    raise _SkipConnector(
+                        f"automation.scopes_write_by_action names "
+                        f"{action!r}, which is not marked mutates: true"
+                    )
+                target_param = auto.target_param_by_action.get(action)
+                if not target_param:
+                    raise _SkipConnector(
+                        f"automation write action {action!r} has no "
+                        f"target_param_by_action entry — a grant cannot "
+                        f"pin a target without one"
+                    )
+                props = (tool.input_schema or {}).get("properties") or {}
+                if target_param not in props:
+                    raise _SkipConnector(
+                        f"automation target param {target_param!r} for "
+                        f"{action!r} is not a property of its input_schema"
+                    )
 
         # 10. Cross-system collision: built-ins, skills, other connectors.
         for tool in manifest.tools:

@@ -126,3 +126,30 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# Observe-only in v1: create_event has no pinnable target (everything
+# lands on the primary calendar), and a grant that cannot pin a
+# target cannot exist — so no write actions are declared.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read:
+    - https://www.googleapis.com/auth/calendar.readonly
+  scopes_write_by_action: {}
+  target_param_by_action: {}
+  events:
+    - key: event_created
+      description: A new event appears on your primary calendar.
+      source_tool: calendar__list_events
+      poll_args:
+        max_results: 50
+      items_path: events
+      dedupe_field: id
+      fields:
+        id: id
+        title: summary

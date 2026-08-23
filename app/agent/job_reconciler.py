@@ -457,4 +457,14 @@ async def reconcile_loop() -> None:
                 logger.info("[job_reconciler] completed %d delivered job(s)", n)
         except Exception as e:  # noqa: BLE001 — pre-bind lobby / DB hiccup
             logger.warning("[job_reconciler] sweep failed: %s", e)
+        # Automations sweeps (Round 26) ride this loop rather than
+        # owning another timer: stuck runs, stale bindings, auto-pause.
+        # Flag-gated so a dark tenant's reconcile pass is unchanged.
+        try:
+            from app.config import settings as _settings
+            if getattr(_settings, "automations_enabled", False):
+                from app.agent.automations.sweep import sweep_automations
+                await sweep_automations()
+        except Exception as e:  # noqa: BLE001 — same tolerance as above
+            logger.warning("[job_reconciler] automations sweep failed: %s", e)
         await asyncio.sleep(RECONCILE_INTERVAL_S)

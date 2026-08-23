@@ -31,6 +31,18 @@ class StubProvider(BaseConnectorProvider):
         tool_input: dict,
         ctx: ConnectorContext,
     ) -> ConnectorResult:
+        if tool_name == "stub__list_items":
+            # Deterministic feed for the automations e2e harness
+            # (scripts/e2e_automations.py): same three items every
+            # poll, so the event-dedupe gate is what makes the second
+            # poll a no-op — exactly the rail under test.
+            return ConnectorOk(content=json.dumps({
+                "items": [
+                    {"id": "item-1", "title": "First stub item"},
+                    {"id": "item-2", "title": "Second stub item"},
+                    {"id": "item-3", "title": "Third stub item"},
+                ],
+            }))
         return ConnectorOk(
             content=json.dumps({
                 "tool": tool_name,

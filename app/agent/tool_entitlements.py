@@ -308,6 +308,14 @@ def skill_enabled(skill_name: str) -> bool:
     # value, env var or entitlement string is even consulted.
     if skill_name in RETIRED_SKILLS:
         return False
+    # Automations (Round 26): dark-launch gate. The skill's tools head
+    # the provider cache prefix like every skill's, so registration is
+    # per-process and flag-resolved once at boot — a dark tenant's wire
+    # array stays byte-identical to today's.
+    if skill_name == "automations":
+        from app.config import settings
+        if not getattr(settings, "automations_enabled", False):
+            return False
     if skill_name in _EXPO_PIPELINE_SKILLS and not pipeline_enabled("expo"):
         return False
     if skill_name in _HTML_PIPELINE_SKILLS and not pipeline_enabled("html"):

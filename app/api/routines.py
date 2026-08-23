@@ -769,6 +769,13 @@ async def list_routines():
                     # Routines UI (founder bug 2026-07-16). Missions
                     # have their own surface: /api/autopilot/missions.
                     Routine.kind != "autopilot",
+                    # Round 26: poll bindings are engine internals for
+                    # the same reason (a hidden system routine); the
+                    # automation itself is the user-visible unit at
+                    # /api/automations. `automation_schedule` stays
+                    # listed deliberately — it IS a schedule the user
+                    # asked for in words.
+                    Routine.kind != "automation_poll",
                 )
                 .order_by(Routine.created_at)
             )

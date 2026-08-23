@@ -140,6 +140,15 @@ AGENT_ONLY_TABLES: set[str] = {
     # WhatsApp Cloud API webhook dedupe (agent-side; survives container
     # restarts so Meta retries within a 7-day window cannot re-run the LLM)
     "whatsapp_inbound_dedupe",
+    # Automations engine (Round 26) — spec, bindings, event dedupe
+    # stream, write outbox, connector-card sessions. Runs live in
+    # build_jobs (job_type='automation_run'), deliberately NOT a
+    # parallel ledger. Grants/templates are PLATFORM_ONLY (below).
+    "automations",
+    "automation_bindings",
+    "automation_events",
+    "automation_outbox",
+    "automation_auth_sessions",
     # Identity & soul
     "identities",
     "soul_configs",
@@ -256,6 +265,12 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "admin_dispatch_targets",
     "admin_thread_messages",
     "admin_thread_attachments",
+    # Automations (Round 26): standing write grants live next to the
+    # connector tokens they gate — the dispatcher is the enforcer, and
+    # an agent-side copy would be a claim the enforcer couldn't check.
+    # Templates are product content, one copy, admin-seeded.
+    "automation_grants",
+    "automation_templates",
 }
 
 SHARED_TABLES: set[str] = {

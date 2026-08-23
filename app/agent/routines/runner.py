@@ -482,6 +482,11 @@ class RoutineRunner:
         if kind == "autopilot":
             from app.agent.autopilot_gate import autopilot_enabled_for
             return autopilot_enabled_for(settings)
+        # Automations engine (Round 26) — poll + schedule bindings run
+        # only when the tenant's automations flag is on; a stray row on
+        # a flag-off tenant is a logged skip, not a fire.
+        if kind in ("automation_poll", "automation_schedule"):
+            return bool(getattr(settings, "automations_enabled", False))
         return False
 
     @staticmethod
@@ -500,7 +505,9 @@ class RoutineRunner:
         interval fire gets a fresh one. fire_instant can be None on
         the manual force-run path — fall back to now() so a force-run
         always executes."""
-        if kind == "autopilot":
+        if kind in ("autopilot", "automation_poll"):
+            # automation_poll (Round 26) ticks many times a day for the
+            # same structural reason autopilot does.
             instant = fire_instant or datetime.utcnow()
             return f"{local_date}T{instant.strftime('%H%M%S')}"
         return str(local_date)
@@ -887,6 +894,13 @@ class RoutineRunner:
             _tick_no = int((routine.last_state_json or {}).get("ticks_run", 0)) + 1
             _job_type = "autopilot_tick"
             _title = f"Autopilot: {routine.name or 'mission'} — tick {_tick_no}"
+        elif routine.kind in ("automation_poll", "automation_schedule"):
+            # Automation ticks are engine internals for the same reason
+            # autopilot ticks are: the user-visible unit is the RUN
+            # (job_type='automation_run', minted per event by the
+            # executor), not the poll heartbeat that observed it.
+            _job_type = "automation_tick"
+            _title = (routine.name or "").strip() or "Automation check"
         else:
             _job_type = "routine_run"
             # Use the routine's human name — the same thing the Scheduled

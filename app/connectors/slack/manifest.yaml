@@ -271,3 +271,23 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# Slack is action-only in v1: no push path (Slack Events API needs an
+# app-level subscription we don't provision) and polling channel
+# history for triggers is a privacy hazard at rest. Writes are
+# grant-gated to ONE pinned channel.
+automation:
+  push: false
+  poll: false
+  floor_s: 300
+  rate_budget:
+    per_hour: 30
+    per_day: 200
+  scopes_read:
+    - channels:read
+  scopes_write_by_action:
+    slack__send_message: ["chat:write"]
+  target_param_by_action:
+    slack__send_message: channel
+  events: []

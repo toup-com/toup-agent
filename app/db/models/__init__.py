@@ -62,6 +62,23 @@ from .trigger import (
     TRIGGER_KINDS, TRIGGER_ACTIONS, TRIGGER_STATUSES, TRIGGER_EVENT_STATUSES,
 )
 
+# Automations (Round 26 — chat-built engine composed from the four
+# primitives above; agent-side tables)
+from .automation import (
+    Automation, AutomationBinding, AutomationEvent, AutomationOutbox,
+    AutomationAuthSession,
+    AUTOMATION_STATUSES, AUTOMATION_TRIGGER_MODES, AUTOMATION_PAUSE_REASONS,
+    AUTOMATION_EVENT_STATUSES, AUTOMATION_OUTBOX_STATUSES,
+    AUTOMATION_AUTH_SESSION_STATUSES,
+    AUTOMATION_POLL_FLOOR_S, AUTOMATION_RUN_CAP_S,
+    AUTOMATION_AUTO_PAUSE_FAILURES, AUTOMATION_OUTBOX_UNDO_WINDOW_S,
+    AUTOMATION_AUTH_SESSION_TTL_S, AUTOMATION_GRANT_REQUEST_TTL_S,
+)
+# Automations — platform-side (grants next to the tokens they gate)
+from .platform_automation import (
+    AutomationGrant, AutomationTemplate, AUTOMATION_GRANT_STATUSES,
+)
+
 # Soul config
 from .soul_config import SoulConfig
 

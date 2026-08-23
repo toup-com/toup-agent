@@ -77,6 +77,12 @@ FLAGS: dict[str, FlagSpec] = {
         env_attr="web_mobile_shell_rollout_pct",
         salt="web_mobile_shell",
     ),
+    "automations": FlagSpec(
+        name="automations",
+        setting_key="automations.rollout_pct",
+        env_attr="automations_rollout_pct",
+        salt="automations",
+    ),
 }
 
 # Back-compat: the key literal was exported and may be referenced elsewhere.

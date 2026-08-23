@@ -136,3 +136,35 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# No push: repo webhooks need per-repo admin provisioning we don't do.
+# Poll lists open issues for a repo the spec pins; dedupe on number
+# is safe because the dedupe space is per-automation and an
+# automation is pinned to one repo.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read:
+    - repo
+  scopes_write_by_action:
+    github__create_comment: ["repo"]
+  target_param_by_action:
+    github__create_comment: repo
+  events:
+    - key: issue_opened
+      description: A new issue is opened in a repository you pick.
+      source_tool: github__list_issues
+      poll_args:
+        state: open
+        per_page: 50
+      items_path: issues
+      dedupe_field: number
+      fields:
+        number: number
+        title: title
+        url: html_url

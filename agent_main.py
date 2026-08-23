@@ -1000,6 +1000,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Could not start job reconciler: {e}")
 
+        # Automations write-outbox flush (Round 26). Dark by default —
+        # only starts when the tenant's automations flag is on. The
+        # inline flush inside a run is the happy path; this loop is
+        # restart recovery + retry backoffs.
+        if getattr(settings, "automations_enabled", False):
+            try:
+                from app.agent.automations.outbox import flush_loop
+                app.state.automations_outbox_task = asyncio.create_task(
+                    flush_loop(), name="automations-outbox-flush",
+                )
+                print("📤 Automations outbox flush started")
+            except Exception as e:
+                print(f"⚠️ Could not start automations outbox flush: {e}")
+
         # TriggerRunner — event-driven sibling. Started after RoutineRunner
         # so its restart sweep + rate-bucket warmup run before any inbound
         # webhook can dispatch. Auto-imports the email_received handler
@@ -1929,6 +1943,12 @@ app.include_router(routines_router, prefix=settings.api_prefix)
 # Gate T2: /api/triggers/* (CRUD + event history + test-fire).
 app.include_router(triggers_inbound_router, prefix=settings.api_prefix)
 app.include_router(triggers_router, prefix=settings.api_prefix)
+
+# Automations engine (Round 26) — chat-built compositions of the two
+# primitives above plus grant-gated connector writes. Every route 404s
+# while settings.automations_enabled is off.
+from app.api.automations import router as automations_router
+app.include_router(automations_router, prefix=settings.api_prefix)
 
 # Out-of-band notification delivery (Autopilot PR4) — the platform
 # dispatcher POSTs /api/notify/deliver when push can't reach the user;

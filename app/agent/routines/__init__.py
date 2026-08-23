@@ -31,6 +31,23 @@ register_handler(AgentTaskHandler())
 register_handler(ReminderHandler())
 register_handler(AutopilotHandler())
 
+# Automations engine (Round 26) — `automation_poll` / `automation_schedule`.
+# Registered ONLY behind the flag so a dark tenant's handler registry —
+# and everything derived from it (API kind validation, runner gating) —
+# is byte-identical to today's. The runner's `_kind_enabled` gates
+# fires a second time, so a flag flipped off after registration also
+# goes quiet.
+try:
+    from app.config import settings as _settings
+    if getattr(_settings, "automations_enabled", False):
+        from app.agent.automations.handlers import register_automation_handlers
+        register_automation_handlers()
+except Exception as _e:  # noqa: BLE001 — never break routine boot
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "automations handler registration failed: %s", _e,
+    )
+
 __all__ = [
     "AgentTaskHandler",
     "AutopilotHandler",

@@ -210,3 +210,43 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 26) ──────────────────────────────
+# What the automations engine may build on Jira: no inbound webhook
+# path exists (push: false — Atlassian webhooks are a per-site admin
+# feature we don't provision), so events arrive by bounded-JQL poll
+# with dedupe on the issue key.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read:
+    - read:jira-work
+  scopes_write_by_action:
+    jira__add_comment: ["write:jira-work"]
+    jira__create_issue: ["write:jira-work"]
+  target_param_by_action:
+    jira__add_comment: issue_key
+    jira__create_issue: project_key
+  events:
+    - key: issue_created
+      description: A new issue appears in a project you pick.
+      source_tool: jira__search_issues
+      # The spec's trigger.params merge OVER these defaults — the
+      # setup agent narrows the JQL to the chosen project. The 1-day
+      # window overlaps deliberately; the event dedupe gate collapses
+      # re-seen issues, so a missed poll self-heals.
+      poll_args:
+        jql: 'created >= "-1d" ORDER BY created DESC'
+        max_results: 50
+      items_path: issues
+      dedupe_field: key
+      fields:
+        key: key
+        summary: summary
+        status: status
+        project: project
+        url: url
