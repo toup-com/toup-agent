@@ -949,11 +949,24 @@ button{min-width:44px;min-height:44px}</style></head><body>
 
 
 def _browser_available() -> bool:
+    """Is a headless-browser DRIVER importable here?
+
+    `find_spec("playwright.async_api")` does not merely return None when
+    playwright is absent — it imports the PARENT package to find the
+    submodule, so with no playwright installed at all it raises
+    ModuleNotFoundError. This runs at module scope, so on an image without the
+    driver (CI: neither of the workflow's inline pip lists installs it) the
+    whole file failed to COLLECT — an ImportError reported as a test failure,
+    for a host fact that this very helper exists to skip over.
+    """
     import importlib.util
-    return any(
-        importlib.util.find_spec(name) is not None
-        for name in ("playwright.async_api", "patchright.async_api")
-    )
+    for name in ("playwright.async_api", "patchright.async_api"):
+        try:
+            if importlib.util.find_spec(name) is not None:
+                return True
+        except (ImportError, ValueError):
+            continue
+    return False
 
 
 needs_browser = pytest.mark.skipif(

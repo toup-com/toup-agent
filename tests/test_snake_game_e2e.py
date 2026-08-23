@@ -157,12 +157,35 @@ def pipeline(tmp_path, monkeypatch):
     return AppHtmlSkill(), SkillContext(user_id=USER, workspace=str(tmp_path))
 
 
+#: A brief the pipeline will accept. `brief` became a REQUIRED argument of
+#: create_app_file (it is the plan written before the code, stored beside the
+#: app and read before every future edit), and this file's helper never grew
+#: one — so every build here returned "ERROR: brief is required" and wrote
+#: nothing. The failure was invisible while the backend sweep sat behind the
+#: step-6 gate; it is not new (it reproduces on an unmodified control at
+#: 5a3dd8fe, 4 failed / 3 passed).
+SNAKE_BRIEF = (
+    "## What it is\n"
+    "Nokia Snake, for someone with a spare minute and no account.\n\n"
+    "## State diagram\n"
+    "start --(START pressed: hide overlay, reset, begin loop)--> playing\n"
+    "playing --(hits wall or self)--> ended\n"
+    "ended --(PLAY AGAIN pressed: hide verdict, reset, begin loop)--> playing\n\n"
+    "## Core flows\n- Press start, steer with the pad, eat, grow, die, retry.\n\n"
+    "## Features, states and controls\n"
+    "- A board, a score, a D-pad; the pad steers and nothing else is pressable.\n\n"
+    "## Design decisions\n"
+    "- An LCD-green field and a dark grid, because the point is the Nokia "
+    "handset it is quoting."
+)
+
+
 async def _build(skill, ctx, slug=SLUG, title=TITLE, html=SNAKE_HTML):
     """The loop the system prompt prescribes: create → verify → present."""
     out = {}
     out["create"] = await skill.execute_tool(
         "app_html__create_app_file",
-        {"slug": slug, "title": title, "html": html}, ctx,
+        {"slug": slug, "title": title, "html": html, "brief": SNAKE_BRIEF}, ctx,
     )
     out["verify"] = await skill.execute_tool(
         "app_html__bash_app",
