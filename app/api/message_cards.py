@@ -280,8 +280,13 @@ def job_card_fields(
     out["job_total_steps"] = sum(
         1 for s in steps if s.get("status") != "skipped"
     )
+    # `was_done`: a row mid-retry (done → running again) still counts as done,
+    # or a job stranded mid-retry hydrates with FEWER done than the live card
+    # already showed (the recorded 2/5 → 1/5 regression at death).
     out["job_completed_steps"] = sum(
-        1 for s in steps if s.get("status") in ("done", "completed")
+        1 for s in steps
+        if s.get("status") in ("done", "completed")
+        or (s.get("status") == "running" and s.get("was_done"))
     )
     _running = next((s for s in steps if s.get("status") == "running"), None)
     if _running and _running.get("label"):

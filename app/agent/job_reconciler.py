@@ -218,6 +218,14 @@ async def _settle_unpublished_build(
                 st = s.get("status")
                 if st == "failed":
                     any_failed = True
+                elif st == "running" and s.get("was_done"):
+                    # A row mid-RETRY when the turn died was already done once
+                    # (`was_done`, stamped by emit_step). Restoring it — the
+                    # same rule finish_job applies — is what keeps the done
+                    # count from regressing at death: the recorded 1:26 AM
+                    # card fell 2/5 → 1/5 exactly here.
+                    s["status"] = "done"
+                    s["rev"] = int(s.get("rev") or 0) + 1
                 elif st in ("pending", "running"):
                     s["status"] = "skipped"
                     label = phase_label(str(s.get("type") or ""), "skipped")
@@ -253,9 +261,16 @@ async def _settle_unpublished_build(
             ))
             await db.commit()
             title = (job.title or "").replace("Build: ", "")
-            total = len(steps)
-            done = sum(1 for s in steps
-                       if isinstance(s, dict) and s.get("status") == "done")
+            # One arithmetic everywhere: skipped rows are excluded from BOTH
+            # numbers (steps.step_counts), or this closing frame disagrees
+            # with the card that watched the build live.
+            try:
+                from app.agent.skills.builtins.app_html.steps import step_counts
+                done, total = step_counts(steps)
+            except Exception:  # noqa: BLE001 - arithmetic drift beats a failed settle
+                total = len(steps)
+                done = sum(1 for s in steps
+                           if isinstance(s, dict) and s.get("status") == "done")
     except Exception:  # noqa: BLE001 - a failed settle leaves the reaper's net
         logger.warning("[job_reconciler] build settle failed for %s",
                        job_id[:8], exc_info=True)

@@ -546,6 +546,47 @@ written the wrong way will often still make a noise — and `present_app`
 **measures** whether it did. An app that builds audio and has none running
 after a tap is refused, with the count in the message.
 
+### 8b. Draw the state machine before you code it — and every state must LEAVE
+
+§8 told you to open on a start screen. This is the other half, learned from a
+shipped Ping-Pong: its serve card rendered, its button worked as a DOM node —
+**and pressing it changed nothing.** The overlay never dismissed, the ball was
+never visible, and the app was unplayable while looking completely finished.
+Every part of the game behind the card was correct, and none of it was
+reachable. The class of bug is always the same: the states were coded, the
+*transitions between them* were never designed.
+
+So, in the brief, before any HTML, write the app's states and the arrow
+between each pair:
+
+```
+start ──(START pressed: hide overlay, reset, begin loop)──▶ playing
+playing ──(lose/finish condition)──▶ ended
+ended ──(PLAY AGAIN pressed: hide verdict, reset, begin loop)──▶ playing
+```
+
+Three rules fall straight out of the diagram:
+
+- **The start control's handler has two jobs, in order: remove the start
+  screen, then start the app.** Not one. `display:none` the overlay (or remove
+  it) in the same handler that begins the loop — a handler that starts the loop
+  under an overlay that stays has built the Ping-Pong bug. If the overlay is a
+  separate element, its dismissal is the FIRST line of the handler.
+- **Every terminal state offers a way back.** `GAME OVER` with no `PLAY AGAIN`
+  is a dead end the user can only escape by closing the app. The way back goes
+  through the same reset the start control used — one function, two callers
+  (§9's rule, applied to states).
+- **A state the diagram doesn't show is a state the app doesn't have.** A pause
+  overlay, a settings sheet, a "how to play" card — each one is a state with an
+  arrow in and an arrow out, or it doesn't ship.
+
+**The gate now enforces the first rule mechanically.** `present_app` presses
+your start control and then checks that the screen actually changed: if the
+same control is still visible and the page still reads like the start screen,
+the publish is refused with the overlay named. The reviewer is also told the
+screenshot was taken *after* the press — a start screen still standing in that
+picture is reported as the app failing to start, not as a normal state.
+
 ---
 
 ## 9. Two ways in, one vocabulary
@@ -648,6 +689,11 @@ unless the stage above it can shrink.
 - [ ] **No stray glyphs — everything on screen has a function or is deleted**
 - [ ] Nothing that can be lost, missed or timed out is running at first paint
 - [ ] A game/timer/quiz opens on a start screen with an explicit start control
+- [ ] **The start control's handler dismisses the start screen BEFORE starting
+      the app — the gate presses it and refuses if the screen doesn't change
+      (§8b)**
+- [ ] **The brief draws the state diagram (start → playing → ended → playing),
+      and every terminal state has a control that leads back (§8b)**
 - [ ] **Every interactive element is ≥ 44 × 44 CSS px, with ≥ 8 px between**
 - [ ] **The main control — D-pad key, paddle, primary action — is ≥ 64 px**
 - [ ] **Repeated controls sit in the bottom third; the top is for reading**
@@ -680,7 +726,11 @@ unless the stage above it can shrink.
 
 `present_app` opens the app in a real browser and refuses to publish it if
 anything throws. A refusal is a list of things to fix, not a dead end: fix
-them with `edit_app_file` and call it again.
+them with `edit_app_file` and call it again — **all of them in one edit pass**,
+because the polish budget is three checks. Cosmetic findings that survive
+three rounds ship with the app, named honestly; a crash or an app that will
+not start never ships at all. Getting it right in the first pass is the whole
+reason the plan comes before the code.
 
 **Several of the boxes above are now measured, not trusted.** At 390×844,
 before and again after the start control is pressed, the gate reads every
@@ -695,7 +745,13 @@ laid-out control's `getBoundingClientRect` and refuses the publish over:
 - **audio that was built and never played** — a context made, a gesture seen,
   and nothing running (§8a),
 - **a sound the sandbox refused**, which the browser reports as a corrupt
-  file rather than as a policy decision.
+  file rather than as a policy decision,
+- **a start screen that survives its own start control** — the gate presses
+  PLAY and refuses when the same control is still on screen with the page
+  unchanged (§8b),
+- **text that fails its contrast ratio against a solid ground** — under 4.5:1
+  for body text, under 3:1 for large text (§5); gradients and imagery are left
+  to the reviewer's eye.
 
 It names the element and the number — "the control “^” renders 34×30px" — so
 the fix is a one-line change to a shared rule. Write to the sizes in §4 and you

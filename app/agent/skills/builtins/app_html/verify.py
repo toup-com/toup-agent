@@ -170,6 +170,11 @@ class Report:
     #: What `runtime.audio_unlock` recorded: contexts made, contexts running,
     #: whether a gesture was seen, `<audio>` play failures, CSP refusals.
     audio: Optional[dict] = None
+    #: The label of the start control the gate pressed, when it pressed one.
+    #: Round 24: `screenshot` is taken AFTER this press, and the visual
+    #: reviewer must know that — told nothing, it approved a start overlay
+    #: that had failed to dismiss because "a start screen is a normal state".
+    pressed_start: Optional[str] = None
     #: WHY the browser pass was downgraded, when it was — one short clause,
     #: e.g. "no usable browser". Round 23 on-device: the fleet ran with a
     #: stale chromium mount for days and every card said "the code checks
@@ -424,29 +429,78 @@ def smoke_enabled() -> bool:
     )
 
 
-async def warm_browser() -> bool:
-    """Launch and close the browser once, so the first BUILD never pays the
-    cold start. Called fire-and-forget from agent boot; failure is logged by
-    the caller and never blocks anything — the smoke test's own downgrade
-    path still owns the honest wording if the browser genuinely cannot run.
-    Returns True when a browser launched.
-    """
-    try:
+# ── Shared browser: one process, reused across builds ─────────────────
+#
+# Round 24 (Investigate 2): every `_smoke` used to launch and close a whole
+# browser process, and `warm_browser()` at boot only primed the OS/disk cache —
+# so every publish still paid a full `chromium.launch()`, which the recordings
+# clocked at 20–40 s per open ("Getting it ready to open 39.2s", eight times in
+# one build). One long-lived browser with a fresh isolated context per call
+# removes the launch from every build after the first, and a fresh context per
+# call keeps each build's storage/cookies sandboxed from the next. Playwright
+# allows many contexts on one browser, so this stays safe under concurrent
+# builds; the launch itself is single-flighted by the lock.
+_pw = None            # the async_playwright driver (started once)
+_browser = None       # the shared Browser handle
+_browser_lock = None  # asyncio.Lock, created lazily on the running loop
+
+
+def _get_browser_lock():
+    global _browser_lock
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+    return _browser_lock
+
+
+async def _acquire_browser():
+    """The shared browser, launched once and reused. Relaunches transparently
+    if the process died since the last call (a crash self-heals on the next
+    build). Raises if a browser cannot be launched at all — the caller's
+    downgrade path owns the honest wording."""
+    global _pw, _browser
+    async with _get_browser_lock():
+        if _browser is not None:
+            try:
+                if _browser.is_connected():
+                    return _browser
+            except Exception:  # noqa: BLE001 — a handle that cannot answer is dead
+                pass
+            _browser = None  # stale/crashed — drop and relaunch below
         try:
             from playwright.async_api import async_playwright  # type: ignore
         except ImportError:  # pragma: no cover
             from patchright.async_api import async_playwright  # type: ignore
-        pw = await async_playwright().start()
+        if _pw is None:
+            _pw = await async_playwright().start()
+        _browser = await _pw.chromium.launch(
+            headless=True,
+            executable_path=find_browser_bin(),
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        return _browser
+
+
+async def _drop_browser() -> None:
+    """Tear the shared browser down after a crash so the next `_acquire_browser`
+    relaunches from clean. Best-effort; never raises."""
+    global _browser
+    b, _browser = _browser, None
+    if b is not None:
         try:
-            browser = await pw.chromium.launch(
-                headless=True,
-                executable_path=find_browser_bin(),
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-            await browser.close()
-            return True
-        finally:
-            await pw.stop()
+            await b.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def warm_browser() -> bool:
+    """Launch the shared browser once, so the first BUILD never pays the cold
+    start — and, unlike before round 24, KEEP it, so no later build pays it
+    either. Called fire-and-forget from agent boot; failure is logged by the
+    caller and never blocks anything. Returns True when a browser is ready.
+    """
+    try:
+        await _acquire_browser()
+        return True
     except Exception as e:  # noqa: BLE001 - warmth is best-effort
         logger.info("[app_html] browser warm-up did not run: %s", str(e)[:120])
         return False
@@ -557,6 +611,57 @@ _PRESS_START_JS = """
 }
 """
 
+#: JS that reports whether a start control is STILL on screen — the same
+#: selector as the press, but read-only. Used to prove the press took: a start
+#: control that is still visible and hittable after being pressed is the
+#: signature of an overlay that never dismissed (the recorded Ping-Pong serve
+#: card). A truthy return is the label still showing.
+_START_STILL_VISIBLE_JS = """
+(pattern) => {
+  const re = new RegExp(pattern, 'i');
+  const sel = 'button,[role="button"],a,input[type="button"],input[type="submit"]';
+  for (const el of document.querySelectorAll(sel)) {
+    const label = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    if (!label || !re.test(label)) continue;
+    const box = el.getBoundingClientRect();
+    if (!box.width || !box.height) continue;   // hidden now: the press took
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0) continue;
+    return label.slice(0, 40);
+  }
+  return null;
+}
+"""
+
+
+async def _start_control_visible(page) -> Optional[str]:
+    """The label of a start control still visible on screen, or None."""
+    try:
+        return await page.evaluate(_START_STILL_VISIBLE_JS, _START_CONTROL_RE)
+    except Exception:  # noqa: BLE001 — a probe that cannot run is not a verdict
+        return None
+
+
+def _texts_match(a: str, b: str) -> bool:
+    """Is the visible text essentially the same on two screens?
+
+    Word-set Jaccard rather than string equality, and digit-only tokens are
+    dropped first — a timer ticking from 0 to 1 or a score moving is state
+    noise, not a different screen. Used to decide whether pressing the start
+    control advanced the app: near-identical text AND the start control still
+    on screen means the press did nothing. The bar is high (0.9) so any real
+    state change — a board appearing, a HUD replacing a title — clears it and
+    no working app is refused.
+    """
+    wa = {w for w in re.findall(r"[a-z0-9]+", (a or "").lower()) if not w.isdigit()}
+    wb = {w for w in re.findall(r"[a-z0-9]+", (b or "").lower()) if not w.isdigit()}
+    if not wa and not wb:
+        return True
+    union = wa | wb
+    if not union:
+        return True
+    return (len(wa & wb) / len(union)) >= 0.9
+
 
 async def _press_start(page) -> Optional[str]:
     """Press the control that begins the app, if the app has one.
@@ -592,6 +697,21 @@ MIN_TEXT_PX = 12
 #: mistake, and forty lines of it would bury everything else in the report.
 MAX_PER_KIND = 4
 
+#: WCAG 1.4.3 — the numbers DESIGN_SKILL.md states four times and nothing
+#: measured (round 24): body text wants 4.5:1 against the ground it sits on;
+#: text from 24px, or 18.66px bold, reads at 3:1. The recorded build whose
+#: headline "Tennis, pocket-sized." shipped washed out was caught only by the
+#: vision model — the expensive pass — for a ratio this file can compute free.
+MIN_CONTRAST_NORMAL = 4.5
+MIN_CONTRAST_LARGE = 3.0
+LARGE_TEXT_PX = 24.0
+LARGE_BOLD_PX = 18.66
+
+#: Most contrast findings to report. One washed-out palette paints the same
+#: pair on forty elements, so the JS dedupes by colour pair first and this
+#: caps what is said about the survivors, worst ratio first.
+MAX_CONTRAST_FINDINGS = 2
+
 #: Measures the laid-out page the way a person meets it. Everything here is
 #: read from `getBoundingClientRect` and `getComputedStyle` AFTER the app has
 #: rendered — the whole point is that it is the rendered geometry, not the
@@ -599,13 +719,53 @@ MAX_PER_KIND = 4
 _LAYOUT_JS = """
 (opts) => {
   const SEL = 'button,[role="button"],a,input,select,textarea,summary,[onclick]';
-  const seen = [], small = [], tiny = [];
+  const seen = [], small = [], tiny = [], contrast = [];
   const vw = window.innerWidth, vh = window.innerHeight;
 
   const label = (el) => (
     (el.getAttribute('aria-label') || el.innerText || el.value ||
      el.getAttribute('title') || el.className || el.tagName) || ''
   ).toString().trim().replace(/\\s+/g, ' ').slice(0, 32);
+
+  const parseColor = (s) => {
+    const m = /rgba?\\(\\s*([\\d.]+)[\\s,]+([\\d.]+)[\\s,]+([\\d.]+)(?:[\\s,\\/]+([\\d.]+%?))?\\s*\\)/.exec(s || '');
+    if (!m) return null;
+    const a = m[4] === undefined ? 1
+      : (m[4].endsWith('%') ? parseFloat(m[4]) / 100 : parseFloat(m[4]));
+    return { r: +m[1], g: +m[2], b: +m[3], a };
+  };
+  const lum = (c) => {
+    const f = (v) => {
+      v /= 255;
+      return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b);
+  };
+  const over = (top, base) => ({
+    r: top.r * top.a + base.r * (1 - top.a),
+    g: top.g * top.a + base.g * (1 - top.a),
+    b: top.b * top.a + base.b * (1 - top.a),
+    a: 1,
+  });
+  // The ground the text actually sits on, or null for "unknowable": a
+  // background-image (a gradient computes as one) anywhere on the walk, or
+  // nothing opaque all the way up — text over a canvas or an <img>. A wrong
+  // ratio is worse than none, so null means the element is not judged at all.
+  const effectiveBg = (el) => {
+    const layers = [];
+    for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+      const s = getComputedStyle(node);
+      if (s.backgroundImage && s.backgroundImage !== 'none') return null;
+      const c = parseColor(s.backgroundColor);
+      if (c && c.a >= 1) {
+        let base = c;
+        for (let i = layers.length - 1; i >= 0; i--) base = over(layers[i], base);
+        return base;
+      }
+      if (c && c.a > 0) layers.push(c);
+    }
+    return null;
+  };
 
   for (const el of document.querySelectorAll(SEL)) {
     const cs = getComputedStyle(el);
@@ -639,7 +799,41 @@ _LAYOUT_JS = """
     if (px && px + 0.5 < opts.minText) {
       tiny.push({ label: (el.innerText || '').trim().slice(0, 24), px: Math.round(px) });
     }
+    if (Number(cs.opacity) === 0) continue;
+    const box = el.getBoundingClientRect();
+    if (!box.width || !box.height) continue;
+    const bg = effectiveBg(el);
+    if (!bg) continue;
+    let fg = parseColor(cs.color);
+    if (!fg) continue;
+    if (fg.a < 1) fg = over(fg, bg);
+    const lf = lum(fg), lb = lum(bg);
+    const ratio = (Math.max(lf, lb) + 0.05) / (Math.min(lf, lb) + 0.05);
+    const large = px >= opts.largePx ||
+      (px >= opts.largeBoldPx && parseFloat(cs.fontWeight) >= 700);
+    if (ratio + 0.005 < (large ? opts.contrastLarge : opts.contrastNormal)) {
+      contrast.push({
+        label: (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 30),
+        ratio: Math.round(ratio * 100) / 100,
+        large,
+        lightText: lf > lb,
+        pair: [fg, bg].map((c) =>
+          [c.r, c.g, c.b].map(Math.round).join(',')).join('|'),
+      });
+    }
   }
+
+  // One palette mistake paints the same pair on forty elements: keep the
+  // worst example of each colour pair, then the worst pairs overall.
+  const byPair = new Map();
+  for (const c of contrast) {
+    const kept = byPair.get(c.pair);
+    if (!kept || c.ratio < kept.ratio) byPair.set(c.pair, c);
+  }
+  const worstContrast = Array.from(byPair.values())
+    .sort((a, b) => a.ratio - b.ratio)
+    .slice(0, opts.maxContrast)
+    .map(({ pair, ...c }) => c);
 
   const doc = document.documentElement;
   return {
@@ -648,11 +842,31 @@ _LAYOUT_JS = """
     smallTotal: small.length,
     tiny: tiny.slice(0, opts.max),
     tinyTotal: tiny.length,
+    contrast: worstContrast,
     overflowPx: Math.max(0, Math.round(doc.scrollWidth - doc.clientWidth)),
     vw, vh,
   };
 }
 """
+
+
+def contrast_ratio(fg_hex: str, bg_hex: str) -> float:
+    """WCAG 2 contrast ratio of two opaque sRGB colours ("#RRGGBB").
+
+    The dry mirror of the maths inside `_LAYOUT_JS`, for the same reason
+    `counts_as_breakage` is its own function: both ways of getting the JS
+    wrong are silent, and a browser is the one place a test cannot look.
+    Keep the constants here and there in step.
+    """
+    def lum(hex_str: str) -> float:
+        s = hex_str.lstrip("#")
+        def f(v: float) -> float:
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+        r, g, b = (f(int(s[i:i + 2], 16) / 255) for i in (0, 2, 4))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    lf, lb = lum(fg_hex), lum(bg_hex)
+    return (max(lf, lb) + 0.05) / (min(lf, lb) + 0.05)
 
 
 def layout_findings(m: dict) -> List[Finding]:
@@ -681,6 +895,23 @@ def layout_findings(m: dict) -> List[Finding]:
         out.append(Finding(kind="layout", message=(
             f"the text “{t['label']}” renders at {t['px']}px — under {MIN_TEXT_PX}px "
             f"it is unreadable on a phone. Body text wants 16px."
+        )))
+    worst_first = sorted(
+        m.get("contrast") or [], key=lambda c: float(c.get("ratio") or 0)
+    )
+    for c in worst_first[:MAX_CONTRAST_FINDINGS]:
+        ratio = float(c.get("ratio") or 0)
+        need = MIN_CONTRAST_LARGE if c.get("large") else MIN_CONTRAST_NORMAL
+        if ratio + 0.005 >= need:
+            # The JS applied the same bar; re-applied here so the threshold is
+            # testable without a browser, like every other number in this file.
+            continue
+        move = ("lighten the text or darken the ground" if c.get("lightText")
+                else "darken the text or lighten the ground")
+        out.append(Finding(kind="layout", message=(
+            f"the text “{c.get('label')}” measures {ratio:.2f}:1 against its "
+            f"background — below the {need:g}:1 minimum it fades on a phone in "
+            f"daylight. {move[0].upper()}{move[1:]} until it clears {need:g}:1."
         )))
     if int(m.get("overflowPx") or 0) > 2:
         out.append(Finding(kind="layout", message=(
@@ -884,7 +1115,16 @@ async def _measure_layout(page) -> List[Finding]:
     try:
         m = await page.evaluate(
             _LAYOUT_JS,
-            {"minTarget": MIN_TARGET_PX, "minText": MIN_TEXT_PX, "max": MAX_PER_KIND},
+            {
+                "minTarget": MIN_TARGET_PX,
+                "minText": MIN_TEXT_PX,
+                "max": MAX_PER_KIND,
+                "contrastNormal": MIN_CONTRAST_NORMAL,
+                "contrastLarge": MIN_CONTRAST_LARGE,
+                "largePx": LARGE_TEXT_PX,
+                "largeBoldPx": LARGE_BOLD_PX,
+                "maxContrast": MAX_CONTRAST_FINDINGS,
+            },
         )
     except Exception:  # noqa: BLE001 - a measurement that cannot run is not a verdict
         logger.debug("[app_html] layout measurement failed", exc_info=True)
@@ -897,11 +1137,6 @@ async def _measure_layout(page) -> List[Finding]:
 
 
 async def _smoke(html: str, report: Report) -> Report:
-    try:
-        from playwright.async_api import async_playwright  # type: ignore
-    except ImportError:  # pragma: no cover - image always ships one of the two
-        from patchright.async_api import async_playwright  # type: ignore
-
     # The wrapper AND the policy. `wrap_for_runtime` alone gave the gate a
     # browser more permissive than the user's, which is how a sound the runner
     # refuses could pass a check that claimed to have opened the app. See
@@ -924,18 +1159,15 @@ async def _smoke(html: str, report: Report) -> Report:
         if len(errors) < 5:
             errors.append(Finding(kind=kind, message=message))
 
-    pw = await async_playwright().start()
+    # The shared browser (round 24): launched once, reused across builds, with
+    # a fresh isolated context per call so each build's storage is sandboxed.
+    # A crash self-heals — `_acquire_browser` relaunches if the process died.
+    context = None
     try:
-        # An installed browser (Brave on the fleet) beats the bundled
-        # chromium, which no longer exists there. `executable_path=None`
-        # keeps the bundle as the dev-machine fallback.
-        browser = await pw.chromium.launch(
-            headless=True,
-            executable_path=find_browser_bin(),
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-        )
         try:
-            page = await browser.new_page(viewport={"width": 390, "height": 844})
+            browser = await _acquire_browser()
+            context = await browser.new_context(viewport={"width": 390, "height": 844})
+            page = await context.new_page()
             page.on("pageerror", lambda e: _note("runtime", str(e).split("\n")[0]))
             page.on(
                 "console",
@@ -971,10 +1203,32 @@ async def _smoke(html: str, report: Report) -> Report:
             # Now DRIVE it. An app that opens on a start screen has run almost
             # none of its own code yet, so everything above this line has
             # verified a title and a button.
-            if await _press_start(page):
+            pressed = await _press_start(page)
+            report.pressed_start = pressed or None
+            if pressed:
                 # Long enough for a game loop to take several ticks, which is
                 # where a first-render throw actually lands.
                 await page.wait_for_timeout(1200)
+                # Did pressing it actually DO anything? The old gate pressed the
+                # start control and asserted nothing about the result, which is
+                # how the recorded Ping-Pong shipped "checked" while its serve
+                # card never dismissed and the ball was never visible. If the
+                # same start control is still on screen AND the visible text is
+                # essentially unchanged, the press did not advance the app — the
+                # start screen is covering it. This is read BEFORE the blind
+                # keyboard/mouse gestures below, which could dismiss an overlay
+                # by accident and mask the fault.
+                after_start_text = await _visible_text(page)
+                if await _start_control_visible(page) and _texts_match(
+                    first_text, after_start_text
+                ):
+                    _note("behaviour", (
+                        f"pressing “{pressed}” did not change the screen — the "
+                        "start screen and its controls are still covering the "
+                        "app. The start control's handler must hide the start "
+                        "screen and reveal the app; right now the player presses "
+                        "it and nothing happens."
+                    ))
             try:
                 await page.keyboard.press("ArrowRight")
                 await page.mouse.click(195, 500)
@@ -1012,9 +1266,20 @@ async def _smoke(html: str, report: Report) -> Report:
                     "screen and begin in the start control's handler."
                 ))
         finally:
-            await browser.close()
-    finally:
-        await pw.stop()
+            # Close the per-call context only — the browser is shared and
+            # stays up for the next build.
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:
+        # A failure at the browser level (a crashed process, a context that
+        # would not open) must not leave a dead handle cached for the next
+        # build to reuse. Drop it so `_acquire_browser` relaunches, then let
+        # `smoke_test`'s downgrade path own the honest wording.
+        await _drop_browser()
+        raise
 
     if blocked:
         # Inconclusive, not clean and not broken. Half the page never ran, so
@@ -1067,6 +1332,7 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     report.screenshot = deep_report.screenshot
     report.cover = deep_report.cover
     report.audio = deep_report.audio
+    report.pressed_start = deep_report.pressed_start
     report.downgrade_reason = deep_report.downgrade_reason
     if "runtime" not in report.ran:
         # The hint scan lived inside the browser pass, so a browserless fleet

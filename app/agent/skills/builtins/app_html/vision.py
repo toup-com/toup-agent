@@ -132,7 +132,11 @@ _SYSTEM = (
     "that is legible, correctly laid out, and not at odds with its purpose "
     "is a PASS.\n"
     "An app showing a start screen, a title and one button is a normal, "
-    "correct state — not an empty screen.\n"
+    "correct state — not an empty screen — UNLESS you are told the start "
+    "control was already pressed before this screenshot was taken. A start "
+    "screen still covering the app after its own button was pressed is not a "
+    "state, it is the app failing to start: report it as a defect, naming "
+    "the overlay that must dismiss.\n"
     "\n"
     "Answer with ONE JSON object and nothing else. No prose, no markdown "
     "fences.\n"
@@ -304,6 +308,7 @@ async def review_screenshot(
     title: str,
     purpose: str = "",
     change: str = "",
+    pressed_start: str = "",
 ) -> Look:
     """Look at the app and say what is wrong with it.
 
@@ -312,6 +317,14 @@ async def review_screenshot(
     wrong for a dashboard. ``change`` is the edit that was just made, which
     turns the same call into "is this change on screen and does it look
     right", the second half of item 3.
+
+    ``pressed_start`` is the label of the start control the render gate
+    pressed before the screenshot was taken, when it pressed one. Round 24:
+    the reviewer used to be told nothing about WHEN the shot was taken, and
+    the system prompt's "a start screen is a normal state" line — written to
+    stop false positives on apps that correctly open on one — blanket-approved
+    a post-press shot too. That is exactly how the recorded Ping-Pong shipped
+    "checked" with a serve card that never dismissed.
 
     Never raises. Every failure path returns ``ran=False`` with a reason.
     """
@@ -332,6 +345,14 @@ async def review_screenshot(
     asks = [f"This is “{title or 'the app'}”."]
     if purpose:
         asks.append(f"It is meant to be: {purpose}")
+    if pressed_start:
+        asks.append(
+            f"Before this screenshot was taken, the “{pressed_start}” control "
+            f"was pressed and the app was given a moment to respond — so this "
+            f"should be the app RUNNING. If you are still looking at a start "
+            f"screen, a title card or an instructions overlay, it failed to "
+            f"dismiss: report that as a defect."
+        )
     if change:
         asks.append(
             f"A change was just made: {change}. Say whether that change is "

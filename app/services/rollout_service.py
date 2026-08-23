@@ -132,6 +132,36 @@ async def _agent_url(db: AsyncSession, container: ManagedContainer) -> Optional[
     return result.scalar_one_or_none()
 
 
+async def _wait_for_tenant_idle(agent_url: str, grace_s: float) -> tuple[bool, int]:
+    """Wait for a tenant's in-flight chat turns to drain before an upgrade.
+
+    Round 24 turn-safety: the legacy bridge `/upgrade` is a `docker rm -f`
+    (SIGKILL, no drain), so a rollout landing mid-turn truncated the reply —
+    the 2026-08-23 P0 was the founder's own turn dying under a canary upgrade.
+    Polls `/agent/health.active_turns` (count only, no identities) and returns
+    once it reads 0, or after `grace_s`. Returns (idle, last_count). A read
+    that fails is treated as idle: an unreachable agent is not one we should
+    hold a rollout for, and its own health gate will catch a real problem.
+    """
+    if grace_s <= 0:
+        return True, 0
+    deadline = time.time() + grace_s
+    last = 0
+    async with httpx.AsyncClient(timeout=10, verify=True) as client:
+        while time.time() < deadline:
+            try:
+                r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
+                if r.status_code != 200:
+                    return True, last  # unhealthy is the health gate's problem
+                last = int((r.json() or {}).get("active_turns") or 0)
+                if last <= 0:
+                    return True, 0
+            except (httpx.HTTPError, ValueError):
+                return True, last
+            await asyncio.sleep(3.0)
+    return False, last
+
+
 async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
     """Legacy elapsed-time poll. Kept for any external caller; new code uses
     `_observe_canary_signal` which short-circuits on real signal instead of
@@ -377,6 +407,31 @@ async def _upgrade_one(
     # Hard per-attempt timeout — defense in depth above httpx's own
     # timeout. See PR #127 for the 547-min stall context.
     hard_timeout_s = (settings.bridge_upgrade_timeout_s or 180) + 30
+
+    # ── Step 0: let a live turn finish before the SIGKILL upgrade ──
+    # Turn-safety (round 24). Best-effort and bounded — a fresh narrow
+    # session, closed before the bridge call, so nothing is held across
+    # the network.
+    grace_s = float(getattr(settings, "rollout_drain_grace_s", 0) or 0)
+    if grace_s > 0:
+        try:
+            async with async_session_maker() as _db:
+                _url = await _agent_url(_db, container)
+            if _url:
+                idle, last = await _wait_for_tenant_idle(_url, grace_s)
+                if not idle:
+                    logger.warning(
+                        "[rollout] tenant=%s still had %d in-flight turn(s) after "
+                        "%.0fs grace — upgrading anyway (likely wedged)",
+                        container.user_id[:8], last, grace_s,
+                    )
+                elif last:
+                    logger.info(
+                        "[rollout] tenant=%s waited for %d in-flight turn(s) to "
+                        "finish before upgrade", container.user_id[:8], last,
+                    )
+        except Exception:  # noqa: BLE001 — turn-safety is best-effort, never fatal
+            logger.debug("[rollout] idle-wait skipped", exc_info=True)
 
     # ── Step 1: narrow session — write attempt='upgrading' ──
     async with async_session_maker() as db:

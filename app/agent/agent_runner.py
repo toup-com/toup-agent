@@ -3468,7 +3468,7 @@ class AgentRunner:
         else:
             # Max iterations reached
             if not final_text:
-                final_text = text_buf or "I've reached the maximum number of tool iterations. Here's what I have so far."
+                final_text = text_buf or "I had to stop here — this took more steps than I can run in one go. Here's where it stands; say \"keep going\" to continue."
 
         # ── Citation-integrity gate: apply ───────────────────────
         # Violations are ALWAYS logged (that is the measurement); the answer

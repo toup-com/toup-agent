@@ -397,6 +397,20 @@ def _get_active_turn(user_id: str) -> Optional[dict]:
     return entry
 
 
+def active_turn_count() -> int:
+    """How many turns are in flight in this process right now, stale entries
+    excluded. Round 24: exposed on `/agent/health` so the rollout can DEFER
+    upgrading a tenant that is mid-reply instead of SIGKILLing it — the acute
+    P0 was the founder's own turn dying under a canary upgrade. A count only:
+    no mission ids, no content, nothing that identifies who is talking."""
+    now = time.time()
+    n = 0
+    for entry in list(_active_turns.values()):
+        if now - (entry.get("started_at") or 0.0) <= _TURN_STALE_S:
+            n += 1
+    return n
+
+
 def _turn_frame(kind: str, entry: dict, **extra) -> dict:
     """Wire shape for turn_active / turn_status. `stage` is coarse
     ('thinking' | 'tool' | 'writing'); `tool` is the raw tool name so the

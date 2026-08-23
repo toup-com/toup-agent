@@ -2142,6 +2142,16 @@ class Settings(BaseSettings):
     # outage must not block an unrelated roll.
     rollout_turn_probe_enabled: bool = True
     rollout_turn_probe_timeout_s: float = 120.0
+    # Turn-safety (round 24): before upgrading a tenant, wait up to this long
+    # for its in-flight chat turns to finish. The legacy bridge /upgrade path
+    # is a `docker rm -f` (SIGKILL, no drain), so an image push landing while
+    # someone was mid-reply truncated it — the 2026-08-23 P0 was the founder's
+    # own turn dying under a canary upgrade. This does NOT remove the pull-
+    # window downtime (only host-side blue-green does), but it removes
+    # "killed mid-sentence". On timeout the upgrade PROCEEDS — a turn that has
+    # run this long is likely wedged, and a rollout cannot wait forever. 0
+    # disables the wait. Reads `active_turns` from /agent/health (count only).
+    rollout_drain_grace_s: float = 90.0
     # How long a rollout waits for the bridge's pool to stop recycling before
     # it touches the canary. A COMPLETED rollout notifies the bridge to refresh
     # the pool image, and the bridge then recycles every pool member — measured

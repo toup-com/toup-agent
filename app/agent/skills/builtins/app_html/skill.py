@@ -21,6 +21,7 @@ branch, which is why every failure path here returns a string starting with
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,26 @@ from app.agent.skills.builtins.app_html.store import AppStoreError
 logger = logging.getLogger(__name__)
 
 DESIGN_SKILL_FILENAME = "toup-frontend-design.md"
+
+#: How many times the publish gate may refuse an app over POLISH findings
+#: (layout, audio, the visual review) before it publishes with the remaining
+#: notes named instead of refusing again. Breakage — syntax, runtime, load,
+#: behaviour (a crash, a start screen that never dismisses) — is never subject
+#: to this budget. Round 24: the recorded tennis build cycled open→judge→fix
+#: for 9 minutes and 40 actions, then resigned with "maximum tool iterations";
+#: three refusals is enough to fix a real mess and few enough to converge.
+GATE_MAX_REFUSALS = 3
+
+#: `Finding.kind`s that always refuse a publish, budget or no budget. A crash
+#: or an app that cannot be started is not a rough edge.
+_HARD_FINDING_KINDS = frozenset({"syntax", "runtime", "load", "behaviour"})
+
+#: Wall clock for the whole logo phase. `ensure_icon`'s own budgets sum to
+#: ~140s (a 20s subject call plus three 40s draws) and the app is already
+#: built by then — every extra second is a row spinning on the user's card.
+#: 45s covers a healthy draw with room for one retry; past that the app keeps
+#: its letter mark and the step says so.
+LOGO_PHASE_BUDGET_S = 45
 
 #: Beyond this, `view_app_file` returns head+tail rather than the whole file.
 #: A single-file app is normally 10–60 KB; 120 KB means embedded data URIs,
@@ -209,6 +230,17 @@ class AppHtmlSkill(Skill):
         #: correctness. The durable record of what changed is the brief's own
         #: history, which `edit_app_file` writes.
         self._pending_changes: Dict[str, List[str]] = {}
+        #: Gate refusals since the last successful publish, per slug. Round 24
+        #: budget discipline: the recorded tennis build burned 40 actions and 9
+        #: minutes cycling open→judge→fix and then resigned mid-sentence. The
+        #: gate now refuses POLISH findings (layout/audio/visual) at most
+        #: `_GATE_MAX_REFUSALS` times per app; after that the app publishes
+        #: with the remaining notes named honestly. Breakage (syntax/runtime/
+        #: load/behaviour — a crash, an app that never starts) refuses forever:
+        #: no budget ships a broken app. In-process on purpose, like
+        #: `_pending_changes`: losing the count across a restart costs at most
+        #: one extra polish loop.
+        self._gate_refusals: Dict[str, int] = {}
         self._design_path: str = design_skill_path()
         # Read ONCE, from the image, in __init__ — before `get_tools()` and
         # before `on_load()`, both of which the loader calls later. The bytes
@@ -309,15 +341,22 @@ class AppHtmlSkill(Skill):
                                 "stored beside the app, NEVER shown to the user, and "
                                 "the first thing you will read before every future "
                                 "edit. Cover: what it is and who it is for; the "
-                                "problem it solves; its core flows; every feature, "
+                                "problem it solves; its STATE DIAGRAM — every screen/"
+                                "state and the arrow between each pair (start → "
+                                "playing → ended → playing again), including what "
+                                "dismisses each overlay and how every terminal state "
+                                "leads back; every feature, "
                                 "state and control and what each does; the layout — "
                                 "where each control cluster sits and how it aligns; "
                                 "and the design decisions (palette, type, spacing, "
                                 "the signature element) WITH your reasoning. The html "
-                                "you write next implements THIS. Write it now, while "
-                                "you still know why you chose what you chose — in "
-                                "three turns' time this file is all that is left of "
-                                "it."
+                                "you write next implements THIS — the publish gate "
+                                "presses your start control and refuses the app if "
+                                "the screen does not change, so the transitions you "
+                                "draw here are the ones that must work. Write it now, "
+                                "while you still know why you chose what you chose — "
+                                "in three turns' time this file is all that is left "
+                                "of it."
                             ),
                         },
                         "html": {
@@ -486,8 +525,14 @@ class AppHtmlSkill(Skill):
             "The `brief` argument is your PLAN and you write it before the "
             "html: subject grounding, palette with its reasoning, the layout "
             "with exact control placement and alignment, the input model, the "
-            "screen states, the one signature element. The file implements "
-            "the plan — not the other way round.\n"
+            "STATE DIAGRAM — every screen/state with the arrow between each "
+            "pair (start → playing → ended → playing again), what dismisses "
+            "each overlay, and how every terminal state leads back — and the "
+            "one signature element. The file implements the plan — not the "
+            "other way round. The publish gate executes the diagram: it "
+            "presses your start control and refuses the app if the screen "
+            "does not change, so a start handler's first job is hiding its "
+            "own overlay.\n"
             "Loop: app_html__create_app_file (one big write) → app_html__edit_app_file "
             "(small exact-string edits; view_app_file first) → app_html__present_app "
             "(show the user). app_html__bash_app is there when you want to look "
@@ -525,9 +570,15 @@ class AppHtmlSkill(Skill):
             "thing you are about to 'fix' was done deliberately two versions "
             "ago. Always pass `reason` to app_html__edit_app_file: it is what "
             "the next editor reads, and 'edited' tells them nothing.\n"
-            "If a check comes back with problems, FIX THEM AND CALL AGAIN. That is "
-            "the whole recovery procedure — do not report a failure to the user "
-            "and stop, and never present an app that has not come back clean.\n"
+            "If a check comes back with problems, fix ALL of them in ONE edit "
+            "pass and call present_app again — never fix one finding per "
+            "round. The polish budget is three checks per app: cosmetic "
+            "findings that survive three rounds ship with the app and are "
+            "named to you honestly (tell the user in one plain sentence, no "
+            "internals); a crash or an app that will not start never ships at "
+            "all. Do not report a failure to the user and stop, and never "
+            "present an app that has not come back clean or been honestly "
+            "closed out this way.\n"
             "## Changing an app that is already open\n"
             "\"Make the button bigger\" is about the control the person was USING "
             "when they said it. In a game that is the thing they play with — the "
@@ -1081,19 +1132,48 @@ class AppHtmlSkill(Skill):
             status="running",
         )
         report = await verify_mod.verify_app(store.read_app(slug), deep=True)
-        await steps_mod.emit_step(
-            user_id=ctx.user_id, job_id=job_id, step_type="verify",
-            status="failed" if report.findings else "done",
-            detail=report.summary(),
-        )
-        if report.findings:
+        # Budget discipline (round 24): breakage always refuses; polish
+        # refuses at most GATE_MAX_REFUSALS times per app, then ships with
+        # the remaining notes named. `remaining_notes` accumulates what the
+        # gate waved through so the publish can say so honestly.
+        hard = [f for f in report.findings if f.kind in _HARD_FINDING_KINDS]
+        soft = [f for f in report.findings if f.kind not in _HARD_FINDING_KINDS]
+        refusals = self._gate_refusals.get(slug, 0)
+        over_budget = refusals >= GATE_MAX_REFUSALS
+        remaining_notes: List[str] = []
+        if report.findings and (hard or not over_budget):
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="verify",
+                status="failed", detail=report.summary(),
+            )
+            self._gate_refusals[slug] = refusals + 1
             # Not presented, so no app card, no completed job and no "Built"
             # badge. The model gets the errors with their real line numbers
             # and the instruction to come back.
+            checks_left = max(0, GATE_MAX_REFUSALS - refusals - 1)
             raise AppStoreError(
                 "the app is not working yet, so it was not published:\n"
                 + report.as_error()
                 + "\nFix these with edit_app_file and call present_app again."
+                + (
+                    f"\nFix ALL of them in ONE edit pass — {checks_left} more "
+                    "check(s) before the app ships with its remaining rough "
+                    "edges listed instead of being held back."
+                    if checks_left and not hard else ""
+                )
+            )
+        if soft and over_budget:
+            remaining_notes.extend(f.as_text() for f in soft)
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="verify",
+                status="done",
+                detail=f"opened it — {len(soft)} rough edge"
+                f"{'' if len(soft) == 1 else 's'} noted",
+            )
+        else:
+            await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type="verify",
+                status="done", detail=report.summary(),
             )
 
         # ── Somebody looks at it ──────────────────────────────────────
@@ -1119,6 +1199,12 @@ class AppHtmlSkill(Skill):
             title=title,
             purpose=self._purpose_line(existing_brief),
             change=change,
+            # The screenshot is taken AFTER the gate pressed the start
+            # control (when it found one). Told nothing, the reviewer's
+            # "a start screen is a normal state" rule blanket-approved a
+            # start overlay that had failed to dismiss — the recorded
+            # Ping-Pong. The label makes the shot's timing part of the ask.
+            pressed_start=report.pressed_start or "",
         )
         # A look that did not happen resolves to SKIPPED here, at the moment
         # it is known — never `done` ("Checked the app looks right" on an app
@@ -1130,11 +1216,23 @@ class AppHtmlSkill(Skill):
         # the image it must simply never happen, so when it does it logs at
         # error level.
         if look.ran:
-            await steps_mod.emit_step(
-                user_id=ctx.user_id, job_id=job_id, step_type="look",
-                status="failed" if look.problems else "done",
-                detail=look.summary(),
+            look_refuses = bool(look.problems) and not (
+                self._gate_refusals.get(slug, 0) >= GATE_MAX_REFUSALS
             )
+            if look.problems and not look_refuses:
+                remaining_notes.extend(look.problems)
+                await steps_mod.emit_step(
+                    user_id=ctx.user_id, job_id=job_id, step_type="look",
+                    status="done",
+                    detail=f"looked at it — {len(look.problems)} thing"
+                    f"{'' if len(look.problems) == 1 else 's'} left to polish",
+                )
+            else:
+                await steps_mod.emit_step(
+                    user_id=ctx.user_id, job_id=job_id, step_type="look",
+                    status="failed" if look.problems else "done",
+                    detail=look.summary(),
+                )
         else:
             skip_reason = look.reason or "couldn't look at it here"
             if report.downgrade_reason and skip_reason == "no screenshot was captured":
@@ -1150,11 +1248,20 @@ class AppHtmlSkill(Skill):
                 user_id=ctx.user_id, job_id=job_id, step_type="look",
                 status="skipped", detail=skip_reason,
             )
-        if look.problems:
+        if look.problems and not remaining_notes:
+            refusals = self._gate_refusals.get(slug, 0)
+            self._gate_refusals[slug] = refusals + 1
+            checks_left = max(0, GATE_MAX_REFUSALS - refusals - 1)
             raise AppStoreError(
                 "the app runs, but it does not look right, so it was not "
                 "published:\n" + look.as_error()
                 + "\nFix these with edit_app_file and call present_app again."
+                + (
+                    f"\nFix ALL of them in ONE edit pass — {checks_left} more "
+                    "check(s) before the app ships with its remaining rough "
+                    "edges listed instead of being held back."
+                    if checks_left else ""
+                )
             )
 
         # ── The preview, from the same browser run (round 23) ─────────
@@ -1198,12 +1305,29 @@ class AppHtmlSkill(Skill):
             status="running",
         )
         icon_source = ""
+        timed_out = False
         try:
-            _svg, icon_source = await logo_mod.ensure_icon(
-                slug, title=title, purpose=self._purpose_line(existing_brief),
-                user_id=ctx.user_id, html=store.read_app(slug),
+            # A PHASE BUDGET, not a hang guard (round 24): `ensure_icon`'s own
+            # internal budgets sum to ~140s (a 20s subject call plus three 40s
+            # draw attempts), and every second of it is a row spinning on the
+            # user's card with the app already built. The recorded 1:26 build
+            # showed a step spinning ~2 minutes and the user could not tell
+            # whether anything was happening. No mark is worth that, so the
+            # phase is cut off and SAYS it was.
+            _svg, icon_source = await asyncio.wait_for(
+                logo_mod.ensure_icon(
+                    slug, title=title, purpose=self._purpose_line(existing_brief),
+                    user_id=ctx.user_id, html=store.read_app(slug),
+                ),
+                timeout=LOGO_PHASE_BUDGET_S,
             )
             logger.info("[app_html] icon for %s: %s", slug, icon_source)
+        except asyncio.TimeoutError:
+            timed_out = True
+            logger.warning(
+                "[app_html] icon step for %s exceeded its %ss phase budget",
+                slug, LOGO_PHASE_BUDGET_S,
+            )
         except Exception:  # noqa: BLE001 - an icon is never worth a publish
             logger.warning("[app_html] icon step failed for %s", slug, exc_info=True)
         if icon_source:
@@ -1227,7 +1351,9 @@ class AppHtmlSkill(Skill):
             # outstanding and not work done, so it is skipped, with words.
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="logo",
-                status="skipped", detail="couldn't draw one this time",
+                status="skipped",
+                detail=("took too long, so the app kept its letter mark"
+                        if timed_out else "couldn't draw one this time"),
             )
 
         await steps_mod.emit_step(
@@ -1266,6 +1392,7 @@ class AppHtmlSkill(Skill):
         # here and not in `_edit`, because "what changed since the user last
         # saw this app" is exactly the window between two publishes.
         self._pending_changes.pop(slug, None)
+        self._gate_refusals.pop(slug, None)
 
         # Round 18, items 2 and 6. This used to hand back an internal URL
         # path, an `[[open_app:…]]` chip and two sentences of stage direction
@@ -1278,6 +1405,20 @@ class AppHtmlSkill(Skill):
         # What replaces it is one sentence of fact. Everything the model is
         # supposed to do next lives in the system prompt, where the user
         # cannot be shown it.
+        if remaining_notes:
+            # Over the polish budget, published anyway — but never silently.
+            # The model is told what it shipped with so it can (a) tell the
+            # user honestly and (b) fix the list from this report in ONE edit
+            # pass without another round of the gate.
+            notes = "\n".join(f"  - {n}" for n in remaining_notes)
+            return ToolResult(
+                f"Published '{title}'. The app card is in the chat, ready to "
+                f"open. It shipped with {len(remaining_notes)} known rough "
+                f"edge{'' if len(remaining_notes) == 1 else 's'} — tell the "
+                f"user, and if you can fix them from this list alone, do it "
+                f"in one edit pass and present again:\n{notes}",
+                display=f"{title} is ready.",
+            )
         return ToolResult(
             f"Published '{title}'. The app card is in the chat, ready to open.",
             display=f"{title} is ready.",

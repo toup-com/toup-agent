@@ -439,8 +439,12 @@ def _message_to_response(message: Message, build_jobs: dict = None) -> ChatMessa
                 # `done`, not `completed` — see the same fix in api/sessions.py.
                 # This module is not mounted today; corrected in place so a
                 # revival cannot bring the defect back with it.
+                # `was_done`: a row mid-retry still counts as done — the same
+                # rule `steps.step_counts` applies (round 24).
                 completed = sum(
-                    1 for s in steps if s.get("status") in ("done", "completed")
+                    1 for s in steps
+                    if s.get("status") in ("done", "completed")
+                    or (s.get("status") == "running" and s.get("was_done"))
                 )
                 # Skipped rows are excluded from the total everywhere — the
                 # one step arithmetic (`app_html.steps.step_counts`).

@@ -257,6 +257,128 @@ async def admin_manual_rollout(
     return {"rollout_id": rollout.id, "status": rollout.status}
 
 
+# ── The canary, as a checked operation ────────────────────────────────
+#
+# Round 24. `users.is_canary` had NO tooling: no route, no script, one raw-SQL
+# snippet in a checklist. That is why the founder's own live account was still
+# the canary through the 2026-08-23 outage — every image push recreated THEIR
+# container first, and the legacy bridge upgrade is a SIGKILL. Moving it was a
+# hand-written UPDATE nobody wanted to run against production at 1am.
+#
+# Two eligibility traps make a hand-written UPDATE genuinely dangerous, and
+# both fail SILENTLY — which is the real argument for a route:
+#   * a POOL-BOUND tenant (`toup-agent-pool-NN`) is excluded from the rollout's
+#     candidate set entirely, so flagging one aborts every future rollout with
+#     "no user with is_canary=TRUE in the running set" and no obvious cause;
+#   * a tenant with no `agent_url` passes the canary observation instantly
+#     (nothing to poll) and one with no `agent_api_key` skips the turn probe —
+#     i.e. a misconfigured canary WEAKENS the gate rather than failing loudly.
+# So this route refuses both, and reports exactly why.
+
+
+class CanarySetReq(BaseModel):
+    user_id: str = Field(..., description="The account to make the rollout canary.")
+
+
+def _canary_blockers(container, agent_url: Optional[str], agent_key: Optional[str]) -> list[str]:
+    """Why this tenant cannot be the canary, in words an operator can act on."""
+    why: list[str] = []
+    if container is None:
+        why.append("no managed container — the rollout only considers running tenants")
+        return why
+    if (container.status or "") != "running":
+        why.append(f"container is {container.status!r}, not running")
+    if getattr(container, "pin_image_tag", None):
+        why.append("container is pinned to an image tag")
+    if (container.container_name or "").startswith("toup-agent-pool-"):
+        why.append(
+            "container is pool-bound — the rollout excludes pool members, so "
+            "every rollout would abort with 'no canary in the running set'"
+        )
+    if not agent_url:
+        why.append("no agent_url — the canary observation would pass without polling anything")
+    if not agent_key:
+        why.append("no agent_api_key — the real-turn probe would be skipped")
+    return why
+
+
+@router.get("/canary")
+async def get_canary(
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Who the rollout upgrades first, and whether they can actually gate it."""
+    from app.db.models import AgentConfig, ManagedContainer
+
+    user = (await db.execute(select(User).where(User.is_canary.is_(True)))).scalars().first()
+    if user is None:
+        return {"canary": None, "eligible": False,
+                "blockers": ["no user has is_canary set — every rollout aborts before touching a tenant"]}
+    container = (await db.execute(
+        select(ManagedContainer).where(ManagedContainer.user_id == user.id)
+    )).scalars().first()
+    cfg = (await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(AgentConfig.user_id == user.id)
+    )).first()
+    agent_url, agent_key = (cfg[0], cfg[1]) if cfg else (None, None)
+    blockers = _canary_blockers(container, agent_url, agent_key)
+    return {
+        "canary": {"user_id": user.id, "email": user.email},
+        "eligible": not blockers,
+        "blockers": blockers,
+    }
+
+
+@router.post("/canary")
+async def set_canary(
+    body: CanarySetReq,
+    _=Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Move the rollout canary to another account, in ONE transaction.
+
+    One transaction because `uq_users_is_canary_partial` is a partial unique
+    index: setting the new flag before clearing the old one raises, and doing
+    it as two statements leaves a window where a rollout starting in between
+    finds zero canaries and aborts.
+    """
+    from app.db.models import AgentConfig, ManagedContainer
+
+    target = (await db.execute(select(User).where(User.id == body.user_id))).scalars().first()
+    if target is None:
+        raise HTTPException(404, "no such user")
+    container = (await db.execute(
+        select(ManagedContainer).where(ManagedContainer.user_id == target.id)
+    )).scalars().first()
+    cfg = (await db.execute(
+        select(AgentConfig.agent_url, AgentConfig.agent_api_key)
+        .where(AgentConfig.user_id == target.id)
+    )).first()
+    agent_url, agent_key = (cfg[0], cfg[1]) if cfg else (None, None)
+    blockers = _canary_blockers(container, agent_url, agent_key)
+    if blockers:
+        raise HTTPException(400, {"error": "not eligible to be the canary", "blockers": blockers})
+
+    if await active_rollout(db) is not None:
+        raise HTTPException(409, "a rollout is in flight — moving the canary now would change its subject mid-run")
+
+    previous = (await db.execute(select(User).where(User.is_canary.is_(True)))).scalars().first()
+    for u in (await db.execute(select(User).where(User.is_canary.is_(True)))).scalars().all():
+        u.is_canary = False
+    await db.flush()  # the partial unique index refuses two rows at once
+    target.is_canary = True
+    await db.commit()
+    logger.warning(
+        "[rollout] canary moved %s → %s by admin",
+        (previous.id[:8] if previous else "none"), target.id[:8],
+    )
+    return {
+        "canary": {"user_id": target.id, "email": target.email},
+        "previous": ({"user_id": previous.id, "email": previous.email} if previous else None),
+    }
+
+
 @router.get("/latest", response_model=RolloutSummaryResp)
 async def get_latest(
     _=Depends(require_admin),

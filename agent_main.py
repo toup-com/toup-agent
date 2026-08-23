@@ -2130,6 +2130,14 @@ async def agent_health():
         _turn_ready = _ws_chat_mod._agent_runner is not None
     except Exception:
         _turn_ready = False
+    # How many chat turns are in flight right now (count only — no identities).
+    # The rollout reads this to DEFER an upgrade rather than SIGKILL a live
+    # reply (round 24 turn-safety). Best-effort: a read that fails must never
+    # make the tenant look unhealthy.
+    try:
+        _active_turns_n = _ws_chat_mod.active_turn_count()
+    except Exception:
+        _active_turns_n = 0
     _init_error_class = None
     if _agent_init_error:
         _last = [l for l in _agent_init_error.strip().splitlines() if l.strip()]
@@ -2146,6 +2154,7 @@ async def agent_health():
         # nothing else may act on it.
         "status": "healthy",
         "turn_ready": _turn_ready,
+        "active_turns": _active_turns_n,
         **({"init_error_class": _init_error_class} if _init_error_class else {}),
         "version": _agent_version,
         "mode": "agent",

@@ -122,7 +122,13 @@ def step_counts(steps: List[Any]) -> "tuple[int, int]":
         if status == "skipped":
             continue
         total += 1
-        if status == "done":
+        # A row EVER done counts as done while it re-runs (`was_done`, see
+        # emit_step): retry-in-place takes a finished row back through
+        # `running`, and counting only the current status is how a frame —
+        # or a job stranded mid-retry by an abnormal close, which never
+        # reaches finish_job's restore — reported 2/5 and then 1/5. The
+        # done-count never decreases for work that completed.
+        if status == "done" or (status == "running" and s.get("was_done")):
             done += 1
     return done, total
 
@@ -313,20 +319,49 @@ async def _adopt_turn_job(user_id: str, app_id: str, title: str) -> Optional[str
     return None
 
 
+def _register_with_turn_finalizers(job_id: str) -> str:
+    """Put a job this pipeline drives into the turn's created-jobs registry.
+
+    The system prompt forbids the model calling `create_job` for a build, so
+    `ensure_job` mints (or revives) the job itself — and an unregistered
+    build job is invisible to both turn-end finalizers (agent_runner's
+    happy-path close and `_sweep_unclosed_created_jobs`); only the 30-minute
+    reaper would close it, which is how an abnormally-ended build sat
+    "running" for half an hour. Both finalizers guard on status, so
+    registering a job `finish_job` already closed costs nothing.
+
+    Appends through the same live list the `create_job` tool path appends to
+    (`_created_job_registry`) — the registry contract is mutate-in-place,
+    never re-`set()`. An adopted job is already in the list, hence the
+    membership check.
+    """
+    try:
+        from app.agent.tool_executor import _created_job_registry
+        reg = _created_job_registry()
+        if job_id not in reg:
+            reg.append(job_id)
+    except Exception:  # noqa: BLE001 - bookkeeping is never worth the build
+        logger.debug("[app_html] created-jobs registry append failed",
+                     exc_info=True)
+    return job_id
+
+
 async def ensure_job(user_id: str, slug: str, title: str) -> Optional[str]:
     """Find-or-create the ONE BuildJob backing this app's card.
 
     Order matters: an app that already has a job keeps it (so an edit three
     turns later updates the same card), otherwise this turn's model-created
     job is adopted, and only if there is neither do we open a new one.
+    Every id returned is registered with the turn finalizers — see
+    :func:`_register_with_turn_finalizers`.
     """
     app_id = app_id_for(user_id, slug)
     existing = await _existing_job_for_app(app_id)
     if existing:
-        return existing
+        return _register_with_turn_finalizers(existing)
     adopted = await _adopt_turn_job(user_id, app_id, title)
     if adopted:
-        return adopted
+        return _register_with_turn_finalizers(adopted)
     try:
         from app.agent.job_runner import JobRunner, TaskSpec
         spec = TaskSpec(
@@ -351,7 +386,7 @@ async def ensure_job(user_id: str, slug: str, title: str) -> Optional[str]:
             idempotency_key=f"html:{slug}",
             layer=1,
         )
-        return job.id
+        return _register_with_turn_finalizers(job.id)
     except Exception:
         logger.warning("[app_html] could not open a job for %s", slug, exc_info=True)
         return None
@@ -452,6 +487,18 @@ async def emit_step(
             s = step_dict
             s["label"] = label
             s["status"] = status
+            # Ever-done marker. Retry-in-place takes a done row back through
+            # `running`, so at an abnormal close (turn death, the reconciler's
+            # settle) the row's CURRENT status no longer says the phase ever
+            # completed — which is how a card that read 2/5 died reading 1/5.
+            # `rev` cannot answer it (a failed→running retry bumps rev too),
+            # so the fact is recorded outright. A skill-REPORTED failed/skip
+            # is a verdict and supersedes the history — without the clear, a
+            # rebuild's genuinely-skipped check would still count as done.
+            if status == "done":
+                s["was_done"] = True
+            elif status in ("failed", "skipped"):
+                s.pop("was_done", None)
             # Per-row write counter: what lets the clients tell a genuine
             # retry (done → running, HIGHER rev) from a stale poll whose rows
             # predate the frame that started the retry (older rev). Without
@@ -598,9 +645,17 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
                 if not isinstance(s, dict):
                     continue
                 if s.get("status") in ("pending", "running"):
-                    s["status"] = "skipped"
-                    s["label"] = phase_label(s.get("type") or "", "skipped")
-                    s.setdefault("detail", "the build finished without it")
+                    if s.get("was_done"):
+                        # Mid-retry at close: the row completed once and the
+                        # re-check never reported back. Its last reported
+                        # result stands — skipping it here is how "2/5" died
+                        # as "1/5", a close un-counting finished work.
+                        s["status"] = "done"
+                        s["label"] = phase_label(s.get("type") or "", "done")
+                    else:
+                        s["status"] = "skipped"
+                        s["label"] = phase_label(s.get("type") or "", "skipped")
+                        s.setdefault("detail", "the build finished without it")
                     s["rev"] = int(s.get("rev") or 0) + 1
             # A build that closes green around a skipped VERIFICATION is the
             # false-success pattern — with the browser shipped in the image

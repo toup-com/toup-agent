@@ -855,11 +855,110 @@ def test_the_app_is_driven_before_the_report_is_believed():
     import inspect
     src = inspect.getsource(verify._smoke)
     i_start = src.index("_press_start(page)")
-    i_close = src.index("browser.close()")
+    # Round 24: the browser is shared and reused, so the per-call teardown is
+    # the CONTEXT (which owns the page and its error handlers), not the browser.
+    i_close = src.index("context.close()")
     i_settle = src.index("SMOKE_SETTLE_MS")
     assert i_settle < i_start < i_close
     # …and AFTER the untouched watch, whose whole claim is "nothing pressed".
     assert src.index("_ended_itself") < i_start
+
+
+# ── 8b. Pressing start has to CHANGE something (round 24) ──────────────
+#
+# The recorded Ping-Pong shipped "checked" while its serve card never
+# dismissed and the ball was never visible. `_smoke` pressed the start
+# control and asserted nothing about the result. Now it asserts the screen
+# advanced: the start control gone, or the visible text materially changed.
+
+
+def test_texts_match_reads_an_unchanged_screen_as_unchanged():
+    # A start screen whose only movement is a timer digit is still the start
+    # screen — the word-set is unchanged, so a press that leaves it up is caught.
+    assert verify._texts_match("TAP TO SERVE  score 0", "TAP TO SERVE  score 0")
+    assert verify._texts_match("TAP TO SERVE  0", "TAP TO SERVE  1")
+
+
+def test_texts_match_reads_a_real_state_change_as_changed():
+    # Title/instructions replaced by the board+HUD: the press took.
+    assert not verify._texts_match(
+        "POCKET PONG  tap to serve  a tiny tennis game",
+        "12 : 9   you   cpu   rally",
+    )
+
+
+def test_the_overlay_stuck_check_is_read_only_and_runs_before_the_blind_gestures():
+    # The still-visible probe must not click anything (it only asks), and the
+    # overlay-stuck assertion must be read before the ArrowRight/mouse gestures
+    # that could dismiss an overlay by accident and mask the fault.
+    assert "el.click()" not in verify._START_STILL_VISIBLE_JS
+    import inspect
+    src = inspect.getsource(verify._smoke)
+    i_assert = src.index("_start_control_visible(page)")
+    i_arrow = src.index('keyboard.press("ArrowRight")')
+    i_press = src.index("_press_start(page)")
+    assert i_press < i_assert < i_arrow
+
+
+def test_the_overlay_stuck_finding_names_no_internals_and_is_a_fix():
+    msg = (
+        "pressing “Serve” did not change the screen — the start screen and "
+        "its controls are still covering the app. The start control's handler "
+        "must hide the start screen and reveal the app; right now the player "
+        "presses it and nothing happens."
+    )
+    assert verify.counts_as_breakage(msg, from_console=False) is True
+    for banned in ("chromium", "brave", "playwright", "getBoundingClientRect", "innerText"):
+        assert banned.lower() not in msg.lower()
+
+
+# ── 8c. One browser, reused across builds (round 24) ──────────────────
+#
+# Every _smoke used to launch and close a whole browser process;
+# warm_browser only primed the disk cache. The recordings clocked 20–40s per
+# open. Now the browser is shared: launched once, kept, reused with a fresh
+# context per call.
+
+
+def test_smoke_uses_the_shared_browser_not_a_fresh_launch():
+    import inspect
+    src = inspect.getsource(verify._smoke)
+    # Acquires the shared browser and opens a per-call context…
+    assert "_acquire_browser()" in src
+    assert "new_context(" in src
+    # …and never launches or stops its own driver inline any more.
+    assert "async_playwright().start()" not in src
+    assert "chromium.launch(" not in src
+
+
+def test_warm_browser_keeps_the_browser_up():
+    # warm_browser must hand the SAME instance to the first real build, not
+    # close it (the round-23 bug: warming only primed the disk cache).
+    import inspect
+    src = inspect.getsource(verify.warm_browser)
+    assert "_acquire_browser()" in src
+    assert "close()" not in src
+
+
+def test_acquire_browser_reuses_a_connected_handle():
+    # A connected cached browser is returned as-is; a dead one is relaunched.
+    class _FakeBrowser:
+        def __init__(self, connected=True):
+            self._c = connected
+            self.launches = 0
+        def is_connected(self):
+            return self._c
+
+    async def go():
+        verify._browser = _FakeBrowser(connected=True)
+        verify._pw = object()  # non-None so no real driver is started
+        got = await verify._acquire_browser()
+        assert got is verify._browser
+    try:
+        run(go())
+    finally:
+        verify._browser = None
+        verify._pw = None
 
 
 # ── 9. A published app has to be READABLE by the shell that checks it ──

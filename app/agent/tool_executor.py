@@ -542,6 +542,13 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
 # Default if tool not in the table
 DEFAULT_OUTPUT_LIMIT = 15_000
 
+# Wall-clock ceiling for skill tools, which manage their own internal budgets
+# and so bypass the per-tool timeout table. 300 because present_app's internal
+# budgets sum to ~220s worst case — this is a hang guard ABOVE them, not a
+# budget: the 2026-08-23 01:26 build spun unbounded on exactly this branch,
+# the only dispatch branch that had no asyncio.wait_for.
+SKILL_TOOL_TIMEOUT_S = 300
+
 # Ticket 6: these tools truncate ONCE to a token budget (settings.*_token_budget)
 # instead of the byte cap above, when settings.web_token_budget_enabled is on.
 _TOKEN_BUDGETED_TOOLS = frozenset({"web_search", "web_fetch"})
@@ -1074,7 +1081,13 @@ class ToolExecutor:
                     user_id=self._current_user_id,
                     chat_id=self._chat_id,
                 )
-                result = await self.skill_loader.execute_tool(tool_name, tool_input, ctx)
+                try:
+                    result = await asyncio.wait_for(
+                        self.skill_loader.execute_tool(tool_name, tool_input, ctx),
+                        timeout=SKILL_TOOL_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    return f"ERROR: Tool '{tool_name}' timed out after {SKILL_TOOL_TIMEOUT_S}s"
             elif (
                 settings.use_connector_dispatch
                 and getattr(self, "mcp_client", None) is not None

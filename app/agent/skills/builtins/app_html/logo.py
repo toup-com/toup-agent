@@ -43,6 +43,15 @@ restarts.
 violation. A mark that had to be edited to be safe or on-palette is a mark
 nobody has looked at; the refusal goes back with its reason and it is drawn
 again.
+
+**The reported source is a claim, and it is kept honest** (round 24).
+``"model"`` means the mark was drawn AND persisted; ``"fallback"`` means the
+three-band holding mark is on disk. A drawn mark that cannot be stored (one
+retry, then :class:`~app.agent.skills.builtins.app_html.store.AppStoreError`)
+RAISES out of :func:`ensure_icon` — the step must not claim a mark it does
+not have, and the caller's except path reports it skipped. Every degrade
+from designed mark to bands is logged at WARNING with its branch, so a fleet
+where every icon degrades is legible from logs rather than silent.
 """
 
 from __future__ import annotations
@@ -610,7 +619,10 @@ async def ensure_icon(
     """The app's mark, drawing it if it is missing or stale.
 
     Returns ``(svg, source)`` where source is ``kept`` | ``model`` |
-    ``fallback``. Never raises and never returns nothing.
+    ``fallback``. Raises :class:`AppStoreError` in exactly one case: a mark
+    was drawn but could not be stored, even on a retry — returning ``model``
+    there would claim a mark that is not on disk (module docstring, the
+    honesty contract).
 
     ``html`` is the app's own source, and it is what the palette is read
     from. Without it the mark can still be drawn, but on the neutral holding
@@ -634,13 +646,22 @@ async def ensure_icon(
         if existing:
             return existing, "kept"
 
+    degrade = ""
     if allow_model:
         from app.agent.skills.builtins.app_html import vision
         if vision.can_call_model():
+            used = subjects_in_use(exclude=slug)
             key, scene = await choose_subject(
-                user_id=user_id, title=title, purpose=purpose,
-                used=subjects_in_use(exclude=slug),
+                user_id=user_id, title=title, purpose=purpose, used=used,
             )
+            if not scene:
+                # One more sample before giving up the designed mark: every
+                # subject failure (no answer, wrong shape, banned, duplicate)
+                # is a property of one draw from the model, and choose_subject
+                # has no retry of its own the way draw_mark does.
+                key, scene = await choose_subject(
+                    user_id=user_id, title=title, purpose=purpose, used=used,
+                )
             if scene and colours:
                 svg = await draw_mark(user_id=user_id, title=title, scene=scene,
                                       palette=colours)
@@ -650,28 +671,48 @@ async def ensure_icon(
                                     purpose=purpose, subject=key,
                                     palette=colours)
                     except (OSError, AppStoreError):
-                        logger.warning("[app_html] could not store the icon for %s",
-                                       slug, exc_info=True)
+                        logger.warning("[app_html] could not store the icon for "
+                                       "%s — retrying once", slug, exc_info=True)
+                        try:
+                            _store_icon(slug, svg, source="model", title=title,
+                                        purpose=purpose, subject=key,
+                                        palette=colours)
+                        except (OSError, AppStoreError) as exc:
+                            # "model" is a claim the mark is ON DISK. The
+                            # caller's except path (skill.py) turns this into
+                            # the honest skipped step instead of "drew a
+                            # fresh mark" over an empty directory.
+                            raise AppStoreError(
+                                f"drew a mark for {slug} but could not store "
+                                f"it") from exc
                     return svg, "model"
+                degrade = f"draw refused all {MAX_DRAW_ATTEMPTS} attempts"
             elif scene and not colours:
                 # No palette means no way to make the mark belong to the app,
                 # and a mark in invented colours is the defect this round
                 # removed. Better a holding mark that says so.
-                logger.info("[app_html] %s has no palette of its own — holding "
-                            "mark rather than an invented one", slug)
+                degrade = "app has no palette of its own"
+            else:
+                degrade = "no usable subject, twice"
 
     existing = read_icon(slug)
     meta = read_sidecar(slug)
     if existing and meta.get("source") == "model" and meta.get("gen") == str(ICON_GENERATION):
         # Keep a current designed mark rather than downgrading it because one
         # generation failed.
+        if degrade:
+            logger.warning("[app_html] icon redraw for %s failed — %s; "
+                           "keeping the current mark", slug, degrade)
         return existing, "kept"
 
     svg = fallback_icon(slug, title, colours)
+    if degrade:
+        logger.warning("[app_html] icon for %s degraded to the holding bands "
+                       "— %s", slug, degrade)
     try:
         _store_icon(slug, svg, source="fallback", title=title, purpose=purpose,
                     palette=colours)
     except (OSError, AppStoreError):
-        logger.debug("[app_html] could not store the holding mark for %s", slug,
-                     exc_info=True)
+        logger.warning("[app_html] could not store the holding mark for %s",
+                       slug, exc_info=True)
     return svg, "fallback"
