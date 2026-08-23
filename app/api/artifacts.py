@@ -75,6 +75,15 @@ async def list_artifacts() -> Dict[str, Any]:
         # icon inline, which would put an SVG per app into every list. A stat,
         # not a read — see `logo.has_icon`.
         d["has_icon"] = logo.has_icon(slug)
+        # …and its etag, the same sha the icon route sends and
+        # `steps.artifact_payload` puts on the frame — ONE cache key for the
+        # mark whichever producer told the client about it. Round 24: the
+        # frame inlines the SVG only under 8 KB and otherwise names it, and
+        # the listing named it only as a boolean, so a client had nothing
+        # stable to cache a fetched mark under and every detailed mark stayed
+        # a letter monogram. A read, unlike `has_icon`'s stat, but a mark is
+        # 1–3 KB and this route already reads the manifest and stats the file.
+        d["icon_etag"] = logo.icon_etag(slug)
         # Same contract as the icon: a stat-cheap etag so the card can cache
         # the snapshot under (slug, etag) and refetch only when a publish
         # moved it. '' for an app published before round 23 — the card falls
