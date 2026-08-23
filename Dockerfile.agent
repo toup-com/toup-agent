@@ -40,6 +40,27 @@ RUN apt-get update && apt-get install -y \
     libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
+# Brave — the fleet's browser (the /opt/toup/playwright chromium mount is
+# retired; founder decision 2026-08-23: Brave is the only browser). It is a
+# full Chromium under the brand, driven by playwright via `executable_path`
+# (see app/agent/skills/builtins/app_html/verify.py::find_browser_bin and
+# app/agent/browser.py — both discover /usr/bin/brave-browser on PATH).
+# This is what makes "Check the app" / "Look at the app" / server previews
+# actually run in the DEPLOYED container instead of degrading to a syntax
+# read. The runtime libs above were already here for the mount era; fonts
+# are new — without them every screenshot renders tofu (and generated apps
+# lean on emoji glyphs, hence noto-color-emoji).
+RUN curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg \
+        https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg] https://brave-browser-apt-release.s3.brave.com/ stable main" \
+        > /etc/apt/sources.list.d/brave-browser-release.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        brave-browser \
+        fonts-liberation \
+        fonts-dejavu-core \
+        fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
 # Node.js 20 — needed for Expo project scaffolding and preview servers
 # NOTE: Do NOT install expo-cli globally — it's the legacy CLI that doesn't support
 # Node 17+. The local @expo/cli (via npx expo) is the correct one and comes from
