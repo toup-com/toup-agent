@@ -273,10 +273,34 @@ def test_debt_is_not_growing_silently():
     step WOULD be a test nobody runs, which is what this ceiling exists to
     catch.
 
+    2026-08-23 (round 25): 72, and the first of the four is not this round's.
+    Main was ALREADY at 69 against a ceiling of 68 — round 21 (`10162cc6`)
+    added `test_r21_apps_files_memory.py` and never raised it, so this very
+    test had been failing on main. Nobody found out, because the failure lived
+    in the backend sweep, and the sweep is step 10 behind step 6, which had
+    been red since 2026-08-21: the guard against un-argued debt was itself
+    behind the gate it exists to protect. That is the whole argument for
+    keeping step 6 green.
+
+    The other three are ROUTING entries of exactly the kind argued at 74 and
+    at 68 — `test_r25_build_card_progress`, `test_r25_build_live_activity` and
+    `test_r25_build_card_on_return` all drive REAL `build_jobs` rows (the
+    measured non-monotonic percent sequence, the Live Activity address, and the
+    live-frame-vs-REST comparison cannot be reproduced against a stub), and
+    `build_jobs` is AGENT_ONLY, so they fail under platform as a
+    mis-invocation rather than a defect. All three RUN, in the agent-mode step.
+    The round's other two new files (`test_r25_live_write_step`,
+    `test_r25_looks_right`) carry no debt line: they touch no database and the
+    platform sweep picks them up.
+
+    Checked rather than assumed, again: CI's own lane arithmetic was replayed
+    against this list, and every one of the five new files lands in exactly one
+    sweep — none in both, none in neither.
+
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 68
+    CEILING = 72
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

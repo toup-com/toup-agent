@@ -58,9 +58,32 @@ _BLOCKED = _CLEAN.replace(
 )
 
 
+def _can_really_render() -> bool:
+    """A browser binary is NOT enough — the driver has to be importable too.
+
+    This guard originally asked only `find_browser_bin() is None`, and that is
+    exactly wrong for CI: the self-hosted runner is the fleet's own box and
+    HAS Brave on PATH, while neither of the workflow's two inline pip lists
+    installs playwright. So the skip did not fire, `verify_app` downgraded for
+    want of a driver, and the control assertion below failed the sweep — a
+    host fact reported as a defect. Ask for both halves.
+    """
+    if verify.find_browser_bin() is None:
+        return False
+    try:
+        import playwright.async_api  # noqa: F401
+    except ImportError:
+        try:
+            import patchright.async_api  # noqa: F401
+        except ImportError:
+            return False
+    return True
+
+
 @pytest.mark.skipif(
-    verify.find_browser_bin() is None,
-    reason="no browser binary on this host — the downgrade cannot be driven",
+    not _can_really_render(),
+    reason="no browser binary AND playwright driver here — the downgrade "
+           "cannot be driven, and a host fact is not a defect",
 )
 def test_a_request_that_never_arrived_is_named_on_the_card():
     """The third downgrade path says WHY, like the other two.
