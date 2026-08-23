@@ -48,9 +48,22 @@ DB_ALERT_AFTER_FAILURES = 2
 DB_ALERT_MIN_TENANTS_IMMEDIATE = 2
 DB_ALERT_COOLDOWN = timedelta(minutes=30)
 
+# ── Turn path (round N P0, 2026-08-23) ────────────────────────────
+# Same contract as the DB path: an agent can be UP and healthy while unable
+# to serve a single chat turn (`turn_ready: false` — its pipeline init threw
+# and was swallowed). Tracked and alerted, never acted on: for a bad IMAGE
+# this hits every recreated tenant at once and a restart storm fixes
+# nothing. One consecutive miss alerts — a dead turn path is a total outage
+# for that user, and the founder finding it in his own chat at 11:28 PM is
+# the incident this block exists to end.
+_turn_down_counts: Dict[str, int] = {}
+_last_turn_alert: Optional[datetime] = None
+TURN_ALERT_AFTER_FAILURES = 1
+TURN_ALERT_COOLDOWN = timedelta(minutes=30)
 
-def verdict_from_health_body(data: dict) -> "tuple[bool, Optional[bool]]":
-    """Read `(healthy, db_ok)` out of an /agent/health body.
+
+def verdict_from_health_body(data: dict) -> "tuple[bool, Optional[bool], Optional[bool]]":
+    """Read `(healthy, db_ok, turn_ready)` out of an /agent/health body.
 
     Pure, so the decision that mattered on 2026-08-01 is testable without a
     database or an HTTP stack. `db_ok` is a SIBLING of `status`, not nested
@@ -58,18 +71,29 @@ def verdict_from_health_body(data: dict) -> "tuple[bool, Optional[bool]]":
     `{"status": "healthy", "db_ok": false}`, which is exactly why reading
     only `status` missed a fleet-wide outage.
 
-    A missing or non-boolean `db_ok` is None, meaning "the agent did not
-    say" — never "down". Older images and pool-generic boots omit it, and
+    `turn_ready` (round N P0, 2026-08-23 — the THIRD "green health while
+    every chat fails" arc): the agent-pipeline init threw and was swallowed,
+    `_agent_runner` stayed None, and every chat turn answered "Agent not
+    available" behind a 200. Same sibling contract as db_ok: tracked and
+    alerted, never acted on.
+
+    A missing or non-boolean field is None, meaning "the agent did not
+    say" — never "down". Older images and pool-generic boots omit them, and
     treating absence as failure would page forever.
     """
     healthy = data.get("status") in ("healthy", "ok")
     db_ok = data.get("db_ok")
-    return healthy, (db_ok if isinstance(db_ok, bool) else None)
+    turn_ready = data.get("turn_ready")
+    return (
+        healthy,
+        (db_ok if isinstance(db_ok, bool) else None),
+        (turn_ready if isinstance(turn_ready, bool) else None),
+    )
 
 
 async def _probe_agent_health(
     container: ManagedContainer,
-) -> "tuple[bool, Optional[bool]]":
+) -> "tuple[bool, Optional[bool], Optional[bool]]":
     """Probe a container's agent health endpoint.
 
     Returns `(healthy, db_ok)`. `healthy` is the liveness verdict that drives
@@ -102,7 +126,7 @@ async def _probe_agent_health(
         # when AgentConfig rows haven't been populated with HTTPS URLs yet.
         url = f"http://{settings.docker_host_ip}:{container.host_port}/agent/health"
     else:
-        return False, None
+        return False, None, None
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -111,7 +135,7 @@ async def _probe_agent_health(
                 return verdict_from_health_body(resp.json())
     except Exception:
         pass
-    return False, None
+    return False, None, None
 
 
 async def _send_telegram_alert(message: str):
@@ -163,10 +187,25 @@ async def check_all_containers():
             return
 
         db_down: list[ManagedContainer] = []
+        turn_down: list[ManagedContainer] = []
 
         for container in containers:
-            healthy, db_ok = await _probe_agent_health(container)
+            healthy, db_ok, turn_ready = await _probe_agent_health(container)
             key = container.id
+
+            # Turn path — tracked and alerted, never acted on (see the
+            # `_turn_down_counts` note). Only an ANSWERING container can
+            # report it; a dead one belongs to the liveness path below.
+            if turn_ready is False:
+                _turn_down_counts[key] = _turn_down_counts.get(key, 0) + 1
+                turn_down.append(container)
+                logger.error(
+                    "[MONITOR] %s reports turn_ready=false (%d consecutive) — "
+                    "agent is up but cannot serve a chat turn",
+                    container.container_name, _turn_down_counts[key],
+                )
+            elif turn_ready is True:
+                _turn_down_counts.pop(key, None)
 
             # Tenant DB path — tracked and alerted, never acted on. Only a
             # container that is otherwise ANSWERING can report db_ok; a dead
@@ -259,6 +298,52 @@ async def check_all_containers():
                     await db.commit()
 
         await _alert_on_db_path(db_down)
+        await _alert_on_turn_path(turn_down)
+
+
+async def _alert_on_turn_path(turn_down: "list[ManagedContainer]") -> None:
+    """One aggregated alert for agents that cannot serve a chat turn.
+
+    Mirrors `_alert_on_db_path`: aggregated because the failure this exists
+    for (a bad agent image whose init throws) hits every recreated tenant at
+    once. Alerts on the FIRST observation — turn_ready=false is a total chat
+    outage for that user, already at least one monitor cycle old.
+    """
+    global _last_turn_alert
+
+    if not turn_down:
+        return
+    if len(turn_down) < 2:
+        only = turn_down[0]
+        if _turn_down_counts.get(only.id, 0) < TURN_ALERT_AFTER_FAILURES:
+            return
+
+    now = datetime.utcnow()
+    if _last_turn_alert and (now - _last_turn_alert) < TURN_ALERT_COOLDOWN:
+        return
+    _last_turn_alert = now
+
+    names = ", ".join(f"<code>{c.container_name}</code>" for c in turn_down[:3])
+    if len(turn_down) > 3:
+        names += f" +{len(turn_down) - 3} more"
+    many = len(turn_down) >= 2
+    verdict = (
+        f"<b>{len(turn_down)} tenants at once → almost certainly the current "
+        f"agent image.</b> Check the latest rollout; roll back the image. "
+        f"Restarting containers will NOT help."
+        if many else
+        "<b>Single tenant</b> — check its /agent/diagnose (agent_runner "
+        "check has the full init traceback)."
+    )
+    await _send_telegram_alert(
+        f"💬 <b>Agent cannot serve chat turns</b>\n"
+        f"{names}\n"
+        f"Time: {now.strftime('%H:%M UTC')}\n\n"
+        f"{verdict}\n\n"
+        f"<i>Agents are UP and /agent/health returns 200 — they report "
+        f"turn_ready=false. Every chat message answers 'Agent not "
+        f"available'.</i>"
+    )
 
 
 async def _alert_on_db_path(db_down: "list[ManagedContainer]") -> None:

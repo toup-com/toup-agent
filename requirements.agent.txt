@@ -8,6 +8,14 @@ python-multipart>=0.0.9
 # Database
 sqlalchemy[asyncio]==2.0.25
 asyncpg==0.29.0
+# The agent's TENANT DB is sqlite — aiosqlite is REQUIRED, not optional.
+# It was never listed here and arrived transitively for months; the
+# 2026-08-23 image rebuild (a new layer above pip invalidated the cache and
+# re-resolved everything fresh) dropped it, database.py's module-level
+# engine build threw on the first startup import, the outer init except
+# swallowed it, and every chat turn answered "Agent not available" while
+# /agent/health said ready. Pin it like the other DB deps.
+aiosqlite==0.20.0
 psycopg2-binary==2.9.9
 pgvector==0.2.4
 alembic==1.13.1

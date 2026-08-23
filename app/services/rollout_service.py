@@ -204,6 +204,28 @@ _CANARY_STABILITY_INTERVAL_S = 10.0 # poll cadence during stability hold
 # Stability hold (60s) and hard cap unchanged.
 
 
+def _health_ok(resp) -> tuple[bool, str]:
+    """A canary health poll's verdict: 200 AND turn-ready.
+
+    Round N P0 (2026-08-23): the gate counted bare 200s while the agent's
+    pipeline init had thrown and been swallowed — /agent/health said ready,
+    every chat turn answered "Agent not available", and the canary passed.
+    `turn_ready` is the agent's live "my runner exists" field; absent on
+    older images (bake window), where a 200 keeps counting as before.
+    """
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+    except ValueError:
+        return True, ""  # a 200 that isn't JSON — old/odd image, keep legacy behaviour
+    tr = body.get("turn_ready")
+    if tr is False:
+        cls = body.get("init_error_class")
+        return False, "not turn-ready" + (f" (init failed: {cls})" if cls else "")
+    return True, ""
+
+
 async def _observe_canary_signal(
     agent_url: str,
     *,
@@ -213,6 +235,7 @@ async def _observe_canary_signal(
     required_ok: int = _CANARY_REQUIRED_OK,
     stability_hold_s: float = _CANARY_STABILITY_HOLD_S,
     stability_interval_s: float = _CANARY_STABILITY_INTERVAL_S,
+    agent_key: "str | None" = None,
 ) -> tuple[bool, str]:
     """Signal-based canary observation. Returns (passed, reason).
 
@@ -239,11 +262,12 @@ async def _observe_canary_signal(
         while time.time() < boot_deadline and consecutive_ok < required_ok:
             try:
                 r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
-                if r.status_code == 200:
+                ok, why = _health_ok(r)
+                if ok:
                     consecutive_ok += 1
                     logger.info("[CANARY-OBSERVE] boot ok %d/%d", consecutive_ok, required_ok)
                 else:
-                    logger.warning("[CANARY-OBSERVE] boot HTTP %d body=%r", r.status_code, r.text[:100])
+                    logger.warning("[CANARY-OBSERVE] boot %s body=%r", why, r.text[:120])
                     consecutive_ok = 0
             except httpx.HTTPError as e:
                 logger.warning("[CANARY-OBSERVE] boot exception %s: %s", type(e).__name__, str(e)[:200])
@@ -265,14 +289,53 @@ async def _observe_canary_signal(
         while time.time() < stability_deadline:
             try:
                 r = await client.get(f"{agent_url.rstrip('/')}/agent/health")
-                if r.status_code != 200:
-                    return (False, f"stability hold failed: HTTP {r.status_code} after boot")
+                ok, why = _health_ok(r)
+                if not ok:
+                    return (False, f"stability hold failed: {why} after boot")
             except httpx.HTTPError as e:
                 return (False, f"stability hold failed: {type(e).__name__}: {str(e)[:200]}")
             await asyncio.sleep(stability_interval_s)
 
+        # Phase 3: one REAL plain turn, end to end — model call included.
+        # Health can only prove the runner exists; this proves a chat turn
+        # completes on the new image. The founder discovered tonight's
+        # outage in his own chat at 11:28 PM; this probe is what discovers
+        # the next one inside the canary window instead. Skippable per
+        # deploy via settings (model outages must not brick deploys — an
+        # operator can flip it off and roll with health-gating only).
+        if agent_key and getattr(settings, "rollout_turn_probe_enabled", True):
+            probe_timeout = float(getattr(settings, "rollout_turn_probe_timeout_s", 120.0))
+            probe_deadline = min(time.time() + probe_timeout, deadline + probe_timeout)
+            attempt = 0
+            last_err = "never attempted"
+            while time.time() < probe_deadline:
+                attempt += 1
+                try:
+                    pr = await client.post(
+                        f"{agent_url.rstrip('/')}/api/v1/internal/agent-turn",
+                        headers={"X-Agent-Key": agent_key},
+                        json={
+                            "message": (
+                                "Deployment smoke test: reply with the single "
+                                "word OK and do nothing else."
+                            ),
+                            "save": False,
+                        },
+                        timeout=min(90.0, probe_timeout),
+                    )
+                    if pr.status_code == 200 and (pr.json().get("text") or "").strip():
+                        logger.info("[CANARY-OBSERVE] turn probe ok (attempt %d)", attempt)
+                        break
+                    last_err = f"HTTP {pr.status_code} {pr.text[:120]}"
+                except (httpx.HTTPError, ValueError) as e:
+                    last_err = f"{type(e).__name__}: {str(e)[:160]}"
+                logger.warning("[CANARY-OBSERVE] turn probe attempt %d failed: %s", attempt, last_err)
+                await asyncio.sleep(5.0)
+            else:
+                return (False, f"turn probe failed after {attempt} attempt(s): {last_err}")
+
     elapsed = cap_seconds - max(0.0, deadline - time.time())
-    return (True, f"healthy (boot + stability passed in {elapsed:.0f}s)")
+    return (True, f"healthy (boot + stability + turn probe passed in {elapsed:.0f}s)")
 
 
 # ─── Per-tenant upgrade + rollback ────────────────────────────────
@@ -805,7 +868,21 @@ async def _canary_observe_loop(
         "[ROLLOUT] %s canary signal-based observe (cap=%.0fs)",
         rollout.id, remaining_s,
     )
-    passed, reason = await _observe_canary_signal(agent_url, cap_seconds=remaining_s)
+    # The canary's own X-Agent-Key, for the phase-3 real-turn probe. Missing
+    # key ⇒ probe skipped (health gating still applies) — never a crash.
+    canary_key: "str | None" = None
+    try:
+        from sqlalchemy import select as _select
+        from app.db.models import AgentConfig as _AC
+        _row = await db.execute(
+            _select(_AC.agent_api_key).where(_AC.user_id == canary.user_id)
+        )
+        canary_key = _row.scalar_one_or_none()
+    except Exception:
+        logger.warning("[ROLLOUT] %s could not resolve canary agent key — turn probe skipped", rollout.id)
+    passed, reason = await _observe_canary_signal(
+        agent_url, cap_seconds=remaining_s, agent_key=canary_key,
+    )
     if passed:
         logger.info("[ROLLOUT] %s canary %s", rollout.id, reason)
         return True

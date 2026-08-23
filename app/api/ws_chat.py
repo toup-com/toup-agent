@@ -2631,7 +2631,15 @@ async def ws_chat(
             return
 
         if not _agent_runner:
-            await websocket.send_json({"type": "error", "message": "Agent not available"})
+            # `code` is the client's classification hook (round N P0): the
+            # app renders "your agent is restarting" copy for this class and
+            # never the generic "try sending it again" — which tonight's
+            # outage proved false twice in the founder's own thread.
+            await websocket.send_json({
+                "type": "error",
+                "code": "agent_starting",
+                "message": "Agent not available",
+            })
             await websocket.close(code=4503, reason="Service unavailable")
             return
 

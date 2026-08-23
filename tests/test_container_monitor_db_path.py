@@ -48,7 +48,7 @@ def _probe_with(payload, status=200):
     extracted into a pure function in the first place.
     """
     if status != 200:
-        return False, None
+        return False, None, None
     return cm.verdict_from_health_body(payload)
 
 
@@ -66,7 +66,7 @@ def _capture_alerts(coro):
 # ── the probe reads the field at all ──────────────────────────────
 
 def test_the_exact_outage_payload_is_parsed():
-    healthy, db_ok = _probe_with({"status": "healthy", "db_ok": False})
+    healthy, db_ok, _tr = _probe_with({"status": "healthy", "db_ok": False})
     assert healthy is True, "the agent WAS answering — liveness must stay true"
     assert db_ok is False, (
         "db_ok=false was not read off the health body; this is the field that "
@@ -75,15 +75,26 @@ def test_the_exact_outage_payload_is_parsed():
 
 
 def test_healthy_db_ok_true():
-    assert _probe_with({"status": "healthy", "db_ok": True}) == (True, True)
+    assert _probe_with({"status": "healthy", "db_ok": True}) == (True, True, None)
 
 
 def test_missing_db_ok_is_unknown_not_down():
     """Older images and pool-generic boots omit the field. Absent must never
     be read as down, or every one of them alerts forever."""
-    healthy, db_ok = _probe_with({"status": "healthy"})
+    healthy, db_ok, turn_ready = _probe_with({"status": "healthy"})
     assert healthy is True
     assert db_ok is None
+    assert turn_ready is None, "absent turn_ready must be unknown, never down"
+
+
+def test_turn_ready_false_is_read_and_alerted_shape():
+    """Round N P0: turn_ready=false behind a green 200 is the exact payload
+    of the 2026-08-23 outage — it must be read, as a sibling of status."""
+    healthy, db_ok, turn_ready = _probe_with(
+        {"status": "healthy", "turn_ready": False, "init_error_class": "RuntimeError"}
+    )
+    assert healthy is True, "liveness stays true — the agent IS answering"
+    assert turn_ready is False
 
 
 def test_non_bool_db_ok_is_unknown():
@@ -91,9 +102,10 @@ def test_non_bool_db_ok_is_unknown():
 
 
 def test_dead_container_reports_no_db_verdict():
-    healthy, db_ok = _probe_with({"status": "healthy"}, status=500)
+    healthy, db_ok, turn_ready = _probe_with({"status": "healthy"}, status=500)
     assert healthy is False
     assert db_ok is None, "a container that isn't answering cannot report db_ok"
+    assert turn_ready is None
 
 
 # ── the alert decision ────────────────────────────────────────────

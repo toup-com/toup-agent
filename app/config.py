@@ -2134,6 +2134,14 @@ class Settings(BaseSettings):
     # comfortably covers the ~90s happy path with margin for slow boots.
     rollout_canary_wait_minutes_default: int = 5
     rollout_batch_size: int = 5             # Post-canary parallel upgrades per batch
+    # Canary phase 3 (round N P0): after boot + stability, run ONE real chat
+    # turn through the canary's own agent (X-Agent-Key → /internal/agent-turn)
+    # and require a non-empty reply. Health can only prove the runner EXISTS;
+    # the 2026-08-23 outage shipped an image whose init failure was swallowed
+    # behind a green health check. Flip off per-deploy if a model-provider
+    # outage must not block an unrelated roll.
+    rollout_turn_probe_enabled: bool = True
+    rollout_turn_probe_timeout_s: float = 120.0
     # How long a rollout waits for the bridge's pool to stop recycling before
     # it touches the canary. A COMPLETED rollout notifies the bridge to refresh
     # the pool image, and the bridge then recycles every pool member — measured

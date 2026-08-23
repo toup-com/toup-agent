@@ -79,6 +79,11 @@ _skill_loader = None
 # ── Boot progress tracking (exposed via /agent/health) ────────────
 _boot_progress = {"percent": 0, "phase": "starting", "ready": False}
 
+#: The swallowed agent-pipeline init traceback, if init failed (round N P0).
+#: Health exposes its exception CLASS; /agent/diagnose (agent-key-gated)
+#: exposes the full text. None on a clean boot.
+_agent_init_error: "str | None" = None
+
 # ── Paths that skip API key auth (health checks, root) ─────────────
 # Pool admin endpoints (`/api/admin/bind` etc.) are public to the
 # X-Agent-Key middleware but enforce their own POOL_ADMIN_TOKEN check
@@ -1224,6 +1229,16 @@ async def lifespan(app: FastAPI):
         print(f"⚠️ Agent initialization error: {e}")
         import traceback
         traceback.print_exc()
+        # Round N P0 (2026-08-23): this except is what turned a broken agent
+        # into a SILENT outage — boot marched on to ready=True, the canary's
+        # bare-200 health gate passed, and every chat turn answered "Agent
+        # not available" until the founder hit it at 11:28 PM. The swallow
+        # stays (a half-broken agent still serves what it can) but it may
+        # never again be invisible: the error is captured for /agent/health's
+        # `turn_ready`/`init_error_class` (class only — messages can carry
+        # DSNs) and for the agent-key-gated diagnose route (full traceback).
+        global _agent_init_error
+        _agent_init_error = traceback.format_exc()
 
     _boot_progress.update(percent=80, phase="channels")
     # ── Hook Bus ──────────────────────────────────────────────
@@ -2088,8 +2103,35 @@ async def agent_health():
     except Exception:
         _embeddings_status = None
 
+    # Can this process actually serve a chat turn? (Round N P0, the third
+    # 2026 arc of "healthy while every chat fails": the agent-pipeline init
+    # threw, the outer except swallowed it, boot reached ready=True, and the
+    # rollout canary passed on a bare 200 while ws_chat answered "Agent not
+    # available" to every turn.) Read LIVE off the one reference ws_chat
+    # itself gates on — not off boot bookkeeping. The rollout canary gates
+    # deploys on this field; per law 1 nothing else may branch on it.
+    try:
+        from app.api import ws_chat as _ws_chat_mod
+        _turn_ready = _ws_chat_mod._agent_runner is not None
+    except Exception:
+        _turn_ready = False
+    _init_error_class = None
+    if _agent_init_error:
+        _last = [l for l in _agent_init_error.strip().splitlines() if l.strip()]
+        # Class name only — exception MESSAGES can carry DSNs/paths and this
+        # endpoint is unauthenticated. Full text lives behind the agent key.
+        _init_error_class = (_last[-1].split(":")[0].strip() if _last else "Exception")
+
     return {
+        # `status` stays LIVENESS-only: container_monitor's auto-restart
+        # branches on it, and flipping it for a systemic fault (a bad image)
+        # would restart the whole fleet for nothing — the db_ok lesson.
+        # `turn_ready` is a SIBLING honest-health field like db_ok: the
+        # rollout canary gates DEPLOYS on it, the monitor alerts on it,
+        # nothing else may act on it.
         "status": "healthy",
+        "turn_ready": _turn_ready,
+        **({"init_error_class": _init_error_class} if _init_error_class else {}),
         "version": _agent_version,
         "mode": "agent",
         "uptime_seconds": round(uptime, 1),
@@ -2249,6 +2291,21 @@ async def agent_diagnose():
 
     def add_check(name, status, detail, fixed=False):
         checks.append({"name": name, "status": status, "detail": detail, "fixed": fixed})
+
+    # 0. Can this process serve a chat turn at all? (Round N P0 — the init
+    # except used to swallow the pipeline failure invisibly; the full
+    # traceback belongs HERE, behind the agent key, not on public health.)
+    try:
+        from app.api import ws_chat as _ws_chat_mod
+        if _ws_chat_mod._agent_runner is not None:
+            add_check("agent_runner", "ok", "turn-ready")
+        else:
+            add_check(
+                "agent_runner", "error",
+                _agent_init_error or "agent_runner is None and no init error was captured",
+            )
+    except Exception as e:
+        add_check("agent_runner", "warning", str(e))
 
     # 1. Disk space
     try:
