@@ -652,7 +652,8 @@ async def lifespan(app: FastAPI):
             if _rec.touched:
                 print(
                     f"🧹 Restart recovery: re-queued {_rec.requeued}, "
-                    f"interrupted {len(_interrupted)}, gave up {len(_gave_up)}"
+                    f"interrupted {len(_interrupted)}, gave up {len(_gave_up)}, "
+                    f"builds settled {len(_rec.settled_builds)}"
                 )
 
             # ── Live Activity / notification reconciliation ───────────
@@ -1013,6 +1014,21 @@ async def lifespan(app: FastAPI):
                 print("📤 Automations outbox flush started")
             except Exception as e:
                 print(f"⚠️ Could not start automations outbox flush: {e}")
+
+        # Round 27: app-build watchdog — no build card may read "In progress"
+        # after the build has stopped. The reconciler above already sweeps
+        # builds on its own minute loop; this is the dedicated loop so the
+        # build lane keeps running even if the agent_task rule ever throws,
+        # and it is where the "impossible by construction" assertion lives
+        # (app/agent/build_watchdog.py).
+        try:
+            from app.agent.build_watchdog import watchdog_loop
+            app.state.build_watchdog_task = asyncio.create_task(
+                watchdog_loop(), name="stuck-builds-watchdog",
+            )
+            print("🏗️ App-build watchdog started")
+        except Exception as e:
+            print(f"⚠️ Could not start app-build watchdog: {e}")
 
         # TriggerRunner — event-driven sibling. Started after RoutineRunner
         # so its restart sweep + rate-bucket warmup run before any inbound

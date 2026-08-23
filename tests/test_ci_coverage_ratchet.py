@@ -308,10 +308,21 @@ def test_debt_is_not_growing_silently():
     `test_automation_grant_gate.py`, platform-only tables) carry no
     debt line — the platform sweep picks them up.
 
+    2026-08-23 (round 27): 75, one file, and it is a ROUTING entry of the same
+    kind. `test_r27_zombie_build_cards` reproduces the recorded card — a build
+    row at "4/7 steps" with `look` still `running` — and drives the REAL
+    settle, the REAL stall reaper and the REAL reconciler against it. All three
+    read `build_jobs` and write `job_events`, and the published-build case
+    reads `apps`; every one of those is AGENT_ONLY, so the file fails under
+    platform as a mis-invocation rather than a defect. It RUNS, in the
+    agent-mode step. The round's other changes land in files that already have
+    lines (`test_r23_step_semantics`, `test_r24_steps_registry`) or no line at
+    all, and neither set moves this number.
+
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 74
+    CEILING = 75
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

@@ -117,3 +117,4 @@ test_r25_build_live_activity.py  # agent-mode: build_jobs are AGENT_ONLY — it 
 test_r25_build_card_on_return.py  # agent-mode: build_jobs are AGENT_ONLY — it compares the live job_update frame against the REST payload for the same row, which needs both to be real
 test_automations_engine.py  # agent-mode: automations/bindings/events/outbox are AGENT_ONLY — it proves the compile→arm→dedupe→outbox-claim rails on real rows
 test_automations_setup_cards.py  # agent-mode: messages/conversations/auth-sessions are AGENT_ONLY — it proves the card contract payload lands in metadata_json on real rows
+test_r27_zombie_build_cards.py  # agent-mode: build_jobs / job_events / apps are AGENT_ONLY — it seeds the recorded "4/7 steps, look still running" row and drives the REAL settle + reaper + reconciler against it, which is the only way the zombie card can be reproduced at all

@@ -1224,27 +1224,63 @@ async def push_github(app_id: str) -> Dict[str, str]:
 
 @router.post("/jobs/{job_id}/fix-steps")
 async def fix_job_steps(job_id: str) -> Dict[str, Any]:
-    """Fix stuck build steps — mark running/pending as done if job is completed."""
+    """Settle a stuck build honestly.
+
+    Round 27 replaced the body of this route. It used to mark every
+    ``running`` / ``pending`` step ``done`` and flip the job ``completed`` —
+    "App built" painted over a build that never published, which is the
+    exact overclaim rounds 18 through 25 exist to remove, reachable with one
+    curl. It now runs the same settle every other close path runs
+    (``build_watchdog.settle_build``): unreported phases become ``skipped``
+    with their honest words, the publish that never happened is marked, and
+    the job closes ``failed`` — or ``completed``, but only when the publish
+    row itself reports done.
+    """
+    from app.agent.build_watchdog import settle_build
+
     async with async_session_maker() as db:
         job = await db.get(BuildJob, job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        steps = []
-        try:
-            steps = json.loads(job.steps_json) if job.steps_json else []
-        except (json.JSONDecodeError, TypeError):
-            pass
-        fixed = 0
-        for s in steps:
-            if s.get("status") in ("running", "pending"):
-                s["status"] = "done"
-                fixed += 1
-        if fixed:
-            job.steps_json = json.dumps(steps)
-            if job.status in ("running", "queued"):
-                job.status = "completed"
-            await db.commit()
-        return {"ok": True, "fixed_steps": fixed}
+        # Read inside the block: the row is detached after it, and the
+        # settle below rewrites it in a session of its own.
+        was = job.status
+    settled = await settle_build(job_id, reason="manual")
+    if settled is None:
+        return {"ok": False, "reason": "not a settleable app build",
+                "status": was}
+    return {"ok": True, "status": settled.status,
+            "completed_steps": settled.done, "total_steps": settled.total}
+
+
+@router.post("/jobs/sweep-stuck-builds")
+async def sweep_stuck_builds_route(
+    dry_run: bool = True, stale_minutes: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Settle every app build on this tenant that has gone silent.
+
+    The watchdog loop does this every 60 seconds by itself; this is the
+    operator's handle on the same sweep, for the fleet runner
+    (``scripts/sweep_zombie_builds.py``) and for a one-off after an
+    incident. DRY RUN BY DEFAULT — the count comes back without a write.
+    """
+    from datetime import timedelta as _td
+
+    from app.agent.build_watchdog import (
+        BUILD_STALE_AFTER, assert_no_zombie_cards, sweep_stuck_builds,
+    )
+
+    stale_after = (_td(minutes=max(1, int(stale_minutes)))
+                   if stale_minutes else BUILD_STALE_AFTER)
+    n = await sweep_stuck_builds(stale_after=stale_after, dry_run=dry_run)
+    remaining = [] if dry_run else await assert_no_zombie_cards(
+        stale_after=stale_after,
+    )
+    return {
+        "ok": True, "dry_run": dry_run,
+        "stale_after_minutes": int(stale_after.total_seconds() // 60),
+        "settled": n, "still_active": remaining,
+    }
 
 
 @router.delete("/jobs/{job_id}")

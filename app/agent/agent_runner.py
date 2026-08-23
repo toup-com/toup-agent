@@ -800,12 +800,23 @@ async def _settle_build_steps(db: Any, job_id: str) -> None:
     Uses the pipeline's own settle so this path cannot drift from the two that
     were already right (``finish_job`` and the reconciler). Caller commits;
     best-effort, because a tidy card is not worth failing a close.
+
+    Round 27: guarded to actual app builds, and largely superseded by
+    ``build_watchdog.settle_build``, which the caller now reaches first. The
+    guard matters because this helper was never build-only in practice —
+    ``_close_interrupted_jobs`` called it on EVERY row it closed, and
+    ``settle_steps`` rewrites each unfinished row's label from
+    ``app_html._PHASE_WORDS``. A ``create_job`` step carries the model's own
+    words and no ``type``, so an interrupted agent_task had its steps
+    relabelled "Working on your app" — the pipeline's fallback string, on a
+    job that had nothing to do with apps.
     """
     try:
+        from app.agent.build_watchdog import is_build_row
         from app.agent.skills.builtins.app_html.steps import settle_steps
         from app.db.models import BuildJob as _BJ
         job = await db.get(_BJ, job_id)
-        if job is None or not job.steps_json:
+        if job is None or not job.steps_json or not is_build_row(job):
             return
         try:
             steps = json.loads(job.steps_json)
@@ -1306,6 +1317,34 @@ class AgentRunner:
         closed: List[tuple] = []
         try:
             _now = datetime.utcnow()
+            # ── App builds take the build-shaped close ──────────────
+            # Round 27. The bulk UPDATE below writes `cancelled` and (since
+            # round 25) settles the step rows, which is honest in the
+            # database and invisible on the card: BOTH clients render a
+            # build off its STEPS, and neither treats `cancelled` as
+            # terminal — the phone's JobsContext drops a card on
+            # `completed`/`failed` only, so a build cancelled here stayed
+            # pinned in the chat reading "In progress · 4/7 steps · 57%"
+            # with polling already stopped. `settle_build` is the ONE close
+            # for the build lane; it resolves the publish row, writes
+            # `failed`, and broadcasts a frame that CARRIES the steps.
+            # Never for a parked turn: a build stages no confirmation card.
+            build_ids: tuple = ()
+            if not parked:
+                from app.agent.build_watchdog import is_build_row, settle_build
+                async with async_session_maker() as db:
+                    rows = [await db.get(_BJ, jid) for jid in job_ids]
+                build_ids = tuple(
+                    r.id for r in rows if r is not None and is_build_row(r)
+                )
+                for jid in build_ids:
+                    try:
+                        await settle_build(jid, user_id=user_id, now=_now,
+                                           reason="turn_interrupted")
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "[job-finalize] build settle failed for %s", jid)
+                job_ids = tuple(j for j in job_ids if j not in build_ids)
             async with async_session_maker() as db:
                 for jid in job_ids:
                     # Guarded UPDATE, same contract as the happy-path

@@ -15,6 +15,12 @@ life — newest ``job_events.ts``, else ``created_at`` — is older than
 - Sub-agent jobs get their own hard timeout + boot orphan sweep
   (subagent_orchestrator); this net only catches them after a
   mid-flight crash that survived a restart.
+- App builds (``auto_builder`` with an ``app_id``) are handed to
+  ``build_watchdog.settle_build`` instead of being reaped here. Round
+  27: this sweep writes a status and broadcasts a status-ONLY frame,
+  and a build card is rendered off its STEPS by both clients — so a
+  reaped build was a terminal row under a card still reading "In
+  progress · 4/7 steps · 57%".
 
 Registered in agent_main next to the notify-outbox loop (agent-side
 only — build_jobs is a tenant table).
@@ -47,6 +53,7 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, JobEvent
 
+    from app.agent.build_watchdog import is_build_row, settle_build
     from app.agent.job_status import STATUS_CANCELLED, turn_interrupted
 
     now = now or datetime.utcnow()
@@ -73,9 +80,9 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             )
         )
         jobs = list(result.scalars().all())
-        if not jobs:
-            return 0
-
+        # NOT an early return. Card parks (below) expire on their own 25-hour
+        # clock and have nothing to do with whether any job is running right
+        # now; returning here meant an idle tenant never swept them at all.
         last_event_ts = dict(
             (
                 await db.execute(
@@ -84,12 +91,27 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
                     .group_by(JobEvent.job_id)
                 )
             ).all()
-        )
+        ) if jobs else {}
 
         reaped: list[tuple[str, str, str]] = []
+        builds: list[str] = []
         for job in jobs:
             last_alive = last_event_ts.get(job.id) or job.created_at
             if last_alive and last_alive >= cutoff:
+                continue
+            # ── An app build is never reaped by the generic net ──────
+            # Round 27. This loop writes a status and nothing else: it never
+            # touches `steps_json`, and the frame it broadcasts below is
+            # status-ONLY. Both clients derive a build card's state from its
+            # STEPS — the phone card does not read `job.status` at all — so
+            # reaping a build here produced a terminal row under a card that
+            # went on saying "In progress · 4/7 steps · 57%", which is the
+            # zombie this round exists to end. `settle_build` resolves the
+            # rows AND sends a frame that carries them; the sweep above
+            # normally got there first, and this is the backstop for a row
+            # that arrived between two of its runs.
+            if is_build_row(job):
+                builds.append(job.id)
                 continue
             # `cancelled`, not `failed`. The dominant cause of a stall is a
             # turn that went away mid-flight — the voice relay cancels its SSE
@@ -108,9 +130,18 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             )
             job.completed_at = now
             reaped.append((job.id, job.title or "", job.user_id))
-        if not reaped:
-            return 0
-        await db.commit()
+        if reaped:
+            await db.commit()
+
+    # Outside the session above on purpose: `settle_build` opens and commits
+    # its own, for the same reason the reconciler's settle does.
+    settled_builds = 0
+    for job_id in builds:
+        try:
+            if await settle_build(job_id, now=now, reason="reaper"):
+                settled_builds += 1
+        except Exception:  # noqa: BLE001 — one bad row never stops the sweep
+            logger.exception("[job_reaper] build settle failed for %s", job_id)
 
     for job_id, title, user_id in reaped:
         logger.warning(
@@ -154,7 +185,8 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             )
         except Exception:  # noqa: BLE001
             pass
-    return len(reaped) + await sweep_expired_card_parks(now)
+    return (len(reaped) + settled_builds
+            + await sweep_expired_card_parks(now))
 
 
 async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:

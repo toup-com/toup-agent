@@ -1243,6 +1243,69 @@ class AppHtmlSkill(Skill):
         return ToolResult(f"exit {code}\n{body}", display="Checked the app.")
 
     async def _present(self, args: Dict[str, Any], ctx: SkillContext) -> str:
+        """The publish, wrapped so the card cannot outlive the attempt.
+
+        Round 27. Everything below this method emits its phases as it goes,
+        and every one of those emits leaves the JOB `running` — correctly,
+        because a refused gate is the designed repair loop and the model is
+        expected to come back. What had no owner was the OTHER way this
+        method ends: an exception that is not a refusal. `execute_tool`
+        handles `AppStoreError` / `ShellRefusal` / `OSError` and nothing
+        else, so a raise out of the visual review, the icon draw or the
+        publish itself unwound the turn with the phase it was in still
+        `running` — the recorded "Build: Habit Garden · In progress · 4/7
+        steps · 57%", stuck in the chat for hours with `look` spinning.
+
+        A refusal re-raises untouched: the build is alive and the model has
+        a repair list. Anything else means this build is over, so it is
+        settled HERE, at the moment it is known, rather than waiting the
+        watchdog's window. Cancellation settles in a DETACHED task and
+        re-raises immediately — awaiting inside a cancelled turn raises
+        `CancelledError` at the await and the cleanup would be skipped by
+        the very condition that makes it necessary (the same rule
+        `_sweep_unclosed_created_jobs` follows one layer up).
+        """
+        try:
+            return await self._present_build(args, ctx)
+        except (AppStoreError, ShellRefusal):
+            raise                       # the designed loop; the job lives on
+        except BaseException as exc:    # noqa: BLE001 - re-raised below
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            logger.warning(
+                "[app_html] present_app raised %s — settling the build",
+                type(exc).__name__, exc_info=not cancelled,
+            )
+            coro = self._settle_after_crash(
+                args, ctx, reason="present_crashed",
+            )
+            if cancelled:
+                # Detached: survives this task's cancellation.
+                try:
+                    asyncio.get_running_loop().create_task(coro)
+                except RuntimeError:  # no loop — nothing left to detach onto
+                    coro.close()
+            else:
+                await coro
+            raise
+
+    @staticmethod
+    async def _settle_after_crash(
+        args: Dict[str, Any], ctx: SkillContext, *, reason: str,
+    ) -> None:
+        """Close this app's build honestly. Never raises."""
+        try:
+            slug = store.normalise_slug(args.get("slug", ""))
+            if not slug:
+                return
+            job_id = await steps_mod.job_id_for_slug(ctx.user_id, slug)
+            if not job_id:
+                return
+            from app.agent.build_watchdog import settle_build
+            await settle_build(job_id, user_id=ctx.user_id, reason=reason)
+        except Exception:  # noqa: BLE001 - a settle is never worth a second raise
+            logger.debug("[app_html] crash settle failed", exc_info=True)
+
+    async def _present_build(self, args: Dict[str, Any], ctx: SkillContext) -> str:
         slug = store.normalise_slug(args.get("slug", ""))
         title = self._existing_title(slug)
         html_path = store.app_path(slug)

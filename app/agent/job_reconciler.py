@@ -37,6 +37,16 @@ Two things live here:
    handed to ``spawn`` / ``start_mission`` (``config_json.handed_off``),
    parked (``waiting_on_user``) and terminal rows, and rows younger than
    :data:`MIN_AGE` (the finalizer's own window).
+
+Round 27 (2026-08-23) added the third thing this sweep was missing. Rule 2's
+SELECT is ``job_type == 'agent_task'``, so app builds — ``auto_builder`` —
+were never candidates: the watchdog that exists to stop zombie progress bars
+could not see the build lane at all, and a "Build: … · In progress · 4/7
+steps" card outlived its job by hours in front of it. Builds have their own
+liveness rule (an app is published or it is not; there is no assistant
+message that proves it) and it now runs from the same entry point, so every
+caller of :func:`reconcile_delivered_turn_jobs` covers both lanes. See
+:mod:`app.agent.build_watchdog`.
 """
 from __future__ import annotations
 
@@ -121,9 +131,10 @@ async def close_job_completed(
     # demonstrably never ran: force-greening its rows would paint
     # "Published the app ✓" on an app that was never published — the exact
     # overclaim the pipeline's own gates exist to end. Settle it honestly
-    # instead: unreported phases become `skipped`, and the job closes
-    # `cancelled` (the model moved on) or `failed` (a phase had failed).
-    # `finish_job` remains the ONE way a build completes.
+    # instead: unreported phases become `skipped`, the publish that did not
+    # happen is marked, and the job closes `failed` (round 27 — it used to
+    # close `cancelled`, which neither client treats as terminal).
+    # `finish_job` remains the ONE way a build completes on the happy path.
     if (getattr(job, "job_type", None) == "auto_builder"
             and getattr(job, "app_id", None)):
         # Own session, own commit: the finalizer only commits its session
@@ -184,130 +195,25 @@ async def _settle_unpublished_build(
 ) -> None:
     """Close a build job whose turn ended without a publish. Never 'completed'.
 
-    Steps that reported a terminal state keep it; phases that never reported
-    back become `skipped` (the same rule the pipeline's own `finish_job`
-    applies). Status is `failed` when a phase had failed, else `cancelled` —
-    "stopped before the app was published" is a stop, not a success and not
-    an invented diagnosis. Opens and commits its OWN session: the finalizer
-    only commits when a job was completed, and this path never returns one.
-    The guarded WHERE re-checks 'running' at write time, so a publish racing
-    this settle wins.
+    Round 27 moved the body of this to :mod:`app.agent.build_watchdog` and
+    left the call here, because this was only ever ONE of five paths that
+    close a build and the other four each did something different — the
+    stall reaper flipped a status and left ``steps_json`` alone, boot
+    recovery failed the row and left it alone too. One implementation, five
+    callers, is what makes "a dead build always looks the same" checkable.
+
+    Two things changed with the move, both forced by what the clients
+    actually read (see that module's docstring). The publish row resolves
+    ``failed`` rather than ``skipped``, because a build that stopped without
+    publishing did not publish; and the job therefore resolves ``failed``
+    rather than ``cancelled``, which is the word both clients already treat
+    as terminal. Round 23's rule is untouched: no phase is invented done,
+    unreported rows are still skipped with their honest words, and a row
+    that was ever done keeps its result.
     """
-    from app.db.database import async_session_maker
-    from app.db.models import BuildJob, JobEvent
+    from app.agent.build_watchdog import settle_build
 
-    try:
-        from app.agent.skills.builtins.app_html.steps import phase_label
-    except Exception:  # noqa: BLE001 - words are not worth a failed settle
-        def phase_label(_t: str, _s: str) -> str:  # type: ignore[misc]
-            return ""
-
-    final = "cancelled"
-    total = done = 0
-    title = ""
-    try:
-        async with async_session_maker() as db:
-            job = await db.get(BuildJob, job_id)
-            if job is None or job.user_id != user_id or job.status != "running":
-                return
-            steps = parse_steps(job.steps_json)
-            any_failed = False
-            for s in steps:
-                if not isinstance(s, dict):
-                    continue
-                st = s.get("status")
-                if st == "failed":
-                    any_failed = True
-                    # Round 25, item 2. `recoverable` means "the gate found
-                    # something and the build is about to fix it". This settle
-                    # only runs because the build STOPPED, so nothing is going
-                    # to fix it — leaving the badge on would paint a friendly
-                    # in-progress row under a terminal status. Same resolution
-                    # `finish_job` performs on its own close path.
-                    if s.pop("recoverable", None):
-                        s.pop("was_done", None)
-                        s["rev"] = int(s.get("rev") or 0) + 1
-                elif st == "running" and s.get("was_done"):
-                    # A row mid-RETRY when the turn died was already done once
-                    # (`was_done`, stamped by emit_step). Restoring it — the
-                    # same rule finish_job applies — is what keeps the done
-                    # count from regressing at death: the recorded 1:26 AM
-                    # card fell 2/5 → 1/5 exactly here.
-                    s["status"] = "done"
-                    s["rev"] = int(s.get("rev") or 0) + 1
-                elif st in ("pending", "running"):
-                    s["status"] = "skipped"
-                    label = phase_label(str(s.get("type") or ""), "skipped")
-                    if label:
-                        s["label"] = label
-                    s["rev"] = int(s.get("rev") or 0) + 1
-            final = "failed" if any_failed else "cancelled"
-            new_msg = getattr(job, "user_message", None) or (
-                "The app isn't ready to open yet — it needs a fix first."
-                if any_failed else
-                "The build stopped before the app was published. Ask me to "
-                "finish it."
-            )
-            cfg = dict(job.config_json or {})
-            cfg["settled_reason"] = f"unpublished_build:{reason}"
-            res = await db.execute(
-                update(BuildJob)
-                .where(BuildJob.id == job_id, BuildJob.user_id == user_id,
-                       BuildJob.status == "running")
-                .values(status=final, completed_at=now,
-                        steps_json=dump_steps(steps), config_json=cfg,
-                        user_message=new_msg)
-                .returning(BuildJob.id)
-            )
-            if res.first() is None:
-                return
-            db.add(JobEvent(
-                job_id=job_id, user_id=user_id, kind="info",
-                level="error" if any_failed else "info",
-                status=final, ts=now,
-                label="Build stopped before publish"[:200],
-                metadata_json=json.dumps({"reason": reason}),
-            ))
-            await db.commit()
-            title = (job.title or "").replace("Build: ", "")
-            # One arithmetic everywhere: skipped rows are excluded from BOTH
-            # numbers (steps.step_counts), or this closing frame disagrees
-            # with the card that watched the build live.
-            try:
-                from app.agent.skills.builtins.app_html.steps import progress
-                # Round 25, item 8: the same monotonic percent the live frames
-                # carried, read off the same persisted high-water mark, so the
-                # closing frame cannot undercut the last one the user saw.
-                done, total, percent, _cfg = progress(steps, cfg, job_id=job_id)
-            except Exception:  # noqa: BLE001 - arithmetic drift beats a failed settle
-                total = len(steps)
-                done = sum(1 for s in steps
-                           if isinstance(s, dict) and s.get("status") == "done")
-                percent = 0
-    except Exception:  # noqa: BLE001 - a failed settle leaves the reaper's net
-        logger.warning("[job_reconciler] build settle failed for %s",
-                       job_id[:8], exc_info=True)
-        return
-    try:
-        from app.api.ws_chat import broadcast_to_user
-        await broadcast_to_user(user_id, {
-            "type": "job_update",
-            "job_id": job_id,
-            "name": title,
-            "status": final,
-            "total_steps": total,
-            "completed_steps": done,
-            # Round 25: one frame shape for a build card, live or settled.
-            "percent": percent,
-            "steps": [s for s in steps if isinstance(s, dict)],
-        })
-    except Exception:  # noqa: BLE001 - the DB row is already honest
-        logger.debug("[job_reconciler] build settle broadcast failed",
-                     exc_info=True)
-    logger.info(
-        "[job_reconciler] settled unpublished build %s as %s (%s)",
-        job_id[:8], final, reason,
-    )
+    await settle_build(job_id, user_id=user_id, now=now, reason=reason)
 
 
 async def announce_completed(
@@ -366,13 +272,45 @@ async def announce_completed(
 # ── The watchdog ─────────────────────────────────────────────────────────
 
 
-async def reconcile_delivered_turn_jobs(now: Optional[datetime] = None) -> int:
+async def reconcile_delivered_turn_jobs(
+    now: Optional[datetime] = None, *, sweep_builds: bool = True,
+) -> int:
     """Complete every running agent-authored job whose turn's answer has been
-    delivered. Returns how many were closed."""
+    delivered. Returns how many were closed.
+
+    The delivered-answer rule below is ``agent_task``-only by nature: its
+    proof of completion is a persisted assistant message, and an app build's
+    completion is a published app, not a sentence. That filter is correct —
+    and for eight rounds it also meant this sweep, the one that exists to
+    stop zombie progress bars, had the entire BUILD lane out of scope. A
+    "Build: Habit Garden · In progress · 4/7 steps · 57%" card sat in a chat
+    for hours in front of a watchdog running every 60 seconds.
+
+    So the build lane gets its own rule, run FIRST from here rather than from
+    a fourth loop nobody remembers to call: every caller of this function
+    (boot recovery, the minute loop, the stall reaper's pre-sweep) now covers
+    builds too. ``sweep_builds=False`` is for tests that want one rule at a
+    time. See :mod:`app.agent.build_watchdog`.
+    """
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, Message
 
     now = now or datetime.utcnow()
+    if sweep_builds:
+        try:
+            from app.agent.build_watchdog import (
+                assert_no_zombie_cards, sweep_stuck_builds,
+            )
+            n_builds = await sweep_stuck_builds(now)
+            if n_builds:
+                logger.warning(
+                    "[job_reconciler] settled %d stuck app build(s)", n_builds,
+                )
+            # Round 27, item 4. Nothing to find here by construction; a hit
+            # means a close path stopped calling `settle_build`.
+            await assert_no_zombie_cards(now)
+        except Exception as exc:  # noqa: BLE001 — one lane never sinks the other
+            logger.warning("[job_reconciler] build sweep failed: %s", exc)
     candidates: List[Dict[str, Any]] = []
     async with async_session_maker() as db:
         rows = (await db.execute(

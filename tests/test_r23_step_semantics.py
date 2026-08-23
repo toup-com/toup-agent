@@ -307,7 +307,22 @@ async def test_a_failed_step_at_finish_fails_the_build():
 # ── The watchdog settle: a build is never completed by anyone else ────
 
 @pytest.mark.asyncio
-async def test_an_unpublished_build_is_settled_cancelled_not_completed():
+async def test_an_unpublished_build_is_never_settled_completed():
+    """This round's rule — no phase invented done by a watchdog — with round
+    27's correction to the WORD.
+
+    The settle used to write `cancelled` ("a stop, not a diagnosis"), and
+    `cancelled` turned out to be the one status neither client acts on: both
+    build cards are rendered off their STEPS, and the phone's `JobsContext`
+    drops a card from its live map on `completed`/`failed` only. So the
+    honest-sounding word produced a card that read "In progress · 4/7 steps
+    · 57%" for hours after the build died (the recorded Habit Garden card).
+
+    A build that stopped without publishing did not publish — so `present`
+    resolves `failed` and the job resolves `failed`. Everything this test
+    was actually pinning is unchanged and asserted below: no invented tick,
+    and every phase that never reported back is `skipped` with its words.
+    """
     from datetime import datetime
 
     from app.agent.job_reconciler import close_job_completed
@@ -322,10 +337,14 @@ async def test_an_unpublished_build_is_settled_cancelled_not_completed():
         await db.commit()
     assert closed is None, "a build must never come back as a ClosedJob"
     steps, status = await _steps_of(job_id)
-    assert status == "cancelled"
+    assert status == "failed"
     assert all(s["status"] != "done" for s in steps), \
         "no phase may be invented done by a watchdog"
-    assert all(s["status"] == "skipped" for s in steps)
+    by_type = {s["type"]: s for s in steps}
+    assert by_type["present"]["status"] == "failed", \
+        "the publish that never happened is what the card has to say"
+    assert all(s["status"] == "skipped"
+               for s in steps if s["type"] != "present")
 
 
 @pytest.mark.asyncio

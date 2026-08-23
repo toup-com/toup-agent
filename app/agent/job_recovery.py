@@ -89,10 +89,16 @@ class RecoveryOutcome:
     interrupted: list[tuple[str, str, str]] = field(default_factory=list)
     gave_up: list[tuple[str, str, str]] = field(default_factory=list)
     skipped_in_grace: int = 0
+    #: App builds handed to ``build_watchdog.settle_build`` (round 27).
+    #: Deliberately NOT in ``interrupted``: that list drives the caller's
+    #: generic terminal notifier, and the settle has already sent this row's
+    #: own frame and Live Activity push with the build's real step counts.
+    settled_builds: list[str] = field(default_factory=list)
 
     @property
     def touched(self) -> int:
-        return self.requeued + len(self.interrupted) + len(self.gave_up)
+        return (self.requeued + len(self.interrupted) + len(self.gave_up)
+                + len(self.settled_builds))
 
 
 def _fail_row(job: Any, *, error_class: str, user_message: str,
@@ -143,6 +149,7 @@ async def recover_orphaned_jobs(
     now = now or datetime.utcnow()
     out = RecoveryOutcome()
 
+    builds: list[str] = []
     async with session_maker() as db:
         # `queued` is deliberately NOT in this filter.
         rows = (await db.execute(
@@ -153,6 +160,19 @@ async def recover_orphaned_jobs(
             try:
                 if job.created_at and (now - job.created_at) < grace:
                     out.skipped_in_grace += 1
+                    continue
+
+                # ── App builds take the build-shaped close ──────────
+                # Round 27. `_fail_row` writes a status and never touches
+                # `steps_json`, so a build orphaned by a restart came back
+                # with `look` still spinning — and both clients render a
+                # build card off its STEPS. `settle_build` resolves the
+                # rows, marks the publish that never happened, and
+                # broadcasts a terminal frame that carries them. Run after
+                # this session commits, because it opens its own.
+                if (getattr(job, "job_type", None) == "auto_builder"
+                        and getattr(job, "app_id", None)):
+                    builds.append(job.id)
                     continue
 
                 source_kind = getattr(job, "source_kind", None)
@@ -222,6 +242,14 @@ async def recover_orphaned_jobs(
 
         if out.touched:
             await db.commit()
+
+    for job_id in builds:
+        try:
+            from app.agent.build_watchdog import settle_build
+            if await settle_build(job_id, now=now, reason="restart"):
+                out.settled_builds.append(job_id)
+        except Exception:  # noqa: BLE001 — a boot must never fail on a sweep
+            logger.exception("[job_recovery] build settle failed for %s", job_id)
 
     return out
 

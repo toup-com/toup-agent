@@ -387,7 +387,11 @@ async def test_the_settle_path_keeps_every_done_row_done():
         await db.commit()
     assert closed is None, "a build must never come back as a ClosedJob"
     steps, status = await _steps_of(job_id)
-    assert status == "cancelled"
+    # Round 27 changed the word from `cancelled` to `failed` — a build that
+    # stopped without publishing did not publish, and `cancelled` was the
+    # one status neither client treats as terminal. What this test pins is
+    # the done count, and it is unchanged.
+    assert status == "failed"
     by_type = {s["type"]: s for s in steps}
     assert by_type["create"]["status"] == "done"
     assert by_type["verify"]["status"] == "done"
