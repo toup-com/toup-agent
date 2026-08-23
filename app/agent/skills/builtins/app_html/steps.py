@@ -128,9 +128,88 @@ def step_counts(steps: List[Any]) -> "tuple[int, int]":
         # or a job stranded mid-retry by an abnormal close, which never
         # reaches finish_job's restore — reported 2/5 and then 1/5. The
         # done-count never decreases for work that completed.
-        if status == "done" or (status == "running" and s.get("was_done")):
+        #
+        # Round 25: `failed` joins `running` here when the row is
+        # RECOVERABLE — the publish gate refusing a check it already passed
+        # is the pipeline's designed loop, not work being un-done. Without
+        # this the measured build dipped 2/5 → 1/5 (40% → 20%) the instant
+        # the gate found something to fix, which is the single largest
+        # backwards jump on the recorded card.
+        if status == "done" or (
+            status in ("running", "failed") and s.get("was_done")
+        ):
             done += 1
     return done, total
+
+
+#: Where the monotonic high-water mark is parked between emits.
+#:
+#: ``BuildJob.config_json`` is a free-form JSON column the pipeline already
+#: writes (``_adopt_turn_job`` stamps ``pipeline``/``adopted_by`` into it), so
+#: this needs no migration and survives a process restart — which matters,
+#: because the ONLY monotonicity guarantee before round 25 was a per-mount
+#: `useRef` in ONE of the three clients that guarded the bar and not the
+#: "N/M steps" text beside it.
+_HIGH_WATER_KEY = "progress_high_water"
+
+
+def percent_for(done: int, total: int) -> int:
+    """``steps_done / steps_total`` as a whole percent. The ONE formula.
+
+    Separate from the clamp below so the arithmetic can be asserted on its
+    own: this is the value the brief calls "mathematically correct", and
+    :func:`progress` is what additionally makes it non-decreasing.
+    """
+    if total <= 0:
+        return 0
+    return max(0, min(100, round(100.0 * done / total)))
+
+
+def progress(steps: List[Any], config: Optional[Dict[str, Any]] = None,
+             *, job_id: str = "") -> "tuple[int, int, int, Dict[str, Any]]":
+    """``(done, total, percent, config)`` — counts plus a percent that cannot
+    go backwards.
+
+    Round 25, item 8. Percent was never computed server-side at all: the wire
+    carried the pair and each client divided, so every client re-derived — and
+    re-broke — the same number. Three mechanisms made the honest quotient fall:
+
+    * **Plan growth.** ``review``/``edit`` are not in the up-front plan (round
+      23 removed them deliberately, because a pristine build otherwise opened
+      with two grey rows guaranteed to vanish). They are appended at the moment
+      they happen, so the DENOMINATOR rises mid-build: 1/5 → 1/6, 20% → 17%.
+    * **A refused re-check**, now fixed at the source above by keeping
+      ``was_done`` on a recoverable failure.
+    * **The ordering net** force-skipping an abandoned row.
+
+    The denominator rising is by design and is not going to be undone here —
+    so the guarantee is provided where it belongs, on the number itself, and
+    it is PERSISTED (``config_json``) rather than latched in one client.
+
+    A clamp is a real disagreement between two true numbers, so it is logged
+    at WARNING with both. It never raises: this module is fail-open by
+    contract (see the module docstring) and a progress bar is never worth a
+    build.
+    """
+    done, total = step_counts(steps)
+    raw = percent_for(done, total)
+    cfg = dict(config or {})
+    try:
+        previous = int(cfg.get(_HIGH_WATER_KEY) or 0)
+    except (TypeError, ValueError):
+        previous = 0
+    previous = max(0, min(100, previous))
+    if raw < previous:
+        logger.warning(
+            "[app_html] progress for %s went backwards: %d%% (%d/%d) after "
+            "%d%% — holding the high-water mark",
+            job_id or "?", raw, done, total, previous,
+        )
+        percent = previous
+    else:
+        percent = raw
+    cfg[_HIGH_WATER_KEY] = percent
+    return done, total, percent, cfg
 
 
 #: What the card says under the header when a phase fails.
@@ -177,6 +256,40 @@ def phase_label(step_type: str, status: str) -> str:
     return words.get(status) or words["running"]
 
 
+#: What the card's header says while the pipeline is repairing its own work.
+#:
+#: Round 25, item 2. The brief's words, deliberately: finding-and-fixing is
+#: the designed loop, so the state it puts the card in needs a name that reads
+#: as progress rather than as an alarm.
+FIXING_LABEL = "Fixing it"
+
+
+def _headline(steps: List[Any], label: str) -> str:
+    """The header line for a frame: the phase, or ``Fixing it``.
+
+    A recoverable failure anywhere in the list means the gate found something
+    and the model is working through it. Saying so is more useful — and more
+    honest — than showing the label of whichever row happened to be touched
+    last, which during a repair is "Reading the app" or "Updating the app".
+    """
+    for s in steps:
+        if isinstance(s, dict) and s.get("status") == "failed" and s.get("recoverable"):
+            return FIXING_LABEL
+    return label
+
+
+def public_steps(steps: List[Any]) -> List[Dict[str, Any]]:
+    """The step rows as a client should receive them.
+
+    Deliberately the SAME shape as the rows persisted in ``steps_json`` and
+    shipped by ``message_cards``, not a second projection. Round 25, item 6:
+    the live frame and the history hydrator disagreeing about the shape of a
+    build card is precisely why a returning user saw a card that could not be
+    reconciled with the one they left. One shape, two transports.
+    """
+    return [s for s in steps if isinstance(s, dict)]
+
+
 def app_id_for(user_id: str, slug: str) -> str:
     return str(uuid.uuid5(_APP_NS, f"{user_id or 'local'}:{slug}"))
 
@@ -205,6 +318,80 @@ def initial_steps() -> List[Dict[str, Any]]:
          "label": phase_label(t, "pending"), "status": "pending"}
         for t in PLANNED_TYPES
     ]
+
+
+def turn_deep_link() -> "tuple[Optional[str], Optional[str]]":
+    """``(chat_id, message_id)`` for this turn — the phone card's address.
+
+    Read from the tool executor's own context variables rather than from the
+    job row, and that is the whole difficulty of round 25 item 7. A build job
+    is opened by this pipeline with a ``TaskSpec`` of its own, so historically
+    its ``conversation_id`` was NULL — and ``job_mission_id`` falls back to the
+    RAW JOB ID when there is no chat id. A push addressed that way does not
+    land on the conversation's ``chatjob:<sid>`` card; it opens a second,
+    orphaned one. ``ensure_job`` now stamps the conversation onto the row as
+    well, but this stays the live source: an ADOPTED job already carries one,
+    and the context variable is correct for both.
+    """
+    try:
+        from app.agent.tool_executor import (
+            _ASST_MESSAGE_ID_CTX, _SESSION_ID_CTX,
+        )
+        return _SESSION_ID_CTX.get(), _ASST_MESSAGE_ID_CTX.get()
+    except Exception:  # noqa: BLE001 - no deep link is better than no card
+        return None, None
+
+
+async def _push_live_activity(
+    *, job_id: str, title: str, kind: str, headline: str,
+    done: int, total: int, percent: int, body: str = "",
+) -> None:
+    """Put this build on the lock screen and the Dynamic Island.
+
+    Round 25, item 7. The app builder was the one long-running job with no
+    phone surface of its own: ``grep -rn notify`` over this package returned
+    nothing, so a build that took two minutes showed the user nothing once
+    they left the app. Everything needed already existed — ``_notify_job_event``
+    carries a title, a step name, ``steps_done``/``steps_total``, a 0-100
+    ``progress`` and the deep-link ids — it had simply never been called from
+    here.
+
+    Sent on real phase transitions only, never on the byte-counter ticks: a
+    content-state update per delta would be a push per kilobyte.
+
+    Best-effort by contract, like everything else in this module. A phone card
+    is never worth a build.
+    """
+    try:
+        from app.agent.subagent_orchestrator import _notify_job_event
+        chat_id, message_id = turn_deep_link()
+        await _notify_job_event(
+            job_id=job_id,
+            label=title or "your app",
+            kind=kind,
+            title=title or "Building your app",
+            body=body or None,
+            progress=percent,
+            # `step_name` is what the island shows under the title. During a
+            # repair this is "Fixing it" — the same words the chat card uses,
+            # so the two surfaces cannot disagree about what is happening.
+            step_name=headline,
+            steps_done=done,
+            steps_total=total,
+            job_type="auto_builder",
+            chat_id=chat_id,
+            message_id=message_id,
+            # With a chat id the card is keyed `chatjob:<chat_id>` and routed
+            # to the conversation, so tapping it lands on the build.
+            route="chat" if chat_id else "mission-control",
+            # A build reuses ONE card per conversation: a second app in the
+            # same chat must refresh the card rather than be dropped as a
+            # duplicate `mission_started`.
+            refresh_if_started=True,
+            dedup_suffix=f"app:{kind}:{done}/{total}:{percent}",
+        )
+    except Exception:  # noqa: BLE001 - never worth a build
+        logger.debug("[app_html] live-activity push failed", exc_info=True)
 
 
 async def _broadcast(user_id: str, payload: Dict[str, Any]) -> None:
@@ -369,6 +556,14 @@ async def ensure_job(user_id: str, slug: str, title: str) -> Optional[str]:
             channel="app_builder",
             source_kind="app_builder_skill",
             source_id=app_id,
+            # Round 25, item 7. Without this the row's `conversation_id` was
+            # NULL, and every consumer that derives a Live Activity address
+            # from the JOB — `job_mission_id`, and the interrupted-job sweep's
+            # `mission_failed` push — fell back to the raw job id and
+            # addressed a card nobody was looking at. An adopted job has
+            # carried this all along (the `create_job` tool stamps it); a
+            # pipeline-opened one now does too, so the two behave alike.
+            conversation_id=turn_deep_link()[0],
         )
         job = await JobRunner().create_job(
             # Deliberately the EXISTING job type. Every surface that renders
@@ -399,7 +594,8 @@ async def emit_step(
     step_type: str,
     status: str,
     detail: str = "",
-) -> None:
+    recoverable: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Mark one phase and push it to the chat card + activity feed.
 
     ``status`` ∈ {running, done, failed, skipped}. A skip is emitted AT THE
@@ -408,6 +604,22 @@ async def emit_step(
     it. The label is derived from ``step_type`` and ``status`` (see
     :func:`phase_label`) and is NOT a parameter — see the note on
     :data:`_PHASE_WORDS`.
+
+    ``recoverable`` marks a failure the pipeline EXPECTS and is about to act
+    on — the publish gate finding something to fix and handing the model a
+    repair list. Round 25, item 2.
+
+    Before this flag there was exactly one way to say "a check did not pass",
+    and it flipped ``BuildJob.status`` to ``failed`` (below) — the field the
+    web card keys its red "Couldn't build X · Try again" pill on. And it was
+    not for one frame: ``any_failed`` re-scans the whole list on EVERY
+    subsequent emit, so the refused ``verify`` row held the whole job at
+    ``failed`` through the model's read, through its edit, and through the
+    write-back — the entire repair window — until the next ``present_app``
+    took the row back to ``running``. Finding-and-fixing is the designed loop,
+    so on the wire it now reads as work in progress: the row still says what
+    happened, the job stays ``running``, and red is reserved for a build that
+    truly cannot finish.
     """
     if not job_id:
         return
@@ -427,6 +639,16 @@ async def emit_step(
             if not job:
                 return
             steps = json.loads(job.steps_json) if job.steps_json else initial_steps()
+            # Is this the first thing that has happened on this build? Read
+            # BEFORE the row below is mutated. Decides `mission_started` vs
+            # `progress` on the phone card (round 25, item 7) — a build that
+            # opened with `progress` would update a card that was never
+            # started, and one that sent `mission_started` twice would be
+            # dropped as a duplicate.
+            first_transition = not any(
+                isinstance(s, dict) and s.get("status") != "pending"
+                for s in steps
+            )
 
             # ── Retry-in-place (round N correction) ───────────────────
             # Round 23 APPENDED a fresh row when a completed phase
@@ -477,6 +699,14 @@ async def emit_step(
                     earlier["status"] = "skipped"
                     earlier["label"] = phase_label(earlier.get("type") or "", "skipped")
                     earlier.setdefault("detail", "the build moved on without it")
+                    # Round 25: clear the markers too. `step_counts` excludes
+                    # a skipped row from BOTH numbers before it ever reaches
+                    # the `was_done` test, so a force-skipped row that still
+                    # carried the marker was a phase counted in neither — and
+                    # `finish_job`'s restore only inspects pending/running, so
+                    # nothing downstream could repair it.
+                    earlier.pop("was_done", None)
+                    earlier.pop("recoverable", None)
                     earlier["rev"] = int(earlier.get("rev") or 0) + 1
                     logger.warning(
                         "[app_html] step %r abandoned running while %r advanced "
@@ -497,8 +727,23 @@ async def emit_step(
             # rebuild's genuinely-skipped check would still count as done.
             if status == "done":
                 s["was_done"] = True
+            elif status == "failed" and recoverable:
+                # Deliberately KEEPS `was_done`. A gate refusal is a re-check
+                # of a phase that already passed once, so the work it
+                # represents was really done; popping the marker here is what
+                # dropped the measured card from 2/5 to 1/5 at the exact
+                # moment the pipeline started helping. The verdict is carried
+                # by `recoverable` instead, which every surface can read.
+                pass
             elif status in ("failed", "skipped"):
                 s.pop("was_done", None)
+            # The flag is a property of THIS result, so it is rewritten on
+            # every emit — a row that fails recoverably, is repaired, and then
+            # fails terminally must not still be wearing the friendly badge.
+            if status == "failed" and recoverable:
+                s["recoverable"] = True
+            else:
+                s.pop("recoverable", None)
             # Per-row write counter: what lets the clients tell a genuine
             # retry (done → running, HIGHER rev) from a stale poll whose rows
             # predate the frame that started the retry (older rev). Without
@@ -531,8 +776,16 @@ async def emit_step(
             # flipping it back to *running* on a `view_app_file` that is never
             # followed by a `present_app` would leave a finished build
             # spinning forever.
-            any_failed = any(s.get("status") == "failed" for s in steps
-                             if isinstance(s, dict))
+            # A RECOVERABLE failure is not a failing job. It is the gate
+            # doing its job and the model about to act on it, so it must not
+            # reach the field the clients paint red — see the `recoverable`
+            # note in this function's docstring. It still resolves terminal at
+            # `finish_job`: once the build stops, a check that never passed is
+            # a check that failed, and the card says so.
+            any_failed = any(
+                s.get("status") == "failed" and not s.get("recoverable")
+                for s in steps if isinstance(s, dict)
+            )
             if any_failed:
                 job.status = "failed"
                 # Say which phase, in the field the clients are allowed to
@@ -581,22 +834,123 @@ async def emit_step(
             except Exception:
                 logger.debug("[app_html] job_events write failed", exc_info=True)
 
+            completed, total, percent, job.config_json = progress(
+                steps, job.config_json, job_id=job_id,
+            )
             await db.commit()
             job_status = job.status
             job_title = (job.title or "").replace("Build: ", "") or label
-            completed, total = step_counts(steps)
+            headline = _headline(steps, label)
 
-        await _broadcast(user_id, {
+        frame = {
             "type": "job_update",
             "job_id": job_id,
             "name": job_title,
             "status": job_status,
-            "step": label,
+            "step": headline,
             "total_steps": total,
             "completed_steps": completed,
-        })
+            # Round 25, item 8. The server now says what the percentage IS,
+            # rather than leaving three clients to divide and each get it
+            # wrong in its own way. Monotonic and persisted — see `progress`.
+            "percent": percent,
+            # The steps themselves. `job_update` has never carried them, so a
+            # client that had not seen every earlier frame — one that
+            # reconnected, or hydrated a card from history — had a header, a
+            # bar and no rows to put under them.
+            "steps": public_steps(steps),
+        }
+        await _broadcast(user_id, frame)
+        # Round 25, item 7: the same state, on the phone. `mission_started`
+        # only for the very first transition of a build — after that the card
+        # is up and every push is a content-state update.
+        await _push_live_activity(
+            job_id=job_id, title=job_title,
+            kind="mission_started" if first_transition else "progress",
+            headline=headline, done=completed, total=total, percent=percent,
+        )
+        # Returned so a caller watching a LONG tool call can keep the card
+        # moving without going back to the database for every tick — see
+        # `retouch`. Every existing caller ignores this.
+        return frame
     except Exception:
         logger.debug("[app_html] emit_step failed (non-fatal)", exc_info=True)
+    return None
+
+
+def settle_steps(steps: List[Any], *, detail: str) -> List[Any]:
+    """Resolve every unfinished row of a build that has STOPPED. In place.
+
+    Round 23's rule, and now the ONE implementation of it. A phase left
+    ``running`` never reported back — calling it done would invent a result
+    and calling it failed would invent a diagnosis — so it and any untouched
+    ``pending`` row become ``skipped``, with the honest per-phase words from
+    :data:`_PHASE_WORDS` ("Couldn't look at the app here"). A planned phase may
+    be shown as skipped; it may never vanish, which is how the recorded card's
+    seven rows became four at the moment it completed.
+
+    Two exceptions, both about not un-counting finished work:
+
+    * a row mid-RETRY (``was_done``) keeps its last reported result — skipping
+      it is how a card that read 2/5 died reading 1/5;
+    * a ``recoverable`` failure resolves terminal, because "the build is about
+      to fix this" stops being true the moment the build stops (round 25).
+
+    Extracted because the THIRD caller was the one that got it wrong: the
+    interrupted-turn sweep flipped a job's status in a bulk UPDATE and never
+    touched ``steps_json`` at all, so a cancelled build kept its ``running``
+    and ``pending`` rows and rendered as "In progress · 4/7" under a status
+    that was already terminal.
+    """
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        if s.get("status") == "failed" and s.pop("recoverable", None):
+            s.pop("was_done", None)
+            s["rev"] = int(s.get("rev") or 0) + 1
+            continue
+        if s.get("status") in ("pending", "running"):
+            if s.get("was_done"):
+                s["status"] = "done"
+                s["label"] = phase_label(s.get("type") or "", "done")
+            else:
+                s["status"] = "skipped"
+                s["label"] = phase_label(s.get("type") or "", "skipped")
+                s.setdefault("detail", detail)
+            s["rev"] = int(s.get("rev") or 0) + 1
+    return steps
+
+
+async def retouch(
+    user_id: str, frame: Optional[Dict[str, Any]], *, step_type: str,
+    detail: str,
+) -> Optional[Dict[str, Any]]:
+    """Re-send a frame with a fresh ``detail`` on one row. NO database write.
+
+    Round 25, item 1. While ``create_app_file``'s argument streams, the phase
+    it belongs to is genuinely running and genuinely making progress, but
+    nothing has happened that is worth a row transition — the status is
+    unchanged and will be for a minute or more. Writing the job row on every
+    tick to say so would be a heavy write loop for a detail line; not saying
+    anything is the silence this round exists to remove.
+
+    So the card is kept moving from the frame the last real transition already
+    produced. If that frame never arrived (the open failed), there is nothing
+    to retouch and this is a no-op — never a second source of truth.
+    """
+    if not frame:
+        return None
+    detail = (detail or "").strip()[:200]
+    out = dict(frame)
+    rows: List[Dict[str, Any]] = []
+    for s in frame.get("steps") or []:
+        if isinstance(s, dict) and s.get("type") == step_type:
+            s = dict(s)
+            s["detail"] = detail
+        rows.append(s)
+    out["steps"] = rows
+    await _broadcast(user_id, out)
+    return out
 
 
 async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
@@ -631,32 +985,10 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
                 steps = json.loads(job.steps_json) if job.steps_json else []
             except (TypeError, ValueError):
                 steps = []
-            # Round 23. This used to DROP every row still `pending` or
-            # `running` — which is how the recorded card's 7 planned rows
-            # became 4 at the moment of completion, with "Read the app" and
-            # "Look at the app" vanishing without a trace. The rule is now
-            # the brief's: a planned phase may be shown as skipped, never
-            # vanish. A phase left `running` never reported back — calling it
-            # done would invent a result, calling it failed would invent a
-            # diagnosis — so both it and an untouched `pending` row become
-            # `skipped`, with the honest per-phase words from `_PHASE_WORDS`
-            # ("Couldn't look at the app here", "Kept a plain icon for now").
-            for s in steps:
-                if not isinstance(s, dict):
-                    continue
-                if s.get("status") in ("pending", "running"):
-                    if s.get("was_done"):
-                        # Mid-retry at close: the row completed once and the
-                        # re-check never reported back. Its last reported
-                        # result stands — skipping it here is how "2/5" died
-                        # as "1/5", a close un-counting finished work.
-                        s["status"] = "done"
-                        s["label"] = phase_label(s.get("type") or "", "done")
-                    else:
-                        s["status"] = "skipped"
-                        s["label"] = phase_label(s.get("type") or "", "skipped")
-                        s.setdefault("detail", "the build finished without it")
-                    s["rev"] = int(s.get("rev") or 0) + 1
+            # Round 23's rule, now shared with every other close path — see
+            # `settle_steps` for what it does and why it is not inline here
+            # any more.
+            settle_steps(steps, detail="the build finished without it")
             # A build that closes green around a skipped VERIFICATION is the
             # false-success pattern — with the browser shipped in the image
             # this must never fire, so when it does it is an infrastructure
@@ -673,6 +1005,9 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
                     "%s — infrastructure defect (renderer unavailable?)",
                     job_id, ", ".join(skipped_checks),
                 )
+            # `settle_steps` above has already resolved any `recoverable`
+            # failure to a plain one — the loop has stopped, so nothing is
+            # going to fix it — which is what makes this scan terminal.
             if any(isinstance(s, dict) and s.get("status") == "failed"
                    for s in steps):
                 final = "failed"
@@ -680,6 +1015,20 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
             job.status = final
             job.completed_at = datetime.utcnow()
             title = (job.title or "").replace("Build: ", "")
+            done, total, percent, job.config_json = progress(
+                steps, job.config_json, job_id=job_id,
+            )
+            if final == "completed":
+                # Every row that was going to resolve has resolved above, so
+                # a completed build's own arithmetic already reads N/N. This
+                # is belt-and-braces for the one case that would otherwise
+                # show a finished card at 80%: a clamp holding an older,
+                # higher mark cannot exceed 100, and a completed build is by
+                # definition all the way along.
+                percent = 100
+                cfg = dict(job.config_json or {})
+                cfg[_HIGH_WATER_KEY] = 100
+                job.config_json = cfg
             await db.commit()
 
         await _broadcast(user_id, {
@@ -688,9 +1037,23 @@ async def finish_job(user_id: str, job_id: Optional[str]) -> Optional[str]:
             "name": title,
             "status": final,
             "step": phase_label("present", "done") if final == "completed" else "",
-            "total_steps": step_counts(steps)[1],
-            "completed_steps": step_counts(steps)[0],
+            "total_steps": total,
+            "completed_steps": done,
+            "percent": percent,
+            "steps": public_steps(steps),
         })
+        # Round 25, item 7: success (or failure) on the phone, and the card
+        # ends rather than being left up. `end_after_s` lets the completed
+        # state be READ before the card goes — a build that vanishes the
+        # instant it finishes never showed the user that it worked.
+        await _push_live_activity(
+            job_id=job_id, title=title,
+            kind="mission_completed" if final == "completed" else "mission_failed",
+            headline=(phase_label("present", "done") if final == "completed"
+                      else "Couldn't finish this one"),
+            done=done, total=total, percent=percent,
+            body=(f"{title} is ready to open." if final == "completed" else ""),
+        )
     except Exception:
         logger.debug("[app_html] finish_job failed (non-fatal)", exc_info=True)
     return final

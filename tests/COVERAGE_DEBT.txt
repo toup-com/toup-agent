@@ -112,3 +112,6 @@ test_triggers_inbound.py  # STALE: SELECTs TriggerEvent, removed by the unified-
 # the test's own scaffolding is wrong; neither the assertion nor production is:
 test_token_budget.py  # INFRA: stub lacks _meter_web_tool + pins a tail the INJ-2 fence changed (the real bug it found shipped in #431)
 agent/test_voice_context_parity.py  # agent-mode — identities is AGENT_ONLY
+test_r25_build_card_progress.py  # agent-mode: build_jobs are AGENT_ONLY — it drives the REAL emit_step against a real job row, which is the only way the measured non-monotonic sequence (40% → 20% → 17%) can be reproduced at all
+test_r25_build_live_activity.py  # agent-mode: build_jobs are AGENT_ONLY — it opens a real job to prove the Live Activity is addressed by the CONVERSATION (chatjob:<sid>) and not by the raw job id
+test_r25_build_card_on_return.py  # agent-mode: build_jobs are AGENT_ONLY — it compares the live job_update frame against the REST payload for the same row, which needs both to be real

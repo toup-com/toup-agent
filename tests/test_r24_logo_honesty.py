@@ -23,12 +23,14 @@ import pytest
 from app.agent.skills.builtins.app_html import logo, store, vision
 from app.agent.skills.builtins.app_html.store import AppStoreError
 
+# Redrawn for round 25's art direction: absolute path commands, and the
+# subject inside the 14–82 safe area rather than clipped by the frame.
 GOOD = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" '
     'height="96"><rect width="96" height="96" fill="#2B2724"/>'
-    '<path d="M24 60 q12 -20 24 0 t24 0" stroke="#F3EDE4" stroke-width="7" '
-    'fill="none" stroke-linecap="round"/>'
-    '<circle cx="70" cy="40" r="6" fill="#C1443A"/></svg>'
+    '<path d="M20 62 Q34 40 48 54 Q62 68 76 46" stroke="#F3EDE4" '
+    'stroke-width="10" fill="none" stroke-linecap="round"/>'
+    '<circle cx="72" cy="42" r="7" fill="#C1443A"/></svg>'
 )
 
 

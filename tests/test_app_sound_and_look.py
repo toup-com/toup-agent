@@ -232,16 +232,30 @@ def test_every_javascript_sample_in_the_design_skill_parses():
     here = os.path.dirname(os.path.dirname(os.path.abspath(skill_mod.__file__)))
     packaged = os.path.join(
         os.path.dirname(os.path.abspath(skill_mod.__file__)), "DESIGN_SKILL.md")
+    # FIVE `..`, not four: builtins → skills → agent → app → backend → repo.
+    # It was written with four, which resolves to `backend/skills/...` — a path
+    # that does not exist — so `os.path.isfile` below was always False and the
+    # assertion NEVER RAN. This is the guard that sat in the same package as
+    # round 24's edit to DESIGN_SKILL.md and should have caught it drifting;
+    # it could not, and the drift shipped. A check that cannot run is not a
+    # check that passed.
     repo_copy = os.path.abspath(os.path.join(
-        here, "..", "..", "..", "..", "skills", "toup-frontend-design.md"))
+        here, "..", "..", "..", "..", "..", "skills",
+        "toup-frontend-design.md"))
 
     with open(packaged, encoding="utf-8") as fh:
         body = fh.read()
-    if os.path.isfile(repo_copy):
-        with open(repo_copy, encoding="utf-8") as fh:
-            assert fh.read() == body, (
-                "DESIGN_SKILL.md and skills/toup-frontend-design.md have "
-                "drifted — they are meant to be byte-identical")
+    assert os.path.isfile(repo_copy), (
+        f"the repo copy is missing at {repo_copy} — this guard is only a "
+        f"guard while it can actually read both files"
+    )
+    with open(repo_copy, encoding="utf-8") as fh:
+        assert fh.read() == body, (
+            "DESIGN_SKILL.md and skills/toup-frontend-design.md have "
+            "drifted — they are meant to be byte-identical. The PACKAGED copy "
+            "is the one read into the system prompt, so it is authoritative: "
+            "sync the repo copy to it, never the other way round, or the "
+            "cached prefix moves.")
 
     blocks = re.findall(r"```js\n(.*?)```", body, re.DOTALL)
     assert blocks, "the design skill has no JavaScript samples any more"
@@ -467,9 +481,20 @@ def test_a_look_that_did_not_run_leaves_no_tick_on_the_card():
     Caught by driving the real pipeline on a box with no model: the card read
     **"Checked the app looks right · couldn't look at it here"** — the `done`
     label and the reason it had not happened, in the same row, in green. A step
-    that could not run must not carry a label claiming it did, so no terminal
-    step is emitted at all; `finish_job` drops the `running` one, the same way
-    it drops every phase a build did not need.
+    that could not run must not carry a label claiming it did.
+
+    What it must carry INSTEAD changed after this test was written, and the
+    assertion did not follow. It originally expected the row to be left
+    `running` and dropped at close. Round 23 replaced that with the opposite
+    rule — a planned phase may be shown as skipped, never vanish — because
+    dropping rows is how the recorded card's seven steps became four at the
+    moment it completed. The skill now resolves the skip at the moment it is
+    known (`skill.py`, the `else` branch of `if look.ran`), with its own honest
+    words: "Couldn't look at the app here".
+
+    So the invariant under test is unchanged and is what is asserted below: no
+    `done`, ever, for a look that did not happen. The expected sequence is
+    updated to the shipped one. This file has been red on main since round 23.
     """
     import asyncio as _asyncio
     from app.agent.skills.base import SkillContext
@@ -526,8 +551,8 @@ def test_a_look_that_did_not_run_leaves_no_tick_on_the_card():
                 os.environ[key] = value
 
     looks = [status for step, status in emitted if step == "look"]
-    assert looks == ["running"], emitted
-    assert "done" not in looks
+    assert looks == ["running", "skipped"], emitted
+    assert "done" not in looks, "a look that never ran claimed it had"
     # ...and the app was still published: a review that could not run is not a
     # reason to refuse.
     assert ("present", "done") in emitted, emitted

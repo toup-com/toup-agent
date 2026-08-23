@@ -22,8 +22,10 @@ branch, which is why every failure path here returns a string starting with
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
@@ -134,6 +136,56 @@ def _design_guidance() -> str:
     return body.strip()
 
 
+#: How many in-flight tool calls may be tracked at once (round 25). A turn
+#: issues one tool call at a time on every wire we serve, so this is slack for
+#: abandoned streams rather than a real concurrency bound.
+_MAX_LIVE_CALLS = 8
+
+#: A COMPLETE JSON string value for a top-level key, inside a prefix.
+#:
+#: The trailing quote is the point. A tool's arguments arrive as a growing,
+#: usually-invalid JSON prefix, and half a slug is worse than no slug: it
+#: names a different app. Requiring the closing quote means this returns
+#: nothing until the value has actually finished arriving, so a caller can
+#: poll it on every delta and act exactly once. `[^"\\]|\\.` keeps an escaped
+#: quote inside the value from ending it early.
+_JSON_STR_RE_CACHE: Dict[str, "re.Pattern[str]"] = {}
+
+
+def _partial_arg(partial_json: str, key: str) -> str:
+    """The value of ``key``, or ``""`` if it has not fully arrived yet."""
+    pattern = _JSON_STR_RE_CACHE.get(key)
+    if pattern is None:
+        pattern = re.compile(
+            r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"'
+        )
+        _JSON_STR_RE_CACHE[key] = pattern
+    m = pattern.search(partial_json or "")
+    if not m:
+        return ""
+    try:
+        return json.loads(f'"{m.group(1)}"')
+    except ValueError:
+        return ""
+
+
+def _streamed_body_len(partial_json: str) -> int:
+    """How much of the app's own document has streamed so far, in bytes.
+
+    Measured from the opening quote of the ``html`` value to the end of what
+    has arrived — deliberately not the length of the whole buffer, which also
+    carries the slug, the title and the brief and would show a build as
+    already several KB in before a line of the app existed.
+    """
+    marker = _HTML_KEY_RE.search(partial_json or "")
+    if not marker:
+        return 0
+    return max(0, len(partial_json) - marker.end())
+
+
+_HTML_KEY_RE = re.compile(r'"html"\s*:\s*"')
+
+
 def _short(exc: Exception) -> str:
     """A failure, in one clause, for a step's detail line.
 
@@ -241,6 +293,12 @@ class AppHtmlSkill(Skill):
         #: `_pending_changes`: losing the count across a restart costs at most
         #: one extra polish loop.
         self._gate_refusals: Dict[str, int] = {}
+        #: Round 25, items 1 and 5. One entry per tool call whose arguments
+        #: are still arriving, keyed by the provider's call id: the phase it
+        #: opened, the last frame it broadcast (so the card can be kept moving
+        #: without a database write per tick) and how much of the app has
+        #: streamed so far. Dropped when the call executes.
+        self._live_calls: Dict[str, Dict[str, Any]] = {}
         self._design_path: str = design_skill_path()
         # Read ONCE, from the image, in __init__ — before `get_tools()` and
         # before `on_load()`, both of which the loader calls later. The bytes
@@ -625,6 +683,95 @@ class AppHtmlSkill(Skill):
     # ------------------------------------------------------------------
     # Dispatch
     # ------------------------------------------------------------------
+    #: Which phase each tool opens the moment the model starts calling it.
+    #: `present_app` is absent deliberately — its arguments are one slug, so
+    #: it is executing within a token of starting and an extra pre-open would
+    #: be two writes for one transition.
+    _LIVE_PHASE: Dict[str, str] = {
+        "app_html__create_app_file": "create",
+        "app_html__view_app_file": "review",
+        "app_html__edit_app_file": "edit",
+    }
+
+    async def on_tool_input(
+        self, tool_name: str, call_id: str, partial_json: str,
+        ctx: SkillContext,
+    ) -> None:
+        """Open — and then keep moving — the build card while the model is
+        still writing the tool call.
+
+        Round 25, items 1 and 5. The card used to be minted inside `_create`,
+        which runs only once the whole call has arrived; and the whole call is
+        the app. So a build looked like this: a generic "Building your app"
+        spinner, alone, for as long as the document took to write — commonly
+        two minutes — and then, all at once, a finished-looking steps card.
+        Every phase the pipeline reports was reported truthfully; none of it
+        was reported while there was anything to watch.
+
+        Nothing here is new information. `slug` and `title` are the first two
+        properties of the tool's schema and arguments are generated in schema
+        order — the same fact the schema already relies on to get `brief`
+        written before `html`. They are on the wire within a second or so of
+        the model committing to the call; they were simply being buffered in
+        the provider adapter and thrown at us at the end.
+
+        Cheap and idempotent by contract: `ensure_job` is find-or-create, the
+        phase transition is emitted at most once per call, and every tick
+        after that re-sends the frame the transition already produced with a
+        fresh detail (`steps.retouch`) rather than writing the row again.
+        """
+        phase = self._LIVE_PHASE.get(tool_name)
+        if not phase or not call_id:
+            return
+        state = self._live_calls.get(call_id)
+        if state is None:
+            slug = _partial_arg(partial_json, "slug")
+            if not slug:
+                # The identifying field has not finished arriving. There is
+                # nothing to open a card ON yet, and guessing one would be a
+                # card for the wrong app.
+                return
+            try:
+                slug = store.normalise_slug(slug)
+            except (AppStoreError, ValueError):
+                return
+            title = _partial_arg(partial_json, "title") or slug
+            job_id = await steps_mod.ensure_job(ctx.user_id, slug, title)
+            if not job_id:
+                return
+            frame = await steps_mod.emit_step(
+                user_id=ctx.user_id, job_id=job_id, step_type=phase,
+                status="running",
+            )
+            state = {"slug": slug, "job_id": job_id, "phase": phase,
+                     "frame": frame, "written": -1}
+            self._live_calls[call_id] = state
+            # Bounded, and evicted by age rather than by the call completing:
+            # there is no seam that tells a skill a call it watched has
+            # finished (`execute_tool` gets no call id), so an entry left
+            # behind by an abandoned stream would otherwise live for the life
+            # of the process. Each entry holds one frame, and only the most
+            # recent handful can still be receiving deltas.
+            while len(self._live_calls) > _MAX_LIVE_CALLS:
+                self._live_calls.pop(next(iter(self._live_calls)), None)
+
+        if phase != "create":
+            # Only the app's own body is worth a byte counter. An edit's
+            # arguments are a few lines and a view's is a slug.
+            return
+        written = _streamed_body_len(partial_json)
+        # Whole kilobytes only: this fires about once a second and a number
+        # that twitches is harder to read than one that ticks.
+        if written // 1024 == state["written"] // 1024:
+            return
+        state["written"] = written
+        if written <= 0:
+            return
+        state["frame"] = await steps_mod.retouch(
+            ctx.user_id, state["frame"], step_type="create",
+            detail=f"{written // 1024:,} KB written so far",
+        )
+
     async def execute_tool(
         self, tool_name: str, args: Dict[str, Any], ctx: SkillContext,
     ) -> str:
@@ -780,6 +927,10 @@ class AppHtmlSkill(Skill):
             user_id=ctx.user_id, job_id=job_id, step_type="verify",
             status="failed" if report.findings else "done",
             detail=report.summary(),
+            # The tool result below hands the model the parse errors and tells
+            # it to fix them first, so this is the loop working, not a dead
+            # build. Round 25, item 2 — see `emit_step`'s `recoverable`.
+            recoverable=True,
         )
 
         out = (
@@ -1002,6 +1153,9 @@ class AppHtmlSkill(Skill):
             status="failed" if report.findings else "done",
             detail=(report.summary() if report.findings
                     else (reason or f"revision {rec.revision}")),
+            # Same as `_create`: a parse error found on an edit is handed
+            # straight back for repair (round 25, item 2).
+            recoverable=True,
         )
 
         # A deletion has no new text to find, so the proof is the other half:
@@ -1145,6 +1299,12 @@ class AppHtmlSkill(Skill):
             await steps_mod.emit_step(
                 user_id=ctx.user_id, job_id=job_id, step_type="verify",
                 status="failed", detail=report.summary(),
+                # The gate refusing is the designed loop: the model is handed
+                # the errors with real line numbers and told to come back.
+                # Before round 25 this held the WHOLE job at `failed` — through
+                # the model's read, its edit and the write-back — so the card
+                # was a red "Couldn't build" pill for the entire repair.
+                recoverable=True,
             )
             self._gate_refusals[slug] = refusals + 1
             # Not presented, so no app card, no completed job and no "Built"
@@ -1232,6 +1392,10 @@ class AppHtmlSkill(Skill):
                     user_id=ctx.user_id, job_id=job_id, step_type="look",
                     status="failed" if look.problems else "done",
                     detail=look.summary(),
+                    # The visual review finding something to fix is the loop
+                    # too — the raise below hands the model the repair list
+                    # (round 25, item 2).
+                    recoverable=True,
                 )
         else:
             skip_reason = look.reason or "couldn't look at it here"

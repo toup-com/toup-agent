@@ -177,7 +177,8 @@ def repair_file_modes(root: Optional[str] = None) -> int:
     try:
         directories = [root, os.path.join(root, VERSIONS_DIR),
                        os.path.join(root, STATE_DIR),
-                       os.path.join(root, PREVIEWS_DIR)]
+                       os.path.join(root, PREVIEWS_DIR),
+                       os.path.join(root, JUDGED_DIR)]
         # One level under `.versions/` is a directory per slug.
         try:
             vroot = os.path.join(root, VERSIONS_DIR)
@@ -1076,6 +1077,111 @@ def preview_etag(slug: str) -> str:
     etag = hashlib.sha256(png).hexdigest()[:32]
     _preview_etag_cache[path] = (st.st_mtime, st.st_size, etag)
     return etag
+
+
+# ── The judged screenshot (round 25) ──────────────────────────────────
+# The preview above is the app's FACE — the untouched first paint, taken
+# before the gate pressed anything. It is NOT the picture the visual reviewer
+# was shown: that one (`verify.Report.screenshot`) is taken after the start
+# control was pressed, and until this round it existed only in memory for the
+# length of one publish. So a "looks right" verdict could not be checked
+# afterwards by anybody, which is the one property a screenshot-backed verdict
+# is supposed to have.
+#
+# Keyed by the SHA-256 of the exact HTML that was judged, not by slug: the
+# verdict belongs to those bytes, and an app edited twice since would
+# otherwise overwrite the evidence for the verdict that let it ship. An
+# auditor holding the app file can find its picture with one command —
+#
+#     shasum -a 256 ~/apps/<slug>.html      # first 16 hex chars = the name
+#     open ~/apps/.judged/<those 16>.png
+#
+JUDGED_DIR = ".judged"
+#: Same ceiling as the preview: a 390×844 PNG is 40–120 KB.
+MAX_JUDGED_BYTES = 3 * 1024 * 1024
+#: How many judged screenshots the volume keeps, oldest pruned first. Twenty
+#: apps rebuilt a few times each stays under ~10 MB, which is three orders of
+#: magnitude below one `node_modules` — the same budget `MAX_VERSIONS_PER_APP`
+#: is set against. Bounded because this directory is written by every publish
+#: and read by almost none of them.
+MAX_JUDGED_FILES = 60
+
+_JUDGED_DIGEST_RE = re.compile(r"^[0-9a-f]{8,64}$")
+
+
+def judged_digest(html: str) -> str:
+    """The name a judged screenshot is filed under, for `html` as verified."""
+    return hashlib.sha256((html or "").encode("utf-8")).hexdigest()[:16]
+
+
+def judged_path(digest: str) -> str:
+    digest = (digest or "").strip().lower()
+    if not _JUDGED_DIGEST_RE.match(digest):
+        raise AppStoreError(f"invalid judged-screenshot digest: {digest!r}")
+    root = os.path.realpath(apps_root())
+    full = os.path.realpath(os.path.join(root, JUDGED_DIR, digest + ".png"))
+    expected = os.path.join(root, JUDGED_DIR)
+    if os.path.dirname(full) != expected:
+        raise AppStoreError(f"refusing judged path outside the app root: {digest!r}")
+    return full
+
+
+def _prune_judged(directory: str) -> None:
+    """Keep the newest :data:`MAX_JUDGED_FILES`. Best-effort, never raises."""
+    try:
+        entries = []
+        for name in os.listdir(directory):
+            if not name.endswith(".png"):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                entries.append((os.stat(path).st_mtime, path))
+            except OSError:
+                continue
+        for _mtime, path in sorted(entries, reverse=True)[MAX_JUDGED_FILES:]:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    except OSError:
+        logger.debug("[app_html] judged-screenshot prune skipped", exc_info=True)
+
+
+def write_judged(digest: str, png: bytes) -> Optional[str]:
+    """Retain the picture the reviewer was shown. Returns the path, or None.
+
+    Fail-open by contract, exactly like :func:`write_preview`: this is
+    evidence, and evidence is never worth failing a publish over. It also does
+    NOT create the app root — a process verifying HTML that was never stored
+    (a test, a dry run) must not conjure a workspace tree as a side effect.
+    """
+    if not png or len(png) > MAX_JUDGED_BYTES:
+        return None
+    try:
+        path = judged_path(digest)
+        directory = os.path.dirname(path)
+        if not os.path.isdir(os.path.dirname(directory)):
+            return None  # no app root here; nothing to be beside
+        os.makedirs(directory, exist_ok=True)
+        _atomic_write(path, png, prefix=".judged-")
+        _prune_judged(directory)
+        return path
+    except (OSError, AppStoreError):
+        logger.warning("[app_html] could not retain the judged screenshot (%s)",
+                       digest, exc_info=True)
+        return None
+
+
+def read_judged(digest: str) -> Optional[bytes]:
+    try:
+        with open(judged_path(digest), "rb") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+    except (OSError, AppStoreError) as exc:
+        logger.warning("[app_html] judged screenshot unreadable (%s): %s",
+                       digest, exc)
+        return None
 
 
 def edit_app(slug: str, old_string: str, new_string: str) -> Tuple[AppRecord, int]:

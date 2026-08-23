@@ -28,12 +28,18 @@ import pytest
 from app.agent.skills.builtins.app_html import logo, store
 from app.agent.skills.builtins.app_html.logo import IconError
 
+#: A mark drawn to the ROUND 25 spec, and every rule in this file is checked
+#: against it. It was rewritten for round 25 and the diff is the whole item:
+#: it used to be `q…t…` (relative commands, unmeasurable) drawing a subject
+#: from 24 to 94 in a 96 frame — i.e. running off the right edge, which is
+#: what round 20 asked for and what made the library a set of blobs. Now:
+#: absolute commands only, everything inside 14–82, centred on 48,48.
 GOOD = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" '
-    'height="96"><rect width="96" height="96" rx="22" fill="#2F6B3A"/>'
-    '<path d="M24 60 q12 -20 24 0 t24 0" stroke="#F7F4EC" stroke-width="7" '
-    'fill="none" stroke-linecap="round"/>'
-    '<circle cx="70" cy="40" r="6" fill="#C4703A"/></svg>'
+    'height="96"><rect width="96" height="96" fill="#2F6B3A"/>'
+    '<path d="M20 62 Q34 40 48 54 Q62 68 76 46" stroke="#F7F4EC" '
+    'stroke-width="10" fill="none" stroke-linecap="round"/>'
+    '<circle cx="72" cy="42" r="7" fill="#C4703A"/></svg>'
 )
 
 
@@ -346,8 +352,8 @@ def test_gradients_and_none_are_not_stray_colours():
         '<defs><linearGradient id="g"><stop offset="0" stop-color="#2F6B3A"/>'
         '<stop offset="1" stop-color="#C4703A"/></linearGradient></defs>'
         '<rect width="96" height="96" fill="url(#g)"/>'
-        '<circle cx="50" cy="50" r="30" fill="#F7F4EC"/>'
-        '<path d="M10 80 L90 80 L50 20 Z" fill="none" stroke="#C4703A" '
+        '<circle cx="48" cy="48" r="30" fill="#F7F4EC"/>'
+        '<path d="M20 74 L76 74 L48 24 Z" fill="none" stroke="#C4703A" '
         'stroke-width="9"/></svg>')
     assert logo.sanitize_svg(svg, ["#2F6B3A", "#F7F4EC", "#C4703A"])
 
@@ -424,6 +430,358 @@ def test_the_subjects_already_drawn_are_offered_to_the_next_app(apps_dir):
     assert set(logo.subjects_in_use()) == {"mole and mallet", "coins cascading"}
     # ...and an app never competes with itself when it is being redrawn.
     assert logo.subjects_in_use(exclude="a") == ["coins cascading"]
+
+
+# ── 6b. Round 25: the glyph is centred, and that is MEASURED ──────────
+#
+# The art direction reversed here. Round 20 mandated "HUGE SUBJECT — it fills
+# most of the frame and runs off at least one edge, clipped by it. A small
+# object centred with space around it is the failure to avoid." That is what
+# produced the flat blobs: two to four bold shapes stretched until the frame
+# crops them IS a blob. Round 25 asks for the opposite, and — because the
+# repo's own lesson is that a validator with teeth beats a longer prompt —
+# every clause below is a measurement, and every one of these tests watched
+# it reject something.
+
+def _mark(body: str, view: str = "0 0 96 96") -> str:
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{view}" '
+            f'width="96" height="96"><rect width="96" height="96" '
+            f'fill="#2F6B3A"/>{body}</svg>')
+
+
+#: The same subject, drawn once inside the safe area and once bleeding off
+#: the frame the way round 20 asked for. Everything else about them is equal.
+_CENTRED = _mark('<circle cx="48" cy="48" r="27" fill="#F7F4EC"/>'
+                 '<circle cx="59" cy="38" r="10" fill="#C4703A"/>')
+_BLEEDING = _mark('<circle cx="48" cy="48" r="52" fill="#F7F4EC"/>'
+                  '<circle cx="70" cy="26" r="18" fill="#C4703A"/>')
+
+
+def test_the_round_20_bleed_is_now_the_refusal():
+    """The reversal, as one assertion. The bleeding mark is what generation 2
+    was told to draw; it is refused now, and the centred one — identical but
+    for its scale and placement — is accepted."""
+    assert logo.sanitize_svg(_CENTRED) == _CENTRED
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(_BLEEDING)
+    assert "safe area" in str(exc.value)
+
+
+def test_every_generation_2_icon_is_stale(apps_dir):
+    """The redraw of the whole library, and the reason it is needed: every
+    icon on every volume was drawn to the bleed direction."""
+    assert logo.ICON_GENERATION == 3
+    logo._store_icon("snake", GOOD, source="model", title="Snake",
+                     purpose="a snake game")
+    import json as _json
+    for stale_gen in ("1", "2"):
+        meta = logo.read_sidecar("snake")
+        meta["gen"] = stale_gen
+        with open(logo.sidecar_path("snake"), "w", encoding="utf-8") as fh:
+            _json.dump(meta, fh)
+        assert logo.is_stale("snake", title="Snake", purpose="a snake game")
+
+
+@pytest.mark.parametrize("edge,body", [
+    ("left", '<rect x="2" y="30" width="60" height="36" fill="#F7F4EC"/>'
+             '<circle cx="48" cy="48" r="14" fill="#C4703A"/>'),
+    ("right", '<rect x="34" y="30" width="60" height="36" fill="#F7F4EC"/>'
+              '<circle cx="48" cy="48" r="14" fill="#C4703A"/>'),
+    ("top", '<rect x="30" y="1" width="36" height="60" fill="#F7F4EC"/>'
+            '<circle cx="48" cy="48" r="14" fill="#C4703A"/>'),
+    ("bottom", '<rect x="30" y="34" width="36" height="61" fill="#F7F4EC"/>'
+               '<circle cx="48" cy="48" r="14" fill="#C4703A"/>'),
+])
+def test_a_subject_clipped_by_any_of_the_four_edges_is_refused(edge, body):
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(_mark(body))
+    assert "safe area" in str(exc.value), edge
+
+
+def test_a_stroke_paints_outside_its_line_and_that_counts():
+    """A centreline at 15 with a 12-unit stroke reaches 9. Measuring the
+    geometry and ignoring the stroke would call that centred."""
+    ok = _mark('<path d="M22 48 L74 48" stroke="#F7F4EC" stroke-width="12" '
+               'fill="none"/>'
+               '<circle cx="48" cy="48" r="21" fill="#C4703A"/>')
+    assert logo.sanitize_svg(ok) == ok
+    fat = _mark('<path d="M15 48 L81 48" stroke="#F7F4EC" stroke-width="24" '
+                'fill="none"/>'
+                '<circle cx="48" cy="48" r="21" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(fat)
+    assert "safe area" in str(exc.value)
+
+
+def test_a_small_mark_adrift_in_the_ground_is_refused():
+    """The other half of the reversal. "Not bleeding" is not the goal —
+    centred AND filling the safe box is."""
+    tiny = _mark('<circle cx="48" cy="48" r="12" fill="#F7F4EC"/>'
+                 '<circle cx="52" cy="44" r="5" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(tiny)
+    assert "96 frame" in str(exc.value)
+
+
+def test_the_short_axis_floor_is_where_a_bar_becomes_an_object():
+    """The number that moved after looking at the contact sheet, pinned here
+    so it does not drift back. 18 units was arithmetic — 4.5px of a 24px tile
+    — and rendering it showed a dash with no inside. 24 is a shape."""
+    def _bar(height: int) -> str:
+        y = 48 - height / 2
+        return _mark(f'<rect x="14" y="{y}" width="68" height="{height}" '
+                     f'fill="#F7F4EC"/>'
+                     f'<circle cx="48" cy="48" r="{height / 4:.1f}" '
+                     f'fill="#C4703A"/>')
+
+    assert logo.ICON_MIN_GLYPH_SHORT == 24.0
+    with pytest.raises(IconError):
+        logo.sanitize_svg(_bar(18))
+    assert logo.sanitize_svg(_bar(24)) == _bar(24)
+
+
+def test_a_knockout_in_the_ground_colour_is_not_the_mark_running_off():
+    """A crescent, a bite, a gap: all drawn by overpainting in the ground's
+    own colour, and the cutting shape routinely reaches past what the mark
+    shows. It paints nothing, so it is not where the mark runs — refusing it
+    would push the model off the one technique that makes a two-shape subject
+    look drawn rather than stamped."""
+    crescent = _mark('<circle cx="46" cy="46" r="30" fill="#F7F4EC"/>'
+                     '<circle cx="64" cy="34" r="26" fill="#2F6B3A"/>'
+                     '<circle cx="30" cy="66" r="6" fill="#C4703A"/>')
+    assert logo.sanitize_svg(crescent, ["#2F6B3A", "#F7F4EC", "#C4703A"])
+    # The same circle in any OTHER colour paints, so it counts — and it
+    # reaches 90, off the right edge.
+    painted = crescent.replace('r="26" fill="#2F6B3A"', 'r="26" fill="#C4703A"')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(painted, ["#2F6B3A", "#F7F4EC", "#C4703A"])
+    assert "safe area" in str(exc.value)
+
+
+def test_a_subject_shoved_to_one_side_is_refused():
+    off = _mark('<circle cx="32" cy="48" r="18" fill="#F7F4EC"/>'
+                '<rect x="14" y="28" width="40" height="40" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(off)
+    assert "off to one side" in str(exc.value)
+    # It is inside the safe area and it is big enough — only the placement is
+    # wrong, so only the placement rule may speak.
+    assert "safe area" not in str(exc.value)
+
+
+def test_a_relative_path_is_refused_because_it_cannot_be_measured():
+    """What makes the geometry measurable at all — and the rule is in the
+    draw prompt too, so the model can comply rather than guess."""
+    relative = _mark('<path d="M20 62 q14 -22 28 -8 t28 -8" stroke="#F7F4EC" '
+                     'stroke-width="10" fill="none"/>'
+                     '<circle cx="48" cy="48" r="14" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(relative)
+    assert "relative" in str(exc.value)
+    assert "M, L, C" in str(exc.value)
+    # The absolute spelling of a comparable curve is accepted.
+    assert logo.sanitize_svg(GOOD) == GOOD
+
+
+def test_an_exponent_is_not_a_relative_command():
+    """`e` is in [a-z] and is not a path command. Refusing it would reject a
+    drawing for using scientific notation."""
+    exp = _mark('<path d="M20 6.2e1 L76 30 L48 76 Z" fill="#F7F4EC"/>'
+                '<circle cx="48" cy="48" r="12" fill="#C4703A"/>')
+    assert logo.sanitize_svg(exp) == exp
+
+
+def test_a_transform_is_refused():
+    """Not a safety rule — the coordinates of a transformed shape say nothing
+    about where it lands, so the safe area would be measuring fiction."""
+    moved = _mark('<circle cx="48" cy="48" r="27" fill="#F7F4EC" '
+                  'transform="translate(40 0)"/>'
+                  '<circle cx="59" cy="38" r="10" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(moved)
+    assert "transform" in str(exc.value)
+
+
+def test_an_arc_is_bounded_by_its_bulge_not_its_endpoints():
+    """Two endpoints on the same line do not bound an arc between them — a
+    semicircle swings a full radius away from both. Taking the endpoints
+    would wave a mark through that runs to the frame edge."""
+    bulge = _mark('<path d="M6 48 A42 42 0 1 0 90 48" stroke="#F7F4EC" '
+                  'stroke-width="10" fill="none"/>'
+                  '<circle cx="48" cy="40" r="12" fill="#C4703A"/>')
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(bulge)
+    assert "safe area" in str(exc.value)
+    box = logo.measure_glyph(bulge)
+    assert box is not None and box[3] > 85       # the bulge, actually seen
+
+
+def test_the_path_parser_is_right_about_the_commands_that_carry_state():
+    """Every geometry refusal is fiction if this is wrong, so it is pinned
+    directly rather than only through the rules built on it. H and V carry one
+    coordinate and inherit the other; S and T take an IMPLIED control point
+    reflected from the previous curve, and ignoring that reflection turns a
+    curve into a straight line — 12 units of extent that were really there."""
+    def _bbox(d):
+        pts = logo._path_points(d)
+        return (min(p[0] for p in pts), min(p[1] for p in pts),
+                max(p[0] for p in pts), max(p[1] for p in pts))
+
+    assert _bbox("M20 20 H76 V76 H20 Z") == (20, 20, 76, 76)
+    # The T's control point is (34,24) reflected about (48,48) = (62,72), so
+    # the second curve swells to y=60. Read as "no reflection" it would stop
+    # at 48 and the mark would measure smaller than it draws.
+    box = _bbox("M20 48 Q34 24 48 48 T76 48")
+    assert box[0] == 20 and box[2] == 76
+    assert box[1] == pytest.approx(36, abs=0.5)
+    assert box[3] == pytest.approx(60, abs=0.5)
+    # …and the same shape written with an explicit Q agrees with it.
+    assert _bbox("M20 48 Q34 24 48 48 Q62 72 76 48") == pytest.approx(box, abs=0.01)
+
+
+def test_the_frame_is_the_viewbox_whatever_its_units():
+    """A mark drawn in a 0 0 24 24 viewBox is judged on its composition, not
+    refused for its units — otherwise the refusal names the wrong fault and
+    the redraw fixes the wrong thing."""
+    small = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" '
+             'width="96" height="96"><rect width="24" height="24" '
+             'fill="#2F6B3A"/><circle cx="12" cy="12" r="7" fill="#F7F4EC"/>'
+             '<circle cx="15" cy="9" r="2.5" fill="#C4703A"/></svg>')
+    assert logo.sanitize_svg(small) == small
+    bleeding = small.replace('r="7"', 'r="13"')
+    with pytest.raises(IconError):
+        logo.sanitize_svg(bleeding)
+
+
+def test_the_ground_may_declare_its_size_in_any_order():
+    """A correctness bug, not a security one: the old rule was a regex that
+    required width BEFORE height, so a perfectly good ground rect was refused
+    and burned one of three redraw attempts on nothing."""
+    reversed_attrs = _CENTRED.replace('<rect width="96" height="96"',
+                                      '<rect height="96" width="96"')
+    assert logo.sanitize_svg(reversed_attrs) == reversed_attrs
+    # …and the percentage spelling, which already worked, still does.
+    percent = _CENTRED.replace('width="96" height="96" fill="#2F6B3A"',
+                               'width="100%" height="100%" fill="#2F6B3A"')
+    assert logo.sanitize_svg(percent) == percent
+
+
+def test_the_composition_rules_do_not_fail_a_drawing_they_cannot_read():
+    """Fail open, per the module's contract: a look rule that cannot measure
+    has no opinion. The rules that are about SAFETY are not like this."""
+    unreadable = _mark('<path d="M Z" fill="#F7F4EC"/>'
+                       '<path d="" fill="#C4703A"/>')
+    assert logo.measure_glyph(unreadable) is None
+    assert logo.sanitize_svg(unreadable) == unreadable
+    # And specifically: a Z with no moveto before it does not become a point
+    # on the origin, which would refuse the drawing for bleeding off a corner
+    # it never touches.
+    assert logo._path_points("M Z") == []
+
+
+# ── 6c. The SVG gate, where it was walked through ─────────────────────
+
+@pytest.mark.parametrize("body,why", [
+    ('<animateTransform attributeName="transform" type="rotate" />',
+     "animateTransform"),
+    ('<animateMotion path="M0 0 L9 9"/>', "animateMotion"),
+    ('<style>@import url("//evil.example/x.css");</style>', "style @import"),
+    ('<textPath href="#p">hello</textPath>', "textPath"),
+    ('<a xlink:href="javascript:alert(1)"><circle cx="48" cy="48" r="4"/></a>',
+     "javascript: URI"),
+    ('<use href="https://evil.example/x.svg#a"/>', "off-origin use"),
+    ('<rect x="30" y="30" width="20" height="20" '
+     'style="fill:url(//evil.example/x.svg#f)"/>', "CSS url()"),
+])
+def test_the_gate_no_longer_has_these_holes(body, why):
+    """All four were confirmed by execution before they were fixed:
+
+    * ``animate\\b`` does not match ``<animateTransform`` — the ``\\b``
+      between "e" and "T" is not a word boundary, so the whole SMIL family
+      except bare ``<animate>`` walked through. Same bug for ``<textPath>``.
+    * ``<style>`` was not in the forbidden list at all, and the reference
+      rule only looked at href/src, never at CSS ``url()`` — so
+      ``@import url("//…")`` was a clean pass.
+    * the reference rule wanted ``//`` or ``data:`` specifically, and
+      ``javascript:`` is neither.
+    """
+    with pytest.raises(IconError):
+        logo.sanitize_svg(_CENTRED.replace("</svg>", body + "</svg>"))
+
+
+def test_a_stylesheet_is_refused_even_with_nothing_in_it_to_load():
+    """Found by mutation: deleting `style` from the forbidden tags failed no
+    test, because the @import case above was being caught by the url() rule
+    instead. Both rules are wanted — an icon carries no stylesheet at all,
+    and that is the half that holds when a reference is written in a form
+    the url() rule does not recognise."""
+    styled = _CENTRED.replace(
+        "</svg>", "<style>circle{fill:#C4703A}</style></svg>")
+    with pytest.raises(IconError):
+        logo.sanitize_svg(styled)
+
+
+def test_a_gradient_is_still_named_by_url_and_that_is_fine():
+    """The url() rule has to let through the one url() a drawing needs, or
+    every gradient is a refusal."""
+    grad = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">'
+            '<defs><linearGradient id="g"><stop offset="0" stop-color="#2F6B3A"/>'
+            '<stop offset="1" stop-color="#C4703A"/></linearGradient></defs>'
+            '<rect width="96" height="96" fill="url(#g)"/>'
+            '<circle cx="48" cy="48" r="28" fill="#F7F4EC"/>'
+            '<circle cx="58" cy="38" r="10" fill="#C4703A"/></svg>')
+    assert logo.sanitize_svg(grad, ["#2F6B3A", "#F7F4EC", "#C4703A"]) == grad
+
+
+def test_the_holding_mark_obeys_the_spec_it_is_the_floor_of():
+    """A spec its own fallback violates has never been checked end to end.
+    Round 20's bands ran x=0 to x=96 — straight through the safe area the
+    designed marks are now held to."""
+    for pal in ([], ["#1E2E1C", "#E2703A", "#F4F1E6"],
+                ["#0E1424", "#18203A", "#E8EAF2", "#8A93AC", "#E3A857"]):
+        svg = logo.fallback_icon("x", "X", pal)
+        assert logo.sanitize_svg(svg, pal or None) == svg
+        box = logo.measure_glyph(svg)
+        assert box is not None
+        assert box[0] >= logo.ICON_SAFE_MIN and box[2] <= logo.ICON_SAFE_MAX
+
+
+def test_the_holding_mark_uses_the_app_s_accent():
+    """The palette defect one layer away: on a dark app the middle colour by
+    luminance is `--muted`, so the accent appeared nowhere and the mark was
+    grey on near-black."""
+    dark = ["#0E1424", "#18203A", "#E8EAF2", "#8A93AC", "#E3A857"]
+    assert "#E3A857" in logo.fallback_icon("sleep", "Sleep", dark)
+
+
+def test_a_refusal_is_written_to_be_handed_back(apps_dir, monkeypatch):
+    """Every new rule's message goes into draw_mark's retry prompt verbatim,
+    so it has to name the fault AND the fix."""
+    seen = []
+
+    async def _ask(system, user, **_k):
+        seen.append(user)
+        return _BLEEDING if len(seen) == 1 else GOOD
+
+    monkeypatch.setattr(logo, "_ask", _ask)
+    svg = _run(logo.draw_mark(user_id="u", title="Snake", scene="A snake.",
+                              palette=["#2F6B3A", "#F7F4EC", "#C4703A"]))
+    assert svg == GOOD
+    assert "REJECTED" in seen[1]
+    assert "safe area" in seen[1]
+    assert "14" in seen[1] and "82" in seen[1]
+
+
+def test_the_draw_prompt_asks_for_what_the_validator_measures():
+    """A rule the prompt never states is a rule the model can only discover
+    by being refused three times and falling back to bands."""
+    prompt = logo._DRAW_SYSTEM
+    assert "ABSOLUTE path commands only" in prompt
+    assert "14,14 to 82,82" in prompt
+    assert "transform=" in prompt
+    # …and the round-20 direction is gone from it, not merely contradicted.
+    assert "runs off at least one edge" not in prompt
+    assert "HUGE SUBJECT" not in prompt
 
 
 def test_a_slug_cannot_escape_the_icon_directory(apps_dir):
@@ -560,3 +918,98 @@ def test_a_drawing_that_never_complies_falls_back_rather_than_shipping(apps_dir,
     monkeypatch.setattr(logo, "_ask", _ask)
     assert _run(logo.draw_mark(user_id="u", title="S", scene="A snake.",
                                palette=["#2F6B3A", "#F7F4EC"])) is None
+
+
+# ── Round 25 follow-up: three holes an audit found in the geometry rule ──
+#
+# The measurer was right about geometry and wrong about what counts AS the
+# mark. All three of these passed every composition rule while being obviously
+# not an app icon, and the fourth was the opposite — a legitimate mark refused
+# for something that is never drawn.
+
+_P = ["#111111", "#4488ff", "#88ccff"]
+_G = '<rect width="96" height="96" fill="#111111"/>'
+_GLYPH = ('<circle cx="48" cy="48" r="26" fill="#4488ff"/>'
+          '<rect x="34" y="34" width="28" height="28" fill="#88ccff"/>'
+          '<path d="M30 62 L48 30 L66 62 Z" fill="#4488ff"/>')
+_SPECK = ('<circle cx="48" cy="48" r="3" fill="#4488ff"/>'
+          '<rect x="46" y="46" width="4" height="4" fill="#88ccff"/>'
+          '<path d="M46 50 L48 46 L50 50 Z" fill="#4488ff"/>')
+
+
+def _svg(inner: str) -> str:
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" '
+            f'width="96" height="96">{inner}</svg>')
+
+
+def test_an_invisible_spacer_cannot_size_a_speck_into_a_glyph():
+    """`fill="none"` with no stroke paints nothing, but it has geometry — so
+    it measured like a shape. A 68x68 spacer plus a 3-unit dot satisfied the
+    safe-area, size AND centring rules at once, while being a dot."""
+    with pytest.raises(IconError):
+        logo.sanitize_svg(
+            _svg(_G + '<rect x="14" y="14" width="68" height="68" fill="none"/>'
+                 + _SPECK), _P)
+
+
+def test_specks_in_opposite_corners_are_not_a_centred_mark():
+    """Every size rule measured the UNION of the shapes, and a union is not a
+    mark: two 2-unit specks at opposite corners of the safe box measure 68x68,
+    dead centre. The largest single shape has to carry the mark."""
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(_svg(
+            _G + '<circle cx="16" cy="16" r="2" fill="#4488ff"/>'
+            '<circle cx="80" cy="80" r="2" fill="#88ccff"/>'
+            '<rect x="47" y="47" width="2" height="2" fill="#4488ff"/>'), _P)
+    assert "biggest shape" in str(exc.value)
+
+
+def test_a_definition_is_not_a_drawing():
+    """Shapes inside `<defs>`/`<clipPath>` are never painted where they are
+    written. Measuring them refused a perfectly centred mark because of a
+    4-unit rect in a clip path — a FALSE refusal, which is the expensive kind:
+    three of those and the app falls back to the plain holding bands."""
+    logo.sanitize_svg(_svg(
+        '<defs><rect x="0" y="0" width="4" height="4" fill="#4488ff"/></defs>'
+        + _G + _GLYPH), _P)
+
+
+def test_a_ground_that_exists_only_inside_a_mask_is_not_a_ground():
+    """The same blindness in the other direction: a full-frame rect inside a
+    `<mask>` satisfied the full-bleed-ground check for a drawing with no
+    ground at all."""
+    with pytest.raises(IconError) as exc:
+        logo.sanitize_svg(_svg(
+            '<mask id="m"><rect width="96" height="96" fill="#fff"/></mask>'
+            + _GLYPH), _P)
+    assert "full-bleed ground" in str(exc.value)
+
+
+def test_use_is_refused_because_it_draws_where_nothing_measured():
+    """`<use href="#id" x=... y=...>` re-draws a definition at an offset of its
+    own, so the geometry scan measures it where it was WRITTEN rather than
+    where it lands — the one way left to place a glyph the validator cannot
+    see."""
+    with pytest.raises(IconError):
+        logo.sanitize_svg(
+            _svg(_G + _GLYPH + '<use href="#x" x="40" y="40"/>'), _P)
+
+
+def test_none_of_this_refuses_an_ordinary_good_mark():
+    """The check that matters most: an over-strict validator is worse than a
+    loose one, because `draw_mark` gets MAX_DRAW_ATTEMPTS tries and then the
+    app degrades to the holding bands."""
+    logo.sanitize_svg(_svg(_G + _GLYPH), _P)
+    # A knockout crescent — a shape in the ground's own colour, which is how a
+    # bite or a gap is drawn, and which legitimately reaches past the mark.
+    logo.sanitize_svg(_svg(
+        _G + '<circle cx="48" cy="48" r="28" fill="#4488ff"/>'
+        '<circle cx="58" cy="40" r="22" fill="#111111"/>'
+        '<rect x="30" y="66" width="36" height="10" fill="#88ccff"/>'), _P)
+    # A gradient, defined in `<defs>` and referenced by the glyph.
+    logo.sanitize_svg(_svg(
+        '<defs><linearGradient id="g"><stop stop-color="#4488ff"/>'
+        '<stop offset="1" stop-color="#88ccff"/></linearGradient></defs>'
+        + _G + '<circle cx="48" cy="48" r="27" fill="url(#g)"/>'
+        '<rect x="36" y="36" width="24" height="24" fill="#88ccff"/>'
+        '<path d="M32 64 L48 32 L64 64 Z" fill="#4488ff"/>'), _P)

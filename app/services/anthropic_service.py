@@ -517,6 +517,23 @@ class AnthropicService:
                                 yield StreamEvent(type="thinking", text=delta.thinking)
                             elif delta.type == "input_json_delta":
                                 input_json_buf += delta.partial_json
+                                # Round 25. `tool_use_input` has been in this
+                                # class's `type` docstring since it was
+                                # written and nothing has ever emitted it, so
+                                # the arguments of a long tool call were
+                                # invisible until the call completed. For a
+                                # tool whose argument IS the work — the app
+                                # builder writes a whole document into one
+                                # string — that is minutes of silence. The
+                                # increment is what travels; the runner
+                                # accumulates.
+                                if delta.partial_json:
+                                    yield StreamEvent(
+                                        type="tool_use_input",
+                                        tool_name=current_tool_name,
+                                        tool_id=current_tool_id,
+                                        text=delta.partial_json,
+                                    )
 
                         elif event.type == "content_block_stop":
                             if current_tool_name:

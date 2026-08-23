@@ -149,6 +149,35 @@ class Skill(abc.ABC):
         """Called on shutdown / hot-reload."""
         pass
 
+    async def on_tool_input(
+        self,
+        tool_name: str,
+        call_id: str,
+        partial_json: str,
+        ctx: "SkillContext",
+    ) -> None:
+        """One of this skill's tools is being CALLED — arguments still arriving.
+
+        Round 25. Every other seam in this class fires when a tool call is
+        COMPLETE. That is too late for a tool whose argument is the work: the
+        app builder's ``create_app_file`` carries the entire 10–60 KB document
+        as a string, so the model spends minutes emitting it and the pipeline
+        does not exist until the last byte lands. The user watched a bare
+        spinner for two minutes with nothing under it.
+
+        ``partial_json`` is the raw, still-growing JSON of the tool's arguments
+        — usually invalid, because it is a prefix. Arguments are generated in
+        schema order (this repo already depends on that: ``brief`` is declared
+        before ``html`` precisely so the plan is written before the code), so
+        the small identifying fields land in the first tokens and a skill can
+        open its own progress card immediately.
+
+        Called repeatedly as the arguments grow; a skill must be cheap and
+        idempotent here. Never raises to the runner: the loader swallows
+        everything, because a progress hint is never worth a turn.
+        """
+        return None
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

@@ -182,6 +182,12 @@ class Report:
     #: JS to run. The reason makes a dead gate legible on the card itself,
     #: where an operator actually looks, instead of only in a container log.
     downgrade_reason: Optional[str] = None
+    #: Where `screenshot` was kept on disk, when it was. Round 25: the picture
+    #: the visual reviewer is shown used to live only in memory for the length
+    #: of one publish, so a "looks right" verdict could never be checked
+    #: afterwards. Best-effort — None means nothing was retained, never that
+    #: nothing was judged (`screenshot` is the answer to that).
+    judged_path: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -259,6 +265,19 @@ def find_browser_bin() -> Optional[str]:
 
 # ── Script extraction ─────────────────────────────────────────────────
 
+#: Longest a downgrade reason may be. It is rendered inside another sentence
+#: on the user's card ("the code checks out — couldn't open it (…)"), so a
+#: 120-character URL or a stack-shaped exception line has to be cut somewhere.
+_REASON_MAX = 58
+
+
+def _clip(text: str) -> str:
+    """One clause, short enough for a card. Shared so every downgrade reason
+    is cut at the same place (round 25 added the third caller)."""
+    text = (text or "").strip()
+    return (text[:_REASON_MAX - 1] + "…") if len(text) > _REASON_MAX else text
+
+
 def _downgrade_reason_of(e: BaseException) -> str:
     """The exception, as one clause a card can carry.
 
@@ -274,7 +293,7 @@ def _downgrade_reason_of(e: BaseException) -> str:
         return "no browser on this host"
     if isinstance(e, ImportError):
         return "playwright not installed"
-    return (text[:57] + "…") if len(text) > 58 else (text or type(e).__name__)
+    return _clip(text) or type(e).__name__
 
 
 def _downgrade(report: "Report", pass_name: str) -> None:
@@ -1015,6 +1034,38 @@ def layout_enabled() -> bool:
     )
 
 
+def keep_judged_enabled() -> bool:
+    """Off only if an operator turns it off, like the gates themselves."""
+    return (os.environ.get("TOUP_APP_KEEP_JUDGED", "1") or "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _retain_judged(html: str, png: Optional[bytes]) -> Optional[str]:
+    """Keep the picture the visual reviewer will be shown, beside the app.
+
+    Round 25. Everything else about the look was already honest — `Look.ran`,
+    the skip reasons, the downgrade wording — but the evidence itself was
+    thrown away at the end of the publish, so nobody could ever go back and
+    ask whether the reviewer's "looks right" was right. The screenshot is
+    filed under the SHA-256 of the HTML that was judged, so a verdict stays
+    attached to the exact bytes it was given rather than to a slug whose file
+    has moved on since.
+
+    Best-effort in every direction: a store that will not import, a root that
+    does not exist, a disk that is full — all of them return None and none of
+    them are worth failing a build over. This function must never raise.
+    """
+    if not png or not keep_judged_enabled():
+        return None
+    try:
+        from app.agent.skills.builtins.app_html import store
+        return store.write_judged(store.judged_digest(html), png)
+    except Exception:  # noqa: BLE001 - evidence is never worth a build
+        logger.debug("[app_html] judged screenshot not retained", exc_info=True)
+        return None
+
+
 # ── Did the app actually make a sound? ────────────────────────────────
 
 def audio_findings(state: Optional[dict]) -> List[Finding]:
@@ -1290,6 +1341,16 @@ async def _smoke(html: str, report: Report) -> Report:
             "its result", blocked[0],
         )
         _downgrade(report, "runtime")
+        # And SAY so on the card. Round 25: this was the third downgrade path
+        # and the only one that left `downgrade_reason` unset, so a build whose
+        # library never arrived produced the bare "the code checks out" —
+        # exactly the ambiguity the field was added to end (see its docstring).
+        # It also kept `skill.py`'s substitution from ever firing: that guard
+        # only replaces the look row's "no screenshot was captured" when a
+        # reason exists, so the card blamed the renderer for a run in which the
+        # renderer was fine. Not exotic: an app runs under `default-src 'self'`
+        # on an opaque origin, so any subresource it fetches can land here.
+        report.downgrade_reason = f"couldn't reach {_clip(blocked[0])}"
         # The picture goes too. A screenshot of a page whose stylesheet never
         # arrived would be handed to the visual review as though it were the
         # app, and every finding it produced would be about this container's
@@ -1334,6 +1395,14 @@ async def verify_app(html: str, *, deep: bool = True) -> Report:
     report.audio = deep_report.audio
     report.pressed_start = deep_report.pressed_start
     report.downgrade_reason = deep_report.downgrade_reason
+    # Keep the picture the reviewer is about to be shown. Deliberately here
+    # and not inside `_smoke`: this is the shot that survives the downgrade
+    # rules above, i.e. the one that will actually be judged, and retaining a
+    # screenshot the caller was never given would be evidence for a verdict
+    # nobody reached.
+    report.judged_path = _retain_judged(html, report.screenshot)
+    if report.judged_path:
+        logger.info("[app_html] judged screenshot kept at %s", report.judged_path)
     if "runtime" not in report.ran:
         # The hint scan lived inside the browser pass, so a browserless fleet
         # (the current one: no playwright mount, Brave Search API is the

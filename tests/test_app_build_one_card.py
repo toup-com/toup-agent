@@ -83,10 +83,17 @@ async def test_the_pipeline_adopts_the_turns_job_instead_of_adding_one(test_user
     assert job.layer == 1
     assert job.app_id == steps_mod.app_id_for(test_user_id, "nokia-snake-classic")
     steps = json.loads(job.steps_json)
-    # `STEP_TYPES` is a list of phase names since round 18 — the labels that
-    # used to ride alongside them moved into `phase_label`, because a caller
-    # being able to supply its own is how `9299 bytes` became a step's name.
-    assert [s["type"] for s in steps] == list(steps_mod.STEP_TYPES)
+    # The adopted row is re-seeded with the PLAN, which since round 23 is the
+    # walk every build makes (`PLANNED_TYPES`) and not the full phase
+    # vocabulary (`STEP_TYPES`). `review`/`edit` are appended by `emit_step`
+    # at the moment they happen — a pristine build never enters them, and
+    # planning them up front is what made the recorded card open with two grey
+    # rows guaranteed to vanish ("7 steps became 4").
+    #
+    # This assertion still named STEP_TYPES and had been red on main since
+    # round 23 shipped; it was asserting the contract that round deliberately
+    # replaced. `test_r23_step_semantics.py` already encodes the correct one.
+    assert [s["type"] for s in steps] == list(steps_mod.PLANNED_TYPES)
     assert (job.config_json or {}).get("adopted_by") == "app_html"
 
 

@@ -131,6 +131,18 @@ class JobResponse(BaseModel):
     required_action: Optional[Dict[str, Any]] = None
     progress_step: Optional[int] = None
     progress_total: Optional[int] = None
+    # ── The build card's arithmetic, round 25 item 6 ─────────────────
+    # The live `job_update` frame carries `completed_steps`/`total_steps`/
+    # `percent`; this payload carried `steps` plus the unrelated
+    # `progress_step`/`progress_total` columns, and left the client to derive
+    # the rest. So the card a user watched live and the card they came back to
+    # were computed by two different rules and could not be reconciled — one
+    # of them was always a guess. These three are the SAME numbers from the
+    # SAME function (`app_html.steps.progress`), so coming back is a re-read
+    # rather than a re-derivation.
+    completed_steps: Optional[int] = None
+    total_steps: Optional[int] = None
+    percent: Optional[int] = None
     archived_at: Optional[str] = None
     paused_at: Optional[str] = None
     resume_after: Optional[str] = None
@@ -271,6 +283,34 @@ def _taxonomy_fields(job: BuildJob) -> Dict[str, Any]:
     return {"error_class": verdict.error_class, "user_message": verdict.user_message}
 
 
+def _progress_fields(steps: List[Dict[str, Any]], job: BuildJob) -> Dict[str, Any]:
+    """The build card's counts and percent, by the one shared rule.
+
+    Round 25, item 6. Deliberately READ-ONLY: it reads the persisted
+    high-water mark out of ``config_json`` so this payload can never undercut
+    the last live frame the user saw, but it does not write one back — a GET
+    must not advance a build's state, and two clients polling would otherwise
+    race each other's marks.
+
+    Fail-open, like every other reader here: a job whose steps cannot be
+    counted returns nothing for these three fields rather than failing the
+    request. They are ``Optional`` for exactly that reason, and because a
+    non-build job (an agent task, a routine) has no such arithmetic.
+    """
+    try:
+        from app.agent.skills.builtins.app_html.steps import progress
+        done, total, percent, _ = progress(
+            steps, getattr(job, "config_json", None) or {}, job_id=job.id,
+        )
+        if total <= 0:
+            return {}
+        return {"completed_steps": done, "total_steps": total,
+                "percent": percent}
+    except Exception:  # noqa: BLE001 - a count is never worth the payload
+        logger.debug("[apps] job progress fields unavailable", exc_info=True)
+        return {}
+
+
 def _job_to_response(job: BuildJob) -> JobResponse:
     """Convert BuildJob model to response."""
     steps = []
@@ -314,6 +354,7 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         **_taxonomy_fields(job),
         progress_step=getattr(job, 'progress_step', None),
         progress_total=getattr(job, 'progress_total', None),
+        **_progress_fields(steps, job),
         archived_at=(
             job.archived_at.isoformat() if getattr(job, 'archived_at', None) else None
         ),

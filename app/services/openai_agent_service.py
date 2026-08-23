@@ -452,6 +452,18 @@ class OpenAIAgentService:
                                     )
                                 if tc_delta.function.arguments:
                                     tc["arguments"] += tc_delta.function.arguments
+                                    # Round 25, same as the Responses wire and
+                                    # Anthropic: pass the increment on so a
+                                    # skill can react while a long argument is
+                                    # still arriving. Kept in step across all
+                                    # three so a channel's behaviour does not
+                                    # depend on which wire served the turn.
+                                    yield StreamEvent(
+                                        type="tool_use_input",
+                                        tool_name=tc["name"],
+                                        tool_id=tc["id"],
+                                        text=tc_delta.function.arguments,
+                                    )
 
                 # After stream ends, emit tool_use_end for each completed tool call
                 for idx in sorted(tool_calls_in_progress):
@@ -869,7 +881,22 @@ class OpenAIAgentService:
                     elif ev_type == "response.function_call_arguments.delta":
                         tracker = fn_calls.get(getattr(ev, "item_id", "") or "")
                         if tracker is not None:
-                            tracker["arguments"] += getattr(ev, "delta", "") or ""
+                            _delta = getattr(ev, "delta", "") or ""
+                            tracker["arguments"] += _delta
+                            # Round 25. THIS is the live path — gpt-5.6-* is
+                            # the fleet default and it is Responses-only, so
+                            # every real app build streams its arguments right
+                            # here and they were accumulated in silence. The
+                            # wire has always carried them; we simply never
+                            # passed them on. See `Skill.on_tool_input`.
+                            if _delta:
+                                emitted_any = True
+                                yield StreamEvent(
+                                    type="tool_use_input",
+                                    tool_name=tracker["name"],
+                                    tool_id=tracker["call_id"],
+                                    text=_delta,
+                                )
 
                     elif ev_type == "response.function_call_arguments.done":
                         tracker = fn_calls.get(getattr(ev, "item_id", "") or "")

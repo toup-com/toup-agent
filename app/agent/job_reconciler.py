@@ -218,6 +218,15 @@ async def _settle_unpublished_build(
                 st = s.get("status")
                 if st == "failed":
                     any_failed = True
+                    # Round 25, item 2. `recoverable` means "the gate found
+                    # something and the build is about to fix it". This settle
+                    # only runs because the build STOPPED, so nothing is going
+                    # to fix it — leaving the badge on would paint a friendly
+                    # in-progress row under a terminal status. Same resolution
+                    # `finish_job` performs on its own close path.
+                    if s.pop("recoverable", None):
+                        s.pop("was_done", None)
+                        s["rev"] = int(s.get("rev") or 0) + 1
                 elif st == "running" and s.get("was_done"):
                     # A row mid-RETRY when the turn died was already done once
                     # (`was_done`, stamped by emit_step). Restoring it — the
@@ -265,12 +274,16 @@ async def _settle_unpublished_build(
             # numbers (steps.step_counts), or this closing frame disagrees
             # with the card that watched the build live.
             try:
-                from app.agent.skills.builtins.app_html.steps import step_counts
-                done, total = step_counts(steps)
+                from app.agent.skills.builtins.app_html.steps import progress
+                # Round 25, item 8: the same monotonic percent the live frames
+                # carried, read off the same persisted high-water mark, so the
+                # closing frame cannot undercut the last one the user saw.
+                done, total, percent, _cfg = progress(steps, cfg, job_id=job_id)
             except Exception:  # noqa: BLE001 - arithmetic drift beats a failed settle
                 total = len(steps)
                 done = sum(1 for s in steps
                            if isinstance(s, dict) and s.get("status") == "done")
+                percent = 0
     except Exception:  # noqa: BLE001 - a failed settle leaves the reaper's net
         logger.warning("[job_reconciler] build settle failed for %s",
                        job_id[:8], exc_info=True)
@@ -284,6 +297,9 @@ async def _settle_unpublished_build(
             "status": final,
             "total_steps": total,
             "completed_steps": done,
+            # Round 25: one frame shape for a build card, live or settled.
+            "percent": percent,
+            "steps": [s for s in steps if isinstance(s, dict)],
         })
     except Exception:  # noqa: BLE001 - the DB row is already honest
         logger.debug("[job_reconciler] build settle broadcast failed",

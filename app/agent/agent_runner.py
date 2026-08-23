@@ -775,6 +775,106 @@ def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
         return 0.0
 
 
+#: Live tool-argument dispatch: how often one call may reach its skill.
+#:
+#: The first few increments go straight through — the identifying fields of a
+#: tool call arrive in its first tokens (arguments are generated in schema
+#: order), and the whole point is to open a progress card at once rather than
+#: two minutes later. After that it settles to once a second, because the rest
+#: of a long argument is body text and a skill that touches a database on
+#: every delta would be a worse problem than the silence it replaced.
+_TOOL_INPUT_EAGER_DELTAS = 6
+_TOOL_INPUT_MIN_INTERVAL_S = 1.0
+
+
+async def _settle_build_steps(db: Any, job_id: str) -> None:
+    """Resolve a terminalised build's step rows. Round 25, item 6.
+
+    ``_close_interrupted_jobs`` flips a job's status in one bulk UPDATE and
+    never touches ``steps_json``, so an app build cancelled by a dying turn
+    kept every ``running`` and ``pending`` row exactly as it was. The card
+    then read "In progress · 4/7 steps" underneath a status that was already
+    terminal — the false "didn't finish" snapshot a returning user saw, with
+    numbers that could not be squared with the state beside them.
+
+    Uses the pipeline's own settle so this path cannot drift from the two that
+    were already right (``finish_job`` and the reconciler). Caller commits;
+    best-effort, because a tidy card is not worth failing a close.
+    """
+    try:
+        from app.agent.skills.builtins.app_html.steps import settle_steps
+        from app.db.models import BuildJob as _BJ
+        job = await db.get(_BJ, job_id)
+        if job is None or not job.steps_json:
+            return
+        try:
+            steps = json.loads(job.steps_json)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(steps, list) or not steps:
+            return
+        job.steps_json = json.dumps(
+            settle_steps(steps, detail="the build stopped before this ran")
+        )
+    except Exception:  # noqa: BLE001 - never worth a failed close
+        logger.debug("[job-finalize] could not settle build steps for %s",
+                     job_id, exc_info=True)
+
+
+async def _dispatch_tool_input(
+    skill_loader: Any,
+    *,
+    tool_name: str,
+    call_id: str,
+    partial_json: str,
+    user_id: str,
+    session_id: str,
+    state: Dict[str, Any],
+) -> None:
+    """Hand a still-growing tool argument to the skill that owns the tool.
+
+    Round 25 (items 1 and 5). ``tool_use_start`` gives a tool's NAME the
+    moment the model commits to calling it, but its arguments used to be
+    buffered in the provider adapter and revealed only when the call was
+    complete. For ``app_html__create_app_file`` — whose argument is the entire
+    app — that is the whole build: the card could not exist until the work was
+    already done, so the user got a bare "Building your app" spinner with no
+    steps under it for as long as the document took to write.
+
+    Fail-open and best-effort in every direction: no skill loader, an unknown
+    tool, a throwing hook, a cancelled turn — all are silently nothing. This
+    runs inside the token loop on an open stream, and nothing it could learn
+    is worth interrupting a response.
+    """
+    if not skill_loader or not call_id:
+        return
+    try:
+        if not skill_loader.is_skill_tool(tool_name):
+            return
+    except Exception:  # noqa: BLE001
+        return
+    seen = state.setdefault("counts", {})
+    last = state.setdefault("last", {})
+    n = seen.get(call_id, 0) + 1
+    seen[call_id] = n
+    now = time.monotonic()
+    if n > _TOOL_INPUT_EAGER_DELTAS:
+        if now - last.get(call_id, 0.0) < _TOOL_INPUT_MIN_INTERVAL_S:
+            return
+    last[call_id] = now
+    try:
+        from app.agent.skills.base import SkillContext
+        await skill_loader.on_tool_input(
+            tool_name, call_id, partial_json,
+            SkillContext(user_id=user_id or "", session_id=session_id or ""),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - a progress hint never kills a turn
+        logger.debug("[AGENT] tool-input dispatch failed for %s", tool_name,
+                     exc_info=True)
+
+
 def _scrub_tool_descriptions(tool_defs: list) -> list:
     """Return a copy of the tool-def list with provider/model/stack names
     removed from every human-readable ``description`` (top-level + nested
@@ -1236,6 +1336,8 @@ class AgentRunner:
                     if row:
                         closed.append((row[0], row[1] or "", row[2],
                                        row[3] if isinstance(row[3], dict) else {}))
+                        if not parked:
+                            await _settle_build_steps(db, jid)
                 if closed and parked:
                     # The resume path matches on this, so a job parked by the
                     # interrupted path is closable by an approval just like one
@@ -2618,6 +2720,13 @@ class AgentRunner:
             text_buf = ""
             pending_tool_calls: List[Dict[str, Any]] = []
             stop_reason = ""
+            # Round 25: tool arguments as they stream, per in-flight call id.
+            # Scoped to this LLM call — dropped at `tool_use_end` and rebuilt
+            # each iteration — so a long run cannot accumulate the bodies of
+            # every tool it has ever called. `_ti_state` carries only the
+            # throttle bookkeeping (see _dispatch_tool_input).
+            _ti_parts: Dict[str, List[str]] = {}
+            _ti_state: Dict[str, Any] = {}
             # A8-2: one compact-and-retry per LLM call on context overflow.
             _overflow_compacted = False
             # Round 4: this round's LLM timing (for the reasoning step event).
@@ -2736,7 +2845,23 @@ class AgentRunner:
                                 else:
                                     await on_tool_start(event.tool_name)
 
+                        elif event.type == "tool_use_input":
+                            # Round 25: the arguments, while they are still
+                            # arriving. See _dispatch_tool_input.
+                            _ti_parts.setdefault(event.tool_id, []).append(
+                                event.text or "")
+                            await _dispatch_tool_input(
+                                self.skill_loader,
+                                tool_name=event.tool_name,
+                                call_id=event.tool_id,
+                                partial_json="".join(_ti_parts[event.tool_id]),
+                                user_id=user_id or "",
+                                session_id=session_id or "",
+                                state=_ti_state,
+                            )
+
                         elif event.type == "tool_use_end":
+                            _ti_parts.pop(event.tool_id, None)
                             pending_tool_calls.append({
                                 "id": event.tool_id,
                                 "name": event.tool_name,
@@ -2972,7 +3097,26 @@ class AgentRunner:
                                                 )
                                             else:
                                                 await on_tool_start(event.tool_name)
+                                    elif event.type == "tool_use_input":
+                                        # Round 25 — kept in step with the
+                                        # primary loop above, or a turn served
+                                        # by the fallback model would silently
+                                        # lose its live build card.
+                                        _ti_parts.setdefault(
+                                            event.tool_id, []).append(
+                                                event.text or "")
+                                        await _dispatch_tool_input(
+                                            self.skill_loader,
+                                            tool_name=event.tool_name,
+                                            call_id=event.tool_id,
+                                            partial_json="".join(
+                                                _ti_parts[event.tool_id]),
+                                            user_id=user_id or "",
+                                            session_id=session_id or "",
+                                            state=_ti_state,
+                                        )
                                     elif event.type == "tool_use_end":
+                                        _ti_parts.pop(event.tool_id, None)
                                         pending_tool_calls.append({
                                             "id": event.tool_id,
                                             "name": event.tool_name,

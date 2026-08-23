@@ -162,6 +162,34 @@ class SkillLoader:
             logger.exception(f"Skill tool {tool_name} crashed")
             return f"ERROR: Skill tool crashed: {type(e).__name__}: {e}"
 
+    async def on_tool_input(
+        self,
+        tool_name: str,
+        call_id: str,
+        partial_json: str,
+        ctx: SkillContext,
+    ) -> None:
+        """Route still-arriving tool arguments to the owning skill.
+
+        Round 25 — see :meth:`Skill.on_tool_input`. Deliberately silent on
+        every failure INCLUDING an unknown tool: this runs inside the token
+        loop, on a stream that is still open, for the sole purpose of making a
+        progress card appear sooner. Nothing it can discover is worth an
+        exception reaching the runner, and a skill that does not implement the
+        hook inherits the base no-op.
+        """
+        skill_name = self._tool_index.get(tool_name)
+        if not skill_name:
+            return
+        skill = self._skills.get(skill_name)
+        if not skill:
+            return
+        try:
+            await skill.on_tool_input(tool_name, call_id, partial_json, ctx)
+        except Exception:  # noqa: BLE001 - a progress hint never kills a turn
+            logger.debug("[SKILLS] on_tool_input failed for %s", tool_name,
+                         exc_info=True)
+
     # ------------------------------------------------------------------
     # Discovery & loading
     # ------------------------------------------------------------------

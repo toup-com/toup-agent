@@ -532,25 +532,47 @@ async def test_adapter_exact_event_sequence(responses_flag):
         stable_prefix_active=True,
     )
 
-    # Exact sequence: interleaved text + tool_use_start; partial args never
-    # yielded; tool_use_end only after the wire stream ends; one trailing
-    # message_end.
+    # Exact sequence: interleaved text + tool_use_start; ONE tool_use_input
+    # per argument delta; tool_use_end only after the wire stream ends; one
+    # trailing message_end.
+    #
+    # CHANGED DELIBERATELY, round 25. This used to assert "partial args never
+    # yielded" — the adapter accumulated `function_call_arguments.delta`
+    # privately and revealed the arguments only when the call closed. For a
+    # tool whose argument IS the work (the app builder writes a whole document
+    # into one string) that made the pipeline unable to exist until the build
+    # was already over: the user watched a bare spinner for ~2 minutes with no
+    # steps under it. The deltas were always on the wire; passing them on is
+    # the point of the change, not a side effect. `StreamEvent.type` has named
+    # `tool_use_input` since this file was written and nothing emitted one.
     assert [e.type for e in events] == [
-        "text", "tool_use_start", "text", "tool_use_end", "message_end",
+        "text", "tool_use_start", "tool_use_input", "text",
+        "tool_use_input", "tool_use_end", "message_end",
     ]
     assert events[0].text == "Hello "
-    assert events[2].text == "world"
+    assert events[3].text == "world"
 
     start = events[1]
     assert start.tool_name == "web_search"
     assert start.tool_id == "call_1"  # call_id, NEVER the fc_… item id
 
-    end = events[3]
+    # The INCREMENT travels, not the running buffer — the consumer
+    # accumulates. Concatenating them must reconstruct exactly the arguments
+    # the closing event reports, or a consumer acting on the prefix is acting
+    # on something the model did not say.
+    partials = [e for e in events if e.type == "tool_use_input"]
+    assert [e.text for e in partials] == ['{"query":', ' "x"}']
+    assert "".join(e.text for e in partials) == '{"query": "x"}'
+    for e in partials:
+        assert e.tool_name == "web_search"
+        assert e.tool_id == "call_1", "a partial must carry the call_id too"
+
+    end = events[5]
     assert end.tool_name == "web_search"
     assert end.tool_id == "call_1"
     assert end.tool_input == {"query": "x"}
 
-    tail = events[4]
+    tail = events[6]
     assert tail.stop_reason == "tool_use"
     assert tail.usage == {
         "input_tokens": 1200,
