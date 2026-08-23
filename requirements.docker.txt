@@ -35,7 +35,12 @@ tenacity==8.2.3
 python-telegram-bot==21.0.1
 
 # Anthropic Claude API
-anthropic>=0.40.0
+# PINNED — same P0 pin as requirements.txt / requirements.agent.txt, which this
+# file was also missed out of (2026-08-23). See the long note in
+# requirements.platform.txt: 1.0.0's httpx2 transport rejects the
+# httpx.AsyncClient `bundle_client` passes as `http_client`, and `>=0.40.0`
+# resolves to 1.0.0. Move off this pin only as a deliberate httpx2 migration.
+anthropic==0.122.0
 
 # Document parsing
 PyPDF2>=3.0.0

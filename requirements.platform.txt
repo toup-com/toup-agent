@@ -85,7 +85,22 @@ slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 
 # AI providers
-anthropic>=0.40.0
+# PINNED — the same P0 pin as requirements.txt / requirements.agent.txt, which
+# this file was missed out of (2026-08-23). anthropic 1.0.0 migrated its
+# transport to the httpx2 fork and raises TypeError("Expected an instance of
+# httpx2.AsyncClient") when `bundle_client.make_anthropic_client` hands it the
+# httpx.AsyncClient from `_proxy_http_client()`.
+#
+# The platform reaches that code: platform_main mounts the ws_browser router,
+# and ws_browser imports `make_anthropic_client`. `>=0.40.0` resolves to 1.0.0
+# today, so the next platform image build would have shipped a client that
+# raises on construction — verified by resolving this exact spec in a clean
+# venv and constructing the client. It is a lazy import inside a handler, so it
+# would not have failed boot; it would have failed the feature, quietly.
+#
+# Move off this pin only as a deliberate httpx2 migration, never by
+# re-widening the range.
+anthropic==0.122.0
 cohere>=5.0.0
 
 # Browser automation (headless Chromium for browser agent)
