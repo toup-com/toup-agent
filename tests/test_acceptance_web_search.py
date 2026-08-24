@@ -86,9 +86,36 @@ def test_b_engine_race(monkeypatch):
     monkeypatch.setattr(S, "_search_mojeek", eng(PER_OP, "mojeek"))
     monkeypatch.setattr(S.settings, "search_cache_enabled", False)
 
+    # The race builds a REAL httpx.AsyncClient; the monkeypatched
+    # sequential baseline is pure fake sleeps. That asymmetry is what
+    # went red on main twice on 2026-08-23 (base=0.45 final=0.69, then
+    # 0.64): the winner asserts below PASSED both times — the race
+    # returned bing, it did not wait for ddg — but the process's FIRST
+    # AsyncClient pays SSL-context + CA-bundle construction, which is
+    # CPU-bound and cost ~0.5s on a runner already running three pytest
+    # processes (~12ms warm on an idle box, ~48ms cold — measured). So
+    # `final < base` was really asserting "TLS setup under load is
+    # cheaper than 0.30s of margin", a claim about the runner, not the
+    # race. Two fixes, same spirit as the 0.6x-ratio lesson above:
+    # warm the SSL context before timing EITHER side, and charge the
+    # baseline the same one-client lifecycle the race pays (the REAL
+    # sequential path builds a client per engine call via `_client(None)`,
+    # so one client for the whole chain still flatters the baseline).
+    import httpx as _httpx
+
+    async def _warm():
+        async with _httpx.AsyncClient(timeout=15, follow_redirects=True):
+            pass
+
+    asyncio.run(_warm())
+
+    async def _sequential_with_client():
+        async with _httpx.AsyncClient(timeout=15, follow_redirects=True):
+            return await S._toup_search_sequential("q", 5)
+
     seq_out = {}
     race_out = {}
-    base = _time(lambda: seq_out.update(r=asyncio.run(S._toup_search_sequential("q", 5))))
+    base = _time(lambda: seq_out.update(r=asyncio.run(_sequential_with_client())))
     final = _time(lambda: race_out.update(r=asyncio.run(S._toup_search_race("q", 5))))
 
     _record("B. search w/ dead+slow engine", base, final, "sequential→race")
