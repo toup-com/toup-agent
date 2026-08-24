@@ -443,6 +443,27 @@ def _row_extra_state(row: NotificationQueue) -> Dict[str, Any]:
     return out
 
 
+def automation_deep_link(data: Dict[str, Any], mission_id: str) -> Optional[str]:
+    """R28: the tap target for an automation-run card — COMPUTED from two
+    _safe_id-validated tokens, never a tenant-chosen URL. Colon-free host
+    with ids in the query (the app's Android launch path rebuilds
+    `toup://<route>` and a colon would parse as a port); `mission` rides
+    along for the tap-ACK machinery. None unless the row declares
+    `route:"automation"` with both ids intact."""
+    if data.get("route") != "automation":
+        return None
+    auto_id = _safe_id(data.get("automation_id"))
+    run_id = _safe_id(data.get("run_id"))
+    if not auto_id or not run_id:
+        return None
+    return (
+        "toup://automation?session="
+        + urllib.parse.quote(auto_id, safe="")
+        + "&run=" + urllib.parse.quote(run_id, safe="")
+        + f"&mission={mission_id}"
+    )
+
+
 def _deep_link_params(row: NotificationQueue) -> str:
     """``&chat_id=…&message_id=…`` for the card's tap URL (attributes are
     start-fixed, so this reflects the FIRST job on a conversation card;
@@ -867,13 +888,20 @@ async def _send_start(
                 "live-activity: ignoring data.deep_link on a %s row (mission %s)",
                 row.source, mission_id,
             )
-        base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
-        # Round 3 (item 3): the conversation + answer ids ride the tap URL
-        # too, so a tap can open the thread and scroll to the reply. The
-        # ids come from the same producer as the mission id and are
-        # validated as short opaque tokens (_safe_id) — no URL is ever
-        # taken from a tenant here.
-        deep_link = f"{base_link}?mission={mission_id}{_deep_link_params(row)}"
+        # R28: an automation run's tap lands on its session run card —
+        # see automation_deep_link for the trust posture (computed from
+        # validated tokens, never a tenant-chosen URL).
+        _auto_link = automation_deep_link(data, mission_id)
+        if _auto_link:
+            deep_link = _auto_link
+        else:
+            base_link = "toup://chat" if data.get("route") == "chat" else "toup://mission-control"
+            # Round 3 (item 3): the conversation + answer ids ride the tap URL
+            # too, so a tap can open the thread and scroll to the reply. The
+            # ids come from the same producer as the mission id and are
+            # validated as short opaque tokens (_safe_id) — no URL is ever
+            # taken from a tenant here.
+            deep_link = f"{base_link}?mission={mission_id}{_deep_link_params(row)}"
     timer_ms = _timer_end_ms(row)
     # INSTANT-OPEN seed (2026-07-23): reminder cards carry the reminder
     # text + fire instant on the tap URL so the app can render the

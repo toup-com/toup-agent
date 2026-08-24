@@ -123,6 +123,11 @@ async def automation_connections(
             "status": ident.status,
             "connected": ident.status == "active",
             "scopes": scopes,
+            # R28 connector disclosure: the bound account's identity —
+            # the Gmail address for Google (backfilled at watch-arm),
+            # login for GitHub, None where the provider never told us
+            # (Outlook). The setup skill names it; clients may render it.
+            "account": ident.provider_account_id or None,
         })
     return {"connections": out}
 

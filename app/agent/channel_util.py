@@ -51,6 +51,11 @@ KNOWN_CHANNELS = frozenset({
               # but every serializer resolves the channel of the row
     "agent_task",  # apps.py agent-task runner (internal stamp)
     "health_probe",  # connector_health_probe (internal stamp)
+    "automation",  # per-automation session thread (R28) — session rows and
+                   # engine run stamps; NOT in mcp_auth._KNOWN_CHANNELS on
+                   # purpose: an MCP turn claiming it still clamps to
+                   # background, and the engine only writes via the platform
+                   # dispatch RPC.
 })
 
 

@@ -41,6 +41,7 @@ from app.agent import job_steps
 from .spec import render_value, render_with_ctx, resolve_path
 from .spec_v2 import ValidatedSpecV2, ValidatedSource, ValidatedStep
 from .executor import _FORBIDDEN_TOOLS, _finalize_job, _record_health
+from .session import on_run_created
 from . import memory as engine_memory
 from . import registry as reg
 
@@ -422,6 +423,7 @@ async def _run_event_inner(
     event.status = "run"
     event.job_id = job.id
     await db.commit()
+    await on_run_created(db, job=job, automation=automation)
     await _advance_v2(db, job.id, vspec, "evaluate")
 
     return await _run_steps(db, automation, vspec, job.id, payload, source,
@@ -451,6 +453,7 @@ async def run_schedule_fire_v2(
             steps_json=_new_steps_v2(vspec),
             layer=0,
         )
+        await on_run_created(db, job=job, automation=automation)
         await _advance_v2(db, job.id, vspec, "evaluate")
         return await _run_steps(db, automation, vspec, job.id, {}, source,
                                 idem_prefix=f"fire:{fire_key}")
@@ -565,6 +568,7 @@ async def execute_test_run_v2(
         steps_json=_new_steps_v2(vspec),
         layer=0,
     )
+    await on_run_created(db, job=job, automation=automation)
     await _advance_v2(db, job.id, vspec, "evaluate")
     status = await _run_steps(
         db, automation, vspec, job.id, sample, source,

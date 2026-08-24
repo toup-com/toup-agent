@@ -266,3 +266,36 @@ async def test_rpc_registry_and_grant_request_roundtrip(
     )
     assert r.status_code == 200
     assert r.json()["grant"]["id"] == grant["id"]
+
+
+@pytest.mark.asyncio
+async def test_rpc_connections_disclose_the_bound_account(
+    client, test_user_id,
+):
+    """R28 connector disclosure: /connections names the account the
+    connector is bound to (provider_account_id) — the Gmail address
+    where we have it, None where the provider never told us (Outlook
+    has no backfill), so the setup skill can say WHICH inbox it is
+    about to automate."""
+    await _flag_on()
+    key = await _mk_agent_config(test_user_id)
+    headers = {"X-Agent-Key": key, "X-Agent-User-Id": test_user_id}
+
+    from app.db.models.connectors import ConnectorIdentity
+    async with async_session_maker() as db:
+        db.add(ConnectorIdentity(
+            user_id=test_user_id, connector_id="gmail", status="active",
+            provider_account_id="person@gmail.com",
+            scopes_json=json.dumps(["gmail.readonly"]),
+        ))
+        db.add(ConnectorIdentity(
+            user_id=test_user_id, connector_id="outlook", status="active",
+        ))
+        await db.commit()
+
+    r = await client.get("/api/v1/automations/connections", headers=headers)
+    assert r.status_code == 200
+    by_id = {c["connector_id"]: c for c in r.json()["connections"]}
+    assert by_id["gmail"]["account"] == "person@gmail.com"
+    assert by_id["gmail"]["connected"] is True
+    assert by_id["outlook"]["account"] is None

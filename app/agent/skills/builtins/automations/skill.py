@@ -224,6 +224,15 @@ class AutomationsSkill(Skill):
                             "description": "Catalog template this spec "
                                            "started from, for provenance.",
                         },
+                        "domain": {
+                            "type": "string",
+                            "description": (
+                                "Life domain this automation belongs to: "
+                                "'work', 'university', 'personal', or a "
+                                "short custom slug the user named. Facts "
+                                "it learns are filed under this domain."
+                            ),
+                        },
                     },
                     "required": ["spec"],
                 },
@@ -307,18 +316,40 @@ class AutomationsSkill(Skill):
             "approved write action pinned to ONE target.\n"
             "The build order is fixed:\n"
             "  1. `automations__get_registry` — see what can fire and "
-            "what can write, plus what's connected.\n"
-            "  2. If a needed connector isn't connected (or lacks write "
+            "what can write, plus what's connected. Check "
+            "`automations__list_templates` for a matching template "
+            "before authoring a spec from scratch.\n"
+            "  2. PLAN TURN: before any card, tell the user in one "
+            "short paragraph what you will build, WHICH connector and "
+            "account it uses — name the account when the registry "
+            "shows one, e.g. 'your Gmail (person@gmail.com)'; when "
+            "account is null, name just the connector — and the "
+            "constraints that apply (draft-only mail, poll floor, "
+            "undo window). Ask which life domain this belongs to "
+            "(work / university / personal, or their own word) unless "
+            "it's obvious — then say the one you picked.\n"
+            "  3. If the request is ambiguous between connected "
+            "services (e.g. 'my email' with both Gmail and Outlook "
+            "connected), ask with quick-reply chips on their own "
+            "line — `[[Gmail]] [[Outlook]] [[Both]]` — and wait.\n"
+            "     When a template variable is a fact the user may "
+            "already have told you (their boss's email address, a "
+            "channel they always use), check `memory_search` first "
+            "and CONFIRM the value with the user instead of asking "
+            "cold — never guess an address from nothing.\n"
+            "  4. If a needed connector isn't connected (or lacks write "
             "scopes): `automations__request_connection`, then STOP and "
             "wait for the card. Never poll, never assume.\n"
-            "  3. For a write action: `automations__list_targets`, ask "
+            "  5. For a write action: `automations__list_targets`, ask "
             "the user which target, then "
             "`automations__request_permission` — then STOP and wait.\n"
-            "  4. `automations__create` with the full spec (grant_id "
-            "from the approved permission). Fix every validation error "
-            "it returns in ONE more call.\n"
-            "  5. `automations__test_run`, report what it staged, then "
-            "`automations__arm` when the user is happy.\n"
+            "  6. `automations__create` with the full spec (grant_id "
+            "from the approved permission) and the `domain`. Fix every "
+            "validation error it returns in ONE more call.\n"
+            "  7. `automations__test_run`, report what it staged, then "
+            "`automations__arm` when the user is happy. Once armed, "
+            "the automation gets its own session thread: run cards and "
+            "notices land there, not in this conversation.\n"
             "Hard rules you must repeat to the user when relevant: "
             "polls run at most every 5 minutes; runs are capped at 3 "
             "minutes; 3 failures in a row auto-pauses the automation; "
@@ -380,6 +411,10 @@ class AutomationsSkill(Skill):
                 "connector_id": cid,
                 "name": cap.get("name"),
                 "connected": bool(conn.get("connected")),
+                # R28 disclosure: WHICH account this connector is bound
+                # to (Gmail address etc.); None when the provider never
+                # told us — say the connector name alone then.
+                "account": conn.get("account"),
                 "granted_scopes": conn.get("scopes") or [],
                 "push": cap.get("push"),
                 "poll": cap.get("poll"),
@@ -600,6 +635,7 @@ class AutomationsSkill(Skill):
                 automation, _ = await create_automation(
                     db, user_id=_uid(ctx), spec=args.get("spec"),
                     template_slug=args.get("template_slug"),
+                    domain=args.get("domain"),
                 )
         except SpecError as e:
             return "SPEC INVALID:\n" + _as_json(e.errors)
@@ -668,7 +704,59 @@ class AutomationsSkill(Skill):
         return f"OK — status is now {out.status!r}."
 
     async def _arm(self, args, ctx) -> str:
-        return await self._lifecycle(args, ctx, "arm")
+        out = await self._lifecycle(args, ctx, "arm")
+        if out.startswith("OK"):
+            try:
+                await self._file_setup_fact(args, ctx)
+            except Exception as e:  # noqa: BLE001 — memory is a companion
+                logger.warning("[automations] setup fact skipped: %s", e)
+        return out
+
+    async def _file_setup_fact(self, args, ctx) -> None:
+        """On a successful arm, file ONE clean fact under the
+        automation's domain — composed from setup intent (name, what it
+        watches, what it does), never from provider data. No domain, no
+        fact."""
+        from sqlalchemy import select
+        from app.agent.automations import memory_notes
+        from app.db.database import async_session_maker
+        from app.db.models import Automation
+
+        async with async_session_maker() as db:
+            a = (await db.execute(
+                select(Automation).where(
+                    Automation.id == (args.get("automation_id") or ""),
+                    Automation.user_id == _uid(ctx),
+                )
+            )).scalar_one_or_none()
+            if a is None or not a.domain:
+                return
+            if a.trigger_mode == "schedule":
+                trigger = "runs on a schedule"
+            elif a.connector_id:
+                trigger = f"watches {a.connector_id}"
+            else:
+                trigger = "watches a connected service"
+            action = "acts on it"
+            try:
+                raw = json.loads(a.spec_json)
+                steps = raw.get("steps") or []
+                tools = [s.get("tool") for s in steps if s.get("grant_id")]
+                tool = tools[-1] if tools else (
+                    (raw.get("action") or {}).get("tool"))
+                if tool and "__" in tool:
+                    cid, verb = tool.split("__", 1)
+                    action = f"{verb.replace('_', ' ')}s via {cid}"
+            except (ValueError, TypeError):
+                pass
+            await memory_notes.record_automation_fact(
+                db, user_id=_uid(ctx), domain=a.domain,
+                fact=memory_notes.setup_fact(
+                    automation_name=a.name,
+                    trigger_summary=trigger,
+                    action_summary=action,
+                ),
+            )
 
     async def _pause(self, args, ctx) -> str:
         return await self._lifecycle(args, ctx, "pause")

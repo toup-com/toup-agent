@@ -322,7 +322,10 @@ def test_debt_is_not_growing_silently():
     Lower this when you fix one. Raising it means shipping a test nobody runs,
     and should have to be argued for out loud in review.
     """
-    CEILING = 75
+    # R28-C: +1 for test_automation_sessions.py — conversations/messages/
+    # build_jobs/agent_notify_outbox are AGENT_ONLY, so the session-thread
+    # proofs can only run in the agent lane.
+    CEILING = 76
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

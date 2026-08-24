@@ -364,6 +364,26 @@ async def proxy_runs(
     return await _proxy(request, "/runs", current_user=current_user, db=db)
 
 
+@router.get("/{automation_id}/thread")
+async def proxy_thread(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/thread",
+                        current_user=current_user, db=db)
+
+
+@router.get("/{automation_id}/memory")
+async def proxy_memory(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/memory",
+                        current_user=current_user, db=db)
+
+
 @router.get("/auth-sessions/{session_id}")
 async def proxy_get_auth_session(
     session_id: str, request: Request,

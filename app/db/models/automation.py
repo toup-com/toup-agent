@@ -131,6 +131,12 @@ class Automation(Base):
     # Template provenance (Activity page "Suggested" attribution).
     template_slug: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
+    # Life domain this automation belongs to (R28): "work"/"university"/
+    # "personal" or a custom slug — `memory_notes.normalize_domain` is the
+    # validator. Setup metadata, not run behavior: the spec knows nothing
+    # of it. NULL on R26 rows, which file no memory facts.
+    domain: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
     # Health. consecutive_failures is reset to 0 by any successful run
     # and incremented by terminal failures; at
     # AUTOMATION_AUTO_PAUSE_FAILURES the sweep flips status='error' and

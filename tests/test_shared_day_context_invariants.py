@@ -90,7 +90,12 @@ async def day_tables():
 # Every surface that reaches AgentRunner.run, plus the two that only
 # reach it indirectly. If a channel is added to KNOWN_CHANNELS and it
 # writes day-stamped messages, it belongs here.
-SURFACE_CHANNELS = ["web", "app", "mobile", "extension", "telegram", "whatsapp"]
+SURFACE_CHANNELS = [
+    "web", "app", "mobile", "extension", "telegram", "whatsapp",
+    # R28: the per-automation session thread writes day-stamped rows too —
+    # the agent is supposed to see what its automations did today.
+    "automation",
+]
 
 
 @pytest.mark.asyncio

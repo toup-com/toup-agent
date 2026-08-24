@@ -40,6 +40,7 @@ from app.db.models import (
 from app.agent.job_runner import JobRunner, TaskSpec
 from app.agent import job_steps
 from .spec import ValidatedSpec, render_params, resolve_path
+from .session import on_run_created
 from . import registry as reg
 
 logger = logging.getLogger(__name__)
@@ -98,13 +99,39 @@ async def _finalize_job(
             job_steps.finish_all_steps(steps, now,
                                        fallback_start=job.created_at)
         )
-    await db.execute(
+    result = await db.execute(
         sa_update(BuildJob)
         .where(BuildJob.id == job_id)
         .where(BuildJob.status.in_(("queued", "running", "waiting_on_user")))
         .values(**values)
     )
     await db.commit()
+
+    # R28: every terminal transition — v1, v2, and the outbox aggregate
+    # finalizer — funnels through here, and the guarded UPDATE's
+    # rowcount makes "exactly once" free: only the call that actually
+    # flipped the row notifies. The composer gates on noteworthiness
+    # and never raises.
+    if result.rowcount == 1 and status == "completed" and job is not None:
+        try:
+            if job.source_id:
+                a = await db.get(Automation, job.source_id)
+                if a is not None:
+                    from .notify import notify_run_outcome
+                    await notify_run_outcome(
+                        user_id=job.user_id,
+                        automation_id=a.id,
+                        automation_name=a.name,
+                        job_id=job_id,
+                        outcome=outcome,
+                        chat_id=job.conversation_id,
+                        message_id=job.summary_message_id,
+                    )
+        except Exception as e:  # noqa: BLE001 — a push never fails a run
+            logger.warning(
+                "[automations] finalize notify skipped job=%s: %s",
+                job_id[:8], e,
+            )
 
 
 async def _record_health(
@@ -260,6 +287,7 @@ async def _run_event_inner(
     event.status = "run"
     event.job_id = job.id
     await db.commit()
+    await on_run_created(db, job=job, automation=automation)
     await _advance(db, job.id, "evaluate")
 
     return await _prepare_and_write(db, automation, vspec, job.id, payload,
@@ -291,6 +319,7 @@ async def run_schedule_fire(
             steps_json=_new_steps(),
             layer=0,
         )
+        await on_run_created(db, job=job, automation=automation)
         await _advance(db, job.id, "evaluate")
         return await _prepare_and_write(
             db, automation, vspec, job.id, {},
@@ -408,6 +437,7 @@ async def execute_test_run(
         steps_json=_new_steps(),
         layer=0,
     )
+    await on_run_created(db, job=job, automation=automation)
     await _advance(db, job.id, "evaluate")
     status = await _prepare_and_write(
         db, automation, vspec, job.id, sample,

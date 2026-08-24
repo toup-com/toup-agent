@@ -176,6 +176,108 @@ async def list_runs(
         )}
 
 
+# ── Session thread + working memory (Round 28) ──────────────────────
+
+
+async def _owned_automation_or_404(db, automation_id: str) -> "Automation":
+    a = (await db.execute(
+        select(Automation).where(
+            Automation.id == automation_id,
+            Automation.user_id == _user_id(),
+        )
+    )).scalar_one_or_none()
+    if a is None:
+        raise HTTPException(status_code=404, detail="No such automation")
+    return a
+
+
+@router.get("/{automation_id}/thread")
+async def automation_thread(
+    automation_id: str,
+    limit: int = Query(default=100, ge=1, le=200),
+):
+    """The automation's session thread. `session_id` is TODAY's
+    conversation row, minted lazily on this GET so a composer can
+    always bind to it; `messages` spill over previous days (newest
+    `limit`, returned oldest-first) and use the exact
+    /api/sessions/{id}/messages serialization — cards and run markers
+    hydrate through the same pipeline.
+    """
+    _flag_or_404()
+    from app.agent.automations.session import (
+        list_session_conversation_ids, resolve_session_conversation,
+    )
+    from app.api.message_cards import attach_run_to_cards, load_build_jobs
+    from app.api.sessions import _message_to_response
+    from app.db.models import Message
+
+    async with async_session_maker() as db:
+        a = await _owned_automation_or_404(db, automation_id)
+        conv, _day = await resolve_session_conversation(
+            db, user_id=_user_id(), automation_id=automation_id,
+            title=a.name,
+        )
+        await db.commit()
+        conv_ids = await list_session_conversation_ids(
+            db, user_id=_user_id(), automation_id=automation_id,
+        )
+        if conv.id not in conv_ids:
+            conv_ids.append(conv.id)
+        rows = (await db.execute(
+            select(Message)
+            .where(Message.conversation_id.in_(conv_ids))
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(limit)
+        )).scalars().all()
+        messages = list(reversed(rows))
+        build_jobs = await load_build_jobs(db, messages)
+        from app.agent.reply_quote import (
+            resolve_reply_targets_for_serialization,
+        )
+        reply_targets = await resolve_reply_targets_for_serialization(
+            db, messages,
+        )
+        channels = {cid: "automation" for cid in conv_ids}
+        return {
+            "session_id": conv.id,
+            "messages": attach_run_to_cards([
+                _message_to_response(m, build_jobs, reply_targets, channels)
+                for m in messages
+            ]),
+        }
+
+
+@router.get("/{automation_id}/memory")
+async def automation_memory(automation_id: str):
+    """The automation's working-state row (R28-A §6): machine state,
+    not the user's brain. 404 until the first terminal run writes it."""
+    _flag_or_404()
+    from app.db.models import Memory
+
+    async with async_session_maker() as db:
+        await _owned_automation_or_404(db, automation_id)
+        row = (await db.execute(
+            select(Memory).where(
+                Memory.user_id == _user_id(),
+                Memory.ref_kind == "automation",
+                Memory.ref_id == automation_id,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="No memory yet")
+        try:
+            meta = json.loads(row.metadata_json) if row.metadata_json else {}
+        except (ValueError, TypeError):
+            meta = {}
+        return {
+            "content": row.content,
+            "metadata": meta,
+            "updated_at": (
+                row.updated_at.isoformat() + "Z" if row.updated_at else None
+            ),
+        }
+
+
 # ── Outbox undo ──────────────────────────────────────────────────────
 
 

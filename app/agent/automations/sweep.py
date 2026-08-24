@@ -164,16 +164,23 @@ async def _post_error_notice(db, automation: Automation) -> None:
         f"[[navigate:/activity]]"
     )
     try:
+        # R28: the notice lands in the automation's own session thread,
+        # not the shared routine thread — same exactly-once semantics,
+        # new address. The broadcast frame is unchanged (type "message",
+        # no channel key) so both clients keep hearing it live.
+        from app.agent.automations.session import write_session_message
         from app.agent.routines.message_writer import (
-            broadcast_routine_message, write_routine_message,
+            broadcast_routine_message,
         )
-        message_id, day_chat_id = await write_routine_message(
+        message_id, day_chat_id = await write_session_message(
             db,
             user_id=automation.user_id,
+            automation_id=automation.id,
             content=text,
-            source="automation",
             title=automation.name,
         )
+        if not message_id:
+            raise RuntimeError("session write returned no message id")
         try:
             await broadcast_routine_message(
                 automation.user_id,

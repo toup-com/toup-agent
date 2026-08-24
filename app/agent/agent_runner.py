@@ -4476,6 +4476,39 @@ class AgentRunner:
             if session:
                 from datetime import datetime, timezone
                 now_utc = datetime.now(timezone.utc)
+
+                # ── R28: automation session threads ──────────────────
+                # An explicit session_id aimed at a channel="automation"
+                # row is a deliberate address — the composer in the
+                # automation's session view. The caller's surface channel
+                # (app/web) will always differ, so the channel-switch
+                # fork below would silently split the thread on every
+                # send. Honor the address instead: same local day →
+                # reuse; a stale id from yesterday rolls to TODAY's row
+                # for the SAME automation via the canonical resolver
+                # (returns is_new=False like the system-channel path —
+                # the thread is continuous even when the row is fresh).
+                if session.channel == "automation":
+                    try:
+                        _auto_meta = json.loads(session.metadata_json or "{}")
+                    except (ValueError, TypeError):
+                        _auto_meta = {}
+                    _auto_id = _auto_meta.get("automation_id")
+                    if _auto_id:
+                        _started = session.started_at
+                        if _started is not None and _started.tzinfo is None:
+                            _started = _started.replace(tzinfo=timezone.utc)
+                        if _started is None or same_local_day(_started, now_utc, client_tz):
+                            return session, False
+                        from app.agent.automations.session import (
+                            resolve_session_conversation,
+                        )
+                        conv, _ = await resolve_session_conversation(
+                            db, user_id=user_id, automation_id=_auto_id,
+                            title=session.title, tz_override=client_tz,
+                        )
+                        return conv, False
+
                 channel_switched = channel and session.channel and channel != session.channel
 
                 if session.channel == "telegram" and not channel_switched:

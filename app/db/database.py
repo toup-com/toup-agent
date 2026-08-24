@@ -1037,6 +1037,11 @@ async def init_db():
         # alembic, so a new column has to self-heal here or every query
         # referencing it 500s on exactly the tenants that upgraded.
         "ALTER TABLE media_playlists ADD COLUMN IF NOT EXISTS seed_video_id VARCHAR(32)",
+        # automations.domain (R28): life-domain assignment for memory
+        # fact filing. The automations table is create_all-managed like
+        # every AGENT_ONLY table, so a tenant that booted on the R26
+        # build self-heals the column here.
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS domain VARCHAR(32)",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

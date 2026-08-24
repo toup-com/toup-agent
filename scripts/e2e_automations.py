@@ -17,6 +17,9 @@ Sandbox rails enforced and ASSERTED:
   - event dedupe (second poll is a no-op)
   - undo window (undo inside beats the flush; a claimed row wins)
   - auto-pause at 3 consecutive failures
+  - R28-C: every run minted a session-thread card with job back-links,
+    the auto-pause notice lands IN the session, and noteworthy
+    outcomes push with the deep-link contract fields
 
 Real-vendor mode: E2E_CONNECTOR=jira (etc.) re-runs the flow against a
 real connector using the vault identity of E2E_USER_EMAIL
@@ -503,6 +506,68 @@ async def main() -> int:
                   "boss-email-draft" in email_slugs
                   and "morning-work-brief" not in email_slugs,
                   str(email_slugs))
+
+            # ═══ Round 28-C: session thread, run cards, outcome push ═
+            # The v1 runs above went through on_run_created and
+            # _finalize_job with the R28-C hooks live — verify the
+            # artifacts on real rows. In-process like every agent-side
+            # check here (the harness runs no agent HTTP server), which
+            # also exercises A's StaticPool interleaving warning: these
+            # writers ran beside the outbox flush loop on ONE sqlite
+            # connection.
+            from app.api.automations import automation_thread
+            thread = await automation_thread(automation.id, limit=200)
+            check("session thread minted for the automation",
+                  bool(thread.get("session_id")))
+            t_rows = thread.get("messages") or []
+            job_cards = [m for m in t_rows
+                         if getattr(m, "role", None) == "job"]
+            pause_notices = [
+                m for m in t_rows
+                if "was paused" in (getattr(m, "content", "") or "")
+            ]
+            check("every v1 run has a card in the session",
+                  len(job_cards) >= 3, f"{len(job_cards)} cards")
+            check("the auto-pause notice lives IN the session thread",
+                  len(pause_notices) == 1, f"{len(pause_notices)}")
+            check("run cards hydrate job fields through the pipeline",
+                  all(getattr(m, "job_id", None)
+                      and getattr(m, "job_status", None) == "completed"
+                      for m in job_cards[:3]),
+                  str([(getattr(m, "job_id", None),
+                        getattr(m, "job_status", None))
+                       for m in job_cards[:3]]))
+            async with async_session_maker() as db:
+                jobs = (await db.execute(
+                    select(BuildJob)
+                    .where(BuildJob.source_id == automation.id)
+                    .where(BuildJob.job_type == "automation_run")
+                )).scalars().all()
+                check("every run back-linked (summary_message_id + "
+                      "conversation_id)",
+                      len(jobs) >= 3 and all(
+                          j.summary_message_id and j.conversation_id
+                          for j in jobs),
+                      str([(j.summary_message_id, j.conversation_id)
+                           for j in jobs]))
+                from app.db.models import AgentNotifyOutbox
+                pushes = (await db.execute(
+                    select(AgentNotifyOutbox).where(
+                        AgentNotifyOutbox.dedup_key
+                        == f"automation:{automation.id}:run_done")
+                )).scalars().all()
+                push_data_ok = all(
+                    (p.data_json or {}).get("route") == "automation"
+                    and (p.data_json or {}).get("automation_id")
+                    == automation.id
+                    and (p.data_json or {}).get("run_id")
+                    and (p.data_json or {}).get("chat_id")
+                    and (p.data_json or {}).get("message_id")
+                    for p in pushes)
+                check("noteworthy outcomes pushed with the deep-link "
+                      "contract fields",
+                      len(pushes) >= 1 and push_data_ok,
+                      f"{len(pushes)} pushes")
 
             # ── real-vendor mode ────────────────────────────────────
             vendor = os.environ.get("E2E_CONNECTOR")

@@ -50,9 +50,12 @@ async def create_automation(
     user_id: str,
     spec: dict,
     template_slug: Optional[str] = None,
+    domain: Optional[str] = None,
 ) -> tuple[Automation, ValidatedSpec]:
     """Validate + persist a spec as a DRAFT automation with compiled
     (but disabled) bindings. Raises SpecError with every problem."""
+    from app.agent.automations.memory_notes import normalize_domain
+
     capability = await reg.fetch_registry(user_id)
     vspec = validate_spec(spec, capability)
 
@@ -65,6 +68,9 @@ async def create_automation(
         trigger_mode=vspec.trigger_mode,
         connector_id=vspec.trigger_connector_id or vspec.action_connector_id,
         template_slug=template_slug,
+        # An unrecognizable domain becomes NULL (no facts filed), never
+        # an error — domain is metadata, not a validity condition.
+        domain=normalize_domain(domain),
     )
     db.add(automation)
     await db.flush()
@@ -373,6 +379,7 @@ def automation_payload(a: Automation) -> dict:
         },
         "mode": raw.get("mode"),
         "template_slug": a.template_slug,
+        "domain": a.domain,
         "health": {
             "consecutive_failures": a.consecutive_failures,
             "last_run_at": (a.last_run_at.isoformat() + "Z") if a.last_run_at else None,
