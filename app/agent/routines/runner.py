@@ -85,7 +85,10 @@ def _fast_lane_automation_interval_ok(routine, interval: int) -> bool:
     above the fast-lane floor, and only while the fast lane is active
     (which production refuses by environment): every other routine kind
     keeps the 60-s floor exactly as before."""
-    if routine.kind not in ("automation_poll", "automation_schedule"):
+    # getattr: pre-existing tests drive this builder with bare stubs
+    # that carry only schedule fields — no kind means no fast lane.
+    if getattr(routine, "kind", None) not in (
+            "automation_poll", "automation_schedule"):
         return False
     try:
         from app.agent.automations.spec import (
