@@ -48,6 +48,12 @@ AUTOMATION_GRANT_STATUSES = (
     "pending", "approved", "rejected", "expired", "revoked",
 )
 
+# Round 28 — template catalog categories. Code enum, no migration to
+# add a value (same pattern as TRIGGER_KINDS).
+TEMPLATE_CATEGORIES = frozenset({
+    "work", "email", "code", "calendar", "school", "personal",
+})
+
 
 class AutomationGrant(Base):
     __tablename__ = "automation_grants"
@@ -140,6 +146,17 @@ class AutomationTemplate(Base):
     connectors_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     # JSON AutomationSpec skeleton the setup agent starts from.
     spec_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # Round 28: see TEMPLATE_CATEGORIES. Server_default keeps the 095
+    # seed row valid through the 096 ALTER.
+    category: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="work", server_default="work",
+    )
+    # Round 28: JSON [{name, label, description, example, required,
+    # default}] — the variables the setup agent asks the user for;
+    # spec_json references them as {{var.<name>}}.
+    variables_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]",
+    )
     enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true",
     )

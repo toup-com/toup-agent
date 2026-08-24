@@ -38,6 +38,45 @@ class SpecError(ValueError):
         ))
 
 
+# ── Dev fast-lane (Round 28) ─────────────────────────────────────────
+#
+# An env-gated override for dev/e2e tenants that lowers the poll and
+# every_s floors to seconds so a full trigger→fire loop is watchable in
+# one sitting. Two-sided refusal, same as the e2e metering marker: the
+# flag alone is not enough — a production ENVIRONMENT ignores it, so a
+# stray env var on a prod tenant changes nothing. The manifest load
+# lint and the platform registry keep the honest production floors
+# either way; this bends only spec validation/compile on this tenant.
+
+AUTOMATION_DEV_POLL_FLOOR_S = 5
+
+
+def dev_fast_lane_active() -> bool:
+    from app.config import settings
+    return (
+        bool(getattr(settings, "automations_dev_fast_lane", False))
+        and (settings.environment or "").strip().lower() != "production"
+    )
+
+
+def effective_poll_floor(cap_floor: Any) -> int:
+    """The poll floor for spec validation: the connector's declared
+    floor, never below the global rail — unless the dev fast-lane is
+    active, in which case seconds are allowed."""
+    if dev_fast_lane_active():
+        return AUTOMATION_DEV_POLL_FLOOR_S
+    try:
+        declared = int(cap_floor or AUTOMATION_POLL_FLOOR_S)
+    except (TypeError, ValueError):
+        declared = AUTOMATION_POLL_FLOOR_S
+    return max(declared, AUTOMATION_POLL_FLOOR_S)
+
+
+def effective_every_floor() -> int:
+    """Floor for schedule {every_s}."""
+    return AUTOMATION_DEV_POLL_FLOOR_S if dev_fast_lane_active() else 60
+
+
 @dataclass(frozen=True)
 class ValidatedSpec:
     """The parsed, validated spec. `raw` is the canonical dict to
@@ -66,7 +105,8 @@ def _err(errors: list, code: str, fld: str, message: str) -> None:
     errors.append({"code": code, "field": fld, "message": message})
 
 
-_TOP_KEYS = {"name", "description", "trigger", "action", "dedupe_key", "mode"}
+_TOP_KEYS = {"name", "description", "trigger", "action", "dedupe_key", "mode",
+             "version"}
 _TRIGGER_KEYS = {
     "mode", "connector_id", "event", "params", "poll_interval_s",
     "schedule", "filter",
@@ -82,13 +122,21 @@ _SCHEDULE_KEYS = {"cron_local", "at", "every_s"}
 def validate_spec(
     spec: Any,
     registry: dict[str, dict],
-) -> ValidatedSpec:
+    *,
+    template_mode: bool = False,
+    template_vars: Optional[set] = None,
+):
     """Validate one AutomationSpec against the capability registry.
 
     `registry` maps connector_id → the automation_registry() entry
     (push/poll/floor_s/events/scopes_write_by_action/...). Raises
-    SpecError with EVERY problem found; returns ValidatedSpec on
-    success.
+    SpecError with EVERY problem found.
+
+    Dispatch (Round 28): a spec with `version: 2` returns a
+    `ValidatedSpecV2` from spec_v2.py; anything else takes the v1 path
+    below, unchanged. `template_mode` (catalog lint only — nothing on
+    the create/run path sets it) waives grant references and treats
+    `template_vars` as declared.
     """
     errors: list[dict] = []
 
@@ -96,6 +144,19 @@ def validate_spec(
         raise SpecError([{
             "code": "not_an_object", "field": "",
             "message": f"spec must be an object, got {type(spec).__name__}",
+        }])
+
+    version = spec.get("version", 1)
+    if version == 2:
+        from .spec_v2 import validate_spec_v2
+        return validate_spec_v2(
+            spec, registry,
+            template_mode=template_mode, template_vars=template_vars,
+        )
+    if version != 1:
+        raise SpecError([{
+            "code": "bad_version", "field": "version",
+            "message": f"spec version must be 1 or 2, got {version!r}",
         }])
 
     for k in spec:
@@ -165,10 +226,9 @@ def validate_spec(
             else:
                 event_spec = events[t_event]
         if t_mode == "poll":
-            floor = max(
-                int((cap or {}).get("floor_s") or AUTOMATION_POLL_FLOOR_S),
-                AUTOMATION_POLL_FLOOR_S,
-            )
+            # Identical to the pre-R28 max() when the fast lane is off
+            # (the default); seconds only for env-gated dev tenants.
+            floor = effective_poll_floor((cap or {}).get("floor_s"))
             raw_iv = trig.get("poll_interval_s", floor)
             if not isinstance(raw_iv, int) or isinstance(raw_iv, bool):
                 _err(errors, "bad_interval", "trigger.poll_interval_s",
@@ -195,11 +255,13 @@ def validate_spec(
                 _err(errors, "bad_schedule", "trigger.schedule",
                      "schedule must set exactly one of cron_local / at / every_s")
             ev = schedule.get("every_s")
+            ev_floor = effective_every_floor()
             if ev is not None and (
-                not isinstance(ev, int) or isinstance(ev, bool) or ev < 60
+                not isinstance(ev, int) or isinstance(ev, bool)
+                or ev < ev_floor
             ):
                 _err(errors, "bad_schedule", "trigger.schedule.every_s",
-                     "every_s must be an integer >= 60")
+                     f"every_s must be an integer >= {ev_floor}")
 
     # ── dedupe key ───────────────────────────────────────────────────
     dedupe_field: Optional[str] = None
@@ -255,7 +317,8 @@ def validate_spec(
         writes = a_cap.get("scopes_write_by_action") or {}
         if a_tool in writes:
             mutates = True
-            if not isinstance(grant_id, str) or not grant_id.strip():
+            if (not template_mode
+                    and (not isinstance(grant_id, str) or not grant_id.strip())):
                 _err(errors, "write_without_grant", "action.grant_id",
                      f"{a_tool} is a write action — a grant reference is "
                      f"required before it can be part of a spec")
@@ -326,6 +389,27 @@ def resolve_path(obj: Any, path: str) -> Any:
     return cur
 
 
+def render_value(val: Any, ctx: dict) -> Any:
+    """Render one value against a context dict. Only strings are
+    templated; a placeholder that resolves to None renders as an empty
+    string. Shared by the v1 and v2 render paths."""
+    if not isinstance(val, str):
+        return val
+    out = val
+    # Simple, deliberate: find {{...}} spans, resolve, substitute.
+    while "{{" in out and "}}" in out:
+        start = out.index("{{")
+        end = out.index("}}", start)
+        expr = out[start + 2:end].strip()
+        resolved = resolve_path(ctx, expr)
+        out = out[:start] + ("" if resolved is None else str(resolved)) + out[end + 2:]
+    return out
+
+
+def render_with_ctx(template: dict, ctx: dict) -> dict:
+    return {k: render_value(v, ctx) for k, v in template.items()}
+
+
 def render_params(
     template: dict,
     *,
@@ -340,18 +424,4 @@ def render_params(
         "event": event or {},
         "grant": {"target": grant_target or {}},
     }
-
-    def _render(val: Any) -> Any:
-        if not isinstance(val, str):
-            return val
-        out = val
-        # Simple, deliberate: find {{...}} spans, resolve, substitute.
-        while "{{" in out and "}}" in out:
-            start = out.index("{{")
-            end = out.index("}}", start)
-            expr = out[start + 2:end].strip()
-            resolved = resolve_path(ctx, expr)
-            out = out[:start] + ("" if resolved is None else str(resolved)) + out[end + 2:]
-        return out
-
-    return {k: _render(v) for k, v in template.items()}
+    return render_with_ctx(template, ctx)

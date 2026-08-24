@@ -64,31 +64,21 @@ async def _flag_or_404(db: AsyncSession, user_id: str) -> None:
 
 @router.get("/templates")
 async def list_templates(
+    category: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     await _flag_or_404(db, str(current_user.id))
-    rows = (await db.execute(
+    q = (
         select(AutomationTemplate)
         .where(AutomationTemplate.enabled.is_(True))
         .order_by(AutomationTemplate.sort_order, AutomationTemplate.name)
-    )).scalars().all()
-    out = []
-    for t in rows:
-        try:
-            connectors = json.loads(t.connectors_json or "[]")
-        except (ValueError, TypeError):
-            connectors = []
-        try:
-            spec = json.loads(t.spec_json or "{}")
-        except (ValueError, TypeError):
-            spec = {}
-        out.append({
-            "id": t.id, "slug": t.slug, "name": t.name,
-            "description": t.description, "icon": t.icon,
-            "connectors": connectors, "spec": spec,
-        })
-    return {"templates": out}
+    )
+    if category:
+        q = q.where(AutomationTemplate.category == category.strip().lower())
+    rows = (await db.execute(q)).scalars().all()
+    from app.services.automation_template_catalog import template_payload
+    return {"templates": [template_payload(t) for t in rows]}
 
 
 # ── Platform-native: grant requests ──────────────────────────────────

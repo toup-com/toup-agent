@@ -98,3 +98,22 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 28) ──────────────────────────────
+# Action-only connector (like Slack): no listable event stream — a
+# Doc is fetched by id, nothing to poll. The one write is append,
+# pinned to a single document. docs__create is excluded for the same
+# no-stable-target reason as drive__create_doc.
+automation:
+  push: false
+  poll: false
+  floor_s: 300
+  rate_budget:
+    per_hour: 30
+    per_day: 200
+  scopes_read: []
+  scopes_write_by_action:
+    docs__append_text: ["https://www.googleapis.com/auth/documents"]
+  target_param_by_action:
+    docs__append_text: document_id
+  events: []

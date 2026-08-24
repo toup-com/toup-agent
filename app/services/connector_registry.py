@@ -162,6 +162,10 @@ class AutomationEventSpec(BaseModel):
     description: str
     source_tool: Optional[str] = None
     poll_args: dict = Field(default_factory=dict)
+    # Trigger params the spec MUST supply for this event to poll
+    # meaningfully (e.g. Teams chat polling needs a chat_id). Round 28;
+    # enforced by the spec validators, serialized on the wire.
+    params_required: list[str] = Field(default_factory=list)
     dedupe_field: str
     # Dot-paths into a result item exposed to params templates as
     # {{event.<name>}}. Keys are template names, values are paths.
@@ -339,6 +343,7 @@ class ConnectorRegistry:
                         "description": ev.description,
                         "source_tool": ev.source_tool,
                         "poll_args": dict(ev.poll_args),
+                        "params_required": list(ev.params_required),
                         "items_path": ev.items_path,
                         "dedupe_field": ev.dedupe_field,
                         "fields": dict(ev.fields),

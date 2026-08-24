@@ -1280,6 +1280,15 @@ class Settings(BaseSettings):
     # `automations_rollout_pct` (frontend surface gating).
     automations_enabled: bool = False
 
+    # Round 28 dev fast-lane: allows poll/every_s intervals in SECONDS
+    # for dev/e2e tenants so a full trigger→fire loop is watchable.
+    # Honored ONLY when `environment != "production"` (checked at the
+    # use site, `automations/spec.py:dev_fast_lane_active`) — a stray
+    # env var on a prod tenant changes nothing. The manifest lint and
+    # the platform capability registry keep the honest 300s floors
+    # regardless.
+    automations_dev_fast_lane: bool = False
+
     # ── Maintenance / support agent (app.support) ────────────────────
     # Master switch. Off ⇒ every /api/support route 503s. Dark-launched.
     support_agent_enabled: bool = False

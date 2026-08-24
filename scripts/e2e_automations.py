@@ -69,6 +69,9 @@ _ENV = {
     "AUTOMATIONS_ROLLOUT_PCT": "100",
     "AUTOMATIONS_ENABLED": "true",
     "AUTOMATIONS_E2E": "1",
+    # Round 28 dev fast-lane: honored because ENVIRONMENT=development
+    # above — the same two-sided gate production refuses.
+    "AUTOMATIONS_DEV_FAST_LANE": "1",
     "ENABLE_CONNECTOR_OAUTH": "true",
 }
 
@@ -341,6 +344,165 @@ async def main() -> int:
                 )).scalars().all()
                 check("exactly ONE chat notice", len(notices) == 1,
                       f"{len(notices)} notices")
+
+            # ═══ Round 28: spec v2 over the same real rails ═════════
+            # A second grant (chan-2), a v2 spec whose read step feeds
+            # the write's template, the fast-lane interval, the
+            # namespaced dedupe, and the engine-memory round trip.
+            r = await http.post(
+                "/api/v1/automations/grant-requests", headers=rpc_h,
+                json={"connector_id": "stub", "tool_name": "stub__post",
+                      "target": {"kind": "channel", "id": "chan-2",
+                                 "label": "#e2e-v2"},
+                      "mode": "auto", "summary": "post the v2 digest"},
+            )
+            grant2 = r.json().get("grant") or {}
+            await http.post(
+                f"/api/automations/grant-requests/{grant2['id']}/approve",
+                headers=user_h, json={"decided_via": "web"},
+            )
+
+            spec_v2 = {
+                "version": 2,
+                "name": "Stub digest v2",
+                "mode": "auto",
+                "variables": {"greeting": "digest"},
+                "trigger": {"sources": [
+                    {"id": "feed_src", "mode": "poll",
+                     "connector_id": "stub", "event": "item_created",
+                     # 5s — legal ONLY because the dev fast-lane env is
+                     # on and ENVIRONMENT != production.
+                     "poll_interval_s": 5,
+                     "dedupe_key": "event.id"},
+                ]},
+                "steps": [
+                    {"id": "feed", "connector_id": "stub",
+                     "tool": "stub__list_items", "params": {},
+                     "collect": {"items_path": "items",
+                                 "fields": {"title": "title"},
+                                 "format": "• {{item.title}}",
+                                 "empty_text": "(empty)"},
+                     "on_error": "skip"},
+                    {"id": "post", "connector_id": "stub",
+                     "tool": "stub__post",
+                     "params": {"channel": "{{grant.target.id}}",
+                                "text": "{{var.greeting}} "
+                                        "[{{steps.feed.count}}]\n"
+                                        "{{steps.feed.text}}"},
+                     "grant_id": grant2["id"]},
+                ],
+            }
+            async with async_session_maker() as db:
+                auto2, _ = await create_automation(
+                    db, user_id=user_id, spec=spec_v2,
+                )
+                check("v2 drafted (fast-lane 5s interval accepted)",
+                      auto2.status == "draft")
+                auto2 = await arm_automation(
+                    db, automation_id=auto2.id, user_id=user_id,
+                )
+                check("v2 armed (per-step grant verified via platform)",
+                      auto2.status == "armed")
+
+            from app.db.models import AutomationBinding, Routine
+            async with async_session_maker() as db:
+                b2 = (await db.execute(
+                    select(AutomationBinding)
+                    .where(AutomationBinding.automation_id == auto2.id)
+                )).scalars().all()
+                routine2 = await db.get(Routine, b2[0].target_id)
+                check("v2 poll routine carries source_id + 5s interval",
+                      (routine2.config_json or {}).get("source_id")
+                      == "feed_src"
+                      and routine2.schedule_interval_seconds == 5,
+                      str((routine2.config_json,
+                           routine2.schedule_interval_seconds)))
+
+            from app.agent.automations import executor_v2
+            async with async_session_maker() as db:
+                a = await db.get(type(auto2), auto2.id)
+                vspec2 = await parse_spec_live(a)
+                source = vspec2.source_by_id("feed_src")
+                stats3 = await executor_v2.poll_and_run_v2(
+                    db, a, vspec2, source)
+            check("v2 poll observed 3, ran 3",
+                  stats3 == {"observed": 3, "fresh": 3, "ran": 3,
+                             "failed": 0}, str(stats3))
+
+            from app.db.models import AutomationEvent
+            async with async_session_maker() as db:
+                evs = (await db.execute(
+                    select(AutomationEvent)
+                    .where(AutomationEvent.automation_id == auto2.id)
+                )).scalars().all()
+                check("v2 events namespaced per source",
+                      len(evs) == 3 and
+                      all(e.dedupe_key.startswith("feed_src:")
+                          for e in evs),
+                      str([e.dedupe_key for e in evs]))
+                boxes2 = (await db.execute(
+                    select(AutomationOutbox)
+                    .where(AutomationOutbox.automation_id == auto2.id)
+                )).scalars().all()
+                sent_ok = (
+                    len(boxes2) == 3
+                    and all(b.status == "executed" for b in boxes2)
+                    and all(b.idempotency_key.endswith(":w0")
+                            for b in boxes2)
+                )
+                check("v2 writes executed with w0 idempotency keys",
+                      sent_ok,
+                      str([(b.status, b.idempotency_key,
+                            b.last_error) for b in boxes2]))
+                payload0 = json.loads(boxes2[0].payload_json)
+                check("v2 write rendered var + collected read step",
+                      payload0.get("channel") == "chan-2"
+                      and payload0.get("text", "").startswith("digest [3]")
+                      and "• First stub item" in payload0.get("text", ""),
+                      str(payload0)[:200])
+                jobs2 = (await db.execute(
+                    select(BuildJob)
+                    .where(BuildJob.source_id == auto2.id)
+                    .where(BuildJob.job_type == "automation_run")
+                )).scalars().all()
+                step_ids = ([s["id"] for s in
+                             json.loads(jobs2[0].steps_json)]
+                            if jobs2 else [])
+                check("v2 runs completed with dynamic step ledger",
+                      len(jobs2) == 3
+                      and all(j.status == "completed"
+                              and j.outcome == "sent" for j in jobs2)
+                      and step_ids == ["evaluate", "feed", "post",
+                                       "record"],
+                      str([(j.status, j.outcome) for j in jobs2])
+                      + str(step_ids))
+
+            from app.agent.automations import memory as engine_memory
+            async with async_session_maker() as db:
+                a = await db.get(type(auto2), auto2.id)
+                mem = await engine_memory.read_context(db, a)
+            check("engine memory written after run, read at fire time",
+                  mem.get("last_outcome") == "sent"
+                  and json.loads(mem.get("last_counts") or "{}")
+                  == {"feed": 3}, str(mem))
+
+            # ── template catalog: synced at boot, served both ways ──
+            r = await http.get("/api/v1/automations/templates",
+                               headers=rpc_h)
+            tpls = {t["slug"]: t for t in r.json().get("templates", [])}
+            check("catalog synced at boot and served over the RPC",
+                  "morning-work-brief" in tpls
+                  and tpls["morning-work-brief"]["category"] == "work"
+                  and len(tpls["morning-work-brief"]["variables"]) >= 3,
+                  str(sorted(tpls))[:200])
+            r = await http.get("/api/automations/templates",
+                               params={"category": "email"},
+                               headers=user_h)
+            email_slugs = {t["slug"] for t in r.json().get("templates", [])}
+            check("user route filters by category",
+                  "boss-email-draft" in email_slugs
+                  and "morning-work-brief" not in email_slugs,
+                  str(email_slugs))
 
             # ── real-vendor mode ────────────────────────────────────
             vendor = os.environ.get("E2E_CONNECTOR")

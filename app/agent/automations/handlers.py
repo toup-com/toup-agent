@@ -61,17 +61,40 @@ def _not_runnable(automation: Automation | None) -> RoutineResult | None:
     return None
 
 
+def _v2_source_for_routine(vspec, routine):
+    """A v2 routine's config names its source lane. Returns None when
+    the lane no longer exists in the spec (stale binding — recompile
+    fixes; treated as an orphan by the caller)."""
+    source_id = (routine.config_json or {}).get("source_id")
+    return vspec.source_by_id(source_id)
+
+
 class AutomationPollHandler:
     kind = "automation_poll"
 
     async def execute(self, routine, run, db: AsyncSession) -> RoutineResult:
+        from .spec_v2 import ValidatedSpecV2
         automation = await _automation_for_routine(db, routine)
         early = _not_runnable(automation)
         if early is not None:
             return early
         try:
             vspec = await parse_spec_live(automation)
-            stats = await executor.poll_and_run(db, automation, vspec)
+            if isinstance(vspec, ValidatedSpecV2):
+                from . import executor_v2
+                source = _v2_source_for_routine(vspec, routine)
+                if source is None or source.mode != "poll":
+                    return RoutineResult(
+                        status="failed", error_class="orphan_binding",
+                        error_detail="This routine's source lane is no "
+                                     "longer in the spec — update the "
+                                     "automation to rebuild bindings.",
+                    )
+                stats = await executor_v2.poll_and_run_v2(
+                    db, automation, vspec, source,
+                )
+            else:
+                stats = await executor.poll_and_run(db, automation, vspec)
         except Exception as e:  # noqa: BLE001 — poll transport/shape errors
             logger.warning("[automations] poll failed automation=%s: %s",
                            automation.id, e)
@@ -112,10 +135,26 @@ class AutomationScheduleHandler:
             if fire_instant is not None else "manual"
         )
         try:
+            from .spec_v2 import ValidatedSpecV2
             vspec = await parse_spec_live(automation)
-            status = await executor.run_schedule_fire(
-                db, automation, vspec, fire_key,
-            )
+            if isinstance(vspec, ValidatedSpecV2):
+                from . import executor_v2
+                source = (_v2_source_for_routine(vspec, routine)
+                          or vspec.schedule_source())
+                if source is None:
+                    return RoutineResult(
+                        status="failed", error_class="orphan_binding",
+                        error_detail="No schedule source in the spec — "
+                                     "update the automation to rebuild "
+                                     "bindings.",
+                    )
+                status = await executor_v2.run_schedule_fire_v2(
+                    db, automation, vspec, source, fire_key,
+                )
+            else:
+                status = await executor.run_schedule_fire(
+                    db, automation, vspec, fire_key,
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning("[automations] schedule fire failed %s: %s",
                            automation.id, e)
@@ -181,6 +220,36 @@ async def handle_push_events(
         })
 
     by_key = {i["gmail_message_id"]: i["_trigger_event_id"] for i in items}
+
+    from .spec_v2 import ValidatedSpecV2
+    if isinstance(vspec, ValidatedSpecV2):
+        from . import executor_v2
+        source_id = (trigger.config_json or {}).get("source_id")
+        source = vspec.source_by_id(source_id) or next(
+            (s for s in vspec.sources if s.mode == "push"), None,
+        )
+        if source is None:
+            logger.info("[automations] push trigger %s: no push source in "
+                        "spec", trigger.id)
+            return {getattr(fe, "event_id", "?"): "skipped_filter"
+                    for fe in kept_emails}
+        fresh = await executor_v2.ingest_items_v2(db, automation, source, items)
+        # v2 event keys are namespaced "<source_id>:<gmail_id>".
+        fresh_keys = {e.dedupe_key for e in fresh}
+        for gmail_id, ev_id in by_key.items():
+            if f"{source.id}:{gmail_id}" not in fresh_keys:
+                out[ev_id] = "coalesced"
+        for event in fresh:
+            status = await executor_v2.run_event_v2(
+                db, automation, vspec, source, event,
+            )
+            bare_key = event.dedupe_key.split(":", 1)[-1]
+            ev_id = by_key.get(bare_key, event.id)
+            out[ev_id] = "success" if status == "run" else (
+                "skipped_filter" if status == "skipped_filter" else "failed"
+            )
+        return out
+
     fresh = await executor.ingest_items(db, automation, vspec, items)
     fresh_keys = {e.dedupe_key for e in fresh}
     for gmail_id, ev_id in by_key.items():

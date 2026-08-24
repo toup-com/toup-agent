@@ -162,6 +162,10 @@ automation:
       poll_args:
         state: open
         per_page: 50
+      # The list tool requires a repo — a spec without these params
+      # would poll nothing. v2 validation enforces; v1 setup agents
+      # were already adding them by hand.
+      params_required: [owner, repo]
       items_path: issues
       dedupe_field: number
       fields:

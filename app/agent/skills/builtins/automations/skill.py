@@ -75,14 +75,24 @@ class AutomationsSkill(Skill):
         spec_schema = {
             "type": "object",
             "description": (
-                "AutomationSpec. trigger.mode: 'poll' (connector_id + "
-                "event + poll_interval_s>=300), 'push' (gmail only), or "
-                "'schedule' (schedule: {cron_local | at | every_s}). "
-                "action: connector tool + params_template whose string "
-                "values may use {{event.<field>}} and "
-                "{{grant.target.id}}. Write actions REQUIRE grant_id "
-                "from automations__request_permission. dedupe_key "
-                "('event.<field>') is REQUIRED for push/poll."
+                "AutomationSpec. v1: trigger.mode 'poll' (connector_id "
+                "+ event + poll_interval_s>=300), 'push' (gmail only), "
+                "or 'schedule' ({cron_local | at | every_s}); action: "
+                "one connector tool + params_template using "
+                "{{event.<field>}} / {{grant.target.id}}. Write actions "
+                "REQUIRE grant_id from automations__request_permission. "
+                "dedupe_key ('event.<field>') REQUIRED for push/poll. "
+                "v2 (set \"version\": 2): trigger.sources[] (up to 4 "
+                "lanes, each push/poll lane with its OWN dedupe_key) + "
+                "steps[] (up to 8 tool calls: reads first — each may "
+                "'collect' items into {{steps.<id>.text}}/"
+                "{{steps.<id>.count}} — then 1-3 grant-gated writes, "
+                "each with its own grant_id). String params may also "
+                "use {{var.<name>}} (declared in top-level variables), "
+                "{{source.id}} and {{memory.<key>}} "
+                "(last_run_at/last_outcome/last_counts from earlier "
+                "runs). Start from a template via "
+                "automations__list_templates when one fits."
             ),
         }
         return [
@@ -181,6 +191,24 @@ class AutomationsSkill(Skill):
                 "input_schema": {"type": "object", "properties": {}},
             },
             {
+                "name": "automations__list_templates",
+                "description": (
+                    "The server-curated template catalog: ready-made "
+                    "automation specs by category (work/email/code/"
+                    "calendar/school/personal) with declared variables "
+                    "to fill. Prefer starting from a matching template "
+                    "over authoring a spec from scratch — pass its "
+                    "slug as template_slug to automations__create."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string",
+                                     "description": "Optional filter."},
+                    },
+                },
+            },
+            {
                 "name": "automations__create",
                 "description": (
                     "Validate and save an automation as a DRAFT (not "
@@ -189,7 +217,14 @@ class AutomationsSkill(Skill):
                 ),
                 "input_schema": {
                     "type": "object",
-                    "properties": {"spec": spec_schema},
+                    "properties": {
+                        "spec": spec_schema,
+                        "template_slug": {
+                            "type": "string",
+                            "description": "Catalog template this spec "
+                                           "started from, for provenance.",
+                        },
+                    },
                     "required": ["spec"],
                 },
             },
@@ -306,6 +341,7 @@ class AutomationsSkill(Skill):
             "automations__request_permission": self._request_permission,
             "automations__list_targets": self._list_targets,
             "automations__list": self._list,
+            "automations__list_templates": self._list_templates,
             "automations__create": self._create,
             "automations__update": self._update,
             "automations__test_run": self._test_run,
@@ -541,6 +577,19 @@ class AutomationsSkill(Skill):
         async with async_session_maker() as db:
             rows = await list_automations(db, _uid(ctx))
         return _as_json({"automations": rows})
+
+    async def _list_templates(self, args, ctx) -> str:
+        from app.agent.automations import registry as reg
+        templates = await reg.fetch_templates(_uid(ctx))
+        category = (args.get("category") or "").strip().lower()
+        if category:
+            templates = [t for t in templates
+                         if (t.get("category") or "") == category]
+        if not templates:
+            return ("No templates available" +
+                    (f" in category {category!r}" if category else "") +
+                    " — build the spec from the registry instead.")
+        return _as_json({"templates": templates})
 
     async def _create(self, args, ctx) -> str:
         from app.agent.automations.service import create_automation

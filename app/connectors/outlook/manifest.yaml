@@ -108,3 +108,35 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 28) ──────────────────────────────
+# Honest metadata: Microsoft Graph change-notification webhooks are
+# NOT provisioned in this codebase, so push is false; events arrive by
+# poll. There are NO write actions — outlook__send_message is the
+# rail-forbidden send, and no draft tool exists. An empty write map is
+# the truth, not an omission.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read:
+    - https://graph.microsoft.com/Mail.Read
+  scopes_write_by_action: {}
+  target_param_by_action: {}
+  events:
+    - key: email_received
+      description: A new email arrives in your Outlook inbox.
+      source_tool: outlook__list_messages
+      poll_args:
+        max_results: 25
+      items_path: messages
+      dedupe_field: id
+      fields:
+        id: id
+        subject: subject
+        from: from
+        preview: preview
+        received_at: received_at

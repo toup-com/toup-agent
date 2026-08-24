@@ -203,3 +203,39 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 28) ──────────────────────────────
+# Notion has no webhooks for public integrations — poll only, via
+# search. Notion search sorts by last_edited_time and the event dedupe
+# gate fires once per page id, so the event is honestly "first time a
+# page is seen", not "page updated". Notion OAuth has no granular
+# scopes (empty lists are the truth); the grant is still the write
+# gate, pinned to one parent page.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read: []
+  scopes_write_by_action:
+    notion__create_page: []
+  target_param_by_action:
+    notion__create_page: parent_page_id
+  events:
+    - key: page_added
+      description: >-
+        A page is seen for the first time in your workspace search
+        (Notion offers no created-time feed, so edits to old pages can
+        also surface a page once).
+      source_tool: notion__search
+      poll_args:
+        page_size: 25
+      items_path: results
+      dedupe_field: id
+      fields:
+        id: id
+        title: title
+        url: url
+        last_edited_time: last_edited_time

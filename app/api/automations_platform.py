@@ -81,6 +81,27 @@ async def automation_registry(
     return {"connectors": get_registry().automation_registry()}
 
 
+@router.get("/templates")
+async def automation_templates(
+    x_agent_key: Optional[str] = Header(default=None),
+    x_agent_user_id: Optional[str] = Header(default=None),
+) -> dict:
+    """The template catalog for the tenant setup agent (Round 28) —
+    same serializer as the user-facing route, agent-key auth."""
+    user_id = await _auth_agent(x_agent_key, x_agent_user_id)
+    await _flag_or_404(user_id)
+    from sqlalchemy import select
+    from app.db.models.platform_automation import AutomationTemplate
+    from app.services.automation_template_catalog import template_payload
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationTemplate)
+            .where(AutomationTemplate.enabled.is_(True))
+            .order_by(AutomationTemplate.sort_order, AutomationTemplate.name)
+        )).scalars().all()
+        return {"templates": [template_payload(t) for t in rows]}
+
+
 @router.get("/connections")
 async def automation_connections(
     x_agent_key: Optional[str] = Header(default=None),

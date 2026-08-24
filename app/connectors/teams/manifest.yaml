@@ -192,3 +192,35 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 28) ──────────────────────────────
+# No webhook path (Graph change notifications unprovisioned) — poll
+# only. Chat polling REQUIRES a chat_id in the spec's trigger params
+# (params_required); the write is pinned to one chat, the same param.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 30
+    per_day: 200
+  scopes_read:
+    - https://graph.microsoft.com/Chat.Read
+  scopes_write_by_action:
+    teams__send_chat_message: ["https://graph.microsoft.com/ChatMessage.Send"]
+  target_param_by_action:
+    teams__send_chat_message: chat_id
+  events:
+    - key: chat_message_received
+      description: A new message appears in a Teams chat you pick.
+      source_tool: teams__read_chat_messages
+      poll_args:
+        max_results: 25
+      params_required: [chat_id]
+      items_path: messages
+      dedupe_field: id
+      fields:
+        id: id
+        sender: sender
+        body: body
+        created_at: created_at

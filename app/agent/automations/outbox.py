@@ -215,9 +215,52 @@ async def _finalize_run(db, row: AutomationOutbox, *, status: str,
                         user_message: Optional[str] = None) -> None:
     if not row.job_id:
         return
+    from sqlalchemy import select as sa_select
     from .executor import _finalize_job
-    await _finalize_job(db, row.job_id, status=status, outcome=outcome,
-                        error_class=error_class, user_message=user_message)
+
+    siblings = (await db.execute(
+        sa_select(AutomationOutbox)
+        .where(AutomationOutbox.job_id == row.job_id)
+    )).scalars().all()
+    if len(siblings) <= 1:
+        # v1 (and single-write v2): the row IS the run — pass the
+        # caller's exact terminal through, byte-identical to Round 26.
+        # The one v2 nuance: a run whose read steps were skipped
+        # reports `partial`, not `sent` (v1 never sets the flag).
+        if status == "completed":
+            job = await db.get(BuildJob, row.job_id)
+            if job is not None and (job.config_json or {}).get("steps_partial"):
+                outcome = "partial"
+        await _finalize_job(db, row.job_id, status=status, outcome=outcome,
+                            error_class=error_class,
+                            user_message=user_message)
+        return
+
+    # Round 28, multi-write runs: the job closes only when EVERY
+    # sibling row is terminal, and the terminal aggregates.
+    job = await db.get(BuildJob, row.job_id)
+    if job is not None and job.status == "waiting_on_user":
+        # A confirm-mode card parked the run — the pending-action
+        # resolution path owns the close.
+        return
+    if any(s.status in ("staged", "executing") for s in siblings):
+        return
+    failed = [s for s in siblings if s.status == "failed"]
+    undone = [s for s in siblings if s.status in ("undone", "cancelled")]
+    if failed:
+        await _finalize_job(
+            db, row.job_id, status="failed", outcome="write_failed",
+            error_class="tool_error",
+            user_message=(failed[0].last_error or "A write failed.")[:300],
+        )
+    elif len(undone) == len(siblings):
+        await _finalize_job(db, row.job_id, status="cancelled",
+                            outcome="undone")
+    else:
+        partial = bool(((job.config_json or {}) if job else {})
+                       .get("steps_partial"))
+        await _finalize_job(db, row.job_id, status="completed",
+                            outcome="partial" if partial else "sent")
 
 
 async def _record_health(db, automation_id: str, *, ok: bool,

@@ -77,6 +77,10 @@ async def compile_bindings(
     created DISABLED — `arm` is the only thing that enables. Existing
     bindings for the automation are torn down first so update is
     re-compile, never patch."""
+    from .spec_v2 import ValidatedSpecV2
+    if isinstance(vspec, ValidatedSpecV2):
+        return await _compile_bindings_v2(db, automation, vspec)
+
     await teardown_bindings(db, automation)
 
     bindings: list[AutomationBinding] = []
@@ -153,6 +157,94 @@ async def compile_bindings(
     return bindings
 
 
+async def _compile_bindings_v2(
+    db: AsyncSession,
+    automation: Automation,
+    vspec,
+) -> list[AutomationBinding]:
+    """Round 28: one primitive row PER SOURCE. Each poll source gets
+    its own hidden routine (its own interval, its own dedupe stream);
+    the schedule source a visible routine; a push source a trigger
+    row. `config_json.source_id` is how the fire handler finds its
+    lane back in the spec."""
+    await teardown_bindings(db, automation)
+
+    bindings: list[AutomationBinding] = []
+    for source in vspec.sources:
+        if source.mode == "push":
+            trigger = Trigger(
+                user_id=automation.user_id,
+                kind="email_received",
+                action=TRIGGER_ACTION_RUN_AUTOMATION,
+                enabled=False,
+                name=f"[automation] {vspec.name}"[:100],
+                filter_json=source.filter_rules or None,
+                config_json={
+                    "automation_id": automation.id,
+                    "source_id": source.id,
+                    **({"params": source.params} if source.params else {}),
+                },
+            )
+            db.add(trigger)
+            await db.flush()
+            binding = AutomationBinding(
+                automation_id=automation.id,
+                user_id=automation.user_id,
+                kind="trigger",
+                target_id=trigger.id,
+                active=False,
+                detail_json=json.dumps({"source_id": source.id}),
+            )
+        else:
+            kind = (
+                ROUTINE_KIND_POLL if source.mode == "poll"
+                else ROUTINE_KIND_SCHEDULE
+            )
+            routine = Routine(
+                user_id=automation.user_id,
+                kind=kind,
+                enabled=False,
+                name=f"[automation] {vspec.name}"[:100],
+                config_json={"automation_id": automation.id,
+                             "source_id": source.id},
+            )
+            if source.mode == "poll":
+                routine.schedule_kind = "every"
+                routine.schedule_interval_seconds = source.poll_interval_s
+                routine.schedule_cron_local = "@every"
+            else:
+                sched = source.schedule or {}
+                if sched.get("cron_local"):
+                    routine.schedule_kind = "cron"
+                    routine.schedule_cron_local = str(sched["cron_local"])
+                elif sched.get("at"):
+                    routine.schedule_kind = "at"
+                    routine.schedule_cron_local = "@at"
+                    routine.schedule_at = datetime.fromisoformat(
+                        str(sched["at"]).replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                    routine.auto_disable_after_fire = True
+                else:
+                    routine.schedule_kind = "every"
+                    routine.schedule_interval_seconds = int(sched["every_s"])
+                    routine.schedule_cron_local = "@every"
+            db.add(routine)
+            await db.flush()
+            binding = AutomationBinding(
+                automation_id=automation.id,
+                user_id=automation.user_id,
+                kind="routine",
+                target_id=routine.id,
+                active=False,
+                detail_json=json.dumps({"routine_kind": kind,
+                                        "source_id": source.id}),
+            )
+        db.add(binding)
+        await db.flush()
+        bindings.append(binding)
+    return bindings
+
+
 async def teardown_bindings(db: AsyncSession, automation: Automation) -> None:
     """Remove every primitive row this automation owns, then the
     binding rows. Missing targets are fine (stale binding)."""
@@ -216,6 +308,44 @@ async def set_bindings_active(
     for b in rows:
         if b.kind == "routine":
             await _reload_runner_routine(b.target_id)
+
+
+async def verify_grants_for_arm_v2(
+    automation: Automation, vspec,
+) -> dict[str, dict]:
+    """Round 28: verify EVERY write step's grant, fail closed on the
+    first problem. Returns {step_id: grant dict} so arm can snapshot
+    each pinned target into its step."""
+    from .registry import fetch_grant
+
+    grants: dict[str, dict] = {}
+    for st in vspec.write_steps:
+        grant = await fetch_grant(automation.user_id, st.grant_id or "")
+        if grant is None:
+            raise CompileError(
+                "grant_unverifiable",
+                f"The write permission for step {st.id!r} could not be "
+                f"verified — it may not exist, or the platform is "
+                f"unreachable. Nothing was armed.",
+            )
+        if grant.get("status") != "approved":
+            raise CompileError(
+                "grant_not_approved",
+                f"The write permission for step {st.id!r} is "
+                f"{grant.get('status')!r}, not approved. Ask for "
+                f"permission first.",
+            )
+        if (
+            grant.get("connector_id") != st.connector_id
+            or grant.get("tool_name") != st.tool
+        ):
+            raise CompileError(
+                "grant_target_mismatch",
+                f"The approved permission for step {st.id!r} is for a "
+                f"different action than the step performs.",
+            )
+        grants[st.id] = grant
+    return grants
 
 
 async def verify_grant_for_arm(

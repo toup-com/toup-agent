@@ -98,6 +98,25 @@ async def fetch_connection_state(user_id: str) -> dict[str, dict]:
     return {e["connector_id"]: e for e in entries if e.get("connector_id")}
 
 
+async def fetch_templates(user_id: str) -> list[dict]:
+    """The server-curated template catalog (Round 28) — slug, name,
+    category, connectors, declared variables, and the spec skeleton.
+    Returns [] when the platform is unreachable (the setup agent says
+    so rather than inventing templates)."""
+    url = _platform_url("/v1/automations/templates")
+    if url is None or not settings.agent_api_key:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+            resp = await client.get(url, headers=_headers(user_id))
+        if resp.status_code != 200:
+            return []
+        return (resp.json() or {}).get("templates") or []
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] templates fetch failed: %s", e)
+        return []
+
+
 async def fetch_grant(user_id: str, grant_id: str) -> Optional[dict]:
     """The platform's authoritative view of one grant, or None when it
     does not exist / is not this user's. Used by the compiler at arm

@@ -304,3 +304,390 @@ async def test_run_event_filter_skip_records_status():
         row = await db.get(AutomationEvent, fresh[0].id)
         assert row.status == "skipped_filter"
         assert row.job_id is None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Round 28 — spec v2: multi-source, steps, memory, fast-lane
+# ═════════════════════════════════════════════════════════════════════
+
+REGISTRY_V2 = {
+    "jira": REGISTRY["jira"],
+    "gmail": REGISTRY["gmail"],
+    "slack": REGISTRY["slack"],
+    "teams": {
+        "connector_id": "teams", "push": False, "poll": True, "floor_s": 300,
+        "rate_budget": {}, "scopes_read": [],
+        "scopes_write_by_action": {"teams__send_chat_message": ["w"]},
+        "target_param_by_action": {"teams__send_chat_message": "chat_id"},
+        "events": [{
+            "key": "chat_message_received", "description": "",
+            "source_tool": "teams__read_chat_messages",
+            "poll_args": {"max_results": 25},
+            "params_required": ["chat_id"],
+            "items_path": "messages", "dedupe_field": "id",
+            "fields": {"id": "id", "body": "body"},
+        }],
+    },
+}
+
+
+def _v2_spec(**over):
+    spec = {
+        "version": 2,
+        "name": "Brief v2",
+        "mode": "auto",
+        "trigger": {"sources": [
+            {"id": "sched", "mode": "schedule",
+             "schedule": {"cron_local": "0 8 * * 1-5"}},
+            {"id": "tickets", "mode": "poll", "connector_id": "jira",
+             "event": "issue_created", "poll_interval_s": 600,
+             "dedupe_key": "event.key"},
+        ]},
+        "steps": [
+            {"id": "issues", "connector_id": "jira",
+             "tool": "jira__search_issues",
+             "params": {"jql": "x"},
+             "collect": {"items_path": "issues",
+                         "fields": {"key": "key", "summary": "summary"},
+                         "format": "• {{item.key}} {{item.summary}}",
+                         "empty_text": "none"},
+             "on_error": "skip"},
+            {"id": "post", "connector_id": "slack",
+             "tool": "slack__send_message",
+             "params": {"channel": "{{grant.target.id}}",
+                        "text": "[{{steps.issues.count}}] "
+                                "{{steps.issues.text}} m:{{memory.last_outcome}}"},
+             "grant_id": "g-1",
+             "grant_target": {"kind": "channel", "id": "C-PIN"}},
+        ],
+    }
+    spec.update(over)
+    return validate_spec(spec, REGISTRY_V2)
+
+
+async def _mk_automation_v2(uid: str, vspec):
+    async with async_session_maker() as db:
+        a = Automation(
+            user_id=uid, name=vspec.name, status="armed",
+            spec_json=json.dumps(vspec.raw, sort_keys=True),
+            trigger_mode=vspec.trigger_mode,
+            connector_id=vspec.trigger_connector_id,
+        )
+        db.add(a)
+        await db.flush()
+        await compiler.compile_bindings(db, a, vspec)
+        await db.commit()
+        return a
+
+
+@pytest.mark.asyncio
+async def test_v2_compile_one_binding_per_source():
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationBinding)
+            .where(AutomationBinding.automation_id == a.id)
+        )).scalars().all()
+        assert len(rows) == 2
+        by_source = {}
+        for b in rows:
+            routine = await db.get(Routine, b.target_id)
+            sid = (routine.config_json or {}).get("source_id")
+            by_source[sid] = routine
+        assert by_source["sched"].kind == "automation_schedule"
+        assert by_source["tickets"].kind == "automation_poll"
+        assert by_source["tickets"].schedule_interval_seconds == 600
+        assert (by_source["tickets"].config_json or {}).get(
+            "automation_id") == a.id
+
+
+@pytest.mark.asyncio
+async def test_v2_ingest_namespaces_dedupe_per_source():
+    from app.agent.automations import executor_v2
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+    items = [{"key": "ENG-1", "summary": "one"}]
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh1 = await executor_v2.ingest_items_v2(db, a2, source, items)
+        assert [e.dedupe_key for e in fresh1] == ["tickets:ENG-1"]
+        payload = json.loads(fresh1[0].payload_json)
+        assert payload["_source"] == "tickets"
+        # Same provider key through a DIFFERENT source id lands fresh —
+        # lanes never collide.
+        source_b = type(source)(
+            id="other", mode=source.mode, connector_id=source.connector_id,
+            event=source.event, params=source.params,
+            poll_interval_s=source.poll_interval_s, schedule=None,
+            filter_rules={}, dedupe_key_field=source.dedupe_key_field,
+            event_spec=source.event_spec,
+        )
+        fresh2 = await executor_v2.ingest_items_v2(db, a2, source_b, items)
+        assert [e.dedupe_key for e in fresh2] == ["other:ENG-1"]
+        # Replay through the original source is still collapsed.
+        assert await executor_v2.ingest_items_v2(db, a2, source, items) == []
+
+
+def _fake_dispatch(responses):
+    """dispatch_via_platform stub: tool_name → result dict (or a
+    callable). Records calls."""
+    calls = []
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        grant_id=None, automation_id=None, request_id=None,
+                        timeout_s=60.0):
+        calls.append({"tool": tool_name, "input": tool_input,
+                      "grant_id": grant_id})
+        resp = responses.get(tool_name)
+        if callable(resp):
+            resp = resp(tool_input)
+        return resp or {"kind": "ok", "content": "{}"}
+
+    _dispatch.calls = calls
+    return _dispatch
+
+
+@pytest.mark.asyncio
+async def test_v2_run_reads_collect_then_stage_and_send(monkeypatch):
+    """The full v2 pipeline on real rows: read step collected into the
+    write's template, outbox key w0, job steps evaluate→issues→post→
+    record, memory written after the run."""
+    from app.agent.automations import executor_v2, memory as engine_memory
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+
+    dispatch = _fake_dispatch({
+        "jira__search_issues": {
+            "kind": "ok",
+            "content": json.dumps({"issues": [
+                {"key": "ENG-7", "summary": "fix the gate"},
+            ]}),
+        },
+        "slack__send_message": {"kind": "ok", "content": "{}"},
+    })
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", dispatch)
+    monkeypatch.setattr(executor_v2, "AUTOMATION_OUTBOX_UNDO_WINDOW_S", 0)
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh = await executor_v2.ingest_items_v2(
+            db, a2, source, [{"key": "ENG-7", "summary": "fix the gate"}])
+        status = await executor_v2.run_event_v2(db, a2, vspec, source, fresh[0])
+        assert status == "run"
+
+        rows = (await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.automation_id == a.id)
+        )).scalars().all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.idempotency_key.endswith(":w0")
+        assert row.status == "executed"
+        sent = json.loads(row.payload_json)
+        assert sent["channel"] == "C-PIN"
+        assert "ENG-7 fix the gate" in sent["text"]
+        assert sent["text"].startswith("[1]")
+
+        job = await db.get(BuildJob, row.job_id)
+        assert job.status == "completed" and job.outcome == "sent"
+        ids = [s["id"] for s in json.loads(job.steps_json)]
+        assert ids == ["evaluate", "issues", "post", "record"]
+
+        # Memory: the namespace row exists and carries the run.
+        mem = await engine_memory.read_context(db, a2)
+        assert mem.get("last_outcome") == "sent"
+        assert json.loads(mem["last_counts"]) == {"issues": 1}
+
+    # Second run renders {{memory.last_outcome}} from the first.
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh = await executor_v2.ingest_items_v2(
+            db, a2, source, [{"key": "ENG-8", "summary": "two"}])
+        await executor_v2.run_event_v2(db, a2, vspec, source, fresh[0])
+        rows = (await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.automation_id == a.id)
+            .order_by(AutomationOutbox.created_at)
+        )).scalars().all()
+        assert "m:sent" in json.loads(rows[-1].payload_json)["text"]
+
+
+@pytest.mark.asyncio
+async def test_v2_on_error_skip_continues_and_reports_partial(monkeypatch):
+    from app.agent.automations import executor_v2
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+
+    dispatch = _fake_dispatch({
+        "jira__search_issues": {"kind": "tool_error", "retryable": False,
+                                "message": "provider melted"},
+        "slack__send_message": {"kind": "ok", "content": "{}"},
+    })
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", dispatch)
+    monkeypatch.setattr(executor_v2, "AUTOMATION_OUTBOX_UNDO_WINDOW_S", 0)
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh = await executor_v2.ingest_items_v2(
+            db, a2, source, [{"key": "ENG-9", "summary": "x"}])
+        status = await executor_v2.run_event_v2(db, a2, vspec, source, fresh[0])
+        assert status == "run"
+        row = (await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.automation_id == a.id)
+        )).scalar_one()
+        sent = json.loads(row.payload_json)
+        # The skipped read contributed its empty_text and count 0.
+        assert sent["text"].startswith("[0] none")
+        job = await db.get(BuildJob, row.job_id)
+        assert job.status == "completed"
+        assert job.outcome == "partial"
+
+
+@pytest.mark.asyncio
+async def test_v2_on_error_fail_fails_the_run_and_stages_nothing(monkeypatch):
+    from app.agent.automations import executor_v2
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    raw = _v2_spec().raw
+    raw["steps"][0]["on_error"] = "fail"
+    vspec = validate_spec(raw, REGISTRY_V2)
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+
+    dispatch = _fake_dispatch({
+        "jira__search_issues": {"kind": "tool_error", "retryable": False,
+                                "message": "nope"},
+    })
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", dispatch)
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh = await executor_v2.ingest_items_v2(
+            db, a2, source, [{"key": "ENG-1", "summary": "x"}])
+        status = await executor_v2.run_event_v2(db, a2, vspec, source, fresh[0])
+        assert status == "failed"
+        rows = (await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.automation_id == a.id)
+        )).scalars().all()
+        assert rows == []
+        a3 = await db.get(Automation, a.id)
+        assert a3.consecutive_failures == 1
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == a.id)
+        )).scalars().first()
+        assert job.status == "failed" and job.outcome == "step_failed"
+
+
+@pytest.mark.asyncio
+async def test_v2_multi_write_aggregate_finalize(monkeypatch):
+    """Two write steps → two outbox rows (w0, w1); the job closes only
+    when BOTH are terminal, and one failure fails the aggregate."""
+    from app.agent.automations import executor_v2
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    raw = _v2_spec().raw
+    raw["steps"].append({
+        "id": "chat", "connector_id": "teams",
+        "tool": "teams__send_chat_message",
+        "params": {"chat_id": "{{grant.target.id}}", "message": "hi"},
+        "grant_id": "g-2",
+        "grant_target": {"kind": "chat", "id": "T-PIN"},
+    })
+    vspec = validate_spec(raw, REGISTRY_V2)
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+
+    dispatch = _fake_dispatch({
+        "jira__search_issues": {"kind": "ok",
+                                "content": json.dumps({"issues": []})},
+        "slack__send_message": {"kind": "ok", "content": "{}"},
+        "teams__send_chat_message": {"kind": "tool_error",
+                                     "retryable": False,
+                                     "message": "chat gone"},
+    })
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", dispatch)
+    monkeypatch.setattr(executor_v2, "AUTOMATION_OUTBOX_UNDO_WINDOW_S", 0)
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        fresh = await executor_v2.ingest_items_v2(
+            db, a2, source, [{"key": "ENG-2", "summary": "x"}])
+        await executor_v2.run_event_v2(db, a2, vspec, source, fresh[0])
+        rows = (await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.automation_id == a.id)
+            .order_by(AutomationOutbox.idempotency_key)
+        )).scalars().all()
+        assert [r.idempotency_key.rsplit(":", 1)[-1] for r in rows] == \
+            ["w0", "w1"]
+        assert rows[0].status == "executed"
+        assert rows[1].status == "failed"
+        job = await db.get(BuildJob, rows[0].job_id)
+        assert job.status == "failed" and job.outcome == "write_failed"
+
+
+@pytest.mark.asyncio
+async def test_v2_delete_removes_memory_namespace(monkeypatch):
+    from app.agent.automations import executor_v2, memory as engine_memory
+    from app.agent.automations import service as svc
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await engine_memory.write_after_run(
+        user_id=uid, automation_id=a.id, automation_name=a.name,
+        outcome="sent", counts={"issues": 3},
+    )
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        assert (await engine_memory.read_context(db, a2)) != {}
+        await svc.delete_automation(db, automation_id=a.id, user_id=uid)
+    async with async_session_maker() as db:
+        class _Shim:
+            id = a.id
+            user_id = uid
+        assert await engine_memory.read_context(db, _Shim()) == {}
+
+
+@pytest.mark.asyncio
+async def test_fast_lane_compiles_second_intervals_off_production(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "automations_dev_fast_lane", True,
+                        raising=False)
+    monkeypatch.setattr(settings, "environment", "development")
+    uid = await _mk_user()
+    raw = _v2_spec().raw
+    raw["trigger"]["sources"][1]["poll_interval_s"] = 5
+    vspec = validate_spec(raw, REGISTRY_V2)
+    a = await _mk_automation_v2(uid, vspec)
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationBinding)
+            .where(AutomationBinding.automation_id == a.id)
+        )).scalars().all()
+        intervals = set()
+        for b in rows:
+            routine = await db.get(Routine, b.target_id)
+            if routine.kind == "automation_poll":
+                intervals.add(routine.schedule_interval_seconds)
+        assert intervals == {5}

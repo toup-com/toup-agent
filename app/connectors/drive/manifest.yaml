@@ -90,3 +90,38 @@ tools:
     channel_policy:
       default: allow
       deny: []
+
+# ── Automation capability (Round 28) ──────────────────────────────
+# Poll only (no webhook/watch channel provisioned). The drive.file
+# scope means the feed honestly covers only files the agent created or
+# was explicitly given — the event description says so. NO write
+# actions: drive__create_doc takes only title/body, so there is no
+# stable target parameter a grant could pin — excluded rather than
+# half-gated.
+automation:
+  push: false
+  poll: true
+  floor_s: 300
+  rate_budget:
+    per_hour: 12
+    per_day: 100
+  scopes_read:
+    - https://www.googleapis.com/auth/drive.file
+  scopes_write_by_action: {}
+  target_param_by_action: {}
+  events:
+    - key: file_added
+      description: >-
+        A file the agent can see (created by it, or shared with it —
+        the drive.file scope's honest reach) appears in Drive.
+      source_tool: drive__list_files
+      poll_args:
+        max_results: 25
+      items_path: files
+      dedupe_field: id
+      fields:
+        id: id
+        name: name
+        mime_type: mimeType
+        modified_at: modifiedTime
+        url: webViewLink

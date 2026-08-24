@@ -126,13 +126,28 @@ async def arm_automation(
     automation = await _load_owned(db, automation_id, user_id)
     vspec = await parse_spec_live(automation)
 
-    grant = await compiler.verify_grant_for_arm(automation, vspec)
-    if grant is not None:
-        raw = dict(vspec.raw)
-        action = dict(raw.get("action") or {})
-        action["grant_target"] = grant.get("target") or {}
-        raw["action"] = action
-        automation.spec_json = json.dumps(raw, sort_keys=True)
+    from .spec_v2 import ValidatedSpecV2
+    if isinstance(vspec, ValidatedSpecV2):
+        # Round 28: every write step's grant, fail closed; snapshot
+        # each pinned target into ITS step for template rendering.
+        grants = await compiler.verify_grants_for_arm_v2(automation, vspec)
+        if grants:
+            raw = dict(vspec.raw)
+            steps = [dict(s) for s in raw.get("steps") or []]
+            for s in steps:
+                g = grants.get(s.get("id"))
+                if g is not None:
+                    s["grant_target"] = g.get("target") or {}
+            raw["steps"] = steps
+            automation.spec_json = json.dumps(raw, sort_keys=True)
+    else:
+        grant = await compiler.verify_grant_for_arm(automation, vspec)
+        if grant is not None:
+            raw = dict(vspec.raw)
+            action = dict(raw.get("action") or {})
+            action["grant_target"] = grant.get("target") or {}
+            raw["action"] = action
+            automation.spec_json = json.dumps(raw, sort_keys=True)
 
     await compiler.set_bindings_active(db, automation, True)
     automation.status = "armed"
@@ -141,7 +156,11 @@ async def arm_automation(
     automation.error_notice_at = None
     await db.commit()
 
-    if vspec.trigger_mode == "push":
+    has_push = vspec.trigger_mode == "push" or (
+        isinstance(vspec, ValidatedSpecV2)
+        and any(s.mode == "push" for s in vspec.sources)
+    )
+    if has_push:
         await _provision_push(db, automation)
     logger.info("[automations] armed id=%s user=%s",
                 automation.id, user_id[:8])
@@ -173,6 +192,10 @@ async def delete_automation(
 ) -> None:
     automation = await _load_owned(db, automation_id, user_id)
     await compiler.teardown_bindings(db, automation)
+    from . import memory as engine_memory
+    await engine_memory.delete_for_automation(
+        db, user_id=user_id, automation_id=automation_id,
+    )
     await db.delete(automation)   # events/outbox cascade via FK
     await db.commit()
     logger.info("[automations] deleted id=%s user=%s",
@@ -190,6 +213,10 @@ async def test_run(
     from . import executor
     automation = await _load_owned(db, automation_id, user_id)
     vspec = await parse_spec_live(automation)
+    from .spec_v2 import ValidatedSpecV2
+    if isinstance(vspec, ValidatedSpecV2):
+        from . import executor_v2
+        return await executor_v2.execute_test_run_v2(db, automation, vspec)
     return await executor.execute_test_run(db, automation, vspec)
 
 
@@ -204,6 +231,8 @@ def _parse_spec(automation: Automation) -> ValidatedSpec:
     paths must use `parse_spec_live` — a poll parsed from this snapshot
     would silently observe nothing."""
     raw = json.loads(automation.spec_json)
+    if raw.get("version") == 2:
+        return validate_spec(raw, _permissive_registry_v2(raw))
     trig = raw.get("trigger") or {}
     act = raw.get("action") or {}
     dk = str(raw.get("dedupe_key") or "")
@@ -225,6 +254,49 @@ def _parse_spec(automation: Automation) -> ValidatedSpec:
             ),
         }
     return validate_spec(raw, permissive)
+
+
+def _permissive_registry_v2(raw: dict) -> dict:
+    """Offline registry snapshot for a persisted v2 spec — every
+    referenced connector, each source's event reconstructed from its
+    own dedupe key, each granted step's tool marked as a write. Shape-
+    only, like the v1 permissive path: fire paths use the live
+    registry."""
+    permissive: dict[str, dict] = {}
+
+    def _entry(cid: str) -> dict:
+        return permissive.setdefault(cid, {
+            "connector_id": cid,
+            "push": True, "poll": True, "floor_s": 300,
+            "events": [],
+            "scopes_write_by_action": {},
+        })
+
+    for src in (raw.get("trigger") or {}).get("sources") or []:
+        if not isinstance(src, dict):
+            continue
+        cid = src.get("connector_id")
+        if not cid:
+            continue
+        entry = _entry(cid)
+        dk = str(src.get("dedupe_key") or "")
+        dk_field = dk[len("event."):] if dk.startswith("event.") else ""
+        if src.get("event"):
+            entry["events"].append({
+                "key": src["event"],
+                "dedupe_field": dk_field,
+                "fields": {dk_field: dk_field} if dk_field else {},
+            })
+    for step in raw.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        cid = step.get("connector_id")
+        if not cid:
+            continue
+        entry = _entry(cid)
+        if step.get("grant_id") and step.get("tool"):
+            entry["scopes_write_by_action"][step["tool"]] = []
+    return permissive
 
 
 async def parse_spec_live(automation: Automation) -> ValidatedSpec:
@@ -249,6 +321,45 @@ async def parse_spec_live(automation: Automation) -> ValidatedSpec:
 
 def automation_payload(a: Automation) -> dict:
     raw = json.loads(a.spec_json)
+    if raw.get("version") == 2:
+        # v2 shape: steps[] (system-written grant_target withheld, as
+        # v1 withholds it from action). `action` stays populated with
+        # the first write step so list surfaces keyed on it keep
+        # rendering.
+        steps = [
+            {k: v for k, v in s.items() if k != "grant_target"}
+            for s in (raw.get("steps") or []) if isinstance(s, dict)
+        ]
+        first_write = next(
+            (s for s in steps if s.get("grant_id")), steps[0] if steps else {},
+        )
+        return {
+            "id": a.id,
+            "name": a.name,
+            "description": a.description,
+            "status": a.status,
+            "paused_reason": a.paused_reason,
+            "version": 2,
+            "trigger": raw.get("trigger") or {},
+            "steps": steps,
+            "variables": raw.get("variables") or {},
+            "action": {
+                "connector_id": first_write.get("connector_id"),
+                "tool": first_write.get("tool"),
+                "params_template": first_write.get("params") or {},
+            },
+            "mode": raw.get("mode"),
+            "template_slug": a.template_slug,
+            "health": {
+                "consecutive_failures": a.consecutive_failures,
+                "last_run_at": (a.last_run_at.isoformat() + "Z")
+                if a.last_run_at else None,
+                "last_status": a.last_status,
+                "last_error": a.last_error,
+            },
+            "created_at": a.created_at.isoformat() + "Z",
+            "updated_at": a.updated_at.isoformat() + "Z",
+        }
     return {
         "id": a.id,
         "name": a.name,
