@@ -224,3 +224,33 @@ def test_ci_and_conftest_agree_on_the_database_url():
             "defence conftest documents. Use the "
             "`sqlite+aiosqlite:///file::memory:?cache=shared&uri=true` form."
         )
+
+
+def test_file_sqlite_pools_per_session_memory_keeps_the_shared_connection(tmp_path):
+    """R28-D: StaticPool on a FILE-backed sqlite shares ONE connection
+    process-wide, so a background loop's rollback lands on the same
+    connection as a request handler mid-transaction and eats its
+    flushed-but-uncommitted writes — a live agent lost its own `arm`
+    that way. File DBs must pool per-session (NullPool). Memory DBs
+    must KEEP the shared connection: every new connection to plain
+    :memory: is a fresh empty database, and the CI shared-cache form
+    dies with its last open connection."""
+    from sqlalchemy.pool import NullPool, StaticPool
+
+    from app.db.database import _build_engine_inner
+
+    eng = _build_engine_inner(f"sqlite+aiosqlite:///{tmp_path}/x.db")
+    try:
+        assert isinstance(eng.sync_engine.pool, NullPool)
+    finally:
+        eng.sync_engine.dispose()
+
+    for url in (
+        "sqlite+aiosqlite:///:memory:",
+        "sqlite+aiosqlite:///file::memory:?cache=shared&uri=true",
+    ):
+        eng = _build_engine_inner(url)
+        try:
+            assert isinstance(eng.sync_engine.pool, StaticPool), url
+        finally:
+            eng.sync_engine.dispose()

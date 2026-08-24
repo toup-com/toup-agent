@@ -691,3 +691,116 @@ async def test_fast_lane_compiles_second_intervals_off_production(monkeypatch):
             if routine.kind == "automation_poll":
                 intervals.add(routine.schedule_interval_seconds)
         assert intervals == {5}
+
+
+@pytest.mark.asyncio
+async def test_fast_lane_interval_builds_a_runner_trigger(monkeypatch):
+    """R28-D: the runner's 60-s hygiene floor marked every fast-lane
+    automation routine invalid_schedule — armed, compiled, and never
+    fired. Sub-60 intervals must build a trigger ONLY for automation
+    kinds, only at/above the 5-s fast-lane floor, and only while the
+    fast lane is active outside production."""
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+
+    from app.agent.routines.runner import _build_trigger_for_routine
+    from app.config import settings
+
+    tz = ZoneInfo("UTC")
+
+    def routine(kind, interval):
+        return SimpleNamespace(kind=kind, schedule_kind="every",
+                               schedule_interval_seconds=interval,
+                               id="r-fast-lane")
+
+    monkeypatch.setattr(settings, "automations_dev_fast_lane", True,
+                        raising=False)
+    monkeypatch.setattr(settings, "environment", "development")
+    for kind in ("automation_poll", "automation_schedule"):
+        trig, tag = _build_trigger_for_routine(routine(kind, 5), tz)
+        assert trig is not None and tag == "every", kind
+    # A 5-s reminder keeps the 60-s hygiene floor.
+    assert _build_trigger_for_routine(routine("reminder", 5), tz) \
+        == (None, "invalid")
+    # Below the fast-lane floor stays invalid even for automations.
+    assert _build_trigger_for_routine(routine("automation_poll", 3), tz) \
+        == (None, "invalid")
+    # Fast lane off → automation kinds keep the 60-s floor.
+    monkeypatch.setattr(settings, "automations_dev_fast_lane", False,
+                        raising=False)
+    assert _build_trigger_for_routine(routine("automation_poll", 5), tz) \
+        == (None, "invalid")
+    # Production refuses the lane even with the env var set.
+    monkeypatch.setattr(settings, "automations_dev_fast_lane", True,
+                        raising=False)
+    monkeypatch.setattr(settings, "environment", "production")
+    assert _build_trigger_for_routine(routine("automation_poll", 5), tz) \
+        == (None, "invalid")
+    # At/above 60 s nothing changed for anyone.
+    monkeypatch.setattr(settings, "environment", "development")
+    trig, tag = _build_trigger_for_routine(routine("reminder", 300), tz)
+    assert trig is not None and tag == "every"
+
+
+@pytest.mark.asyncio
+async def test_arm_nudges_the_runner_after_the_commit(monkeypatch):
+    """R28-D: `reload_routine` re-reads the row in its OWN session, so
+    a nudge fired before the arm transaction commits sees the OLD
+    disabled row and unregisters the routine the arm just enabled —
+    armed automations then only scheduled at the 10-minute reconcile.
+    Pin the contract: when the runner is nudged, a fresh session must
+    already see status='armed' and the routine enabled."""
+    from app.agent.automations import service as svc
+    from app.api import routines as routines_api
+
+    uid = await _mk_user()
+    vspec = _poll_spec()
+    a = await _mk_automation(uid, vspec)
+
+    async def _fake_verify(automation, _vspec):
+        return {"target": {"kind": "channel", "id": "C1", "label": "#x"}}
+
+    async def _fake_parse(_automation):
+        return vspec
+
+    monkeypatch.setattr(compiler, "verify_grant_for_arm", _fake_verify)
+    monkeypatch.setattr(svc, "parse_spec_live", _fake_parse)
+
+    seen: list[tuple[str, str, bool]] = []
+
+    class _Runner:
+        async def reload_routine(self, rid):
+            async with async_session_maker() as db:
+                r = await db.get(Routine, rid)
+                auto = await db.get(Automation, a.id)
+            seen.append((rid, auto.status, bool(r and r.enabled)))
+
+    monkeypatch.setattr(routines_api, "_runner", _Runner(), raising=False)
+
+    async with async_session_maker() as db:
+        await svc.arm_automation(db, automation_id=a.id, user_id=uid)
+
+    assert seen, "arm never nudged the runner"
+    assert all(status == "armed" and enabled
+               for _, status, enabled in seen), seen
+
+
+def test_schedule_fires_are_keyed_per_instant_not_per_day():
+    """R28-D: `_fire_idempotency_key` keyed automation_schedule by
+    local DATE alone, so the second `every_s` fire of the day hit the
+    (source_id, idempotency_key) UNIQUE and silently exited — an
+    "every 2 hours" automation became "once a day". Multi-fire kinds
+    key by fire instant; reminders keep the one-per-day contract."""
+    from datetime import date, datetime as dt
+
+    from app.agent.routines.runner import RoutineRunner
+
+    d = date(2026, 8, 24)
+    t1 = dt(2026, 8, 24, 10, 0, 0)
+    t2 = dt(2026, 8, 24, 10, 0, 5)
+    key = RoutineRunner._fire_idempotency_key
+    for kind in ("automation_schedule", "automation_poll", "autopilot"):
+        assert key(kind, d, t1) != key(kind, d, t2), kind
+        # retries of the SAME fire share the key
+        assert key(kind, d, t1) == key(kind, d, t1), kind
+    assert key("reminder", d, t1) == key("reminder", d, t2) == str(d)

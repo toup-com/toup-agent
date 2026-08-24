@@ -269,11 +269,29 @@ async def teardown_bindings(db: AsyncSession, automation: Automation) -> None:
     await db.flush()
 
 
+async def nudge_routines(routine_ids: list[str]) -> None:
+    """Post-COMMIT scheduler nudge. Must be called AFTER the
+    transaction that changed the rows commits — `reload_routine`
+    re-reads each row in its own session, so a pre-commit nudge sees
+    the OLD state and does the opposite of what was intended."""
+    for rid in routine_ids:
+        await _reload_runner_routine(rid)
+
+
 async def set_bindings_active(
     db: AsyncSession, automation: Automation, active: bool,
-) -> None:
-    """Flip the primitive rows + binding.active. The routine runner is
-    nudged so the change takes effect now, not at the next reconcile."""
+) -> list[str]:
+    """Flip the primitive rows + binding.active. Returns the routine
+    ids touched so the CALLER can `nudge_routines()` AFTER its commit.
+
+    R28-D: the nudge used to live here, pre-commit — and
+    `reload_routine` re-reads the row in its OWN session, which on any
+    non-shared-connection DB (prod postgres, NullPool sqlite) sees only
+    committed state, i.e. the OLD enabled value. Every arm therefore
+    unregistered the routine it had just enabled, and the automation
+    only actually scheduled at the next 10-minute reconcile. (The
+    StaticPool test rig shared one connection, so the nudge saw the
+    uncommitted flush and the bug was structurally invisible there.)"""
     rows = (await db.execute(
         select(AutomationBinding)
         .where(AutomationBinding.automation_id == automation.id)
@@ -305,9 +323,7 @@ async def set_bindings_active(
             trigger.enabled = active
         b.active = active
     await db.flush()
-    for b in rows:
-        if b.kind == "routine":
-            await _reload_runner_routine(b.target_id)
+    return [b.target_id for b in rows if b.kind == "routine"]
 
 
 async def verify_grants_for_arm_v2(

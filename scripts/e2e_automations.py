@@ -569,6 +569,130 @@ async def main() -> int:
                       len(pushes) >= 1 and push_data_ok,
                       f"{len(pushes)} pushes")
 
+            # ═══ Round 28-D: the card/endpoint surface, in-process ═══
+            # The live harness (e2e_automations_live.py) proves these
+            # over real HTTP/WS; this keeps the same contracts pinned
+            # in the fast suite a laptop can run without an LLM key.
+            from app.api.automations import (
+                automation_memory, connector_connected_hook,
+                grant_decided_hook, undo_outbox, ConnectorHook,
+                GrantHook,
+            )
+            from fastapi import HTTPException
+
+            # /memory — the engine's working state, 404 for strangers.
+            mem_body = await automation_memory(auto2.id)
+            check("memory route serves the working-state row",
+                  (mem_body.get("metadata") or {}).get("last_outcome")
+                  == "sent" and mem_body.get("updated_at"),
+                  str(mem_body)[:160])
+            try:
+                await automation_memory(str(uuid.uuid4()))
+                check("memory route 404s on a stranger", False, "no raise")
+            except HTTPException as e:
+                check("memory route 404s on a stranger",
+                      e.status_code == 404, str(e.status_code))
+
+            # Connector card + the _connector_connected wake-up hook:
+            # stage a card the way the skill tool does, then flip it
+            # the way the platform's OAuth callback does.
+            from app.agent.automations import cards
+            from app.db.models import (
+                AutomationAuthSession, AUTOMATION_AUTH_SESSION_TTL_S,
+            )
+            async with async_session_maker() as db:
+                auth_s = AutomationAuthSession(
+                    user_id=user_id, connector_id="stub",
+                    mode="read", scopes_json="[]", status="offered",
+                    expires_at=datetime.utcnow()
+                    + timedelta(seconds=AUTOMATION_AUTH_SESSION_TTL_S),
+                )
+                db.add(auth_s)
+                await db.commit()
+                payload = cards.connector_card_payload(
+                    auth_s, name="Stub", icon=None, scopes=[],
+                )
+                msg_id, _ = await cards.write_card_message(
+                    db, user_id=user_id, content="Connect Stub",
+                    metadata_key=cards.CONNECTOR_CARD_KEY,
+                    payload=payload, title="Connect a service",
+                )
+                auth_s2 = await db.get(AutomationAuthSession, auth_s.id)
+                auth_s2.message_id = msg_id
+                await db.commit()
+            hook_res = await connector_connected_hook(
+                ConnectorHook(connector_id="stub", ok=True),
+            )
+            async with async_session_maker() as db:
+                auth_s3 = await db.get(AutomationAuthSession, auth_s.id)
+                msg = await db.get(Message, msg_id)
+                card_meta = json.loads(msg.metadata_json)[
+                    cards.CONNECTOR_CARD_KEY]
+            check("wake-up hook flips the open card to connected",
+                  hook_res.get("updated") == 1
+                  and auth_s3.status == "connected",
+                  str((hook_res, auth_s3.status)))
+            check("…and rewrites the card's message row in place",
+                  card_meta.get("status") == "connected"
+                  and card_meta.get("id") == auth_s.id,
+                  str(card_meta)[:160])
+
+            # Grant card + the _grant_decided hook: the platform's
+            # approve calls this to rewrite the chat card.
+            async with async_session_maker() as db:
+                g_msg_id, _ = await cards.write_card_message(
+                    db, user_id=user_id, content="May I post?",
+                    metadata_key=cards.GRANT_CARD_KEY,
+                    payload={"id": grant2["id"], "status": "pending"},
+                    title="Permission",
+                )
+            await grant_decided_hook(GrantHook(
+                grant_id=grant2["id"], status="approved",
+                payload={"decided_via": "web"},
+            ))
+            async with async_session_maker() as db:
+                g_msg = await db.get(Message, g_msg_id)
+                g_meta = json.loads(g_msg.metadata_json)[
+                    cards.GRANT_CARD_KEY]
+            check("grant-decided hook rewrites the grant card in place",
+                  g_meta.get("status") == "approved"
+                  and g_meta.get("decided_via") == "web",
+                  str(g_meta)[:160])
+
+            # Undo ROUTE semantics: an executed row answers 409, an
+            # in-window row answers {"undone": true}.
+            async with async_session_maker() as db:
+                late_row = (await db.execute(
+                    select(AutomationOutbox)
+                    .where(AutomationOutbox.automation_id
+                           == automation.id)
+                    .where(AutomationOutbox.status == "executed")
+                )).scalars().first()
+            try:
+                await undo_outbox(late_row.id)
+                check("undo route 409s after the write went out",
+                      False, "no raise")
+            except HTTPException as e:
+                check("undo route 409s after the write went out",
+                      e.status_code == 409, str(e.status_code))
+            async with async_session_maker() as db:
+                fresh_row = AutomationOutbox(
+                    user_id=user_id, automation_id=automation.id,
+                    connector_id="stub", tool_name="stub__post",
+                    payload_json=json.dumps({"channel": "chan-1",
+                                             "text": "route undo"}),
+                    grant_id=grant["id"],
+                    idempotency_key=f"route-undo:{uuid.uuid4()}",
+                    execute_after=datetime.utcnow()
+                    + timedelta(seconds=30),
+                )
+                db.add(fresh_row)
+                await db.commit()
+                fresh_id = fresh_row.id
+            undo_res = await undo_outbox(fresh_id)
+            check("undo route cancels an in-window row",
+                  undo_res.get("undone") is True, str(undo_res))
+
             # ── real-vendor mode ────────────────────────────────────
             vendor = os.environ.get("E2E_CONNECTOR")
             if vendor:

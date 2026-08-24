@@ -116,8 +116,11 @@ async def _sweep_stale_bindings() -> int:
                 from . import compiler
                 vspec = _parse_spec(automation)
                 await compiler.compile_bindings(db, automation, vspec)
-                await compiler.set_bindings_active(db, automation, True)
+                routine_ids = await compiler.set_bindings_active(
+                    db, automation, True,
+                )
                 await db.commit()
+                await compiler.nudge_routines(routine_ids)
                 fixed += 1
                 logger.info("[automations] reset stale bindings for %s",
                             automation.id)
@@ -139,8 +142,11 @@ async def _sweep_auto_pause() -> int:
         )).scalars().all()
         for automation in rows:
             from . import compiler
+            routine_ids: list[str] = []
             try:
-                await compiler.set_bindings_active(db, automation, False)
+                routine_ids = await compiler.set_bindings_active(
+                    db, automation, False,
+                )
             except compiler.CompileError:
                 pass  # binding already gone — the pause still stands
             automation.status = "error"
@@ -148,6 +154,7 @@ async def _sweep_auto_pause() -> int:
             already_noticed = automation.error_notice_at is not None
             automation.error_notice_at = datetime.utcnow()
             await db.commit()
+            await compiler.nudge_routines(routine_ids)
             paused += 1
             if not already_noticed:
                 await _post_error_notice(db, automation)

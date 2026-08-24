@@ -76,6 +76,26 @@ def _parse_cron(expr: str, tz) -> Optional[CronTrigger]:
         return None
 
 
+def _fast_lane_automation_interval_ok(routine, interval: int) -> bool:
+    """R28-D: the automations dev fast-lane compiles poll/every_s
+    intervals down to 5 s (validated in spec.py, dev-only) — but this
+    builder's 60-s hygiene floor silently marked those routines
+    invalid_schedule, so an armed fast-lane automation never fired
+    through the real scheduler. Only automation kinds pass, only at or
+    above the fast-lane floor, and only while the fast lane is active
+    (which production refuses by environment): every other routine kind
+    keeps the 60-s floor exactly as before."""
+    if routine.kind not in ("automation_poll", "automation_schedule"):
+        return False
+    try:
+        from app.agent.automations.spec import (
+            AUTOMATION_DEV_POLL_FLOOR_S, dev_fast_lane_active,
+        )
+    except Exception:  # pragma: no cover — automations package absent
+        return False
+    return interval >= AUTOMATION_DEV_POLL_FLOOR_S and dev_fast_lane_active()
+
+
 def _build_trigger_for_routine(routine, tz):
     """Mig 042 — dispatch on schedule_kind.
 
@@ -102,7 +122,8 @@ def _build_trigger_for_routine(routine, tz):
 
     if kind == "every":
         interval = getattr(routine, "schedule_interval_seconds", None) or 0
-        if interval < 60:
+        if interval < 60 and not _fast_lane_automation_interval_ok(
+                routine, interval):
             return None, "invalid"
         return IntervalTrigger(seconds=int(interval), timezone=tz), "every"
 
@@ -505,9 +526,14 @@ class RoutineRunner:
         interval fire gets a fresh one. fire_instant can be None on
         the manual force-run path — fall back to now() so a force-run
         always executes."""
-        if kind in ("autopilot", "automation_poll"):
+        if kind in ("autopilot", "automation_poll", "automation_schedule"):
             # automation_poll (Round 26) ticks many times a day for the
             # same structural reason autopilot does.
+            # automation_schedule (R28-D): `every_s` schedules tick all
+            # day too — keyed by date alone, the second fire of the day
+            # collided and an "every 2 hours" automation silently became
+            # "once a day". Daily crons lose nothing: retries of one
+            # fire still share the fire instant.
             instant = fire_instant or datetime.utcnow()
             return f"{local_date}T{instant.strftime('%H%M%S')}"
         return str(local_date)

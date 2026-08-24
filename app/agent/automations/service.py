@@ -155,12 +155,15 @@ async def arm_automation(
             raw["action"] = action
             automation.spec_json = json.dumps(raw, sort_keys=True)
 
-    await compiler.set_bindings_active(db, automation, True)
+    routine_ids = await compiler.set_bindings_active(db, automation, True)
     automation.status = "armed"
     automation.paused_reason = None
     automation.consecutive_failures = 0
     automation.error_notice_at = None
     await db.commit()
+    # AFTER the commit — a pre-commit nudge reads the old (disabled)
+    # row and unregisters the routine this arm just enabled (R28-D).
+    await compiler.nudge_routines(routine_ids)
 
     has_push = vspec.trigger_mode == "push" or (
         isinstance(vspec, ValidatedSpecV2)
@@ -178,10 +181,11 @@ async def pause_automation(
     reason: str = "user",
 ) -> Automation:
     automation = await _load_owned(db, automation_id, user_id)
-    await compiler.set_bindings_active(db, automation, False)
+    routine_ids = await compiler.set_bindings_active(db, automation, False)
     automation.status = "paused" if reason == "user" else "error"
     automation.paused_reason = reason
     await db.commit()
+    await compiler.nudge_routines(routine_ids)
     return automation
 
 

@@ -52,10 +52,30 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
     `rebind_database()` builds an identical engine to the one created
     at import."""
     if database_url.startswith("sqlite"):
+        if ":memory:" in database_url:
+            # In-memory databases NEED the one shared connection —
+            # every new connection would otherwise open a fresh empty
+            # DB (plain :memory:) or race the last-close teardown
+            # (file::memory:?cache=shared). This is the CI/test shape.
+            return create_async_engine(
+                database_url,
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+                echo=settings.sql_echo,
+            )
+        # R28-D: file-backed sqlite (dev agents, the e2e harnesses)
+        # must NOT share one connection across the whole process. On
+        # StaticPool a background loop's rollback lands on the same
+        # connection as a request handler mid-transaction and EATS its
+        # flushed-but-uncommitted writes — a live agent lost its own
+        # `arm` this way (routine.enabled=1 flushed, a concurrent
+        # replay sweep rolled back, the later commit committed
+        # nothing). NullPool gives each session its own connection;
+        # the busy timeout rides out writer contention.
         return create_async_engine(
             database_url,
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
+            connect_args={"check_same_thread": False, "timeout": 30},
+            poolclass=NullPool,
             echo=settings.sql_echo,
         )
     if settings.run_mode in ("platform", "agent"):
