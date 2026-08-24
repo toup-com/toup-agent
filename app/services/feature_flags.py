@@ -135,6 +135,59 @@ async def set_rollout_pct(db: AsyncSession, flag: str, pct: int) -> int:
     return pct
 
 
+# ── Per-user allowlist override (R28-D) ──────────────────────────────
+# The pct rollout can only move whole hash buckets, which makes "turn
+# this on for the dev/test tenant, nobody else" impossible — the R28-D
+# simulator round hit exactly that: the app points at production, the
+# flag is dark, and the only lever would have enrolled a percentage of
+# the real fleet. The allowlist is the missing lever: a short
+# comma-separated list of user ids in `platform_settings` under
+# `<setting_key>.allow`, checked BEFORE bucketing. An allowlisted user
+# reads the flag as ON at any pct, including 0; everyone else is
+# untouched. Admin surface: PUT /api/admin/feature-flags/flag/{flag}/allow.
+
+_ALLOWLIST_MAX = 50
+
+
+def _allow_key(spec: FlagSpec) -> str:
+    return spec.setting_key + ".allow"
+
+
+async def get_allowlist(db: AsyncSession, flag: str) -> list[str]:
+    spec = _spec(flag)
+    row = (await db.execute(
+        select(PlatformSetting).where(PlatformSetting.key == _allow_key(spec))
+    )).scalar_one_or_none()
+    if row is None or not (row.value or "").strip():
+        return []
+    return [t.strip() for t in row.value.split(",") if t.strip()]
+
+
+async def set_allowlist(
+    db: AsyncSession, flag: str, user_ids: list[str],
+) -> list[str]:
+    """Replace the allowlist (empty list clears it). Normalizes,
+    dedupes preserving order, caps at _ALLOWLIST_MAX — this is a dev/
+    canary lever, not a rollout mechanism; ramps use the percentage."""
+    spec = _spec(flag)
+    ids: list[str] = []
+    for u in user_ids:
+        u = (u or "").strip()
+        if u and len(u) <= 64 and u not in ids:
+            ids.append(u)
+    ids = ids[:_ALLOWLIST_MAX]
+    value = ",".join(ids)
+    row = (await db.execute(
+        select(PlatformSetting).where(PlatformSetting.key == _allow_key(spec))
+    )).scalar_one_or_none()
+    if row is None:
+        db.add(PlatformSetting(key=_allow_key(spec), value=value))
+    else:
+        row.value = value
+    await db.commit()
+    return ids
+
+
 def _hash_to_bucket(seed: str) -> int:
     # First 8 hex chars of SHA-256 → 32-bit int → mod 100. Deterministic
     # per seed, uniformly distributed enough for rollout cohorts of any
@@ -162,6 +215,11 @@ async def is_enabled(
     db: AsyncSession, flag: str, seed: Optional[str] = None,
 ) -> bool:
     spec = _spec(flag)
+    # Allowlist first: an allowlisted user is ON at any pct, incl. 0.
+    # Only user-id seeds can match — anonymous/IP seeds never do,
+    # because the list holds user ids.
+    if seed and seed in await get_allowlist(db, flag):
+        return True
     pct = await get_rollout_pct(db, flag)
     return is_enabled_for(seed, pct, spec.salt)
 

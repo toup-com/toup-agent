@@ -228,10 +228,19 @@ class FlagSnapshot(BaseModel):
     flag: str
     rollout_pct: int
     env_default_pct: int
+    # R28-D: per-user override — ON at any pct for exactly these user
+    # ids (the dev/test-tenant lever the pct rollout cannot express).
+    allow_user_ids: list[str] = []
 
 
 class FlagUpdate(BaseModel):
     rollout_pct: int = Field(..., ge=0, le=100)
+
+
+class FlagAllowlistUpdate(BaseModel):
+    # Replaces the whole list; [] clears. Capped server-side — this is
+    # a dev/canary lever, not a rollout mechanism.
+    user_ids: list[str] = Field(..., max_length=50)
 
 
 def _known_flag(flag: str) -> str:
@@ -254,6 +263,7 @@ async def list_feature_flags(
             flag=name,
             rollout_pct=await feature_flags.get_rollout_pct(db, name),
             env_default_pct=int(getattr(_s, spec.env_attr, 0) or 0),
+            allow_user_ids=await feature_flags.get_allowlist(db, name),
         )
         for name, spec in feature_flags.FLAGS.items()
     ]
@@ -271,6 +281,7 @@ async def get_feature_flag(
         flag=flag,
         rollout_pct=await feature_flags.get_rollout_pct(db, flag),
         env_default_pct=int(getattr(_s, feature_flags.FLAGS[flag].env_attr, 0) or 0),
+        allow_user_ids=await feature_flags.get_allowlist(db, flag),
     )
 
 
@@ -291,4 +302,30 @@ async def put_feature_flag(
         flag=flag,
         rollout_pct=pct,
         env_default_pct=int(getattr(_s, feature_flags.FLAGS[flag].env_attr, 0) or 0),
+        allow_user_ids=await feature_flags.get_allowlist(db, flag),
+    )
+
+
+@admin_router.put("/flag/{flag}/allow", response_model=FlagSnapshot)
+async def put_feature_flag_allowlist(
+    flag: str,
+    body: FlagAllowlistUpdate,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> FlagSnapshot:
+    """Replace the flag's per-user allowlist (R28-D). The listed user
+    ids see the flag ON at any rollout pct, including 0 — the dev/test
+    tenant lever. [] clears it."""
+    from app.config import settings as _s
+    _known_flag(flag)
+    ids = await feature_flags.set_allowlist(db, flag, body.user_ids)
+    logger.info(
+        "admin.feature_flag.%s allowlist=%d_users by_admin=%s",
+        flag, len(ids), admin.id,
+    )
+    return FlagSnapshot(
+        flag=flag,
+        rollout_pct=await feature_flags.get_rollout_pct(db, flag),
+        env_default_pct=int(getattr(_s, feature_flags.FLAGS[flag].env_attr, 0) or 0),
+        allow_user_ids=ids,
     )

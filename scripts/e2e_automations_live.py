@@ -368,6 +368,40 @@ async def main() -> int:
             )
             check("non-admin cannot flip the flag (403)",
                   r.status_code == 403, f"{r.status_code}")
+
+            # ── the dev-tenant lever: per-user allowlist at pct 0 ────
+            # (R28-D: the pct rollout can only move hash buckets — this
+            # is how ONE tenant goes live while production stays dark.)
+            r = await http.put(
+                f"{base}/api/admin/feature-flags/flag/automations/allow",
+                headers=admin_h, json={"user_ids": [user_id]},
+            )
+            check("admin allowlists the dev tenant (pct still 0)",
+                  r.status_code == 200
+                  and r.json().get("allow_user_ids") == [user_id]
+                  and r.json().get("rollout_pct") == 0,
+                  f"{r.status_code} {r.text[:160]}")
+            r = await http.get(f"{base}/api/system/feature-flags",
+                               headers=user_h)
+            check("the listed tenant reads automations ON",
+                  r.json().get("automations") is True, r.text[:120])
+            r = await http.get(f"{base}/api/automations/templates",
+                               headers=user_h)
+            check("…and the surface serves for them",
+                  r.status_code == 200, f"{r.status_code}")
+            r = await http.get(f"{base}/api/automations/templates",
+                               headers=admin_h)
+            check("…while an unlisted user stays dark (404)",
+                  r.status_code == 404, f"{r.status_code}")
+            r = await http.put(
+                f"{base}/api/admin/feature-flags/flag/automations/allow",
+                headers=admin_h, json={"user_ids": []},
+            )
+            r = await http.get(f"{base}/api/automations/templates",
+                               headers=user_h)
+            check("clearing the allowlist re-darkens the tenant",
+                  r.status_code == 404, f"{r.status_code}")
+
             r = await http.put(
                 f"{base}/api/admin/feature-flags/flag/automations",
                 headers=admin_h, json={"rollout_pct": 100},
