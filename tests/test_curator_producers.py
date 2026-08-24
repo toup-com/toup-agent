@@ -458,6 +458,20 @@ _ALLOWED_WRITE_SITES = {
         "No route, no client, run by hand. Severing its extraction would "
         "leave a script that pretends to seed."
     ),
+    "app/agent/automations/memory.py": (1,
+        "The automations engine's working-state row (R28 contract §6): ONE "
+        "row per automation, ref_kind='automation', upserted after each "
+        "terminal run so templates can read {{memory.<key>}} at fire time. "
+        "It is the current_context.py precedent applied to a row — direct, "
+        "deterministic, no curator, no LLM — and INVISIBLE to the brain by "
+        "construction: not a memory file, unreachable from load_brain / "
+        "search_files / the Memory UI; only the engine and GET "
+        "/api/automations/{id}/memory read it, and deleting the automation "
+        "deletes it. The invariant this audit protects — conversational "
+        "facts reach the brain only through the curator — is untouched: an "
+        "automation's BRAIN facts go through memory_curator.instruct_file "
+        "(automations/memory_notes.py), never through this row."
+    ),
 }
 
 
