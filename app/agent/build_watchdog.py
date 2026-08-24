@@ -216,7 +216,7 @@ async def settle_build(
     paused, missing, not an app build, or another sweep got there first.
     """
     from app.db.database import async_session_maker
-    from app.db.models import App as AppModel, BuildJob, JobEvent
+    from app.db.models import BuildJob, JobEvent
     from app.agent.skills.builtins.app_html.steps import (
         _HIGH_WATER_KEY, progress as _progress, public_steps, settle_steps,
     )
@@ -310,26 +310,11 @@ async def settle_build(
                                           "published": published}),
             ))
 
-            # A build that died mid-flight leaves its App row on 'building',
-            # which is its own spinner one surface over. A build that DID
-            # publish and then died leaves the same row on 'building' with a
-            # live app behind it — read the slug either way, because the
-            # published branch needs it for the `app_ready` frame below.
-            slug = None
-            if job.app_id:
-                app_row = await db.get(AppModel, job.app_id)
-                if app_row is not None:
-                    slug = app_row.slug
-                    if not published and app_row.status == "building":
-                        app_row.status = "error"
-                    elif published and app_row.status == "building":
-                        app_row.status = "ready"
-
             await db.commit()
             out = SettledBuild(
                 job_id=job_id, user_id=job.user_id,
                 title=(job.title or "").replace("Build: ", ""),
-                status=final, app_id=job.app_id, slug=slug,
+                status=final, app_id=job.app_id,
                 chat_id=getattr(job, "conversation_id", None),
                 published=published, done=done, total=total, percent=percent,
                 steps=public_steps(steps),
@@ -339,6 +324,17 @@ async def settle_build(
                        exc_info=True)
         return None
 
+    # The App row is touched in its OWN session, AFTER the job is committed.
+    # Not tidiness: `apps` is one of the AGENT_ONLY tables, so under
+    # RUN_MODE=platform (and in any test whose fixture creates only the job
+    # tables) the SELECT raises `no such table: apps` — and reading it inside
+    # the transaction above put that exception on the settle's own path,
+    # where the blanket `except` swallowed it and returned None. The card
+    # then stayed exactly as stuck as before, with a warning in the log
+    # saying so. A cosmetic row on a second table must not be able to veto
+    # the close.
+    out.slug = await _sync_app_row(out.app_id, published=out.published)
+
     logger.warning(
         "[build_watchdog] settled build %s (%s) as %s — %d/%d, reason=%s",
         out.job_id[:8], out.title[:60], out.status, out.done, out.total, reason,
@@ -346,6 +342,39 @@ async def settle_build(
     if announce:
         await announce_settled(out)
     return out
+
+
+async def _sync_app_row(app_id: Optional[str], *, published: bool) -> Optional[str]:
+    """Take the app off ``building``, and hand back its slug. Never raises.
+
+    A build that died mid-flight leaves its App row on ``building``, which is
+    its own spinner one surface over — in the library rather than the chat.
+    A build that DID publish and then died leaves the same row on
+    ``building`` with a live app behind it. Both are resolved here, and the
+    slug comes back either way because the published branch needs it to
+    address the ``app_ready`` frame.
+
+    Own session, and a total swallow: ``apps`` is AGENT_ONLY, so this is the
+    one part of a settle that can simply be absent.
+    """
+    if not app_id:
+        return None
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import App as AppModel
+        async with async_session_maker() as db:
+            row = await db.get(AppModel, app_id)
+            if row is None:
+                return None
+            slug = row.slug
+            if row.status == "building":
+                row.status = "ready" if published else "error"
+                await db.commit()
+            return slug
+    except Exception:  # noqa: BLE001 - never worth a settle
+        logger.debug("[build_watchdog] app row sync skipped for %s",
+                     app_id, exc_info=True)
+        return None
 
 
 async def announce_settled(settled: SettledBuild) -> None:

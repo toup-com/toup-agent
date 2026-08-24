@@ -431,6 +431,36 @@ async def test_a_published_build_still_announces_the_app(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_settle_survives_an_absent_apps_table(monkeypatch):
+    """`apps` is AGENT_ONLY, and the settle must not depend on it.
+
+    Caught by CI, not by me: the first cut read the App row INSIDE the
+    settle's own transaction, so under `RUN_MODE=platform` — where
+    `init_db()` does not build AGENT_ONLY tables — `no such table: apps`
+    landed on the settle's path, the blanket `except` swallowed it, and
+    `settle_build` returned None. The card stayed exactly as stuck as
+    before, with a log line politely saying so. Two suites went red in the
+    platform sweep and green in the agent one, which is the tell.
+
+    A cosmetic row on a second table may not veto the close.
+    """
+    import app.agent.build_watchdog as bw
+    from app.db.database import engine
+    from app.db.models import App as AppModel
+
+    _mute_surfaces(monkeypatch)
+    job_id = await _seed_build()
+    async with engine.begin() as conn:
+        await conn.run_sync(AppModel.__table__.drop, checkfirst=True)
+
+    settled = await bw.settle_build(job_id, reason="watchdog")
+    assert settled is not None and settled.status == "failed"
+    assert settled.slug is None
+    _steps, status, _ = await _row(job_id)
+    assert status == "failed"
+
+
+@pytest.mark.asyncio
 async def test_an_unpublished_build_marks_its_app_errored(monkeypatch):
     """The mirror: an app left on `building` by a dead build is a spinner
     one surface over, in the library rather than the chat."""
