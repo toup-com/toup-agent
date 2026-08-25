@@ -282,15 +282,25 @@ class AgentTunnelClient:
             load_dotenv(env_path, override=True)
             logger.info("[TUNNEL-CLIENT] Reloaded env vars from %s", env_path)
 
-        # Clear the settings cache so next access creates fresh Settings
+        # Mutate the canonical Settings object IN PLACE. The previous
+        # shape (cache_clear + rebind app.config.settings) only updated
+        # the module ATTRIBUTE — every module that did
+        # `from app.config import settings` at import (nearly all of
+        # them, including the /api/automations feature gate) kept its
+        # reference to the OLD object and never saw a single reloaded
+        # value. Observed live 2026-08-25 on the founder tenant: the
+        # config push delivered AUTOMATIONS_ENABLED=true, this "reload"
+        # logged success, and the gate kept refusing until a full
+        # process restart. Updating the one canonical object's __dict__
+        # makes every held reference see the new values; get_settings()
+        # keeps returning that same (now-updated) object — one
+        # identity, no forks.
         try:
-            from app.config import get_settings
-            get_settings.cache_clear()
-            # Re-import to force re-creation
-            import app.config
-            app.config.settings = get_settings()
-            logger.info("[TUNNEL-CLIENT] Settings reloaded (model=%s)", app.config.settings.agent_model)
-            print(f"✅ Settings reloaded (model={app.config.settings.agent_model})")
+            from app.config import Settings, settings as _canonical
+            fresh = Settings()
+            _canonical.__dict__.update(fresh.__dict__)
+            logger.info("[TUNNEL-CLIENT] Settings reloaded in place (model=%s)", _canonical.agent_model)
+            print(f"✅ Settings reloaded (model={_canonical.agent_model})")
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] Failed to reload settings: %s", e)
 
