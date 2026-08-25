@@ -153,9 +153,17 @@ async def gmail_pubsub_webhook(
         logger.warning("[gmail_pubsub] envelope_invalid reason=%s", str(e)[:200])
         raise HTTPException(status_code=400, detail=f"envelope invalid: {e}")
 
-    # 3. Resolve email → user_id via connector_identities.
-    user_id = await _resolve_user_for_email(email)
-    if user_id is None:
+    # 3. Resolve email → EVERY user with an active identity for this
+    # mailbox. One mailbox under several platform users is ordinary
+    # (shared inbox, one person's dev + prod accounts): each of them
+    # independently authorized it, so each gets the push. The previous
+    # single-user resolver used scalar_one_or_none(), which RAISED
+    # MultipleResultsFound out of the handler the moment a second
+    # active identity appeared — every push for that mailbox 500'd and
+    # Pub/Sub retried forever (live incident: founder's email triggers
+    # dead since 2026-08-11).
+    user_ids = await _resolve_users_for_email(email)
+    if not user_ids:
         # Common, not an error — user disconnected Gmail, or the push
         # is for an email we never had a connector for. Return 200 so
         # Pub/Sub stops retrying. Log so ops can spot a misconfigured
@@ -169,6 +177,60 @@ async def gmail_pubsub_webhook(
             "dropped": "unknown_email",
             "latency_ms": _ms_now() - started_ms,
         }
+
+    # 4-7 run per user. Watermarks are already keyed per
+    # (user_id, email) so each user's delta is independent. Sequential
+    # on purpose: 2-3 users × (history.list + dispatch) fits the 10 s
+    # Pub/Sub budget with room, and it keeps the error policy simple.
+    #
+    # Error policy: a TRANSIENT per-user failure (history 5xx, agent
+    # unreachable) is remembered and re-raised as 503 AFTER the other
+    # users are served — Pub/Sub redelivers, and the users that
+    # succeeded are idempotent on the redo (agent dedupe gate +
+    # advanced watermark → empty delta). A PERMANENT per-user failure
+    # (agent 4xx) is recorded and never blocks the others; retrying
+    # cannot fix it, so it must not hold the mailbox hostage.
+    results: list[dict[str, Any]] = []
+    transient: Optional[HTTPException] = None
+    total_dispatched = 0
+    for user_id in user_ids:
+        try:
+            outcome = await _process_push_for_user(
+                user_id, email, history_id,
+            )
+            total_dispatched += int(outcome.get("dispatched") or 0)
+            results.append({"user_id": user_id[:8], **outcome})
+        except HTTPException as e:
+            if e.status_code >= 500:
+                transient = e
+                results.append(
+                    {"user_id": user_id[:8], "transient_status": e.status_code}
+                )
+            else:
+                results.append(
+                    {"user_id": user_id[:8], "permanent_status": e.status_code}
+                )
+    if transient is not None:
+        raise transient
+
+    latency_ms = _ms_now() - started_ms
+    return {
+        "status": "ok",
+        "users": len(user_ids),
+        "dispatched": total_dispatched,
+        "results": results,
+        "latency_ms": latency_ms,
+    }
+
+
+async def _process_push_for_user(
+    user_id: str, email: str, history_id: str,
+) -> dict[str, Any]:
+    """Steps 4-7 of the push flow for ONE user: watermark → history
+    delta → dispatch → advance. Raises HTTPException(503) on transient
+    failure (caller re-raises after serving other users) and
+    HTTPException(4xx) on permanent agent rejection."""
+    started_ms = _ms_now()
 
     # 4. Look up the watermark. Single source of truth is
     # `ConnectorIdentity.metadata_json.gmail_history_id` on the
@@ -290,21 +352,31 @@ async def gmail_pubsub_webhook(
 # ── Helpers (DB-local) ───────────────────────────────────────────────
 
 
-async def _resolve_user_for_email(email: str) -> str | None:
-    """`connector_identities.provider_account_id == email` →
-    `user_id`. Returns None if no active Gmail identity for this email
-    (user disconnected or never connected)."""
+async def _resolve_users_for_email(email: str) -> list[str]:
+    """`connector_identities.provider_account_id == email` → every
+    user_id with an ACTIVE Gmail identity for this mailbox, oldest
+    connection first (deterministic order for logs/retries). Empty
+    list if nobody holds it (disconnected or never connected).
+
+    Distinct on purpose: one user re-connecting can leave two rows
+    for the same mailbox — they still get the push exactly once."""
     from app.db.models import ConnectorIdentity
 
     async with async_session_maker() as db:
-        result = (await db.execute(
+        rows = (await db.execute(
             select(ConnectorIdentity.user_id).where(
                 ConnectorIdentity.connector_id == "gmail",
                 ConnectorIdentity.provider_account_id == email,
                 ConnectorIdentity.status == "active",
-            )
-        )).scalar_one_or_none()
-    return result
+            ).order_by(ConnectorIdentity.connected_at)
+        )).scalars().all()
+    seen: set[str] = set()
+    out: list[str] = []
+    for uid in rows:
+        if uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
 
 
 async def _read_watermark_from_connector(
@@ -358,28 +430,31 @@ async def _advance_watermark_on_connector(
     from app.db.models import ConnectorIdentity
 
     async with async_session_maker() as db:
-        row = (await db.execute(
+        # .all(): one user re-connecting can leave two rows for the
+        # same mailbox; scalar_one_or_none() would raise on the pair.
+        rows = (await db.execute(
             select(ConnectorIdentity).where(
                 ConnectorIdentity.user_id == user_id,
                 ConnectorIdentity.connector_id == "gmail",
                 ConnectorIdentity.provider_account_id == email,
             )
-        )).scalar_one_or_none()
-        if row is None:
+        )).scalars().all()
+        if not rows:
             return
-        try:
-            meta = json.loads(row.metadata_json or "{}")
-            if not isinstance(meta, dict):
+        for row in rows:
+            try:
+                meta = json.loads(row.metadata_json or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except (ValueError, TypeError):
                 meta = {}
-        except (ValueError, TypeError):
-            meta = {}
-        meta["gmail_history_id"] = str(new_history_id)
-        meta.pop("needs_refresh", None)             # advancing resets the flag
-        await db.execute(
-            update(ConnectorIdentity)
-            .where(ConnectorIdentity.id == row.id)
-            .values(metadata_json=json.dumps(meta))
-        )
+            meta["gmail_history_id"] = str(new_history_id)
+            meta.pop("needs_refresh", None)         # advancing resets the flag
+            await db.execute(
+                update(ConnectorIdentity)
+                .where(ConnectorIdentity.id == row.id)
+                .values(metadata_json=json.dumps(meta))
+            )
         await db.commit()
 
 
@@ -393,27 +468,28 @@ async def _flag_connector_needs_refresh(user_id: str, email: str) -> None:
     from app.db.models import ConnectorIdentity
 
     async with async_session_maker() as db:
-        row = (await db.execute(
+        rows = (await db.execute(
             select(ConnectorIdentity).where(
                 ConnectorIdentity.user_id == user_id,
                 ConnectorIdentity.connector_id == "gmail",
                 ConnectorIdentity.provider_account_id == email,
             )
-        )).scalar_one_or_none()
-        if row is None:
+        )).scalars().all()
+        if not rows:
             return
-        try:
-            meta = json.loads(row.metadata_json or "{}")
-            if not isinstance(meta, dict):
+        for row in rows:
+            try:
+                meta = json.loads(row.metadata_json or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except (ValueError, TypeError):
                 meta = {}
-        except (ValueError, TypeError):
-            meta = {}
-        meta["needs_refresh"] = True
-        await db.execute(
-            update(ConnectorIdentity)
-            .where(ConnectorIdentity.id == row.id)
-            .values(metadata_json=json.dumps(meta))
-        )
+            meta["needs_refresh"] = True
+            await db.execute(
+                update(ConnectorIdentity)
+                .where(ConnectorIdentity.id == row.id)
+                .values(metadata_json=json.dumps(meta))
+            )
         await db.commit()
 
 
@@ -443,26 +519,36 @@ async def _record_push_received(email: str) -> None:
     from app.db.models import ConnectorIdentity
 
     async with async_session_maker() as db:
-        row = (await db.execute(
+        # ALL matching rows, status-unfiltered: this stamp exists to
+        # prove "a push physically arrived for this mailbox", and that
+        # is true for every identity holding it — including a
+        # reauth_required one, whose owner is exactly the person
+        # debugging why their triggers stopped. The previous
+        # scalar_one_or_none() raised MultipleResultsFound the moment
+        # a second identity appeared, silently freezing the timestamp
+        # in the very incident it was built to illuminate.
+        rows = (await db.execute(
             select(ConnectorIdentity).where(
                 ConnectorIdentity.connector_id == "gmail",
                 ConnectorIdentity.provider_account_id == email,
             )
-        )).scalar_one_or_none()
-        if row is None:
+        )).scalars().all()
+        if not rows:
             return
-        try:
-            meta = _json.loads(row.metadata_json or "{}")
-            if not isinstance(meta, dict):
+        stamp = _utc_iso_z()
+        for row in rows:
+            try:
+                meta = _json.loads(row.metadata_json or "{}")
+                if not isinstance(meta, dict):
+                    meta = {}
+            except (ValueError, TypeError):
                 meta = {}
-        except (ValueError, TypeError):
-            meta = {}
-        meta["last_push_received_at"] = _utc_iso_z()
-        await db.execute(
-            update(ConnectorIdentity)
-            .where(ConnectorIdentity.id == row.id)
-            .values(metadata_json=_json.dumps(meta))
-        )
+            meta["last_push_received_at"] = stamp
+            await db.execute(
+                update(ConnectorIdentity)
+                .where(ConnectorIdentity.id == row.id)
+                .values(metadata_json=_json.dumps(meta))
+            )
         await db.commit()
 
 

@@ -705,3 +705,172 @@ def test_validate_triggers_env_raises_with_whitespace_only_values():
     )
     with pytest.raises(TriggersEmailMisconfigured):
         _validate_triggers_email_env(bad)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# R29-D — one mailbox, many identities (the 2026-08-11 founder outage).
+#
+# Prod had THREE active gmail identities for one mailbox (three platform
+# users each authorized it). `_resolve_user_for_email` used
+# scalar_one_or_none(), so every push raised MultipleResultsFound out of
+# the handler → 500 → Pub/Sub retry loop; `_record_push_received` died
+# the same way, freezing the very diagnostic built for this outage.
+# Fix: resolve to EVERY active user and fan the push out per-user
+# (watermarks are already keyed per (user_id, email)).
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _seed_shared_mailbox(email: str):
+    """Three users on one mailbox: A active (oldest), B
+    reauth_required, C active (newest). Returns (user_a, user_b,
+    user_c). One row per (user, connector) — the model's UNIQUE
+    constraint forbids same-user duplicates; the resolver's dedup is
+    belt-and-braces for prod tables that predate the constraint
+    (create_all never retrofits one)."""
+    from app.db.database import async_session_maker
+    from app.db.models import ConnectorIdentity, User
+
+    uids = [str(uuid.uuid4()) for _ in range(3)]
+    base = datetime(2026, 8, 11, 18, 0, 0)
+    async with async_session_maker() as db:
+        for i, uid in enumerate(uids):
+            db.add(User(id=uid, email=f"shared-{i}-{uid[:8]}@example.com",
+                        hashed_password="x"))
+        rows = [
+            (uids[0], "active", base),
+            (uids[1], "reauth_required", base + timedelta(days=1)),
+            (uids[2], "active", base + timedelta(days=2)),
+        ]
+        for uid, st, ts in rows:
+            db.add(ConnectorIdentity(
+                id=str(uuid.uuid4()), user_id=uid, connector_id="gmail",
+                provider_account_id=email, status=st, connected_at=ts,
+            ))
+        await db.commit()
+    return uids
+
+
+@pytest.mark.asyncio
+async def test_resolver_fans_out_to_every_active_user_for_shared_mailbox():
+    """All ACTIVE holders come back, oldest connection first, deduped —
+    and above all: no MultipleResultsFound."""
+    from app.api.webhooks_gmail_pubsub import _resolve_users_for_email
+
+    email = f"shared-{uuid.uuid4().hex[:10]}@gmail.com"
+    user_a, user_b, user_c = await _seed_shared_mailbox(email)
+
+    resolved = await _resolve_users_for_email(email)
+    assert resolved == [user_a, user_c], (
+        "resolver must return every ACTIVE user exactly once, oldest "
+        f"first — got {resolved}"
+    )
+    assert user_b not in resolved, "reauth_required must not receive pushes"
+
+
+@pytest.mark.asyncio
+async def test_record_push_received_stamps_every_identity_row():
+    """The pre-JWT footprint must land on EVERY row for the mailbox —
+    including reauth_required, whose owner is exactly the person
+    debugging why their triggers went quiet."""
+    import json as _json
+    from sqlalchemy import select
+    from app.api.webhooks_gmail_pubsub import _record_push_received
+    from app.db.database import async_session_maker
+    from app.db.models import ConnectorIdentity
+
+    email = f"shared-{uuid.uuid4().hex[:10]}@gmail.com"
+    await _seed_shared_mailbox(email)
+
+    await _record_push_received(email)
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(ConnectorIdentity).where(
+                ConnectorIdentity.provider_account_id == email,
+            )
+        )).scalars().all()
+    assert len(rows) == 3
+    for row in rows:
+        meta = _json.loads(row.metadata_json or "{}")
+        assert meta.get("last_push_received_at"), (
+            f"row status={row.status} was not stamped"
+        )
+
+
+def _pubsub_body(email: str, history_id: str = "1000") -> dict:
+    import base64
+    import json as _json
+    payload = _json.dumps(
+        {"emailAddress": email, "historyId": history_id}
+    ).encode()
+    return {
+        "message": {"data": base64.b64encode(payload).decode(),
+                    "messageId": "m-1", "publishTime": "2026-08-24T00:00:00Z"},
+        "subscription": "projects/x/subscriptions/y",
+    }
+
+
+@pytest.mark.asyncio
+async def test_push_fans_out_and_transient_failure_still_serves_others(monkeypatch):
+    """Two active users on one mailbox: BOTH get the dispatch. A
+    transient dispatch failure for one user 503s the push (Pub/Sub
+    redelivers) — but only AFTER the other user was served."""
+    from app.api import webhooks_gmail_pubsub as mod
+    from app.services.trigger_dispatch import TriggerDispatchError
+
+    email = f"shared-{uuid.uuid4().hex[:10]}@gmail.com"
+    user_a, _user_b, user_c = await _seed_shared_mailbox(email)
+
+    monkeypatch.setattr(mod.settings, "triggers_email_enabled", True)
+    monkeypatch.setattr(
+        mod, "verify_pubsub_jwt",
+        AsyncMock(return_value={"email": "pubsub@gcp-sa.example"}),
+    )
+    monkeypatch.setattr(
+        mod, "list_new_message_ids",
+        AsyncMock(return_value=(["msg-1"], "1001")),
+    )
+    dispatched: list[str] = []
+
+    async def _dispatch(user_id: str, trigger_kind: str, events: list):
+        dispatched.append(user_id)
+        if user_id == user_c:
+            raise TriggerDispatchError("agent unreachable", status_code=503)
+        return {"inserted": 1, "dedupe_hits": 0}
+
+    monkeypatch.setattr(mod, "dispatch_events", _dispatch)
+
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        r = await client.post(
+            "/api/v1/webhooks/gmail", json=_pubsub_body(email),
+            headers={"Authorization": "Bearer x"},
+        )
+    assert r.status_code == 503, (
+        "a transient per-user failure must surface as 503 so Pub/Sub "
+        f"redelivers — got {r.status_code}: {r.text[:200]}"
+    )
+    assert dispatched == [user_a, user_c], (
+        "the healthy user must be served BEFORE the transient failure "
+        f"is re-raised — dispatch order was {dispatched}"
+    )
+
+    # Redo (Pub/Sub redelivery): both healthy now → 200, both served.
+    dispatched.clear()
+
+    async def _dispatch_ok(user_id: str, trigger_kind: str, events: list):
+        dispatched.append(user_id)
+        return {"inserted": 0, "dedupe_hits": 1}
+
+    monkeypatch.setattr(mod, "dispatch_events", _dispatch_ok)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        r = await client.post(
+            "/api/v1/webhooks/gmail", json=_pubsub_body(email),
+            headers={"Authorization": "Bearer x"},
+        )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["users"] == 2
+    assert dispatched == [user_a, user_c]

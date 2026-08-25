@@ -1150,7 +1150,7 @@ async def _arm_gmail_watch_post_connect(user_id: str) -> None:
     # response, but Google's token endpoint doesn't return account/login
     # — those are GitHub-style fields. Result: provider_account_id stayed
     # NULL on every Gmail OAuth, and the Pub/Sub webhook's email→user
-    # resolver (`_resolve_user_for_email`) returned None, silently
+    # resolver (`_resolve_users_for_email`) returned nothing, silently
     # dropping every push as `unknown_email`. We fetch the actual email
     # via Gmail's users.getProfile and write it here so the next push
     # resolves correctly. Idempotent — every arm rewrites with the same

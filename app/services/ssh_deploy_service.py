@@ -1359,6 +1359,7 @@ def generate_env_content(
     toup_token: str = "",
     db_mode: str = "auto",
     supabase_url: str = "",
+    automations_enabled: bool = False,
 ) -> str:
     """Generate .env file content for the agent service."""
     lines = [
@@ -1475,6 +1476,12 @@ def generate_env_content(
         service_lines.append(f"ELEVENLABS_API_KEY={elevenlabs_api_key}")
     if service_lines:
         lines.extend(["", "# --- Services ---"] + service_lines)
+
+    # Feature flags the platform resolves per-tenant. Emitted only when ON
+    # so a dark tenant's env stays byte-identical to what it was before the
+    # flag existed (absent key = the agent-side default, False).
+    if automations_enabled:
+        lines.extend(["", "# --- Features ---", "AUTOMATIONS_ENABLED=true"])
 
     lines.append("")
     return "\n".join(lines)

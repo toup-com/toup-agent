@@ -324,8 +324,11 @@ async def agent_tunnel_ws(
             )
             _cfg = _result.scalars().first()
             if _cfg:
-                from app.api.agent_setup import _build_env
-                _env = _build_env(_cfg, user_id)
+                from app.api.agent_setup import _build_env, _automations_env_flag
+                _env = _build_env(
+                    _cfg, user_id,
+                    automations_enabled=await _automations_env_flag(user_id),
+                )
                 await websocket.send_json({
                     "type": "config_update",
                     "env_content": _env,
