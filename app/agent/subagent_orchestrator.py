@@ -383,9 +383,11 @@ async def _run_child(
         # bar animates ON-DEVICE toward the job's timeout window (zero
         # update pushes needed) — the honest ceiling for a bounded job.
         from app.services.plain_text import humanize_label as _hl
+        # R30 (D-03): plain words, no glyph — this title is an OS banner and
+        # a lock-screen card, and emoji there is the machinery's dialect.
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_started",
-            title=f"🛠 Working on: {_hl(label)[:150]}",
+            title=f"Working on: {_hl(label)[:150]}",
             body=(task or "")[:200],
             timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
             dedup_suffix="started",
@@ -969,7 +971,7 @@ async def _finalize(
     if outcome == "success":
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_completed",
-            title=f"✅ Done: {(label or 'background task')[:150]}",
+            title=f"Done: {(label or 'background task')[:150]}",
             body=_strip_md(final_text or "")[:300],
             progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
@@ -984,7 +986,7 @@ async def _finalize(
     elif outcome == "cancelled":
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_failed",
-            title=f"⏹ Stopped: {(label or 'background task')[:150]}",
+            title=f"Stopped: {(label or 'background task')[:150]}",
             body="Cancelled.", priority="low",
             dismiss_after_s=60, dedup_suffix="cancelled",
             urgent=_urgent,
@@ -992,7 +994,7 @@ async def _finalize(
     else:  # failed | timeout | budget_exhausted
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_failed",
-            title=f"⚠️ Didn't finish: {(label or 'background task')[:150]}",
+            title=f"Didn't finish: {(label or 'background task')[:150]}",
             body=(error_message or outcome)[:300],
             dedup_suffix="failed",
             urgent=_urgent,
@@ -1210,7 +1212,7 @@ async def orphan_sweep_on_boot(session_maker: Any = None) -> int:
                 await _notify_job_event(
                     job_id=row.id, label=label or row.title,
                     kind="mission_failed",
-                    title=f"⚠️ Didn't finish: {(label or row.title or 'background task')[:150]}",
+                    title=f"Didn't finish: {(label or row.title or 'background task')[:150]}",
                     body="The agent restarted while this task was running.",
                     dedup_suffix="failed",
                 )

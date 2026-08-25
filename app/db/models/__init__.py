@@ -81,6 +81,25 @@ from .platform_automation import (
     AutomationGrant, AutomationTemplate, AUTOMATION_GRANT_STATUSES,
 )
 
+# Run ledger v3 (R30) — threads, typed turns, write ledger, saved
+# per-automation permissions, once-per-run notification identity.
+from .automation_ledger import (
+    AutomationThread, AutomationTurn, AutomationWrite,
+    AutomationAccountPermission, AutomationNotification,
+    AUTOMATION_TURN_KINDS, AUTOMATION_NOTE_STAMPS, AUTOMATION_RUN_KINDS,
+    AUTOMATION_RUN_V3_STATUSES, AUTOMATION_WRITE_AUDIENCES,
+    AUTOMATION_NOTIFICATION_KINDS, BRIEF_TIERS, CHANGES_TIERS,
+    RESULT_VOCABULARIES,
+)
+
+# Memory v2 (R30) — facts, episodes, entities, forget signals.
+from .memory_v2 import (
+    MemoryFact, MemoryEpisode, MemoryEntity, MemoryForget,
+    MEMORY_V2_CATEGORIES, MEMORY_V2_CATEGORY_LABELS,
+    MEMORY_V2_CATEGORY_TONES, MEMORY_V2_SOURCES, MEMORY_V2_SCOPE_GLOBAL,
+    MEMORY_ENTITY_KINDS, MEMORY_FORGET_SUPPRESS_DAYS,
+)
+
 # Soul config
 from .soul_config import SoulConfig
 

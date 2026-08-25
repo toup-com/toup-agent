@@ -800,3 +800,164 @@ async def test_refresh_coalesce_no_double_audit(
             f"expected 1 refresh_succeeded audit row under coalescing, "
             f"got {len(refresh_events)}"
         )
+
+
+# ─── Round 30: credit metering actually lands in the ledger ──────────
+#
+# GROUND-TRUTH-R30 (P1, rollout gate): automation connector dispatches
+# wrote ZERO credit_ledger rows. Root cause: the step-7.5 try_charge
+# only FLUSHES, and both real callers (the connector MCP handler and
+# the automations dispatch RPC) close their session without committing
+# — so the flushed row was rolled back at close. The dispatcher now
+# commits the charge itself, the way it already commits its audits.
+# Same event_type/bucket on every channel so dashboards aggregate
+# identically; the automation channel's row additionally names the
+# automation that spent the credit.
+
+
+async def _ledger_rows(user_id: str):
+    """tool_call rows only — the first charge also creates the balance
+    row, whose initial plan grants write their own ledger rows."""
+    from app.db.models import CreditLedger, LEDGER_TOOL_CALL
+    async with async_session_maker() as db:
+        return (await db.execute(
+            select(CreditLedger)
+            .where(CreditLedger.user_id == user_id)
+            .where(CreditLedger.event_type == LEDGER_TOOL_CALL)
+        )).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_chat_dispatch_charge_survives_the_session_close(
+    register_scripted, alice_user_id,
+):
+    """The chat control: the charge must exist AFTER the dispatch
+    session is gone — the exact thing the flush-only defect lost."""
+    from app.db.models import LEDGER_TOOL_CALL
+
+    manifest, provider = register_scripted()
+    await _seed_active_identity(alice_user_id)
+
+    async with async_session_maker() as db:
+        result = await dispatcher.execute(
+            db, alice_user_id, "scripted", "scripted__do",
+            tool_input={}, channel="web",
+            agent_request_id=f"req-{uuid.uuid4().hex[:8]}",
+        )
+    assert isinstance(result, ConnectorOk)
+
+    rows = await _ledger_rows(alice_user_id)
+    assert len(rows) == 1, "one dispatch = one ledger row, persisted"
+    row = rows[0]
+    assert row.event_type == LEDGER_TOOL_CALL
+    assert row.bucket == "integration"
+    assert row.metadata_json["connector_id"] == "scripted"
+    assert row.metadata_json["tool_name"] == "scripted__do"
+    assert row.metadata_json["channel"] == "web"
+
+
+@pytest.mark.asyncio
+async def test_automation_dispatch_writes_the_same_charge_shape(
+    register_scripted, alice_user_id,
+):
+    """channel='automation' meters exactly like chat — same event_type
+    and bucket (admin dashboards aggregate identically) — and the row
+    names the automation that spent the credit."""
+    from app.db.models import LEDGER_TOOL_CALL
+
+    manifest, provider = register_scripted()
+    await _seed_active_identity(alice_user_id)
+
+    async with async_session_maker() as db:
+        result = await dispatcher.execute(
+            db, alice_user_id, "scripted", "scripted__do",
+            tool_input={}, channel="automation",
+            agent_request_id=f"req-{uuid.uuid4().hex[:8]}",
+            automation_id="auto-r30",
+        )
+    assert isinstance(result, ConnectorOk)
+
+    rows = await _ledger_rows(alice_user_id)
+    assert len(rows) == 1, "an automation dispatch must meter"
+    row = rows[0]
+    assert row.event_type == LEDGER_TOOL_CALL
+    assert row.bucket == "integration"
+    assert float(row.amount) != 0.0
+    assert row.metadata_json["channel"] == "automation"
+    assert row.metadata_json["automation_id"] == "auto-r30"
+    assert row.metadata_json["connector_id"] == "scripted"
+    assert row.metadata_json["tool_name"] == "scripted__do"
+
+
+@pytest.mark.asyncio
+async def test_same_request_id_never_double_charges(
+    register_scripted, alice_user_id,
+):
+    manifest, provider = register_scripted()
+    await _seed_active_identity(alice_user_id)
+
+    rid = f"req-{uuid.uuid4().hex[:8]}"
+    for _ in range(2):
+        async with async_session_maker() as db:
+            await dispatcher.execute(
+                db, alice_user_id, "scripted", "scripted__do",
+                tool_input={}, channel="automation",
+                agent_request_id=rid, automation_id="auto-r30",
+            )
+
+    rows = await _ledger_rows(alice_user_id)
+    assert len(rows) == 1, "an SDK-level retry of the same call is free"
+
+
+@pytest.mark.asyncio
+async def test_exclude_metering_writes_no_ledger_row(
+    register_scripted, alice_user_id,
+):
+    """The e2e harness marker stays un-billed (the RPC only honors it
+    outside production) — the metering fix must not start charging it."""
+    manifest, provider = register_scripted()
+    await _seed_active_identity(alice_user_id)
+
+    async with async_session_maker() as db:
+        result = await dispatcher.execute(
+            db, alice_user_id, "scripted", "scripted__do",
+            tool_input={}, channel="automation",
+            agent_request_id=f"req-{uuid.uuid4().hex[:8]}",
+            automation_id="auto-r30", exclude_metering=True,
+        )
+    assert isinstance(result, ConnectorOk)
+    assert await _ledger_rows(alice_user_id) == []
+
+
+@pytest.mark.asyncio
+async def test_admin_dispatch_meters_at_zero_amount(
+    register_scripted, alice_user_id,
+):
+    """Admins unlimited is EXISTING semantics: the row lands for the
+    audit trail, the amount is zero, the balance never moves — the
+    founder's live fires must read as metered, not billed."""
+    from app.db.models import User as _User
+    from sqlalchemy import update as sa_update
+
+    manifest, provider = register_scripted()
+    await _seed_active_identity(alice_user_id)
+    async with async_session_maker() as db:
+        await db.execute(
+            sa_update(_User).where(_User.id == alice_user_id)
+            .values(role="admin")
+        )
+        await db.commit()
+
+    async with async_session_maker() as db:
+        result = await dispatcher.execute(
+            db, alice_user_id, "scripted", "scripted__do",
+            tool_input={}, channel="automation",
+            agent_request_id=f"req-{uuid.uuid4().hex[:8]}",
+            automation_id="auto-r30",
+        )
+    assert isinstance(result, ConnectorOk)
+
+    rows = await _ledger_rows(alice_user_id)
+    assert len(rows) == 1
+    assert float(rows[0].amount) == 0.0
+    assert rows[0].metadata_json.get("admin_unlimited") is True

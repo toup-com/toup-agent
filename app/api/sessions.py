@@ -835,6 +835,12 @@ def _message_to_response(
             msg_metadata.get("automation_grant_card")
             if msg_metadata else None
         ),
+        # R30 §4.10: the once-per-run notification card — same parity
+        # rule; the ONLY automation presence in the main chat (D-05).
+        automation_notification=(
+            msg_metadata.get("automation_notification")
+            if msg_metadata else None
+        ),
         # Round 29 session chips/cards — same parity rule as above.
         draft_card=msg_metadata.get("draft_card") if msg_metadata else None,
         memory_update=(

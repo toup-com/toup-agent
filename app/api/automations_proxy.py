@@ -665,3 +665,348 @@ async def proxy_test_run(
 ):
     return await _proxy(request, f"/{automation_id}/test-run",
                         current_user=current_user, db=db)
+
+
+# ── R30 pass-throughs (summary, threads, stop/resume, workflow) ──────
+# Appended literals never collide with the R26 parametrized routes:
+# every new literal here differs in segment count from the
+# {automation_id} family, so declaration order stays safe.
+
+
+@router.get("/summary")
+async def proxy_summary(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/summary",
+                        current_user=current_user, db=db)
+
+
+@router.get("/{automation_id}/runs")
+async def proxy_nested_runs(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/runs",
+                        current_user=current_user, db=db)
+
+
+@router.post("/runs/{run_id}/stop")
+async def proxy_stop_run(
+    run_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/runs/{run_id}/stop",
+                        current_user=current_user, db=db)
+
+
+@router.post("/runs/{run_id}/resume")
+async def proxy_resume_run(
+    run_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/runs/{run_id}/resume",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/run-now")
+async def proxy_run_now(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/run-now",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/thread/messages")
+async def proxy_thread_message(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/thread/messages",
+                        current_user=current_user, db=db)
+
+
+@router.get("/{automation_id}/workflow")
+async def proxy_workflow(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow",
+                        current_user=current_user, db=db)
+
+
+@router.put("/{automation_id}/workflow/schedule")
+async def proxy_workflow_schedule(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/schedule",
+                        current_user=current_user, db=db)
+
+
+@router.put("/{automation_id}/workflow/steps")
+async def proxy_workflow_steps(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/steps",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/workflow/rules")
+async def proxy_workflow_rule_add(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/rules",
+                        current_user=current_user, db=db)
+
+
+@router.put("/{automation_id}/workflow/rules/{rule_id}")
+async def proxy_workflow_rule_edit(
+    automation_id: str, rule_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/rules/{rule_id}",
+        current_user=current_user, db=db,
+    )
+
+
+@router.delete("/{automation_id}/workflow/rules/{rule_id}")
+async def proxy_workflow_rule_delete(
+    automation_id: str, rule_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/rules/{rule_id}",
+        current_user=current_user, db=db,
+    )
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/permissions")
+async def proxy_workflow_permissions(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request,
+        f"/{automation_id}/workflow/accounts/{account_id}/permissions",
+        current_user=current_user, db=db,
+    )
+
+
+@router.post("/{automation_id}/workflow/accounts")
+async def proxy_workflow_account_add(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/accounts",
+                        current_user=current_user, db=db)
+
+
+@router.delete("/{automation_id}/workflow/accounts/{account_id}")
+async def proxy_workflow_account_remove(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}",
+        current_user=current_user, db=db,
+    )
+
+
+@router.post("/{automation_id}/workflow/ask")
+async def proxy_workflow_ask(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/ask",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/workflow/undo")
+async def proxy_workflow_undo(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/undo",
+                        current_user=current_user, db=db)
+
+
+@router.post("/from-template")
+async def proxy_from_template(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/from-template",
+                        current_user=current_user, db=db)
+
+
+@router.post("/describe")
+async def proxy_describe(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/describe",
+                        current_user=current_user, db=db)
+
+
+# ── R30 §4.6 — the served catalog (PLATFORM-NATIVE: templates and
+# identity states are platform rows; no agent hop) ───────────────────
+
+
+@router.get("/catalog")
+async def catalog(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _flag_or_404(db, str(current_user.id))
+    from sqlalchemy import select as _select
+    from app.db.models import ConnectorIdentity
+    from app.services.automation_template_catalog import template_payload
+
+    templates = list((await db.execute(
+        _select(AutomationTemplate)
+        .where(AutomationTemplate.enabled.is_(True))
+        .order_by(AutomationTemplate.sort_order,
+                  AutomationTemplate.name)
+    )).scalars())
+    identities = {
+        r.connector_id: r
+        for r in (await db.execute(
+            _select(ConnectorIdentity)
+            .where(ConnectorIdentity.user_id == current_user.id)
+        )).scalars()
+    }
+
+    def _meta(t) -> str:
+        try:
+            connectors = json.loads(t.connectors_json or "[]")
+        except (ValueError, TypeError):
+            connectors = []
+        active = [c for c in connectors
+                  if (identities.get(c) is not None
+                      and identities[c].status == "active")]
+        missing = [c for c in connectors if c not in active]
+        from app.services.automation_verbs import display_name
+        try:
+            spec = json.loads(t.spec_json or "{}")
+        except (ValueError, TypeError):
+            spec = {}
+        has_writes = any(
+            isinstance(s, dict) and s.get("grant_target") is not None
+            for s in (spec.get("steps") or [])
+        ) or "{{grant.target.id}}" in (t.spec_json or "")
+        if not missing:
+            if len(connectors) == 1:
+                name = display_name(connectors[0]) or connectors[0]
+                return f"{name} · connected"
+            if not has_writes:
+                return "Reads only"
+            return f"{len(connectors)} connected"
+        name = display_name(missing[0]) or missing[0]
+        return f"{name} on setup"
+
+    cards = []
+    for t in templates:
+        payload = template_payload(t)
+        try:
+            connectors = json.loads(t.connectors_json or "[]")
+        except (ValueError, TypeError):
+            connectors = []
+        cards.append({
+            "id": t.slug,
+            "cats": [t.category] if t.category else [],
+            "title": t.name,
+            "when": payload.get("cadence_human") or "",
+            "desc": t.description or "",
+            "icons": connectors,
+            "meta": _meta(t),
+        })
+    # unused_count is authoritative on /summary (the agent knows which
+    # templates this user already set up; the platform does not) —
+    # served null here so nothing renders a wrong badge from this route.
+    return {"cards": cards, "unused_count": None}
+
+
+# ── R30 §4.7 — accounts card/reconnect proxy (own prefix) ────────────
+
+accounts_proxy_router = APIRouter(prefix="/accounts", tags=["accounts"])
+
+
+async def _proxy_accounts(
+    request: Request, sub_path: str, *,
+    current_user: User, db: AsyncSession,
+) -> Response:
+    uid = str(current_user.id)
+    await _flag_or_404(db, uid)
+    target = await _get_agent_target(uid, db)
+    if target is None:
+        raise HTTPException(status_code=404,
+                            detail="No active agent for this user")
+    agent_url, agent_api_key = target
+    url = f"{agent_url.rstrip('/')}/api/accounts{sub_path}"
+    from app.services.agent_http import get_agent_http_client
+    try:
+        client = get_agent_http_client()
+        resp = await client.request(
+            request.method.upper(), url,
+            params=dict(request.query_params),
+            headers={"X-Agent-Key": agent_api_key,
+                     "accept": "application/json"},
+            timeout=30.0,
+        )
+    except httpx.RequestError as e:
+        logger.warning("accounts_proxy %s %s failed: %s",
+                       request.method, url, e)
+        raise HTTPException(status_code=502, detail="Agent unreachable")
+    out_headers = {
+        k: v for k, v in resp.headers.items()
+        if k.lower() not in _HOP_BY_HOP
+    }
+    return Response(
+        content=resp.content, status_code=resp.status_code,
+        headers=out_headers,
+        media_type=resp.headers.get("content-type"),
+    )
+
+
+@accounts_proxy_router.get("/{account_id}/card")
+async def proxy_account_card(
+    account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy_accounts(request, f"/{account_id}/card",
+                                 current_user=current_user, db=db)
+
+
+@accounts_proxy_router.post("/{account_id}/reconnect")
+async def proxy_account_reconnect(
+    account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy_accounts(request, f"/{account_id}/reconnect",
+                                 current_user=current_user, db=db)

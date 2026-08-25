@@ -75,6 +75,42 @@ async def _execute_claimed(db, outbox_id: str) -> str:
     row = await db.get(AutomationOutbox, outbox_id)
     if row is None:
         return "failed"
+
+    # R30 §4.3 second line of defence: no write may start after a stop.
+    # The executor checks at step boundaries; a staged row that outlived
+    # a stop (undo-window sleep, backoff retry, loop sweep) is refused
+    # HERE, where the send actually happens.
+    if row.job_id:
+        try:
+            from .run_v3 import stop_requested
+            if await stop_requested(db, row.job_id):
+                row.status = "cancelled"
+                row.last_error = "run stopped by the user before the write"
+                await db.commit()
+                logger.info("[automations] outbox %s refused: run %s stopped",
+                            row.id, row.job_id)
+                return row.status
+        except Exception as e:  # noqa: BLE001
+            # D's design-review note (R30): when the stop CHECK itself
+            # errors we cannot know the user's intent — for an
+            # unattended writer the safe direction is retry-later,
+            # never send-anyway. Return the claim and back off.
+            logger.warning("[automations] outbox %s stop check errored — "
+                           "deferring the send: %s", row.id, e)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            row2 = await db.get(AutomationOutbox, outbox_id)
+            if row2 is not None:
+                row2.status = "staged"
+                row2.next_attempt_at = datetime.utcnow() + timedelta(
+                    seconds=_RETRY_DELAYS_S[0])
+                row2.execute_after = row2.next_attempt_at
+                await db.commit()
+                return row2.status
+            return "failed"
+
     try:
         payload = json.loads(row.payload_json)
     except (ValueError, TypeError):
@@ -99,9 +135,18 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         row.status = "executed"
         row.executed_at = now
         row.result_json = json.dumps(result, default=str)[:8000]
+        # R30 §4.8: the honest write ledger — appended in the SAME
+        # transaction as the executed flip, from the display form
+        # snapshotted at staging. The job-sheet grammar, the `changes`
+        # vocabulary and stop notes read ONLY these rows.
+        write_row = _write_ledger_row(row)
+        if write_row is not None:
+            db.add(write_row)
         await db.commit()
+        await _mark_write_step(db, row, ok=True)
         await _finalize_run(db, row, status="completed", outcome="sent")
         await _record_health(db, row.automation_id, ok=True, error=None)
+        await _append_write_turn(db, row, write_row)
         if row.tool_name in _DRAFT_TOOLS:
             # The proactive-draft surface (R29): a session card that
             # names the draft and tells the "nothing was sent" truth.
@@ -141,6 +186,7 @@ async def _execute_claimed(db, outbox_id: str) -> str:
     row.last_error = str(result.get("message") or kind)[:2000]
     row.result_json = json.dumps(result, default=str)[:8000]
     await db.commit()
+    await _mark_write_step(db, row, ok=False)
     await _finalize_run(
         db, row, status="failed", outcome="write_failed",
         error_class="tool_error",
@@ -331,6 +377,27 @@ async def _park_run_on_card(db, row: AutomationOutbox,
     job.completed_at = None
     await db.commit()
 
+    # R30 §4.9: the park is a `waiting` turn in the thread — the
+    # WAITING ON YOU card with Approve / Not now. Best-effort; the
+    # R29 pending card above stays the resolve surface.
+    if action_id:
+        try:
+            from . import ledger as _ledger
+            thread = await _ledger.thread_for(db, row.automation_id)
+            if thread is not None:
+                await _ledger.append_turn(
+                    db, user_id=row.user_id, thread=thread,
+                    run_id=row.job_id, kind="waiting",
+                    payload={
+                        "pending_action_id": str(action_id),
+                        "text": "Nothing happens until you approve.",
+                        "expires_at": str(expires_at) if expires_at
+                        else None,
+                    },
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[automations] waiting turn skipped: %s", e)
+
 
 async def _notify_needs_approval(row: AutomationOutbox,
                                  action_id: Optional[str]) -> None:
@@ -354,3 +421,132 @@ async def _notify_needs_approval(row: AutomationOutbox,
         )
     except Exception as e:  # noqa: BLE001 — notify is best-effort
         logger.warning("[automations] approval notify failed: %s", e)
+
+
+# ── R30: the write ledger + the write tool turn ─────────────────────
+
+
+def _display_of(row: AutomationOutbox) -> dict:
+    """The staged display form, with a total fallback so a pre-R30 row
+    (no display_json) still ledgers honestly."""
+    try:
+        d = json.loads(row.display_json) if row.display_json else {}
+    except (ValueError, TypeError):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    if not d.get("what"):
+        from app.services.automation_verbs import turn_action
+        d["what"] = turn_action(
+            row.connector_id, row.tool_name, kind="write", ok=True,
+        )["action"]
+    d.setdefault("target", None)
+    d.setdefault("audience",
+                 "you" if row.tool_name in _DRAFT_TOOLS else "others")
+    d.setdefault("reversible", row.tool_name in _DRAFT_TOOLS)
+    return d
+
+
+def _write_ledger_row(row: AutomationOutbox):
+    """Build the AutomationWrite row for an about-to-be-executed write.
+    Returns None only if the model import itself fails (boot order)."""
+    try:
+        from app.db.models import AutomationWrite
+        d = _display_of(row)
+        return AutomationWrite(
+            user_id=row.user_id,
+            automation_id=row.automation_id,
+            run_id=row.job_id or "",
+            account_id=row.connector_id,
+            what=str(d["what"])[:200],
+            target=(str(d["target"])[:200] if d.get("target") else None),
+            audience=d["audience"] if d["audience"] in ("you", "others")
+            else "others",
+            reversible=bool(d.get("reversible")),
+            undo_ref=row.id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] write ledger row skipped: %s", e)
+        return None
+
+
+async def _append_write_turn(db, row: AutomationOutbox, write_row) -> None:
+    """The v3 write tool turn (+ the draft turn for draft tools) into
+    the automation's thread. Best-effort: the ledger row above is the
+    durable record; the turn is its display."""
+    try:
+        from . import ledger
+        from .run_v3 import notify_progress  # noqa: F401 — module load check
+        thread = await ledger.thread_for(db, row.automation_id)
+        if thread is None:
+            return
+        d = _display_of(row)
+        from app.services.automation_verbs import turn_action
+        act = turn_action(
+            row.connector_id, row.tool_name, kind="write", ok=True,
+            target=d.get("target"), audience=d["audience"],
+        )
+        await ledger.append_turn(
+            db, user_id=row.user_id, thread=thread, run_id=row.job_id,
+            kind="tool",
+            payload={
+                "account_id": row.connector_id, "tool_kind": "write",
+                "action": act["action"], "detail": act["detail"],
+                "ok": True, "ms": 0, "steps": [], "items": [],
+                "write_ids": [write_row.id] if write_row is not None else [],
+                "rest": "",
+            },
+        )
+        if row.tool_name in _DRAFT_TOOLS:
+            try:
+                payload = json.loads(row.payload_json)
+            except (ValueError, TypeError):
+                payload = {}
+            body = str(payload.get("body") or "").strip()
+            if body:
+                await ledger.append_turn(
+                    db, user_id=row.user_id, thread=thread,
+                    run_id=row.job_id, kind="draft",
+                    payload={
+                        "text": body[:2000],
+                        "target": {"account_id": row.connector_id,
+                                   "ref": None},
+                        "sent_at": None,
+                    },
+                )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[automations] write turn skipped: %s", e)
+
+
+async def _mark_write_step(db, row: AutomationOutbox, *, ok: bool) -> None:
+    """ND-4: the write step's verb flips to its DONE form only when the
+    write executed — a refused/failed write wears the failed state, not
+    "Posted to Slack". Keyed by display_json.step_id, mutated directly
+    in steps_json (the shared substrate)."""
+    try:
+        if not row.job_id:
+            return
+        d = _display_of(row)
+        step_id = d.get("step_id")
+        if not step_id:
+            return
+        from datetime import datetime as _dt
+        from app.agent import job_steps
+        job = await db.get(BuildJob, row.job_id)
+        if job is None:
+            return
+        steps = job_steps.parse_steps(job.steps_json)
+        now = _dt.utcnow()
+        touched = False
+        for s in steps:
+            if s.get("id") == step_id:
+                s["status"] = "done" if ok else "failed"
+                s.setdefault("started_at", now.isoformat())
+                s["completed_at"] = now.isoformat()
+                touched = True
+                break
+        if touched:
+            job.steps_json = job_steps.dump_steps(steps)
+            await db.commit()
+    except Exception as e:  # noqa: BLE001 — a label flip never blocks a send
+        logger.debug("[automations] write-step mark skipped: %s", e)

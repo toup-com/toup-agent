@@ -212,7 +212,11 @@ class HealthProbeScheduler:
             await self._flip_identity_down(ident.id)
 
     async def _flip_identity_down(self, identity_id: str) -> None:
+        user_id = connector_id = None
         async with async_session_maker() as db:
+            row = await db.get(ConnectorIdentity, identity_id)
+            if row is not None:
+                user_id, connector_id = row.user_id, row.connector_id
             await db.execute(
                 sa_update(ConnectorIdentity)
                 .where(ConnectorIdentity.id == identity_id)
@@ -224,6 +228,18 @@ class HealthProbeScheduler:
             "after %d consecutive failures",
             identity_id, self._failure_threshold,
         )
+        # R30 §4.7: the state change must reach live clients — same
+        # best-effort agent hook the vault's reauth flip uses.
+        if user_id and connector_id:
+            try:
+                from app.services.connector_vault import (
+                    notify_agent_connector_state,
+                )
+                await notify_agent_connector_state(
+                    user_id, connector_id, ok=False, error="provider_down",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[health_probe] state hook skipped: %s", e)
 
     async def loop(self) -> None:
         """Long-running coroutine. Stagger first run by [0, interval/2)

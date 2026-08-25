@@ -204,10 +204,15 @@ async def test_projection_failure_never_loses_the_row(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_deleting_the_automation_deletes_its_facts():
-    """Through the service door (the only real delete path) — explicit
-    deletion, because a sqlite tenant does not enforce FK cascades."""
+async def test_delete_keeps_facts_30_days_then_the_purge_removes_them():
+    """R30 §4.8 rewrites the R29 pin: the tap is a SOFT delete (facts
+    kept 30 days — "memory kept for 30 days then purged"); the purge
+    sweep does the explicit removal, because a sqlite tenant does not
+    enforce FK cascades."""
+    from datetime import datetime, timedelta
     from app.agent.automations.service import delete_automation
+    from app.agent.automations.sweep import sweep_purge_soft_deleted
+    from app.db.models import Automation
 
     uid = await _mk_user()
     aid = await _mk_automation(uid)
@@ -219,6 +224,15 @@ async def test_deleting_the_automation_deletes_its_facts():
         )
     async with async_session_maker() as db:
         await delete_automation(db, automation_id=aid, user_id=uid)
+        rows = (await db.execute(
+            select(AutomationFact).where(AutomationFact.automation_id == aid)
+        )).scalars().all()
+        assert len(rows) == 1, "soft delete keeps the facts"
+        a = await db.get(Automation, aid)
+        a.deleted_at = datetime.utcnow() - timedelta(days=31)
+        await db.commit()
+    async with async_session_maker() as db:
+        assert await sweep_purge_soft_deleted(db) == 1
         rows = (await db.execute(
             select(AutomationFact).where(AutomationFact.automation_id == aid)
         )).scalars().all()

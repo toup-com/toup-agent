@@ -687,3 +687,98 @@ async def forget_all_memories(
         # must not make the user think their FILES survived.
         logger.warning("legacy row wipe failed for %s: %s", current_user.id[:8], e)
     return {"success": True, "removed": removed_files + removed_rows}
+
+
+# ── R30 memory v2 — the whole platform memory (CONTRACTS-R30 §4.5) ──
+#
+# A second router so the wire path is exactly `GET /api/memory` (the
+# sidebar Memory screen's one call). Same topology as the file routes:
+# agent-mode serves from the tenant DB; platform-mode proxies to the
+# tenant and 503s honestly when the agent is unreachable — never a
+# synthesized empty view.
+
+memory_v2_router = APIRouter(prefix="/memory", tags=["memory-v2"])
+
+
+async def _proxy_memory_v2(
+    agent_url: str, agent_api_key: str, path: str,
+    method: str = "GET",
+):
+    from app.services.agent_http import get_agent_http_client
+    url = f"{agent_url}/api/memory{path}"
+    try:
+        client = get_agent_http_client()
+        if method == "GET":
+            resp = await client.get(
+                url, headers={"X-Agent-Key": agent_api_key}, timeout=10.0,
+            )
+        else:
+            resp = await client.delete(
+                url, headers={"X-Agent-Key": agent_api_key}, timeout=10.0,
+            )
+        if resp.status_code in (200, 404):
+            return resp.status_code, resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Agent memory-v2 proxy %s failed: %s", url, e)
+    return None, None
+
+
+@memory_v2_router.get("")
+async def global_memory_tree(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Domain → category → entity over the whole store, with the
+    FROM YOUR AUTOMATIONS view and per-entity episode timelines."""
+    user_id = str(current_user.id)
+    if _platform_mode():
+        info = await _get_agent_proxy_info(user_id, db)
+        if info is None:
+            raise _agent_unreachable()
+        status_code, data = await _proxy_memory_v2(info[0], info[1], "")
+        if status_code is None:
+            raise _agent_unreachable()
+        return JSONResponse(status_code=status_code, content=data)
+    from app.services.memory_v2_service import global_memory
+    from sqlalchemy import select as _select
+    from app.db.models import Automation
+    titles = {
+        a.id: a.name
+        for a in (await db.execute(
+            _select(Automation).where(Automation.user_id == user_id)
+        )).scalars()
+    }
+    payload = await global_memory(
+        db, user_id=user_id, automation_titles=titles,
+    )
+    try:
+        from app.agent._user_tz_cache import get_cached_user_tz
+        payload["tz"] = get_cached_user_tz(user_id)
+    except Exception:  # noqa: BLE001
+        payload["tz"] = None
+    return payload
+
+
+@memory_v2_router.delete("/facts/{fact_id}")
+async def forget_fact_route(
+    fact_id: str,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Forget everywhere + the 30-day relearn suppression (§4.5)."""
+    user_id = str(current_user.id)
+    if _platform_mode():
+        info = await _get_agent_proxy_info(user_id, db)
+        if info is None:
+            raise _agent_unreachable()
+        status_code, data = await _proxy_memory_v2(
+            info[0], info[1], f"/facts/{fact_id}", method="DELETE",
+        )
+        if status_code is None:
+            raise _agent_unreachable()
+        return JSONResponse(status_code=status_code, content=data)
+    from app.services.memory_v2_service import forget_fact
+    deleted = await forget_fact(db, user_id=user_id, fact_id=fact_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="No such fact")
+    return {"deleted": True}

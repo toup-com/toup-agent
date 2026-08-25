@@ -26,7 +26,14 @@ Public surface (all `async`):
 
   mark_reauth_required(db, identity_id, *, reason)
       Flip status to 'reauth_required'. Audit row is `event_type`
-      (default `EVENT_REFRESH_FAILED`).
+      (default `EVENT_REFRESH_FAILED`). After the commit, fires the
+      best-effort agent state hook (R30 §4.7) so the tenant emits the
+      `connector.state` frame — fire-and-forget, never blocking.
+
+  notify_agent_connector_state(user_id, connector_id, *, ok, error=None)
+      The R30 §4.7 platform→agent state hook body (own session,
+      fully best-effort). Public so other status-flip writers
+      (e.g. the health probe's provider_down) can reuse it.
 
   disconnect(db, user_id, connector_id, *, event_type=EVENT_DISCONNECTED)
       Atomically: status='revoked' AND access_token_enc=NULL AND
@@ -388,6 +395,78 @@ async def mark_reauth_required(
     # 2. Vault write — status flip only.
     row.status = "reauth_required"
     await db.commit()
+
+    # 3. Round 30 §4.7: best-effort platform→agent state hook, AFTER
+    #    the flip is durable. The agent answers by emitting the
+    #    `connector.state` frame (state "expired") so the app's cards
+    #    flip without a poll — before this round no connector state
+    #    change was visible to clients at all. Fire-and-forget on its
+    #    OWN session inside the spawned task: this session is the
+    #    dispatcher's, and the hook must never delay or break the
+    #    vault write it decorates.
+    try:
+        from app.services.background_tasks import spawn as _spawn_bg
+        _spawn_bg(notify_agent_connector_state(
+            row.user_id, row.connector_id, ok=False, error="reauth_required",
+        ))
+    except Exception as e:  # noqa: BLE001 — the vault write already landed
+        logger.warning(
+            "[connector_vault] reauth state hook spawn failed for "
+            "user=%s connector=%s: %s",
+            row.user_id[:8], row.connector_id, e,
+        )
+
+
+async def notify_agent_connector_state(
+    user_id: str,
+    connector_id: str,
+    *,
+    ok: bool,
+    error: Optional[str] = None,
+) -> None:
+    """POST a connector state flip to the tenant agent's
+    `/api/automations/_connector_connected` hook (CONTRACTS-R30 §4.7).
+
+    Reuses the exact client path OAuth-callback step 6a uses
+    (`automations_proxy._get_agent_target` + the shared
+    `agent_http` client) rather than inventing a second HTTP lane.
+    Opens its OWN session: it runs as a spawned background task, after
+    the caller's session has moved on (the repo's own-session-per-
+    fallback convention). Fully best-effort — every failure is a WARN,
+    never an exception; a dark tenant answers 404 and that is normal.
+
+    Public on purpose: `mark_reauth_required` is the only vault-side
+    status-flip to a blocked state today, but the health probe's
+    `provider_down` flip (connector_health_probe.py) should call this
+    same helper when it gains the hook.
+    """
+    try:
+        from app.api.automations_proxy import _get_agent_target
+        from app.db.database import async_session_maker
+        from app.services.agent_http import get_agent_http_client
+
+        async with async_session_maker() as adb:
+            target = await _get_agent_target(user_id, adb)
+        if target is None:
+            return
+        agent_url, agent_key = target
+        resp = await get_agent_http_client().post(
+            f"{agent_url.rstrip('/')}/api/automations/_connector_connected",
+            json={"connector_id": connector_id, "ok": ok, "error": error},
+            headers={"X-Agent-Key": agent_key},
+            timeout=5.0,
+        )
+        if resp.status_code not in (200, 404):
+            logger.warning(
+                "[connector_vault] agent state hook %s for user=%s connector=%s",
+                resp.status_code, user_id[:8], connector_id,
+            )
+    except Exception as e:  # noqa: BLE001 — the flip must never depend on it
+        logger.warning(
+            "[connector_vault] agent state hook failed for user=%s "
+            "connector=%s: %s",
+            user_id[:8], connector_id, e,
+        )
 
 
 async def disconnect(

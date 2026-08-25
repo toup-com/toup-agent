@@ -219,12 +219,16 @@ def test_write_without_grant_per_step():
     assert "write_without_grant" in codes(ei)
 
 
-def test_no_write_step_is_rejected():
+def test_reads_only_spec_is_accepted():
+    # Round 30 (§4.11a): a spec with read steps only is legal — migrated
+    # email briefings deliver via the notification pipeline, not a write
+    # step, and §4.1 derives mode "reads_only" from this shape. (Until
+    # R30 this was the `no_write_step` rejection.)
     spec = good_spec()
     spec["steps"] = spec["steps"][:1]
-    with pytest.raises(SpecError) as ei:
-        validate_spec(spec, REGISTRY)
-    assert "no_write_step" in codes(ei)
+    v = validate_spec(spec, REGISTRY)
+    assert isinstance(v, ValidatedSpecV2)
+    assert v.write_steps == ()
 
 
 def test_read_after_write_is_rejected():

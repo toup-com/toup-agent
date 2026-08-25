@@ -572,10 +572,10 @@ def validate_spec_v2(
                  "read steps must come before write steps — a write is "
                  "staged asynchronously, so a later read could never "
                  "see it")
-    if steps and write_count == 0:
-        _err(errors, "no_write_step", "steps",
-             "an automation needs at least one write step — one that "
-             "writes nothing does nothing")
+    # Round 30 (§4.11a): reads-only specs are legal — migrated email
+    # briefings deliver through the notification pipeline, not a write
+    # step, and §4.1 derives mode "reads_only" from exactly this shape.
+    # (Until R30 this was the `no_write_step` rejection.)
     if write_count > MAX_WRITE_STEPS:
         _err(errors, "too_many_writes", "steps",
              f"at most {MAX_WRITE_STEPS} write steps")

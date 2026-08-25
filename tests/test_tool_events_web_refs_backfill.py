@@ -66,9 +66,11 @@ def test_pre_rollout_web_search_record_gets_domains_from_its_summary():
 
 
 def test_post_rollout_record_keeps_the_domains_the_runner_wrote():
-    """A record that already carries the field is served verbatim — the
+    """A record that already carries the field keeps it verbatim — the
     writer's order/dedupe is authoritative, the read-time derivation is only
-    for rows that predate it."""
+    for rows that predate it. (R30: the reader now also back-fills a human
+    ``label`` on records persisted without one; everything the runner wrote
+    is untouched.)"""
     fresh = {
         "tool": "web_search", "call_id": "tc_1",
         "started_at_ms": 1_000, "completed_at_ms": 2_000,
@@ -76,10 +78,13 @@ def test_post_rollout_record_keeps_the_domains_the_runner_wrote():
         "domains": ["ai.google.dev"], "urls": ["https://ai.google.dev/x"],
     }
     out = _serialize_tool_events(_msg([fresh]))
-    assert out == [fresh]
+    assert out is not None and len(out) == 1
+    for k, v in fresh.items():
+        assert out[0][k] == v
+    assert out[0]["label"] == "Searching the web"
 
 
-def test_non_web_records_and_url_less_web_records_are_unchanged():
+def test_non_web_records_and_url_less_web_records_keep_their_fields():
     file_read = {
         "tool": "read_file", "started_at_ms": 1, "completed_at_ms": 2,
         # A URL inside a file the agent read is content, not provenance.
@@ -90,8 +95,20 @@ def test_non_web_records_and_url_less_web_records_are_unchanged():
         "summary": "No search results found.",
     }
     out = _serialize_tool_events(_msg([file_read, empty_search]))
-    assert out == [file_read, empty_search]
+    assert out is not None and len(out) == 2
+    for rec, src in zip(out, (file_read, empty_search)):
+        for k, v in src.items():
+            assert rec[k] == v
     assert "domains" not in out[0] and "domains" not in out[1]
+
+
+def test_a_record_with_a_label_keeps_the_label_the_runner_chose():
+    labelled = {
+        "tool": "app_html__bash_app", "started_at_ms": 1, "completed_at_ms": 2,
+        "summary": "Checked the app.", "label": "Checking your app",
+    }
+    out = _serialize_tool_events(_msg([labelled]))
+    assert out == [labelled]
 
 
 def test_malformed_records_still_dropped_and_absent_list_is_none():

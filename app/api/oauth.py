@@ -401,6 +401,16 @@ async def oauth_connect(
             "user — plain-chat connects never widen consent."
         ),
     ),
+    return_to: Optional[str] = Query(
+        default=None,
+        pattern="^app$",
+        description=(
+            "Round 30 §10: 'app' marks this dance as started from the "
+            "app's in-sheet browser (ASWebAuthenticationSession); the "
+            "callback then 302s to toup://oauth instead of the web "
+            "bridge. Absent ⇒ the web path, unchanged."
+        ),
+    ),
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -485,6 +495,28 @@ async def oauth_connect(
         code_verifier=code_verifier,
         expires_at=expires_at,
     ))
+    # Round 30 §10 (D-13): the app-return marker, same commit as the
+    # session row so the two can never disagree about one dance. See
+    # the `_APP_RETURN_KEY_PREFIX` comment for why this is a KV row
+    # and not a key inside the signed state.
+    if return_to == "app":
+        from app.db.models.platform import PlatformSetting
+        # Opportunistic hygiene: markers of abandoned dances (older
+        # than the state TTL, so unredeemable) are swept here rather
+        # than by a job — this is the only writer, so the table stays
+        # bounded by in-flight app connects.
+        await db.execute(
+            delete(PlatformSetting).where(
+                PlatformSetting.key.like(_APP_RETURN_KEY_PREFIX + "%"),
+                PlatformSetting.updated_at
+                < datetime.utcnow()
+                - timedelta(seconds=settings.oauth_state_ttl_seconds),
+            )
+        )
+        db.add(PlatformSetting(
+            key=_APP_RETURN_KEY_PREFIX + state_hash(state),
+            value="app",
+        ))
     await db.commit()
 
     # 5. Build the authorize URL with the manifest's declared scopes.
@@ -538,6 +570,76 @@ _PROVIDER_ERROR_COPY = {
     "server_error": "The provider hit an error on their side. Please try again.",
     "temporarily_unavailable": "The provider is temporarily unavailable. Please try again shortly.",
 }
+
+
+# ─── In-app OAuth return (Round 30 §10, D-13) ────────────────────────
+#
+# `ASWebAuthenticationSession` completes only when the final redirect
+# lands on the app's own scheme — the web `/oauth/callback-bridge`
+# leaves the sheet hanging. `POST /connect/<id>?return_to=app` marks
+# the dance; the callback then 302s to `toup://oauth?connected=<id>&
+# ok=<1|0>[&error=<code>]` instead of the bridge. Absent marker ⇒ the
+# web path, byte-identical to today.
+#
+# The marker mechanism: a `PlatformSetting` row keyed by the state's
+# hash (`oauth_rt:<state_hash>`), the same key the in-flight
+# ConnectorOAuthSession row uses. Why not a key inside the signed
+# state itself: `verify_state` tolerates extra payload keys, but
+# `sign_state`'s payload is fixed in `oauth_state.py`, and minting a
+# widened state here would mean re-implementing the HMAC construction
+# against that module's private helpers — a second signer that breaks
+# silently (and only on the app leg) the day the first one changes.
+# The KV row uses existing public machinery, is deleted when the
+# marker is read, and stale rows (abandoned dances) are swept
+# opportunistically on the next app-return connect.
+_APP_RETURN_KEY_PREFIX = "oauth_rt:"
+_APP_RETURN_SCHEME_URL = "toup://oauth"
+
+
+def _app_return_redirect(
+    *,
+    ok: bool,
+    connector_id: Optional[str] = None,
+    error: Optional[str] = None,
+) -> RedirectResponse:
+    """302 to the app scheme — the ONLY terminal for a marked dance.
+
+    Param names per CONTRACTS-R30 §10: `connected` (when known), `ok`
+    as 1/0, `error` code on failure. No free-text message — the app
+    renders its own copy off the code.
+    """
+    params: dict[str, str] = {}
+    if connector_id:
+        params["connected"] = connector_id
+    params["ok"] = "1" if ok else "0"
+    if error:
+        params["error"] = error
+    return RedirectResponse(
+        url=f"{_APP_RETURN_SCHEME_URL}?{urllib.parse.urlencode(params)}",
+        status_code=status.HTTP_302_FOUND,
+    )
+
+
+async def _app_return_marker_pop(db: AsyncSession, sh: str) -> bool:
+    """Read + stage-delete the app-return marker for one state hash.
+
+    The delete is STAGED, not committed — deliberately, so it rides the
+    caller's transaction exactly like the single-use session-row
+    delete: committed together on success, rolled back together on the
+    failure branches that keep the dance retryable.
+    """
+    from app.db.models.platform import PlatformSetting
+    row = (
+        await db.execute(
+            select(PlatformSetting).where(
+                PlatformSetting.key == _APP_RETURN_KEY_PREFIX + sh
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return False
+    await db.delete(row)
+    return True
 
 
 def _bridge_error(
@@ -607,6 +709,22 @@ async def oauth_callback(
                 # source. Narrow this back and a second such leak turns
                 # a branch that always redirected into an unhandled 500.
                 pass
+        # Round 30 §10: a dance marked app-return must terminate on the
+        # app scheme even when the user cancelled — the sheet has no
+        # other way to close. Marker lookup is best-effort (the state
+        # is untrusted here); anything it raises falls through to the
+        # web bridge, which is the pre-R30 behavior.
+        if state:
+            try:
+                if await _app_return_marker_pop(db, state_hash(state)):
+                    await db.commit()  # the marker delete — flow is over
+                    return _app_return_redirect(
+                        ok=False, connector_id=_cid, error=error,
+                    )
+            except Exception as _e:  # noqa: BLE001 — bridge is the fallback
+                logger.warning(
+                    "[oauth.callback] app-return marker check failed: %s", _e,
+                )
         # Same bridge route — popup gets the postMessage in error mode,
         # full-page fallback gets the URL params on the bridge page
         # and bounces back to /agent/integrations via the parent's
@@ -660,6 +778,19 @@ async def oauth_callback(
         delete(ConnectorOAuthSession).where(ConnectorOAuthSession.state_hash == sh)
     )
 
+    # Round 30 §10: pop the app-return marker in the SAME transaction as
+    # the single-use session delete — committed together at step 5,
+    # rolled back together on the failure branches that keep the dance
+    # retryable, so the marker's lifecycle exactly parallels the dance
+    # it marks. Absent marker ⇒ the web path, byte-identical to today.
+    return_to_app = False
+    try:
+        return_to_app = await _app_return_marker_pop(db, sh)
+    except Exception as _e:  # noqa: BLE001 — web path is the safe default
+        logger.warning(
+            "[oauth.callback] app-return marker read failed: %s", _e,
+        )
+
     # Defense in depth: the /connect entry already refused if no
     # agent_config existed, but a stale state token from a user whose
     # agent was deleted mid-flow could still land here. Refusing the
@@ -677,6 +808,11 @@ async def oauth_callback(
             "[oauth.callback] user_id %s has no agent_config — refusing vault.put",
             payload.user_id[:8],
         )
+        if return_to_app:
+            return _app_return_redirect(
+                ok=False, connector_id=payload.connector_id,
+                error="no_agent_config",
+            )
         return _bridge_error(
             "no_agent_config",
             connector_id=payload.connector_id,
@@ -728,6 +864,13 @@ async def oauth_callback(
             "[oauth.callback] token exchange failed connector=%s: %s",
             payload.connector_id, e,
         )
+        if return_to_app:
+            # The rollback above kept the session row AND the marker, so
+            # a retry from the sheet is still a marked dance.
+            return _app_return_redirect(
+                ok=False, connector_id=payload.connector_id,
+                error="token_exchange_failed",
+            )
         return _bridge_error(
             "token_exchange_failed",
             connector_id=payload.connector_id,
@@ -747,6 +890,11 @@ async def oauth_callback(
             "[oauth.callback] no access_token connector=%s provider_error=%s detail=%s keys=%s",
             payload.connector_id, provider_error, provider_detail, sorted(tokens.keys()),
         )
+        if return_to_app:
+            return _app_return_redirect(
+                ok=False, connector_id=payload.connector_id,
+                error="token_exchange_failed",
+            )
         return _bridge_error(
             "token_exchange_failed",
             connector_id=payload.connector_id,
@@ -839,12 +987,18 @@ async def oauth_callback(
     if payload.connector_id == "gmail":
         _spawn_bg(_arm_gmail_watch_post_connect(payload.user_id))
 
-    # 7. Redirect to the frontend OAuth callback bridge. When the
-    #    OAuth flow ran in a popup, the bridge posts back to the
+    # 7. Redirect. A dance marked app-return (Round 30 §10) terminates
+    #    on the app scheme so ASWebAuthenticationSession completes
+    #    in-sheet; the agent hook at 6a has already fired, so the
+    #    `connector.state` frame reaches the app independently of this
+    #    redirect. Otherwise: the frontend OAuth callback bridge. When
+    #    the OAuth flow ran in a popup, the bridge posts back to the
     #    parent via BroadcastChannel and closes; when the flow ran
     #    full-page (popup blocked), the bridge's render still works
     #    and the parent's URL-param effect on /agent/integrations
     #    handles the success.
+    if return_to_app:
+        return _app_return_redirect(ok=True, connector_id=payload.connector_id)
     return RedirectResponse(
         url=f"/oauth/callback-bridge?connected={urllib.parse.quote(payload.connector_id)}",
         status_code=status.HTTP_302_FOUND,

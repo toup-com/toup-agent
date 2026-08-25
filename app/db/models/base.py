@@ -156,6 +156,22 @@ AGENT_ONLY_TABLES: set[str] = {
     # both Railway deploys failed while sqlite CI stayed green.
     # test_table_partition_complete.py now pins the whole class.
     "automation_facts",
+    # Run ledger v3 (R30) — first-class threads, typed turns, the honest
+    # write ledger, saved per-automation account permissions, and the
+    # once-per-run notification identity. All FK/soft-point into the
+    # AGENT_ONLY automations/build_jobs world, so they live here.
+    "automation_threads",
+    "automation_turns",
+    "automation_writes",
+    "automation_account_permissions",
+    "automation_notifications",
+    # Memory v2 (R30) — one platform memory per user, scoped views.
+    # Facts/episodes/entities/forget-signals; the brain (memory_files)
+    # stays the prompt projection; the extraction graph stays dormant.
+    "memory_facts",
+    "memory_episodes",
+    "memory_entities",
+    "memory_forgets",
     # Identity & soul
     "identities",
     "soul_configs",

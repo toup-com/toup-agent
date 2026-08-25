@@ -487,3 +487,144 @@ async def test_outlook_draft_grant_needs_the_reconnect(
                           json=body, headers=headers)
     assert r.status_code == 200
     assert r.json()["grant"]["status"] == "pending"
+
+
+# ── Round 30 ND-1: approved grants must carry automation_id ──────────
+#
+# GROUND-TRUTH-R30 found automation_id NULL on 4/4 approved grants in
+# prod: the skill's setup order is permission card FIRST, create SECOND,
+# so the staging POST never carries an id — and the old harness
+# constructed grant rows WITH the id, so it could not catch this. Both
+# pins below go through the REAL routes.
+
+
+async def _load_registry():
+    from app.services.connector_registry import get_registry
+    if not get_registry().automation_registry():
+        get_registry().load_all(include_experimental=True)
+
+
+@pytest.mark.asyncio
+async def test_staged_automation_id_survives_the_approve(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """The staging half: a request body that DOES carry automation_id
+    keeps it through approve, and the nested grants list serves it."""
+    await _flag_on()
+    key = await _mk_agent_config(test_user_id)
+    agent_headers = {"X-Agent-Key": key, "X-Agent-User-Id": test_user_id}
+    await _load_registry()
+
+    async def _quiet(db, uid, row):
+        pass
+
+    monkeypatch.setattr(
+        "app.api.automations_proxy._notify_agent_grant_decided", _quiet)
+
+    aid = str(uuid.uuid4())
+    r = await client.post(
+        "/api/v1/automations/grant-requests",
+        json={
+            "connector_id": "slack",
+            "tool_name": "slack__send_message",
+            "target": {"kind": "channel", "id": "C7", "label": "#eng"},
+            "mode": "auto",
+            "summary": "post to #eng",
+            "automation_id": aid,
+        },
+        headers=agent_headers,
+    )
+    assert r.status_code == 200
+    grant = r.json()["grant"]
+    assert grant["automation_id"] == aid
+
+    r = await client.post(
+        f"/api/automations/grant-requests/{grant['id']}/approve",
+        json={}, headers=auth_headers,
+    )
+    assert r.status_code == 200
+
+    async with async_session_maker() as db:
+        row = await db.get(AutomationGrant, grant["id"])
+        assert row.status == "approved"
+        assert row.automation_id == aid
+
+    r = await client.get(f"/api/automations/{aid}/grants",
+                         headers=auth_headers)
+    assert [g["id"] for g in r.json()["grants"]] == [grant["id"]]
+
+
+@pytest.mark.asyncio
+async def test_skill_shaped_orphan_grant_binds_once_after_approve(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """The prod 4/4-NULL shape: the grant is staged WITHOUT an
+    automation_id (the automation does not exist yet in the skill's
+    flow), approved, and then bound via /grant-bind — what arm-time
+    verification does through registry.bind_grant. Bind-once: same id
+    idempotent, a different automation refused."""
+    await _flag_on()
+    key = await _mk_agent_config(test_user_id)
+    agent_headers = {"X-Agent-Key": key, "X-Agent-User-Id": test_user_id}
+    await _load_registry()
+
+    async def _quiet(db, uid, row):
+        pass
+
+    monkeypatch.setattr(
+        "app.api.automations_proxy._notify_agent_grant_decided", _quiet)
+
+    r = await client.post(
+        "/api/v1/automations/grant-requests",
+        json={
+            "connector_id": "slack",
+            "tool_name": "slack__send_message",
+            "target": {"kind": "channel", "id": "C7", "label": "#eng"},
+            "mode": "auto",
+            "summary": "post to #eng",
+        },
+        headers=agent_headers,
+    )
+    assert r.status_code == 200
+    grant = r.json()["grant"]
+    assert grant["automation_id"] is None, "the skill sends no id today"
+
+    r = await client.post(
+        f"/api/automations/grant-requests/{grant['id']}/approve",
+        json={}, headers=auth_headers,
+    )
+    assert r.status_code == 200
+
+    aid = str(uuid.uuid4())
+    r = await client.post(
+        "/api/v1/automations/grant-bind",
+        json={"grant_id": grant["id"], "automation_id": aid},
+        headers=agent_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["grant"]["automation_id"] == aid
+
+    # Idempotent on the same automation.
+    r = await client.post(
+        "/api/v1/automations/grant-bind",
+        json={"grant_id": grant["id"], "automation_id": aid},
+        headers=agent_headers,
+    )
+    assert r.status_code == 200
+
+    # A grant approved for one rule never silently covers another.
+    r = await client.post(
+        "/api/v1/automations/grant-bind",
+        json={"grant_id": grant["id"], "automation_id": str(uuid.uuid4())},
+        headers=agent_headers,
+    )
+    assert r.status_code == 409
+
+    async with async_session_maker() as db:
+        row = await db.get(AutomationGrant, grant["id"])
+        assert row.automation_id == aid
+
+    # The Overview list — the surface ND-1 blanked — now serves it.
+    r = await client.get(f"/api/automations/{aid}/grants",
+                         headers=auth_headers)
+    assert [g["id"] for g in r.json()["grants"]] == [grant["id"]]

@@ -33,7 +33,7 @@ from typing import Any, Optional
 from sqlalchemy.exc import IntegrityError
 
 from app.db.models import (
-    Automation, AutomationEvent, AutomationOutbox,
+    Automation, AutomationEvent, AutomationOutbox, BuildJob,
     AUTOMATION_OUTBOX_UNDO_WINDOW_S, AUTOMATION_RUN_CAP_S,
 )
 from app.agent.job_runner import JobRunner, TaskSpec
@@ -221,19 +221,25 @@ def _collect_result(step: ValidatedStep, content: dict,
     limit = int(collect.get("limit") or 10)
     fmt = collect.get("format")
     lines: list[str] = []
+    raw_fields: list[dict] = []
     if fmt:
         for item in items[:limit]:
             item_fields = {
                 name: resolve_path(item, path)
                 for name, path in (collect.get("fields") or {}).items()
             }
+            raw_fields.append(item_fields)
             lines.append(str(render_value(
                 fmt, {"item": item_fields, "var": variables or {}},
             )))
     text = (collect.get("join") or "\n").join(lines)
     if count == 0:
         text = collect.get("empty_text") or ""
-    return {"ok": True, "text": text, "count": count}
+    # `lines`/`raw_fields` are R30 ledger inputs (mechanical item titles
+    # + the narrator's raw material); templates keep reading only
+    # text/count via resolve_path — extra keys are inert there.
+    return {"ok": True, "text": text, "count": count,
+            "lines": lines, "raw_fields": raw_fields}
 
 
 def _skipped_result(step: ValidatedStep) -> dict:
@@ -283,8 +289,14 @@ async def _run_steps(
     *,
     idem_prefix: str,
     stage_only: bool = False,
+    resume: bool = False,
 ) -> str:
-    """steps (reads) → stage writes → flush → record + memory."""
+    """steps (reads) → stage writes → flush → record + memory.
+
+    `resume` (R30 §4.3): the run is a reopened stopped run — reads
+    re-execute (the honest answer to a moved dedupe window), already-
+    staged outbox rows are REUSED instead of conflicting, and the
+    narration does not repeat its opening line."""
     mem_ctx = await engine_memory.read_context(db, automation)
     ctx: dict[str, Any] = {
         "event": event_payload or {},
@@ -311,19 +323,80 @@ async def _run_steps(
                                  error="forbidden tool " + st.tool)
             return "failed"
 
+    # R30 v3 ledger context — best-effort throughout: a ledger failure
+    # never changes the run's outcome (the typed record degrades, the
+    # work does not).
+    from . import ledger as _ledger
+    from . import run_v3 as _rv3
+    from app.services import automation_verbs as _verbs
+    import time as _time
+    thread = None
+    job_row = await db.get(BuildJob, job_id)
+    try:
+        thread = await _ledger.thread_for(db, automation.id)
+    except Exception:  # noqa: BLE001
+        thread = None
+    total_steps = len(vspec.steps)
+    step_no = 0
+    tool_turn_by_step: dict[str, dict] = {}
+
+    async def _stop_boundary(at_step: int) -> bool:
+        """§4.3: the stop takes effect at the next step boundary."""
+        if job_row is None:
+            return False
+        try:
+            if await _rv3.stop_requested(db, job_id):
+                await _rv3.handle_stop(
+                    db, automation=automation, job=job_row,
+                    step_index=at_step,
+                )
+                return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("[automations] stop boundary check failed: %s", e)
+        return False
+
     partial = False
     for st in vspec.steps:
         if st.mutates:
             break
+        if await _stop_boundary(step_no):
+            return "stopped"
+        step_no += 1
+        sentence = _verbs.live_sentence(st.connector_id, st.tool)
+        try:
+            await _ledger.emit_progress(
+                automation.user_id, run_id=job_id,
+                automation_id=automation.id, step=step_no,
+                total=total_steps, sentence=sentence,
+                fraction=(step_no - 1) / max(total_steps, 1),
+                status="running",
+            )
+            if job_row is not None:
+                await _rv3.notify_progress(
+                    db, automation=automation, job=job_row, step=step_no,
+                    total=total_steps, sentence=sentence,
+                    fraction=(step_no - 1) / max(total_steps, 1),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        _t0 = _time.monotonic()
+        step_failed_reason = None
         try:
             ctx["steps"][st.id] = await _execute_read_step(automation, st, ctx)
         except Exception as e:  # noqa: BLE001 — transport/shape errors
+            step_failed_reason = _failure_reason(e)
             if st.on_error == "skip":
                 logger.info("[automations] step %s skipped (%s) on %s",
                             st.id, e, automation.id)
                 ctx["steps"][st.id] = _skipped_result(st)
                 partial = True
             else:
+                await _append_read_turn(
+                    db, thread=thread, automation=automation, job_id=job_id,
+                    step=st, result=None, ms=int((_time.monotonic() - _t0) * 1000),
+                    ok=False, reason=step_failed_reason,
+                    turn_index=tool_turn_by_step,
+                )
                 await _finalize_job(
                     db, job_id, status="failed", outcome="step_failed",
                     error_class="tool_error",
@@ -333,6 +406,13 @@ async def _run_steps(
                                      error=str(e)[:500])
                 return "failed"
         step_result = ctx["steps"].get(st.id) or {}
+        await _append_read_turn(
+            db, thread=thread, automation=automation, job_id=job_id,
+            step=st, result=step_result,
+            ms=int((_time.monotonic() - _t0) * 1000),
+            ok=step_failed_reason is None, reason=step_failed_reason,
+            turn_index=tool_turn_by_step,
+        )
         await _advance_v2(
             db, job_id, vspec, st.id,
             count=step_result.get("count")
@@ -343,6 +423,11 @@ async def _run_steps(
         # The aggregate finalizer reads this to report `partial`
         # honestly when the writes themselves succeed.
         await merge_job_config(db, job_id, steps_partial=True)
+
+    # §4.3: the last boundary before writes — a stop that arrived during
+    # the reads must land HERE; no write step may start after it.
+    if vspec.write_steps and await _stop_boundary(step_no):
+        return "stopped"
 
     # Stage every write in one transaction: a replayed run conflicts on
     # w0 and rolls the whole batch back — all-or-nothing, never a
@@ -364,25 +449,62 @@ async def _run_steps(
             grant_id=st.grant_id,
             idempotency_key=f"{idem_prefix}:w{n}"[:128],
             execute_after=execute_after,
+            display_json=json.dumps(
+                _write_display(st), sort_keys=True, default=str,
+            ),
         ))
     db.add_all(rows)
     try:
         await db.flush()
     except IntegrityError:
         await db.rollback()
-        logger.info("[automations] outbox idempotency hit %s", idem_prefix)
-        return "run"
-    await db.commit()
-    for st in vspec.write_steps:
-        await _advance_v2(db, job_id, vspec, st.id)
+        if not resume:
+            logger.info("[automations] outbox idempotency hit %s",
+                        idem_prefix)
+            return "run"
+        # Resume: the stop landed after staging — reuse the surviving
+        # staged rows (an executed/cancelled one stays terminal; the
+        # claim gate keeps a double-send impossible either way).
+        from sqlalchemy import select as _select
+        rows = list((await db.execute(
+            _select(AutomationOutbox)
+            .where(AutomationOutbox.job_id == job_id)
+            .where(AutomationOutbox.status == "staged")
+        )).scalars())
+        now2 = datetime.utcnow()
+        for row in rows:
+            if row.execute_after and row.execute_after < now2:
+                row.execute_after = now2 + timedelta(
+                    seconds=AUTOMATION_OUTBOX_UNDO_WINDOW_S)
+        await db.commit()
+    else:
+        await db.commit()
+    # ND-4: a write step's done-form verb lands when the write actually
+    # EXECUTES (outbox ok branch, keyed by display_json.step_id) — never
+    # at staging. A refused write must not wear "Posted to Slack".
 
     if stage_only:
         return "staged"
+
+    # R30 narration phase 1 (pre-write): the opening line, item whys,
+    # think turns, the draft's text. Result + close land in phase 2 so
+    # the thread never claims a change before the write executed.
+    narration = await _narrate_phase1(
+        db, automation=automation, vspec=vspec, job_id=job_id,
+        thread=thread, tool_turn_by_step=tool_turn_by_step,
+        partial=partial,
+    )
 
     from .outbox import flush_row_when_due
     statuses = []
     for row in rows:
         statuses.append(await flush_row_when_due(db, row.id))
+
+    await _narrate_phase2(
+        db, automation=automation, job_id=job_id, thread=thread,
+        narration=narration,
+        writes_ok=not any(s == "failed" for s in statuses),
+    )
 
     outcome = "sent"
     if any(s == "failed" for s in statuses):
@@ -476,6 +598,9 @@ async def _run_event_inner(
     await db.commit()
     await on_run_created(db, job=job, automation=automation)
     await _advance_v2(db, job.id, vspec, "evaluate")
+    from . import run_v3 as _rv3_open
+    await _rv3_open.open_run(db, automation=automation, job=job,
+                             kind="scheduled", total_steps=len(vspec.steps))
 
     return await _run_steps(db, automation, vspec, job.id, payload, source,
                             idem_prefix=f"evt:{event.id}")
@@ -487,8 +612,18 @@ async def run_schedule_fire_v2(
     vspec: ValidatedSpecV2,
     source: ValidatedSource,
     fire_key: str,
+    run_kind: str = "scheduled",
 ) -> str:
     async def _inner() -> str:
+        # §4.3: the next scheduled fire supersedes a still-stopped run —
+        # its stop note was already written; no new turn.
+        try:
+            from . import run_v3 as _rv3_sup
+            await _rv3_sup.supersede_stopped_run(
+                db, automation_id=automation.id,
+            )
+        except Exception:  # noqa: BLE001
+            pass
         job = await JobRunner().create_job(
             job_type="automation_run",
             spec=TaskSpec(
@@ -506,6 +641,10 @@ async def run_schedule_fire_v2(
         )
         await on_run_created(db, job=job, automation=automation)
         await _advance_v2(db, job.id, vspec, "evaluate")
+        from . import run_v3 as _rv3_open
+        await _rv3_open.open_run(db, automation=automation, job=job,
+                                 kind=run_kind,
+                                 total_steps=len(vspec.steps))
         return await _run_steps(db, automation, vspec, job.id, {}, source,
                                 idem_prefix=f"fire:{fire_key}")
 
@@ -621,8 +760,338 @@ async def execute_test_run_v2(
     )
     await on_run_created(db, job=job, automation=automation)
     await _advance_v2(db, job.id, vspec, "evaluate")
+    from . import run_v3 as _rv3_open
+    await _rv3_open.open_run(db, automation=automation, job=job,
+                             kind="run_now", total_steps=len(vspec.steps))
     status = await _run_steps(
         db, automation, vspec, job.id, sample, source,
         idem_prefix=f"test:{job.id}", stage_only=True,
     )
     return {"job_id": job.id, "status": status, "sample_event": sample}
+
+
+# ── R30: the v3 ledger + narration seams ─────────────────────────────
+
+
+def _failure_reason(e: Exception) -> str:
+    """Map a read-step exception onto the verb dictionary's failure
+    reasons. The dispatch error message carries the RPC envelope kind."""
+    msg = str(e)
+    for token in ("reauth_required", "scope_missing", "provider_down",
+                  "rate_limited", "timeout"):
+        if token in msg:
+            return token
+    return "unreachable"
+
+
+def _write_display(st: ValidatedStep) -> dict:
+    """The write's honest display form, snapshotted at staging
+    (CONTRACTS-R30 §4.8) — the flush path cannot read platform grants,
+    so the pinned target label rides here."""
+    from app.services.automation_verbs import turn_action
+    from .draft_card import DRAFT_TOOLS
+    target = (st.grant_target or {})
+    label = target.get("label") or target.get("id")
+    is_draft = st.tool in DRAFT_TOOLS
+    audience = "you" if is_draft or str(label or "").lower().startswith("dm") \
+        else "others"
+    act = turn_action(
+        st.connector_id, st.tool, kind="write", ok=True,
+        target=label, audience=audience,
+    )
+    return {
+        "what": act["action"],
+        "target": label,
+        "audience": audience,
+        "reversible": is_draft,
+        # ND-4: lets the outbox flip THIS step's verb to its done form
+        # only when the write actually executed (or to failed when not).
+        "step_id": st.id,
+    }
+
+
+async def _append_read_turn(
+    db, *, thread, automation: Automation, job_id: str,
+    step: ValidatedStep, result: Optional[dict], ms: int, ok: bool,
+    reason: Optional[str], turn_index: dict,
+) -> None:
+    """The mechanical tool turn for one read step — engine facts only
+    (action/detail/ms/ok/items); the narrator fills whys in place."""
+    if thread is None:
+        return
+    try:
+        from . import ledger as _ledger
+        from app.services import automation_verbs as _verbs
+        if ok:
+            count = (result or {}).get("count")
+            act = _verbs.turn_action(
+                step.connector_id, step.tool, kind="read", ok=True,
+                count=count if isinstance(count, int) else None,
+            )
+            items = [
+                {"title": str(line)[:200], "sub": "", "why": ""}
+                for line in ((result or {}).get("lines") or [])
+            ]
+            steps_lines = []
+        else:
+            act = _verbs.failure_action(step.connector_id, reason)
+            name = _verbs.display_name(step.connector_id) or "the account"
+            items = []
+            steps_lines = [
+                {"text": f"Asked {name} for what changed", "ok": True},
+                {"text": act["detail"].capitalize() or "It did not answer",
+                 "ok": False},
+            ]
+        turn = await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=job_id,
+            kind="tool",
+            payload={
+                "account_id": step.connector_id or "",
+                "tool_kind": "read",
+                "action": act["action"], "detail": act["detail"],
+                "ok": ok, "ms": max(int(ms), 0),
+                "steps": steps_lines, "items": items,
+                "write_ids": [], "rest": "",
+            },
+        )
+        turn_index[step.id] = turn
+    except Exception as e:  # noqa: BLE001 — the ledger degrades, the run does not
+        logger.debug("[automations] read turn skipped step=%s: %s",
+                     step.id, e)
+
+
+async def _recall_facts(db, automation: Automation) -> list[dict]:
+    """What the narrator may use to judge: this automation's scoped
+    facts + globals (memory v2), falling back to the R29 ledger."""
+    try:
+        from sqlalchemy import select as _select
+        from app.db.models import MemoryFact
+        rows = list((await db.execute(
+            _select(MemoryFact)
+            .where(MemoryFact.user_id == automation.user_id)
+            .where(MemoryFact.scope.in_((automation.id, "global")))
+            .order_by(MemoryFact.learned_at.desc())
+            .limit(24)
+        )).scalars())
+        if rows:
+            return [{"category": r.category, "text": r.text} for r in rows]
+        from app.db.models import AutomationFact
+        legacy = list((await db.execute(
+            _select(AutomationFact)
+            .where(AutomationFact.automation_id == automation.id)
+            .order_by(AutomationFact.updated_at.desc())
+            .limit(24)
+        )).scalars())
+        return [{"category": r.category, "text": r.text} for r in legacy]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _rules_of(automation: Automation) -> list[str]:
+    try:
+        rules = json.loads(automation.rules_json or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [str(r.get("text") or "").strip()
+            for r in rules if isinstance(r, dict) and r.get("text")]
+
+
+async def _narrate_phase1(
+    db, *, automation: Automation, vspec: ValidatedSpecV2, job_id: str,
+    thread, tool_turn_by_step: dict, partial: bool,
+) -> Optional[dict]:
+    """Run the narrator and persist what may precede the writes: the
+    opening agent line + the per-item whys (in-place annotates). The
+    result/thinks/draft/close land in phase 2, after the writes, so
+    the thread never claims a change before it happened."""
+    if thread is None:
+        return None
+    try:
+        job = await db.get(BuildJob, job_id)
+        from . import ledger as _ledger
+        if job is None or _ledger.run_kind_of(job) not in ("scheduled",
+                                                           "run_now"):
+            return None
+        from .draft_card import DRAFT_TOOLS
+        vocabulary = "changes" if any(
+            st.tool not in DRAFT_TOOLS for st in vspec.write_steps
+        ) else "brief"
+        steps_record = []
+        from app.services import automation_verbs as _verbs
+        for st in vspec.steps:
+            if st.mutates:
+                d = _write_display(st)
+                steps_record.append({
+                    "step_ref": st.id,
+                    "connector_name": _verbs.display_name(st.connector_id)
+                    or st.connector_id,
+                    "account_id": st.connector_id,
+                    "tool_kind": "write",
+                    "action": d["what"], "detail": d.get("target") or "",
+                    "ok": True, "failure_reason": None, "items": [],
+                    "write": d,
+                })
+                continue
+            turn = tool_turn_by_step.get(st.id) or {}
+            steps_record.append({
+                "step_ref": st.id,
+                "connector_name": _verbs.display_name(st.connector_id)
+                or st.connector_id,
+                "account_id": st.connector_id or "",
+                "tool_kind": "read",
+                "action": turn.get("action") or "",
+                "detail": turn.get("detail") or "",
+                "ok": bool(turn.get("ok", True)),
+                "failure_reason": None if turn.get("ok", True)
+                else (turn.get("detail") or "unreachable"),
+                "items": [
+                    {"id": it["id"], "title": it.get("title") or "",
+                     "sub": it.get("sub") or "",
+                     "msgs": it.get("msgs") or []}
+                    for it in (turn.get("items") or [])
+                ],
+                "write": None,
+            })
+        record = {
+            "automation": {"title": automation.name,
+                           "mode": (vspec.raw or {}).get("mode") or "auto"},
+            "run_kind": _ledger.run_kind_of(job),
+            "vocabulary": vocabulary,
+            "status": "partial" if partial else "completed",
+            "rules": _rules_of(automation),
+            "memory_facts": await _recall_facts(db, automation),
+            "steps": steps_record,
+        }
+        from .narrator import narrate_run
+        outcome = await narrate_run(record)
+        drafts = outcome.get("turns") or []
+        if outcome.get("problems"):
+            logger.info("[automations] narration problems on %s: %s",
+                        job_id[:8], outcome["problems"][:5])
+        held: list[dict] = []
+        # A resumed run already has its opening line — never repeat it.
+        existing = await _ledger.run_turns(db, run_id=job_id)
+        opened = any(t["kind"] == "agent" for t in existing)
+        for d in drafts:
+            kind = d.get("kind")
+            if kind == "annotate":
+                await _apply_annotate(db, automation, tool_turn_by_step, d)
+            elif kind == "agent" and not opened:
+                opened = True
+                await _ledger.append_turn(
+                    db, user_id=automation.user_id, thread=thread,
+                    run_id=job_id, kind="agent",
+                    payload={"text": d.get("text") or ""},
+                )
+            else:
+                held.append(d)
+        return {"held": held, "vocabulary": vocabulary}
+    except Exception as e:  # noqa: BLE001 — narration must not kill the run
+        logger.warning("[automations] narration phase 1 skipped: %s", e)
+        return None
+
+
+async def _apply_annotate(
+    db, automation: Automation, tool_turn_by_step: dict, draft: dict,
+) -> None:
+    """Fill item whys / msg whys / rest into the persisted tool turn
+    the annotate addresses (matched by minted item ids)."""
+    from app.db.models import AutomationTurn
+    from . import ledger as _ledger
+    step_ref = draft.get("step_ref")
+    turn = None
+    for sid, t in tool_turn_by_step.items():
+        if sid == step_ref or t.get("id") == step_ref:
+            turn = t
+            break
+    if turn is None:
+        return
+    row = await db.get(AutomationTurn, turn["id"])
+    if row is None:
+        return
+    body = json.loads(row.payload_json)
+    by_id = {it.get("id"): it for it in body.get("items") or []}
+    for ann in draft.get("items") or []:
+        it = by_id.get(ann.get("id"))
+        if it is None:
+            continue
+        if ann.get("why"):
+            it["why"] = str(ann["why"])[:400]
+        for m in ann.get("msgs") or []:
+            idx = m.get("idx")
+            msgs = it.get("msgs") or []
+            if isinstance(idx, int) and 0 <= idx < len(msgs) and m.get("why"):
+                msgs[idx]["why"] = str(m["why"])[:400]
+    if draft.get("rest"):
+        body["rest"] = str(draft["rest"])[:400]
+    row.payload_json = json.dumps(body, default=str)
+    await db.commit()
+    turn.update(body)
+    await _ledger._broadcast(automation.user_id, {
+        "type": "automation.turn",
+        "thread_id": row.thread_id,
+        "run_id": row.run_id,
+        "turn": _ledger._serialize_row(row),
+    })
+
+
+async def _narrate_phase2(
+    db, *, automation: Automation, job_id: str, thread,
+    narration: Optional[dict], writes_ok: bool,
+) -> None:
+    """Post-write narration: result (only when every write landed),
+    thinks, the draft (unless the outbox already appended one), the
+    closing line."""
+    if thread is None or not narration:
+        return
+    try:
+        from . import ledger as _ledger
+        existing = await _ledger.run_turns(db, run_id=job_id)
+        has_draft = any(t["kind"] == "draft" for t in existing)
+        for d in narration.get("held") or []:
+            kind = d.get("kind")
+            if kind == "result":
+                if not writes_ok:
+                    continue
+                await _ledger.append_turn(
+                    db, user_id=automation.user_id, thread=thread,
+                    run_id=job_id, kind="result",
+                    payload={
+                        "title": d.get("title") or "",
+                        "vocabulary": d.get("vocabulary")
+                        or narration.get("vocabulary") or "brief",
+                        "groups": d.get("groups") or [],
+                    },
+                )
+            elif kind == "think":
+                await _ledger.append_turn(
+                    db, user_id=automation.user_id, thread=thread,
+                    run_id=job_id, kind="think",
+                    payload={"text": d.get("text") or ""},
+                )
+            elif kind == "draft":
+                if has_draft:
+                    continue
+                await _ledger.append_turn(
+                    db, user_id=automation.user_id, thread=thread,
+                    run_id=job_id, kind="draft",
+                    payload={
+                        "text": d.get("text") or "",
+                        "target": {
+                            "account_id": d.get("target_account_id") or "",
+                            "ref": d.get("target_ref"),
+                        },
+                        "sent_at": None,
+                    },
+                )
+                has_draft = True
+            elif kind == "agent":
+                if not writes_ok:
+                    continue
+                await _ledger.append_turn(
+                    db, user_id=automation.user_id, thread=thread,
+                    run_id=job_id, kind="agent",
+                    payload={"text": d.get("text") or ""},
+                )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] narration phase 2 skipped: %s", e)

@@ -647,8 +647,12 @@ async def test_v2_multi_write_aggregate_finalize(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_v2_delete_removes_memory_namespace(monkeypatch):
-    from app.agent.automations import executor_v2, memory as engine_memory
+async def test_v2_delete_is_soft_then_purges_memory_namespace(monkeypatch):
+    """R30 §4.8 rewrites the R29 pin: delete is SOFT (memory kept 30
+    days, row invisible to lists), and the PURGE sweep hard-deletes —
+    the engine namespace goes with the purge, not the tap."""
+    from datetime import datetime, timedelta
+    from app.agent.automations import memory as engine_memory
     from app.agent.automations import service as svc
 
     uid = await _mk_user()
@@ -663,6 +667,23 @@ async def test_v2_delete_removes_memory_namespace(monkeypatch):
         assert (await engine_memory.read_context(db, a2)) != {}
         await svc.delete_automation(db, automation_id=a.id, user_id=uid)
     async with async_session_maker() as db:
+        # Soft: the row survives with deleted_at, invisible to the list,
+        # memory namespace intact (openable-for-30-days honesty).
+        a3 = await db.get(Automation, a.id)
+        assert a3 is not None and a3.deleted_at is not None
+        assert (await engine_memory.read_context(db, a3)) != {}
+        listed = await svc.list_automations(db, uid)
+        assert all(x["id"] != a.id for x in listed)
+        # Back-date past the retention window; the purge sweep deletes.
+        a3.deleted_at = datetime.utcnow() - timedelta(days=31)
+        await db.commit()
+    from app.agent.automations.sweep import sweep_purge_soft_deleted
+    async with async_session_maker() as db:
+        purged = await sweep_purge_soft_deleted(db)
+        assert purged == 1
+    async with async_session_maker() as db:
+        assert await db.get(Automation, a.id) is None
+
         class _Shim:
             id = a.id
             user_id = uid

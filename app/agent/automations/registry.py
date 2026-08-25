@@ -227,6 +227,31 @@ async def create_grant_request(
         return None
 
 
+async def bind_grant(
+    user_id: str, *, grant_id: str, automation_id: str,
+) -> Optional[dict]:
+    """ND-1: stamp `automation_id` onto a grant staged before the
+    automation existed (the skill shows the permission card BEFORE
+    automations__create, so the request body never carries the id).
+    Returns the platform's updated grant payload, or None on any
+    failure — callers treat binding as a repair, not a gate."""
+    url = _platform_url("/v1/automations/grant-bind")
+    if url is None or not settings.agent_api_key:
+        return None
+    body = {"grant_id": grant_id, "automation_id": automation_id}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
+            resp = await client.post(url, json=body, headers=_headers(user_id))
+        if resp.status_code != 200:
+            logger.warning("[automations] grant-bind non-200: %s %s",
+                           resp.status_code, resp.text[:200])
+            return None
+        return (resp.json() or {}).get("grant")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] grant-bind failed: %s", e)
+        return None
+
+
 def invalidate_cache() -> None:
     _cache["data"] = None
     _cache["at"] = 0.0

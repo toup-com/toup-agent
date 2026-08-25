@@ -761,6 +761,7 @@ OnToolEvent = Callable[[Dict[str, Any]], Coroutine[Any, Any, None]]
 
 from app.agent.tool_display import client_summary
 from app.agent.tool_display import public_label as _tool_public_label
+from app.agent.tool_display import public_step_label as _tool_public_step_label
 
 
 def _credits_for_llm_call(model: str, tokens_in: int, tokens_out: int) -> float:
@@ -3466,8 +3467,13 @@ class AgentRunner:
                 # PERSISTED summary — read back by day_chats and rendered in the
                 # expanded actions card on reload, so it goes through the same
                 # redaction as the live frame. JSON results pass through
-                # untouched (create_job's job_id binds the card to its turn).
-                _record_summary = client_summary(result, cap=2048)
+                # untouched (create_job's job_id binds the card to its turn) —
+                # EXCEPT for connector tools, whose JSON is a vendor payload
+                # the client would render as a "Site: Toup · Is last: true"
+                # detail line (R30, D-17); those serve their `display`
+                # sentence or nothing.
+                _record_summary = client_summary(result, cap=2048,
+                                                 tool_name=tc["name"])
                 # Round 4 (items 1/8): attribution + favicon refs ride the
                 # persisted record AND the live frame, so a message re-rendered
                 # from history shows the same steps/favicons a live turn did.
@@ -3488,9 +3494,11 @@ class AgentRunner:
                 # re-rendered from history reads identically to the one the
                 # user watched instead of falling back to a humanised
                 # identifier ("Building your app" vs "create app file").
-                _label = _tool_public_label(tc["name"])
-                if _label:
-                    _rec["label"] = _label
+                # R30 (D-01): ALWAYS present. A record without a label left
+                # every client to humanise the wire id, which is exactly how
+                # "List events" / "Search issues" reached a job sheet; the
+                # total form serves a sentence for any tool.
+                _rec["label"] = _tool_public_step_label(tc["name"])
                 if _domains:
                     _rec["domains"] = _domains
                     _rec["urls"] = _urls
@@ -3546,7 +3554,8 @@ class AgentRunner:
                     # return value. See app/agent/tool_display.py — this line
                     # used to be `result[:200]` and shipped tenant uuids, the
                     # storage layout and internal component names into the chat.
-                    summary = client_summary(result, cap=200)
+                    summary = client_summary(result, cap=200,
+                                             tool_name=tc["name"])
                     if _tool_end_meta:
                         _meta: Dict[str, Any] = {
                             "call_id": tc["id"],
@@ -3776,6 +3785,39 @@ class AgentRunner:
         async def _background_post_processing():
             try:
                 async with async_session_maker() as bg_db:
+                    # R30 §4.10: an automation-session chat exchange is
+                    # part of the thread's FULL record — mirror the user
+                    # and agent turns into the v3 ledger (best-effort;
+                    # the conversation row stays the legacy surface).
+                    if _automation_ctx_for_bg and final_text:
+                        try:
+                            from app.agent.automations import ledger as _lg
+                            _aid = _automation_ctx_for_bg.get(
+                                "automation_id")
+                            if _aid:
+                                _thread = await _lg.ensure_thread(
+                                    bg_db, user_id=user_id,
+                                    automation_id=_aid,
+                                )
+                                if _curator_user_text:
+                                    await _lg.append_turn(
+                                        bg_db, user_id=user_id,
+                                        thread=_thread, kind="user",
+                                        payload={
+                                            "text": _curator_user_text,
+                                        },
+                                        broadcast=False,
+                                    )
+                                await _lg.append_turn(
+                                    bg_db, user_id=user_id,
+                                    thread=_thread, kind="agent",
+                                    payload={"text": final_text[:4000]},
+                                )
+                        except Exception as _lg_err:  # noqa: BLE001
+                            logger.debug(
+                                "[AGENT] v3 thread mirror skipped: %s",
+                                _lg_err,
+                            )
                     try:
                         if (
                             settings.auto_extract_memories and final_text

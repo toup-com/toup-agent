@@ -854,6 +854,9 @@ class ChatMessageResponse(BaseModel):
     # same names). Contract shared with the Round-26 app session.
     automation_connector_card: Optional[dict] = None
     automation_grant_card: Optional[dict] = None
+    # R30 §4.10: the once-per-run notification card — the ONLY
+    # automation presence in the main chat (D-05).
+    automation_notification: Optional[dict] = None
     # Automations (Round 29) — session-thread chips/cards, persisted
     # under the same-named metadata keys (CONTRACTS-R29 §4):
     #   draft_card    {provider, sender, subject, preview, open_url}

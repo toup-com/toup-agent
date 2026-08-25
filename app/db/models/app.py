@@ -61,6 +61,10 @@ class BuildJob(Base):
     paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # When build was paused (token limit)
     resume_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # When tokens reset
     checkpoint_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # Serialized build state for resume
+    # R30 automation-run stop (CONTRACTS-R30 §4.3): stamped by the stop
+    # route, read by the executor at every step boundary and by the
+    # outbox flush before executing a staged write. NULL = not stopped.
+    stop_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     layer: Mapped[int] = mapped_column(Integer, default=1)  # 1 = app builder, 2 = user customization via agent
     layer2_changes_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array of Layer 2 changes
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

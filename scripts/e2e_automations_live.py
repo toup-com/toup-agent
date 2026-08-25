@@ -38,7 +38,8 @@ Proof sections (R28-D brief):
               undone over HTTP inside the 6-s window while the REAL
               flush loop is running; a second write is left alone, the
               flush wins, and the late undo 409s.
-  AUTOPAUSE   a revoked grant makes 3 REAL schedule fires fail; the
+  AUTOPAUSE   a revoke pauses its dependent at once (R30); a wrong-
+              target write fails 3 REAL schedule fires; the
               60-s reconciler sweep flips the automation to error,
               posts exactly ONE notice IN the session thread, with the
               navigate chip.
@@ -689,8 +690,8 @@ async def main() -> int:
                   == ["sent", "sent", "undone"], str(jrows))
 
             # ════ AUTOPAUSE — real failures → the 60-s sweep ══════════
-            section("AUTOPAUSE — a revoked grant fails 3 real fires; "
-                    "the sweep pauses and speaks ONCE, in the session")
+            section("AUTOPAUSE — revoke pauses at once; wrong-target "
+                    "fails 3 real fires; the sweep speaks ONCE")
             r = await http.post(
                 f"{base}/api/v1/automations/grant-requests", headers=rpc_h,
                 json={"connector_id": "stub", "tool_name": "stub__post",
@@ -735,10 +736,63 @@ async def main() -> int:
                   r.status_code == 200
                   and r.json().get("status") == "revoked",
                   f"{r.status_code} {r.text[:160]}")
+            # R30: the revoke hook now pauses its dependent IMMEDIATELY
+            # (status=error, paused_reason=grant_revoked — the R29 §3.1
+            # promise, unmasked by the ND-1 automation_id fix). The old
+            # scenario waited for 3 failed fires that can no longer
+            # happen off a revoked grant.
+            arows = await _await_agent_rows(
+                "SELECT status, paused_reason FROM automations "
+                "WHERE id=?", (sched_id,),
+                lambda r: bool(r) and r[0][0] == "error", timeout=60,
+            )
+            check("the revoke pauses its dependent immediately "
+                  "(attention=grant_revoked)",
+                  bool(arows) and arows[0][0] == "error"
+                  and arows[0][1] == "grant_revoked", str(arows))
+
+            # The 3-strike arc needs a failure mode that ISN'T a revoked
+            # grant now: an APPROVED grant whose write renders the wrong
+            # target — the dispatcher's pinned-target guard refuses each
+            # fire ("Nothing was sent", the live BUG-7 class), the streak
+            # climbs, and the 60-s sweep pauses at 3.
+            r = await http.post(
+                f"{base}/api/v1/automations/grant-requests", headers=rpc_h,
+                json={"connector_id": "stub", "tool_name": "stub__post",
+                      "target": {"kind": "channel", "id": "chan-live-3",
+                                 "label": "#live3"},
+                      "mode": "auto", "summary": "scheduled stub post"},
+            )
+            sg3 = r.json().get("grant") or {}
+            await http.post(
+                f"{base}/api/automations/grant-requests/{sg3['id']}"
+                f"/approve",
+                headers=user_h, json={"decided_via": "web"},
+            )
+            strike_spec = {
+                "name": "Live strikes",
+                "trigger": {"mode": "schedule", "schedule": {"every_s": 5}},
+                "action": {"connector_id": "stub", "tool": "stub__post",
+                           "params_template": {
+                               "channel": "wrong-target",
+                               "text": "tick"},
+                           "grant_id": sg3["id"]},
+                "mode": "auto",
+            }
+            r = await http.post(f"{base}/api/automations", headers=user_h,
+                                json={"spec": strike_spec})
+            strike_id = (r.json().get("automation") or {}).get("id")
+            r = await http.post(
+                f"{base}/api/automations/{strike_id}/arm", headers=user_h)
+            check("wrong-target automation armed (approved grant, "
+                  "pinned-target guard will refuse each fire)",
+                  r.status_code == 200 and bool(strike_id),
+                  f"{r.status_code} {r.text[:200]}")
             arows = await _await_agent_rows(
                 "SELECT status, paused_reason, consecutive_failures "
-                "FROM automations WHERE id=?", (sched_id,),
-                lambda r: bool(r) and r[0][0] == "error", timeout=240,
+                "FROM automations WHERE id=?", (strike_id,),
+                lambda r: bool(r) and r[0][0] == "error"
+                and r[0][1] == "auto_failures", timeout=240,
             )
             check("the REAL sweep auto-paused it to error after 3 "
                   "consecutive failures",
@@ -746,7 +800,7 @@ async def main() -> int:
                   and arows[0][1] == "auto_failures"
                   and arows[0][2] >= 3, str(arows))
             r = await http.get(
-                f"{base}/api/automations/{sched_id}/thread",
+                f"{base}/api/automations/{strike_id}/thread",
                 headers=user_h,
             )
             t_msgs = (r.json() or {}).get("messages") or []
@@ -755,10 +809,21 @@ async def main() -> int:
             check("exactly ONE auto-pause notice, IN the session thread",
                   len(notices) == 1,
                   f"{len(notices)} notices in {len(t_msgs)} messages")
-            check("the notice carries its navigate chip",
+            # aff765a7 (R29-C) replaced the inline [[navigate:/activity]]
+            # markup with the CONTRACTS-R29 §1 fix_chip {label, prompt}
+            # riding message metadata (served by _message_to_response).
+            # This check pinned the pre-contract markup and went red on
+            # the MERGED tree only (the R29-D 42/42 branch predated the
+            # merge) — the merge-seam class. Pin the contracted shape.
+            n_chip = (notices[0].get("fix_chip") or {}) if notices else {}
+            check("the notice carries its fix chip (label+prompt), "
+                  "no legacy navigate markup",
                   bool(notices)
-                  and "[[navigate:" in notices[0].get("content", ""),
-                  (notices[0].get("content", "")[:160] if notices else ""))
+                  and bool(n_chip.get("label"))
+                  and bool(n_chip.get("prompt"))
+                  and "[[navigate:" not in notices[0].get("content", ""),
+                  (f"chip={n_chip!r:.120} " if notices else "")
+                  + (notices[0].get("content", "")[:100] if notices else ""))
 
             # ════ ENDPOINTS — thread + memory over the proxy ══════════
             section("ENDPOINTS — session thread and working memory, "
@@ -775,13 +840,24 @@ async def main() -> int:
                   and all(c.get("job_status") in ("completed", "cancelled")
                           for c in job_cards),
                   f"{r.status_code} cards={len(job_cards)}")
+            # CONTRACTS-R30 §4.5: /memory serves the curated categories
+            # view (the §3.10 sheet); the engine state row is internal
+            # only now (the D-07 retirement). The old assertion pinned
+            # the R29 metadata shape.
             r = await http.get(f"{base}/api/automations/{auto_id}/memory",
                                headers=user_h)
-            meta = (r.json() or {}).get("metadata") or {} \
-                if r.status_code == 200 else {}
-            check("working memory over the proxy after terminal runs",
-                  r.status_code == 200 and meta.get("last_outcome")
-                  and meta.get("last_run_at"),
+            m_body = r.json() if r.status_code == 200 else {}
+            m_cats = [c.get("key") for c in
+                      (m_body.get("categories") or [])]
+            check("memory over the proxy serves the §4.5 categories "
+                  "view, engine state values off the wire (legacy keys "
+                  "are null tombstones for the pre-rebuild app)",
+                  r.status_code == 200
+                  and isinstance(m_body.get("count"), int)
+                  and m_cats == ["people", "team_workspace", "your_time",
+                                 "work_you_own", "noise_filters"]
+                  and not m_body.get("metadata")
+                  and m_body.get("content") is None,
                   f"{r.status_code} {r.text[:160]}")
             r = await http.get(
                 f"{base}/api/automations/{uuid.uuid4()}/memory",

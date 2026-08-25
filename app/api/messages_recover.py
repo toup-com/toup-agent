@@ -224,6 +224,8 @@ async def messages_since(
                 msg, "automation_connector_card"),
             "automation_grant_card": _serialize_automation_card(
                 msg, "automation_grant_card"),
+            "automation_notification": _serialize_automation_card(
+                msg, "automation_notification"),
             "pending_action": _serialize_meta_card(msg, "pending_action"),
             "draft_card": _serialize_meta_card(msg, "draft_card"),
             "memory_update": _serialize_meta_card(msg, "memory_update"),

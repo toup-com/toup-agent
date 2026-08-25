@@ -461,3 +461,415 @@ def fix_chip(
             f"need from me."
         ),
     }
+
+
+# =====================================================================
+# v2 (R30) — per-connector turn phrasings. CONTRACTS-R30 §2.
+#
+# Ownership split: A owns the STRUCTURE, fallbacks, and the rejection
+# predicate; C owns the per-connector ENTRY STRINGS below (refine in
+# place — every function stays total regardless of table contents).
+# =====================================================================
+
+# connector → (read action, count-detail template). `{n}` is the item
+# count; the "(s)" marker is singularised by _n() below.
+_V2_READ: dict[str, tuple[str, str]] = {
+    "gmail": ("Read your unread mail", "{n} new thread(s)"),
+    "outlook": ("Read your Outlook mail", "{n} new message(s)"),
+    "slack": ("Read your channels", "{n} place(s)"),
+    "jira": ("Checked your board", "{n} issue(s) moved"),
+    "github": ("Checked your repositories", "{n} pull request(s)"),
+    "teams": ("Read your Teams chats", "{n} new message(s)"),
+    "notion": ("Checked your pages", "{n} page(s) changed"),
+    "drive": ("Checked your files", "{n} new file(s)"),
+    "docs": ("Read the document", ""),
+    "calendar": ("Read your week", "{n} event(s)"),
+    "stub": ("Checked the test feed", "{n} item(s)"),
+}
+
+# connector → progressive live-pill / step-sentence form.
+_V2_READ_LIVE: dict[str, str] = {
+    "gmail": "reading {n} unread messages",
+    "outlook": "reading {n} Outlook messages",
+    "slack": "reading your channels",
+    "jira": "checking your board",
+    "github": "checking your repositories",
+    "teams": "reading your Teams chats",
+    "notion": "checking your pages",
+    "drive": "checking your files",
+    "docs": "reading the document",
+    "calendar": "reading your week",
+    "stub": "checking the test feed",
+}
+
+# write tool → phrasing. `action` is the you-audience form;
+# `action_others` names the real target (`{target}` interpolated).
+_V2_WRITE: dict[str, dict[str, str]] = {
+    "slack__send_message": {
+        "action": "Told you in Slack", "action_others": "Posted in {target}",
+        "detail": "one line, no thread",
+    },
+    "teams__send_chat_message": {
+        "action": "Told you in Teams", "action_others": "Posted in {target}",
+        "detail": "one line, no thread",
+    },
+    "gmail__create_draft": {
+        "action": "Drafted a reply", "action_others": "Drafted a reply",
+        "detail": "waiting in Gmail — nothing sent",
+    },
+    "outlook__create_draft": {
+        "action": "Drafted a reply", "action_others": "Drafted a reply",
+        "detail": "waiting in Outlook — nothing sent",
+    },
+    "jira__add_comment": {
+        "action": "Commented on your ticket",
+        "action_others": "Commented on {target}",
+        "detail": "one comment, nothing else touched",
+    },
+    "jira__create_issue": {
+        "action": "Filed a ticket", "action_others": "Filed a ticket in {target}",
+        "detail": "created, not assigned",
+    },
+    "github__create_comment": {
+        "action": "Commented on the pull request",
+        "action_others": "Commented on {target}",
+        "detail": "a comment, nothing merged",
+    },
+    "notion__create_page": {
+        "action": "Added a page", "action_others": "Added a page in {target}",
+        "detail": "a new page, nothing overwritten",
+    },
+    "docs__append_text": {
+        "action": "Added to the doc", "action_others": "Added to {target}",
+        "detail": "appended, nothing removed",
+    },
+    "stub__post": {
+        "action": "Posted to the test channel",
+        "action_others": "Posted in {target}",
+        "detail": "test write",
+    },
+}
+
+# failure reason → (action, detail).
+_V2_FAILURE: dict[str, tuple[str, str]] = {
+    "reauth_required": ("Could not connect", "access expired"),
+    "scope_missing": ("Could not connect", "it needs more access than you gave it"),
+    "provider_down": ("Could not connect", "the service was unreachable"),
+    "rate_limited": ("Could not connect", "asked to slow down"),
+    "timeout": ("Could not connect", "it did not answer in time"),
+}
+_V2_FAILURE_DEFAULT = ("Could not connect", "it did not answer")
+
+# event-trigger node sub (§3.9): connector or "connector:event" key.
+_V2_TRIGGER_SUB: dict[str, str] = {
+    "gmail": "when mail arrives",
+    "outlook": "when mail arrives",
+    "slack": "when a message lands",
+    "jira": "when an issue appears",
+    "github": "when a pull request moves",
+    "teams": "when a chat message lands",
+    "notion": "when a page changes",
+    "calendar": "when your week changes",
+    "drive": "when a file lands",
+    "stub": "when a test item appears",
+}
+
+# Engine-authored (non-connector) actions the thread can carry.
+_V2_ENGINE_ACTIONS = frozenset({
+    "Checked what I can do",   # setup capability check (C §5.3)
+    "Connected again",         # the reconnect catch-up turn (§4.7)
+})
+
+
+def _n(template: str, count: Optional[int]) -> str:
+    """Interpolate `{n}`/`{count}` and singularise `(s)` markers."""
+    if not template:
+        return ""
+    n = 0 if count is None else int(count)
+    out = template.replace("{n}", str(n)).replace("{count}", str(n))
+    return out.replace("(s)", "" if n == 1 else "s")
+
+
+_C_ENTRIES_CACHE: Any = None
+
+
+def _c_entries():
+    """C's per-connector entry module (`automation_verb_entries.py`,
+    same package so both images can import it) — overlaid when present,
+    never required: every v2 function keeps its built-in fallback so
+    totality never depends on that module importing."""
+    global _C_ENTRIES_CACHE
+    if _C_ENTRIES_CACHE is None:
+        try:
+            from app.services import automation_verb_entries as entries
+            _C_ENTRIES_CACHE = entries
+        except Exception:  # noqa: BLE001
+            _C_ENTRIES_CACHE = False
+    return _C_ENTRIES_CACHE or None
+
+
+def _c_entry(connector_id: str) -> Optional[dict]:
+    e = _c_entries()
+    if e is None:
+        return None
+    return (getattr(e, "ENTRIES", {}) or {}).get(connector_id)
+
+
+def turn_action(
+    connector_id: Optional[str],
+    tool: Optional[str] = None,
+    *,
+    kind: str = "read",
+    ok: bool = True,
+    count: Optional[int] = None,
+    target: Optional[str] = None,
+    audience: str = "you",
+) -> dict:
+    """`{"action", "detail"}` for one v3 tool turn. Total."""
+    cid = connector_id or ""
+    if not ok:
+        return failure_action(cid, "reauth_required" if not tool else None)
+    ce = _c_entry(cid)
+    if kind == "write":
+        entry = None
+        if ce:
+            entry = (ce.get("writes") or {}).get(tool or "")
+        entry = entry or _V2_WRITE.get(tool or "")
+        if entry:
+            if audience == "others" and target and entry.get("action_others"):
+                action = entry["action_others"].replace(
+                    "{target}", str(target)
+                ).replace("{channel}", str(target))
+            else:
+                action = entry["action"]
+            return {"action": action, "detail": entry.get("detail") or ""}
+        name = display_name(cid) or "the account"
+        return {"action": f"Made a change in {name}", "detail": ""}
+    if ce:
+        reads = ce.get("reads") or {}
+        entry_c = reads.get(tool or "") or reads.get("*")
+        if entry_c:
+            return {"action": entry_c["action"],
+                    "detail": _n(entry_c.get("detail") or "", count)
+                    if count is not None else ""}
+    entry = _V2_READ.get(cid)
+    if entry:
+        return {"action": entry[0], "detail": _n(entry[1], count)}
+    name = display_name(cid) or "the account"
+    return {"action": f"Checked {name}", "detail": _n("{n} item(s)", count) if count else ""}
+
+
+def live_sentence(
+    connector_id: Optional[str], tool: Optional[str] = None,
+    count: Optional[int] = None,
+) -> str:
+    """Progressive form for the live pill / step sentence. Total."""
+    cid = connector_id or ""
+    ce = _c_entry(cid)
+    if ce:
+        for table in (ce.get("reads") or {}, ce.get("writes") or {}):
+            entry = table.get(tool or "") or (
+                table.get("*") if table is ce.get("reads") else None
+            )
+            if entry and entry.get("progressive"):
+                form = entry["progressive"]
+                if ("{count}" in form or "{n}" in form) and count is None:
+                    form = form.replace(" {count}", "").replace(
+                        "{count} ", "").replace(" {n}", "").replace("{n} ", "")
+                    return form
+                return _n(form, count)
+    form = _V2_READ_LIVE.get(cid)
+    if form:
+        if "{n}" in form and count is None:
+            # No count yet — drop the number, keep the verb.
+            form = form.replace(" {n}", "").replace("{n} ", "")
+            return form
+        return _n(form, count)
+    name = display_name(cid)
+    return f"checking {name}" if name else "working"
+
+
+_C_FAILURE_ALIASES = {
+    # my reason vocabulary → C's entry keys where they differ
+    "reauth_required": "access_expired",
+    "scope_missing": "access_expired",
+    "timeout": "provider_down",
+}
+
+
+def failure_action(
+    connector_id: Optional[str], reason: Optional[str] = None,
+) -> dict:
+    e = _c_entries()
+    if e is not None:
+        table = getattr(e, "V2_FAILURE", {}) or {}
+        entry = table.get(reason or "") or \
+            table.get(_C_FAILURE_ALIASES.get(reason or "", ""))
+        if isinstance(entry, dict) and entry.get("action"):
+            name = display_name(connector_id) or "the account"
+            return {
+                "action": entry["action"].replace("{name}", name),
+                "detail": (entry.get("detail") or "").replace("{name}", name),
+            }
+    action, detail = _V2_FAILURE.get(reason or "", _V2_FAILURE_DEFAULT)
+    return {"action": action, "detail": detail}
+
+
+def trigger_sub(
+    connector_id: Optional[str], event_key: Optional[str] = None,
+) -> str:
+    cid = connector_id or ""
+    ce = _c_entry(cid)
+    if ce and ce.get("trigger_sub"):
+        return ce["trigger_sub"]
+    if event_key and f"{cid}:{event_key}" in _V2_TRIGGER_SUB:
+        return _V2_TRIGGER_SUB[f"{cid}:{event_key}"]
+    if cid in _V2_TRIGGER_SUB:
+        return _V2_TRIGGER_SUB[cid]
+    return "when something changes"
+
+
+def _lower_first(s: str) -> str:
+    return s[:1].lower() + s[1:] if s else s
+
+
+def job_card_label(group: list[dict]) -> str:
+    """The job card's label from its grouped tool turns (§3.4).
+
+    Three forms: any not-ok → "Could not reach an account"; any write →
+    the write turns' actions joined with ` · ` (second onward lowered);
+    else "Checked {n} account(s)". Input turns need only
+    `tool_kind`/`ok`/`action`/`account_id`.
+    """
+    turns = [t for t in group or [] if t]
+    if any(not t.get("ok", True) for t in turns):
+        return "Could not reach an account"
+    writes = [t for t in turns if t.get("tool_kind") == "write"]
+    if writes:
+        parts = [writes[0].get("action") or "Made a change"]
+        parts += [_lower_first(t.get("action") or "made a change")
+                  for t in writes[1:]]
+        return " · ".join(parts)
+    accounts = {t.get("account_id") for t in turns if t.get("account_id")}
+    n = max(1, len(accounts))
+    return f"Checked {n} account" + ("" if n == 1 else "s")
+
+
+def sheet_subtitle(group: list[dict], run: Optional[dict] = None) -> str:
+    """The job sheet's per-group subtitle grammar (§3.5). Total.
+
+    `run` may carry {"status", "stopped_at_step", "failed_whole_run",
+    "unreachable": [connector display names]}.
+    """
+    run = run or {}
+    turns = [t for t in group or [] if t]
+    parts: list[str] = []
+    failed_here = any(not t.get("ok", True) for t in turns)
+    writes = [t for t in turns if t.get("tool_kind") == "write"
+              and t.get("ok", True)]
+    if failed_here:
+        parts.append("Stopped before it finished")
+    elif writes:
+        changes = len(writes)
+        msgs_you = sum(1 for t in writes
+                       if (t.get("audience") or "you") == "you")
+        clauses = [f"{changes} change" + ("" if changes == 1 else "s")]
+        if msgs_you:
+            clauses.append(
+                f"{msgs_you} message" + ("" if msgs_you == 1 else "s")
+                + " to you"
+            )
+        named_others = [
+            t.get("target") for t in writes
+            if (t.get("audience") or "you") == "others" and t.get("target")
+        ]
+        if named_others:
+            clauses.append(f"posted in {named_others[0]}")
+        else:
+            clauses.append("nothing sent to anyone else")
+        parts.append(" · ".join(clauses))
+    else:
+        parts.append("Nothing was sent or changed")
+    for name in run.get("unreachable") or []:
+        parts.append(f"Could not reach {name}")
+    if run.get("stopped_at_step"):
+        parts.append(f"stopped by you at step {int(run['stopped_at_step'])}")
+    return " · ".join(parts)
+
+
+def _served_action_patterns() -> list[re.Pattern]:
+    pats: list[re.Pattern] = []
+    for entry in _V2_WRITE.values():
+        for key in ("action", "action_others"):
+            tmpl = entry.get(key) or ""
+            pats.append(re.compile(
+                re.escape(tmpl).replace(r"\{target\}", ".+?") + r"\Z"
+            ))
+    return pats
+
+
+_SERVED_EXACT: frozenset = frozenset(
+    {a for a, _ in _V2_READ.values()}
+    | {a for a, _ in _V2_FAILURE.values()}
+    | {_V2_FAILURE_DEFAULT[0]}
+    | _V2_ENGINE_ACTIONS
+)
+_SERVED_PATTERNS = _served_action_patterns()
+_SERVED_GENERIC_RE = re.compile(
+    r"(Checked|Made a change in|Could not reach) [A-Z][\w ]{0,40}\Z"
+)
+
+
+_C_SERVED_CACHE: Optional[tuple] = None
+
+
+def _c_served() -> tuple:
+    """(exact_set, patterns) built from C's entries — cached once."""
+    global _C_SERVED_CACHE
+    if _C_SERVED_CACHE is not None:
+        return _C_SERVED_CACHE
+    exact: set = set()
+    patterns: list = []
+
+    def _add(tmpl: str) -> None:
+        if not tmpl:
+            return
+        if "{" in tmpl:
+            patterns.append(re.compile(
+                re.sub(r"\\\{[a-z_]+\\\}", ".+?", re.escape(tmpl)) + r"\Z"
+            ))
+        else:
+            exact.add(tmpl)
+
+    e = _c_entries()
+    if e is not None:
+        for entry in (getattr(e, "ENTRIES", {}) or {}).values():
+            for table_name in ("reads", "writes"):
+                for t in (entry.get(table_name) or {}).values():
+                    _add(t.get("action") or "")
+                    _add(t.get("action_others") or "")
+        for f in (getattr(e, "V2_FAILURE", {}) or {}).values():
+            if isinstance(f, dict):
+                _add(f.get("action") or "")
+        exact.update(getattr(e, "V2_ENGINE_ACTIONS", ()) or ())
+    _C_SERVED_CACHE = (frozenset(exact), tuple(patterns))
+    return _C_SERVED_CACHE
+
+
+def is_served_action(action: Any) -> bool:
+    """True iff this module could have emitted `action` — the v3
+    serializer's rejection predicate (CONTRACTS-R30 §1). Total."""
+    if not isinstance(action, str) or not action.strip():
+        return False
+    if "__" in action:
+        return False
+    if action in _SERVED_EXACT:
+        return True
+    if _SERVED_GENERIC_RE.match(action):
+        return True
+    if any(p.match(action) for p in _SERVED_PATTERNS):
+        return True
+    c_exact, c_patterns = _c_served()
+    if action in c_exact:
+        return True
+    return any(p.match(action) for p in c_patterns)

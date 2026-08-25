@@ -198,22 +198,21 @@ async def test_thread_endpoint_mints_serializes_and_404s(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_memory_endpoint_serves_state_row(monkeypatch):
+async def test_memory_endpoint_serves_v2_sheet_never_the_state_row(monkeypatch):
+    """R30 §4.5 rewrites the R28 pin: this route serves the §3.10
+    five-category sheet; the engine-state row (raw ISO + counters,
+    D-07) NEVER reaches this payload again — even when it exists."""
     uid = await _mk_user()
     aid = await _mk_automation(uid, "Remembers")
     monkeypatch.setattr(settings, "automations_enabled", True)
     monkeypatch.setattr(settings, "user_id", uid)
     from app.api.automations import automation_memory
-    from fastapi import HTTPException
-
-    with pytest.raises(HTTPException) as e:
-        await automation_memory(aid)
-    assert e.value.status_code == 404
 
     async with async_session_maker() as db:
         db.add(Memory(
             id=str(uuid.uuid4()), user_id=uid,
-            content="Last ran and posted 3 items.",
+            content="Automation 'Remembers': last run partial at "
+                    "2026-08-25T02:52:14.716539Z",
             ref_kind="automation", ref_id=aid,
             source_type="automation", brain_type="agent",
             category="automation", memory_type="state",
@@ -223,9 +222,15 @@ async def test_memory_endpoint_serves_state_row(monkeypatch):
         await db.commit()
 
     out = await automation_memory(aid)
-    assert out["content"] == "Last ran and posted 3 items."
-    assert out["metadata"]["last_outcome"] == "sent"
-    assert out["updated_at"]
+    assert out["content"] is None
+    assert out["metadata"] == {}
+    keys = [c["key"] for c in out["categories"]]
+    assert keys == ["people", "team_workspace", "your_time",
+                    "work_you_own", "noise_filters"]
+    assert out["count"] == 0
+    body = json.dumps(out)
+    assert "2026-08-25T02:52" not in body
+    assert "last_counts" not in body
 
 
 @pytest.mark.asyncio

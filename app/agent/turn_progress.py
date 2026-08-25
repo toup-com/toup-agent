@@ -63,20 +63,12 @@ def _subtitle_for(tool_name: str) -> str:
     if tool_name.startswith("memory_") or tool_name in ("recall_day", "search_memory"):
         return "Checking notes…"
     # `tool_display` owns the human names for tools that have one, so the
-    # Dynamic Island and the chat row cannot drift apart.
-    from app.agent.tool_display import public_label
-    labelled = public_label(tool_name)
-    if labelled:
-        return f"{labelled}…"
-    # Round 18. This used to be `tool_name.replace("_", " ")`, which turned
-    # `app_html__create_app_file` into "app html  create app file…" on a lock
-    # screen. A raw wire identifier is not a status, and a `__`-prefixed one
-    # is not even readable as English. An unmapped tool gets the honest
-    # generic — the user learns that work is happening, which is all this
-    # surface was ever able to tell them.
-    if "__" in (tool_name or ""):
-        return "Working…"
-    return (tool_name or "working").replace("_", " ") + "…"
+    # Dynamic Island and the chat row cannot drift apart. Round 18 made the
+    # unmapped-connector case an honest generic; R30 (D-01) makes the WHOLE
+    # tail total — `public_step_label` never yields the wire id, so the last
+    # derivation (`tool_name.replace("_", " ")` for plain tools) is gone too.
+    from app.agent.tool_display import public_step_label
+    return f"{public_step_label(tool_name)}…"
 
 
 class TurnProgressEmitter:

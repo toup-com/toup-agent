@@ -542,23 +542,54 @@ async def test_session_conversation_yields_prompt_section():
         assert await build_automation_context(db, plain) is None
 
 
+def _capture_memory_writes(monkeypatch, recorded):
+    """Capture fact writes on EITHER seam, so these pins hold on this
+    branch (legacy fallback) AND on the merged tree (curator_v2 finds
+    the v2 store and writes memory_facts instead — the merge-seam class
+    A's integration run caught). Entries: {"facts", "category",
+    "source", "source_kind"} with the category in whichever vocabulary
+    the firing seam speaks."""
+    import sys as _sys
+    import types as _types
+
+    async def _add_fact(db, **kw):
+        recorded.append({"facts": [kw["text"]], "category": kw["category"],
+                         "source": kw.get("source"),
+                         "source_kind": "interview"})
+        return {"saved": True}
+
+    try:
+        from app.services import memory_v2_service as _v2
+        monkeypatch.setattr(_v2, "add_fact", _add_fact)
+    except ImportError:
+        _fake = _types.ModuleType("app.services.memory_v2_service")
+        _fake.add_fact = _add_fact
+        monkeypatch.setitem(
+            _sys.modules, "app.services.memory_v2_service", _fake)
+        import app.services as _services_pkg
+        monkeypatch.setattr(
+            _services_pkg, "memory_v2_service", _fake, raising=False)
+
+    from app.agent.automations import facts as _facts_seam
+
+    async def _record(db, *, user_id, automation_id, facts, category,
+                      source, source_kind, run_id=None):
+        recorded.append({"facts": list(facts), "category": category,
+                         "source": source, "source_kind": source_kind})
+        return {"saved": len(facts), "ids": [str(uuid.uuid4())]}
+
+    monkeypatch.setattr(_facts_seam, "record", _record)
+
+
 async def test_interview_extractor_records_via_seam_and_emits_chip(
         monkeypatch):
-    from app.agent.automations import facts as facts_seam
     from app.agent.automations import interview
 
     uid = await _mk_user()
     aid = await _mk_automation(uid, "Draft replies")
 
     recorded = []
-
-    async def _record(db, *, user_id, automation_id, facts, category,
-                      source, source_kind, run_id=None):
-        recorded.append({"facts": facts, "category": category,
-                         "source": source, "source_kind": source_kind})
-        return {"saved": len(facts), "ids": [str(uuid.uuid4())]}
-
-    monkeypatch.setattr(facts_seam, "record", _record)
+    _capture_memory_writes(monkeypatch, recorded)
 
     class _Resp:
         content = json.dumps({"facts": [
@@ -586,7 +617,13 @@ async def test_interview_extractor_records_via_seam_and_emits_chip(
             assistant_text="Got it.",
         )
     assert n == 2
-    assert {r["category"] for r in recorded} == {"people", "preferences"}
+    texts = sorted(t for r in recorded for t in r["facts"])
+    assert texts == ["Boss is Sarah (sarah@acme.com).",
+                     "Keep draft replies under three sentences."]
+    # Category vocabulary depends on the firing seam: legacy fallback
+    # speaks {people, preferences}; the v2 store {people, your_time}.
+    cats = {r["category"] for r in recorded}
+    assert cats in ({"people", "preferences"}, {"people", "your_time"})
     assert all(r["source"] == "agent" and r["source_kind"] == "interview"
                for r in recorded)
 
@@ -595,3 +632,82 @@ async def test_interview_extractor_records_via_seam_and_emits_chip(
     markers = [m for m in msgs if "memory_update" in (m.metadata_json or "")]
     assert len(markers) == 1
     assert json.loads(markers[0].metadata_json)["memory_update"]["count"] == 2
+
+
+async def test_interview_extractor_refuses_status_and_definition_facts(
+        monkeypatch):
+    """R30 §5.6 (ND-2/ND-3): the two classes GROUND-TRUTH found live in
+    prod are refused at the extraction gate — not merely dropped later
+    by A's migration — so they can never re-enter."""
+    from app.agent.automations import interview
+
+    uid = await _mk_user()
+    aid = await _mk_automation(uid, "Morning work brief")
+
+    recorded = []
+    _capture_memory_writes(monkeypatch, recorded)
+
+    class _Resp:
+        content = json.dumps({"facts": [
+            {"text": "Marcus Webb gets same-day answers.",
+             "category": "people"},
+            {"text": "The Morning work brief is currently paused.",
+             "category": "preferences"},
+            {"text": ("Has an automation 'Morning work brief': Every day "
+                      "at 22:52, check Jira, GitHub, Teams, Gmail and "
+                      "Outlook and post to Slack."),
+             "category": "preferences"},
+        ]})
+
+    class _LLM:
+        async def complete_with_json(self, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr(
+        "app.services.llm_service.get_llm_service", lambda: _LLM())
+
+    ctx = {"automation_id": aid, "name": "Morning work brief",
+           "rule_text": "reads overnight mail and briefs you",
+           "domain": None, "facts": {}}
+    async with async_session_maker() as db:
+        n = await interview.extract_and_record_facts(
+            db, user_id=uid, ctx=ctx,
+            user_text="Marcus always gets same-day answers from me",
+            assistant_text="Noted.",
+        )
+    assert n == 1
+    assert [t for r in recorded for t in r["facts"]] == [
+        "Marcus Webb gets same-day answers."]
+
+    msgs = await _session_messages(uid, aid)
+    markers = [m for m in msgs if "memory_update" in (m.metadata_json or "")]
+    assert len(markers) == 1
+    assert json.loads(markers[0].metadata_json)["memory_update"]["count"] == 1
+
+
+async def test_prompt_section_states_status_once_and_hides_raw_errors():
+    """R30 §5.4 (D-19): one engine-derived status claim, stated once;
+    the raw last_error string never reaches the prompt."""
+    from app.agent.automations.interview import prompt_section
+
+    raw_error = "forbidden tool gmail__send_message at step 2"
+    section = prompt_section({
+        "automation_id": "a1", "name": "Morning work brief",
+        "rule_text": "reads overnight mail and briefs you",
+        "status": "error", "last_error": raw_error, "facts": {},
+    })
+    assert raw_error not in section
+    assert "gmail__send_message" not in section
+    assert "__" not in section
+    assert "it tried something automations never do" in section
+    assert "ONCE per reply" in section
+    assert "never quietly re-run" in section
+    assert "check memory first" in section
+    assert "never a memory" in section
+
+    paused = prompt_section({
+        "automation_id": "a1", "name": "Morning work brief",
+        "rule_text": "x", "status": "paused", "facts": {},
+    })
+    assert "paused by the user" in paused
+    assert paused.count("stated once") == 1

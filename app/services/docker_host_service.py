@@ -607,6 +607,90 @@ async def backfill_sentinel_image_containers(
     return summary
 
 
+async def reconcile_managed_rows(db: AsyncSession) -> dict:
+    """Row ↔ docker truth sync (R30, task_4ae52334 — pre-ramp blocker).
+
+    The bridge's read-only `/v1/pool/tenant-truth` is the docker census;
+    `managed_containers` rows drift from it whenever a blue-green
+    re-randomises a port or a rollout leaves an image/status stale —
+    and a stale row starves `_running_tenants` and the canary gate.
+    This writes the drift BACK to the row (port, image tag, run state)
+    and keeps `AgentConfig.agent_url` in step when the port moved. It
+    repairs rows only — a MISSING container is the re-provision legs'
+    job, counted here as `missing` and left alone.
+    """
+    truth: dict = {}
+    try:
+        async with _bridge_client(timeout_s=15) as client:
+            r = await client.get("/v1/pool/tenant-truth")
+            if r.status_code != 200:
+                return {"skipped": f"bridge_http_{r.status_code}"}
+            truth = {
+                c["name"]: c
+                for c in (r.json() or {}).get("containers") or []
+                if c.get("name")
+            }
+    except Exception as e:  # noqa: BLE001 — bridge down ⇒ next tick
+        return {"skipped": f"bridge_unreachable:{type(e).__name__}"}
+    if not truth:
+        return {"skipped": "empty_census"}
+
+    rows = (await db.execute(select(ManagedContainer))).scalars().all()
+    fixed = failed = missing = 0
+    for row in rows:
+        c = truth.get(row.container_name or "")
+        if c is None:
+            if row.status == "running":
+                missing += 1
+            continue
+        try:
+            changed = []
+            new_port = c.get("host_port")
+            if new_port and row.host_port != int(new_port):
+                old_port = row.host_port
+                row.host_port = int(new_port)
+                changed.append(f"port {old_port}->{new_port}")
+                cfg = (await db.execute(
+                    select(AgentConfig).where(
+                        AgentConfig.user_id == row.user_id,
+                    )
+                )).scalar_one_or_none()
+                if cfg is not None and cfg.agent_url and old_port and \
+                        f":{old_port}" in cfg.agent_url:
+                    cfg.agent_url = cfg.agent_url.replace(
+                        f":{old_port}", f":{new_port}", 1,
+                    )
+                    changed.append("agent_url")
+            image = c.get("image") or ""
+            tag = image.rsplit(":", 1)[-1] if ":" in image else None
+            if tag and row.image_tag != tag:
+                changed.append(f"image {row.image_tag}->{tag}")
+                row.image_tag = tag
+            running = bool(c.get("running"))
+            if running and row.status != "running":
+                changed.append(f"status {row.status}->running")
+                row.status = "running"
+            elif not running and row.status == "running":
+                changed.append("status running->stopped")
+                row.status = "stopped"
+                row.stopped_at = datetime.utcnow()
+            if changed:
+                await db.commit()
+                fixed += 1
+                logger.info(
+                    "[row-sync] user=%s container=%s: %s",
+                    (row.user_id or "?")[:8], row.container_name,
+                    ", ".join(changed),
+                )
+        except Exception as e:  # noqa: BLE001 — one row never blocks the rest
+            await db.rollback()
+            failed += 1
+            logger.warning("[row-sync] failed for %s: %s",
+                           row.container_name, e)
+    return {"rows": len(rows), "fixed": fixed, "failed": failed,
+            "missing": missing}
+
+
 async def container_reconciler_loop() -> None:
     """Long-running background task — re-runs `backfill_sentinel_image_containers`
     on an interval so a signup that lands in the broken state (container_id
@@ -655,6 +739,18 @@ async def container_reconciler_loop() -> None:
                 logger.info("[container-reconciler] reclaim: %s", reclaim)
         except Exception:
             logger.exception("[container-reconciler] reclaim failed; will retry")
+        # R30 (task_4ae52334, pre-ramp blocker): row ↔ docker truth sync.
+        # A blue-green re-randomises the host port and nothing wrote it
+        # back; the stale row then starves the running-tenant census and
+        # the rollout canary gate (two rollouts lost on 2026-08-25). Own
+        # try/except + own session, same isolation as the legs above.
+        try:
+            async with async_session_maker() as db:
+                drift = await reconcile_managed_rows(db)
+            if drift.get("fixed") or drift.get("failed"):
+                logger.info("[container-reconciler] row-sync: %s", drift)
+        except Exception:
+            logger.exception("[container-reconciler] row-sync failed; will retry")
 
 
 async def stop_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:

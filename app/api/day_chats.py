@@ -221,9 +221,51 @@ def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
     # records but a hand-edited row in production should degrade
     # gracefully, not 500 every history load.
     return [
-        _with_web_refs(e) for e in events
+        _with_public_copy(_with_web_refs(e)) for e in events
         if isinstance(e, dict) and "tool" in e and "started_at_ms" in e
     ] or None
+
+
+def _with_public_copy(rec: dict) -> dict:
+    """R30 (D-01/D-03/D-17): serve every persisted record with the copy the
+    dictionary allows, whatever the runner wrote at the time.
+
+    Records persisted before this round carry no ``label`` (the client
+    humanised the wire id into "List events" / "Search issues"), a raw
+    vendor-JSON ``summary`` for connector tools (rendered as the
+    "Site: Toup · Is last: true" detail line), and terminal-flavoured emoji
+    in prose summaries ("Overall: ✅ OK" from the doctor report). The runner
+    now writes clean records; THIS is the read path that makes the rows
+    already in the founder's history serve clean too — the rollout-boundary
+    rule: a sometimes-missing field is fixed where it is read.
+
+    Defensive by the `_with_web_refs` precedent: these serializers are
+    mounted in platform_main too, where ``app/agent`` does not exist — an
+    import failure serves the record as persisted rather than 500ing the
+    history load.
+    """
+    try:
+        from app.agent.tool_display import public_step_label, strip_emoji
+    except Exception:  # noqa: BLE001 — platform image has no app/agent
+        return rec
+    try:
+        out = rec
+        tool = str(rec.get("tool") or "")
+        if not rec.get("label"):
+            out = {**out, "label": public_step_label(tool)}
+        summary = rec.get("summary")
+        if isinstance(summary, str) and summary:
+            cleaned = summary
+            if "__" in tool and cleaned.strip()[:1] in "{[":
+                cleaned = ""
+            else:
+                cleaned = strip_emoji(cleaned)
+            if cleaned != summary:
+                out = {**out} if out is rec else out
+                out["summary"] = cleaned
+        return out
+    except Exception:  # noqa: BLE001 — history must load even if this can't
+        return rec
 
 
 def _with_web_refs(rec: dict) -> dict:
@@ -584,6 +626,8 @@ async def get_day_chat_messages(
                     m, "automation_connector_card"),
                 "automation_grant_card": _serialize_automation_card(
                     m, "automation_grant_card"),
+                "automation_notification": _serialize_automation_card(
+                    m, "automation_notification"),
                 "pending_action": _serialize_meta_card(m, "pending_action"),
                 "draft_card": _serialize_meta_card(m, "draft_card"),
                 "memory_update": _serialize_meta_card(m, "memory_update"),
@@ -667,6 +711,8 @@ async def get_day_chat_messages(
                 msg, "automation_connector_card"),
             "automation_grant_card": _serialize_automation_card(
                 msg, "automation_grant_card"),
+            "automation_notification": _serialize_automation_card(
+                msg, "automation_notification"),
             "pending_action": _serialize_meta_card(msg, "pending_action"),
             "draft_card": _serialize_meta_card(msg, "draft_card"),
             "memory_update": _serialize_meta_card(msg, "memory_update"),

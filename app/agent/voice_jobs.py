@@ -701,7 +701,7 @@ class VoiceTurnJob:
                 await _notify_job_event(
                     job_id=self._job_id, label=self._title,
                     kind="mission_started",
-                    title=f"🛠 Working on: {_hl(_plain(self._title, 150))}",
+                    title=f"Working on: {_hl(_plain(self._title, 150))}",
                     body=_plain(self._title, 200),
                     # Indeterminate timer, never progress=0 — `_content_state`
                     # prefers a timer, and a bare 0 ships a card frozen at

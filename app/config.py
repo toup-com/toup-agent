@@ -1289,6 +1289,12 @@ class Settings(BaseSettings):
     # regardless.
     automations_dev_fast_lane: bool = False
 
+    # R30 narration model (CONTRACTS-R30 §4.2): the run-narrator LLM.
+    # Pinned to the fleet-default strong model — narration quality IS
+    # the round; C's narrator falls back to memory_extraction_model
+    # only when this is unset. Env-overridable AUTOMATION_NARRATOR_MODEL.
+    automation_narrator_model: str = "gpt-5.6-terra"
+
     # ── Maintenance / support agent (app.support) ────────────────────
     # Master switch. Off ⇒ every /api/support route 503s. Dark-launched.
     support_agent_enabled: bool = False

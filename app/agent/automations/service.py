@@ -33,12 +33,19 @@ class AutomationNotFound(LookupError):
 
 async def _load_owned(
     db: AsyncSession, automation_id: str, user_id: str,
+    *, include_deleted: bool = False,
 ) -> Automation:
-    row = (await db.execute(
+    q = (
         select(Automation)
         .where(Automation.id == automation_id)
         .where(Automation.user_id == user_id)
-    )).scalar_one_or_none()
+    )
+    if not include_deleted:
+        # R30 §4.8: a soft-deleted automation is invisible to every
+        # list/read/edit path; only the sweep and the archived-thread
+        # reader opt in.
+        q = q.where(Automation.deleted_at.is_(None))
+    row = (await db.execute(q)).scalar_one_or_none()
     if row is None:
         raise AutomationNotFound(automation_id)
     return row
@@ -51,13 +58,17 @@ async def create_automation(
     spec: dict,
     template_slug: Optional[str] = None,
     domain: Optional[str] = None,
+    template_mode: bool = False,
 ) -> tuple[Automation, ValidatedSpec]:
     """Validate + persist a spec as a DRAFT automation with compiled
-    (but disabled) bindings. Raises SpecError with every problem."""
+    (but disabled) bindings. Raises SpecError with every problem.
+    `template_mode` (R30 from-template): write steps may lack grants —
+    the draft cannot ARM until the grant conversation completes
+    (arm_automation verifies fail-closed), so nothing weakens."""
     from app.agent.automations.memory_notes import normalize_domain
 
     capability = await reg.fetch_registry(user_id)
-    vspec = validate_spec(spec, capability)
+    vspec = validate_spec(spec, capability, template_mode=template_mode)
 
     automation = Automation(
         user_id=user_id,
@@ -199,8 +210,50 @@ async def resume_automation(
 
 async def delete_automation(
     db: AsyncSession, *, automation_id: str, user_id: str,
+    undo: bool = False,
 ) -> None:
+    """R30 §4.8. Two shapes: `undo=True` (allowed only before the first
+    run starts) hard-deletes with no ledger residue; the normal delete
+    is SOFT — schedule disarmed, thread archived (openable 30 days),
+    drafts untouched, memory kept 30 days — and the sweep purges."""
     automation = await _load_owned(db, automation_id, user_id)
+    if undo:
+        from app.db.models import BuildJob
+        has_run = automation.last_run_at is not None or (
+            (await db.execute(
+                select(BuildJob.id)
+                .where(BuildJob.source_id == automation_id)
+                .where(BuildJob.job_type == "automation_run")
+                .limit(1)
+            )).scalar_one_or_none() is not None
+        )
+        if has_run:
+            raise MembershipError(
+                "undo_window_closed",
+                "the first run already started — delete keeps the record",
+            )
+        await _hard_delete(db, automation, user_id)
+        return
+    await compiler.teardown_bindings(db, automation)
+    automation.deleted_at = datetime.utcnow()
+    automation.status = "paused"
+    automation.paused_reason = "user"
+    from app.db.models import AutomationThread
+    thread = (await db.execute(
+        select(AutomationThread)
+        .where(AutomationThread.automation_id == automation_id)
+    )).scalar_one_or_none()
+    if thread is not None and thread.archived_at is None:
+        thread.archived_at = datetime.utcnow()
+    await db.commit()
+    logger.info("[automations] soft-deleted id=%s user=%s",
+                automation_id, user_id[:8])
+
+
+async def _hard_delete(
+    db: AsyncSession, automation: Automation, user_id: str,
+) -> None:
+    automation_id = automation.id
     await compiler.teardown_bindings(db, automation)
     from . import memory as engine_memory
     await engine_memory.delete_for_automation(
@@ -211,13 +264,18 @@ async def delete_automation(
     # projection is deliberately NOT unwound: facts about a life
     # outlive the tool that learned them (CONTRACTS-R29.md §4).
     from sqlalchemy import delete as sa_delete
-    from app.db.models import AutomationFact
+    from app.db.models import AutomationFact, MemoryFact
     await db.execute(
         sa_delete(AutomationFact)
         .where(AutomationFact.automation_id == automation_id)
         .where(AutomationFact.user_id == user_id)
     )
-    await db.delete(automation)   # events/outbox cascade via FK
+    await db.execute(
+        sa_delete(MemoryFact)
+        .where(MemoryFact.scope == automation_id)
+        .where(MemoryFact.user_id == user_id)
+    )
+    await db.delete(automation)   # events/outbox/threads cascade via FK
     await db.commit()
     logger.info("[automations] deleted id=%s user=%s",
                 automation_id, user_id[:8])
@@ -680,6 +738,7 @@ async def list_automations(db: AsyncSession, user_id: str) -> list[dict]:
     rows = (await db.execute(
         select(Automation)
         .where(Automation.user_id == user_id)
+        .where(Automation.deleted_at.is_(None))
         .order_by(Automation.created_at.desc())
     )).scalars().all()
     return [automation_payload(a) for a in rows]

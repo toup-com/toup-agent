@@ -6804,7 +6804,11 @@ class ToolExecutor:
         # Round 4 (item 4): step labels are notification-surface strings
         # (LA stepName, push bodies) — store them plain so no surface has to
         # remember to strip. Titles/descriptions are stripped at push time.
+        # R30 (D-03): emoji-free too — a model-authored "✅ Review results"
+        # would otherwise persist the glyph into steps_json, which every
+        # card and job sheet then serves verbatim.
         from app.services.plain_text import plain_preview as _plain
+        from app.agent.tool_display import strip_emoji as _strip_emoji
         from datetime import datetime as _dt_cj
         from app.agent.job_steps import dump_steps as _dump_steps, open_first_step
         steps = []
@@ -6812,7 +6816,8 @@ class ToolExecutor:
             steps.append({
                 "id": str(_uuid.uuid4()),
                 "type": f"step_{i}",
-                "label": _plain(str(label), 120) or str(label),
+                "label": _strip_emoji(_plain(str(label), 120) or str(label))
+                or "Working",
                 "status": "pending",
             })
         # Round 8: step 0 is RUNNING from creation, with its start stamped —
@@ -6910,7 +6915,7 @@ class ToolExecutor:
         from app.services.plain_text import humanize_label as _hl_cj
         await _notify_job_event(
             job_id=job_id, label=title, kind="mission_started",
-            title=f"🛠 Working on: {_hl_cj(_plain(title, 150))}",
+            title=f"Working on: {_hl_cj(_plain(title, 150))}",
             body=_plain(description or "", 200),
             # Indeterminate timer, NOT progress=0. `_content_state` picks timer
             # over progress, so a bare 0 shipped a card reading a frozen "0%"
@@ -7113,7 +7118,7 @@ class ToolExecutor:
         elif job.status == "completed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_completed",
-                title=f"✅ Done: {_job_title_plain}",
+                title=f"Done: {_job_title_plain}",
                 body=current_label or "Finished.",
                 progress=100, dismiss_after_s=900, dedup_suffix="completed",
                 end_after_s=_JOB_CARD_END_AFTER_S, **_card,
@@ -7121,7 +7126,7 @@ class ToolExecutor:
         elif job.status == "failed":
             await _notify_job_event(
                 job_id=job_id, label=job.title, kind="mission_failed",
-                title=f"⚠️ Didn't finish: {_job_title_plain}",
+                title=f"Didn't finish: {_job_title_plain}",
                 body=_plain(error_message or "The task hit an error.", 300),
                 dedup_suffix="failed", **_card,
             )

@@ -330,6 +330,7 @@ async def execute(
     agent_request_id: Optional[str] = None,
     approved_action_id: Optional[str] = None,
     grant_id: Optional[str] = None,
+    automation_id: Optional[str] = None,
     exclude_metering: bool = False,
 ) -> ConnectorResult:
     """Run one connector tool call end-to-end.
@@ -352,6 +353,11 @@ async def execute(
     cadence budget against the row, failing closed on any mismatch; a
     mutating call on the automation channel WITHOUT a verifiable grant
     is refused outright.
+
+    `automation_id` (Round 30) is metering attribution only: the
+    automations RPC passes it so the charge's ledger row names the
+    automation that spent the credit. It gates nothing — the grant
+    machinery above is the enforcement.
     """
     started = time.monotonic()
     # Phase-level timing breakdown. Logged at the end of `execute`
@@ -770,8 +776,24 @@ async def execute(
                     "connector_id": connector_id,
                     "tool_name": tool_name,
                     "channel": channel,
+                    # R30 credit-metering defect: name the automation
+                    # that spent the credit (same event_type/bucket as
+                    # every chat tool call, so dashboards aggregate
+                    # identically; this key is the only difference).
+                    **({"automation_id": automation_id}
+                       if automation_id else {}),
                 },
             )
+            # try_charge only FLUSHES — the audit above committed via
+            # _audit_then_commit, but nothing committed the charge, and
+            # both real callers (the connector MCP handler and the
+            # automations dispatch RPC) close their session without
+            # committing, so the ledger row was rolled back at close.
+            # That is the R30 "dispatches write ZERO credit_ledger
+            # rows" defect. The dispatcher owns its transaction
+            # boundaries (audit-then-act already commits mid-flight),
+            # so the charge commits here too.
+            await db.commit()
         except Exception as _credit_charge_err:
             logger.warning(
                 "[credits] connector post-charge failed user=%s connector=%s tool=%s: %s",

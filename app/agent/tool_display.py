@@ -137,6 +137,48 @@ _STAGE_DIRECTION = re.compile(
     re.IGNORECASE,
 )
 
+# R30 (D-03): emoji are machinery grammar on these surfaces. "Overall: ✅ OK"
+# and "⚠ That step didn't finish." reached a founder's job sheet verbatim —
+# a tool result written for a terminal (the doctor report) persisted as a
+# ToolPillRow summary. A served string states its status in words; the glyph
+# is the terminal's dialect, not the product's. Ranges cover the pictograph
+# planes plus the two symbol blocks the recordings actually showed (⚠ ✅ ❌
+# live in 2600–27BF; ⏰ ⏹ in the media-control run of Misc Technical), and
+# the joiners/selectors that ride them. Arrows and box-drawing stay — "old →
+# new" is prose.
+_EMOJI = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"  # pictographs, emoticons, transport, supplemental
+    "\u2600-\u27BF"          # misc symbols + dingbats (warning, check, cross, sparkle)
+    "\u2B00-\u2BFF"          # misc symbols and arrows (up-arrow, star)
+    "\u23E9-\u23FA"          # media controls + clocks (alarm, hourglass, stop)
+    "\u2139"                  # information source
+    "\uFE0F\u200D\u20E3"    # variation selector, ZWJ, keycap combiner
+    "]+"
+)
+
+
+def strip_emoji(text: Optional[str]) -> str:
+    """``text`` with emoji removed and the spacing closed back up.
+
+    For strings a MACHINE authored that a client will render (step labels,
+    summaries, card titles) — never for the model's own prose to the user.
+    Never raises; returns ``""`` for None/empty.
+    """
+    if not text:
+        return ""
+    try:
+        s = str(text)
+        out = _EMOJI.sub("", s)
+        if out == s:
+            # Untouched text passes through byte-identical — the spacing
+            # tidy-up below is only for the holes a removal leaves.
+            return s
+        out = re.sub(r" {2,}", " ", out)
+        return out.strip()
+    except Exception:  # noqa: BLE001 — a stripper must never break a serve
+        return str(text)
+
 
 def sanitize_for_client(text: Optional[str]) -> str:
     """Strip anything that describes how this system is built.
@@ -170,6 +212,11 @@ def sanitize_for_client(text: Optional[str]) -> str:
         out = _BARE_UUID.sub("", out)
         out = _BARE_HEX32.sub("", out)
         out = _INTERNAL_NAMES.sub("", out)
+        # R30 (D-03): status glyphs out of every served summary. The doctor
+        # report's "Overall: ✅ OK" is the proven leak; the rule is general
+        # because the next terminal-flavoured tool result will pick a
+        # different glyph.
+        out = _EMOJI.sub("", out)
         # Tidy the punctuation the removals left behind.
         out = re.sub(r"\(\s*[,;]?\s*\)", "", out)
         out = re.sub(r"\s+([,.;:])", r"\1", out)
@@ -181,12 +228,28 @@ def sanitize_for_client(text: Optional[str]) -> str:
         return ""
 
 
-def client_summary(result: object, cap: int = 200) -> str:
+def client_summary(result: object, cap: int = 200,
+                   tool_name: Optional[str] = None) -> str:
     """The one function the emit path calls: the tool's own sentence when it
-    has one, otherwise its redacted return value, capped."""
+    has one, otherwise its redacted return value, capped.
+
+    ``tool_name`` (R30, D-17): the JSON pass-through above exists for
+    first-party tools whose payload the client parses structurally
+    (`create_job`'s job_id binds the card to its turn). A CONNECTOR tool's
+    JSON is a different animal — a vendor API response the client renders as
+    text, which is how ``{"site": "Toup", "is_last": true}`` became the
+    detail line "Site: Toup · Is last: true" on a founder's job sheet. When
+    the caller names a connector tool (``__`` in the wire name) and the tool
+    declared no ``display`` sentence, a JSON result serves as EMPTY — the
+    step's label carries the row, and the model still reads the full payload.
+    """
     chosen = display_of(result)
     if chosen is None:
         chosen = sanitize_for_client(str(result))
+        if tool_name and "__" in tool_name:
+            head = (chosen or "").strip()[:1]
+            if head in "{[":
+                return ""
     else:
         # A declared display string is still redacted. A tool author writing
         # `display=f"Saved to {path}"` should not be able to reopen this hole.
@@ -228,3 +291,143 @@ def public_label(tool_name: str) -> Optional[str]:
     because that happened.
     """
     return _LIVE_LABELS.get(tool_name or "")
+
+
+# ── Total step labels (R30, D-01/D-17) ───────────────────────────────────
+# `public_label` is Optional by design: a live surface with its own known
+# fallback may prefer it. A PERSISTED surface has no such luxury — a
+# `tool_events` record served without a label leaves every client to
+# humanise the wire id, and the founder's job sheet read "List events",
+# "Search issues", "List repos": raw connector ids with the underscores
+# swapped out. `public_step_label` is the total form: every input yields a
+# human sentence, never the identifier, never a bare verb.
+#
+# Same discipline as `automation_verbs.step_verb` (the R29 dictionary the
+# automation ledger passes): a lookup first, then a closed connector rule,
+# then the honest generic.
+
+#: The agent's own (non-connector) work. One vocabulary with the live
+#: Dynamic-Island subtitles (`turn_progress._TOOL_SUBTITLES`), minus the
+#: ellipsis — these label settled rows, not in-flight ones.
+_STEP_LABELS = {
+    "web_search": "Searching the web",
+    "extension_search": "Searching the web",
+    "extension_research": "Searching the web",
+    "web_fetch": "Reading a page",
+    "extension_read": "Reading a page",
+    "smart_fetch": "Reading a page",
+    "exec": "Running a command",
+    "pty_exec": "Running a command",
+    "process": "Running a command",
+    "generate_image": "Creating an image",
+    "edit_image": "Editing an image",
+    "analyze_image": "Looking at an image",
+    "canvas": "Creating an image",
+    "write_file": "Writing a file",
+    "edit_file": "Editing a file",
+    "apply_patch": "Editing a file",
+    "read_file": "Reading a file",
+    "list_files": "Looking at files",
+    "ls": "Looking at files",
+    "grep": "Searching files",
+    "find": "Searching files",
+    "generate_pdf": "Building a document",
+    "generate_docx": "Building a document",
+    "generate_xlsx": "Building a document",
+    "generate_pptx": "Building a document",
+    "generate_markdown": "Building a document",
+    "generate_html_to_pdf": "Building a document",
+    "convert_document": "Building a document",
+    "memory_store": "Saving notes",
+    "memory_delete": "Updating notes",
+    "memory_search": "Checking notes",
+    "recall_day": "Checking notes",
+    "sessions_list": "Reviewing conversations",
+    "sessions_history": "Reviewing conversations",
+    "session_status": "Reviewing conversations",
+    "thread": "Reviewing conversations",
+    "doctor": "Running a health check",
+    "spawn": "Starting a helper",
+    "start_mission": "Starting a mission",
+    "create_job": "Planning the work",
+    "update_job": "Tracking progress",
+    "send_file": "Sending a file",
+    "send_photo": "Sending a photo",
+}
+
+#: The recorded defects, pinned by name: the exact tools the founder's job
+#: sheet showed as raw ids get a first-class sentence rather than the
+#: connector rule's generic.
+_CONNECTOR_STEP_LABELS = {
+    "calendar__list_events": "Checking your calendar",
+    "gcal__list_events": "Checking your calendar",
+    "teams__list_chats": "Checking Teams",
+    "teams__read_chat_messages": "Checking Teams",
+    "jira__search_issues": "Searching Jira",
+    "github__list_repos": "Checking GitHub",
+    "github__list_issues": "Checking GitHub",
+    "gmail__list_messages": "Checking Gmail",
+    "gmail__search_threads": "Searching Gmail",
+    "outlook__list_messages": "Checking Outlook",
+    "drive__list_files": "Checking Drive",
+    "notion__search": "Searching Notion",
+    "slack__send_message": "Posting to Slack",
+    "teams__send_chat_message": "Posting to Teams",
+}
+
+#: Brand casing for a connector prefix. Mirrors `automation_verbs.
+#: _CONNECTOR_NAMES` (which the platform image owns) — kept local because
+#: this module ships in the agent image and must import with no siblings.
+_CONNECTOR_BRANDS = {
+    "gmail": "Gmail", "outlook": "Outlook", "jira": "Jira",
+    "github": "GitHub", "slack": "Slack", "teams": "Teams",
+    "notion": "Notion", "drive": "Drive", "gdrive": "Drive",
+    "docs": "Docs", "sheets": "Sheets", "slides": "Slides",
+    "calendar": "Calendar", "gcal": "Calendar", "linkedin": "LinkedIn",
+    "figma": "Figma", "linear": "Linear", "stripe": "Stripe",
+}
+
+#: Connector actions that only read. Anything else labels as work IN the
+#: connector, which is the safe direction — "Checking Slack" beside a message
+#: that was sent is the bigger lie.
+_CONNECTOR_READ_VERBS = (
+    "list", "get", "search", "read", "find", "fetch", "query", "lookup",
+    "describe", "download", "export", "check",
+)
+
+#: `<skill>__<tool>` prefixes that are OUR machinery, not a vendor brand.
+#: The connector rule must not title-case these into "App Html" — the exact
+#: humanised-identifier failure this module exists to end.
+_INTERNAL_TOOL_PREFIXES = frozenset({
+    "app_html", "app", "routines", "triggers", "memory", "session",
+})
+
+
+def public_step_label(tool_name: str) -> str:
+    """A human label for a settled tool row. TOTAL: any input — an unmapped
+    connector action, a tool literally named ``list`` or ``create``, an empty
+    string — yields a sentence a person can read, never the wire id and never
+    a bare verb. Dictionary first; the connector rule is the only derivation
+    and it derives a BRAND (a single-word vendor prefix, title-cased — the
+    `voice_jobs._brand` precedent), never the action's words.
+    """
+    name = str(tool_name or "")
+    lbl = _LIVE_LABELS.get(name) or _CONNECTOR_STEP_LABELS.get(name) \
+        or _STEP_LABELS.get(name)
+    if lbl:
+        return lbl
+    if name.startswith("browser"):
+        return "Browsing"
+    if "__" in name:
+        prefix, _, action = name.partition("__")
+        p = prefix.lower()
+        brand = _CONNECTOR_BRANDS.get(p)
+        if brand is None and p not in _INTERNAL_TOOL_PREFIXES \
+                and re.fullmatch(r"[a-z][a-z0-9]{1,23}", p):
+            brand = p.title()
+        if not brand:
+            return "Working"
+        if any(action.lower().startswith(v) for v in _CONNECTOR_READ_VERBS):
+            return f"Checking {brand}"
+        return f"Updating {brand}"
+    return "Working"

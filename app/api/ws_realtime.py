@@ -449,7 +449,18 @@ def _tool_activity(func_name: str, arguments: dict) -> tuple:
     """(title, detail) for a client tool-activity row. `detail` is a short,
     human string pulled from the most salient argument (the search query, the
     task, the path…), trimmed so large blobs never hit the wire."""
-    title = _TOOL_TITLES.get(func_name) or (func_name.replace("_", " ").strip().capitalize() or "Working")
+    title = _TOOL_TITLES.get(func_name)
+    if not title:
+        # R30 (D-01): never a humanised wire id — `.capitalize()` on a
+        # connector tool served "Calendar list events" as a title. The
+        # total labeler is agent-image code, so degrade to the honest
+        # generic where it is absent (this module also mounts in
+        # platform_main).
+        try:
+            from app.agent.tool_display import public_step_label
+            title = public_step_label(func_name)
+        except Exception:  # noqa: BLE001
+            title = "Working"
     detail = ""
     if func_name == "think":
         detail = str(arguments.get("task", ""))[:200]
@@ -457,6 +468,11 @@ def _tool_activity(func_name: str, arguments: dict) -> tuple:
         detail = str(arguments.get("path", ""))
     elif func_name in ("web_search", "browser"):
         detail = str(arguments.get("query") or arguments.get("url") or "")[:200]
+    elif "__" in (func_name or ""):
+        # R30 (D-17): a connector call's arguments are a vendor payload, not
+        # copy — the first-string-argument fallback is how "Site: Toup"
+        # became a detail line. The title carries the row.
+        detail = ""
     else:
         for v in arguments.values():
             if isinstance(v, str) and v.strip():

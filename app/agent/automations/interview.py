@@ -132,26 +132,54 @@ async def _load_facts_grouped(db, automation_id: str) -> dict[str, list[str]]:
     return ordered
 
 
+def _friendly_error(raw: object) -> str:
+    """One plain clause for the last failure — never the raw engine
+    string (it has carried tool ids and provider text into this prompt
+    before; D-19's sibling leak). Known classes get their §5.8 phrasing;
+    anything else the honest generic."""
+    text = str(raw or "").lower()
+    if not text:
+        return "the last run could not finish"
+    if "expired" in text or "token" in text or "401" in text or "reauth" in text:
+        return "the access it had ran out"
+    if "forbidden" in text:
+        return "it tried something automations never do, and was stopped"
+    if "timeout" in text or "cap" in text:
+        return "the last run took too long and was stopped"
+    return "the last run could not finish"
+
+
 def prompt_section(ctx: dict) -> str:
-    """The `automation_session` system-prompt section."""
+    """The `automation_session` system-prompt section — the R30 thread
+    posture: grounded answers from the run record, one status claim per
+    reply, memory first, the interview kept from R29."""
     lines = [
-        "## This conversation is an automation's session thread",
-        f'The user is talking to you inside the thread of their '
-        f'automation "{ctx["name"]}".',
+        "## This conversation is an automation's thread",
+        f'The user is inside the thread of their automation '
+        f'"{ctx["name"]}". This thread holds every run plus their '
+        "questions; the main chat only ever receives this automation's "
+        "notification card — never repeat a run's findings there.",
     ]
     if ctx.get("rule_text"):
         lines.append(f"Its standing rule: {ctx['rule_text']}")
+
     status = ctx.get("status")
     if status == "error":
         lines.append(
-            "It is currently PAUSED after repeated failures"
-            + (f" (last error: {str(ctx['last_error'])[:150]})"
-               if ctx.get("last_error") else "")
-            + ". If the user wants it running again, help them fix the "
-              "cause first, then re-arm it."
+            "Its status, stated once: PAUSED after repeated failures — "
+            f"{_friendly_error(ctx.get('last_error'))}. Help the user "
+            "fix the cause, then re-arm it."
         )
     elif status == "paused":
-        lines.append("It is currently paused by the user.")
+        lines.append(
+            "Its status, stated once: paused by the user. It keeps its "
+            "setup and memory and will not run until resumed."
+        )
+    lines.append(
+        "State its status from the line above, ONCE per reply, and "
+        "never two ways — a reply that says both 'active' and 'paused' "
+        "is a defect."
+    )
 
     facts = ctx.get("facts") or {}
     if any(facts.values()):
@@ -167,6 +195,16 @@ def prompt_section(ctx: dict) -> str:
 
     lines.append(
         "\nHow to behave here:\n"
+        "- \"Ask why it did that\" is answered from THIS thread's run "
+        "record: cite the item by name and give the reason that was "
+        "recorded with it. If the record does not contain the answer, "
+        "say so plainly — never invent one, never quietly re-run. If "
+        "answering needs new reading, say what you will look at and do "
+        "it here in this thread, never in the main chat.\n"
+        "- Before answering anything about a person, a channel, a "
+        "ticket or a past run, check memory first (memory recall / "
+        "memory_search) — the platform memory holds everything the "
+        "automations learned and did.\n"
         "- Interview for the context the automation is missing: who "
         "matters (people), how the user wants things handled "
         "(preferences), and dates that matter (deadlines). Ask ONE "
@@ -174,37 +212,48 @@ def prompt_section(ctx: dict) -> str:
         "- Anything durable the user tells you here is saved to this "
         "automation's memory automatically after your reply; don't "
         "narrate the saving, and never re-ask what the memory above "
-        "already answers.\n"
+        "already answers. What an automation IS — its schedule, its "
+        "status, its rule — is never a memory.\n"
         "- Be honest about actions: this automation can stage drafts "
         "and post summaries, but it NEVER sends mail — never promise "
         "otherwise. If a run is waiting on the user's approval, "
         "approving it is their tap, not your call.\n"
         "- Describe what runs did in plain words; never expose "
-        "internal tool or step identifiers."
+        "internal tool or step identifiers, and never use engine "
+        "jargon for it (no 'Mission Control', no 'polling', no "
+        "percent-complete talk — it reads, it drafts, it tells you)."
     )
     return "\n".join(lines)
 
 
 def _extraction_prompt(ctx: dict, user_text: str, assistant_text: str) -> str:
-    domain = ctx.get("domain")
-    categories = list(CANONICAL_CATEGORIES) + ([domain] if domain else [])
     existing = json.dumps(ctx.get("facts") or {}, ensure_ascii=False)
     return (
-        "You maintain the fact ledger of one personal automation.\n"
-        f'Automation: "{ctx["name"]}". Rule: {ctx.get("rule_text") or "—"}\n'
-        f"Existing facts by category: {existing}\n\n"
-        "From the exchange below, extract durable facts WORTH KEEPING "
-        "for this automation's future runs — people who matter (with "
-        "addresses when stated), standing preferences, deadlines/dates. "
-        "Rules:\n"
-        "- Only what the USER stated or clearly confirmed this turn; "
-        "nothing inferred, nothing the ledger already says.\n"
-        "- Each fact one short self-contained sentence.\n"
-        f"- Allowed categories: {categories}. Dates become absolute.\n"
-        f"- At most {_MAX_FACTS_PER_TURN} facts; an empty list is the "
-        "right answer for small talk.\n\n"
+        "You file durable facts about the user into one platform "
+        f'memory. The exchange happened inside their automation '
+        f'"{ctx["name"]}" (its rule: {ctx.get("rule_text") or "—"}).\n'
+        f"Already known: {existing}\n\n"
+        "From the exchange below, extract facts WORTH KEEPING. For "
+        "each:\n"
+        '- "category": people (who matters and how) · team_workspace '
+        "(channels, ownership, team habits) · your_time (blocks, "
+        "holds, when things reach the user) · work_you_own (surfaces, "
+        "tickets, priorities) · noise_filters (what never surfaces).\n"
+        '- "scope": "automation" when it only matters to this '
+        'automation\'s work; "global" when it is about the person.\n'
+        '- "subject": the person/channel/ticket/repo it is about, or '
+        "null.\n"
+        '- "why": the evidence in one second-person sentence '
+        '("You said Sarah is your boss.").\n'
+        "Rules: only what the USER stated or clearly confirmed this "
+        "turn; nothing inferred; nothing already known (either scope). "
+        "NEVER file what an automation is or does, its schedule, its "
+        "status, or run outcomes. One short self-contained sentence "
+        f"each; dates absolute; at most {_MAX_FACTS_PER_TURN}; an "
+        "empty list is the right answer for small talk.\n\n"
         f"USER: {user_text[:2000]}\n\nASSISTANT: {assistant_text[:1500]}\n\n"
-        'Reply as JSON: {"facts": [{"text": "...", "category": "..."}]}'
+        'Reply as JSON: {"facts": [{"text", "category", "scope", '
+        '"subject", "why"}]}'
     )
 
 
@@ -244,35 +293,27 @@ async def extract_and_record_facts(
         if not isinstance(items, list):
             return 0
 
-        allowed = set(CANONICAL_CATEGORIES)
-        if ctx.get("domain"):
-            allowed.add(ctx["domain"])
-        by_category: dict[str, list[str]] = {}
-        for item in items[:_MAX_FACTS_PER_TURN]:
-            if not isinstance(item, dict):
-                continue
-            fact = " ".join(str(item.get("text") or "").split())[:_FACT_MAX_LEN]
-            category = str(item.get("category") or "").strip().lower()
-            if not fact or category not in allowed:
-                continue
-            by_category.setdefault(category, []).append(fact)
-        if not by_category:
+        from .curator_v2 import file_facts, normalize_candidate
+
+        # normalize_candidate applies the ND-2/ND-3 refusal gate: a
+        # definition or a run-status sentence is refused here, not just
+        # dropped by A's migration.
+        candidates = [
+            fact for fact in (
+                normalize_candidate(item)
+                for item in items[:_MAX_FACTS_PER_TURN]
+            ) if fact is not None
+        ]
+        if not candidates:
             return 0
-
-        from app.agent.automations import facts as facts_seam
-
-        saved = 0
-        for category, fact_texts in by_category.items():
-            result = await facts_seam.record(
-                db,
-                user_id=user_id,
-                automation_id=automation_id,
-                facts=fact_texts,
-                category=category,
-                source="agent",
-                source_kind="interview",
-            )
-            saved += int((result or {}).get("saved", 0))
+        saved = await file_facts(
+            db,
+            user_id=user_id,
+            facts=candidates,
+            automation_id=automation_id,
+            domain=ctx.get("domain"),
+            source="agent",
+        )
         if saved:
             from .session import emit_memory_update
 

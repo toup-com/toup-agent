@@ -255,7 +255,7 @@ async def announce_completed(
         await _notify_job_event(
             job_id=closed.job_id, label=closed.title,
             kind="mission_completed",
-            title=f"✅ Done: {_hl(_plain(closed.title or '', 150))}",
+            title=f"Done: {_hl(_plain(closed.title or '', 150))}",
             body=_preview or "Finished.", progress=100,
             dismiss_after_s=900, dedup_suffix="completed",
             chat_id=chat_id, message_id=message_id,

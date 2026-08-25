@@ -595,11 +595,22 @@ async def main() -> int:
             )
             from fastapi import HTTPException
 
-            # /memory — the engine's working state, 404 for strangers.
+            # /memory — CONTRACTS-R30 §4.5: the route serves the curated
+            # categories view (the §3.10 sheet), NOT the engine state row
+            # (that row is internal-only now — the D-07 retirement). The
+            # old assertion pinned the R29 shape and went red when A
+            # landed the contract; the rig follows the contract.
             mem_body = await automation_memory(auto2.id)
-            check("memory route serves the working-state row",
-                  (mem_body.get("metadata") or {}).get("last_outcome")
-                  == "sent" and mem_body.get("updated_at"),
+            mem_cats = [c.get("key") for c in
+                        (mem_body.get("categories") or [])]
+            check("memory route serves the §4.5 categories view, "
+                  "engine state values off the wire (legacy keys are "
+                  "null tombstones for the pre-rebuild app)",
+                  isinstance(mem_body.get("count"), int)
+                  and mem_cats == ["people", "team_workspace", "your_time",
+                                   "work_you_own", "noise_filters"]
+                  and not mem_body.get("metadata")
+                  and mem_body.get("content") is None,
                   str(mem_body)[:160])
             try:
                 await automation_memory(str(uuid.uuid4()))
@@ -850,6 +861,276 @@ async def main() -> int:
                   tpls["morning-work-brief"].get("cadence_human")
                   == "weekdays 8:00",
                   str(tpls["morning-work-brief"].get("cadence_human")))
+
+            # ── R30: ledger v3, threads, notifications, workflow ───
+            from app.agent.automations import ledger as r30_ledger
+            from app.db.models import (
+                AutomationNotification, AutomationTurn, AutomationWrite,
+                Message as R30Message,
+            )
+
+            async with async_session_maker() as db:
+                thread = await r30_ledger.thread_for(db, auto2.id)
+                check("R30 thread minted for the v2 automation",
+                      thread is not None, str(thread))
+                v2_runs = (await db.execute(
+                    select(BuildJob)
+                    .where(BuildJob.source_id == auto2.id)
+                    .order_by(BuildJob.created_at.asc())
+                )).scalars().all()
+                run0 = v2_runs[0]
+                turns = await r30_ledger.run_turns(db, run_id=run0.id)
+                kinds = [t["kind"] for t in turns]
+                check("R30 run opens with a note that flipped to RAN",
+                      kinds and kinds[0] == "note"
+                      and turns[0].get("stamp") == "ran", str(kinds[:3]))
+                tools = [t for t in turns if t["kind"] == "tool"]
+                reads = [t for t in tools if t["tool_kind"] == "read"]
+                writes = [t for t in tools if t["tool_kind"] == "write"]
+                check("R30 read + write tool turns with clean actions",
+                      len(reads) >= 1 and len(writes) >= 1
+                      and all("__" not in (t.get("action") or "")
+                              for t in tools)
+                      and all(it.get("id")
+                              for t in reads for it in t["items"]),
+                      str([(t["tool_kind"], t["action"]) for t in tools]))
+                results = [t for t in turns if t["kind"] == "result"]
+                item_ids = {it["id"] for t in reads
+                            for it in (t.get("items") or [])}
+                refs = [ref for t in results
+                        for g in t.get("groups") or []
+                        for r0 in g.get("rows") or []
+                        for ref in r0.get("item_refs") or []]
+                check("R30 completeness: one result, every item "
+                      "referenced exactly once",
+                      len(results) == 1 and sorted(refs)
+                      == sorted(item_ids) and len(refs) == len(set(refs)),
+                      f"items={len(item_ids)} refs={len(refs)}")
+                w_rows = (await db.execute(
+                    select(AutomationWrite)
+                    .where(AutomationWrite.automation_id == auto2.id)
+                )).scalars().all()
+                check("R30 write ledger: one honest row per executed "
+                      "write with undo_ref",
+                      len(w_rows) == 3
+                      and all(w.undo_ref for w in w_rows)
+                      and all(w.audience in ("you", "others")
+                              for w in w_rows),
+                      str([(w.what, w.audience) for w in w_rows])[:120])
+                cfg0 = r30_ledger._cfg_of(run0)
+                check("R30 accounts_touched stamped on the run",
+                      "stub" in (cfg0.get("accounts_touched") or []),
+                      str(cfg0.get("accounts_touched")))
+
+                notes = (await db.execute(
+                    select(AutomationNotification)
+                    .where(AutomationNotification.automation_id
+                           == auto2.id)
+                    .where(AutomationNotification.kind
+                           == "automation_run")
+                )).scalars().all()
+                by_run = {n.run_id for n in notes}
+                check("R30 one notification per run, bodies filled",
+                      len(notes) == len(v2_runs)
+                      and by_run == {r.id for r in v2_runs}
+                      and all(n.body for n in notes),
+                      f"{len(notes)} notes / {len(v2_runs)} runs")
+                n0 = next(n for n in notes if n.run_id == run0.id)
+                card_msg = await db.get(R30Message, n0.message_id) \
+                    if n0.message_id else None
+                card = (json.loads(card_msg.metadata_json or "{}")
+                        .get("automation_notification")
+                        if card_msg is not None else None)
+                check("R30 the in-chat card carries the SAME body",
+                      card is not None and card.get("body") == n0.body
+                      and card.get("status") in ("completed", "partial"),
+                      str(card)[:120])
+
+            # Stop route: a finished run refuses with the honest 409.
+            from app.api.automations import (
+                automations_summary, get_workflow, nested_runs,
+                post_workflow_rule, put_account_permissions,
+                put_workflow_schedule, stop_run,
+                PermissionsBody, PresetBody, RuleBody,
+            )
+            try:
+                await stop_run(run0.id)
+                check("R30 stop refuses a finished run", False, "no raise")
+            except HTTPException as e:
+                check("R30 stop refuses a finished run",
+                      e.status_code == 409
+                      and (e.detail or {}).get("code") == "not_running",
+                      str(e.detail))
+
+            runs_nested = await nested_runs(auto2.id, limit=50)
+            check("R30 nested runs alias serves the flat list",
+                  len(runs_nested.get("runs") or []) == len(v2_runs),
+                  str(len(runs_nested.get("runs") or [])))
+
+            summary = await automations_summary()
+            s_items = {x["id"]: x for x in summary["automations"]}
+            check("R30 summary: §4.1 shape with thread ids",
+                  auto2.id in s_items
+                  and s_items[auto2.id]["pill"] in
+                  ("On", "Paused", "Needs you", "Just added")
+                  and s_items[auto2.id]["thread_id"]
+                  and "headline" in summary
+                  and "unused_count" in summary,
+                  str(s_items.get(auto2.id, {}).get("pill")))
+
+            wf = await get_workflow(auto2.id)
+            wf_accounts = {a0["account_id"]: a0 for a0 in wf["accounts"]}
+            check("R30 workflow GET: presets, accounts, rails, counts",
+                  {p0["id"] for p0 in wf["schedule"]["presets"]}
+                  >= {"weekdays-8", "weekdays-730", "daily-8",
+                      "weekdays-9"}
+                  and "stub" in wf_accounts
+                  and any(p0.get("kind") == "rail"
+                          for p0 in wf_accounts["stub"]["cant"])
+                  and wf["counts"]["briefs_per_run"] == 1,
+                  str(list(wf_accounts)))
+
+            # auto2 is EVENT-triggered — the When-it-runs sheet for it
+            # lists sources, and a preset write refuses honestly.
+            try:
+                await put_workflow_schedule(
+                    auto2.id, PresetBody(preset_id="weekdays-9"))
+                check("R30 preset on an event automation refuses",
+                      False, "no raise")
+            except HTTPException as e:
+                check("R30 preset on an event automation refuses",
+                      e.status_code == 409
+                      and (e.detail or {}).get("code") == "no_schedule",
+                      str(e.detail))
+
+            rule = await post_workflow_rule(
+                auto2.id, RuleBody(text="Never post twice about one item."))
+            check("R30 rule added with the confirmation sentence",
+                  rule["sentence"].startswith("Added a rule")
+                  and len(rule["rules"]) == 1, rule["sentence"])
+
+            from app.agent.automations import permissions as r30_perms
+            stub_cat = r30_perms.catalog_for("stub")
+            try:
+                await put_account_permissions(
+                    auto2.id, "stub",
+                    PermissionsBody(
+                        can=[p0["id"] for p0 in stub_cat["reads"]]
+                        + [p0["id"] for p0 in stub_cat["rails"][:1]],
+                        cant=[]))
+                check("R30 a rail can never be allowed", False, "no raise")
+            except HTTPException as e:
+                check("R30 a rail can never be allowed",
+                      e.status_code == 409
+                      and (e.detail or {}).get("code") == "hard_rail",
+                      str(e.detail))
+
+            async with async_session_maker() as db:
+                thread_after = await r30_ledger.thread_for(db, auto2.id)
+                t_all, _more = await r30_ledger.list_turns(
+                    db, thread_id=thread_after.id, limit=200)
+                edited = [t for t in t_all if t["kind"] == "note"
+                          and t.get("stamp") == "edited"]
+                # Exactly the ONE applied write (the rule) noted — the
+                # two REFUSED writes (no_schedule, hard_rail) must not
+                # fabricate an edit record.
+                check("R30 applied writes note EDITED; refused writes "
+                      "do not",
+                      len(edited) == 1, str(len(edited)))
+
+            # Memory v2 over the wire: scoped sheet + global tree +
+            # forget suppression.
+            from app.services import memory_v2_service as m2
+            async with async_session_maker() as db:
+                saved = await m2.add_fact(
+                    db, user_id=user_id,
+                    text="Marcus Webb gets same-day answers",
+                    category="people", scope=auto2.id,
+                    why="You replied within the hour four times running.",
+                    source="reaction",
+                    subject_entity={"kind": "person",
+                                    "name": "Marcus Webb"})
+                check("R30 add_fact saves with the seam contract keys",
+                      saved.get("saved") is True and saved.get("id"),
+                      str(saved)[:100])
+            r = await http.get("/api/memory", headers=user_h)
+            tree = r.json() if r.status_code == 200 else {}
+            fya = {x.get("automation_id"): x
+                   for x in tree.get("from_your_automations") or []}
+            check("R30 GET /api/memory groups the scoped fact under "
+                  "its automation",
+                  r.status_code == 200 and auto2.id in fya,
+                  f"{r.status_code} {list(fya)[:3]}")
+            fact_id = saved["id"]
+            r = await http.delete(f"/api/memory/facts/{fact_id}",
+                                  headers=user_h)
+            check("R30 forget deletes over the wire",
+                  r.status_code == 200 and r.json().get("deleted") is True,
+                  str(r.status_code))
+            async with async_session_maker() as db:
+                again = await m2.add_fact(
+                    db, user_id=user_id,
+                    text="Marcus Webb gets same-day answers",
+                    category="people", scope=auto2.id)
+                check("R30 the forget signal suppresses relearning",
+                      again.get("suppressed") is True, str(again))
+
+            # Catalog over the wire (platform-native).
+            r = await http.get("/api/automations/catalog", headers=user_h)
+            cat_body = r.json() if r.status_code == 200 else {}
+            check("R30 catalog serves cards with cadence + meta",
+                  r.status_code == 200
+                  and len(cat_body.get("cards") or []) >= 20
+                  and all("meta" in c0 and "when" in c0
+                          for c0 in cat_body.get("cards") or []),
+                  f"{r.status_code} n={len(cat_body.get('cards') or [])}")
+
+            # Routine migration (§4.11a) on a seeded email_briefing.
+            from app.db.models import Routine as R30Routine
+            from app.agent.automations.routine_migration import (
+                migrate_email_briefings,
+            )
+            async with async_session_maker() as db:
+                db.add(R30Routine(
+                    id=str(uuid.uuid4()), user_id=user_id,
+                    kind="email_briefing", enabled=False,
+                    name="Morning new-email briefing",
+                    prompt_text="brief me",
+                    schedule_cron_local="0 8 * * *",
+                    schedule_kind="cron",
+                ))
+                await db.commit()
+                mig = await migrate_email_briefings(db, user_id=user_id)
+                check("R30 routine migrated once with the promised-time "
+                      "cron",
+                      len(mig.get("migrated") or []) == 1, str(mig)[:160])
+                mig2 = await migrate_email_briefings(db, user_id=user_id)
+                check("R30 migration is idempotent",
+                      not mig2.get("migrated"), str(mig2)[:120])
+
+            mig_aid = (mig.get("migrated") or [{}])[0].get("automation_id")
+            preset = await put_workflow_schedule(
+                mig_aid, PresetBody(preset_id="weekdays-9"))
+            async with async_session_maker() as db:
+                a_row = await db.get(type(auto2), mig_aid)
+                raw_spec = json.loads(a_row.spec_json)
+                crons = [src.get("schedule", {}).get("cron_local")
+                         for src in raw_spec["trigger"]["sources"]
+                         if src.get("schedule")]
+            check("R30 schedule preset rewrote the migrated brief's cron",
+                  crons == ["0 9 * * 1-5"]
+                  and preset["sentence"].startswith("Moved it to"),
+                  str(crons))
+            async with async_session_maker() as db:
+                mig_thread = await r30_ledger.thread_for(db, mig_aid)
+                mig_turns, _m = await r30_ledger.list_turns(
+                    db, thread_id=mig_thread.id, limit=50)
+                check("R30 the preset write left its EDITED note",
+                      any(t["kind"] == "note"
+                          and t.get("stamp") == "edited"
+                          for t in mig_turns),
+                      str([t.get("stamp") for t in mig_turns
+                           if t["kind"] == "note"]))
 
             # ── real-vendor mode ────────────────────────────────────
             vendor = os.environ.get("E2E_CONNECTOR")

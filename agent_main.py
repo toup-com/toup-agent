@@ -1863,6 +1863,12 @@ app.add_middleware(LobbyAndDrainMiddleware)
 app.include_router(agent_router, prefix=settings.api_prefix)
 app.include_router(stats_router, prefix=settings.api_prefix)
 app.include_router(memories_router, prefix=settings.api_prefix)
+# R30 §4.7 — the connector sheet's card routes.
+from app.api.automations import accounts_router as _accounts_router
+app.include_router(_accounts_router, prefix=settings.api_prefix)
+# R30 memory v2 — the whole platform memory (GET /api/memory).
+from app.api.memories import memory_v2_router as _memory_v2_router
+app.include_router(_memory_v2_router, prefix=settings.api_prefix)
 # Toup Media — saved playlists. AGENT_ONLY store lives HERE; the platform
 # proxies user requests in with X-Agent-Key (memories pattern), and the play
 # endpoint broadcasts over this process's chat WS queues.

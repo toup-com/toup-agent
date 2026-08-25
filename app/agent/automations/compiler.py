@@ -360,8 +360,34 @@ async def verify_grants_for_arm_v2(
                 f"The approved permission for step {st.id!r} is for a "
                 f"different action than the step performs.",
             )
-        grants[st.id] = grant
+        grants[st.id] = await _bind_orphan_grant(automation, grant)
     return grants
+
+
+async def _bind_orphan_grant(automation: Automation, grant: dict) -> dict:
+    """ND-1: a grant minted by the skill's setup flow carries
+    automation_id NULL (the permission card is shown BEFORE
+    automations__create, so no id existed to send). Arm is the first
+    moment the automation exists AND claims the grant — stamp the link
+    now, platform-side, so `GET /{id}/grants` serves it and
+    revoke→pause can fire. A repair, not a gate: on any failure the arm
+    proceeds and the next arm retries."""
+    if grant.get("automation_id"):
+        return grant
+    from .registry import bind_grant
+
+    bound = await bind_grant(
+        automation.user_id,
+        grant_id=str(grant.get("id") or ""),
+        automation_id=automation.id,
+    )
+    if bound is None:
+        logger.warning(
+            "[automations] grant %s could not be bound to %s at arm time",
+            grant.get("id"), automation.id,
+        )
+        return grant
+    return bound
 
 
 async def verify_grant_for_arm(
@@ -401,4 +427,4 @@ async def verify_grant_for_arm(
             "The approved permission is for a different action than "
             "this automation performs.",
         )
-    return grant
+    return await _bind_orphan_grant(automation, grant)

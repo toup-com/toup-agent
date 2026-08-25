@@ -280,6 +280,53 @@ async def create_grant_request(
         return {"grant": _grant_payload(row)}
 
 
+class GrantBindReq(BaseModel):
+    grant_id: str = Field(..., min_length=1, max_length=36)
+    automation_id: str = Field(..., min_length=1, max_length=36)
+
+
+@router.post("/grant-bind")
+async def bind_grant_to_automation(
+    req: GrantBindReq,
+    x_agent_key: Optional[str] = Header(default=None),
+    x_agent_user_id: Optional[str] = Header(default=None),
+) -> dict:
+    """ND-1 (GROUND-TRUTH-R30): stamp `automation_id` onto a grant that
+    was staged before its automation existed.
+
+    The skill's setup order is permission card FIRST (step 5), create
+    SECOND (step 6) — so /grant-requests, which accepts and stamps
+    `automation_id`, receives None every time, `GET /{id}/grants`
+    serves `[]`, and revoke→pause can never fire. The agent calls this
+    the moment the automation exists (arm verifies each grant and binds
+    the orphans).
+
+    Bind-once: NULL → id, idempotent on the same id, 409 on an attempt
+    to move a grant to a DIFFERENT automation — a grant the user
+    approved for one rule must not silently start covering another."""
+    user_id = await _auth_agent(x_agent_key, x_agent_user_id)
+    await _flag_or_404(user_id)
+    async with async_session_maker() as db:
+        row = (await db.execute(
+            select(AutomationGrant)
+            .where(AutomationGrant.id == req.grant_id)
+            .where(AutomationGrant.user_id == user_id)
+        )).scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="No such grant")
+        if row.automation_id and row.automation_id != req.automation_id:
+            raise HTTPException(
+                status_code=409,
+                detail="grant is already bound to a different automation",
+            )
+        if not row.automation_id:
+            row.automation_id = req.automation_id
+            await db.commit()
+            logger.info("[automations] grant %s bound to automation %s",
+                        row.id, req.automation_id)
+        return {"grant": _grant_payload(row)}
+
+
 class DispatchReq(BaseModel):
     connector_id: str = Field(..., min_length=1, max_length=64)
     tool_name: str = Field(..., min_length=1, max_length=128)
@@ -341,6 +388,7 @@ async def automation_dispatch(
             channel="automation",
             agent_request_id=req.request_id,
             grant_id=req.grant_id,
+            automation_id=req.automation_id,
             exclude_metering=exclude_metering,
         )
     return _serialize_connector_result(result)

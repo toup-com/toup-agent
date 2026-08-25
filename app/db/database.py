@@ -1069,6 +1069,17 @@ async def init_db():
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_outcome_text VARCHAR(300)",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_outcome_at TIMESTAMP",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS outcome_seen_at TIMESTAMP",
+        # R30 (CONTRACTS-R30 §3): user rules + human step sentences on
+        # the automation, the §4.8 soft delete, and the run-stop stamp
+        # on build_jobs. Same self-heal reasoning as every ALTER above.
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS rules_json TEXT",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS steps_human_json TEXT",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS stop_requested_at TIMESTAMP",
+        # The write's display form snapshotted at staging (R30 §4.8) —
+        # an upgraded tenant's outbox INSERT names this column on the
+        # very first staged write, so it must self-heal here.
+        "ALTER TABLE automation_outbox ADD COLUMN IF NOT EXISTS display_json TEXT",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

@@ -69,9 +69,42 @@ async def sweep_automations() -> dict:
         stats["expired_confirms"] = await sweep_expired_confirm_parks()
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] confirm-park sweep failed: %s", e)
+    try:
+        # R30 §4.8: soft-deleted automations past the 30-day window are
+        # purged for real — thread, turns, facts, engine namespace.
+        async with async_session_maker() as db:
+            stats["purged"] = await sweep_purge_soft_deleted(db)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] purge sweep failed: %s", e)
     if any(stats.values()):
         logger.info("[automations] sweep %s", stats)
     return stats
+
+
+SOFT_DELETE_RETENTION_DAYS = 30
+
+
+async def sweep_purge_soft_deleted(db) -> int:
+    """Hard-delete every automation whose soft delete is older than the
+    retention window (§4.8: "memory kept for 30 days then purged")."""
+    cutoff = datetime.utcnow() - timedelta(days=SOFT_DELETE_RETENTION_DAYS)
+    rows = (await db.execute(
+        select(Automation).where(
+            Automation.deleted_at.isnot(None),
+            Automation.deleted_at < cutoff,
+        )
+    )).scalars().all()
+    from .service import _hard_delete
+    purged = 0
+    for a in rows:
+        try:
+            await _hard_delete(db, a, a.user_id)
+            purged += 1
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[automations] purge failed id=%s: %s",
+                           a.id, e)
+            await db.rollback()
+    return purged
 
 
 async def _sweep_stuck_runs() -> int:
@@ -199,11 +232,26 @@ async def _post_error_notice(db, automation: Automation) -> None:
     """Exactly ONE chat notice + one push per error episode
     (`error_notice_at` dedupes; arming again clears it)."""
     chip = _fix_chip_for(automation)
-    text = (
-        f"⚠️ **{automation.name}** was paused after "
-        f"{AUTOMATION_AUTO_PAUSE_FAILURES} failed runs in a row.\n\n"
-        f"Last error: {(automation.last_error or 'unknown')[:200]}"
-    )
+    # R30 copy contract: no emoji, no markdown markup, and the raw
+    # provider error never reaches the UI unformatted (D-03) — it stays
+    # on the row for diagnosis; the fix chip carries the honest ask.
+    # C's template module owns the sentence; the fallback keeps the
+    # notice whole when the module predates the merge.
+    text = None
+    try:
+        from .notification_templates import auto_pause_body
+        text = auto_pause_body(
+            automation.name, AUTOMATION_AUTO_PAUSE_FAILURES,
+        )
+    except Exception:  # noqa: BLE001 — the notice must always exist
+        text = None
+    if not text:
+        text = (
+            f"{automation.name} was paused after "
+            f"{AUTOMATION_AUTO_PAUSE_FAILURES} failed runs in a row. "
+            f"Nothing more will run until you resume it — I can help "
+            f"you fix it."
+        )
     try:
         # R28: the notice lands in the automation's own session thread,
         # not the shared routine thread — same exactly-once semantics,

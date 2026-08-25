@@ -134,7 +134,20 @@ async def _finalize_job(
         stamp = await _stamp_last_outcome(
             db, job, status=status, outcome=outcome,
         )
-    if result.rowcount == 1 and status == "completed" and job is not None:
+    # R30: a run with a v3 thread notifies through the §4.10 pipeline
+    # (on_terminal below — card + completed-only push + LA end with one
+    # body); the legacy per-run push would double-notify it.
+    _has_v3_thread = False
+    if job is not None:
+        try:
+            cfg = job.config_json or {}
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg or "{}")
+            _has_v3_thread = bool(cfg.get("thread_id"))
+        except (ValueError, TypeError):
+            _has_v3_thread = False
+    if (result.rowcount == 1 and status == "completed" and job is not None
+            and not _has_v3_thread):
         try:
             if job.source_id:
                 a = await db.get(Automation, job.source_id)
@@ -153,6 +166,15 @@ async def _finalize_job(
         except Exception as e:  # noqa: BLE001 — a push never fails a run
             logger.warning(
                 "[automations] finalize notify skipped job=%s: %s",
+                job_id[:8], e,
+            )
+    if result.rowcount == 1 and job is not None and _has_v3_thread:
+        try:
+            from .run_v3 import on_terminal
+            await on_terminal(db, job_id)
+        except Exception as e:  # noqa: BLE001 — v3 close never fails a run
+            logger.warning(
+                "[automations] v3 terminal close skipped job=%s: %s",
                 job_id[:8], e,
             )
 
