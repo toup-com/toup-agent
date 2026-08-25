@@ -149,6 +149,13 @@ AGENT_ONLY_TABLES: set[str] = {
     "automation_events",
     "automation_outbox",
     "automation_auth_sessions",
+    # The engine's per-automation facts ledger (R29, memory filter v2).
+    # FK → automations, so it can only live where automations lives.
+    # Landed UNLISTED on 2026-08-25: neither lane excluded it, the
+    # platform's postgres create_all hit the missing FK target, and
+    # both Railway deploys failed while sqlite CI stayed green.
+    # test_table_partition_complete.py now pins the whole class.
+    "automation_facts",
     # Identity & soul
     "identities",
     "soul_configs",
