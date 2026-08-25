@@ -50,6 +50,26 @@ CONTAINER_USER_ID = "00000000-0000-0000-0000-0000000000d0"
 BACKEND = Path(__file__).resolve().parent.parent
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _ensure_trigger_table():
+    """The CI sweep runs this file under RUN_MODE=platform, whose
+    init_db() omits `triggers` (AGENT_ONLY) — three tests here then die
+    on "no such table". Everywhere the code under test actually runs —
+    prod postgres (full historical schema) and monolith dev — the table
+    exists, so create it checkfirst instead of re-routing the whole
+    file to a lane that drops the platform-only tables the OTHER tests
+    need (agent mode fails five). Late import: conftest may rebind the
+    engine."""
+    from app.db import database as _dbmod
+    from app.db.models import Trigger
+
+    async with _dbmod.engine.begin() as conn:
+        await conn.run_sync(
+            lambda sync: Trigger.__table__.create(sync, checkfirst=True)
+        )
+    yield
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Source-grep guards — bug-recurrence pins.
 # ──────────────────────────────────────────────────────────────────────
