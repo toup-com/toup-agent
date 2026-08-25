@@ -18,7 +18,10 @@ flag) rather than owning another timer. Four responsibilities:
      automation to `error`, deactivates bindings, and posts exactly ONE
      chat notice with a fix chip (`error_notice_at` is the dedupe) plus
      one push notify.
-  4. Token refresh / webhook renewal — deliberately NOT here: token
+  4. Expired confirm-parks (R29) — runs parked on a confirmation card
+     whose TTL passed without the platform's resolve hop landing close
+     as outcome "skipped" (confirm.sweep_expired_confirm_parks).
+  5. Token refresh / webhook renewal — deliberately NOT here: token
      refresh is lazy+coalesced in the dispatcher at call time, and the
      Gmail watch already rides the platform's 6-hour refresh cron. A
      second refresher would race the coalescing locks.
@@ -45,7 +48,8 @@ _STUCK_AFTER = timedelta(seconds=AUTOMATION_RUN_CAP_S * 2)
 async def sweep_automations() -> dict:
     """One pass; every leg isolated so a failure in one cannot starve
     the others. Returns counters for the reconcile log line."""
-    stats = {"stuck_runs": 0, "stale_bindings": 0, "auto_paused": 0}
+    stats = {"stuck_runs": 0, "stale_bindings": 0, "auto_paused": 0,
+             "expired_confirms": 0}
     try:
         stats["stuck_runs"] = await _sweep_stuck_runs()
     except Exception as e:  # noqa: BLE001
@@ -58,6 +62,13 @@ async def sweep_automations() -> dict:
         stats["auto_paused"] = await _sweep_auto_pause()
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] auto-pause sweep failed: %s", e)
+    try:
+        # R29: confirm-parks whose card expired and whose platform
+        # resolve hop never landed — close as outcome "skipped".
+        from .confirm import sweep_expired_confirm_parks
+        stats["expired_confirms"] = await sweep_expired_confirm_parks()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] confirm-park sweep failed: %s", e)
     if any(stats.values()):
         logger.info("[automations] sweep %s", stats)
     return stats
@@ -161,14 +172,37 @@ async def _sweep_auto_pause() -> int:
     return paused
 
 
+def _fix_chip_for(automation: Automation) -> dict:
+    """The notice's one-tap repair path: `prompt` is sent as a user
+    turn into this automation's session (CONTRACTS-R29 §1). The verbs
+    module composes it; this fallback keeps the notice whole when the
+    module predates the rebase or ever raises."""
+    try:
+        from app.services.automation_verbs import fix_chip
+        chip = fix_chip(automation.name, "auto_paused",
+                        automation.last_error)
+        if isinstance(chip, dict) and chip.get("label") and chip.get("prompt"):
+            return {"label": str(chip["label"]), "prompt": str(chip["prompt"])}
+    except Exception:  # noqa: BLE001 — the chip must always exist
+        pass
+    return {
+        "label": "Help me fix it",
+        "prompt": (
+            f'My automation "{automation.name}" was paused after repeated '
+            f"failures. Diagnose what went wrong, help me fix it, and "
+            f"turn it back on."
+        ),
+    }
+
+
 async def _post_error_notice(db, automation: Automation) -> None:
     """Exactly ONE chat notice + one push per error episode
     (`error_notice_at` dedupes; arming again clears it)."""
+    chip = _fix_chip_for(automation)
     text = (
         f"⚠️ **{automation.name}** was paused after "
         f"{AUTOMATION_AUTO_PAUSE_FAILURES} failed runs in a row.\n\n"
-        f"Last error: {(automation.last_error or 'unknown')[:200]}\n\n"
-        f"[[navigate:/activity]]"
+        f"Last error: {(automation.last_error or 'unknown')[:200]}"
     )
     try:
         # R28: the notice lands in the automation's own session thread,
@@ -184,6 +218,7 @@ async def _post_error_notice(db, automation: Automation) -> None:
             user_id=automation.user_id,
             automation_id=automation.id,
             content=text,
+            metadata={"fix_chip": chip},
             title=automation.name,
         )
         if not message_id:
@@ -196,6 +231,8 @@ async def _post_error_notice(db, automation: Automation) -> None:
                 source="automation",
                 content=text,
                 routine_name=automation.name,
+                extra={"fix_chip": chip,
+                       "automation_id": automation.id},
             )
         except Exception:  # noqa: BLE001 — broadcast is a courtesy
             pass

@@ -717,6 +717,7 @@ async def resolve_job_for_pending_action(
     from app.db.models import BuildJob
 
     resolved: list[tuple[str, str, str]] = []
+    automation_run_ids: set[str] = set()
     async with async_session_maker() as db:
         rows = (await db.execute(
             select(BuildJob).where(BuildJob.status == STATUS_WAITING_ON_USER)
@@ -726,6 +727,21 @@ async def resolve_job_for_pending_action(
             if not isinstance(cfg, dict):
                 continue
             if cfg.get("pending_action_id") != body.action_id:
+                continue
+            if job.job_type == "automation_run":
+                # R29: an automation run's terminal rides the engine's
+                # exactly-once finalize gate (outcome vocabulary,
+                # last-outcome stamp, noteworthy push, session card
+                # flip, health) — the generic flip below would bypass
+                # all of it. Rejected/expired close as outcome
+                # "skipped": the user's decision, not a failure.
+                from app.agent.automations.confirm import resolve_parked_run
+
+                if await resolve_parked_run(
+                    db, job, outcome=body.outcome, detail=body.detail,
+                ):
+                    resolved.append((job.id, job.title or "", job.user_id))
+                    automation_run_ids.add(job.id)
                 continue
             job.status = new_status
             job.completed_at = _dt.utcnow()
@@ -758,6 +774,11 @@ async def resolve_job_for_pending_action(
             })
         except Exception:  # noqa: BLE001
             pass
+        if job_id in automation_run_ids:
+            # The engine's own composer already pushed what was
+            # noteworthy (notify_run_outcome via the finalize gate);
+            # the generic mission events below would double-speak.
+            continue
         # The Live Activity is still ALIVE — `notify_job_needs_user`
         # deliberately kept it that way — so a terminal notification is the
         # only thing that ends it. A DB write never touches the card.

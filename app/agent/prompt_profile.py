@@ -92,6 +92,9 @@ _FULL_SECTIONS: tuple[str, ...] = (
     "media",             # Media playback (web/app only)
     "runtime",           # WHEN/WHERE
     "vibecoding",        # Vibe coding mode override
+    "automation_session",  # R29: automation session-thread context —
+                           # only present when the turn is addressed
+                           # to an automation's thread
     "formatting",        # HOW to respond
     "onboarding",        # Temporary onboarding instructions
     "activation",        # Optional activation prompt

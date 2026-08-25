@@ -731,31 +731,51 @@ class AutomationsSkill(Skill):
             )).scalar_one_or_none()
             if a is None or not a.domain:
                 return
-            if a.trigger_mode == "schedule":
-                trigger = "runs on a schedule"
-            elif a.connector_id:
-                trigger = f"watches {a.connector_id}"
-            else:
-                trigger = "watches a connected service"
-            action = "acts on it"
+            fact: Optional[str] = None
             try:
+                # R29: the verbs module owns the human sentence — a
+                # derived "<verb>s via <connector>" was a raw tool name
+                # wearing spaces.
+                from app.services.automation_verbs import rule_sentence
                 raw = json.loads(a.spec_json)
-                steps = raw.get("steps") or []
-                tools = [s.get("tool") for s in steps if s.get("grant_id")]
-                tool = tools[-1] if tools else (
-                    (raw.get("action") or {}).get("tool"))
-                if tool and "__" in tool:
-                    cid, verb = tool.split("__", 1)
-                    action = f"{verb.replace('_', ' ')}s via {cid}"
-            except (ValueError, TypeError):
+                sentence = rule_sentence(raw) if isinstance(raw, dict) else None
+                if sentence:
+                    fact = (f'Has an automation "{a.name[:60]}": '
+                            f"{str(sentence)[:160]}")
+            except Exception:  # noqa: BLE001 — composition falls back
                 pass
-            await memory_notes.record_automation_fact(
-                db, user_id=_uid(ctx), domain=a.domain,
-                fact=memory_notes.setup_fact(
+            if fact is None:
+                if a.trigger_mode == "schedule":
+                    trigger = "runs on a schedule"
+                elif a.connector_id:
+                    trigger = f"watches {a.connector_id}"
+                else:
+                    trigger = "watches a connected service"
+                fact = memory_notes.setup_fact(
                     automation_name=a.name,
                     trigger_summary=trigger,
-                    action_summary=action,
-                ),
+                    action_summary="acts on it",
+                )
+            # Ledger-first (CONTRACTS-R29 §4): `record` stamps
+            # attribution AND projects to the brain itself — the R28
+            # memory_notes path stays only as the pre-seam fallback.
+            try:
+                from app.agent.automations import facts as facts_seam
+                result = await facts_seam.record(
+                    db,
+                    user_id=_uid(ctx),
+                    automation_id=a.id,
+                    facts=[fact],
+                    category=a.domain,
+                    source="agent",
+                    source_kind="chat",
+                )
+                if int((result or {}).get("saved", 0)) > 0:
+                    return
+            except ImportError:
+                pass
+            await memory_notes.record_automation_fact(
+                db, user_id=_uid(ctx), domain=a.domain, fact=fact,
             )
 
     async def _pause(self, args, ctx) -> str:

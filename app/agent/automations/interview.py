@@ -1,0 +1,303 @@
+"""Session-thread conversation intelligence (Round 29).
+
+An automation's session thread is a chat like any other — the R28
+runner honors the address instead of forking. What was missing is the
+agent KNOWING it is standing inside an automation when it answers
+there. This module supplies both halves:
+
+  - `build_automation_context` + `prompt_section` — the system-prompt
+    section for a turn on an `automation`-channel conversation: what
+    this automation is (name, standing rule, status), what the fact
+    ledger already knows, and the interview posture — ask for the
+    context the automation is missing, ONE question at a time, and
+    never promise a send (drafts only; the rail is engine-enforced).
+
+  - `extract_and_record_facts` — the post-turn writer. Automation
+    session turns run THIS instead of the global curator
+    (CONTRACTS-R29 §4: the write seam `facts.record`
+    projects to the brain itself; running `curate_turn` beside it
+    would double-file the same facts). One small pinned-model JSON
+    call (`settings.memory_extraction_model` — never `model=None` on
+    a background path), then one `record` per category, then the
+    "Memory updated · N facts" chip.
+
+Raw tool names never appear in anything this module composes — the
+prompt section describes the rule via the automation's own
+`rule_text`/description vocabulary, with the verbs module supplying
+the sentence when it can.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+#: Categories the extractor may file under, in ledger order. Domain
+#: slugs are added per automation at call time.
+CANONICAL_CATEGORIES = ("people", "preferences", "deadlines")
+
+_MAX_FACTS_PER_TURN = 5
+_FACT_MAX_LEN = 300
+
+
+async def build_automation_context(db, conversation) -> Optional[dict]:
+    """The automation behind this conversation, shaped for the prompt
+    section — or None when the conversation isn't an automation session
+    (the caller's common case; one metadata parse, no query)."""
+    from .session import SESSION_CHANNEL, automation_id_of
+
+    if getattr(conversation, "channel", None) != SESSION_CHANNEL:
+        return None
+    automation_id = automation_id_of(conversation)
+    if not automation_id:
+        return None
+    try:
+        from app.db.models import Automation
+
+        automation = await db.get(Automation, automation_id)
+        if automation is None:
+            return None
+        rule_text = _rule_text(automation)
+        facts = await _load_facts_grouped(db, automation_id)
+        return {
+            "automation_id": automation_id,
+            "name": automation.name,
+            "rule_text": rule_text,
+            "status": automation.status,
+            "paused_reason": automation.paused_reason,
+            "domain": getattr(automation, "domain", None),
+            "last_error": automation.last_error,
+            "facts": facts,
+        }
+    except Exception as e:  # noqa: BLE001 — context is a companion
+        logger.warning(
+            "[automations] session context load failed conv=%s: %s",
+            str(getattr(conversation, "id", "?"))[:8], e,
+        )
+        return None
+
+
+def _rule_text(automation) -> str:
+    """One plain sentence for what this automation does — the verbs
+    module when available, the stored description otherwise, never the
+    spec JSON."""
+    try:
+        from app.services.automation_verbs import rule_sentence
+
+        spec_raw = automation.spec_json
+        if isinstance(spec_raw, str):
+            try:
+                spec_raw = json.loads(spec_raw)
+            except (ValueError, TypeError):
+                spec_raw = None
+        if isinstance(spec_raw, dict):
+            sentence = rule_sentence(spec_raw)
+            if sentence:
+                return str(sentence)
+    except Exception:  # noqa: BLE001 — fall through to the description
+        pass
+    return (automation.description or automation.name or "").strip()
+
+
+async def _load_facts_grouped(db, automation_id: str) -> dict[str, list[str]]:
+    """Ledger facts grouped by category, canonical order first. Empty
+    dict when the table predates the R29-A half."""
+    grouped: dict[str, list[str]] = {}
+    try:
+        from sqlalchemy import select
+        from app.db.models import AutomationFact
+
+        rows = (await db.execute(
+            select(AutomationFact)
+            .where(AutomationFact.automation_id == automation_id)
+            .order_by(AutomationFact.created_at.asc())
+        )).scalars().all()
+        for row in rows:
+            text = (row.text or "").strip()
+            if text:
+                grouped.setdefault(row.category, []).append(text)
+    except ImportError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] facts load failed: %s", e)
+    ordered: dict[str, list[str]] = {}
+    for cat in CANONICAL_CATEGORIES:
+        if cat in grouped:
+            ordered[cat] = grouped.pop(cat)
+    ordered.update(dict(sorted(grouped.items())))
+    return ordered
+
+
+def prompt_section(ctx: dict) -> str:
+    """The `automation_session` system-prompt section."""
+    lines = [
+        "## This conversation is an automation's session thread",
+        f'The user is talking to you inside the thread of their '
+        f'automation "{ctx["name"]}".',
+    ]
+    if ctx.get("rule_text"):
+        lines.append(f"Its standing rule: {ctx['rule_text']}")
+    status = ctx.get("status")
+    if status == "error":
+        lines.append(
+            "It is currently PAUSED after repeated failures"
+            + (f" (last error: {str(ctx['last_error'])[:150]})"
+               if ctx.get("last_error") else "")
+            + ". If the user wants it running again, help them fix the "
+              "cause first, then re-arm it."
+        )
+    elif status == "paused":
+        lines.append("It is currently paused by the user.")
+
+    facts = ctx.get("facts") or {}
+    if any(facts.values()):
+        lines.append("\nWhat its memory already knows:")
+        for cat, texts in facts.items():
+            for text in texts[:8]:
+                lines.append(f"- [{cat}] {text}")
+    else:
+        lines.append(
+            "\nIts memory is EMPTY — it knows nothing about the people, "
+            "preferences, or deadlines it should be tuned to."
+        )
+
+    lines.append(
+        "\nHow to behave here:\n"
+        "- Interview for the context the automation is missing: who "
+        "matters (people), how the user wants things handled "
+        "(preferences), and dates that matter (deadlines). Ask ONE "
+        "question at a time, conversationally — never a form.\n"
+        "- Anything durable the user tells you here is saved to this "
+        "automation's memory automatically after your reply; don't "
+        "narrate the saving, and never re-ask what the memory above "
+        "already answers.\n"
+        "- Be honest about actions: this automation can stage drafts "
+        "and post summaries, but it NEVER sends mail — never promise "
+        "otherwise. If a run is waiting on the user's approval, "
+        "approving it is their tap, not your call.\n"
+        "- Describe what runs did in plain words; never expose "
+        "internal tool or step identifiers."
+    )
+    return "\n".join(lines)
+
+
+def _extraction_prompt(ctx: dict, user_text: str, assistant_text: str) -> str:
+    domain = ctx.get("domain")
+    categories = list(CANONICAL_CATEGORIES) + ([domain] if domain else [])
+    existing = json.dumps(ctx.get("facts") or {}, ensure_ascii=False)
+    return (
+        "You maintain the fact ledger of one personal automation.\n"
+        f'Automation: "{ctx["name"]}". Rule: {ctx.get("rule_text") or "—"}\n'
+        f"Existing facts by category: {existing}\n\n"
+        "From the exchange below, extract durable facts WORTH KEEPING "
+        "for this automation's future runs — people who matter (with "
+        "addresses when stated), standing preferences, deadlines/dates. "
+        "Rules:\n"
+        "- Only what the USER stated or clearly confirmed this turn; "
+        "nothing inferred, nothing the ledger already says.\n"
+        "- Each fact one short self-contained sentence.\n"
+        f"- Allowed categories: {categories}. Dates become absolute.\n"
+        f"- At most {_MAX_FACTS_PER_TURN} facts; an empty list is the "
+        "right answer for small talk.\n\n"
+        f"USER: {user_text[:2000]}\n\nASSISTANT: {assistant_text[:1500]}\n\n"
+        'Reply as JSON: {"facts": [{"text": "...", "category": "..."}]}'
+    )
+
+
+async def extract_and_record_facts(
+    db,
+    *,
+    user_id: str,
+    ctx: dict,
+    user_text: str,
+    assistant_text: str,
+) -> int:
+    """The post-turn writer for automation session turns. Returns the
+    number of facts saved (0 on any failure — this is a background
+    companion, never a veto)."""
+    text = (user_text or "").strip()
+    if not text:
+        return 0
+    automation_id = ctx["automation_id"]
+    try:
+        from app.config import settings
+        from app.services.llm_service import get_llm_service
+
+        response = await get_llm_service().complete_with_json(
+            messages=[{
+                "role": "user",
+                "content": _extraction_prompt(ctx, text, assistant_text or ""),
+            }],
+            model=settings.memory_extraction_model,
+            temperature=0.0,
+        )
+        parsed: Any = response
+        if hasattr(response, "content"):
+            raw = (response.content or "").strip()
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
+            parsed = json.loads(raw)
+        items = parsed.get("facts") if isinstance(parsed, dict) else None
+        if not isinstance(items, list):
+            return 0
+
+        allowed = set(CANONICAL_CATEGORIES)
+        if ctx.get("domain"):
+            allowed.add(ctx["domain"])
+        by_category: dict[str, list[str]] = {}
+        for item in items[:_MAX_FACTS_PER_TURN]:
+            if not isinstance(item, dict):
+                continue
+            fact = " ".join(str(item.get("text") or "").split())[:_FACT_MAX_LEN]
+            category = str(item.get("category") or "").strip().lower()
+            if not fact or category not in allowed:
+                continue
+            by_category.setdefault(category, []).append(fact)
+        if not by_category:
+            return 0
+
+        from app.agent.automations import facts as facts_seam
+
+        saved = 0
+        for category, fact_texts in by_category.items():
+            result = await facts_seam.record(
+                db,
+                user_id=user_id,
+                automation_id=automation_id,
+                facts=fact_texts,
+                category=category,
+                source="agent",
+                source_kind="interview",
+            )
+            saved += int((result or {}).get("saved", 0))
+        if saved:
+            from .session import emit_memory_update
+
+            await emit_memory_update(
+                db,
+                user_id=user_id,
+                automation_id=automation_id,
+                count=saved,
+                title=ctx.get("name"),
+            )
+        return saved
+    except ImportError:
+        # automation_facts ships with the R29-A half; until the rebase
+        # the interview still talks, it just cannot file.
+        logger.info("[automations] interview extractor: facts seam "
+                    "unavailable; nothing recorded")
+        return 0
+    except Exception as e:  # noqa: BLE001 — background companion
+        logger.warning(
+            "[automations] interview extraction failed automation=%s: "
+            "%s: %s",
+            str(automation_id)[:8], type(e).__name__, str(e)[:200],
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return 0

@@ -329,7 +329,12 @@ def test_debt_is_not_growing_silently():
     # AGENT_ONLY table (the curated-fact ledger); its attributed-write,
     # CRUD-wall and delete-cleanup proofs need the real rows, so the file
     # RUNS in the agent-mode step and only routes there.
-    CEILING = 77
+    # R29-C: +1 for test_automation_intelligence.py — the confirm-park
+    # stamp/card, skipped terminals, facts-needle filter, session chips
+    # and interview seam all drive real build_jobs/automations/
+    # conversations rows, AGENT_ONLY every one; it RUNS in the
+    # agent-mode step (a ROUTING entry, not an excuse).
+    CEILING = 78
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

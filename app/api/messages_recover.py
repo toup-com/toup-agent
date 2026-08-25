@@ -37,6 +37,7 @@ from app.api.day_chats import (
     _serialize_admin_notice, _serialize_app_artifact, _serialize_attachments,
     _serialize_automation_card,
     _serialize_media,
+    _serialize_meta_card,
     _serialize_tool_events,
 )
 from app.api.message_cards import (
@@ -223,6 +224,10 @@ async def messages_since(
                 msg, "automation_connector_card"),
             "automation_grant_card": _serialize_automation_card(
                 msg, "automation_grant_card"),
+            "pending_action": _serialize_meta_card(msg, "pending_action"),
+            "draft_card": _serialize_meta_card(msg, "draft_card"),
+            "memory_update": _serialize_meta_card(msg, "memory_update"),
+            "fix_chip": _serialize_meta_card(msg, "fix_chip"),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),

@@ -169,9 +169,18 @@ async def ingest_items_v2(
 
 
 def _passes_filter_v2(source: ValidatedSource, payload: dict,
-                      variables: dict) -> bool:
+                      variables: dict,
+                      facts_ctx: Optional[dict] = None) -> bool:
     """v1 filter semantics per source, with {{var.*}} rendered in the
-    needles so templates can parameterize filters."""
+    needles so templates can parameterize filters.
+
+    R29: a `{{facts.<category>}}` needle matches against the fact
+    ledger (facts_context, the "memory-filtered" leg) and is
+    intercepted BEFORE render_value — the var renderer would blank the
+    unknown template and turn the needle into a match-nothing literal
+    instead of a ledger lookup."""
+    from .facts_context import facts_needle_category, needle_matches
+
     ctx = {"var": variables or {}}
     for fld, needles in (source.filter_rules or {}).items():
         if not needles:
@@ -179,8 +188,18 @@ def _passes_filter_v2(source: ValidatedSource, payload: dict,
         if not isinstance(needles, list):
             needles = [needles]
         value = str(payload.get(fld) or "").lower()
-        rendered = [str(render_value(str(n), ctx)).lower() for n in needles]
-        if not any(n in value for n in rendered if n):
+        ok = False
+        for n in needles:
+            if facts_needle_category(n) is not None:
+                if needle_matches(n, value, facts_ctx):
+                    ok = True
+                    break
+                continue
+            rendered = str(render_value(str(n), ctx)).lower()
+            if rendered and rendered in value:
+                ok = True
+                break
+        if not ok:
             return False
     return True
 
@@ -427,7 +446,11 @@ async def _run_event_inner(
     except (ValueError, TypeError):
         payload = {}
 
-    if not _passes_filter_v2(source, payload, vspec.variables):
+    from .facts_context import load_facts_context
+    facts_ctx = await load_facts_context(
+        db, automation.id, source.filter_rules,
+    )
+    if not _passes_filter_v2(source, payload, vspec.variables, facts_ctx):
         event.status = "skipped_filter"
         await db.commit()
         return event.status

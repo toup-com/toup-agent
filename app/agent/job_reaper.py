@@ -222,6 +222,12 @@ async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:
                 BuildJob.status == STATUS_WAITING_ON_USER,
                 BuildJob.error_class == ERR_AWAITING_CONFIRMATION,
                 BuildJob.created_at < cutoff,
+                # Automation runs have their own closer with the run
+                # outcome vocabulary (confirm.sweep_expired_confirm_parks,
+                # outcome="skipped" through the finalize gate) — closing
+                # them here would skip the last-outcome stamp and the
+                # session card flip.
+                BuildJob.job_type != "automation_run",
             )
         )).scalars().all())
         if not rows:

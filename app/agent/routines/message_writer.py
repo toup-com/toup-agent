@@ -115,6 +115,7 @@ async def broadcast_routine_message(
     model_used: Optional[str] = None,
     delivery_channels: Optional[list[str]] = None,
     routine_name: Optional[str] = None,
+    extra: Optional[dict] = None,
 ):
     """Push a routine Message to any live WS clients AND (optionally) to
     extra outbound channels the routine asked for (Telegram / WhatsApp).
@@ -159,6 +160,11 @@ async def broadcast_routine_message(
             "routine_message": True,
             "created_at": datetime.utcnow().isoformat(),
         }
+        if extra:
+            # Additive card/chip keys (e.g. R29's fix_chip) — the
+            # persisted metadata_json is the durable copy; this keeps
+            # the live frame and the reload agreeing.
+            event.update(extra)
         try:
             ws_count = await broadcast_to_user(user_id, event)
         except Exception as e:  # pragma: no cover — defensive

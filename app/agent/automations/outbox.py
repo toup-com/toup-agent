@@ -31,6 +31,7 @@ from sqlalchemy import select, update as sa_update
 from app.db.database import async_session_maker
 from app.db.models import Automation, AutomationOutbox, BuildJob
 from . import registry as reg
+from .draft_card import DRAFT_TOOLS as _DRAFT_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,11 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         await db.commit()
         await _finalize_run(db, row, status="completed", outcome="sent")
         await _record_health(db, row.automation_id, ok=True, error=None)
+        if row.tool_name in _DRAFT_TOOLS:
+            # The proactive-draft surface (R29): a session card that
+            # names the draft and tells the "nothing was sent" truth.
+            from .draft_card import write_draft_card
+            await write_draft_card(db, row, result)
         return row.status
 
     if kind == "confirmation_required":
@@ -113,7 +119,7 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         row.executed_at = now
         row.result_json = json.dumps(result, default=str)[:8000]
         await db.commit()
-        await _park_run_on_card(db, row, action_id)
+        await _park_run_on_card(db, row, result)
         await _notify_needs_approval(row, action_id)
         return row.status
 
@@ -270,20 +276,58 @@ async def _record_health(db, automation_id: str, *, ok: bool,
 
 
 async def _park_run_on_card(db, row: AutomationOutbox,
-                            action_id: Optional[str]) -> None:
+                            result: dict) -> None:
     """waiting_on_user + config.pending_action_id — the EXISTING
-    resolve-pending-action hop then closes the run when the user
-    decides, and the reaper's card-park sweep is the TTL backstop."""
+    resolve-pending-action hop closes the run when the user decides.
+
+    R29: the park now stamps `error_class` (the class the reaper and
+    the confirm sweep match on — R28 omitted it, which made the park
+    invisible to every TTL backstop), a user_message that says what
+    "Waiting on you" means, and the session's pending-action card so
+    the park is visible where the automation lives.
+    """
+    from app.agent.job_status import ERR_AWAITING_CONFIRMATION
+    from . import confirm
+
     if not row.job_id:
         return
     job = await db.get(BuildJob, row.job_id)
     if job is None:
         return
+
+    action_id = result.get("action_id")
+    expires_at = result.get("expires_at")
+    card_msg_id: Optional[str] = None
+    automation = await db.get(Automation, row.automation_id)
+    if automation is not None and action_id:
+        card = confirm.pending_card_payload(
+            action_id=str(action_id),
+            connector_id=row.connector_id,
+            tool_name=row.tool_name,
+            summary=str(result.get("summary") or ""),
+            payload=result.get("payload")
+            if isinstance(result.get("payload"), dict) else None,
+            expires_at=str(expires_at) if expires_at else None,
+            automation_id=row.automation_id,
+            job_id=row.job_id,
+        )
+        card_msg_id = await confirm.write_pending_card(
+            db, automation=automation, job_id=row.job_id, card=card,
+        )
+
     cfg = dict(job.config_json or {})
     if action_id:
         cfg["pending_action_id"] = action_id
+    if expires_at:
+        cfg["pending_action_expires_at"] = str(expires_at)
+    if card_msg_id:
+        cfg["pending_card_message_id"] = card_msg_id
     job.config_json = cfg
     job.status = "waiting_on_user"
+    job.error_class = ERR_AWAITING_CONFIRMATION
+    job.user_message = (
+        "Waiting for your approval — nothing is sent until you confirm."
+    )
     job.completed_at = None
     await db.commit()
 

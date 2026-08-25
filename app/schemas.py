@@ -854,6 +854,15 @@ class ChatMessageResponse(BaseModel):
     # same names). Contract shared with the Round-26 app session.
     automation_connector_card: Optional[dict] = None
     automation_grant_card: Optional[dict] = None
+    # Automations (Round 29) — session-thread chips/cards, persisted
+    # under the same-named metadata keys (CONTRACTS-R29 §4):
+    #   draft_card    {provider, sender, subject, preview, open_url}
+    #   memory_update {count, at}
+    #   fix_chip      {label, prompt} — prompt is sent as a user turn
+    # Same declare-or-dropped rule as the Round-26 cards above.
+    draft_card: Optional[dict] = None
+    memory_update: Optional[dict] = None
+    fix_chip: Optional[dict] = None
     # Generated-file attachments (doc-delivery feature). List of
     # {id, filename, mime_type, size_bytes, created_at}. storage_path
     # is stripped server-side — it's an internal key.

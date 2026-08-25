@@ -88,6 +88,10 @@ def test_full_profile_has_every_historic_section():
         "media",
         "runtime",
         "vibecoding",
+        "automation_session",  # R29: present only when the turn is
+                               # addressed to an automation's session
+                               # thread (agent_runner builds it from
+                               # automations/interview.py)
         "formatting",
         "onboarding",
         "activation",

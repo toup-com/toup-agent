@@ -195,6 +195,16 @@ def _serialize_automation_card(msg: Message, key: str) -> Optional[dict]:
     return card if isinstance(card, dict) and card.get("id") else None
 
 
+def _serialize_meta_card(msg: Message, key: str) -> Optional[dict]:
+    """Round 29 — dict-shaped metadata payloads with no `id` field:
+    `pending_action` (the confirm card, same key the chat path uses),
+    `draft_card`, `memory_update`, and `fix_chip`. Same four-serializer
+    parity contract as the automation cards above."""
+    parsed = _metadata(msg)
+    card = parsed.get(key)
+    return card if isinstance(card, dict) and card else None
+
+
 def _serialize_tool_events(msg: Message) -> Optional[List[dict]]:
     """Extract the ToolPillRow records persisted in metadata_json by
     agent_runner. Shape per record: {tool, started_at_ms,
@@ -574,6 +584,10 @@ async def get_day_chat_messages(
                     m, "automation_connector_card"),
                 "automation_grant_card": _serialize_automation_card(
                     m, "automation_grant_card"),
+                "pending_action": _serialize_meta_card(m, "pending_action"),
+                "draft_card": _serialize_meta_card(m, "draft_card"),
+                "memory_update": _serialize_meta_card(m, "memory_update"),
+                "fix_chip": _serialize_meta_card(m, "fix_chip"),
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
@@ -653,6 +667,10 @@ async def get_day_chat_messages(
                 msg, "automation_connector_card"),
             "automation_grant_card": _serialize_automation_card(
                 msg, "automation_grant_card"),
+            "pending_action": _serialize_meta_card(msg, "pending_action"),
+            "draft_card": _serialize_meta_card(msg, "draft_card"),
+            "memory_update": _serialize_meta_card(msg, "memory_update"),
+            "fix_chip": _serialize_meta_card(msg, "fix_chip"),
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),

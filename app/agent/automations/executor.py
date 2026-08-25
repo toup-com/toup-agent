@@ -295,17 +295,25 @@ async def ingest_items(
     return fresh
 
 
-def _passes_filter(vspec: ValidatedSpec, payload: dict) -> bool:
+def _passes_filter(vspec: ValidatedSpec, payload: dict,
+                   facts_ctx: Optional[dict] = None) -> bool:
     """Filter rules: {field: [substrings]} — the event passes when, for
-    every constrained field, at least one substring matches
-    (case-insensitive). Empty/absent rules match everything."""
+    every constrained field, at least one needle matches
+    (case-insensitive). Empty/absent rules match everything.
+
+    R29: a `{{facts.<category>}}` needle matches against the
+    automation's fact ledger instead (facts_context — the
+    "memory-filtered" leg); `facts_ctx` is the pre-loaded context and
+    None keeps the pure-literal fast path byte-identical."""
+    from .facts_context import needle_matches
+
     for fld, needles in (vspec.filter_rules or {}).items():
         if not needles:
             continue
         if not isinstance(needles, list):
             needles = [needles]
         value = str(payload.get(fld) or "").lower()
-        if not any(str(n).lower() in value for n in needles):
+        if not any(needle_matches(n, value, facts_ctx) for n in needles):
             return False
     return True
 
@@ -352,7 +360,11 @@ async def _run_event_inner(
 
     # evaluate — a filtered event is recorded, never run (the honest
     # answer to "why didn't my rule fire?").
-    if not _passes_filter(vspec, payload):
+    from .facts_context import load_facts_context
+    facts_ctx = await load_facts_context(
+        db, automation.id, vspec.filter_rules,
+    )
+    if not _passes_filter(vspec, payload, facts_ctx):
         event.status = "skipped_filter"
         await db.commit()
         return event.status

@@ -835,6 +835,12 @@ def _message_to_response(
             msg_metadata.get("automation_grant_card")
             if msg_metadata else None
         ),
+        # Round 29 session chips/cards — same parity rule as above.
+        draft_card=msg_metadata.get("draft_card") if msg_metadata else None,
+        memory_update=(
+            msg_metadata.get("memory_update") if msg_metadata else None
+        ),
+        fix_chip=msg_metadata.get("fix_chip") if msg_metadata else None,
         # Operator notice (admin dispatch). The clients fall back from
         # /api/day-chats/.../messages to these session routes whenever
         # day-chats fails, so a field emitted by only one serializer

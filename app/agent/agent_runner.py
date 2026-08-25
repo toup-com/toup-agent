@@ -1745,6 +1745,9 @@ class AgentRunner:
             # 2026-04-13 (audit A2-1).
             client_tz = await self._resolve_effective_tz(db, user_id, client_tz, channel)
             t_db = time.perf_counter()
+            # R29: set on the automation-session path below; every other
+            # path (incl. SUBAGENT's sentinel branch) stays None.
+            _automation_ctx = None
             if prompt_profile == PromptProfile.SUBAGENT:
                 # W1.2(d): child runs never persist through this session —
                 # save flags are False and the announce-back writes its own
@@ -1781,6 +1784,22 @@ class AgentRunner:
                 session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz, ephemeral=_ephemeral_session)
                 session_id = session.id
                 logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
+
+                # ── R29: a turn addressed to an automation's session ──
+                # thread gets the automation in its prompt (name, rule,
+                # fact ledger, interview posture) and its OWN post-turn
+                # fact extractor instead of the global curator. Built
+                # here because both the session row and the db are in
+                # scope; a run-local (not self.*) because the
+                # post-processing closure must not race a later turn
+                # (the W1.4c rule).
+                if getattr(session, "channel", None) == "automation":
+                    from app.agent.automations.interview import (
+                        build_automation_context,
+                    )
+                    _automation_ctx = await build_automation_context(
+                        db, session,
+                    )
             # Stamp the conversation onto the tool context and reset the
             # per-turn created-job list. Must be here, not with the other
             # set_* calls above: session_id is only resolved above. The
@@ -2008,6 +2027,7 @@ class AgentRunner:
                 channel=channel, intent=query_intent, client_tz=client_tz,
                 prompt_profile=prompt_profile,
                 subagent_task_label=subagent_task_label,
+                automation_context=_automation_ctx,
                 turn_context_out=_turn_context_parts if _stable_layout else None,
             )
             # W1.4c: capture THIS turn's trivial classification synchronously,
@@ -3746,11 +3766,42 @@ class AgentRunner:
             for tc in all_tool_calls if isinstance(tc, dict)
         )
 
+        # R29: automation-session turns run their OWN extractor into the
+        # automation's fact ledger (which projects to the brain itself,
+        # CONTRACTS-R29 §4) — running the global curator beside it would
+        # file the same facts twice. Captured race-free like the
+        # neighbors above (W1.4c).
+        _automation_ctx_for_bg = _automation_ctx
+
         async def _background_post_processing():
             try:
                 async with async_session_maker() as bg_db:
                     try:
-                        if settings.auto_extract_memories and final_text:
+                        if (
+                            settings.auto_extract_memories and final_text
+                            and _automation_ctx_for_bg
+                        ):
+                            try:
+                                from app.agent.automations.interview import (
+                                    extract_and_record_facts,
+                                )
+                                _n_facts = await extract_and_record_facts(
+                                    bg_db,
+                                    user_id=user_id,
+                                    ctx=_automation_ctx_for_bg,
+                                    user_text=_curator_user_text,
+                                    assistant_text=final_text,
+                                )
+                                logger.info(
+                                    "[AGENT] Background: automation interview "
+                                    "filed %d fact(s)", _n_facts,
+                                )
+                            except Exception as _iv_err:  # noqa: BLE001
+                                logger.warning(
+                                    "[AGENT] Interview extractor failed "
+                                    "(non-fatal): %s", _iv_err,
+                                )
+                        elif settings.auto_extract_memories and final_text:
                             try:
                                 from app.services import memory_curator
 
@@ -4489,11 +4540,10 @@ class AgentRunner:
                 # (returns is_new=False like the system-channel path —
                 # the thread is continuous even when the row is fresh).
                 if session.channel == "automation":
-                    try:
-                        _auto_meta = json.loads(session.metadata_json or "{}")
-                    except (ValueError, TypeError):
-                        _auto_meta = {}
-                    _auto_id = _auto_meta.get("automation_id")
+                    from app.agent.automations.session import (
+                        automation_id_of,
+                    )
+                    _auto_id = automation_id_of(session)
                     if _auto_id:
                         _started = session.started_at
                         if _started is not None and _started.tzinfo is None:
@@ -4658,6 +4708,7 @@ class AgentRunner:
         client_tz: Optional[str] = None,
         prompt_profile: Optional["PromptProfile"] = None,
         subagent_task_label: Optional[str] = None,
+        automation_context: Optional[dict] = None,
         turn_context_out: Optional[Dict[str, str]] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
@@ -5976,6 +6027,22 @@ class AgentRunner:
                 "relevant) what you recommend. This message is what "
                 "the supervisor and the user will see.\n"
             )
+
+        # ── Automation session context (R29) ───────────────────────
+        # Present only when the turn is addressed to an automation's
+        # session thread: what the automation is, what its fact ledger
+        # knows, and the interview posture. Composed by
+        # automations/interview.py; absent for every other turn.
+        if automation_context:
+            try:
+                from app.agent.automations.interview import prompt_section
+                section_parts["automation_session"] = prompt_section(
+                    automation_context,
+                )
+            except Exception as e:  # noqa: BLE001 — a turn never fails on it
+                logger.warning(
+                    "[AGENT] automation session section skipped: %s", e,
+                )
 
         # ── Assemble in order ──────────────────────────────────────
         # Per-profile section allow-list. The FULL profile mirrors

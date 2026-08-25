@@ -37,6 +37,18 @@ logger = logging.getLogger(__name__)
 SESSION_CHANNEL = "automation"
 
 
+def automation_id_of(conversation) -> Optional[str]:
+    """The automation this conversation belongs to, or None. The one
+    parse for `metadata_json {"automation_id": …}` — the runner's R28
+    branch, both scans below, and the R29 turn path all read it."""
+    try:
+        meta = json.loads(conversation.metadata_json or "{}")
+    except (ValueError, TypeError):
+        return None
+    value = meta.get("automation_id")
+    return value if isinstance(value, str) and value else None
+
+
 async def resolve_session_conversation(
     db: AsyncSession,
     *,
@@ -74,11 +86,7 @@ async def resolve_session_conversation(
             )
         ).scalars().all()
         for conv in candidates:
-            try:
-                meta = json.loads(conv.metadata_json or "{}")
-            except (ValueError, TypeError):
-                continue
-            if meta.get("automation_id") == automation_id:
+            if automation_id_of(conv) == automation_id:
                 return conv, day_chat_id
     else:
         # Degraded path — same policy as conversation_resolver: create
@@ -132,11 +140,7 @@ async def list_session_conversation_ids(
     ).scalars().all()
     out = []
     for conv in rows:
-        try:
-            meta = json.loads(conv.metadata_json or "{}")
-        except (ValueError, TypeError):
-            continue
-        if meta.get("automation_id") == automation_id:
+        if automation_id_of(conv) == automation_id:
             out.append(conv.id)
     return out
 
@@ -273,3 +277,43 @@ async def write_run_card(
             "[automations] run card write failed job=%s: %s", job_id[:8], e,
         )
         return None, None
+
+
+async def emit_memory_update(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    automation_id: str,
+    count: int,
+    title: Optional[str] = None,
+) -> Optional[str]:
+    """The "Memory updated · N facts" chip (CONTRACTS-R29 §4): one
+    session marker message carrying `memory_update` in its metadata,
+    plus the live `automation_memory_update` frame — NO channel key
+    (the app's frame filter drops channeled frames). Best-effort like
+    every session write; the facts themselves are already committed by
+    the write seam before this is called."""
+    if count <= 0:
+        return None
+    at = datetime.utcnow().isoformat() + "Z"
+    noun = "fact" if count == 1 else "facts"
+    msg_id, _day = await write_session_message(
+        db,
+        user_id=user_id,
+        automation_id=automation_id,
+        content=f"Memory updated · {count} {noun}",
+        metadata={"memory_update": {"count": count, "at": at}},
+        title=title,
+    )
+    if msg_id:
+        try:
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(user_id, {
+                "type": "automation_memory_update",
+                "automation_id": automation_id,
+                "count": count,
+                "message_id": msg_id,
+            })
+        except Exception as e:  # noqa: BLE001 — no live socket is normal
+            logger.debug("[automations] memory chip broadcast skipped: %s", e)
+    return msg_id
