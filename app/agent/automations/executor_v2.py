@@ -71,17 +71,32 @@ def _step_order(vspec: ValidatedSpecV2) -> list[str]:
 
 
 def _new_steps_v2(vspec: ValidatedSpecV2) -> str:
+    """Humanized labels at mint (R29): steps_json is the shared
+    substrate (runs API, job cards, web) — spec steps wear their
+    tool's verb + connector brand, engine phases the orb (brand
+    None). The verb dictionary is the only composer."""
+    from app.services.automation_verbs import step_verb
+
+    by_id = {st.id: st for st in vspec.steps}
     now = datetime.utcnow()
-    steps = [
-        {"id": s, "type": "generic", "label": s.capitalize(),
-         "status": "pending", "started_at": None, "completed_at": None}
-        for s in _step_order(vspec)
-    ]
+    steps = []
+    for s in _step_order(vspec):
+        st = by_id.get(s)
+        if st is not None:
+            v = step_verb(st.tool, st.connector_id)
+        else:
+            v = step_verb(None, None, phase=s)
+        steps.append({
+            "id": s, "type": "generic", "label": v["label"],
+            "brand": v["brand"],
+            "status": "pending", "started_at": None, "completed_at": None,
+        })
     return job_steps.dump_steps(job_steps.open_first_step(steps, now))
 
 
 async def _advance_v2(db, job_id: str, vspec: ValidatedSpecV2,
-                      done_step: str) -> None:
+                      done_step: str,
+                      count: Optional[int] = None) -> None:
     from app.db.models import BuildJob
     job = await db.get(BuildJob, job_id)
     if job is None:
@@ -90,6 +105,14 @@ async def _advance_v2(db, job_id: str, vspec: ValidatedSpecV2,
     if done_step not in order:
         return
     steps = job_steps.parse_steps(job.steps_json)
+    if count is not None:
+        # A collected read's count rides the step dict (R29): the runs
+        # API's done-form verbs and the last-outcome sentence both read
+        # it back — steps_json is the one substrate.
+        for s in steps:
+            if s.get("id") == done_step:
+                s["count"] = count
+                break
     job.steps_json = job_steps.dump_steps(
         job_steps.advance_steps(
             steps, order.index(done_step), datetime.utcnow(),
@@ -290,7 +313,12 @@ async def _run_steps(
                 await _record_health(db, automation.id, ok=False,
                                      error=str(e)[:500])
                 return "failed"
-        await _advance_v2(db, job_id, vspec, st.id)
+        step_result = ctx["steps"].get(st.id) or {}
+        await _advance_v2(
+            db, job_id, vspec, st.id,
+            count=step_result.get("count")
+            if isinstance(step_result.get("count"), int) else None,
+        )
 
     if partial:
         # The aggregate finalizer reads this to report `partial`

@@ -804,3 +804,370 @@ def test_schedule_fires_are_keyed_per_instant_not_per_day():
         # retries of the SAME fire share the key
         assert key(kind, d, t1) == key(kind, d, t1), kind
     assert key("reminder", d, t1) == key("reminder", d, t2) == str(d)
+
+
+# ── Round 29: last outcome, unseen, payload shape, membership ────────
+
+
+@pytest.mark.asyncio
+async def test_finalize_stamps_last_outcome_before_notify(monkeypatch):
+    """CONTRACTS-R29.md §2 order pin: when the exactly-once notify
+    fires, the automation row ALREADY carries the sentence — and the
+    R28 wrote_count=0 bug stays dead (real count reaches the push)."""
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+    job_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=job_id, user_id=uid, title="Run", prompt="(automation)",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+        ))
+        await db.commit()
+
+    seen = {}
+
+    async def fake_notify(**kw):
+        async with async_session_maker() as db:
+            row = await db.get(Automation, a.id)
+            seen["stamped_at_notify"] = row.last_outcome
+            seen["text_at_notify"] = row.last_outcome_text
+        seen["wrote_count"] = kw.get("wrote_count")
+        return True
+
+    monkeypatch.setattr(
+        "app.agent.automations.notify.notify_run_outcome", fake_notify)
+
+    async with async_session_maker() as db:
+        await executor._finalize_job(
+            db, job_id, status="completed", outcome="sent",
+        )
+
+    assert seen["stamped_at_notify"] == "sent"
+    assert seen["text_at_notify"] == "Posted to Slack."
+    assert seen["wrote_count"] == 1
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        assert row.last_outcome_at is not None
+        assert row.outcome_seen_at is None
+
+
+@pytest.mark.asyncio
+async def test_unseen_flips_with_the_seen_cas_and_the_next_stamp():
+    from app.agent.automations.service import (
+        automation_payload, mark_outcome_seen,
+    )
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+
+    async def _terminal(outcome):
+        jid = str(uuid.uuid4())
+        async with async_session_maker() as db:
+            db.add(BuildJob(
+                id=jid, user_id=uid, title="Run", prompt="(automation)",
+                job_type="automation_run", status="running",
+                source_kind="automation", source_id=a.id,
+            ))
+            await db.commit()
+            await executor._finalize_job(
+                db, jid, status="completed", outcome=outcome,
+            )
+
+    await _terminal("sent")
+    async with async_session_maker() as db:
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["unseen"] is True
+    assert p["last_outcome"]["tone"] == "ok"
+    assert p["last_outcome"]["sentence"] == "Posted to Slack."
+
+    async with async_session_maker() as db:
+        await mark_outcome_seen(db, automation_id=a.id, user_id=uid)
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["unseen"] is False
+
+    await _terminal("sent")
+    async with async_session_maker() as db:
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["unseen"] is True, "a fresh terminal outcome re-arms unseen"
+
+
+@pytest.mark.asyncio
+async def test_payload_carries_the_r29_shape():
+    """B's canvas contract: connectors[], schedule_human, rule_text,
+    mode (already served, pinned so it cannot regress), attention."""
+    from app.agent.automations.service import automation_payload
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    async with async_session_maker() as db:
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["connectors"] == ["jira", "slack"]
+    assert p["schedule_human"] == "weekdays 8:00"
+    assert p["rule_text"] == (
+        "Every weekday at 8:00, check Jira and post to Slack."
+    )
+    assert p["mode"] == "auto"
+    assert p["attention"] is None
+    assert p["unseen"] is False and p["last_outcome"] is None
+    assert "domain" in p, "the v2 branch used to drop the column"
+    for s in p["steps"]:
+        assert "grant_target" not in s
+
+
+@pytest.mark.asyncio
+async def test_attention_states_are_explicit():
+    from app.agent.automations.service import (
+        automation_payload, pause_automation,
+    )
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+    async with async_session_maker() as db:
+        await pause_automation(
+            db, automation_id=a.id, user_id=uid, reason="grant_revoked",
+        )
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["attention"] == "grant_revoked"
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "error"
+        row.paused_reason = "auto_failures"
+        await db.commit()
+        p = automation_payload(await db.get(Automation, a.id))
+    assert p["attention"] == "auto_paused"
+
+
+@pytest.mark.asyncio
+async def test_steps_json_is_humanized_at_mint_with_brands():
+    """The substrate rule (§1): labels are human at MINT — every
+    downstream surface (runs API, job cards, web) inherits; no raw
+    step id or tool name is ever stored."""
+    from app.agent.automations.executor import _new_steps
+    from app.agent.automations.executor_v2 import _new_steps_v2
+
+    v1 = json.loads(_new_steps(_poll_spec()))
+    assert [s["label"] for s in v1] == [
+        "Checking triggers", "Composing", "Posting to Slack", "Wrapping up",
+    ]
+    assert [s["brand"] for s in v1] == [None, None, "slack", None]
+
+    v2 = json.loads(_new_steps_v2(_v2_spec()))
+    by_id = {s["id"]: s for s in v2}
+    assert by_id["issues"]["label"] == "Checking Jira"
+    assert by_id["issues"]["brand"] == "jira"
+    assert by_id["post"]["label"] == "Posting to Slack"
+    assert by_id["evaluate"]["brand"] is None
+    for s in v1 + v2:
+        assert "__" not in s["label"]
+
+
+@pytest.mark.asyncio
+async def test_runs_api_serves_verbs_with_counts_and_fix_chips(monkeypatch):
+    """One render path for every era: the collected count reaches the
+    done-form verb, a failed run grows its fix chip, and no served
+    step string carries a raw name."""
+    from app.agent.automations import executor_v2
+    from app.agent.automations.service import list_runs
+    from app.db.models import BuildJob
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+
+    dispatch = _fake_dispatch({
+        "jira__search_issues": {
+            "kind": "ok",
+            "content": json.dumps({"issues": [
+                {"key": "ENG-1", "summary": "a"},
+                {"key": "ENG-2", "summary": "b"},
+            ]}),
+        },
+        "slack__send_message": {"kind": "ok", "content": "{}"},
+    })
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", dispatch)
+    monkeypatch.setattr(executor_v2, "AUTOMATION_OUTBOX_UNDO_WINDOW_S", 0)
+
+    async with async_session_maker() as db:
+        jid = str(uuid.uuid4())
+        db.add(BuildJob(
+            id=jid, user_id=uid, title="Run", prompt="(automation)",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            steps_json=executor_v2._new_steps_v2(vspec),
+        ))
+        await db.commit()
+        await executor_v2._run_steps(
+            db, await db.get(Automation, a.id), vspec, jid, {}, None,
+            idem_prefix=f"t:{jid[:8]}",
+        )
+
+    async with async_session_maker() as db:
+        runs = await list_runs(db, uid)
+    run = next(r for r in runs if r["id"] == jid)
+    by_id = {s["id"]: s for s in run["steps"]}
+    assert by_id["issues"]["verb"] == "Read 2 Jira issues"
+    assert by_id["issues"]["brand"] == "jira"
+    assert by_id["post"]["brand"] == "slack"
+    assert run["fix"] is None
+    for s in run["steps"]:
+        assert "__" not in (s["verb"] or "")
+        assert "__" not in (s["label"] or "")
+
+    # A failed run grows the chip.
+    async with async_session_maker() as db:
+        fid = str(uuid.uuid4())
+        db.add(BuildJob(
+            id=fid, user_id=uid, title="Run", prompt="(automation)",
+            job_type="automation_run", status="failed",
+            outcome="step_failed", source_kind="automation", source_id=a.id,
+        ))
+        await db.commit()
+        runs = await list_runs(db, uid)
+    failed = next(r for r in runs if r["id"] == fid)
+    assert failed["fix"]["label"] == "Fix this"
+    assert "Brief v2" in failed["fix"]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_mode_and_membership_edits(monkeypatch):
+    """§3.2/§3.3 — the focused edits ride the full update path
+    (revalidate, recompile); refusals carry stable codes."""
+    from app.agent.automations import service
+    from app.db.models import Routine
+
+    async def _registry(user_id, *, force=False):
+        return REGISTRY_V2
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _registry)
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+
+    async with async_session_maker() as db:
+        automation, vspec = await service.set_schedule(
+            db, automation_id=a.id, user_id=uid,
+            schedule={"cron_local": "30 7 * * *"},
+        )
+        raw = json.loads(automation.spec_json)
+        sched = next(s for s in raw["trigger"]["sources"]
+                     if s["mode"] == "schedule")
+        assert sched["schedule"] == {"cron_local": "30 7 * * *"}
+        b_rows = (await db.execute(
+            select(AutomationBinding)
+            .where(AutomationBinding.automation_id == a.id)
+        )).scalars().all()
+        routine_ids = [b.target_id for b in b_rows if b.kind == "routine"]
+        crons = [
+            r.schedule_cron_local
+            for r in (await db.execute(
+                select(Routine).where(Routine.id.in_(routine_ids))
+            )).scalars().all()
+            if r.kind == "automation_schedule"
+        ]
+        assert crons == ["30 7 * * *"], "recompile carries the new cron"
+
+        with pytest.raises(service.MembershipError) as e:
+            await service.set_schedule(
+                db, automation_id=a.id, user_id=uid,
+                schedule={"cron_local": "0 8 * * *", "every_s": 60},
+            )
+        assert e.value.code == "bad_schedule"
+
+        automation, _ = await service.set_mode(
+            db, automation_id=a.id, user_id=uid, mode="confirm",
+        )
+        assert json.loads(automation.spec_json)["mode"] == "confirm"
+
+        # Membership: the write connector is load-bearing.
+        with pytest.raises(service.MembershipError) as e:
+            await service.remove_connector(
+                db, automation_id=a.id, user_id=uid, connector_id="slack",
+            )
+        assert e.value.code == "connector_required"
+        # Removing the only poll source's connector still leaves the
+        # schedule source — allowed, and the payload loses the brand.
+        automation, _ = await service.remove_connector(
+            db, automation_id=a.id, user_id=uid, connector_id="jira",
+        )
+        assert "jira" not in service.automation_payload(automation)[
+            "connectors"]
+        with pytest.raises(service.MembershipError) as e:
+            await service.remove_connector(
+                db, automation_id=a.id, user_id=uid, connector_id="jira",
+            )
+        assert e.value.code == "not_member"
+
+        # Re-add from the template skeleton.
+        async def _templates(user_id):
+            return [{
+                "slug": "brief-v2",
+                "spec": _v2_spec().raw,
+            }]
+        monkeypatch.setattr(
+            "app.agent.automations.registry.fetch_templates", _templates)
+        row = await db.get(Automation, a.id)
+        row.template_slug = "brief-v2"
+        await db.commit()
+        automation, _ = await service.add_connector(
+            db, automation_id=a.id, user_id=uid, connector_id="jira",
+        )
+        assert "jira" in service.automation_payload(automation)["connectors"]
+        with pytest.raises(service.MembershipError) as e:
+            await service.add_connector(
+                db, automation_id=a.id, user_id=uid, connector_id="jira",
+            )
+        assert e.value.code == "already_member"
+
+
+@pytest.mark.asyncio
+async def test_grant_revoked_hook_pauses_the_armed_dependent(monkeypatch):
+    """§3.1: the platform's revoke reaches the tenant through the
+    existing _grant_decided hook, which now pauses the armed dependent
+    (`grant_revoked`) — the dispatcher already fails closed; this makes
+    the STATE honest for the attention pill."""
+    from app.config import settings
+    from app.api.automations import GrantHook, grant_decided_hook
+    from app.agent.automations.service import automation_payload
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "armed"
+        await db.commit()
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    await grant_decided_hook(GrantHook(
+        grant_id=str(uuid.uuid4()), status="revoked",
+        payload={"automation_id": a.id},
+    ))
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        assert row.status == "error"
+        assert row.paused_reason == "grant_revoked"
+        assert automation_payload(row)["attention"] == "grant_revoked"
+
+    # A non-revoke decision leaves the automation alone.
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "armed"
+        row.paused_reason = None
+        await db.commit()
+    await grant_decided_hook(GrantHook(
+        grant_id=str(uuid.uuid4()), status="approved",
+        payload={"automation_id": a.id},
+    ))
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        assert row.status == "armed"

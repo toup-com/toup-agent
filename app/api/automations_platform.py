@@ -221,6 +221,45 @@ async def create_grant_request(
             detail="target.id is required — a grant pins ONE target",
         )
 
+    # R29 §5 — the scope truth, checked while the user is still in the
+    # setup conversation: a connected identity that never consented to
+    # the write's scope (a pre-R29 Outlook connection vs Mail.ReadWrite)
+    # gets the stable reconnect-shaped refusal HERE, not a doomed grant
+    # card followed by dispatch-time 403s.
+    needed_scopes = list(
+        (cap.scopes_write_by_action or {}).get(req.tool_name) or []
+    )
+    if needed_scopes:
+        from app.services import connector_vault as vault
+        held: Optional[set] = None
+        async with async_session_maker() as db:
+            for ident in await vault.list_active(db, user_id):
+                if ident.connector_id == req.connector_id:
+                    try:
+                        held = set(json.loads(ident.scopes_json or "[]"))
+                    except (ValueError, TypeError):
+                        held = set()
+                    break
+        # A connection with NO recorded scopes predates scope tracking —
+        # let dispatch fail honestly rather than refusing everyone.
+        if held:
+            missing = [s for s in needed_scopes if s not in held]
+            if missing:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "scope_missing",
+                        "connector_id": req.connector_id,
+                        "needed_scope": missing[0],
+                        "reconnect": True,
+                        "message": (
+                            f"The connected {req.connector_id} account "
+                            f"hasn't granted the permission this action "
+                            f"needs — reconnect it to continue."
+                        ),
+                    },
+                )
+
     row = AutomationGrant(
         user_id=user_id,
         automation_id=req.automation_id,
@@ -346,6 +385,13 @@ def _serialize_connector_result(result: Any) -> dict:
         return {"kind": "confirmation_required",
                 "action_id": result.action_id,
                 "summary": result.summary,
+                # R29-C's park card + expiry sweep read these from the
+                # envelope (the MCP serializer already sends both) —
+                # without them the card is payload-less and expiry
+                # falls back to the generic 25h.
+                "payload": result.payload or {},
+                "expires_at": (result.expires_at.isoformat() + "Z")
+                if result.expires_at else None,
                 "retryable": False,
                 "message": "staged for user confirmation — not executed"}
     if isinstance(result, ConnectorToolError):

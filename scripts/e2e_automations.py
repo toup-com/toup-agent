@@ -107,6 +107,21 @@ def _wait_port(port: int, timeout: float = 60.0) -> bool:
 
 async def main() -> int:
     # ── boot the platform for real ──────────────────────────────────
+    # A LEAKED child from a crashed earlier run keeps LISTENing here —
+    # the fresh uvicorn then dies on the bind while the harness
+    # health-checks the ZOMBIE (old tree, old DB) and every failure
+    # after that is nonsense ("no such table: agent_configs"). Fail
+    # LOUD before booting instead of debugging a stranger (R29).
+    with socket.socket() as _probe:
+        _probe.settimeout(0.5)
+        try:
+            _probe.connect(("127.0.0.1", _PORT))
+            print(f"❌ port {_PORT} is already in use — a leaked platform "
+                  f"from a crashed run? `lsof -ti :{_PORT} | xargs kill` "
+                  f"and re-run (or set E2E_PLATFORM_PORT).")
+            return 1
+        except OSError:
+            pass
     log_path = _DB_PATH.parent / "platform.log"
     log_f = open(log_path, "w")
     print(f"  (platform log: {log_path})")
@@ -692,6 +707,149 @@ async def main() -> int:
             undo_res = await undo_outbox(fresh_id)
             check("undo route cancels an in-window row",
                   undo_res.get("undone") is True, str(undo_res))
+
+            # ═══ Round 29: verbs, last outcome, facts, grants ═══════
+            from app.db.models import Automation
+            from app.api.automations import (
+                add_memory_fact, delete_memory_fact, list_memory_facts,
+                list_runs as runs_route, list_automations as list_route,
+                mark_seen, update_memory_fact, FactBody, FactPatchBody,
+            )
+
+            listing = {a["id"]: a for a in
+                       (await list_route())["automations"]}
+            row = listing.get(automation.id) or {}
+            check("R29 list payload: connectors + rule_text + "
+                  "schedule keys",
+                  row.get("connectors") == ["stub"]
+                  and "schedule_human" in row
+                  and (row.get("rule_text") or "").startswith("When a new")
+                  and "post to the test channel" in
+                  (row.get("rule_text") or ""),
+                  str({k: row.get(k) for k in
+                       ("connectors", "schedule_human", "rule_text")}))
+            lo = row.get("last_outcome") or {}
+            check("R29 last outcome stamped by the runs, unseen until "
+                  "opened",
+                  row.get("unseen") is True
+                  and lo.get("tone") in ("ok", "warn", "err")
+                  and lo.get("sentence") and "__" not in lo["sentence"],
+                  str((row.get("unseen"), lo))[:160])
+            await mark_seen(automation.id)
+            listing = {a["id"]: a for a in
+                       (await list_route())["automations"]}
+            check("R29 seen CAS clears unseen",
+                  listing[automation.id]["unseen"] is False)
+
+            served_runs = (await runs_route(
+                automation_id=automation.id, limit=20))["runs"]
+            step_strings = [
+                s.get(k) or ""
+                for r in served_runs for s in r["steps"]
+                for k in ("verb", "label")
+            ]
+            check("R29 runs carry verb+brand and no raw tool names",
+                  served_runs
+                  and all("verb" in s and "brand" in s
+                          for r in served_runs for s in r["steps"])
+                  and all("__" not in x for x in step_strings),
+                  str(step_strings)[:200])
+            done_writes = [
+                s["verb"] for r in served_runs for s in r["steps"]
+                if s.get("brand") == "stub"
+                and s.get("status") in ("done", "completed")
+            ]
+            check("R29 write steps wear the dictionary's done form",
+                  done_writes
+                  and all(v == "Posted to the test channel"
+                          for v in done_writes),
+                  str(done_writes)[:120])
+
+            # Curated facts: user CRUD through the routes, agent batch
+            # through the seam, attribution derived.
+            from app.agent.automations import facts as facts_mod
+            fact = (await add_memory_fact(automation.id, FactBody(
+                text="Standup moved to 9:15", category="work",
+            )))["fact"]
+            async with async_session_maker() as db:
+                await facts_mod.record(
+                    db, user_id=user_id, automation_id=automation.id,
+                    facts=["Boss is Sarah", "Prefers bullets"],
+                    category="preferences", source="agent",
+                    source_kind="automation_run", run_id="run-e2e",
+                )
+            ledger = await list_memory_facts(automation.id)
+            check("R29 facts ledger lists both sources in category "
+                  "order",
+                  len(ledger["facts"]) == 3
+                  and ledger["last_agent_update"]["count"] == 2
+                  and [f["category"] for f in ledger["facts"]][:2]
+                  == ["preferences", "preferences"],
+                  str(ledger)[:200])
+            await update_memory_fact(
+                automation.id, fact["id"],
+                FactPatchBody(text="Standup moved to 9:30"),
+            )
+            await delete_memory_fact(automation.id, fact["id"])
+            ledger = await list_memory_facts(automation.id)
+            check("R29 fact edit+delete land",
+                  len(ledger["facts"]) == 2
+                  and all(f["text"] != "Standup moved to 9:30"
+                          for f in ledger["facts"]))
+
+            # Grants on the Overview — platform-native, over the wire.
+            async with async_session_maker() as db:
+                from app.db.models import AutomationGrant
+                g_row = AutomationGrant(
+                    user_id=user_id, automation_id=automation.id,
+                    connector_id="stub", tool_name="stub__post",
+                    target_json=json.dumps({"kind": "channel",
+                                            "id": "chan-1"}),
+                    mode="auto", summary="post to the test channel",
+                    status="approved", decided_at=datetime.utcnow(),
+                    expires_at=datetime.utcnow() + timedelta(hours=1),
+                )
+                db.add(g_row)
+                await db.commit()
+                g_row_id = g_row.id
+            r = await http.get(
+                f"/api/automations/{automation.id}/grants",
+                headers=user_h)
+            served = {g["id"] for g in r.json().get("grants", [])}
+            check("R29 grants list serves the automation's grants",
+                  r.status_code == 200 and g_row_id in served,
+                  str(r.json())[:160])
+            r = await http.post(
+                f"/api/automations/{automation.id}/grants/"
+                f"{g_row_id}/revoke",
+                headers=user_h)
+            check("R29 nested revoke transitions the grant",
+                  r.status_code == 200
+                  and r.json().get("status") == "revoked",
+                  str(r.json())[:120])
+            # The pause half of revoke rides the _grant_decided hook —
+            # in-process here (the monolith has no agent HTTP server
+            # for the platform to call back).
+            async with async_session_maker() as db:
+                a_row = await db.get(Automation, automation.id)
+                a_row.status = "armed"
+                a_row.paused_reason = None
+                await db.commit()
+            await grant_decided_hook(GrantHook(
+                grant_id=g_row_id, status="revoked",
+                payload={"automation_id": automation.id},
+            ))
+            listing = {a["id"]: a for a in
+                       (await list_route())["automations"]}
+            check("R29 revoked grant pauses the dependent "
+                  "(attention=grant_revoked)",
+                  listing[automation.id]["attention"] == "grant_revoked",
+                  str(listing[automation.id].get("attention")))
+
+            check("R29 template cadence tag",
+                  tpls["morning-work-brief"].get("cadence_human")
+                  == "weekdays 8:00",
+                  str(tpls["morning-work-brief"].get("cadence_human")))
 
             # ── real-vendor mode ────────────────────────────────────
             vendor = os.environ.get("E2E_CONNECTOR")

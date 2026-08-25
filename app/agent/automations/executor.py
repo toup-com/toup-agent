@@ -54,13 +54,26 @@ _FORBIDDEN_TOOLS = frozenset({"gmail__send_message", "outlook__send_message"})
 _STEPS = ("evaluate", "prepare", "write", "record")
 
 
-def _new_steps() -> str:
+def _new_steps(vspec: Optional[ValidatedSpec] = None) -> str:
+    """Step ledger with HUMANIZED labels at mint (R29): steps_json is
+    the shared substrate (runs API, job cards, web), so the verb
+    dictionary applies here, not at render time. The write step wears
+    the spec's action verb + connector brand; engine phases brand as
+    the orb (brand None)."""
+    from app.services.automation_verbs import step_verb
+
     now = datetime.utcnow()
-    steps = [
-        {"id": s, "type": "generic", "label": s.capitalize(),
-         "status": "pending", "started_at": None, "completed_at": None}
-        for s in _STEPS
-    ]
+    steps = []
+    for s in _STEPS:
+        if s == "write" and vspec is not None and vspec.action_tool:
+            v = step_verb(vspec.action_tool, vspec.action_connector_id)
+        else:
+            v = step_verb(None, None, phase=s)
+        steps.append({
+            "id": s, "type": "generic", "label": v["label"],
+            "brand": v["brand"],
+            "status": "pending", "started_at": None, "completed_at": None,
+        })
     return job_steps.dump_steps(job_steps.open_first_step(steps, now))
 
 
@@ -112,6 +125,15 @@ async def _finalize_job(
     # rowcount makes "exactly once" free: only the call that actually
     # flipped the row notifies. The composer gates on noteworthiness
     # and never raises.
+    #
+    # R29 ordering contract (CONTRACTS-R29.md §2): the last-outcome
+    # stamp lands BEFORE the notify — a push can never reference a
+    # sentence that isn't stamped yet. R29-C's additions go after.
+    stamp = None
+    if result.rowcount == 1 and job is not None and job.source_id:
+        stamp = await _stamp_last_outcome(
+            db, job, status=status, outcome=outcome,
+        )
     if result.rowcount == 1 and status == "completed" and job is not None:
         try:
             if job.source_id:
@@ -124,6 +146,7 @@ async def _finalize_job(
                         automation_name=a.name,
                         job_id=job_id,
                         outcome=outcome,
+                        wrote_count=(stamp or {}).get("wrote_count", 0),
                         chat_id=job.conversation_id,
                         message_id=job.summary_message_id,
                     )
@@ -132,6 +155,72 @@ async def _finalize_job(
                 "[automations] finalize notify skipped job=%s: %s",
                 job_id[:8], e,
             )
+
+
+def _spec_write_shape(spec_raw: dict) -> tuple[Optional[str], Optional[str],
+                                               int, dict]:
+    """(write_tool, connector_id, wrote_count, step_id→connector) from a
+    persisted canonical spec dict — shape-only, no validation."""
+    if spec_raw.get("version") == 2:
+        steps = [s for s in (spec_raw.get("steps") or [])
+                 if isinstance(s, dict)]
+        writes = [s for s in steps if s.get("grant_id")]
+        by_id = {s.get("id"): s.get("connector_id") for s in steps}
+        first = writes[0] if writes else {}
+        return (first.get("tool"), first.get("connector_id"),
+                len(writes), by_id)
+    action = spec_raw.get("action") or {}
+    return (action.get("tool"), action.get("connector_id"),
+            1 if action.get("tool") else 0, {})
+
+
+async def _stamp_last_outcome(
+    db: AsyncSession, job: BuildJob, *, status: str, outcome: Optional[str],
+) -> Optional[dict]:
+    """Stamp the automation's last-outcome columns (R29 §2). The stamp
+    itself makes the row UNSEEN (last_outcome_at outruns
+    outcome_seen_at); `POST /{id}/seen` is the CAS that clears it.
+    Best-effort — never fails the finalize."""
+    try:
+        a = await db.get(Automation, job.source_id)
+        if a is None:
+            return None
+        try:
+            spec_raw = json.loads(a.spec_json or "{}")
+        except (ValueError, TypeError):
+            spec_raw = {}
+        write_tool, connector_id, wrote_count, by_id = \
+            _spec_write_shape(spec_raw)
+        counts: dict[str, int] = {}
+        try:
+            for s in json.loads(job.steps_json or "[]"):
+                if isinstance(s, dict) and isinstance(s.get("count"), int):
+                    cid = by_id.get(s.get("id"))
+                    if cid:
+                        counts[cid] = counts.get(cid, 0) + s["count"]
+        except (ValueError, TypeError):
+            pass
+        from app.services.automation_verbs import outcome_sentence
+        stored = outcome or status
+        sent = outcome_sentence(
+            outcome, write_tool=write_tool, connector_id=connector_id,
+            counts=counts, wrote_count=wrote_count,
+        )
+        a.last_outcome = (stored or "")[:24] or None
+        a.last_outcome_text = sent["sentence"][:300]
+        a.last_outcome_at = datetime.utcnow()
+        await db.commit()
+        return {"wrote_count": wrote_count, "counts": counts}
+    except Exception as e:  # noqa: BLE001 — a stamp never fails a run
+        logger.warning(
+            "[automations] last-outcome stamp skipped job=%s: %s",
+            job.id[:8], e,
+        )
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
 
 async def _record_health(
@@ -281,7 +370,7 @@ async def _run_event_inner(
         title=f"{automation.name}"[:100],
         idempotency_key=f"evt:{event.id}",
         status="running",
-        steps_json=_new_steps(),
+        steps_json=_new_steps(vspec),
         layer=0,
     )
     event.status = "run"
@@ -316,7 +405,7 @@ async def run_schedule_fire(
             title=f"{automation.name}"[:100],
             idempotency_key=f"fire:{fire_key}"[:120],
             status="running",
-            steps_json=_new_steps(),
+            steps_json=_new_steps(vspec),
             layer=0,
         )
         await on_run_created(db, job=job, automation=automation)
@@ -434,7 +523,7 @@ async def execute_test_run(
         title=f"[test] {automation.name}"[:100],
         idempotency_key=f"test:{uuid.uuid4()}",
         status="running",
-        steps_json=_new_steps(),
+        steps_json=_new_steps(vspec),
         layer=0,
     )
     await on_run_created(db, job=job, automation=automation)

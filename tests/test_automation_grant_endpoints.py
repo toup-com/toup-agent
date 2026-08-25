@@ -299,3 +299,191 @@ async def test_rpc_connections_disclose_the_bound_account(
     assert by_id["gmail"]["account"] == "person@gmail.com"
     assert by_id["gmail"]["connected"] is True
     assert by_id["outlook"]["account"] is None
+
+
+# ── Round 29: grants on the Overview, mode consent, scope truth ──────
+
+
+async def _mk_approved_grant(user_id: str, automation_id: str) -> str:
+    row = AutomationGrant(
+        user_id=user_id,
+        automation_id=automation_id,
+        connector_id="slack",
+        tool_name="slack__send_message",
+        target_json=json.dumps({"kind": "channel", "id": "C1",
+                                "label": "#eng"}),
+        mode="auto",
+        summary="post to #eng",
+        status="approved",
+        decided_at=datetime.utcnow(),
+        expires_at=datetime.utcnow() + timedelta(hours=1),
+    )
+    async with async_session_maker() as db:
+        db.add(row)
+        await db.commit()
+        return row.id
+
+
+@pytest.mark.asyncio
+async def test_grants_list_scoped_to_owner_and_automation(
+    client, auth_headers, test_user_id,
+):
+    await _flag_on()
+    aid = str(uuid.uuid4())
+    gid = await _mk_approved_grant(test_user_id, aid)
+    await _mk_pending_grant(test_user_id)          # no automation_id
+    await _mk_approved_grant(test_user_id, str(uuid.uuid4()))  # other one
+
+    r = await client.get(f"/api/automations/{aid}/grants",
+                         headers=auth_headers)
+    assert r.status_code == 200
+    grants = r.json()["grants"]
+    assert [g["id"] for g in grants] == [gid]
+    assert grants[0]["granted_at"] is not None
+    assert grants[0]["action_label"] == "send message"
+
+
+@pytest.mark.asyncio
+async def test_nested_revoke_checks_the_automation_and_notifies(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    await _flag_on()
+    aid = str(uuid.uuid4())
+    gid = await _mk_approved_grant(test_user_id, aid)
+
+    decided = []
+
+    async def _capture(db, uid, row):
+        decided.append(row.status)
+
+    monkeypatch.setattr(
+        "app.api.automations_proxy._notify_agent_grant_decided", _capture)
+
+    r = await client.post(
+        f"/api/automations/{str(uuid.uuid4())}/grants/{gid}/revoke",
+        headers=auth_headers,
+    )
+    assert r.status_code == 404, "wrong automation must not find the grant"
+
+    r = await client.post(
+        f"/api/automations/{aid}/grants/{gid}/revoke", headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "revoked"
+    assert decided == ["revoked"], "the agent hook heard about it"
+
+    r = await client.post(
+        f"/api/automations/{aid}/grants/{gid}/revoke", headers=auth_headers,
+    )
+    assert r.status_code == 409, "revoke is one-way"
+
+
+@pytest.mark.asyncio
+async def test_mode_patch_flips_spec_then_grants(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """§3.3: the user-JWT route is the ONLY door to a grant's mode —
+    it proxies the spec flip to the agent first, then moves every
+    approved grant, stamping mode_changed_at."""
+    from fastapi import Response
+
+    await _flag_on()
+    aid = str(uuid.uuid4())
+    gid = await _mk_approved_grant(test_user_id, aid)
+
+    proxied = []
+
+    async def _fake_proxy(request, sub_path, *, current_user, db):
+        proxied.append(sub_path)
+        return Response(content=b'{"automation": {}}', status_code=200,
+                        media_type="application/json")
+
+    monkeypatch.setattr("app.api.automations_proxy._proxy", _fake_proxy)
+
+    r = await client.patch(
+        f"/api/automations/{aid}/mode", json={"mode": "confirm"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert proxied == [f"/{aid}/mode"], "spec flip proxied to the agent"
+    async with async_session_maker() as db:
+        row = await db.get(AutomationGrant, gid)
+        assert row.mode == "confirm"
+        assert row.mode_changed_at is not None
+
+    # An agent 409 (e.g. draft automation mid-edit) leaves grants alone.
+    async def _refusing_proxy(request, sub_path, *, current_user, db):
+        return Response(content=b'{"detail": "no"}', status_code=409,
+                        media_type="application/json")
+
+    monkeypatch.setattr("app.api.automations_proxy._proxy", _refusing_proxy)
+    r = await client.patch(
+        f"/api/automations/{aid}/mode", json={"mode": "auto"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 409
+    async with async_session_maker() as db:
+        row = await db.get(AutomationGrant, gid)
+        assert row.mode == "confirm", "a refused spec flip moves no grant"
+
+
+@pytest.mark.asyncio
+async def test_outlook_draft_grant_needs_the_reconnect(
+    client, test_user_id,
+):
+    """§5 scope truth: a pre-R29 Outlook connection (no Mail.ReadWrite)
+    gets the stable 409 scope_missing at grant-request time; a
+    reconnected one proceeds; a connection with NO recorded scopes is
+    let through (dispatch fails honestly instead)."""
+    await _flag_on()
+    key = await _mk_agent_config(test_user_id)
+    headers = {"X-Agent-Key": key, "X-Agent-User-Id": test_user_id}
+
+    from app.services.connector_registry import get_registry
+    if not get_registry().automation_registry():
+        get_registry().load_all(include_experimental=True)
+
+    from app.db.models.connectors import ConnectorIdentity
+    async with async_session_maker() as db:
+        db.add(ConnectorIdentity(
+            user_id=test_user_id, connector_id="outlook", status="active",
+            scopes_json=json.dumps([
+                "https://graph.microsoft.com/Mail.Read",
+                "https://graph.microsoft.com/Mail.Send",
+            ]),
+        ))
+        await db.commit()
+
+    body = {
+        "connector_id": "outlook",
+        "tool_name": "outlook__create_draft",
+        "target": {"kind": "recipient", "id": "boss@corp.com",
+                   "label": "boss@corp.com"},
+        "summary": "draft replies to the boss",
+    }
+    r = await client.post("/api/v1/automations/grant-requests",
+                          json=body, headers=headers)
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["code"] == "scope_missing"
+    assert detail["connector_id"] == "outlook"
+    assert detail["reconnect"] is True
+    assert "Mail.ReadWrite" in detail["needed_scope"]
+
+    # Reconnected: the scope is on the identity now.
+    from sqlalchemy import update as sa_update
+    async with async_session_maker() as db:
+        await db.execute(
+            sa_update(ConnectorIdentity)
+            .where(ConnectorIdentity.user_id == test_user_id)
+            .where(ConnectorIdentity.connector_id == "outlook")
+            .values(scopes_json=json.dumps([
+                "https://graph.microsoft.com/Mail.Read",
+                "https://graph.microsoft.com/Mail.ReadWrite",
+            ]))
+        )
+        await db.commit()
+    r = await client.post("/api/v1/automations/grant-requests",
+                          json=body, headers=headers)
+    assert r.status_code == 200
+    assert r.json()["grant"]["status"] == "pending"

@@ -22,6 +22,7 @@ oauth:
   provider_app: microsoft
   scopes:
     - https://graph.microsoft.com/Mail.Read
+    - https://graph.microsoft.com/Mail.ReadWrite
     - https://graph.microsoft.com/Mail.Send
     - https://graph.microsoft.com/User.Read
     - offline_access
@@ -31,6 +32,7 @@ oauth:
 
 scope_descriptions:
   https://graph.microsoft.com/Mail.Read: Read your Outlook mail.
+  https://graph.microsoft.com/Mail.ReadWrite: Save drafts to your Outlook mailbox (never sends).
   https://graph.microsoft.com/Mail.Send: Send mail on your behalf.
   https://graph.microsoft.com/User.Read: Read your basic profile (mailbox address, display name).
   offline_access: Refresh tokens so we don't ask you to sign in every hour.
@@ -83,6 +85,33 @@ tools:
       default: allow
       deny: []
 
+  - name: outlook__create_draft
+    description: |
+      Compose a draft in the user's Outlook Drafts folder. NOTHING is sent — the user reviews and sends it themselves from Outlook. This is the only mail-writing action automations may use.
+    input_schema:
+      type: object
+      properties:
+        to:
+          type: string
+          description: Recipient email address (single).
+        subject:
+          type: string
+        body:
+          type: string
+        cc:
+          type: string
+        bcc:
+          type: string
+      required: [to, subject, body]
+    mutates: true
+    elevation: false
+    output_redaction: ["body", "cc", "bcc"]
+    pii: high
+    rate_limit: "10/min"
+    channel_policy:
+      default: allow
+      deny: []
+
   - name: outlook__send_message
     description: Compose and send an Outlook message. Subject and body are required.
     input_schema:
@@ -109,12 +138,15 @@ tools:
       default: allow
       deny: []
 
-# ── Automation capability (Round 28) ──────────────────────────────
+# ── Automation capability (Round 28; drafts added Round 29) ─────────
 # Honest metadata: Microsoft Graph change-notification webhooks are
 # NOT provisioned in this codebase, so push is false; events arrive by
-# poll. There are NO write actions — outlook__send_message is the
-# rail-forbidden send, and no draft tool exists. An empty write map is
-# the truth, not an omission.
+# poll. ONE write action: outlook__create_draft (R29 §5) — a draft is
+# inert, the user sends it themselves; outlook__send_message stays
+# rail-forbidden (_FORBIDDEN_TOOLS + no send grant is ever minted).
+# The draft scope truth: Mail.ReadWrite was added to the OAuth block
+# in R29, so pre-R29 connections do NOT carry it — grant-request
+# creation refuses with `scope_missing` until the user reconnects.
 automation:
   push: false
   poll: true
@@ -124,8 +156,11 @@ automation:
     per_day: 100
   scopes_read:
     - https://graph.microsoft.com/Mail.Read
-  scopes_write_by_action: {}
-  target_param_by_action: {}
+  scopes_write_by_action:
+    outlook__create_draft:
+      - https://graph.microsoft.com/Mail.ReadWrite
+  target_param_by_action:
+    outlook__create_draft: to
   events:
     - key: email_received
       description: A new email arrives in your Outlook inbox.

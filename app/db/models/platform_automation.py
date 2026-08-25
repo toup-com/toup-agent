@@ -120,6 +120,12 @@ class AutomationGrant(Base):
     decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     decided_via: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # When the user last flipped auto/confirm from the Overview (R29,
+    # mig 097) — the audit that the live mode is not the approval
+    # card's. User-JWT-only; no agent RPC touches mode.
+    mode_changed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
 
     __table_args__ = (
         CheckConstraint(

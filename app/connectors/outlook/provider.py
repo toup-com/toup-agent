@@ -214,6 +214,51 @@ class OutlookProvider(BaseConnectorProvider):
                     "subject": subject,
                 }))
 
+            if tool_name == "outlook__create_draft":
+                to = tool_input.get("to")
+                subject = tool_input.get("subject")
+                body = tool_input.get("body")
+                if not (to and subject and body):
+                    return ConnectorToolError(
+                        message="to, subject, and body are required",
+                        retryable=False,
+                    )
+                message = {
+                    "subject": subject,
+                    "body": {
+                        "contentType": "Text",
+                        "content": body,
+                    },
+                    "toRecipients": _split_recipient_csv(to),
+                }
+                cc = _split_recipient_csv(tool_input.get("cc"))
+                if cc:
+                    message["ccRecipients"] = cc
+                bcc = _split_recipient_csv(tool_input.get("bcc"))
+                if bcc:
+                    message["bccRecipients"] = bcc
+                # POST /me/messages creates the message IN DRAFTS —
+                # nothing is sent (that is the whole point: send stays
+                # rail-forbidden, R29 §5). Needs Mail.ReadWrite, which
+                # pre-R29 connections never consented to — the Graph
+                # 403 comes back through _retarget_reauth as the
+                # reconnect-shaped error.
+                result = await microsoft_graph_request(
+                    "POST",
+                    f"{GRAPH_API}/me/messages",
+                    access_token=access_token,
+                    json_body=message,
+                    connector_id="outlook",
+                    scope_hint="Mail.ReadWrite",
+                )
+                return ConnectorOk(content=json.dumps({
+                    "draft_id": result.get("id"),
+                    "id": result.get("id"),
+                    "web_link": result.get("webLink"),
+                    "to": to,
+                    "subject": subject,
+                }))
+
             return ConnectorToolError(
                 message=f"unknown outlook tool {tool_name!r}",
                 retryable=False,

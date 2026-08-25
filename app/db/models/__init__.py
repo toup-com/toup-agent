@@ -66,7 +66,9 @@ from .trigger import (
 # primitives above; agent-side tables)
 from .automation import (
     Automation, AutomationBinding, AutomationEvent, AutomationOutbox,
-    AutomationAuthSession,
+    AutomationAuthSession, AutomationFact,
+    AUTOMATION_FACT_SOURCES, AUTOMATION_FACT_SOURCE_KINDS,
+    AUTOMATION_FACT_CANONICAL_CATEGORIES,
     AUTOMATION_STATUSES, AUTOMATION_TRIGGER_MODES, AUTOMATION_PAUSE_REASONS,
     AUTOMATION_EVENT_STATUSES, AUTOMATION_OUTBOX_STATUSES,
     AUTOMATION_AUTH_SESSION_STATUSES,

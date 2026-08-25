@@ -887,6 +887,12 @@ class ChatMessageResponse(BaseModel):
     # reopened thread showed a bare title where the live card had shown the
     # run's steps — the same card, twice as poor.
     job_steps: Optional[List[dict]] = None
+    # R29: a terminal status is not a terminal card — without the
+    # outcome a failed automation run rendered exactly like a completed
+    # one when rebuilt from history.
+    job_outcome: Optional[str] = None
+    job_error_class: Optional[str] = None
+    job_user_message: Optional[str] = None
     # Cross-channel reply-to (migration 049): soft pointer to a previous
     # message anywhere in this user's day. Frontend resolves the target
     # client-side from its in-memory day-chat list and renders a quoted

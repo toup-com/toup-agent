@@ -240,6 +240,9 @@ async def automation_thread(
         channels = {cid: "automation" for cid in conv_ids}
         return {
             "session_id": conv.id,
+            # R29: `session_id` is TODAY's conversation row, not the
+            # automation id the deep links use — serve both explicitly.
+            "automation_id": automation_id,
             "messages": attach_run_to_cards([
                 _message_to_response(m, build_jobs, reply_targets, channels)
                 for m in messages
@@ -276,6 +279,173 @@ async def automation_memory(automation_id: str):
                 row.updated_at.isoformat() + "Z" if row.updated_at else None
             ),
         }
+
+
+# ── Seen, curated facts, schedule/mode, membership (Round 29) ────────
+
+
+@router.post("/{automation_id}/seen")
+async def mark_seen(automation_id: str):
+    """CAS-style read receipt for the last outcome — B calls it when
+    the session screen opens (CONTRACTS-R29.md §2)."""
+    _flag_or_404()
+    from app.agent.automations.service import (
+        AutomationNotFound, mark_outcome_seen,
+    )
+    try:
+        async with async_session_maker() as db:
+            await mark_outcome_seen(
+                db, automation_id=automation_id, user_id=_user_id(),
+            )
+    except AutomationNotFound:
+        raise HTTPException(status_code=404, detail="No such automation")
+    return {"seen": True}
+
+
+class FactBody(BaseModel):
+    text: str = Field(..., min_length=1, max_length=400)
+    category: str = Field(..., min_length=2, max_length=32)
+
+
+class FactPatchBody(BaseModel):
+    text: Optional[str] = Field(default=None, min_length=1, max_length=400)
+    category: Optional[str] = Field(default=None, min_length=2, max_length=32)
+
+
+@router.get("/{automation_id}/memory/facts")
+async def list_memory_facts(automation_id: str):
+    """The Memory tab's curated facts. An empty ledger is 200 with an
+    empty list — 404 means the automation doesn't exist, never "no
+    facts yet" (absence of facts is not absence of the feature)."""
+    _flag_or_404()
+    from app.agent.automations import facts
+    async with async_session_maker() as db:
+        await _owned_automation_or_404(db, automation_id)
+        return await facts.list_facts(
+            db, user_id=_user_id(), automation_id=automation_id,
+        )
+
+
+@router.post("/{automation_id}/memory/facts")
+async def add_memory_fact(automation_id: str, body: FactBody):
+    _flag_or_404()
+    from app.agent.automations import facts
+    async with async_session_maker() as db:
+        await _owned_automation_or_404(db, automation_id)
+        fact = await facts.add_fact(
+            db, user_id=_user_id(), automation_id=automation_id,
+            text=body.text, category=body.category,
+        )
+    if fact is None:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "bad_fact",
+                    "message": "category must be a lowercase slug and "
+                               "the text non-empty (duplicates are "
+                               "refused)"},
+        )
+    return {"fact": fact}
+
+
+@router.patch("/{automation_id}/memory/facts/{fact_id}")
+async def update_memory_fact(
+    automation_id: str, fact_id: str, body: FactPatchBody,
+):
+    _flag_or_404()
+    from app.agent.automations import facts
+    async with async_session_maker() as db:
+        await _owned_automation_or_404(db, automation_id)
+        fact = await facts.update_fact(
+            db, user_id=_user_id(), automation_id=automation_id,
+            fact_id=fact_id, text=body.text, category=body.category,
+        )
+    if fact is None:
+        raise HTTPException(status_code=404, detail="No such fact")
+    return {"fact": fact}
+
+
+@router.delete("/{automation_id}/memory/facts/{fact_id}")
+async def delete_memory_fact(automation_id: str, fact_id: str):
+    _flag_or_404()
+    from app.agent.automations import facts
+    async with async_session_maker() as db:
+        await _owned_automation_or_404(db, automation_id)
+        ok = await facts.delete_fact(
+            db, user_id=_user_id(), automation_id=automation_id,
+            fact_id=fact_id,
+        )
+    if not ok:
+        raise HTTPException(status_code=404, detail="No such fact")
+    return {"deleted": True}
+
+
+class ScheduleBody(BaseModel):
+    cron_local: Optional[str] = Field(default=None, max_length=64)
+    at: Optional[str] = Field(default=None, max_length=16)
+    every_s: Optional[int] = Field(default=None, ge=1)
+
+
+class ModeBody(BaseModel):
+    mode: str = Field(..., pattern="^(auto|confirm)$")
+
+
+async def _spec_edit(fn, automation_id: str, **kwargs) -> dict:
+    """Shared plumbing for the focused spec edits: MembershipError →
+    409 with its stable code, SpecError → 422 like PATCH."""
+    from app.agent.automations.service import (
+        AutomationNotFound, MembershipError, automation_payload,
+    )
+    from app.agent.automations.spec import SpecError
+    try:
+        async with async_session_maker() as db:
+            automation, _ = await fn(
+                db, automation_id=automation_id, user_id=_user_id(),
+                **kwargs,
+            )
+            return {"automation": automation_payload(automation)}
+    except AutomationNotFound:
+        raise HTTPException(status_code=404, detail="No such automation")
+    except MembershipError as e:
+        raise HTTPException(status_code=409,
+                            detail={"code": e.code, "message": str(e)})
+    except SpecError as e:
+        raise HTTPException(status_code=422, detail={"errors": e.errors})
+
+
+@router.patch("/{automation_id}/schedule")
+async def patch_schedule(automation_id: str, body: ScheduleBody):
+    _flag_or_404()
+    from app.agent.automations.service import set_schedule
+    schedule = {
+        k: v for k, v in (
+            ("cron_local", body.cron_local), ("at", body.at),
+            ("every_s", body.every_s),
+        ) if v is not None
+    }
+    return await _spec_edit(set_schedule, automation_id, schedule=schedule)
+
+
+@router.patch("/{automation_id}/mode")
+async def patch_mode(automation_id: str, body: ModeBody):
+    _flag_or_404()
+    from app.agent.automations.service import set_mode
+    return await _spec_edit(set_mode, automation_id, mode=body.mode)
+
+
+@router.post("/{automation_id}/connectors/{connector_id}")
+async def add_connector_membership(automation_id: str, connector_id: str):
+    _flag_or_404()
+    from app.agent.automations.service import add_connector
+    return await _spec_edit(add_connector, automation_id,
+                            connector_id=connector_id)
+
+
+@router.delete("/{automation_id}/connectors/{connector_id}")
+async def remove_connector_membership(automation_id: str, connector_id: str):
+    _flag_or_404()
+    from app.agent.automations.service import remove_connector
+    return await _spec_edit(remove_connector, automation_id,
+                            connector_id=connector_id)
 
 
 # ── Outbox undo ──────────────────────────────────────────────────────
@@ -460,4 +630,30 @@ async def grant_decided_hook(body: GrantHook):
             await cards.broadcast_card(
                 _user_id(), cards.GRANT_CARD_KEY, card,
             )
+
+    # R29 §3.1: a revoked grant pauses its armed automation — the
+    # dispatcher already fails closed, this makes the STATE honest
+    # (feeds the `attention: grant_revoked` pill). Best-effort in its
+    # own session; the platform's grant row is the record either way.
+    if body.status == "revoked":
+        automation_id = (body.payload or {}).get("automation_id")
+        if automation_id:
+            try:
+                from app.agent.automations.service import pause_automation
+                async with async_session_maker() as db:
+                    a = (await db.execute(
+                        select(Automation)
+                        .where(Automation.id == automation_id)
+                        .where(Automation.user_id == _user_id())
+                    )).scalar_one_or_none()
+                    if a is not None and a.status == "armed":
+                        await pause_automation(
+                            db, automation_id=automation_id,
+                            user_id=_user_id(), reason="grant_revoked",
+                        )
+            except Exception as e:  # noqa: BLE001 — state stays honest
+                logger.warning(
+                    "[automations] revoke-pause failed for %s: %s",
+                    automation_id, e,
+                )
     return {"ok": True}

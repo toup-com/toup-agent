@@ -263,15 +263,13 @@ async def reject_grant_request(
 # ── Revoke (standing grant → dead) ───────────────────────────────────
 
 
-@router.post("/grant-requests/{grant_id}/revoke")
-async def revoke_grant(
-    grant_id: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    uid = str(current_user.id)
-    await _flag_or_404(db, uid)
-    row = await _load_grant_or_404(db, grant_id, uid)
+async def _revoke_grant_row(
+    db: AsyncSession, uid: str, row: AutomationGrant,
+) -> AutomationGrant:
+    """The one revoke transition (guarded), shared by the flat and the
+    R29 nested route. The agent hook it fires also pauses a dependent
+    armed automation (`paused_reason="grant_revoked"`) — the dispatcher
+    already fails closed, this makes the STATE honest."""
     if row.status != "approved":
         raise HTTPException(status_code=409,
                             detail=f"Only an approved grant can be "
@@ -283,9 +281,101 @@ async def revoke_grant(
         .values(status="revoked", revoked_at=datetime.utcnow())
     )
     await db.commit()
-    row = await _load_grant_or_404(db, grant_id, uid)
+    row = await _load_grant_or_404(db, row.id, uid)
     await _notify_agent_grant_decided(db, uid, row)
+    return row
+
+
+@router.post("/grant-requests/{grant_id}/revoke")
+async def revoke_grant(
+    grant_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    uid = str(current_user.id)
+    await _flag_or_404(db, uid)
+    row = await _load_grant_or_404(db, grant_id, uid)
+    row = await _revoke_grant_row(db, uid, row)
     return _grant_card_payload(row)
+
+
+# ── Grants on the Overview (Round 29, platform-native) ───────────────
+
+
+@router.get("/{automation_id}/grants")
+async def list_automation_grants(
+    automation_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every live grant backing one automation — approved and pending
+    both (the client may filter); revoked/expired history stays off
+    the Overview."""
+    uid = str(current_user.id)
+    await _flag_or_404(db, uid)
+    rows = (await db.execute(
+        select(AutomationGrant)
+        .where(AutomationGrant.user_id == uid)
+        .where(AutomationGrant.automation_id == automation_id)
+        .where(AutomationGrant.status.in_(("approved", "pending")))
+        .order_by(AutomationGrant.created_at.desc())
+    )).scalars().all()
+    grants = []
+    for row in rows:
+        payload = _grant_card_payload(row)
+        payload["granted_at"] = payload.get("decided_at")
+        grants.append(payload)
+    return {"grants": grants}
+
+
+@router.post("/{automation_id}/grants/{grant_id}/revoke")
+async def revoke_automation_grant(
+    automation_id: str, grant_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    uid = str(current_user.id)
+    await _flag_or_404(db, uid)
+    row = await _load_grant_or_404(db, grant_id, uid)
+    if row.automation_id != automation_id:
+        raise HTTPException(status_code=404, detail="No such grant request")
+    row = await _revoke_grant_row(db, uid, row)
+    return _grant_card_payload(row)
+
+
+class ModePatchBody(BaseModel):
+    mode: str
+
+
+@router.patch("/{automation_id}/mode")
+async def patch_automation_mode(
+    automation_id: str, request: Request, body: ModePatchBody,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flip auto/confirm for one automation — BOTH halves
+    (CONTRACTS-R29.md §3.3): the spec via the agent first, then this
+    automation's approved grants. User-JWT only; the grant mode is
+    consent and the authenticated Overview is the consent surface. No
+    agent RPC can reach the grant half."""
+    uid = str(current_user.id)
+    await _flag_or_404(db, uid)
+    if body.mode not in ("auto", "confirm"):
+        raise HTTPException(status_code=422,
+                            detail="mode must be auto or confirm")
+    resp = await _proxy(request, f"/{automation_id}/mode",
+                        current_user=current_user, db=db)
+    if resp.status_code >= 300:
+        return resp
+    await db.execute(
+        sa_update(AutomationGrant)
+        .where(AutomationGrant.user_id == uid)
+        .where(AutomationGrant.automation_id == automation_id)
+        .where(AutomationGrant.status == "approved")
+        .values(mode=body.mode, mode_changed_at=datetime.utcnow())
+    )
+    await db.commit()
+    return resp
 
 
 # ── Agent proxy (routines_proxy pattern) ─────────────────────────────
@@ -381,6 +471,91 @@ async def proxy_memory(
     db: AsyncSession = Depends(get_db),
 ):
     return await _proxy(request, f"/{automation_id}/memory",
+                        current_user=current_user, db=db)
+
+
+# ── Round 29 pass-throughs (seen, facts, schedule, membership) ───────
+
+
+@router.post("/{automation_id}/seen")
+async def proxy_seen(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/seen",
+                        current_user=current_user, db=db)
+
+
+@router.get("/{automation_id}/memory/facts")
+async def proxy_list_facts(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/memory/facts",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/memory/facts")
+async def proxy_add_fact(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/memory/facts",
+                        current_user=current_user, db=db)
+
+
+@router.patch("/{automation_id}/memory/facts/{fact_id}")
+async def proxy_update_fact(
+    automation_id: str, fact_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/memory/facts/{fact_id}",
+                        current_user=current_user, db=db)
+
+
+@router.delete("/{automation_id}/memory/facts/{fact_id}")
+async def proxy_delete_fact(
+    automation_id: str, fact_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/memory/facts/{fact_id}",
+                        current_user=current_user, db=db)
+
+
+@router.patch("/{automation_id}/schedule")
+async def proxy_schedule(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/schedule",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/connectors/{connector_id}")
+async def proxy_add_connector(
+    automation_id: str, connector_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request,
+                        f"/{automation_id}/connectors/{connector_id}",
+                        current_user=current_user, db=db)
+
+
+@router.delete("/{automation_id}/connectors/{connector_id}")
+async def proxy_remove_connector(
+    automation_id: str, connector_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request,
+                        f"/{automation_id}/connectors/{connector_id}",
                         current_user=current_user, db=db)
 
 

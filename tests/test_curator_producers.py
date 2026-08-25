@@ -258,6 +258,26 @@ def test_reflection_makes_ONE_call_for_the_turns_notes():
     assert "for n in notes" in body or "for n in notes)" in body
 
 
+def test_automation_facts_project_only_through_the_curator():
+    """R29: `automations/facts.py` owns the fact TABLE; its brain half
+    is a projection through the sanctioned entries only — the curator
+    (instruct_file / instruct_global / memory_notes) plus ONE
+    deterministic create_file walk for the fixed topic files. Never a
+    raw row write, never `disable_post_processing`."""
+    src = code_of(BACKEND / "app/agent/automations/facts.py")
+    assert "memory_curator.instruct_global(" in src
+    assert "memory_curator.instruct_file(" in src
+    assert "record_automation_fact(" in src
+    # The only direct ops use is the deterministic topic-file create —
+    # the validate→apply walk every writer uses, no LLM.
+    assert src.count("ops.apply_ops(") == 1
+    assert "'op': 'create_file'" in src  # code_of unparses to single quotes
+    # Severed paths: no row-store writes, no post-processing bypass.
+    assert "Memory(" not in src
+    assert "create_memory" not in src
+    assert "disable_post_processing" not in src
+
+
 # ── 6. MCP ────────────────────────────────────────────────────────────
 
 def test_no_mcp_tool_proxies_a_deleted_route():

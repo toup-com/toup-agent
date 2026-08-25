@@ -101,10 +101,18 @@ def test_poll_events_resolve_and_declare_their_requirements(
 def test_specific_round28_shape_pins(entries):
     """The §3 table, literally — so a drive-by edit shows up in review
     as a contract change, not a silent drift."""
-    # Outlook: poll source only, NO writes (send is rail-forbidden and
-    # there is no draft tool).
+    # Outlook (R29 §5, deliberate flip of the R28 "no writes" pin):
+    # exactly ONE write — create_draft, target-pinned to `to`, gated on
+    # Mail.ReadWrite (pre-R29 connections lack it → scope_missing at
+    # grant-request time). Send stays rail-forbidden.
     assert entries["outlook"]["poll"] is True
-    assert entries["outlook"]["scopes_write_by_action"] == {}
+    assert set(entries["outlook"]["scopes_write_by_action"]) == {
+        "outlook__create_draft"}
+    assert entries["outlook"]["scopes_write_by_action"][
+        "outlook__create_draft"] == [
+        "https://graph.microsoft.com/Mail.ReadWrite"]
+    assert entries["outlook"]["target_param_by_action"][
+        "outlook__create_draft"] == "to"
     assert [e["key"] for e in entries["outlook"]["events"]] == [
         "email_received"]
     # Teams: chat polling requires the chat id.

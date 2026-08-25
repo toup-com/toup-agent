@@ -1080,6 +1080,20 @@ def template_payload(t) -> dict:
         except (ValueError, TypeError):
             return default
 
+    spec = _loads(t.spec_json, {})
+    from app.services import automation_verbs
+
+    cadence = automation_verbs.schedule_human(spec)
+    if cadence is None:
+        # Event-triggered template: the tag comes from the event
+        # vocabulary ("on new GitHub issues") — never a raw key.
+        trig = (spec.get("trigger") or {})
+        sources = trig.get("sources") or ([trig] if trig else [])
+        first = next(
+            (s for s in sources if isinstance(s, dict) and s.get("event")),
+            {},
+        )
+        cadence = automation_verbs.event_tag(first.get("event"))
     return {
         "id": t.id,
         "slug": t.slug,
@@ -1089,7 +1103,8 @@ def template_payload(t) -> dict:
         "category": getattr(t, "category", None) or "work",
         "connectors": _loads(t.connectors_json, []),
         "variables": _loads(getattr(t, "variables_json", None), []),
-        "spec": _loads(t.spec_json, {}),
+        "spec": spec,
+        "cadence_human": cadence,
     }
 
 

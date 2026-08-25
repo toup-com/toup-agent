@@ -206,6 +206,17 @@ async def delete_automation(
     await engine_memory.delete_for_automation(
         db, user_id=user_id, automation_id=automation_id,
     )
+    # Curated facts (R29): explicit, not cascade-only — a sqlite tenant
+    # (the live harness, dev) doesn't enforce FK cascades. The brain
+    # projection is deliberately NOT unwound: facts about a life
+    # outlive the tool that learned them (CONTRACTS-R29.md §4).
+    from sqlalchemy import delete as sa_delete
+    from app.db.models import AutomationFact
+    await db.execute(
+        sa_delete(AutomationFact)
+        .where(AutomationFact.automation_id == automation_id)
+        .where(AutomationFact.user_id == user_id)
+    )
     await db.delete(automation)   # events/outbox cascade via FK
     await db.commit()
     logger.info("[automations] deleted id=%s user=%s",
@@ -228,6 +239,213 @@ async def test_run(
         from . import executor_v2
         return await executor_v2.execute_test_run_v2(db, automation, vspec)
     return await executor.execute_test_run(db, automation, vspec)
+
+
+class MembershipError(ValueError):
+    """A connector/schedule/mode edit the spec cannot absorb — carries
+    the stable machine `code` the routes serve as HTTP 409."""
+
+    def __init__(self, code: str, message: str = ""):
+        super().__init__(message or code)
+        self.code = code
+
+
+async def mark_outcome_seen(
+    db: AsyncSession, *, automation_id: str, user_id: str,
+) -> bool:
+    """`POST /{id}/seen` — stamp the current outcome as seen. A later
+    terminal stamp makes the row unseen again; there is nothing to
+    race (the stamp is monotonic now())."""
+    automation = await _load_owned(db, automation_id, user_id)
+    automation.outcome_seen_at = datetime.utcnow()
+    await db.commit()
+    return True
+
+
+def _spec_dict(automation: Automation) -> dict:
+    try:
+        raw = json.loads(automation.spec_json)
+    except (ValueError, TypeError):
+        raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+async def set_schedule(
+    db: AsyncSession, *, automation_id: str, user_id: str, schedule: dict,
+) -> tuple[Automation, ValidatedSpec]:
+    """Replace the automation's ONE schedule (v2 schedule source / v1
+    schedule trigger) and rerun the full update path — revalidation,
+    recompile, re-arm-if-was-armed. `schedule` must be exactly one of
+    {cron_local} / {at} / {every_s}; the spec's own validation owns the
+    value rules."""
+    keys = set(schedule or {}) & {"cron_local", "at", "every_s"}
+    if len(schedule or {}) != 1 or len(keys) != 1:
+        raise MembershipError(
+            "bad_schedule",
+            "body must be exactly one of cron_local / at / every_s",
+        )
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = _spec_dict(automation)
+    placed = False
+    if raw.get("version") == 2:
+        for src in (raw.get("trigger") or {}).get("sources") or []:
+            if isinstance(src, dict) and src.get("mode") == "schedule":
+                src["schedule"] = dict(schedule)
+                placed = True
+                break
+    else:
+        trig = raw.get("trigger") or {}
+        if trig.get("mode") == "schedule" or "schedule" in trig:
+            trig["schedule"] = dict(schedule)
+            raw["trigger"] = trig
+            placed = True
+    if not placed:
+        raise MembershipError(
+            "no_schedule", "this automation has no schedule to edit",
+        )
+    return await update_automation(
+        db, automation_id=automation_id, user_id=user_id, spec=raw,
+    )
+
+
+async def set_mode(
+    db: AsyncSession, *, automation_id: str, user_id: str, mode: str,
+) -> tuple[Automation, ValidatedSpec]:
+    """Flip spec-level auto/confirm through the full update path. The
+    GRANT rows' mode is the enforcer and is flipped platform-side by
+    the user-JWT proxy route — never from here (an agent RPC must not
+    be able to widen consent)."""
+    if mode not in ("auto", "confirm"):
+        raise MembershipError("bad_mode", "mode must be auto or confirm")
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = _spec_dict(automation)
+    raw["mode"] = mode
+    return await update_automation(
+        db, automation_id=automation_id, user_id=user_id, spec=raw,
+    )
+
+
+def _connector_membership(raw: dict, connector_id: str) -> dict:
+    steps = [s for s in (raw.get("steps") or []) if isinstance(s, dict)]
+    sources = [
+        s for s in ((raw.get("trigger") or {}).get("sources") or [])
+        if isinstance(s, dict)
+    ]
+    return {
+        "read_steps": [s for s in steps
+                       if s.get("connector_id") == connector_id
+                       and not s.get("grant_id")],
+        "write_steps": [s for s in steps
+                        if s.get("connector_id") == connector_id
+                        and s.get("grant_id")],
+        "sources": [s for s in sources
+                    if s.get("connector_id") == connector_id],
+    }
+
+
+async def add_connector(
+    db: AsyncSession, *, automation_id: str, user_id: str, connector_id: str,
+) -> tuple[Automation, ValidatedSpec]:
+    """Re-add a connector's READ presence from the automation's
+    template skeleton (CONTRACTS-R29.md §3.2): its read step(s) and
+    poll/push source(s), inserted ahead of the writes. Writes never
+    ride this path — a write needs its own grant conversation."""
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = _spec_dict(automation)
+    if raw.get("version") != 2:
+        raise MembershipError(
+            "not_supported_v1",
+            "connector membership edits need a v2 automation",
+        )
+    if any(_connector_membership(raw, connector_id).values()):
+        raise MembershipError("already_member", "connector already present")
+    if not automation.template_slug:
+        raise MembershipError(
+            "no_template_step", "this automation has no template to add from",
+        )
+    template = next(
+        (t for t in await reg.fetch_templates(user_id)
+         if t.get("slug") == automation.template_slug),
+        None,
+    )
+    tspec = (template or {}).get("spec") or {}
+    donor = _connector_membership(tspec, connector_id)
+    if not donor["read_steps"] and not donor["sources"]:
+        raise MembershipError(
+            "no_template_step",
+            "the template has nothing for this connector",
+        )
+    steps = [s for s in (raw.get("steps") or []) if isinstance(s, dict)]
+    first_write = next(
+        (i for i, s in enumerate(steps) if s.get("grant_id")), len(steps),
+    )
+    existing_ids = {s.get("id") for s in steps}
+    new_steps = [dict(s) for s in donor["read_steps"]
+                 if s.get("id") not in existing_ids]
+    raw["steps"] = steps[:first_write] + new_steps + steps[first_write:]
+    if donor["sources"]:
+        trig = dict(raw.get("trigger") or {})
+        sources = [s for s in (trig.get("sources") or [])
+                   if isinstance(s, dict)]
+        src_ids = {s.get("id") for s in sources}
+        sources.extend(dict(s) for s in donor["sources"]
+                       if s.get("id") not in src_ids)
+        trig["sources"] = sources
+        raw["trigger"] = trig
+    return await update_automation(
+        db, automation_id=automation_id, user_id=user_id, spec=raw,
+    )
+
+
+async def remove_connector(
+    db: AsyncSession, *, automation_id: str, user_id: str, connector_id: str,
+) -> tuple[Automation, ValidatedSpec]:
+    """Remove a connector's read steps and sources. Refused when the
+    connector backs a write step or removal would leave the spec
+    unable to fire (no sources / no read material the spec needs)."""
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = _spec_dict(automation)
+    if raw.get("version") != 2:
+        raise MembershipError(
+            "connector_required",
+            "a v1 automation needs both of its connectors",
+        )
+    member = _connector_membership(raw, connector_id)
+    if member["write_steps"]:
+        raise MembershipError(
+            "connector_required", "this connector performs the write",
+        )
+    if not member["read_steps"] and not member["sources"]:
+        raise MembershipError("not_member", "connector not present")
+    steps = [
+        s for s in (raw.get("steps") or [])
+        if not (isinstance(s, dict)
+                and s.get("connector_id") == connector_id
+                and not s.get("grant_id"))
+    ]
+    trig = dict(raw.get("trigger") or {})
+    sources = [
+        s for s in (trig.get("sources") or [])
+        if not (isinstance(s, dict)
+                and s.get("connector_id") == connector_id)
+    ]
+    if not sources:
+        raise MembershipError(
+            "connector_required",
+            "removing this connector would leave no trigger",
+        )
+    trig["sources"] = sources
+    raw["trigger"] = trig
+    raw["steps"] = steps
+    try:
+        return await update_automation(
+            db, automation_id=automation_id, user_id=user_id, spec=raw,
+        )
+    except SpecError as e:
+        raise MembershipError(
+            "connector_required",
+            f"removal would leave the automation invalid: {e}",
+        ) from e
 
 
 # ── Read shapes (API + tools + Activity page) ─────────────────────────
@@ -329,6 +547,66 @@ async def parse_spec_live(automation: Automation) -> ValidatedSpec:
     return _parse_spec(automation)
 
 
+def _spec_connectors(raw: dict) -> list[str]:
+    """Ordered, deduped connector ids: trigger/sources first, then
+    reads, then writes — the card's mark row (R29 §2)."""
+    out: list[str] = []
+
+    def _add(cid) -> None:
+        if isinstance(cid, str) and cid and cid not in out:
+            out.append(cid)
+
+    trig = raw.get("trigger") or {}
+    if raw.get("version") == 2:
+        for src in trig.get("sources") or []:
+            if isinstance(src, dict):
+                _add(src.get("connector_id"))
+        steps = [s for s in (raw.get("steps") or []) if isinstance(s, dict)]
+        for s in steps:
+            if not s.get("grant_id"):
+                _add(s.get("connector_id"))
+        for s in steps:
+            if s.get("grant_id"):
+                _add(s.get("connector_id"))
+    else:
+        _add(trig.get("connector_id"))
+        _add((raw.get("action") or {}).get("connector_id"))
+    return out
+
+
+def _payload_extras(a: Automation, raw: dict) -> dict:
+    """The R29 list-payload additions, shared by both spec versions."""
+    from app.services import automation_verbs as verbs
+
+    last_outcome = None
+    if a.last_outcome_at is not None:
+        last_outcome = {
+            "outcome": a.last_outcome,
+            "sentence": a.last_outcome_text or "",
+            "at": a.last_outcome_at.isoformat() + "Z",
+            "tone": verbs.tone_for(a.last_outcome),
+        }
+    unseen = bool(
+        a.last_outcome_at is not None
+        and (a.outcome_seen_at is None
+             or a.outcome_seen_at < a.last_outcome_at)
+    )
+    if a.paused_reason == "grant_revoked":
+        attention = "grant_revoked"
+    elif a.status == "error":
+        attention = "auto_paused"
+    else:
+        attention = None
+    return {
+        "connectors": _spec_connectors(raw),
+        "last_outcome": last_outcome,
+        "unseen": unseen,
+        "schedule_human": verbs.schedule_human(raw),
+        "rule_text": verbs.rule_sentence(raw),
+        "attention": attention,
+    }
+
+
 def automation_payload(a: Automation) -> dict:
     raw = json.loads(a.spec_json)
     if raw.get("version") == 2:
@@ -360,6 +638,7 @@ def automation_payload(a: Automation) -> dict:
             },
             "mode": raw.get("mode"),
             "template_slug": a.template_slug,
+            "domain": a.domain,
             "health": {
                 "consecutive_failures": a.consecutive_failures,
                 "last_run_at": (a.last_run_at.isoformat() + "Z")
@@ -369,6 +648,7 @@ def automation_payload(a: Automation) -> dict:
             },
             "created_at": a.created_at.isoformat() + "Z",
             "updated_at": a.updated_at.isoformat() + "Z",
+            **_payload_extras(a, raw),
         }
     return {
         "id": a.id,
@@ -392,6 +672,7 @@ def automation_payload(a: Automation) -> dict:
         },
         "created_at": a.created_at.isoformat() + "Z",
         "updated_at": a.updated_at.isoformat() + "Z",
+        **_payload_extras(a, raw),
     }
 
 
@@ -422,26 +703,69 @@ async def list_runs(
     jobs = (await db.execute(q)).scalars().all()
 
     names: dict[str, str] = {}
+    tools_by_auto: dict[str, dict] = {}
     if jobs:
         autos = (await db.execute(
-            select(Automation.id, Automation.name)
+            select(Automation.id, Automation.name, Automation.spec_json)
             .where(Automation.user_id == user_id)
         )).all()
-        names = {a_id: a_name for a_id, a_name in autos}
+        for a_id, a_name, a_spec in autos:
+            names[a_id] = a_name
+            try:
+                raw = json.loads(a_spec or "{}")
+            except (ValueError, TypeError):
+                raw = {}
+            by_id: dict[str, tuple] = {}
+            if raw.get("version") == 2:
+                for s in raw.get("steps") or []:
+                    if isinstance(s, dict) and s.get("id"):
+                        by_id[s["id"]] = (s.get("tool"), s.get("connector_id"))
+            else:
+                action = raw.get("action") or {}
+                by_id["write"] = (action.get("tool"),
+                                  action.get("connector_id"))
+            tools_by_auto[a_id] = by_id
+
+    from app.services import automation_verbs as verbs
 
     out = []
     for j in jobs:
+        by_id = tools_by_auto.get(j.source_id or "", {})
         steps = []
         try:
             for s in (json.loads(j.steps_json) if j.steps_json else []):
+                sid = s.get("id")
+                status = s.get("status")
+                count = s.get("count") if isinstance(s.get("count"), int) \
+                    else None
+                tool, connector = by_id.get(sid, (None, None))
+                # One render path for every era: spec steps get their
+                # tool's verb (done-form + count when terminal), engine
+                # phases the orb's; a step the spec no longer knows
+                # falls through the dictionary's total fallback.
+                v = verbs.step_verb(
+                    tool, connector,
+                    phase=sid if tool is None else None,
+                    status=status or "pending",
+                    count=count,
+                )
                 steps.append({
-                    "id": s.get("id"),
-                    "label": s.get("label"),
-                    "status": s.get("status"),
+                    "id": sid,
+                    "label": v["label"],
+                    "verb": v["label"],
+                    "brand": s.get("brand", v["brand"]),
+                    "status": status,
                     "duration_ms": s.get("duration_ms"),
                 })
         except (ValueError, TypeError):
             pass
+        fix = None
+        if j.status == "failed":
+            fix = verbs.fix_chip(
+                names.get(j.source_id or "", "this automation") or
+                "this automation",
+                j.outcome, j.user_message or j.error_class,
+            )
         out.append({
             "id": j.id,
             "automation_id": j.source_id,
@@ -452,6 +776,7 @@ async def list_runs(
             "started_at": j.created_at.isoformat() + "Z",
             "finished_at": (j.completed_at.isoformat() + "Z") if j.completed_at else None,
             "steps": steps,
+            "fix": fix,
             "error_class": j.error_class,
             "user_message": j.user_message,
         })

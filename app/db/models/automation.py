@@ -12,7 +12,7 @@ An Automation is a compiled composition of the four existing primitives:
                repo just retired `routine_runs`/`trigger_events` as
                ledgers; see docs/automations/MAPPING.md §3.1).
 
-Five tables, all AGENT_ONLY (tenant DB): created by init_db create_all
+Six tables, all AGENT_ONLY (tenant DB): created by init_db create_all
 on agent boot — new tables need no alembic mirror (the mirror rule is
 for COLUMNS on existing tables). The two platform-side automation
 tables (`automation_grants`, `automation_templates`) live in
@@ -150,6 +150,15 @@ class Automation(Base):
     )
     last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_notice_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Last-outcome + unseen (R29). Stamped by `_finalize_job`'s
+    # exactly-once gate on EVERY terminal transition, before the push
+    # notify. `outcome_seen_at` is a CAS stamp (`POST /{id}/seen`);
+    # unseen ⇔ last_outcome_at newer than outcome_seen_at.
+    last_outcome: Mapped[Optional[str]] = mapped_column(String(24), nullable=True)
+    last_outcome_text: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    last_outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    outcome_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
@@ -396,4 +405,64 @@ class AutomationAuthSession(Base):
     __table_args__ = (
         Index("ix_automation_auth_sessions_user_status", "user_id", "status"),
         Index("ix_automation_auth_sessions_connector", "connector_id", "status"),
+    )
+
+
+AUTOMATION_FACT_SOURCES = frozenset({"agent", "user"})
+AUTOMATION_FACT_SOURCE_KINDS = frozenset({
+    "interview", "automation_run", "chat", "edit",
+})
+# Canonical display order for fact categories; anything else renders
+# after these, title-cased by the client (CONTRACTS-R29.md §4).
+AUTOMATION_FACT_CANONICAL_CATEGORIES = ("people", "preferences", "deadlines")
+
+
+class AutomationFact(Base):
+    """One curated memory fact learned via an automation (Round 29).
+
+    The UI ledger for the automation's Memory tab: first-class rows
+    because v3 bullet files cannot carry per-fact ids, categories,
+    sources, or timestamps. The BRAIN half is a projection: every
+    agent-side write also files the fact through the sanctioned
+    curator seam (best-effort — the table never waits on the curator,
+    a projection failure never loses the row). Deleting the automation
+    cascades the rows; the brain keeps what the curator judged durable
+    (facts about a life outlive the tool that learned them).
+    """
+
+    __tablename__ = "automation_facts"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    automation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("automations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+
+    # Lowercase slug: the canonical trio, a life domain, or custom —
+    # validated by `facts.normalize_category`, free-form by contract.
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    text: Mapped[str] = mapped_column(String(400), nullable=False)
+
+    # Attribution — "Agent updated 3 facts" is derived, never baked
+    # into a string at write time.
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    source_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    run_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_automation_facts_automation", "automation_id", "category"),
     )

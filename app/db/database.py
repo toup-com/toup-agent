@@ -1062,6 +1062,13 @@ async def init_db():
         # every AGENT_ONLY table, so a tenant that booted on the R26
         # build self-heals the column here.
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS domain VARCHAR(32)",
+        # automations last-outcome + unseen (R29): stamped by
+        # _finalize_job's exactly-once gate; same self-heal reasoning
+        # as `domain` above.
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_outcome VARCHAR(24)",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_outcome_text VARCHAR(300)",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS last_outcome_at TIMESTAMP",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS outcome_seen_at TIMESTAMP",
     ]
 
     # Vector dimension migration (agent-only: memories, entities, messages, document_chunks)

@@ -291,6 +291,15 @@ def job_card_fields(
     _running = next((s for s in steps if s.get("status") == "running"), None)
     if _running and _running.get("label"):
         out["job_step"] = _running["label"]
+    # R29: a terminal status is not a terminal card — without the
+    # outcome a failed automation run rendered exactly like a completed
+    # one in history. Additive; absent on rows that never carried them.
+    if getattr(bj, "outcome", None):
+        out["job_outcome"] = bj.outcome
+    if getattr(bj, "error_class", None):
+        out["job_error_class"] = bj.error_class
+    if getattr(bj, "user_message", None):
+        out["job_user_message"] = bj.user_message
     return out
 
 

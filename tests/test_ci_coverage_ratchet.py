@@ -325,7 +325,11 @@ def test_debt_is_not_growing_silently():
     # R28-C: +1 for test_automation_sessions.py — conversations/messages/
     # build_jobs/agent_notify_outbox are AGENT_ONLY, so the session-thread
     # proofs can only run in the agent lane.
-    CEILING = 76
+    # R29-A: +1 for test_automation_facts.py — automation_facts is a new
+    # AGENT_ONLY table (the curated-fact ledger); its attributed-write,
+    # CRUD-wall and delete-cleanup proofs need the real rows, so the file
+    # RUNS in the agent-mode step and only routes there.
+    CEILING = 77
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
