@@ -1390,18 +1390,43 @@ async def account_reconnect(account_id: str):
 # ── R30 §4.11a — the routine-migration trigger (ND-6) ────────────────
 
 
+class MigrateBody(BaseModel):
+    # ND-12: intent is SELECTED, never inferred. Without ids only the
+    # structurally-safe set (kind == email_briefing) migrates; anything
+    # else must be named, because the migrated spec reads Gmail and a
+    # keyword scan of a prompt once rewrote a motivational-quote routine
+    # into "check Gmail".
+    routine_ids: Optional[list[str]] = Field(default=None, max_length=50)
+
+
 @router.post("/migrate-routines")
-async def migrate_routines():
-    """Run the §4.11a email-briefing migration for THIS tenant.
-    Idempotent (the `migrated_to` stamp no-ops a second call), so it is
-    safe to drive repeatedly; D's live pass calls it explicitly so the
-    before/after states are captured rather than raced by a boot hook."""
+async def migrate_routines(body: Optional[MigrateBody] = None):
+    """Run the §4.11a migration for THIS tenant. Idempotent (the
+    `migrated_to` stamp no-ops a second call), so it is safe to drive
+    repeatedly; the live pass calls it explicitly so the before/after
+    states are captured rather than raced by a boot hook."""
     _flag_or_404()
     from app.agent.automations.routine_migration import (
         migrate_email_briefings,
     )
     async with async_session_maker() as db:
-        return await migrate_email_briefings(db, user_id=_user_id())
+        return await migrate_email_briefings(
+            db, user_id=_user_id(),
+            routine_ids=(body.routine_ids if body else None),
+        )
+
+
+@router.post("/migrate-routines/repair")
+async def migrate_routines_repair():
+    """Undo migrations that should never have been made (ND-12): the
+    automation is deleted and the routine restored to the state
+    recorded at migration time. Refuses any automation that has run."""
+    _flag_or_404()
+    from app.agent.automations.routine_migration import (
+        repair_mismigrations,
+    )
+    async with async_session_maker() as db:
+        return await repair_mismigrations(db, user_id=_user_id())
 
 
 @router.get("/migrate-routines/report")

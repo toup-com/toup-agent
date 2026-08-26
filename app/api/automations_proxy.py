@@ -1022,6 +1022,16 @@ async def proxy_migrate_routines(
                         current_user=current_user, db=db)
 
 
+@router.post("/migrate-routines/repair")
+async def proxy_migrate_routines_repair(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/migrate-routines/repair",
+                        current_user=current_user, db=db)
+
+
 @router.get("/migrate-routines/report")
 async def proxy_migrate_routines_report(
     request: Request,

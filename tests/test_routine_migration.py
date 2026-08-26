@@ -21,7 +21,9 @@ from sqlalchemy import select
 from app.agent.automations import compiler, registry as reg
 from app.agent.automations import routine_migration as mig
 from app.db.database import async_session_maker
-from app.db.models import Automation, AutomationBinding, Routine, User
+from app.db.models import (
+    Automation, AutomationBinding, BuildJob, Routine, User,
+)
 
 REGISTRY = {
     "gmail": {
@@ -117,12 +119,23 @@ async def test_enabled_briefing_migrates_once_to_an_armed_automation():
 
 
 @pytest.mark.asyncio
-async def test_disabled_briefing_becomes_a_paused_draft():
+async def test_disabled_briefing_is_not_resurrected_unless_selected():
+    """ND-12: a routine the user SWITCHED OFF must not come back as a
+    new object (the founder's list went 3 -> 6 that way). Explicitly
+    selecting it still migrates it, to a paused draft."""
     uid = await _mk_user()
     rid = await _mk_routine(uid, enabled=False)
 
     async with async_session_maker() as db:
-        result = await mig.migrate_email_briefings(db, user_id=uid)
+        untouched = await mig.migrate_email_briefings(db, user_id=uid)
+    assert untouched["migrated"] == []
+    assert [e["routine_id"] for e in untouched["needs_review"]] == [rid]
+    assert "disabled" in untouched["needs_review"][0]["reason"]
+
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(
+            db, user_id=uid, routine_ids=[rid],
+        )
 
     aid = result["migrated"][0]["automation_id"]
     assert result["migrated"][0]["armed"] is False
@@ -200,8 +213,18 @@ async def test_nd9_the_founders_real_shape_migrates():
         prompt_text="summarise my new email",
         schedule_cron_local="0 8 * * *", schedule_kind="cron",
     )
+    # Unprompted it is only REPORTED — an agent_task is not a briefing
+    # by kind, and its intent must be selected, never inferred (ND-12).
     async with async_session_maker() as db:
-        result = await mig.migrate_email_briefings(db, user_id=uid)
+        unprompted = await mig.migrate_email_briefings(db, user_id=uid)
+    assert unprompted["migrated"] == []
+    assert [e["routine_id"] for e in unprompted["needs_review"]] == [rid]
+
+    # Selected by id — the way the live pass drives it.
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(
+            db, user_id=uid, routine_ids=[rid],
+        )
 
     assert len(result["migrated"]) == 1, result
     entry = result["migrated"][0]
@@ -369,7 +392,7 @@ async def test_nd6_the_route_actually_triggers_the_migration(monkeypatch):
     async with async_session_maker() as db:
         db.add(Routine(
             id=str(_uuid.uuid4()), user_id=uid, kind="email_briefing",
-            enabled=False, name="Morning new-email briefing",
+            enabled=True, name="Morning new-email briefing",
             prompt_text="brief me", schedule_cron_local="0 8 * * *",
             schedule_kind="cron",
         ))
@@ -378,3 +401,195 @@ async def test_nd6_the_route_actually_triggers_the_migration(monkeypatch):
     assert len(out.get("migrated") or []) == 1, out
     out2 = await migrate_routines()
     assert not out2.get("migrated"), out2
+
+
+@pytest.mark.asyncio
+async def test_nd11_the_report_sees_its_subjects_and_predicts_the_outcome():
+    """ND-11 (live on the founder, tenant already on 98d03bab): the
+    migration query was widened and its report was left on the old
+    singular constant, so the audit view answered {"routines": []} for
+    an account whose routines the migration was about to act on — and
+    an empty report reads as "nothing to migrate". The two now share ONE
+    selector, and this pins the stronger property: the report is a DRY
+    RUN whose prediction matches what running it actually does.
+    """
+    uid = await _mk_user()
+    # The founder's three real shapes, plus an untouchable.
+    async with async_session_maker() as db:
+        twin = Automation(
+            user_id=uid, name="Jira → Slack new-issue alerts",
+            status="armed", spec_json=json.dumps({"version": 2}),
+            trigger_mode="poll", connector_id="jira",
+        )
+        db.add(twin)
+        await db.commit()
+
+    brief = await _mk_routine(
+        uid, kind="agent_task", name="Morning new-email briefing",
+        prompt_text="summarise my new email",
+        schedule_cron_local="0 8 * * *", schedule_kind="cron")
+    recap = await _mk_routine(
+        uid, kind="agent_task", name="Weekly work recap",
+        prompt_text="summarise closed jira tickets",
+        schedule_cron_local="0 17 * * 5", schedule_kind="cron")
+    dupe = await _mk_routine(
+        uid, kind="agent_task", name="Jira → Slack new-issue alerts",
+        prompt_text="post new jira issues to slack",
+        schedule_cron_local="* * * * *", schedule_kind="cron")
+    await _mk_routine(uid, kind="reminder", reminder_text="stand up",
+                      config_json=None)
+
+    async with async_session_maker() as db:
+        report = await mig.migration_report(db, user_id=uid)
+    seen = {e["routine_id"]: e for e in report["routines"]}
+
+    # It can SEE its subjects — the ND-11 regression.
+    assert {brief, recap, dupe} <= set(seen), report
+    # And it predicts each outcome, with the schedule for the capture.
+    assert seen[brief]["outcome"] == "would_need_review"
+    assert seen[brief]["likely_mail"] is True   # the hint, not a gate
+    assert seen[brief]["schedule"] == {"cron_local": "0 8 * * *"}
+    assert seen[recap]["outcome"] == "would_need_review"
+    assert seen[recap].get("likely_mail") is False
+    assert seen[dupe]["outcome"] == "would_supersede"
+    # A reminder is never a candidate at all.
+    assert all(e["kind"] != "reminder" for e in report["routines"])
+
+    # THE PROPERTY: running it does exactly what the report predicted.
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(
+            db, user_id=uid, routine_ids=[brief],
+        )
+    assert [e["routine_id"] for e in result["migrated"]] == [brief]
+    assert [e["routine_id"] for e in result["superseded"]] == [dupe]
+    assert [e["routine_id"] for e in result["needs_review"]] == [recap]
+
+    # After the run the report reflects the new state, not the old plan.
+    async with async_session_maker() as db:
+        after = await mig.migration_report(db, user_id=uid)
+    seen_after = {e["routine_id"]: e for e in after["routines"]}
+    assert seen_after[brief]["outcome"] == "already_migrated"
+    assert seen_after[brief]["migrated_to"]
+    assert seen_after[dupe]["outcome"] == "already_superseded"
+
+
+@pytest.mark.asyncio
+async def test_nd12_a_quote_routine_is_never_rewritten_into_a_gmail_brief():
+    """ND-12 (live on the founder): "Daily motivational quote" — "Send
+    Nariman one short motivational quote every day" — was converted
+    into an automation whose rule read "Every day at 16:39, check
+    Gmail." The intent was not misstated, it was REPLACED. A keyword
+    scan over prose cannot make that call, so intent is now SELECTED:
+    an agent_task is never migrated unprompted, no matter what its
+    prose contains."""
+    uid = await _mk_user()
+    quote = await _mk_routine(
+        uid, kind="agent_task", name="Daily motivational quote",
+        prompt_text="Send Nariman one short motivational quote every "
+                    "day. Keep it concise, uplifting, and not cheesy — "
+                    "no need to email anything else.",
+        schedule_cron_local="39 16 * * *", schedule_kind="cron")
+
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(db, user_id=uid)
+
+    assert result["migrated"] == [], result
+    assert [e["routine_id"] for e in result["needs_review"]] == [quote]
+    async with async_session_maker() as db:
+        autos = (await db.execute(
+            select(Automation).where(Automation.user_id == uid)
+        )).scalars().all()
+        assert autos == [], "no automation may be invented from prose"
+        r = await db.get(Routine, quote)
+        assert r.enabled is True and not (r.config_json or {}).get(
+            "migrated_to")
+
+
+@pytest.mark.asyncio
+async def test_nd12_repair_undoes_a_mis_migration_and_restores_the_routine():
+    """ND-12's trap: a mis-migrated routine is STAMPED, so a corrected
+    selector skips it and the bad automation persists — the fix cannot
+    self-heal. Repair reverses the pair and puts the routine back as it
+    was, and refuses any automation that has already RUN."""
+    uid = await _mk_user()
+    quote = await _mk_routine(
+        uid, kind="agent_task", name="Daily motivational quote",
+        prompt_text="one uplifting quote a day",
+        schedule_cron_local="39 16 * * *", schedule_kind="cron",
+        enabled=False)
+
+    # Simulate the bad pair the old rules produced (selected => migrates).
+    async with async_session_maker() as db:
+        bad = await mig.migrate_email_briefings(
+            db, user_id=uid, routine_ids=[quote],
+        )
+    aid = bad["migrated"][0]["automation_id"]
+
+    async with async_session_maker() as db:
+        out = await mig.repair_mismigrations(db, user_id=uid)
+
+    assert [e["routine_id"] for e in out["repaired"]] == [quote], out
+    async with async_session_maker() as db:
+        assert await db.get(Automation, aid) is None, "the draft is gone"
+        r = await db.get(Routine, quote)
+        # Restored to the state recorded at migration time — the user
+        # had switched it off, so it stays off.
+        assert r.enabled is False
+        assert not (r.config_json or {}).get("migrated_to")
+
+    # A pair whose automation has RUN is kept, never deleted.
+    brief = await _mk_routine(uid, name="Morning briefing")
+    async with async_session_maker() as db:
+        ok = await mig.migrate_email_briefings(db, user_id=uid)
+    ok_aid = ok["migrated"][0]["automation_id"]
+    async with async_session_maker() as db:
+        r = await db.get(Routine, brief)
+        r.kind = "agent_task"          # force the repair to consider it
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="completed",
+            source_kind="automation", source_id=ok_aid,
+        ))
+        await db.commit()
+    async with async_session_maker() as db:
+        out2 = await mig.repair_mismigrations(db, user_id=uid)
+    assert [e["automation_id"] for e in out2["kept"]] == [ok_aid], out2
+    async with async_session_maker() as db:
+        assert await db.get(Automation, ok_aid) is not None
+
+
+@pytest.mark.asyncio
+async def test_nd13_a_longer_title_still_matches_the_same_intent():
+    """ND-13 (live): exact normalised equality never fired — the
+    founder's routine "Jira → Slack new-issue alerts" and the
+    automation "Jira → Slack" are one intent under two titles, so the
+    per-minute duplicate kept running. Token-subset with >= 2 shared
+    tokens is the honest test, and a single shared word must NOT
+    collapse two unrelated things."""
+    assert mig._same_intent("Jira → Slack new-issue alerts", "Jira → Slack")
+    assert mig._same_intent("Morning brief", "Morning brief extended")
+    # One shared word is not an intent match.
+    assert not mig._same_intent("Daily motivational quote", "Daily recap")
+    assert not mig._same_intent("Morning work brief",
+                                "Morning new-email briefing")
+
+    uid = await _mk_user()
+    async with async_session_maker() as db:
+        db.add(Automation(
+            user_id=uid, name="Jira → Slack", status="armed",
+            spec_json=json.dumps({"version": 2}), trigger_mode="poll",
+            connector_id="jira",
+        ))
+        await db.commit()
+    dupe = await _mk_routine(
+        uid, kind="agent_task", name="Jira → Slack new-issue alerts",
+        prompt_text="post new jira issues to slack",
+        schedule_cron_local="* * * * *", schedule_kind="cron")
+
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(db, user_id=uid)
+
+    assert [e["routine_id"] for e in result["superseded"]] == [dupe], result
+    async with async_session_maker() as db:
+        r = await db.get(Routine, dupe)
+        assert r.enabled is False, "the per-minute duplicate must stop"

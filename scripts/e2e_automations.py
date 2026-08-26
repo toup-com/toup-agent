@@ -1088,7 +1088,7 @@ async def main() -> int:
             # Routine migration (§4.11a) on a seeded email_briefing.
             from app.db.models import Routine as R30Routine
             from app.agent.automations.routine_migration import (
-                migrate_email_briefings,
+                migrate_email_briefings, migration_report,
             )
             async with async_session_maker() as db:
                 db.add(R30Routine(
@@ -1100,13 +1100,31 @@ async def main() -> int:
                     schedule_kind="cron",
                 ))
                 await db.commit()
-                mig = await migrate_email_briefings(db, user_id=user_id)
+                # ND-12: intent is SELECTED, never inferred — a routine
+                # the user switched off is not resurrected unprompted.
+                unprompted = await migrate_email_briefings(
+                    db, user_id=user_id)
+                check("R30 a disabled routine is reported, not "
+                      "resurrected",
+                      not unprompted.get("migrated")
+                      and len(unprompted.get("needs_review") or []) == 1,
+                      str(unprompted)[:160])
+                seeded_rid = (unprompted["needs_review"][0]["routine_id"]
+                              if unprompted.get("needs_review") else None)
+                mig = await migrate_email_briefings(
+                    db, user_id=user_id, routine_ids=[seeded_rid])
                 check("R30 routine migrated once with the promised-time "
                       "cron",
                       len(mig.get("migrated") or []) == 1, str(mig)[:160])
-                mig2 = await migrate_email_briefings(db, user_id=user_id)
+                mig2 = await migrate_email_briefings(
+                    db, user_id=user_id, routine_ids=[seeded_rid])
                 check("R30 migration is idempotent",
                       not mig2.get("migrated"), str(mig2)[:120])
+                rep = await migration_report(db, user_id=user_id)
+                check("R30 the report predicts and then reflects state",
+                      any(e.get("outcome") == "already_migrated"
+                          for e in rep.get("routines") or []),
+                      str(rep)[:160])
 
             mig_aid = (mig.get("migrated") or [{}])[0].get("automation_id")
             preset = await put_workflow_schedule(
