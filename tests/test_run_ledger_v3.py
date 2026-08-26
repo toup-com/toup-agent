@@ -781,3 +781,72 @@ async def test_nd10_a_reaped_run_stamps_the_card_it_belongs_to():
         assert row.last_outcome == "lost", row.last_outcome
         assert row.last_outcome_at > before
         assert "Posted to Slack." not in (row.last_outcome_text or "")
+
+
+def test_nd14_a_stop_is_not_a_failure_in_the_dictionary():
+    """ND-14 (live): R30 added the `stopped` / `superseded` terminals to
+    the engine but never to the dictionary, so tone_for hit the "err"
+    default and the sentence fell through to "The last run didn't
+    complete." The card painted the user's own Stop in the danger tint
+    and contradicted the thread beside it, which said "You stopped it.
+    Nothing was sent." """
+    from app.services.automation_verbs import outcome_sentence, tone_for
+
+    assert tone_for("stopped") == "warn", "a stop is not an error"
+    assert tone_for("superseded") == "warn"
+    # The generic fallthrough must not be reachable for either.
+    for oc in ("stopped", "superseded"):
+        s = outcome_sentence(oc, wrote_count=0)["sentence"]
+        assert "didn't complete" not in s, (oc, s)
+
+    zero = outcome_sentence("stopped", wrote_count=0)
+    assert zero["sentence"] == "You stopped it. Nothing was sent."
+    assert zero["tone"] == "warn"
+    one = outcome_sentence("stopped", wrote_count=1)["sentence"]
+    assert one == "You stopped it. 1 change already made."
+    two = outcome_sentence("stopped", wrote_count=2)["sentence"]
+    assert two == "You stopped it. 2 changes already made."
+
+
+@pytest.mark.asyncio
+async def test_nd14_the_card_and_the_thread_tell_the_same_story(monkeypatch):
+    """The stamp's count must come from the write LEDGER, not the
+    spec's write-STEP count — otherwise the card claims a change the
+    stop prevented. Drives a real stop and compares the two surfaces."""
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    from app.agent.automations import ledger, run_v3
+
+    async def _stop_read(tool_input):
+        async with async_session_maker() as db:
+            job = (await db.execute(
+                select(BuildJob).where(BuildJob.source_id == a.id)
+                .order_by(BuildJob.created_at.desc()).limit(1)
+            )).scalar_one()
+            await run_v3.request_stop(db, job.id)
+        return _ISSUES
+
+    status = await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": _stop_read,
+        "slack__send_message": _OK,
+    })
+    assert status == "stopped"
+    job = await _one_run(a.id)
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        # The card: stamped, not an error, and the honest count.
+        assert row.last_outcome == "stopped", row.last_outcome
+        assert row.last_outcome_text == "You stopped it. Nothing was sent."
+        from app.services.automation_verbs import tone_for
+        assert tone_for(row.last_outcome) == "warn"
+        # The thread: the same story, from the same truth.
+        turns = await ledger.run_turns(db, run_id=job.id)
+        note = [t for t in turns if t["kind"] == "note"
+                and t.get("stamp") == "stopped"][0]
+        assert note["writes_count"] == 0
+        # And the runs API offers no "Fix this" for a stop.
+        from app.agent.automations.service import list_runs
+        runs = await list_runs(db, uid, automation_id=a.id, limit=5)
+        assert next(r for r in runs if r["id"] == job.id)["fix"] is None

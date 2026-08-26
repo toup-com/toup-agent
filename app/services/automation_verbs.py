@@ -377,6 +377,15 @@ _TONES = {
     "partial": "warn",
     "undone": "warn",
     "skipped": "warn",
+    # R30's two new terminals. ND-14 (live): they were added to the
+    # engine's vocabulary but never to this table, so `tone_for` hit the
+    # "err" default and the card painted a user's own Stop in the danger
+    # tint while the thread beside it said "You stopped it. Nothing was
+    # sent." A stop is not a failure — it is the user getting what they
+    # asked for, which is exactly why `undone` (also user-initiated)
+    # already sits at "warn".
+    "stopped": "warn",
+    "superseded": "warn",
 }
 
 
@@ -441,6 +450,23 @@ def outcome_sentence(
                 "tone": tone}
     if outcome == "lost":
         return {"sentence": "The last run was interrupted.", "tone": tone}
+    if outcome == "stopped":
+        # The card must not contradict the thread. `wrote_count` here is
+        # the HONEST write-ledger count the caller passes for a stop —
+        # never the spec's write-step count, which would claim a change
+        # the stop prevented.
+        n = int(wrote_count or 0)
+        if n <= 0:
+            return {"sentence": "You stopped it. Nothing was sent.",
+                    "tone": tone}
+        return {
+            "sentence": f"You stopped it. {n} change"
+                        + ("" if n == 1 else "s") + " already made.",
+            "tone": tone,
+        }
+    if outcome == "superseded":
+        return {"sentence": "You stopped it, and the next run has taken "
+                            "over.", "tone": tone}
     return {"sentence": "The last run didn't complete.", "tone": tone}
 
 

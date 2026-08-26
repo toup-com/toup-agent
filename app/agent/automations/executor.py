@@ -224,6 +224,17 @@ async def _stamp_last_outcome(
             pass
         from app.services.automation_verbs import outcome_sentence
         stored = outcome or status
+        if (outcome or "") in ("stopped", "superseded"):
+            # ND-14: the stopped sentence names how many changes were
+            # ALREADY made, so it must come from the write ledger — the
+            # spec's write-STEP count would claim a change the stop
+            # prevented, and the card would contradict the thread.
+            from sqlalchemy import func as _func
+            from app.db.models import AutomationWrite
+            wrote_count = (await db.execute(
+                select(_func.count()).select_from(AutomationWrite)
+                .where(AutomationWrite.run_id == job.id)
+            )).scalar_one() or 0
         sent = outcome_sentence(
             outcome, write_tool=write_tool, connector_id=connector_id,
             counts=counts, wrote_count=wrote_count,
