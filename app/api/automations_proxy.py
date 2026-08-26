@@ -968,13 +968,27 @@ async def _proxy_accounts(
     agent_url, agent_api_key = target
     url = f"{agent_url.rstrip('/')}/api/accounts{sub_path}"
     from app.services.agent_http import get_agent_http_client
+    # R31: forward the BODY.
+    #
+    # This never passed `content=`, which was harmless while the two
+    # accounts routes were a GET and a bodyless POST — and became a
+    # silent data loss the moment `reconnect` grew `add_scopes` and
+    # `probe` grew `force`. A dropped body does not error: the agent
+    # sees an empty request and answers plausibly, so `Grant access`
+    # would have run an ordinary reconnect and told the user it was
+    # done. `_proxy` (the automations sibling) has always relayed it.
+    body = await request.body()
+    headers = {"X-Agent-Key": agent_api_key, "accept": "application/json"}
+    ctype = request.headers.get("content-type")
+    if ctype:
+        headers["content-type"] = ctype
     try:
         client = get_agent_http_client()
         resp = await client.request(
             request.method.upper(), url,
             params=dict(request.query_params),
-            headers={"X-Agent-Key": agent_api_key,
-                     "accept": "application/json"},
+            content=body or None,
+            headers=headers,
             timeout=30.0,
         )
     except httpx.RequestError as e:
@@ -1010,6 +1024,52 @@ async def proxy_account_reconnect(
 ):
     return await _proxy_accounts(request, f"/{account_id}/reconnect",
                                  current_user=current_user, db=db)
+
+
+@accounts_proxy_router.post("/{account_id}/probe")
+async def proxy_account_probe(
+    account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R31 §4.4 — ask the vendor now. `force` bypasses the ten-minute
+    cache and is what the two user-initiated paths send."""
+    return await _proxy_accounts(request, f"/{account_id}/probe",
+                                 current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/workflow/commit")
+async def proxy_workflow_commit(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R31 §4.6 — the workflow's one commit."""
+    return await _proxy(request, f"/{automation_id}/workflow/commit",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/runs/{run_id}/resume-source")
+async def proxy_resume_source(
+    automation_id: str, run_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R31 §4.2a — the `Try again` button on a needs-you card."""
+    return await _proxy(
+        request, f"/{automation_id}/runs/{run_id}/resume-source",
+        current_user=current_user, db=db)
+
+
+@router.post("/cleanup-day-chat")
+async def proxy_cleanup_day_chat(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R31 §4.1 — move the leaked rows out of the day chat."""
+    return await _proxy(request, "/cleanup-day-chat",
+                        current_user=current_user, db=db)
 
 
 @router.post("/migrate-routines")

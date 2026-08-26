@@ -658,6 +658,35 @@ async def _run_steps(
 # ── Entry points (cap-bounded, mirroring executor.py) ────────────────
 
 
+def _refuse_during_drain(automation: Automation, kind: str) -> bool:
+    """§4.8: a deploy "never starts a run it will kill".
+
+    R31-42. The drain gate blocks new WEBSOCKETS and deliberately lets
+    HTTP through — which is exactly how an inbound push starts a run
+    during a deploy. That run has, at best, `drain_timeout_s` to do
+    three minutes of work; at worst it is killed before its first step,
+    and a killed run is not quiet: it is reaped `failed/lost` and the
+    user is told their automation broke.
+
+    Skipping is the honest outcome. A scheduled fire comes round again;
+    a push event stays in its dedupe namespace and the next poll picks
+    it up. Neither is worse than a run that dies at step two and
+    reports a connector problem that never happened.
+    """
+    try:
+        from app.services import drain_state as _drain
+        if not _drain.should_refuse_new_run():
+            return False
+    except Exception:  # noqa: BLE001 — no drain module ⇒ never refuse
+        return False
+    logger.warning(
+        "[automations] run refused during drain automation=%s kind=%s "
+        "— it would be killed mid-flight",
+        automation.id, kind,
+    )
+    return True
+
+
 async def run_event_v2(
     db,
     automation: Automation,
@@ -665,6 +694,8 @@ async def run_event_v2(
     source: ValidatedSource,
     event: AutomationEvent,
 ) -> str:
+    if _refuse_during_drain(automation, "event"):
+        return "drained"
     try:
         return await asyncio.wait_for(
             _run_event_inner(db, automation, vspec, source, event),
@@ -762,6 +793,8 @@ async def run_schedule_fire_v2(
     fire_key: str,
     run_kind: str = "scheduled",
 ) -> str:
+    if _refuse_during_drain(automation, run_kind):
+        return "drained"
     # ND-7b: the job is minted INSIDE the wait_for — the ref carries its
     # id out so the cap handler can finalize (the old handler could not
     # even name the job and returned with the row still `running`).

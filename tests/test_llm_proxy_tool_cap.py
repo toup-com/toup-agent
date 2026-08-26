@@ -68,10 +68,24 @@ def test_a_large_overflow_reports_every_dropped_name():
 
 def test_dropped_names_survive_the_responses_shape():
     """Responses-style tools nest the name under `function`. A dropped
-    tool that logs as <unnamed> is a tool nobody can identify later."""
-    tools = _tools(128) + [{"type": "function", "function": {"name": "github__search_code"}}]
-    _, dropped = _cap_tools(tools)
-    assert dropped == ["github__search_code"]
+    tool that logs as <unnamed> is a tool nobody can identify later.
+
+    R31-41 changed WHICH tool goes, so this now builds a namespace with
+    two members: the cap will never empty a namespace, and a connector
+    with one tool is therefore protected. The property under test is
+    unchanged — the dropped entry is identified by NAME.
+    """
+    # One namespace, Responses shape throughout, so whatever the trim
+    # picks it has to read the nested name to report it.
+    tools = [
+        {"type": "function", "function": {"name": f"github__t{i}"}}
+        for i in range(130)
+    ]
+    kept, dropped = _cap_tools(tools)
+    assert len(kept) == 128
+    assert len(dropped) == 2
+    assert "<unnamed>" not in dropped, dropped
+    assert all(n.startswith("github__") for n in dropped), dropped
 
 
 def test_an_unnamed_tool_still_reports_something():
@@ -91,8 +105,14 @@ def test_the_cap_is_wired_on_the_openai_path_only_and_after_routing():
     src = Path(__file__).resolve().parents[1] / "app" / "api" / "llm_proxy.py"
     text = src.read_text()
 
-    # Both endpoints cap.
-    assert text.count("_cap_tools(_tools)") == 2, "one endpoint is missing the cap"
+    # Both endpoints cap. The probe matches the CALL, not its
+    # arguments: since R31-41 each site also passes `protected=`, and a
+    # probe pinned to an exact argument list goes red on every future
+    # signature change while proving nothing about the wiring.
+    assert text.count("_cap_tools(\n") == 2, "one endpoint is missing the cap"
+    # …and each protects the tools the request itself named, or the cap
+    # can still guarantee the 400 it exists to prevent.
+    assert text.count("protected=_requested_tool_names(body)") == 2
 
     # proxy_chat gates on the resolved backend, not on the model string.
     assert 'if backend.name == "openai":' in text

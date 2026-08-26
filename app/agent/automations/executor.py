@@ -129,6 +129,19 @@ async def _finalize_job(
     )
     await db.commit()
 
+    # R31-42: the run stops holding a deploy open HERE — the one gate
+    # every terminal passes, whichever executor or sweep got there.
+    # `on_terminal` was the obvious place and is the wrong one: it is
+    # reached only when the rowcount won AND the run has a v3 thread, so
+    # a pre-v3 or thread-less run would hold a drain open forever.
+    # `discard` is idempotent, so a double release is free; a MISSED one
+    # is the failure mode worth designing against.
+    try:
+        from app.services import drain_state as _drain
+        _drain.run_finished(job_id)
+    except Exception:  # noqa: BLE001 — a drain hook never fails a run
+        pass
+
     # R28: every terminal transition — v1, v2, and the outbox aggregate
     # finalizer — funnels through here, and the guarded UPDATE's
     # rowcount makes "exactly once" free: only the call that actually

@@ -1175,6 +1175,42 @@ def _dedup_tool_names(tools: list) -> tuple[list, list]:
 _OPENAI_MAX_TOOLS = 128
 
 
+def _requested_tool_names(body: dict) -> set:
+    """Every tool name THIS request explicitly names.
+
+    R31-41: these must survive the cap. `_prune_tool_choice` repairs the
+    allowlist after the fact, which keeps the request valid but silently
+    removes a capability the caller had asked for — and for a forced
+    `{"type":"function"}` it cannot repair anything at all, so the
+    request is a guaranteed 400. Protecting them at the cap makes both
+    cases unreachable instead of handled.
+    """
+    out: set = set()
+    tc = body.get("tool_choice")
+    if not isinstance(tc, dict):
+        return out
+    if tc.get("type") == "function":
+        fn = tc.get("function")
+        name = (fn or {}).get("name") if isinstance(fn, dict) else tc.get("name")
+        if name:
+            out.add(str(name))
+        return out
+    if tc.get("type") != "allowed_tools":
+        return out
+    container = tc["allowed_tools"] if isinstance(
+        tc.get("allowed_tools"), dict) else tc
+    for e in container.get("tools") or []:
+        if not isinstance(e, dict):
+            continue
+        name = e.get("name") or (
+            (e.get("function") or {}).get("name")
+            if isinstance(e.get("function"), dict) else None
+        )
+        if name:
+            out.add(str(name))
+    return out
+
+
 def _prune_tool_choice(body: dict, dropped_names: list, *,
                        model_name: str = "?", original_len: int = 0) -> list:
     """Drop capped-away tools from `tool_choice` so the request stays
@@ -1287,30 +1323,110 @@ def _prune_tool_choice(body: dict, dropped_names: list, *,
     return pruned
 
 
-def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS) -> tuple[list, list]:
-    """Trim an over-long tools array from the TAIL. Returns (kept, dropped_names).
+def _tool_name_of(t) -> str:
+    if not isinstance(t, dict):
+        return ""
+    return t.get("name") or (t.get("function") or {}).get("name") or ""
+
+
+def _namespace_of(name: str) -> str:
+    """`slack__send_message` → `slack`. Core tools share one namespace."""
+    return name.split("__", 1)[0] if "__" in name else ""
+
+
+def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
+               protected: Optional[set] = None) -> tuple[list, list]:
+    """Fit an over-long tools array under `limit`. Returns (kept, dropped).
 
     This is a cliff, not a slope: at `limit` everything works and at
     `limit + 1` every single turn fails, for every prompt, with an error
     that blames the user's phrasing. One tenant crossed it on 2026-08-08
     by connecting a 5-tool connector (124 → 129) and lost chat entirely.
 
-    Tail-first because the agent assembles core tools before skills
-    before MCP/connectors (the same ordering `_dedup_tool_names` relies
-    on for first-wins). So the agent keeps memory, files and messaging —
-    the tools it is broken without — and degrades at the margin instead.
-    That is the least-bad truncation, not a good one: the real fix is for
-    the agent not to offer 129 tools, and the WARN below is what makes
+    **R31-41 changes WHICH tools go.** It used to be `tools[:limit]` — a
+    head slice — and the tail is not arbitrary: the agent assembles core
+    → skills → MCP/connectors, and `mcp_tools_cache` sorts the MCP block
+    BY NAME. So the casualties were always the same alphabetical tail:
+    `outlook__send_message`, `session_create`, `session_list`, then every
+    `slack__*` and every `teams__*`. Reads and writes alike, and entire
+    connectors at a time.
+
+    That is the shape of the R30 blocker. An automation whose steps read
+    Slack and post to Slack loses BOTH on a ten-connector account, and
+    the only signal is a log line — so the run fails with "it did not
+    answer" and the user is told to reconnect a connector that is
+    perfectly healthy. Alphabetical order is not importance order, and
+    losing all five of a connector's tools is categorically worse than
+    losing one of five.
+
+    So the trim is now:
+
+      1. **`protected` is never dropped.** These are the tools the
+         request itself names (`tool_choice` / `allowed_tools`) —
+         dropping one guarantees a 400, which is the ND-22 path.
+      2. **Every namespace keeps at least one tool.** A connector that
+         is present at all stays reachable; the model can discover the
+         rest is missing, but it cannot discover a connector that has
+         vanished.
+      3. **Beyond that, drop from the LARGEST namespace first**, tail
+         within it. Degradation spreads across the connectors that can
+         best afford it instead of landing entirely on whoever sorts
+         last.
+
+    Still the least-bad truncation, not a good one. The real fix is per
+    step tool selection at the agent, and the WARN below is what keeps
     that visible rather than silent.
     """
     if len(tools) <= limit:
         return tools, []
-    kept = tools[:limit]
-    dropped = [
-        t.get("name") or (t.get("function") or {}).get("name") or "<unnamed>"
-        for t in tools[limit:]
-        if isinstance(t, dict)
-    ]
+
+    protected = protected or set()
+    keep_flags = [True] * len(tools)
+    names = [_tool_name_of(t) for t in tools]
+    spaces = [_namespace_of(n) for n in names]
+
+    # How many of each namespace are still in. Core tools (no `__`) are
+    # one namespace and are never the biggest by construction, but they
+    # are protected by rule 2 anyway.
+    from collections import Counter
+    remaining = Counter(spaces)
+    n_kept = len(tools)
+
+    # Drop candidates, tail-first within a namespace, largest namespace
+    # first — recomputed each step so the biggest never runs away.
+    order = sorted(
+        range(len(tools)),
+        key=lambda i: -i,          # tail first
+    )
+    while n_kept > limit:
+        victim = None
+        best_size = 0
+        for i in order:
+            if not keep_flags[i]:
+                continue
+            if names[i] in protected:
+                continue
+            ns = spaces[i]
+            if remaining[ns] <= 1:
+                continue           # rule 2: never empty a namespace
+            if remaining[ns] > best_size:
+                best_size, victim = remaining[ns], i
+        if victim is None:
+            # Every remaining tool is protected or is its namespace's
+            # last. Fall back to the old behaviour for the remainder —
+            # a 400 for everyone is worse than a degraded turn.
+            for i in order:
+                if keep_flags[i] and names[i] not in protected:
+                    victim = i
+                    break
+        if victim is None:
+            break                  # nothing left we may drop
+        keep_flags[victim] = False
+        remaining[spaces[victim]] -= 1
+        n_kept -= 1
+
+    kept = [t for t, k in zip(tools, keep_flags) if k]
+    dropped = [n or "<unnamed>" for n, k in zip(names, keep_flags) if not k]
     return kept, dropped
 
 
@@ -1392,14 +1508,15 @@ async def proxy_chat(
     if backend.name == "openai":
         _tools = body.get("tools")
         if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
-            _kept, _dropped = _cap_tools(_tools)
+            _kept, _dropped = _cap_tools(
+                _tools, protected=_requested_tool_names(body))
             body["tools"] = _kept
             _pruned = _prune_tool_choice(
                 body, _dropped, model_name=str(model),
                 original_len=len(_tools))
             logger.warning(
                 "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-                "%d > %d, dropped %d from the tail: %s%s",
+                "%d > %d, dropped %d (namespace-fair): %s%s",
                 config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
                 len(_dropped), _dropped,
                 (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
@@ -1747,14 +1864,15 @@ async def proxy_responses(
     # to fix one path and leave this one live.
     _tools = body.get("tools")
     if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
-        _kept, _dropped = _cap_tools(_tools)
+        _kept, _dropped = _cap_tools(
+            _tools, protected=_requested_tool_names(body))
         body["tools"] = _kept
         _pruned = _prune_tool_choice(
             body, _dropped, model_name=str(model),
             original_len=len(_tools))
         logger.warning(
             "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-            "%d > %d, dropped %d from the tail: %s%s",
+            "%d > %d, dropped %d (namespace-fair): %s%s",
             config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
             len(_dropped), _dropped,
             (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),

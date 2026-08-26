@@ -54,6 +54,55 @@ def connector_card_payload(
     }
 
 
+# CONTRACTS-R31 §4.1: the ONLY metadata key an automation may write
+# into the day chat. Everything else belongs in the thread.
+#
+# The three setup cards are the documented exception and they are not
+# an automation NARRATING — they are the connector/grant consent flow
+# and the setup card, which happen in the main chat because that is
+# where the user typed the request (§2.1's `automation_setup` clause).
+DAY_CHAT_METADATA_KEYS: frozenset = frozenset({
+    "automation_notification",
+    "automation_connector_card",
+    "automation_grant_card",
+})
+
+
+class AutomationDayChatWrite(RuntimeError):
+    """An automation tried to put something else in the day chat."""
+
+
+def assert_day_chat_clean(metadata_key: str) -> None:
+    """Refuse a day-chat write outside the sanctioned key set.
+
+    §4.1's storage invariant, at the one remaining writer. R31 retired
+    `session.write_session_message` — the path that put run cards,
+    memory chips, auto-pause notices, pending cards and draft cards in
+    the user's main chat — and this is the door that stays open, so it
+    is the door that needs a check.
+
+    Raises in dev/test so a new card fails at its first call; logs in
+    production, because losing one card is survivable and losing a run
+    is not.
+    """
+    if metadata_key in DAY_CHAT_METADATA_KEYS:
+        return
+    msg = (
+        f"day-chat write refused (CONTRACTS-R31 §4.1): "
+        f"{metadata_key!r} is not one of {sorted(DAY_CHAT_METADATA_KEYS)}. "
+        "Write a turn with ledger.append_turn instead."
+    )
+    logger.error("[automations] %s", msg)
+    try:
+        from app.config import settings
+        if (getattr(settings, "environment", "") or "").lower() != "production":
+            raise AutomationDayChatWrite(msg)
+    except AutomationDayChatWrite:
+        raise
+    except Exception:  # noqa: BLE001 — settings unavailable ⇒ fail soft
+        pass
+
+
 async def write_card_message(
     db: AsyncSession,
     *,
@@ -65,6 +114,7 @@ async def write_card_message(
 ) -> tuple[str, Optional[str]]:
     """Persist one assistant message carrying the card. Returns
     (message_id, day_chat_id)."""
+    assert_day_chat_clean(metadata_key)
     from app.agent.conversation_resolver import (
         resolve_or_create_day_conversation,
     )

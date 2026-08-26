@@ -607,6 +607,41 @@ async def backfill_sentinel_image_containers(
     return summary
 
 
+def _normalise_image_tag(value) -> str:
+    """The bare tag, whatever format it arrived in (R31-44)."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.rsplit(":", 1)[-1] if ":" in text else text
+
+
+def _parse_started_at(value):
+    """The container's own start time from the bridge census, or None.
+
+    None means "the bridge did not tell us", and the caller must then
+    leave the column alone. Guessing is the defect: a `started_at` that
+    is really a provision time is worse than a null one, because a null
+    reads as unknown and a wrong timestamp reads as fact.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        from datetime import datetime as _dt
+        # Docker emits RFC3339 with nanoseconds and a Z.
+        text = text.replace("Z", "+00:00")
+        if "." in text:
+            head, _, rest = text.partition(".")
+            frac, sign, off = rest.partition("+")
+            if not sign:
+                frac, sign, off = rest.partition("-")
+            text = f"{head}.{frac[:6]}{sign}{off}"
+        parsed = _dt.fromisoformat(text)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except (ValueError, TypeError):
+        return None
+
+
 async def reconcile_managed_rows(db: AsyncSession) -> dict:
     """Row ↔ docker truth sync (R30, task_4ae52334 — pre-ramp blocker).
 
@@ -663,7 +698,24 @@ async def reconcile_managed_rows(db: AsyncSession) -> dict:
                     changed.append("agent_url")
             image = c.get("image") or ""
             tag = image.rsplit(":", 1)[-1] if ":" in image else None
-            if tag and row.image_tag != tag:
+            # R31-44: compare NORMALISED, write normalised.
+            #
+            # Two writers touch this column in two formats — this
+            # reconciler writes the bare digest (`0b3926cbe809`) while
+            # `upgrade_tenant_image` writes whatever it was handed,
+            # which is the fully-qualified `ghcr.io/toup-com/toup-agent:
+            # 0b3926cbe809`. R31-D watched one row flip between the two
+            # 50 seconds apart on 2026-08-26.
+            #
+            # The cost is not cosmetic: a fleet census that groups rows
+            # by `image_tag` reads one image as two, so "the fleet is on
+            # X" is false for every value of X — which is exactly the
+            # reading D had to correct mid-round. Normalising here does
+            # NOT make the census trustworthy during a rollout (the
+            # managed row can lead the actual container; the census is
+            # only true at rest) — it removes a comparison hazard, not a
+            # truth hazard.
+            if tag and _normalise_image_tag(row.image_tag) != tag:
                 changed.append(f"image {row.image_tag}->{tag}")
                 row.image_tag = tag
             # container_id drifts on every blue-green recreate (D's
@@ -681,6 +733,29 @@ async def reconcile_managed_rows(db: AsyncSession) -> dict:
                 changed.append("status running->stopped")
                 row.status = "stopped"
                 row.stopped_at = datetime.utcnow()
+
+            # R31-44: `started_at` gets a source.
+            #
+            # Its four writers were all platform-side wall clocks
+            # stamped at the moment the PLATFORM made an API call —
+            # provision, the unique-violation recovery, restart, and the
+            # pool claim. None of them is the container's start, and the
+            # rollout path (`upgrade_tenant_image`) writes only
+            # `image_tag`, so every blue-green recreate left the column
+            # pointing at the previous provision. Two operator surfaces
+            # serve it as if it meant something, and R31-D found it
+            # reading 05:00:27 with no event at either of the 14:21 and
+            # 14:36 recreates they were trying to attribute.
+            #
+            # The bridge census now carries `started_at` from
+            # `docker inspect .State.StartedAt`. Where it does not (an
+            # older bridge — that file is hand-deployed and outside this
+            # repo), the column is LEFT ALONE rather than stamped with
+            # now(): a wrong timestamp is what this row is about.
+            started = _parse_started_at(c.get("started_at"))
+            if started is not None and row.started_at != started:
+                changed.append("started_at")
+                row.started_at = started
             if changed:
                 await db.commit()
                 fixed += 1

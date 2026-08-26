@@ -233,12 +233,9 @@ async def overview(
     total_containers = len(managed)
     running_containers = sum(1 for c in managed if c["status"] == "running")
 
-    return {
+    reachable = bridge_data is not None
+    out = {
         "host": host,
-        "docker": {
-            "containers_running": containers_running,
-            "container_stats": container_stats,
-        },
         "managed": managed,
         "totals": {
             "users": total_users,
@@ -247,8 +244,30 @@ async def overview(
             "port_range": f"{settings.docker_port_range_start}-{settings.docker_port_range_end}",
             "max_capacity": settings.docker_port_range_end - settings.docker_port_range_start + 1,
         },
-        "bridge_reachable": bridge_data is not None,
+        "bridge_reachable": reachable,
     }
+    # R31 (ND-23's family): the `docker` half is OMITTED when the bridge
+    # is unreachable, rather than served as empty lists.
+    #
+    # R31-D characterised the flap on 2026-08-26 — roughly 90 s down on a
+    # ~2-minute cycle, with every tenant serving 200 throughout, so the
+    # outage is in the CENSUS PATH and not in the fleet. During it this
+    # payload returned `containers_running: []`, and a reader that does
+    # not check `bridge_reachable` first concludes the fleet has
+    # vanished. D nearly published "5 tenants disagree with docker" off
+    # one of those samples.
+    #
+    # That is worse than an error, because it is a confident wrong
+    # answer about OTHER subsystems: an instrument that fails by
+    # ANSWERING contaminates whatever it was pointed at. A missing key
+    # raises where an empty list computes, so a consumer that forgets
+    # the guard now fails loudly instead of quietly reporting zero.
+    if reachable:
+        out["docker"] = {
+            "containers_running": containers_running,
+            "container_stats": container_stats,
+        }
+    return out
 
 
 @router.post("/containers/{container_id}/start")

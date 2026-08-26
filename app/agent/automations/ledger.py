@@ -746,6 +746,28 @@ async def run_v3_payload(
 
 # ------------------------------------------- the completeness invariant
 
+def _expected_vocabulary(automation, job) -> Optional[str]:
+    """What this run's result turn should be speaking (R31-37).
+
+    Derived from the automation's WRITE STEPS, which is the same source
+    the narrator uses — so a mismatch means the two disagreed, not that
+    this function has an opinion of its own.
+    """
+    try:
+        from .narrator import vocabulary_for
+        raw = json.loads(automation.spec_json or "{}")
+        if raw.get("version") != 2:
+            return None
+        tools = [
+            s.get("tool") for s in (raw.get("steps") or [])
+            if isinstance(s, dict) and (s.get("grant_id")
+                                        or s.get("grant_target"))
+        ]
+        return vocabulary_for([t for t in tools if t])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def close_ledger(
     db: AsyncSession, *, user_id: str, job: BuildJob, automation: Automation,
 ) -> None:
@@ -843,6 +865,35 @@ async def close_ledger(
                     "item_refs": missing,
                 })
                 turn_row.payload_json = json.dumps(body, default=str)
+
+    # R31-37: the result turn's VOCABULARY must match what the run
+    # actually did, and it is asserted here because here is where the
+    # run's whole record exists at once.
+    #
+    # The founder's Morning work brief — a reads-only brief, posting one
+    # line to Slack — rendered as `CHANGED YOUR WEEK · 1 item` /
+    # `TOLD YOU ONLY · 0 items` / `LEFT ALONE ON PURPOSE · 2 items`,
+    # and closed "That is everything I could change in this run." It
+    # changed nothing. A brief that speaks the `changes` vocabulary
+    # tells the user their week was altered by a run that only read.
+    #
+    # Logged, not corrected: the tiers differ in COUNT (five vs three)
+    # as well as in wording, so a turn cannot be re-vocabularised
+    # mechanically — its rows were ranked against labels that do not
+    # exist in the other set. C's `vocabulary_for` is the fix at the
+    # source; this is the tripwire that says when it drifted, on which
+    # run, and in which direction.
+    try:
+        expected = _expected_vocabulary(automation, job)
+        for t in [x for x in turns if x["kind"] == "result"]:
+            if expected and t.get("vocabulary") != expected:
+                logger.warning(
+                    "automation.ledger.vocabulary run=%s automation=%s "
+                    "served=%s expected=%s",
+                    job.id, automation.id, t.get("vocabulary"), expected,
+                )
+    except Exception as e:  # noqa: BLE001 — a tripwire never fails a close
+        logger.debug("[ledger] vocabulary check skipped: %s", e)
 
     # Stamp accounts onto the job config for cheap list reads.
     try:

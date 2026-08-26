@@ -301,3 +301,48 @@ async def test_cleanup_keeps_the_notification_card():
     rows = await _day_rows(uid)
     assert len(rows) == 1
     assert rows[0].id == msg_id
+
+
+@pytest.mark.asyncio
+async def test_a_day_chat_write_outside_the_sanctioned_keys_is_refused():
+    """§4.1's storage invariant, at the one remaining writer.
+
+    R31-D searched the founder's day and found the shape that makes
+    this necessary: eight rows whose CONTENT is a thread turn — both
+    `Run all of them again` pairs and the whole 15:16/15:17 Q&A — with
+    `metadata_json` empty on every one. No `automation_id`, no
+    `thread_id`, nothing. Their only marker is `channel='automation'`.
+
+    So a tag-based filter cannot catch this shape, on either side: the
+    migration finds them by channel (the only thing they have), and
+    B's `mapDayMsg` clause is specified against metadata these rows do
+    not carry. The net has to be at the WRITE path, where a missing tag
+    is loud once instead of silent in every consumer downstream.
+    """
+    from app.agent.automations.cards import (
+        AutomationDayChatWrite, DAY_CHAT_METADATA_KEYS,
+        assert_day_chat_clean, write_card_message,
+    )
+
+    # The three sanctioned keys pass.
+    for key in DAY_CHAT_METADATA_KEYS:
+        assert_day_chat_clean(key)
+
+    # Anything an automation might narrate does not.
+    for key in ("memory_update", "draft_card", "pending_action",
+                "fix_chip", "automation_turn"):
+        with pytest.raises(AutomationDayChatWrite):
+            assert_day_chat_clean(key)
+
+    # And it is wired at the writer, not only exported.
+    uid = await _mk_user()
+    aid = await _mk_automation(uid, "Guarded")
+    async with async_session_maker() as db:
+        with pytest.raises(AutomationDayChatWrite):
+            await write_card_message(
+                db, user_id=uid, content="Memory updated · 2 facts",
+                metadata_key="memory_update",
+                payload={"count": 2}, title="Guarded",
+            )
+    assert await _day_rows(uid) == []
+    del aid

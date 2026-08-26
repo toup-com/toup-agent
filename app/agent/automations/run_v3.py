@@ -61,6 +61,16 @@ async def open_run(
     """Open the v3 record for a freshly minted run. Best-effort by
     contract — a ledger failure never blocks the run itself."""
     try:
+        # R31-42: this run holds the drain open until it terminalizes.
+        # Registered here rather than at mint because `open_run` is the
+        # one seam EVERY run passes (both executors, all six minting
+        # sites) — a second registration point is a second place to
+        # forget, and a forgotten decrement wedges a deploy.
+        try:
+            from app.services import drain_state as _drain
+            _drain.run_started(job.id)
+        except Exception:  # noqa: BLE001 — a drain hook never fails a run
+            pass
         thread = await ledger.ensure_thread(
             db, user_id=automation.user_id, automation_id=automation.id,
         )

@@ -889,9 +889,35 @@ async def get_messages_by_date(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Get all messages for all sessions on a specific date (YYYY-MM-DD).
-    Returns messages from the 10 most recent sessions, ordered chronologically.
-    tz_offset adjusts the date boundary to match the client's local day.
+    Get all messages for all sessions on a specific date (YYYY-MM-DD),
+    ordered chronologically. `tz_offset` adjusts the date boundary to
+    match the client's local day.
+
+    **A day is bounded by its MESSAGES, not by a session count.**
+
+    This used to take the 10 most recently-UPDATED conversations of the
+    day and return their messages. That is a silent, moving truncation:
+    a day is a fixed set of rows, and which of them you could see
+    depended on how many conversations had been touched since — so a
+    row that was there an hour ago is gone now, with no error and no
+    marker, and nothing about the response says a session was dropped.
+
+    R31-D caught it on 2026-08-26 with two captures of the same date at
+    the same offset: 30 rows at 17:35Z, 19 at 18:47Z, 11 dropped and 0
+    added. The eleven were all three `automation_notification` cards and
+    eight rows of ordinary conversation about reminders — the founder
+    talking to his agent, invisible in his own day. They were never
+    deleted: `/api/day-chats/{date}/messages`, which does not have this
+    limit, returned all 51 rows throughout.
+
+    Automations made it VISIBLE rather than caused it: each automation
+    thread mints a conversation, so an active day now has more than ten,
+    and `updated_at DESC` puts the freshly-touched automation rows at
+    the top and pushes the user's own morning off the end.
+
+    So the session cap is gone. The `limit` parameter — which the caller
+    controls and which already bounds the response — does the bounding,
+    against the day's messages directly.
     """
     from datetime import date as date_type, timedelta
 
@@ -925,7 +951,6 @@ async def get_messages_by_date(
                 )
             )
             .order_by(Conversation.updated_at.desc())
-            .limit(10)
         )
     except _MISSING_TABLE_ERRORS:
         # Platform DB doesn't carry conversations/messages (AGENT_ONLY_TABLES).
@@ -940,16 +965,23 @@ async def get_messages_by_date(
 
     # Get all messages for these sessions in one query
     try:
+        # NEWEST `limit`, re-sorted ascending for the client.
+        #
+        # With the session cap gone a busy day can exceed `limit`, and
+        # `ORDER BY created_at ASC LIMIT n` would then return the day's
+        # FIRST n rows — so the user's most recent messages become the
+        # ones that disappear, which is the worse half of the same
+        # defect. Take the tail and reverse it.
         messages_result = await db.execute(
             select(Message)
             .where(Message.conversation_id.in_(session_ids))
-            .order_by(Message.created_at.asc())
+            .order_by(Message.created_at.desc(), Message.id.desc())
             .limit(limit)
         )
     except _MISSING_TABLE_ERRORS:
         await db.rollback()
         return JSONResponse(content=[])
-    messages = messages_result.scalars().all()
+    messages = list(reversed(messages_result.scalars().all()))
 
     # Enrich with build job data
     build_jobs = await load_build_jobs(db, messages)
