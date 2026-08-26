@@ -20,7 +20,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from app.api.llm_proxy import _OPENAI_MAX_TOOLS, _cap_tools
+from app.api.llm_proxy import (
+    _OPENAI_MAX_TOOLS, _cap_tools, _prune_tool_choice,
+)
 
 
 def _tools(n: int) -> list:
@@ -105,3 +107,184 @@ def test_the_cap_is_wired_on_the_openai_path_only_and_after_routing():
     for m in re.finditer(r"_cap_tools\(_tools\)", text):
         window = text[max(0, m.start() - 700):m.start()]
         assert "openai" in window.lower(), "a _cap_tools call with no OpenAI guard above it"
+
+
+# ── The half this file never tested: the CHOICE, not just the array ──────
+#
+# `_cap_tools` was pinned in isolation, so nothing noticed that capping the
+# array left `tool_choice` naming tools the same request no longer offered.
+# OpenAI answers 400 "Tool choice 'X' not found in 'tools' parameter".
+
+
+def _chat_allowed(*names):
+    return {"type": "allowed_tools",
+            "allowed_tools": {"mode": "auto",
+                              "tools": [{"type": "function",
+                                         "function": {"name": n}}
+                                        for n in names]}}
+
+
+def _responses_allowed(*names):
+    return {"type": "allowed_tools", "mode": "auto",
+            "tools": [{"type": "function", "name": n} for n in names]}
+
+
+def test_the_production_failure_chat_shape():
+    """The founder's voice turn: 141 tools, 13 capped from the tail, and
+    `slack__list_channels` still named in the allowlist."""
+    body = {"tool_choice": _chat_allowed(
+        "memory_search", "slack__list_channels", "navigate_to")}
+    pruned = _prune_tool_choice(body, ["slack__list_channels"])
+
+    assert pruned == ["slack__list_channels"]
+    left = [t["function"]["name"]
+            for t in body["tool_choice"]["allowed_tools"]["tools"]]
+    assert left == ["memory_search", "navigate_to"]
+    assert "slack__list_channels" not in left
+
+
+def test_the_responses_wire_shape_too():
+    """The 400 was on /v1/responses, whose allowlist is FLAT — a fix that
+    only understood the chat shape would not have helped the request that
+    actually failed."""
+    body = {"tool_choice": _responses_allowed("a", "jira__search_issues")}
+    pruned = _prune_tool_choice(body, ["jira__search_issues"])
+
+    assert pruned == ["jira__search_issues"]
+    assert [t["name"] for t in body["tool_choice"]["tools"]] == ["a"]
+
+
+def test_an_allowlist_emptied_by_the_cap_drops_the_restriction():
+    """An allowlist whose every entry was capped away would forbid every
+    tool the model was offered. Dropping the restriction is the honest
+    degradation; keeping an empty one is a guaranteed dead turn."""
+    body = {"tool_choice": _chat_allowed("slack__list_channels")}
+    pruned = _prune_tool_choice(body, ["slack__list_channels"])
+
+    assert pruned == ["slack__list_channels"]
+    assert "tool_choice" not in body
+
+
+def test_a_choice_naming_only_surviving_tools_is_untouched():
+    """The common case must not be disturbed — no cap, no pruning, and the
+    object is left byte-identical."""
+    tc = _chat_allowed("memory_search", "navigate_to")
+    body = {"tool_choice": tc}
+    assert _prune_tool_choice(body, ["some__other_tool"]) == []
+    assert body["tool_choice"] is tc
+    assert [t["function"]["name"]
+            for t in tc["allowed_tools"]["tools"]] == [
+        "memory_search", "navigate_to"]
+    # ...and no dropped names at all is a no-op.
+    assert _prune_tool_choice({"tool_choice": tc}, []) == []
+
+
+def test_a_forced_single_tool_is_reported_not_silently_rewritten():
+    """A forced `{"type":"function"}` naming a capped tool has no valid
+    repair — pruning it would invent a different request than the caller
+    asked for. It is left alone and logged instead."""
+    body = {"tool_choice": {"type": "function",
+                            "function": {"name": "slack__list_channels"}}}
+    assert _prune_tool_choice(body, ["slack__list_channels"]) == []
+    assert body["tool_choice"]["function"]["name"] == "slack__list_channels"
+
+    # "auto" / "required" / absent are all untouched.
+    for tc in ("auto", "required", None):
+        b = {"tool_choice": tc} if tc else {}
+        assert _prune_tool_choice(b, ["x"]) == []
+
+
+# ── The cut must never reach a tool the agent OWNS ──────────────────────
+
+
+def test_the_cap_can_only_ever_reach_the_mcp_block():
+    """Two rules in this repo point in opposite directions.
+
+    Prefix stability says a new tool may only join at the **END** — that is
+    why `automations__memory_recall` is last in its skill and why
+    CONTRACTS §14 leans on the append-only property. **The cap drops from
+    the END.** So the newest tool occupies simultaneously the cache-safest
+    position and the first-to-vanish one, and nothing anywhere says which
+    property wins when the array overflows.
+
+    Today the collision is invisible: wire order is core → skill →
+    MCP/connector (`agent_runner.py:1038`, `:1054`), and the MCP block
+    absorbs the whole cut. That is luck, not design — the boundary is
+    pinned nowhere, so the moment the MCP block shrinks or the skill block
+    grows, the cut walks into skill tools **silently**, which is ND-24's
+    actual defect rather than the Slack writes specifically.
+
+    It also protects `tool_choice` INTEGRITY, not only capability
+    presence — R30-C's point, about their own change. `_ALWAYS_INCLUDED_TOOLS`
+    does not merely widen the array; it feeds the allowlist
+    (`filter_tools_by_intent` → `_gated_names` → `_allowed_tool_names` →
+    `build_allowed_tools_choice`), and `automations__list` was added to
+    that set for ND-18. So an allowlisted tool cut by the cap is exactly
+    the ND-22 path: `tool_choice` naming a tool absent from `tools`, three
+    400s, a silent fallback to a weaker model, and a 20.7s turn returning
+    two output tokens. Skill tools sit upstream of the MCP block, so
+    bounding that block is what keeps an always-included entry from
+    becoming that failure.
+
+    This does not decide the precedence question — deliberately. It makes
+    the day the question becomes urgent arrive as a red test instead of as
+    a capability quietly missing from production.
+    """
+    from app.agent.tool_definitions import (
+        get_agent_tools, get_extended_tools, get_navigation_tools,
+    )
+    from app.agent.skills.loader import SkillLoader
+    from app.config import settings
+
+    settings.automations_enabled = True   # widest skill set we ship
+    core = get_agent_tools() + get_extended_tools() + get_navigation_tools()
+    import asyncio
+    loader = SkillLoader()
+    asyncio.run(loader.load_all())
+    skills = loader.get_all_tool_definitions()
+
+    owned = len(core) + len(skills)
+    assert owned <= _OPENAI_MAX_TOOLS, (
+        f"core+skill tools ({owned}) exceed the OpenAI cap "
+        f"({_OPENAI_MAX_TOOLS}), so `_cap_tools` would trim a tool the "
+        f"agent OWNS rather than an MCP tool. Decide the precedence "
+        f"question before shipping this: which yields, append-only "
+        f"prefix stability or capability presence?"
+    )
+    # Headroom is the thing worth watching; name it in the failure.
+    headroom = _OPENAI_MAX_TOOLS - owned
+    assert headroom >= 1, headroom
+
+
+def test_pruning_announces_itself_because_it_removes_the_last_signal(caplog):
+    """The strip makes the request valid — and silences the only symptom.
+
+    Before pruning existed the mismatch announced itself as a 400: three
+    retries and a visible model downgrade. Making the request valid means
+    the model quietly takes whatever survived the cut instead of failing,
+    so the log is now the ONLY way a human learns capability was removed.
+
+    Measured on the founder 2026-08-26: asked which Slack channels it
+    could see with every `slack__*` tool capped away, the agent answered
+    correctly via `automations__list_targets` — a skill tool upstream of
+    the cut. Reads have a survivor; writes do not. The agent looks
+    capable when asked to LOOK and is silently incapable when asked to
+    ACT.
+    """
+    import logging
+
+    body = {"tool_choice": _chat_allowed("memory_search",
+                                         "slack__send_message")}
+    with caplog.at_level(logging.ERROR, logger="app.api.llm_proxy"):
+        pruned = _prune_tool_choice(
+            body, ["slack__send_message"],
+            model_name="gpt-5.6-terra", original_len=144)
+
+    assert pruned == ["slack__send_message"]
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, "capability was removed and nothing said so"
+    said = errors[0].getMessage()
+    assert "CAPABILITY REMOVED" in said
+    assert "slack__send_message" in said
+    # The numbers a human needs to act on it, not just the fact.
+    assert "144" in said and str(_OPENAI_MAX_TOOLS) in said

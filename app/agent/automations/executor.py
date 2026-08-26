@@ -258,16 +258,37 @@ async def _stamp_last_outcome(
 
 async def _record_health(
     db: AsyncSession, automation_id: str, *, ok: bool, error: Optional[str],
+    ran: bool = True,
 ) -> None:
     """Success resets the failure streak; failure increments it. The
-    sweep (sweep.py) owns the auto-pause decision — one place."""
+    sweep (sweep.py) owns the auto-pause decision — one place.
+
+    `ran` separates two things this used to conflate: **is the automation
+    healthy** (the connector answered, the streak may reset) and **did a
+    run happen** (`last_run_at` / `last_status`). A poll that finds no
+    fresh events is the first without being the second — nothing ran, so
+    there is no run row — and stamping it as a successful run made health
+    claim a run the ledger had never heard of.
+
+    Observed live 2026-08-26 (ND-25, R30-D): automation `7681a214` carried
+    `last_status: "success"` at `05:21:40`, fifteen seconds after the
+    container booted, with **no run row at that time in either the
+    per-automation or the global runs feed**. That is this line: a boot-time
+    poll found nothing fresh and reported a run.
+
+    Health is the observability surface for the ramp, so a false success
+    there is worse than a missing one — it is the reading a human trusts
+    when deciding whether an automation is working.
+    """
     a = await db.get(Automation, automation_id)
     if a is None:
         return
-    a.last_run_at = datetime.utcnow()
+    if ran:
+        a.last_run_at = datetime.utcnow()
     if ok:
         a.consecutive_failures = 0
-        a.last_status = "success"
+        if ran:
+            a.last_status = "success"
         a.last_error = None
     else:
         a.consecutive_failures = (a.consecutive_failures or 0) + 1
@@ -631,6 +652,9 @@ async def poll_and_run(
         elif status == "run":
             ran += 1
     if failed == 0:
-        await _record_health(db, automation.id, ok=True, error=None)
+        # `ran=ran > 0`: a poll that found nothing fresh proves the
+        # connector answered, not that a run happened. See `_record_health`.
+        await _record_health(db, automation.id, ok=True, error=None,
+                             ran=ran > 0)
     return {"observed": len(items), "fresh": len(fresh),
             "ran": ran, "failed": failed}

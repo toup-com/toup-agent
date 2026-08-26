@@ -737,7 +737,11 @@ async def poll_and_run_v2(
         elif status == "run":
             ran += 1
     if failed == 0:
-        await _record_health(db, automation.id, ok=True, error=None)
+        # See `_record_health`: a poll with nothing fresh is connector
+        # health, not a run. Stamping it as a run made the health object
+        # claim runs the ledger had never heard of (ND-25).
+        await _record_health(db, automation.id, ok=True, error=None,
+                             ran=ran > 0)
     return {"observed": len(items), "fresh": len(fresh),
             "ran": ran, "failed": failed}
 

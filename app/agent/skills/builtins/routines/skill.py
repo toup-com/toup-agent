@@ -88,6 +88,53 @@ def _infer_tz_from_phone(e164: Optional[str]) -> Optional[str]:
         return None
 
 
+
+def _automations_boundary(available: Optional[bool] = None) -> str:
+    """The ND-18 boundary, told two ways.
+
+    Automations are a flag-gated product: when the skill is not loaded,
+    `automations__list` is not in the tools array and the automations
+    prompt section is absent. Naming that tool unconditionally left the
+    model instructed to use something it did not have, which is how
+    ND-19 sounded from the user's side — *"I can't verify your full
+    automation list from here right now"*, followed by an invented
+    automation. So the sentence that points at the tool ships only when
+    the tool does; the half that stops reminders being called
+    automations ships always.
+
+    `available` MUST come from the same lifetime as registration.
+    Reading the setting here would be wrong: `skill_enabled` is resolved
+    ONCE AT BOOT by the loader, while `settings.automations_enabled`
+    flips live on a settings reload — so after a reload this prompt
+    would start naming a tool the loader never registered, which is the
+    exact defect. The caller passes a snapshot taken in `on_load`, and
+    only falls back to the live setting when there was no load (tests
+    instantiating the skill directly).
+    """
+    if available is None:
+        from app.config import settings
+        available = bool(getattr(settings, "automations_enabled", False))
+
+    shared = (
+        "**These are not the user's automations.** Reminders and "
+        "scheduled tasks are their own thing. Never present them as "
+        "automations, and never fold them into a list or a count of "
+        "automations. When the user asks about these, call them "
+        "reminders and scheduled tasks.\n"
+    )
+    if not available:
+        return shared
+    return shared + (
+        "When the user asks what automations they have, or how many, "
+        "read `automations__list` and answer from it — never from this "
+        "list, never from memory, and never from what you remember of "
+        "the conversation. **If you cannot read it, say plainly that "
+        "you cannot see their automations right now and name none.** An "
+        "invented automation, or a real one with a guessed status, is a "
+        "worse answer than admitting you could not look.\n"
+    )
+
+
 def _routine_summary(r) -> Dict[str, Any]:
     """Compact dict the agent can reason over. Mirrors RoutineResponse
     minus recent_runs (the agent rarely needs them; if it does, it calls
@@ -207,6 +254,42 @@ class RoutinesSkill(Skill):
         ),
         author="Toup",
     )
+
+    #: Snapshot of whether the automations skill registered THIS boot.
+    #: None until `on_load` runs (a directly-instantiated skill in a test
+    #: falls back to the live setting).
+    _automations_available: Optional[bool] = None
+
+    async def on_load(self) -> None:
+        """Capture the automations gate in registration's own lifetime.
+
+        The prompt may only name `automations__list` when the loader
+        actually registered that skill in this process — reading the
+        setting at render time would let a reload point the model at a
+        tool nobody registered (ND-19).
+        """
+        self._resample_automations()
+
+    async def on_entitlements_changed(self) -> None:
+        """Re-take the snapshot when registration reopens.
+
+        `on_load` alone was right only while registration was resolved
+        once per process. `SkillLoader.refresh_entitlements` extends that
+        lifetime: a container that boots dark can register automations
+        later, and a boot-time snapshot would then under-claim a tool the
+        model is actually holding — safe, and therefore the kind of stale
+        that never gets noticed. This is the loader telling us the set
+        changed.
+        """
+        self._resample_automations()
+
+    def _resample_automations(self) -> None:
+        try:
+            from app.agent.tool_entitlements import skill_enabled
+
+            self._automations_available = bool(skill_enabled("automations"))
+        except Exception:  # noqa: BLE001 — a companion, never a load failure
+            self._automations_available = None
 
     # ------------------------------------------------------------------
     # Tools
@@ -583,12 +666,7 @@ class RoutinesSkill(Skill):
             "  • \"Remind me to call mom at 6pm\" — *use `routines__remind`*\n"
             "  • \"Buzz me every 30 minutes between 9 and 5 to stretch\" — *use `routines__remind`*\n"
             "\n"
-            "**These are not the user's automations.** Automations are a "
-            "separate surface with their own tools (`automations__*`) and "
-            "their own list. When the user asks what automations they have, "
-            "or how many, answer from `automations__list` alone — never fold "
-            "reminders or scheduled tasks into that list or that count. When "
-            "they ask about these, call them reminders and scheduled tasks.\n"
+            + _automations_boundary(self._automations_available) +
             "\n"
             "**Tool to pick:**\n"
             "  • If the user wants literal text delivered at a time "

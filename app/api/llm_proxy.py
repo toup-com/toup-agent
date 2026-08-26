@@ -1175,6 +1175,118 @@ def _dedup_tool_names(tools: list) -> tuple[list, list]:
 _OPENAI_MAX_TOOLS = 128
 
 
+def _prune_tool_choice(body: dict, dropped_names: list, *,
+                       model_name: str = "?", original_len: int = 0) -> list:
+    """Drop capped-away tools from `tool_choice` so the request stays
+    internally consistent. Returns the names actually pruned.
+
+    `_cap_tools` trims the tools array from the tail and left `tool_choice`
+    untouched — so a request could name a tool in its allowlist that the
+    same request no longer offered, and OpenAI answers 400 "Tool choice
+    'X' not found in 'tools' parameter". The tail is exactly where this
+    bites: the agent assembles core → skills → CONNECTOR tools last, so
+    the dropped names are connector tools, and the allowlist is built from
+    the uncapped array.
+
+    Observed live 2026-08-26 on the founder's VOICE turn: 141 tools sent,
+    13 over the cap, `slack__list_channels` capped away and still named in
+    allowed_tools. Three 400s, then a silent fallback to a weaker model —
+    20.7s for 2 output tokens and no tool calls. The user saw a slow,
+    empty answer and no error.
+
+    Handles both wire shapes: chat `{"type":"allowed_tools",
+    "allowed_tools":{"tools":[{"function":{"name":n}}]}}` and Responses
+    `{"type":"allowed_tools","tools":[{"name":n}]}`. A forced single
+    `{"type":"function", ...}` naming a dropped tool cannot be repaired by
+    pruning — the request has no valid form — so it is left alone and
+    logged loudly rather than silently rewritten into something the caller
+    did not ask for.
+    """
+    tc = body.get("tool_choice")
+    if not isinstance(tc, dict) or not dropped_names:
+        return []
+    gone = set(dropped_names)
+
+    if tc.get("type") == "function":
+        named = ""
+        if isinstance(tc.get("function"), dict):
+            named = tc["function"].get("name", "")
+        else:
+            named = tc.get("name", "") or ""
+        if named in gone:
+            logger.error(
+                "[LLM-PROXY] tool_choice FORCES '%s' but the cap dropped it "
+                "— this request cannot succeed; the tools array is too "
+                "large for a forced choice", named,
+            )
+        return []
+
+    if tc.get("type") != "allowed_tools":
+        return []
+
+    # Chat shape nests under "allowed_tools"; Responses shape is flat.
+    container = tc["allowed_tools"] if isinstance(
+        tc.get("allowed_tools"), dict) else tc
+    entries = container.get("tools")
+    if not isinstance(entries, list):
+        return []
+
+    pruned: list = []
+    kept_entries: list = []
+    for e in entries:
+        if not isinstance(e, dict):
+            kept_entries.append(e)
+            continue
+        name = e.get("name") or (
+            e.get("function", {}) or {}).get("name", "")
+        if name in gone:
+            pruned.append(name)
+        else:
+            kept_entries.append(e)
+    if not pruned:
+        return []
+
+    # Its own line, at ERROR, not a clause on the cap's WARNING.
+    #
+    # Pruning is a different and worse event than a long array: the
+    # request asked for a capability and was made valid by REMOVING it.
+    # And it is now the ONLY signal. Before this function existed the
+    # mismatch announced itself as a 400 — loud, three retries, a model
+    # downgrade. Stripping the name makes the request succeed, so the
+    # model quietly takes whatever survived the cut instead of erroring.
+    # Measured on the founder 2026-08-26: asked which Slack channels it
+    # could see with every `slack__*` tool capped away, the agent
+    # answered correctly through `automations__list_targets` — a skill
+    # tool upstream of the cut. Reads have a survivor; writes
+    # (`slack__send_message`, `teams__send_chat_message`,
+    # `outlook__send_message`) have none. So the agent looks capable when
+    # asked to LOOK and is silently incapable when asked to ACT, which is
+    # worse than a uniformly broken connector because it is not legible.
+    #
+    # This line is what replaces the 400 as the thing a human can find.
+    logger.error(
+        "[LLM-PROXY] CAPABILITY REMOVED to make the request valid: "
+        "pruned %s from tool_choice for user=%s model=%s because the "
+        "%d-tool array was capped to %d. The model will now silently "
+        "choose from what survived instead of failing.",
+        pruned, (body.get("_toup_user") or "?"), model_name, original_len,
+        _OPENAI_MAX_TOOLS,
+    )
+
+    if kept_entries:
+        container["tools"] = kept_entries
+    else:
+        # An allowlist emptied by the cap would forbid every tool. Dropping
+        # the restriction entirely is the honest degradation: the model may
+        # choose from what it was actually offered.
+        body.pop("tool_choice", None)
+        logger.error(
+            "[LLM-PROXY] the cap emptied tool_choice's allowlist — dropping "
+            "the restriction so the turn can proceed",
+        )
+    return pruned
+
+
 def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS) -> tuple[list, list]:
     """Trim an over-long tools array from the TAIL. Returns (kept, dropped_names).
 
@@ -1282,11 +1394,15 @@ async def proxy_chat(
         if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
             _kept, _dropped = _cap_tools(_tools)
             body["tools"] = _kept
+            _pruned = _prune_tool_choice(
+                body, _dropped, model_name=str(model),
+                original_len=len(_tools))
             logger.warning(
                 "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-                "%d > %d, dropped %d from the tail: %s",
+                "%d > %d, dropped %d from the tail: %s%s",
                 config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
                 len(_dropped), _dropped,
+                (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
             )
 
     # Credit pre-flight: zero-balance gate. Only enforces when
@@ -1633,11 +1749,15 @@ async def proxy_responses(
     if isinstance(_tools, list) and len(_tools) > _OPENAI_MAX_TOOLS:
         _kept, _dropped = _cap_tools(_tools)
         body["tools"] = _kept
+        _pruned = _prune_tool_choice(
+            body, _dropped, model_name=str(model),
+            original_len=len(_tools))
         logger.warning(
             "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-            "%d > %d, dropped %d from the tail: %s",
+            "%d > %d, dropped %d from the tail: %s%s",
             config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
             len(_dropped), _dropped,
+            (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
         )
 
     # Credit pre-flight: zero-balance gate (same contract as proxy_chat).

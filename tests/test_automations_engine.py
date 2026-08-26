@@ -1321,3 +1321,50 @@ async def test_grant_revoked_hook_for_an_unknown_grant_touches_nothing(
             )
         )).scalars().all()
         assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_a_poll_with_nothing_fresh_is_not_a_run(monkeypatch):
+    """ND-25 direction 2: health claimed runs the ledger never saw.
+
+    `poll_and_run` stamped `_record_health(ok=True)` whenever nothing
+    FAILED — including when nothing RAN, because there were no fresh
+    events. That set `last_run_at` and `last_status="success"` with no
+    run row anywhere.
+
+    Measured live 2026-08-26: automation `7681a214` carried
+    `last_status: "success"` at 05:21:40, fifteen seconds after the
+    container booted, with no run row at that time in either the
+    per-automation or the global runs feed. A boot-time poll found
+    nothing fresh and reported a run.
+
+    Health is the ramp's observability surface, so a FALSE success there
+    is worse than a missing one — it is what a human reads when deciding
+    whether an automation works.
+    """
+    from app.agent.automations import executor
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+
+    async def _no_items(automation, vspec):
+        return []
+    monkeypatch.setattr(executor, "_poll_once", _no_items)
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.consecutive_failures = 2      # a streak the clean poll may reset
+        await db.commit()
+        vspec = _poll_spec()
+        stats = await executor.poll_and_run(db, row, vspec)
+
+    assert stats["fresh"] == 0 and stats["ran"] == 0
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        # The connector answered, so the streak resets — that IS health.
+        assert row.consecutive_failures == 0
+        # ...but nothing ran, so no run may be claimed.
+        assert row.last_run_at is None, (
+            f"a poll with nothing fresh stamped a run at {row.last_run_at}")
+        assert row.last_status != "success", row.last_status
