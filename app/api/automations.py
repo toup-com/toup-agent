@@ -157,7 +157,24 @@ async def resume(automation_id: str):
 
 @router.post("/{automation_id}/test-run")
 async def test_run(automation_id: str):
+    """DEV ONLY (R31-04).
+
+    A test run mints a real `BuildJob`, posts a run notification and
+    fires a `mission_started` push for an automation the user may never
+    have armed. It exists for the harness, and until R31 it was
+    reachable three ways: this route, its proxy twin, and — worst — the
+    `automations__test_run` TOOL, which the skill's own build order made
+    step 7. That is how "Run all of them again" was answered by a
+    staged synthetic fire reporting `TEST RUN STAGED` and a status of
+    `paused`.
+
+    The tool is gone from the model's array. The route stays for
+    `make e2e-automations`, behind the same flag, and 404s in
+    production so it cannot be curl'd into a user's thread.
+    """
     _flag_or_404()
+    if not getattr(settings, "automations_dev_tools", False):
+        raise HTTPException(status_code=404, detail="Feature not available")
     from app.agent.automations.service import (
         AutomationNotFound, test_run as _test,
     )
@@ -809,26 +826,56 @@ async def run_now(automation_id: str):
             automation = await _load_owned(db, automation_id, _user_id())
         except AutomationNotFound:
             raise HTTPException(status_code=404, detail="Not found")
+        # CONTRACTS-R31 §4.2: `already_running` is refused for a RUNNING
+        # run and nothing else.
+        #
+        # The old predicate was `status IN (queued, running)` on the job
+        # row, and the menu's own disable was `run_in_flight is not
+        # None` — which the summary populated for `stopped_by_user` too.
+        # So a run the user had STOPPED disabled `Run it now` with
+        # `Already running — step 0 of 5`: a refusal, naming a step
+        # count of zero, for a run that had already ended. Both sides
+        # now read one predicate.
+        #
+        # `waiting_on_user` is refused too, but never as "already
+        # running": a parked run is waiting for a decision, and firing a
+        # second one beside it double-posts the moment the card is
+        # approved. It gets its own code and its own true sentence.
         live = (await db.execute(
             _select(BuildJob)
             .where(BuildJob.source_id == automation_id)
             .where(BuildJob.job_type == "automation_run")
-            .where(BuildJob.status.in_(("queued", "running")))
+            .where(BuildJob.status.in_(("queued", "running",
+                                        "waiting_on_user", "paused")))
+            .order_by(BuildJob.created_at.desc())
             .limit(1)
         )).scalar_one_or_none()
         if live is not None:
-            total = int(live.progress_total or 0)
-            step = int(live.progress_step or 0)
-            # R31-30 / §4.4 string table: "Already running" is retired.
-            # It was shown for a run the user had STOPPED ("Already
-            # running — step 0 of 5"), which is the one thing it was
-            # not. The form is `run_now_disabled_sub` in
-            # fixtures/automations/reason-strings.json.
-            raise HTTPException(status_code=409, detail={
-                "code": "already_running",
-                "sentence": f"It is running now — step {max(step, 1)} "
-                            f"of {max(total, 1)}.",
-            })
+            from app.agent.automations import ledger as _ledger
+            v3 = _ledger.run_v3_status(live)
+            if v3 == "waiting_on_user":
+                # Not "already running" — a parked run is waiting for a
+                # DECISION, and firing a second one beside it
+                # double-posts the moment the card is approved.
+                raise HTTPException(status_code=409, detail={
+                    "code": "waiting_on_you",
+                    "sentence": "It is waiting for you to approve a "
+                                "change. Decide that first.",
+                })
+            if v3 == "running":
+                total = int(live.progress_total or 0)
+                step = int(live.progress_step or 0)
+                # R31-30 / §4.4 string table: "Already running" is
+                # retired as a SENTENCE (it was shown for a run the user
+                # had STOPPED — "Already running — step 0 of 5" — which
+                # is the one thing it was not). The CODE keeps its name;
+                # the form is `run_now_disabled_sub` in
+                # fixtures/automations/reason-strings.json.
+                raise HTTPException(status_code=409, detail={
+                    "code": "already_running",
+                    "sentence": f"It is running now — step "
+                                f"{max(step, 1)} of {max(total, 1)}.",
+                })
         vspec = await parse_spec_live(automation)
         from app.agent.automations.spec_v2 import ValidatedSpecV2
         if not isinstance(vspec, ValidatedSpecV2):
@@ -853,17 +900,32 @@ async def run_now(automation_id: str):
 
 class ThreadMessageBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
+    # Replay protection, the same guarantee the chat socket has. Without
+    # it a retried POST after a dropped connection is a second user turn
+    # AND a second agent run.
+    client_msg_id: Optional[str] = Field(default=None, max_length=64)
 
 
-@router.post("/{automation_id}/thread/messages")
+@router.post("/{automation_id}/thread/messages", status_code=202)
 async def post_thread_message(automation_id: str, body: ThreadMessageBody):
-    """§4.10 — persist the user turn on the thread. The conversational
-    reply rides the existing WS chat (session-resolved to this
-    automation); this REST leg is the durable record + deep-link
-    anchor, so the thread stays complete even when the WS is down."""
+    """§4.1 — the thread's own turn: persist, then ANSWER, in the thread.
+
+    Supersedes R30 §4.10's "the conversational reply rides the existing
+    WS chat (session-resolved to this automation)". That sentence is
+    what made an automation's conversation a day-chat conversation:
+    `ws_chat` stamps every user message with today's `day_chat_id`
+    before it has looked at `session_id` at all, so a thread question
+    was a main-chat row by construction and its reply was an ordinary
+    main-chat turn. The founder's 11:17 answer about "everything in all
+    channels" is in his main chat for that reason, and `Memory updated ·
+    5 facts` is underneath it.
+
+    A question that needs new reading becomes a `question` run in this
+    same thread (§4.9) and its id comes back on `run_id`.
+    """
     _flag_or_404()
     from app.agent.automations.service import _load_owned, AutomationNotFound
-    from app.agent.automations import ledger
+    from app.agent.automations import ledger, thread_agent
     async with async_session_maker() as db:
         try:
             automation = await _load_owned(db, automation_id, _user_id())
@@ -872,11 +934,77 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
         thread = await ledger.ensure_thread(
             db, user_id=_user_id(), automation_id=automation.id,
         )
+
+        if body.client_msg_id:
+            existing = await _thread_turn_by_client_id(
+                db, thread_id=thread.id, client_msg_id=body.client_msg_id,
+            )
+            if existing is not None:
+                # A replay. Return the turn we already have and start no
+                # second run — the expensive half of this route is the
+                # agent turn, not the insert.
+                return {"turn": existing, "thread_id": thread.id,
+                        "replayed": True}
+
         turn = await ledger.append_turn(
             db, user_id=_user_id(), thread=thread, run_id=None,
-            kind="user", payload={"text": body.text},
+            kind="user",
+            payload={"text": body.text,
+                     "client_msg_id": body.client_msg_id},
         )
-        return {"turn": turn, "thread_id": thread.id}
+
+        run_id = None
+        try:
+            if thread_agent.needs_fresh_read(body.text):
+                run_id = await thread_agent.open_question_run(
+                    db, automation=automation, thread=thread,
+                    user_text=body.text,
+                )
+            if run_id is None:
+                await thread_agent.answer_in_thread(
+                    db, automation=automation, thread=thread,
+                    user_text=body.text,
+                )
+        except Exception as e:  # noqa: BLE001
+            # The user's turn is already durable; an answer that failed
+            # must say so in the thread rather than leave the live state
+            # spinning (R31-17's silence).
+            logger.warning("[automations] thread answer failed: %s", e)
+            try:
+                await ledger.append_turn(
+                    db, user_id=_user_id(), thread=thread, run_id=None,
+                    kind="agent",
+                    payload={"text": (
+                        "Something went wrong answering that. Ask me "
+                        "again and I will try once more."
+                    )},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return {"turn": turn, "thread_id": thread.id, "run_id": run_id}
+
+
+async def _thread_turn_by_client_id(
+    db, *, thread_id: str, client_msg_id: str,
+):
+    """The already-persisted turn for this client id, if any."""
+    from app.db.models import AutomationTurn
+    rows = (await db.execute(
+        select(AutomationTurn)
+        .where(AutomationTurn.thread_id == thread_id)
+        .where(AutomationTurn.kind == "user")
+        .order_by(AutomationTurn.seq.desc())
+        .limit(40)
+    )).scalars().all()
+    for row in rows:
+        try:
+            if json.loads(row.payload_json).get("client_msg_id") \
+                    == client_msg_id:
+                from app.agent.automations.ledger import _serialize_row
+                return _serialize_row(row)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 @router.get("/{automation_id}/workflow")
@@ -900,8 +1028,22 @@ def _workflow_409(e) -> HTTPException:
     })
 
 
+class CustomSchedule(BaseModel):
+    """§4.7's `Custom…` row — what the time wheel and the weekday chips
+    send. `days` is ISO (1 = Monday, 7 = Sunday); `date` makes it a
+    one-time automation and is mutually exclusive with `days`."""
+    time: str = Field(..., max_length=5)             # "HH:MM", 24h
+    days: list[int] = Field(default_factory=list, max_length=7)
+    date: Optional[str] = Field(default=None, max_length=10)
+    tz: Optional[str] = Field(default=None, max_length=64)
+
+
 class PresetBody(BaseModel):
-    preset_id: str = Field(..., max_length=32)
+    # Either a preset or a custom body. `preset_id` stays optional
+    # rather than being replaced, so the four canvas presets keep the
+    # exact wire shape B already ships.
+    preset_id: Optional[str] = Field(default=None, max_length=32)
+    custom: Optional[CustomSchedule] = None
 
 
 @router.put("/{automation_id}/workflow/schedule")
@@ -911,14 +1053,23 @@ async def put_workflow_schedule(automation_id: str, body: PresetBody):
         _load_owned, AutomationNotFound, MembershipError,
     )
     from app.agent.automations.workflow import (
-        WorkflowError, set_schedule_preset,
+        WorkflowError, set_schedule_preset, set_schedule_custom,
     )
+    if not body.preset_id and not body.custom:
+        raise HTTPException(status_code=422, detail={
+            "code": "no_schedule", "sentence": "Pick a time first.",
+        })
     async with async_session_maker() as db:
         try:
             automation = await _load_owned(db, automation_id, _user_id())
+            if body.custom is not None:
+                return await set_schedule_custom(
+                    db, automation=automation, user_id=_user_id(),
+                    custom=body.custom.model_dump(),
+                )
             return await set_schedule_preset(
                 db, automation=automation, user_id=_user_id(),
-                preset_id=body.preset_id,
+                preset_id=body.preset_id or "",
             )
         except AutomationNotFound:
             raise HTTPException(status_code=404, detail="Not found")
@@ -926,6 +1077,120 @@ async def put_workflow_schedule(automation_id: str, body: PresetBody):
             raise _workflow_409(e)
         except MembershipError as e:
             raise HTTPException(status_code=409, detail={"code": e.code})
+
+
+class RuleEdit(BaseModel):
+    id: str = Field(..., max_length=64)
+    text: str = Field(..., max_length=300)
+
+
+class RulesDraft(BaseModel):
+    add: list[str] = Field(default_factory=list, max_length=32)
+    remove: list[str] = Field(default_factory=list, max_length=32)
+    edit: list[RuleEdit] = Field(default_factory=list, max_length=32)
+
+
+class AccountsDraft(BaseModel):
+    add: list[str] = Field(default_factory=list, max_length=16)
+    remove: list[str] = Field(default_factory=list, max_length=16)
+
+
+class PermissionDraft(BaseModel):
+    account_id: str = Field(..., max_length=64)
+    can: list[str] = Field(default_factory=list, max_length=64)
+    cant: list[str] = Field(default_factory=list, max_length=64)
+
+
+class CommitBody(BaseModel):
+    workflow_rev: Optional[int] = None
+    schedule: Optional[PresetBody] = None
+    permissions: Optional[list[PermissionDraft]] = None
+    steps: Optional[list[dict]] = Field(default=None, max_length=8)
+    rules: Optional[RulesDraft] = None
+    accounts: Optional[AccountsDraft] = None
+
+
+@router.post("/{automation_id}/workflow/commit")
+async def post_workflow_commit(automation_id: str, body: CommitBody):
+    """§4.6 — the workflow's green ✓: every draft, one transaction.
+
+    Supersedes R30 §4.4's "never one big PUT" for THIS path only; the
+    per-sheet routes stay for `/workflow/ask` and the web. The canvas
+    holds local drafts and commits them together, so a refusal leaves
+    the workflow exactly as the user last saw it rather than
+    half-applied — and one edit costs one round trip on a tenant that
+    can boot dark for the better part of a minute.
+
+    `409 stale` re-bases rather than refusing outright: the drafts were
+    made against an older revision, so the app re-layers them over the
+    workflow returned here and the user sees nothing unless a draft's
+    target is gone.
+    """
+    _flag_or_404()
+    from app.agent.automations.service import (
+        _load_owned, AutomationNotFound, MembershipError,
+    )
+    from app.agent.automations.workflow import (
+        WorkflowError, commit_workflow, set_steps,
+    )
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            out = await commit_workflow(
+                db, automation=automation, user_id=_user_id(),
+                workflow_rev=body.workflow_rev,
+                schedule=body.schedule.model_dump() if body.schedule else None,
+                permissions=[p.model_dump() for p in body.permissions]
+                if body.permissions else None,
+                steps=body.steps,
+                rules=body.rules.model_dump() if body.rules else None,
+                accounts=body.accounts.model_dump() if body.accounts else None,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            # A refusal applies NOTHING — the nested transaction rolled
+            # back before this reached the caller.
+            raise HTTPException(status_code=409, detail={
+                "code": "refused", "item": e.code, "sentence": e.sentence,
+                **(e.extra or {}),
+            })
+        except MembershipError as e:
+            raise HTTPException(status_code=409, detail={
+                "code": "refused", "item": e.code,
+                "sentence": "That change was refused.",
+            })
+        if out.get("code") == "stale":
+            raise HTTPException(status_code=409, detail=out)
+
+        # Steps land AFTER the transaction, through C's recompiler: it
+        # is an LLM call that can take seconds and can legitimately
+        # refuse one step, and neither of those belongs inside a lock
+        # holding the user's schedule and permissions.
+        if body.steps:
+            try:
+                step_out = await set_steps(
+                    db, automation=automation, user_id=_user_id(),
+                    steps=body.steps,
+                )
+                out["steps"] = step_out
+                out.pop("pending", None)
+            except WorkflowError as e:
+                out["steps_refused"] = {
+                    "code": e.code, "sentence": e.sentence,
+                }
+        from app.agent.automations.workflow import workflow_payload
+        out["summary"] = None
+        try:
+            from app.agent.automations.summary import summary_payload
+            full = await summary_payload(db, user_id=_user_id())
+            for row in (full or {}).get("automations") or []:
+                if row.get("id") == automation_id:
+                    out["summary"] = row
+                    break
+        except Exception:  # noqa: BLE001 — the commit already applied
+            pass
+        return out
 
 
 class StepsBody(BaseModel):

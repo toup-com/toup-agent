@@ -38,7 +38,33 @@ AUTOMATION_TURN_KINDS = frozenset({
     # tool turns carry items; result carries the ranked account;
     # draft/waiting carry the two user-action cards. `live` is a FRAME,
     # never a row (CONTRACTS-R30 §4.2).
+    #
+    # R31 adds two (CONTRACTS-R31 §4.5):
+    #   memory   — the "Memory updated · N facts" chip, which used to be
+    #              a day-chat Message and is now a turn in the thread
+    #              that learned the facts.
+    #   needs_you— one per failed source of a partial/failed/question
+    #              run: the account, the real reason, and the button
+    #              that fixes it. This is the card R31-05 asks for, in
+    #              the thread rather than four taps away.
     "note", "agent", "think", "user", "tool", "result", "draft", "waiting",
+    "memory", "needs_you",
+})
+
+# §4.4 — the failure vocabulary. A `needs_you` turn carries exactly one
+# of each. `fix` decides the button; `reason_code` decides the sentence.
+AUTOMATION_ACCOUNT_STATES = frozenset({
+    "connected", "expired", "revoked", "scope_missing",
+    "org_approval_needed", "not_connected",
+})
+AUTOMATION_FIXES = frozenset({
+    "reconnect", "grant", "approve", "connect", "retry",
+})
+# Transient reasons keep `connected` and get `fix: retry`; only a
+# credential, scope or approval problem may move an account off
+# `connected` (CONTRACTS-R31 §4.4, pinned by test_health_is_the_ledger).
+AUTOMATION_TRANSIENT_REASONS = frozenset({
+    "rate_limited", "vendor_down", "timeout",
 })
 
 AUTOMATION_NOTE_STAMPS = frozenset({
@@ -284,5 +310,68 @@ class AutomationNotification(Base):
     __table_args__ = (
         UniqueConstraint(
             "run_id", "kind", name="uq_automation_notifications_run_kind",
+        ),
+    )
+
+
+class AccountHealth(Base):
+    """The one recorded state of one connected account — R31 §4.4.
+
+    There was no such row before. `ConnectorIdentity.status` is the
+    vault's reading of the CREDENTIAL (does the token refresh?), and
+    nothing wrote back what a real call actually did — a tool that came
+    back `ConnectorReauthRequired` was recorded as audit metadata and
+    the identity kept saying `active`. That is why the Connectors page
+    read `Connected · 10` on 26 August while the same Outlook account's
+    sheet read `Could not connect · access expired` two taps away.
+
+    One row per (user, account). Written by `account_health.record_use`
+    at every dispatch, by the OAuth callback, and by the scope probe.
+    Read by every surface that names an account's state.
+
+    AGENT_ONLY: the platform image has no automations package and the
+    tenant DB is where the runs live. Created by `init_db` create_all
+    like the rest of the ledger set.
+    """
+
+    __tablename__ = "account_health"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # `account_id == connector_id` verbatim today (CONTRACTS-R30 §1);
+    # the column is named for the concept that will outlive that.
+    account_id: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="connected",
+    )
+    reason_code: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+    )
+    fix: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # What told us. `use` (a real tool call) outranks `oauth`, which
+    # outranks `probe`, which outranks `identity`.
+    source: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    scopes_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "account_id", name="uq_account_health_user_account",
         ),
     )

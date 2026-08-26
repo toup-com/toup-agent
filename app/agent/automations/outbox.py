@@ -167,7 +167,16 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         await db.commit()
         await _mark_write_step(db, row, ok=True)
         await _finalize_run(db, row, status="completed", outcome="sent")
-        await _record_health(db, row.automation_id, ok=True, error=None)
+        # R31-43: a write that landed is not a clean run if a source was
+        # lost getting there. `steps_partial` is the same flag the
+        # aggregate finalizer reads to report `partial`; reading it here
+        # is what stops a partial run clearing the 3-strike streak it
+        # should be building.
+        _job = await db.get(BuildJob, row.job_id) if row.job_id else None
+        _clean = not bool(((_job.config_json or {}) if _job else {})
+                          .get("steps_partial"))
+        await _record_health(db, row.automation_id, ok=True, error=None,
+                             clean=_clean)
         await _append_write_turn(db, row, write_row)
         if row.tool_name in _DRAFT_TOOLS:
             # The proactive-draft surface (R29): a session card that
@@ -338,9 +347,17 @@ async def _finalize_run(db, row: AutomationOutbox, *, status: str,
 
 
 async def _record_health(db, automation_id: str, *, ok: bool,
-                         error: Optional[str]) -> None:
+                         error: Optional[str],
+                         clean: Optional[bool] = None) -> None:
+    """Thin shim onto the executor's recorder.
+
+    It forwards `clean` explicitly rather than `**kwargs`: a shim that
+    silently drops an argument its caller passed is how a fix lands in
+    the source and never reaches the behaviour, and this one sits
+    between the write path and the 3-strike streak (R31-43).
+    """
     from .executor import _record_health as _rh
-    await _rh(db, automation_id, ok=ok, error=error)
+    await _rh(db, automation_id, ok=ok, error=error, clean=clean)
 
 
 async def _park_run_on_card(db, row: AutomationOutbox,

@@ -85,7 +85,7 @@ from .platform_automation import (
 # per-automation permissions, once-per-run notification identity.
 from .automation_ledger import (
     AutomationThread, AutomationTurn, AutomationWrite,
-    AutomationAccountPermission, AutomationNotification,
+    AutomationAccountPermission, AutomationNotification, AccountHealth,
     AUTOMATION_TURN_KINDS, AUTOMATION_NOTE_STAMPS, AUTOMATION_RUN_KINDS,
     AUTOMATION_RUN_V3_STATUSES, AUTOMATION_WRITE_AUDIENCES,
     AUTOMATION_NOTIFICATION_KINDS, BRIEF_TIERS, CHANGES_TIERS,

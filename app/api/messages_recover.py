@@ -183,9 +183,9 @@ async def messages_since(
                         Conversation.user_id == current_user.id,
                         Message.created_at >= seed_created_at,
                         Message.id != message_id,
-                        # Hide historical raw autopilot tick rows —
-                        # same predicate as day_chats.py (2026-07-16).
-                        Conversation.channel != "autopilot",
+                        # Hidden day channels — one tuple, every
+                        # reader (CONTRACTS-R31 §4.1).
+                        Conversation.channel.notin_(HIDDEN_DAY_CHANNELS),
                     )
                 )
                 .order_by(Message.created_at.asc(), Message.id.asc())

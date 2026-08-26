@@ -99,27 +99,22 @@ async def write_pending_card(
     job_id: str,
     card: dict,
 ) -> Optional[str]:
-    """Persist the card in the automation's session thread and
-    broadcast the live frame. Best-effort like every session write —
-    the park never depends on its card."""
-    from .session import write_session_message
+    """Broadcast the live pending frame. Best-effort — the park never
+    depends on its card.
 
-    text = (
-        f"**{automation.name}** staged an action that needs your "
-        f"approval. Nothing happens until you confirm it."
-    )
-    msg_id, _day = await write_session_message(
-        db,
-        user_id=automation.user_id,
-        automation_id=automation.id,
-        content=text,
-        metadata={"pending_action": card},
-        title=automation.name,
-    )
-    if msg_id:
-        await _broadcast_pending(automation.user_id, card,
-                                 message_id=msg_id)
-    return msg_id
+    CONTRACTS-R31 §4.1: the DURABLE half of a park is the `waiting`
+    turn in the automation's thread (written by the caller, R30 §11),
+    not a day-chat Message. This function used to write one, carrying
+    `**{name}** staged an action…` — raw markdown bold, in the main
+    chat, for an automation the main chat should not be narrating.
+
+    The frame still goes out so a live client repaints at once; it
+    carries `automation_id` and no `message_id`, because there is no
+    message to address any more.
+    """
+    del db
+    await _broadcast_pending(automation.user_id, card, message_id=None)
+    return None
 
 
 async def update_pending_card(
@@ -164,7 +159,7 @@ async def update_pending_card(
 
 
 async def _broadcast_pending(user_id: str, card: dict,
-                             *, message_id: str) -> None:
+                             *, message_id: Optional[str]) -> None:
     """Same frame type as the chat path (`pending_action`, card keys at
     top level, NO channel key) so both clients reuse their renderer."""
     try:

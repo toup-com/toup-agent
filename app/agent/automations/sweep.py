@@ -321,12 +321,18 @@ async def _post_error_notice(db, automation: Automation) -> None:
     # on the row for diagnosis; the fix chip carries the honest ask.
     # C's template module owns the sentence; the fallback keeps the
     # notice whole when the module predates the merge.
+    #
+    # R31: this called `auto_pause_body(name, 3)` against a ZERO-arg
+    # function. The bare except below swallowed the TypeError, so A's
+    # fallback shipped every time and C's sentence — written precisely
+    # to replace a live string wearing an emoji and markdown bold — has
+    # never reached a user. An arity mismatch that a broad except turns
+    # into "the other branch always wins" is invisible to every test
+    # that only checks a notice exists.
     text = None
     try:
         from .notification_templates import auto_pause_body
-        text = auto_pause_body(
-            automation.name, AUTOMATION_AUTO_PAUSE_FAILURES,
-        )
+        text = auto_pause_body()
     except Exception:  # noqa: BLE001 — the notice must always exist
         text = None
     if not text:
@@ -337,38 +343,22 @@ async def _post_error_notice(db, automation: Automation) -> None:
             f"you fix it."
         )
     try:
-        # R28: the notice lands in the automation's own session thread,
-        # not the shared routine thread — same exactly-once semantics,
-        # new address. The broadcast frame is unchanged (type "message",
-        # no channel key) so both clients keep hearing it live.
-        from app.agent.automations.session import write_session_message
-        from app.agent.routines.message_writer import (
-            broadcast_routine_message,
+        # CONTRACTS-R31 §4.1: the notice lands in the automation's own
+        # THREAD, as a turn. It used to be a day-chat Message plus a
+        # `type: "message"` chat frame — an automation speaking in the
+        # main chat's own voice, which is exactly what the isolation
+        # rule forbids. The push below is untouched: a paused
+        # automation must still reach the user when the app is closed.
+        from . import ledger as _ledger
+        thread = await _ledger.ensure_thread(
+            db, user_id=automation.user_id, automation_id=automation.id,
         )
-        message_id, day_chat_id = await write_session_message(
-            db,
-            user_id=automation.user_id,
-            automation_id=automation.id,
-            content=text,
-            metadata={"fix_chip": chip},
-            title=automation.name,
+        await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=None,
+            kind="agent", payload={"text": text},
         )
-        if not message_id:
-            raise RuntimeError("session write returned no message id")
-        try:
-            await broadcast_routine_message(
-                automation.user_id,
-                message_id=message_id,
-                day_chat_id=day_chat_id,
-                source="automation",
-                content=text,
-                routine_name=automation.name,
-                extra={"fix_chip": chip,
-                       "automation_id": automation.id},
-            )
-        except Exception:  # noqa: BLE001 — broadcast is a courtesy
-            pass
-    except Exception as e:  # noqa: BLE001 — chat write is best-effort
+        del chip  # the thread's own fix affordances replace the chip
+    except Exception as e:  # noqa: BLE001 — the notice is best-effort
         logger.warning("[automations] error notice write failed %s: %s",
                        automation.id, e)
     try:

@@ -87,7 +87,9 @@ async def test_session_converges_per_automation_and_isolates():
     uid = await _mk_user()
     a1 = await _mk_automation(uid, "First")
     a2 = await _mk_automation(uid, "Second")
-    from app.agent.automations.session import write_session_message
+    from app.agent.automations.session import (
+        _retired_write_session_message as write_session_message,
+    )
 
     ids = set()
     async with async_session_maker() as db:
@@ -125,29 +127,60 @@ async def test_session_converges_per_automation_and_isolates():
         assert len(msgs) == 2
         assert all(m.channel == "automation" for m in msgs)
         assert all(m.source == "automation" for m in msgs)
-        assert all(m.day_chat_id for m in msgs)  # in the agent's day
+        # These rows carry a real day_chat_id — that is exactly what the
+        # R28 writer did, and exactly why R31 retired it. The day-chat
+        # readers must not see them (CONTRACTS-R31 §4.1): that is
+        # test_thread_isolation_both_directions' job. This one records
+        # the SHAPE the clean-up migration has to find and move.
+        assert all(m.day_chat_id for m in msgs)
 
 
 @pytest.mark.asyncio
-async def test_run_card_is_a_hydratable_job_marker():
+async def test_a_run_writes_no_chat_job_card():
+    """R31-02. A run is not a chat job.
+
+    `on_run_created` is still the seam all six run-minting sites call,
+    and it must write NOTHING. Before R31 it minted a `role="job"`
+    marker in the automation's session for every scheduled, push, poll,
+    manual and test run — which is how `[test] Morning work brief`,
+    `[automation] Jira → Slack · Done` and `Morning work brief · Done
+    in 7 steps` reached the founder's main chat on 26 August, each with
+    a sheet reading `Nothing recorded for this task yet.`
+
+    This drives the seam rather than asserting a function is gone: a
+    caller resurrected from an older branch would pass the second and
+    fail this.
+    """
+    from types import SimpleNamespace
+    from app.agent.automations.session import on_run_created
+
     uid = await _mk_user()
     aid = await _mk_automation(uid, "Card maker")
     job_id = str(uuid.uuid4())
-    from app.agent.automations.session import write_run_card
-    from app.api.message_cards import parse_job_marker
-
-    msg_id, _day = await write_run_card(
-        user_id=uid, automation_id=aid,
-        automation_name="Card maker", job_id=job_id,
-    )
-    assert msg_id
     async with async_session_maker() as db:
-        m = await db.get(Message, msg_id)
-        assert m is not None and m.role == "job"
-        marker = parse_job_marker(m.content)
-        assert marker and marker["job_id"] == job_id
-        assert marker["job_name"] == "Card maker"
-        assert marker["job_type"] == "automation_run"
+        db.add(BuildJob(
+            id=job_id, user_id=uid, title="Card maker",
+            prompt="(automation)", job_type="automation_run",
+            status="running", source_kind="automation", source_id=aid,
+        ))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, job_id)
+        await on_run_created(
+            db, job=job,
+            automation=SimpleNamespace(
+                id=aid, user_id=uid, name="Card maker",
+            ),
+        )
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(Message).where(Message.role == "job")
+        )).scalars().all()
+        assert rows == [], f"a run wrote {len(rows)} chat job card(s)"
+        job = await db.get(BuildJob, job_id)
+        assert not job.summary_message_id
 
 
 # ── HTTP surface ─────────────────────────────────────────────────────
@@ -176,11 +209,21 @@ async def test_thread_endpoint_mints_serializes_and_404s(monkeypatch):
             source_kind="automation", source_id=aid,
         ))
         await db.commit()
-    from app.agent.automations.session import write_run_card
-    msg_id, _ = await write_run_card(
-        user_id=uid, automation_id=aid,
-        automation_name="Threaded", job_id=job_id,
+    # R31-02: a run no longer writes a legacy row, so the legacy half
+    # of this route stays EMPTY for a run. Its remaining job is to keep
+    # serving history that predates the clean-up migration, which the
+    # retired writer stands in for here.
+    from app.agent.automations.session import (
+        _retired_write_session_message as _legacy_write,
     )
+    from app.api.message_cards import job_marker_content
+    async with async_session_maker() as db:
+        msg_id, _ = await _legacy_write(
+            db, user_id=uid, automation_id=aid, role="job",
+            content=job_marker_content(job_id, "Threaded",
+                                       "automation_run"),
+            title="Threaded",
+        )
     assert msg_id
 
     out2 = await automation_thread(aid, limit=100)
@@ -254,7 +297,9 @@ async def test_composer_send_does_not_fork_the_session():
 
     uid = await _mk_user()
     aid = await _mk_automation(uid, "Composer")
-    from app.agent.automations.session import write_session_message
+    from app.agent.automations.session import (
+        _retired_write_session_message as write_session_message,
+    )
     from app.agent.agent_runner import AgentRunner
 
     async with async_session_maker() as db:

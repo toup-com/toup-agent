@@ -245,7 +245,54 @@ async def delete_automation(
     )).scalar_one_or_none()
     if thread is not None and thread.archived_at is None:
         thread.archived_at = datetime.utcnow()
+
+    # R31-09. Soft is about the RECORD — the thread and its facts keep
+    # their 30 days so the main-chat card can still open them. Nothing
+    # that can FIRE or NOTIFY may survive, and two things did:
+    #
+    #  - the migrated routine pair. §4.11a leaves the original routine
+    #    disabled and stamped `migrated_to`; disabled is not deleted,
+    #    and a routine row that outlives the automation it became is one
+    #    re-enable away from a deleted automation running again.
+    #  - pending notifications. A queued `automation_run` card or push
+    #    for a run that finished after the delete is a message from an
+    #    automation the user just removed.
+    from sqlalchemy import delete as sa_delete
+    from app.db.models import AutomationNotification, Routine
+    try:
+        routines = (await db.execute(
+            select(Routine).where(Routine.user_id == user_id)
+        )).scalars().all()
+        for r in routines:
+            cfg = r.config_json if isinstance(r.config_json, dict) else {}
+            if cfg.get("migrated_to") == automation_id \
+                    or cfg.get("superseded_by") == automation_id:
+                await db.delete(r)
+    except Exception as e:  # noqa: BLE001 — a delete never half-fails
+        logger.warning("[automations] routine-pair cleanup skipped %s: %s",
+                       automation_id, e)
+    try:
+        await db.execute(
+            sa_delete(AutomationNotification)
+            .where(AutomationNotification.automation_id == automation_id)
+            .where(AutomationNotification.status.in_(
+                ("running", "queued", "waiting_on_user")))
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] notification cleanup skipped %s: %s",
+                       automation_id, e)
+
     await db.commit()
+    # Every list, summary, thread and workflow reader already excludes
+    # `deleted_at`; the frame is what makes another device's home list
+    # drop the card without a reload (§4.6).
+    try:
+        from . import ledger as _ledger
+        await _ledger.emit_updated(
+            db, user_id, automation_id=automation_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[automations] delete frame skipped: %s", e)
     logger.info("[automations] soft-deleted id=%s user=%s",
                 automation_id, user_id[:8])
 

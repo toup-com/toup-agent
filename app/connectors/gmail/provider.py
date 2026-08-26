@@ -78,16 +78,60 @@ def _b64url_encode(s: str) -> str:
     )
 
 
+def _encode_header(value: str) -> str:
+    """RFC 2047 encode a header value when it is not 7-bit ASCII.
+
+    R31-34. The D session's test mail arrived in the founder's inbox as
+    `R29-D live loop test Ã¢Â€Â" Gmail push` — an em dash, mangled. The
+    obvious reading is a double encode; measured, it is the opposite.
+    This function used to build the Subject with a bare f-string, so
+    U+2014 went onto the wire as its three raw UTF-8 bytes inside a
+    header. RFC 5322 headers are 7-bit: a receiver has no way to know
+    those bytes are UTF-8, reads them as Latin-1, and renders `â€"` —
+    which is then mojibake'd a second time by whatever displays THAT.
+    Zero encodings, not two.
+
+    `Content-Type: charset=utf-8` below covers the BODY only and always
+    did; it says nothing about the header block above it.
+
+    The platform's other mail path (`services/email_service.py`) has
+    been correct all along because `MIMEMultipart` does this for you —
+    so the two writers disagreed, and the one automations can reach was
+    the wrong one. Drafts use the same builder, and an automation CAN
+    draft, so this is on the automations path too.
+
+    Pure-ASCII values are returned untouched: encoding them would be
+    correct but unreadable in every mail client's raw view, and this is
+    the header a user is most likely to see quoted back.
+    """
+    if not value:
+        return ""
+    try:
+        value.encode("ascii")
+        return value
+    except UnicodeEncodeError:
+        from email.header import Header
+        return Header(value, "utf-8").encode()
+
+
 def _build_rfc822(*, to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> str:
     """Minimal RFC 822 message — Gmail accepts the body as one base64url
     blob in the `raw` field. We construct without an MIME multipart
     because v1 of the connector only sends plain text; T3b+ may add
-    HTML alongside."""
-    headers = [f"To: {to}", f"Subject: {subject}"]
+    HTML alongside.
+
+    Every header value goes through `_encode_header` (R31-34): a
+    non-ASCII address display-name mangles exactly the way a non-ASCII
+    subject did.
+    """
+    headers = [
+        f"To: {_encode_header(to)}",
+        f"Subject: {_encode_header(subject)}",
+    ]
     if cc:
-        headers.append(f"Cc: {cc}")
+        headers.append(f"Cc: {_encode_header(cc)}")
     if bcc:
-        headers.append(f"Bcc: {bcc}")
+        headers.append(f"Bcc: {_encode_header(bcc)}")
     headers.append("Content-Type: text/plain; charset=utf-8")
     return "\r\n".join(headers) + "\r\n\r\n" + body
 

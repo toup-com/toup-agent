@@ -165,6 +165,10 @@ AGENT_ONLY_TABLES: set[str] = {
     "automation_writes",
     "automation_account_permissions",
     "automation_notifications",
+    # R31 §4.4 — the one recorded state of a connected account, written
+    # from a REAL use. AGENT_ONLY for the same reason as the rest of the
+    # ledger set: the row exists to be joined against runs.
+    "account_health",
     # Memory v2 (R30) — one platform memory per user, scoped views.
     # Facts/episodes/entities/forget-signals; the brain (memory_files)
     # stays the prompt projection; the extraction graph stays dormant.

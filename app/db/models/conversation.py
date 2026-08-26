@@ -10,6 +10,24 @@ from sqlalchemy.orm import relationship, Mapped, mapped_column
 
 from .base import Base, Vector
 
+# Channels whose rows must never render in — or be read back into — the
+# main day chat. One tuple, four readers (CONTRACTS-R31 §4.1; the
+# repo's "fixing one reader leaves the other doors open" class).
+#
+#   autopilot  — raw tick turns persisted before 2026-07-16; ticks are
+#                headless now and mission outcomes arrive as 'routine'.
+#   automation — an automation's OWN thread. The R28 session path wrote
+#                those turns as ordinary Messages carrying a real
+#                day_chat_id, which is how a thread question, its
+#                answer and its "Memory updated" chip all appeared in
+#                the founder's main chat on 26 August. The one
+#                sanctioned automation row in the day is the
+#                notification card, written on channel='routine'.
+#
+# Every day-scoped Message reader filters on this; the isolation guard
+# test asserts the reader list has not grown a fifth member that forgot.
+HIDDEN_DAY_CHANNELS: tuple = ("autopilot", "automation")
+
 
 class Conversation(Base):
     """Conversation/Session record for tracking message history.

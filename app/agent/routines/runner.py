@@ -28,6 +28,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 logger = logging.getLogger(__name__)
 
+# R31-33. How late a never-delivered reminder may still be delivered.
+# Six hours covers the case this branch was written for — an agent that
+# rolled, or a container that restarted, between the due time and now —
+# and excludes the case that shipped: a reminder from May ringing in
+# August. A reminder is a promise about a moment; past this it is not
+# late, it is wrong.
+REMINDER_CATCH_UP_MAX = timedelta(hours=6)
+
 
 def _resolve_tz(tz_str: Optional[str], user_id: str):
     """Return a ZoneInfo for tz_str, falling back to UTC with a structured
@@ -587,8 +595,54 @@ class RoutineRunner:
                 # the fire path is otherwise identical, so
                 # auto_disable_after_fire still runs and one-shots
                 # don't re-fire.
+                # R31-33. The catch-up window is BOUNDED now.
+                #
+                # This branch exists for a real case: the agent rolled at
+                # 01:35 UTC and a reminder was due at 01:28, so a
+                # never-delivered row fires ~5 s after the scheduler is
+                # ready. It had no age limit of any kind — the only
+                # `timedelta` in it was that 5 seconds — and it is
+                # re-evaluated every ten minutes for the life of the
+                # process (`_reconcile_loop` → `reload_all`), while the
+                # per-fire dedupe key for a reminder is the LOCAL DATE
+                # alone, so a catch-up today mints a key the original
+                # day's claim cannot block.
+                #
+                # On 26 August 2026 a reminder reading "Time to call your
+                # brother — May 18 at 4:30 PM" rang, with the alarm
+                # sound, quiet hours bypassed, on a phone. Ninety-nine
+                # days late. Two structural holds can park an enabled,
+                # never-run reminder for months (a missing user tz, and
+                # the per-tenant reminder flag being off), and when
+                # either clears, the next reload fires everything behind
+                # it at once.
+                #
+                # A reminder is a promise about a MOMENT. Seven minutes
+                # late is the promise kept; three months late is a
+                # different message, and it arrives with no way for the
+                # user to tell which one they are looking at. So:
+                # catch up within the window, and past it, deliver
+                # nothing.
                 already_fired = getattr(routine, "last_run_at", None) is not None
-                if routine.kind == "reminder" and not already_fired:
+                _due = getattr(routine, "schedule_at", None)
+                _too_old = False
+                if _due is not None:
+                    if _due.tzinfo is None:
+                        _due = _due.replace(tzinfo=timezone.utc)
+                    _too_old = (
+                        datetime.now(timezone.utc) - _due
+                    ) > REMINDER_CATCH_UP_MAX
+                if routine.kind == "reminder" and not already_fired \
+                        and _too_old:
+                    logger.warning(
+                        "[routine_runner] stale_reminder routine_id=%s "
+                        "schedule_at=%s age=%s — past the catch-up "
+                        "window, NOT firing",
+                        routine.id, _due,
+                        datetime.now(timezone.utc) - _due if _due else None,
+                    )
+                if routine.kind == "reminder" and not already_fired \
+                        and not _too_old:
                     catch_up_at = datetime.now(timezone.utc) + timedelta(seconds=5)
                     trigger = DateTrigger(run_date=catch_up_at)
                     trigger_tag = "catch_up"

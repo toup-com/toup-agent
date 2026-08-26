@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.db.models import User, Conversation, Message
+from app.db.models.conversation import HIDDEN_DAY_CHANNELS
 from app.db.models.day_chat import DayChat
 from app.api.auth import get_current_user
 from app.api.message_cards import (
@@ -245,7 +246,9 @@ def _with_public_copy(rec: dict) -> dict:
     history load.
     """
     try:
-        from app.agent.tool_display import public_step_label, strip_emoji
+        from app.agent.tool_display import (
+            is_first_party_tool, public_step_label, strip_emoji,
+        )
     except Exception:  # noqa: BLE001 — platform image has no app/agent
         return rec
     try:
@@ -256,7 +259,18 @@ def _with_public_copy(rec: dict) -> dict:
         summary = rec.get("summary")
         if isinstance(summary, str) and summary:
             cleaned = summary
-            if "__" in tool and cleaned.strip()[:1] in "{[":
+            # ND-19 / R31-28. This carried its own copy of the old
+            # `"__" in tool` predicate — the one `tool_display` fixed
+            # at the write path — so a first-party tool's JSON was
+            # blanked on every history load. Measured on real rows:
+            # `routines__remind` served an empty summary, and the
+            # reminder card the client builds out of that exact string
+            # therefore did not render on reload.
+            if (
+                "__" in tool
+                and not is_first_party_tool(tool)
+                and cleaned.strip()[:1] in "{["
+            ):
                 cleaned = ""
             else:
                 cleaned = strip_emoji(cleaned)
@@ -572,7 +586,7 @@ async def get_day_chat_messages(
                         # ticks are headless now and terminal messages
                         # arrive as channel='routine'. Hide the
                         # historical noise without a data migration.
-                        Conversation.channel != "autopilot",
+                        Conversation.channel.notin_(HIDDEN_DAY_CHANNELS),
                     )
                 )
             )
@@ -671,7 +685,15 @@ async def get_day_chat_messages(
                 # Hide historical raw autopilot tick rows (see the
                 # fallback path above); mission outcomes arrive as
                 # channel='routine' and still render.
-                Conversation.channel != "autopilot",
+                # CONTRACTS-R31 §4.1: an automation's conversation belongs
+                # to that automation's thread. The R28 session path wrote
+                # those turns here with a real day_chat_id, which is how
+                # a thread question, its answer and its memory chip all
+                # appeared in the main chat on 26 August. The one
+                # sanctioned automation row in the day is the
+                # notification card, and that is written on
+                # channel='routine', not this one.
+                Conversation.channel.notin_(HIDDEN_DAY_CHANNELS),
             )
             .order_by(Message.created_at.asc())
             .limit(limit)

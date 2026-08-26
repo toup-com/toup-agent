@@ -957,6 +957,9 @@ async def test_nd16_the_card_never_invents_a_connector_failure(monkeypatch):
     assert "did not finish" in meta, meta
 
     # When a connector DID fail, name it — the honest form survives.
+    # R31-07 changed the WORDS (§4.2's table: `Tried {t} · {names} need
+    # you`, from the one string table) but not the property this test
+    # exists for: a name appears only when the ledger recorded one.
     async with async_session_maker() as db:
         job = (await db.execute(
             select(BuildJob).where(BuildJob.source_id == a.id)
@@ -965,7 +968,23 @@ async def test_nd16_the_card_never_invents_a_connector_failure(monkeypatch):
         await db.commit()
     async with async_session_maker() as db:
         payload = await summary_payload(db, user_id=uid)
-    assert "could not reach Jira" in payload["automations"][0]["meta"]
+    meta = payload["automations"][0]["meta"]
+    assert "Jira" in meta, meta
+    assert "need you" in meta, meta
+
+    # And EVERY name, at any count — the old form took names[0] and
+    # dropped the rest, so a user fixed one account, re-ran, and met the
+    # next one.
+    async with async_session_maker() as db:
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == a.id)
+        )).scalars().first()
+        job.config_json = {"accounts_failed": ["jira", "slack"]}
+        await db.commit()
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    meta = payload["automations"][0]["meta"]
+    assert "Jira" in meta and "Slack" in meta, meta
 
 
 @pytest.mark.asyncio

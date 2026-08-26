@@ -22,7 +22,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -407,10 +407,34 @@ async def _last_use(
 
 # ------------------------------------------------------------- writes
 
+async def bump_rev(db: AsyncSession, automation: Automation) -> int:
+    """Advance the workflow revision (§4.6). Total; never raises."""
+    try:
+        row = await db.get(Automation, automation.id)
+        if row is None:
+            return 0
+        row.workflow_rev = int(row.workflow_rev or 0) + 1
+        await db.commit()
+        return int(row.workflow_rev)
+    except Exception as e:  # noqa: BLE001 — a rev never fails a write
+        logger.warning("[workflow] rev bump skipped: %s", e)
+        return int(getattr(automation, "workflow_rev", 0) or 0)
+
+
 async def _edited_note(
     db: AsyncSession, automation: Automation,
 ) -> Optional[str]:
-    """Every workflow write appends the EDITED note (§4.4)."""
+    """Every workflow write appends the EDITED note (§4.4) and
+    broadcasts `automation.updated` (§4.6).
+
+    One seam for both, because they are one fact: the workflow changed.
+    R31-11 is what happens when the second half is missing — the
+    founder removed Outlook in the Workflow, came back to the thread,
+    and the header still showed five chips while the ⋯ menu still said
+    `5 accounts`, because those two surfaces read a summary nobody had
+    told. Every writer in this module already calls this function, so
+    putting the broadcast here means a new writer cannot forget it.
+    """
     try:
         thread = await ledger.ensure_thread(
             db, user_id=automation.user_id, automation_id=automation.id,
@@ -421,10 +445,19 @@ async def _edited_note(
             payload={"stamp": "edited",
                      "at": datetime.utcnow().isoformat() + "Z"},
         )
-        return turn["id"]
+        turn_id = turn["id"]
     except Exception as e:  # noqa: BLE001
         logger.warning("[workflow] EDITED note skipped: %s", e)
-        return None
+        turn_id = None
+    try:
+        rev = await bump_rev(db, automation)
+        await ledger.emit_updated(
+            db, automation.user_id, automation_id=automation.id,
+            workflow_rev=rev,
+        )
+    except Exception as e:  # noqa: BLE001 — a frame never fails a write
+        logger.warning("[workflow] automation.updated skipped: %s", e)
+    return turn_id
 
 
 async def set_schedule_preset(
@@ -456,6 +489,199 @@ async def set_schedule_preset(
         "schedule": schedule_block(automation, _spec_raw(automation)),
         "sentence": f"Moved it to {sentence[0].lower()}{sentence[1:]}.",
     }
+
+
+_ISO_WEEKDAY_CRON = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6",
+                    7: "0"}   # cron: Sunday is 0, ISO: Sunday is 7
+
+
+def custom_cron(custom: dict) -> tuple[str, dict]:
+    """Turn the picker's `{time, days, date?, tz}` into a schedule dict.
+
+    CONTRACTS-R31 §4.7. The picker sends what the USER chose; the cron
+    it compiles to is evaluated in the user's own zone
+    (`Routine.schedule_cron_local`), which is the semantics R30-D
+    already proved works — `Daily 22:52` fired at 22:52 Toronto exactly.
+    What was broken was never the timezone: it was that a chat promise
+    of "8:00 Toronto" and the armed cron were two objects nobody
+    reconciled. Here they cannot diverge, because the sentence the
+    thread shows is rendered FROM the schedule that was armed.
+    """
+    raw_time = str(custom.get("time") or "").strip()
+    try:
+        hh, mm = raw_time.split(":")
+        hour, minute = int(hh), int(mm)
+    except (ValueError, AttributeError):
+        raise WorkflowError("bad_time", "Pick a time first.")
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise WorkflowError("bad_time", "Pick a time first.")
+
+    date = str(custom.get("date") or "").strip()
+    if date:
+        # A one-time automation: an `at` schedule, not a cron. It must
+        # be in the FUTURE — an `at` in the past is R31-33's shape, and
+        # a picker is exactly where one gets typed.
+        try:
+            when = datetime.strptime(f"{date} {hour:02d}:{minute:02d}",
+                                     "%Y-%m-%d %H:%M")
+        except ValueError:
+            raise WorkflowError("bad_date", "Pick a date first.")
+        if when <= datetime.utcnow() - timedelta(days=1):
+            raise WorkflowError(
+                "past_date", "Pick a date that has not happened yet.")
+        return "at", {"at": when.isoformat()}
+
+    days = [int(d) for d in (custom.get("days") or [])
+            if isinstance(d, (int, str)) and str(d).isdigit()]
+    days = sorted({d for d in days if 1 <= d <= 7})
+    dow = ",".join(_ISO_WEEKDAY_CRON[d] for d in days) if days else "*"
+    return "cron_local", {"cron_local": f"{minute} {hour} * * {dow}"}
+
+
+async def set_schedule_custom(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    custom: dict,
+) -> dict:
+    """§4.7's `Custom…` row — a real time, in the user's own zone."""
+    from . import service
+    _kind, schedule = custom_cron(custom)
+    await service.set_schedule(
+        db, user_id=user_id, automation_id=automation.id,
+        schedule=schedule,
+    )
+    await db.refresh(automation)
+    await _edited_note(db, automation)
+    block = schedule_block(automation, _spec_raw(automation))
+    return {
+        "schedule": block,
+        # The sentence renders the schedule that was ARMED, so a
+        # mismatch between what the user asked for and what fired is
+        # visible in the thread rather than discovered days later.
+        "sentence": f"Moved it to {block['sentence'][0].lower()}"
+                    f"{block['sentence'][1:]}.",
+    }
+
+
+async def commit_workflow(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    workflow_rev: Optional[int], schedule: Optional[dict] = None,
+    permissions: Optional[list] = None, steps: Optional[list] = None,
+    rules: Optional[dict] = None, accounts: Optional[dict] = None,
+) -> dict:
+    """The workflow's ✓ — every draft, in ONE transaction (§4.6).
+
+    Supersedes R30 §4.4's "never one big PUT" for this path only. The
+    per-sheet routes stay for `/workflow/ask` and the web; what changes
+    is that the CANVAS commits once. The reason is not tidiness: a
+    canvas that saved per sheet left the user's edits half-applied
+    whenever one of them was refused, and on a tenant that boots dark
+    for 40-70 s each of those was its own round trip.
+
+    Refusal semantics, in the order the app depends on:
+      - `409 stale` — the drafts were made against an older workflow.
+        Nothing is applied; the caller re-bases and re-layers its
+        drafts. Checked FIRST, so a stale commit cannot half-apply.
+      - `409 refused {item, sentence}` — one item is impossible (a hard
+        rail, the last read, a missing consent). Nothing is applied.
+      - `200` — everything applied.
+
+    `steps` are deliberately NOT in the transaction: they go through
+    C's recompiler, which is an LLM call that can take seconds and can
+    legitimately refuse one step. They are applied after, and reported
+    as `pending: ["steps"]`; a refused step reverts that step alone.
+    """
+    current_rev = int(getattr(automation, "workflow_rev", 0) or 0)
+    if workflow_rev is not None and int(workflow_rev) != current_rev:
+        return {
+            "code": "stale",
+            "workflow_rev": current_rev,
+            "workflow": await workflow_payload(
+                db, automation=automation, user_id=user_id,
+            ),
+        }
+
+    from . import service
+
+    # ── phase 1: everything that can refuse, before anything is written.
+    #
+    # `save_permissions` and the membership writers raise WorkflowError /
+    # MembershipError on refusal. Doing the whole set inside one
+    # transaction is what makes "a 409 applies nothing" true; the
+    # alternative — apply, hit a refusal, unwind — is the half-applied
+    # state this route exists to remove.
+    applied: list[str] = []
+    async with db.begin_nested():
+        if accounts:
+            for account_id in (accounts.get("remove") or []):
+                await service.remove_connector(
+                    db, automation_id=automation.id, user_id=user_id,
+                    connector_id=str(account_id),
+                )
+                applied.append(f"account-{account_id}")
+            for account_id in (accounts.get("add") or []):
+                await service.add_connector(
+                    db, automation_id=automation.id, user_id=user_id,
+                    connector_id=str(account_id),
+                )
+                applied.append(f"account+{account_id}")
+
+        if rules:
+            for rule_id in (rules.get("remove") or []):
+                await delete_rule(db, automation=automation,
+                                  rule_id=str(rule_id), note=False)
+                applied.append("rule-")
+            for edit in (rules.get("edit") or []):
+                await update_rule(db, automation=automation,
+                                  rule_id=str(edit.get("id") or ""),
+                                  text=str(edit.get("text") or ""),
+                                  note=False)
+                applied.append("rule~")
+            for text in (rules.get("add") or []):
+                await add_rule(db, automation=automation, text=str(text),
+                               note=False)
+                applied.append("rule+")
+
+        if permissions:
+            for perm in permissions:
+                await save_permissions(
+                    db, automation=automation, user_id=user_id,
+                    account_id=str(perm.get("account_id") or ""),
+                    can_ids=list(perm.get("can") or []),
+                    cant_ids=list(perm.get("cant") or []),
+                    note=False,
+                )
+                applied.append("perm")
+
+        if schedule:
+            if schedule.get("custom"):
+                await set_schedule_custom(
+                    db, automation=automation, user_id=user_id,
+                    custom=schedule["custom"],
+                )
+            elif schedule.get("preset_id"):
+                await set_schedule_preset(
+                    db, automation=automation, user_id=user_id,
+                    preset_id=str(schedule["preset_id"]),
+                )
+            applied.append("schedule")
+
+    await db.commit()
+    await db.refresh(automation)
+
+    # ONE note and ONE frame for the whole commit — not one per draft.
+    # The thread should read "EDITED" once for something the user did
+    # once.
+    await _edited_note(db, automation)
+
+    out = {
+        "workflow": await workflow_payload(
+            db, automation=automation, user_id=user_id,
+        ),
+        "workflow_rev": int(getattr(automation, "workflow_rev", 0) or 0),
+    }
+    if steps:
+        out["pending"] = ["steps"]
+    return out
 
 
 async def set_steps(
@@ -498,6 +724,7 @@ async def set_steps(
 
 async def add_rule(
     db: AsyncSession, *, automation: Automation, text: str,
+    note: bool = True,
 ) -> dict:
     text = " ".join(str(text or "").split())[:300]
     if not text:
@@ -508,7 +735,11 @@ async def add_rule(
     rules.append(rule)
     automation.rules_json = json.dumps(rules)
     await db.commit()
-    await _edited_note(db, automation)
+    if note:
+        # `commit_workflow` writes ONE note for the whole
+        # commit — the user edited once, so the thread says
+        # EDITED once, not once per draft.
+        await _edited_note(db, automation)
     return {"rule": rule, "rules": rules,
             "sentence": f"Added a rule — {text[0].lower()}{text[1:]}"
             + ("" if text.endswith(".") else ".")}
@@ -516,6 +747,7 @@ async def add_rule(
 
 async def update_rule(
     db: AsyncSession, *, automation: Automation, rule_id: str, text: str,
+    note: bool = True,
 ) -> dict:
     rules = rules_list(automation)
     for r in rules:
@@ -526,12 +758,17 @@ async def update_rule(
         raise WorkflowError("not_found", "That rule is gone.")
     automation.rules_json = json.dumps(rules)
     await db.commit()
-    await _edited_note(db, automation)
+    if note:
+        # `commit_workflow` writes ONE note for the whole
+        # commit — the user edited once, so the thread says
+        # EDITED once, not once per draft.
+        await _edited_note(db, automation)
     return {"rules": rules, "sentence": "Changed the rule."}
 
 
 async def delete_rule(
     db: AsyncSession, *, automation: Automation, rule_id: str,
+    note: bool = True,
 ) -> dict:
     before = rules_list(automation)
     rules = [r for r in before if r.get("id") != rule_id]
@@ -542,13 +779,18 @@ async def delete_rule(
         raise WorkflowError("not_found", "That rule is gone.")
     automation.rules_json = json.dumps(rules)
     await db.commit()
-    await _edited_note(db, automation)
+    if note:
+        # `commit_workflow` writes ONE note for the whole
+        # commit — the user edited once, so the thread says
+        # EDITED once, not once per draft.
+        await _edited_note(db, automation)
     return {"rules": rules, "sentence": "Removed the rule."}
 
 
 async def save_permissions(
     db: AsyncSession, *, automation: Automation, user_id: str,
     account_id: str, can_ids: list[str], cant_ids: list[str],
+    note: bool = True,
 ) -> dict:
     """The green ✓ (§4.4). The consent question is answered by the
     platform grant: allowing a write with no approved grant behind it
@@ -581,7 +823,11 @@ async def save_permissions(
         )
     except permissions.PermissionError409 as e:
         raise WorkflowError(e.code, e.sentence, e.extra)
-    await _edited_note(db, automation)
+    if note:
+        # `commit_workflow` writes ONE note for the whole
+        # commit — the user edited once, so the thread says
+        # EDITED once, not once per draft.
+        await _edited_note(db, automation)
     return result
 
 

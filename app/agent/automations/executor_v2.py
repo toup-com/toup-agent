@@ -355,7 +355,17 @@ async def _run_steps(
             logger.debug("[automations] stop boundary check failed: %s", e)
         return False
 
+    # CONTRACTS-R31 §4.2a — a failing account never stops the run.
+    #
+    # `partial` alone used to carry two very different facts: "a step was
+    # skipped" and nothing else. It could not say WHICH account, WHY, or
+    # what would fix it, so the run's own record could not answer the
+    # question the user was about to ask. `failed_sources` is that
+    # record, and it is what the `needs_you` turns, the honest line, the
+    # notification flip and the per-source resume are all built from.
     partial = False
+    failed_sources: list[dict] = []
+    read_ok: list[str] = []
     for st in vspec.steps:
         if st.mutates:
             break
@@ -379,18 +389,43 @@ async def _run_steps(
                 )
         except Exception:  # noqa: BLE001
             pass
+        # R31-30, second half: `progress_step` / `progress_total` have
+        # FOUR readers in this engine — the terminal frame, the park,
+        # the home card's fraction, and run-now's 409 sentence — and had
+        # no writer anywhere in the repo. So `Already running — step 0
+        # of 5` was not a stale number, it was a column nobody had ever
+        # filled, and a running automation's card always drew 0%.
+        # Progress lived only in the ephemeral WS frame.
+        try:
+            if job_row is not None:
+                job_row.progress_step = step_no
+                job_row.progress_total = total_steps
+                await db.flush()
+        except Exception as e:  # noqa: BLE001 — progress never fails a run
+            logger.debug("[automations] progress stamp skipped: %s", e)
+
+        # §4.5: the same phase change the main chat has always had.
+        try:
+            await _ledger.emit_activity(
+                automation.user_id, automation_id=automation.id,
+                thread_id=thread.id if thread is not None else None,
+                run_id=job_id, phase="tool",
+                tool={"account_id": st.connector_id or "",
+                      "label": sentence},
+            )
+        except Exception:  # noqa: BLE001 — a frame never fails a run
+            pass
+
         _t0 = _time.monotonic()
         step_failed_reason = None
         try:
             ctx["steps"][st.id] = await _execute_read_step(automation, st, ctx)
         except Exception as e:  # noqa: BLE001 — transport/shape errors
             step_failed_reason = _failure_reason(e)
-            if st.on_error == "skip":
-                logger.info("[automations] step %s skipped (%s) on %s",
-                            st.id, e, automation.id)
-                ctx["steps"][st.id] = _skipped_result(st)
-                partial = True
-            else:
+            if st.on_error == "fail":
+                # Still reachable, and still correct for a step whose
+                # absence makes the rest of the run meaningless. It is
+                # no longer the DEFAULT for a read (spec_v2).
                 await _append_read_turn(
                     db, thread=thread, automation=automation, job_id=job_id,
                     step=st, result=None, ms=int((_time.monotonic() - _t0) * 1000),
@@ -405,6 +440,23 @@ async def _run_steps(
                 await _record_health(db, automation.id, ok=False,
                                      error=str(e)[:500])
                 return "failed"
+            logger.info("[automations] step %s continued past %s on %s",
+                        st.id, e, automation.id)
+            ctx["steps"][st.id] = _skipped_result(st)
+            partial = True
+            if st.on_error == "continue":
+                # `skip` stays SILENT (the Teams provider_down
+                # precedent); `continue` owes the user a named account,
+                # a real reason and a button.
+                failed_sources.append({
+                    "account_id": st.connector_id or "",
+                    "reason_code": _reason_code_of(e, step_failed_reason),
+                    "step_id": st.id,
+                    "at": datetime.utcnow().isoformat() + "Z",
+                })
+        else:
+            if st.connector_id and st.connector_id not in read_ok:
+                read_ok.append(st.connector_id)
         step_result = ctx["steps"].get(st.id) or {}
         await _append_read_turn(
             db, thread=thread, automation=automation, job_id=job_id,
@@ -423,6 +475,46 @@ async def _run_steps(
         # The aggregate finalizer reads this to report `partial`
         # honestly when the writes themselves succeed.
         await merge_job_config(db, job_id, steps_partial=True)
+
+    if failed_sources:
+        # §4.2a. Stamped on the RUN, so `accounts_failed` is answerable
+        # before the ledger closes — the notification flip, the home
+        # card's meta and the per-source resume all read it, and two of
+        # those happen while the run is still going.
+        await merge_job_config(
+            db, job_id,
+            accounts_failed=[f["account_id"] for f in failed_sources
+                             if f.get("account_id")],
+            failed_sources=failed_sources,
+        )
+        await _append_needs_you_turns(
+            db, thread=thread, automation=automation, job_id=job_id,
+            failed_sources=failed_sources,
+        )
+
+    if failed_sources and not read_ok:
+        # EVERY source failed. There is nothing to post and nothing to
+        # rank — a brief assembled from nothing is a lie with a nice
+        # layout. The run is `failed`, and the thread already carries one
+        # named card per account with the button that fixes it.
+        await _finalize_job(
+            db, job_id, status="failed", outcome="all_sources_failed",
+            error_class="tool_error",
+            user_message=_all_failed_message(failed_sources),
+        )
+        await _record_health(db, automation.id, ok=False,
+                             error=_all_failed_message(failed_sources))
+        return "failed"
+
+    if failed_sources:
+        # Some read, some did not: the brief goes out, and it SAYS so.
+        # "GitHub and Outlook are missing from this — I could not read
+        # them" is the difference between a brief the user can trust and
+        # one they have to audit.
+        await _append_honest_line(
+            db, thread=thread, automation=automation, job_id=job_id,
+            failed_sources=failed_sources,
+        )
 
     # §4.3: the last boundary before writes — a stop that arrived during
     # the reads must land HERE; no write step may start after it.
@@ -492,7 +584,7 @@ async def _run_steps(
     narration = await _narrate_phase1(
         db, automation=automation, vspec=vspec, job_id=job_id,
         thread=thread, tool_turn_by_step=tool_turn_by_step,
-        partial=partial,
+        partial=partial, failed_sources=failed_sources,
     )
 
     from .outbox import flush_row_when_due
@@ -511,6 +603,32 @@ async def _run_steps(
         outcome = "failed"
     elif partial:
         outcome = "partial"
+
+    if not rows:
+        # A READS-ONLY run has no outbox row, and the outbox flush is
+        # this path's ONLY route to `_finalize_job` — so nothing
+        # terminalized it. The job sat `running` for the full 360 s
+        # stuck-run window and was then reaped as `failed/lost` with a
+        # "Fix this" chip, which is precisely the founder's `Morning
+        # new-email briefing`: a thread ending "Your inbox is clear for
+        # now." under a home card reading `Tried 1:20 · it did not
+        # finish` (R31-31, F10).
+        #
+        # Reads-only specs became legal in R30 §4.11a — the migrated
+        # email briefings are exactly that shape — and this terminal
+        # was never added with them. `_finalize_job`'s guarded UPDATE
+        # keeps it exactly-once, so it is safe beside every other
+        # terminal, and going through it (never a raw UPDATE) is what
+        # keeps `_stamp_last_outcome`, the outcome notification and the
+        # v3 ledger close coupled (CONTRACTS-R30 §12).
+        await _finalize_job(
+            db, job_id,
+            status="completed",
+            outcome="partial" if partial else "sent",
+        )
+        await _record_health(db, automation.id, ok=True, error=None,
+                             ran=True, clean=not partial)
+
     counts = {
         sid: res.get("count")
         for sid, res in ctx["steps"].items()
@@ -523,6 +641,17 @@ async def _run_steps(
         outcome=outcome,
         counts=counts,
     )
+    try:
+        await _ledger.emit_activity(
+            automation.user_id, automation_id=automation.id,
+            thread_id=thread.id if thread is not None else None,
+            run_id=job_id, phase="done",
+        )
+        await _ledger.emit_updated(
+            db, automation.user_id, automation_id=automation.id,
+        )
+    except Exception:  # noqa: BLE001 — a frame never fails a run
+        pass
     return "run"
 
 
@@ -821,6 +950,125 @@ def _failure_reason(e: Exception) -> str:
     return "unreachable"
 
 
+def _reason_code_of(e: Exception, token: str) -> str:
+    """The R31 reason code for a failed read (§4.4).
+
+    `_failure_reason` gives a loose token from a substring match on the
+    exception text; `account_health.classify` turns that plus the
+    provider's own message into the code the string table is keyed on —
+    which is where `org_approval_needed` comes from, since a GitHub org
+    policy announces itself only in the message body.
+    """
+    from . import account_health
+    return account_health.classify(token, str(e))
+
+
+def _failure_sentence(connector_id: str, reason_code: str) -> str:
+    """The string table's `thread_sentence` for a failed source."""
+    if not reason_code:
+        return ""
+    from . import account_health
+    state, _fix = account_health.state_for_reason(reason_code)
+    return account_health.sentence_for(
+        account_state=state, reason_code=reason_code,
+        connector_id=connector_id,
+        name=account_health.display_of(connector_id),
+    )
+
+
+def _display_name(connector_id: str) -> str:
+    from app.services import automation_verbs as _verbs
+    return _verbs.display_name(connector_id) or connector_id or "an account"
+
+
+def _all_failed_message(failed_sources: list[dict]) -> str:
+    """The job row's `user_message` when nothing could be read.
+
+    Names every account, because `Could not reach an account` is the
+    string this round exists to delete.
+    """
+    from . import account_health
+    names = [_display_name(f.get("account_id") or "") for f in failed_sources]
+    return account_health.names_sentence(names, prefix="could_not_reach") \
+        or "Could not reach the accounts it needs."
+
+
+async def _append_needs_you_turns(
+    db, *, thread, automation: Automation, job_id: str,
+    failed_sources: list[dict],
+) -> None:
+    """One `needs_you` turn per failed source (§4.4/§4.5).
+
+    This is R31-05: the only route from a failed run to a fix used to be
+    job card → row → act page → About GitHub → sheet, five taps away
+    from the sentence that named the problem. The card now sits in the
+    thread, next to the run that hit it, carrying the button.
+
+    Each turn is its own try/except: one account whose card cannot be
+    written must not cost the others theirs.
+    """
+    if thread is None:
+        return
+    from . import account_health, ledger as _ledger
+    for src in failed_sources:
+        account_id = src.get("account_id") or ""
+        if not account_id:
+            continue
+        try:
+            payload = account_health.needs_you_payload(
+                account_id=account_id,
+                connector_id=account_id,
+                name=_display_name(account_id),
+                reason_code=src.get("reason_code") or "timeout",
+            )
+            await _ledger.append_turn(
+                db, user_id=automation.user_id, thread=thread,
+                run_id=job_id, kind="needs_you", payload=payload,
+            )
+            await account_health.record_use(
+                db, user_id=automation.user_id, account_id=account_id,
+                ok=False, reason_code=src.get("reason_code") or "",
+            )
+        except Exception as e:  # noqa: BLE001 — see docstring
+            logger.warning(
+                "[automations] needs_you turn skipped account=%s: %s",
+                account_id, e,
+            )
+
+
+async def _append_honest_line(
+    db, *, thread, automation: Automation, job_id: str,
+    failed_sources: list[dict],
+) -> None:
+    """"GitHub and Outlook are missing from this — I could not read
+    them." (§4.2a)
+
+    Written by the ENGINE, not the narrator: it is a fact about the run
+    and it must be there whether or not the narration pass succeeded. A
+    brief that silently omits two of five accounts is the failure mode
+    the whole partial-run design exists to prevent.
+    """
+    if thread is None:
+        return
+    from . import account_health, ledger as _ledger
+    names = [_display_name(f.get("account_id") or "")
+             for f in failed_sources if f.get("account_id")]
+    # C's purpose-written form when it exists; otherwise C's OWN
+    # `could_not_reach_*`, which says the same true thing in the same
+    # voice. A composes from the table and authors no sentence (§4.4).
+    text = (account_health.names_sentence(names, prefix="missing_from_this")
+            or account_health.names_sentence(names, prefix="could_not_reach"))
+    if not text:
+        return
+    try:
+        await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=job_id,
+            kind="agent", payload={"text": text},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] honest line skipped: %s", e)
+
+
 def _write_display(st: ValidatedStep) -> dict:
     """The write's honest display form, snapshotted at staging
     (CONTRACTS-R30 §4.8) — the flush path cannot read platform grants,
@@ -936,6 +1184,7 @@ def _rules_of(automation: Automation) -> list[str]:
 async def _narrate_phase1(
     db, *, automation: Automation, vspec: ValidatedSpecV2, job_id: str,
     thread, tool_turn_by_step: dict, partial: bool,
+    failed_sources: Optional[list] = None,
 ) -> Optional[dict]:
     """Run the narrator and persist what may precede the writes: the
     opening agent line + the per-item whys (in-place annotates). The
@@ -943,6 +1192,10 @@ async def _narrate_phase1(
     the thread never claims a change before it happened."""
     if thread is None:
         return None
+    _reason_by_step = {
+        str(f.get("step_id") or ""): str(f.get("reason_code") or "")
+        for f in (failed_sources or [])
+    }
     try:
         job = await db.get(BuildJob, job_id)
         from . import ledger as _ledger
@@ -983,8 +1236,20 @@ async def _narrate_phase1(
                 "action": turn.get("action") or "",
                 "detail": turn.get("detail") or "",
                 "ok": bool(turn.get("ok", True)),
+                # C's narrator contract: `failure_reason` IS the string
+                # table's `thread_sentence`, quoted verbatim into the
+                # prose. It used to be the tool turn's `detail` — "it
+                # did not answer" — a run-row fragment with no account
+                # and no fix, which is how a GitHub org-approval refusal
+                # was narrated as "GitHub did not respond" and sent the
+                # user to fix the wrong thing. Passing a reason CODE
+                # here would be just as wrong: the model would have to
+                # invent the sentence, which is the improvising this
+                # field exists to stop.
                 "failure_reason": None if turn.get("ok", True)
-                else (turn.get("detail") or "unreachable"),
+                else _failure_sentence(st.connector_id or "",
+                                       _reason_by_step.get(st.id, ""))
+                or (turn.get("detail") or ""),
                 "items": [
                     {"id": it["id"], "title": it.get("title") or "",
                      "sub": it.get("sub") or "",

@@ -77,6 +77,17 @@ async def test_skill_tools_match_round_brief(monkeypatch):
     assert ordered[-1] == "automations__run_now"
     assert ordered[-2] == "automations__memory_recall"
 
+    # Under the dev fast lane it comes back. The array is FILTERED
+    # rather than appended to, so it returns to its original position —
+    # which keeps the two arrays' shared entries in the same order and
+    # is what a dev tenant's cache lineage needs.
+    monkeypatch.setattr(
+        "app.agent.skills.builtins.automations.skill._dev_tools_active",
+        lambda: True,
+    )
+    dev_names = {t["name"] for t in AutomationsSkill().get_tools()}
+    assert "automations__test_run" in dev_names
+
 
 @pytest.mark.asyncio
 async def test_every_builtin_skill_tool_carries_its_skill_prefix():

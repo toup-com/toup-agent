@@ -19,17 +19,53 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Automation, AutomationThread, BuildJob, Routine
 from app.services import automation_verbs as verbs
-from . import ledger, workflow
+from . import account_health, ledger, workflow
 from . import registry as reg
 
 logger = logging.getLogger(__name__)
 
 
-def _tz(user_id: str) -> ZoneInfo:
+async def _tz_name(db: AsyncSession, user_id: str) -> Optional[str]:
+    """The user's IANA zone — cache first, then the DB.
+
+    R31-26. Every stamp on the founder's home screen read UTC: `Tried
+    14:21` on a 10:29 clock, `EDITED · 14:14` at 10:14, `Tried 14:36` at
+    11:17. The cause is here rather than in the formatter — the tz came
+    ONLY from a 5-minute in-process cache whose single writer is
+    `agent_runner`'s per-turn seed. A summary served by a cold worker,
+    or to a user who had not taken a chat turn in five minutes, had no
+    tz at all and silently rendered every line in UTC, with the
+    payload's own `tz` field null.
+
+    So: fall back to the row. `users.timezone` is TENANT-authoritative
+    (the CI-enforced shared-column map in db/models/base.py) and this is
+    the agent lane, so `db` is the right database — the same column read
+    from the platform lane is a different row and a known trap.
+    """
     from app.agent._user_tz_cache import get_cached_user_tz
-    name = get_cached_user_tz(user_id) or "UTC"
+    name = get_cached_user_tz(user_id)
+    if name:
+        return name
     try:
-        return ZoneInfo(name)
+        from app.db.models import User
+        row = await db.get(User, user_id)
+        name = getattr(row, "timezone", None) if row is not None else None
+        if name:
+            # Warm the cache for the rest of this request's renders.
+            try:
+                from app.agent._user_tz_cache import set_cached_user_tz
+                set_cached_user_tz(user_id, name)
+            except Exception:  # noqa: BLE001 — a cache is an optimisation
+                pass
+        return name
+    except Exception as e:  # noqa: BLE001 — never fail a summary on tz
+        logger.debug("[summary] tz fallback skipped: %s", e)
+        return None
+
+
+def _zone(name: Optional[str]) -> ZoneInfo:
+    try:
+        return ZoneInfo(name or "UTC")
     except Exception:  # noqa: BLE001
         return ZoneInfo("UTC")
 
@@ -56,6 +92,29 @@ def _when_label(dt: Optional[datetime], tz: ZoneInfo) -> str:
 
 def _acct_count(n: int) -> str:
     return f"{n} account" + ("" if n == 1 else "s")
+
+
+def _and_list(names: list[str]) -> str:
+    """`A` / `A and B` / `A, B and C` — every name, at any count."""
+    clean = [n for n in (names or []) if n]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    return ", ".join(clean[:-1]) + " and " + clean[-1]
+
+
+def _brief_not_posted(job) -> bool:
+    """Did the reads succeed and the WRITE fail? (§4.2's fourth row.)
+
+    The distinction matters to the user's next action: a partial run
+    that posted is missing information, a partial run that did not is
+    missing the delivery, and only the second one leaves them waiting
+    for a message that will never arrive.
+    """
+    return (job.outcome or "") == "failed" and bool(
+        (ledger._cfg_of(job).get("accounts_touched") or [])
+    )
 
 
 async def _latest_run(
@@ -118,7 +177,8 @@ def _description_of(
 
 
 async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
-    tz = _tz(user_id)
+    tz_name = await _tz_name(db, user_id)
+    tz = _zone(tz_name)
     rows = list((await db.execute(
         select(Automation)
         .where(Automation.user_id == user_id)
@@ -212,22 +272,59 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             # applying it to a run that died mid-"Wrapping up" asserts a
             # refusal that never happened, on the home screen. Only
             # claim a connector when the ledger recorded one.
+            #
+            # R31-07: and when it recorded three, say three. The old
+            # form took `failed_names[0]` and dropped the rest, so a run
+            # that could not reach GitHub, Outlook and Teams told the
+            # user about GitHub — and the user fixed GitHub, re-ran, and
+            # met the next name. Every name, at any count.
             failed_ids = ledger._cfg_of(last).get("accounts_failed") or []
             failed_names = [x["name"] for x in accounts
                             if x["account_id"] in failed_ids]
             when = _clock(last.completed_at or last.created_at, tz)
+            if not failed_names and expired_name \
+                    and status == "needs_attention":
+                failed_names = [expired_name]
             if failed_names:
-                meta = (f"Tried {when} · could not reach "
-                        f"{failed_names[0]}")
-            elif expired_name and status == "needs_attention":
-                meta = f"Tried {when} · could not reach {expired_name}"
+                meta = account_health.form(
+                    "tried_names_need_you", t=when,
+                    names=_and_list(failed_names),
+                )
             else:
-                meta = f"Tried {when} · it did not finish"
+                meta = account_health.form("tried_did_not_finish", t=when)
+        elif v3 == "partial":
+            # §4.2: a run that read some of its accounts and could not
+            # read the others. It had NO form at all — it fell through
+            # to "Ran 10:15 · 4 accounts touched", which is true and
+            # says nothing about the two that are broken.
+            failed_ids = ledger._cfg_of(last).get("accounts_failed") or []
+            when = _clock(last.completed_at or last.created_at, tz)
+            n_ok = max(touched - len(failed_ids), 0)
+            total_accounts = max(len(members), touched)
+            if _brief_not_posted(last):
+                meta = account_health.form("ran_brief_not_posted", t=when)
+            else:
+                meta = account_health.form(
+                    "ran_n_of_m", t=when, n=n_ok, m=total_accounts,
+                )
         elif missing_account:
             missing_names = [x["name"] for x in accounts
                              if x["state"] == "expired"]
-            meta = f"Waiting on {missing_names[0] if missing_names else 'an account'} · " \
-                   f"{_acct_count(len(members))}"
+            # `an account` is banned in a status string (§4.3(7)): it is
+            # the sentence this round exists to delete, and a fallback is
+            # exactly where it survives a search-and-replace. With no
+            # name to give, say the true thing that has one.
+            meta = (
+                f"Waiting on {_and_list(missing_names)} · "
+                f"{_acct_count(len(members))}"
+                if missing_names else
+                f"Waiting on a connection · {_acct_count(len(members))}"
+            )
+        elif status == "paused" and last is not None:
+            meta = account_health.form(
+                "paused_ran_once",
+                t=_clock(last.completed_at or last.created_at, tz),
+            )
         else:
             meta = f"Ran {_clock(last.completed_at or last.created_at, tz)}" \
                    f" · {_acct_count(max(touched, 1))} touched"
@@ -296,5 +393,5 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
         "headline": headline,
         "automation_count": n,
         "unused_count": unused,
-        "tz": get_cached_user_tz(user_id),
+        "tz": tz_name,
     }

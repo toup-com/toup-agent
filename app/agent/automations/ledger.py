@@ -37,6 +37,7 @@ from app.db.models import (
     AUTOMATION_TURN_KINDS, AUTOMATION_NOTE_STAMPS, AUTOMATION_RUN_KINDS,
     RESULT_VOCABULARIES,
 )
+from app.db.models.automation_ledger import AUTOMATION_FIXES
 from app.services import automation_verbs as verbs
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,50 @@ def _clean_sentence(s: Any, field: str, *, allow_empty: bool = False) -> str:
     return s
 
 
+# R31-24. `**paused**`, `- **Gmail:**` and backticks reached the founder's
+# thread verbatim because nothing between the model and the bubble had an
+# opinion about markdown: `copy_guard.scan("**bold**")` returns clean, and
+# `plain_text.strip_markdown` was wired only to push transports.
+#
+# This STRIPS and never rejects, deliberately. A rejected agent turn is
+# R31-17's silence — 40 seconds of "Looking at that now…" and then
+# nothing — and the user would be paying for C's prompt drifting with a
+# blank screen. The violation is logged instead, under one grep-able key,
+# so C can find and fix the source.
+#
+# Only OUR prose goes through it. Item titles/subs and message texts are
+# quoted vendor content: an email whose subject really is `**URGENT**`
+# must keep its asterisks, or the thread misquotes the mail it read.
+_MD_EMPHASIS_RE = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1",
+                             re.DOTALL)
+_MD_CODE_RE = re.compile(r"`{1,3}([^`]+)`{1,3}", re.DOTALL)
+_MD_BULLET_RE = re.compile(r"(?m)^[ \t]*(?:[-*+]|\d{1,2}[.)])[ \t]+")
+_MD_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+")
+
+
+def strip_markdown_markers(s: str) -> tuple[str, bool]:
+    """Return `(plain, found)`. Total — never raises, never drops text."""
+    if not isinstance(s, str) or not s:
+        return s or "", False
+    out = _MD_CODE_RE.sub(r"\1", s)
+    prev = None
+    while prev != out:                      # nested **_bold italic_**
+        prev = out
+        out = _MD_EMPHASIS_RE.sub(r"\2", out)
+    out = _MD_HEADING_RE.sub("", out)
+    out = _MD_BULLET_RE.sub("", out)
+    return out, out != s
+
+
+def _plain(s: Any, field: str, *, allow_empty: bool = False) -> str:
+    """`_clean_sentence` for agent-authored prose, markdown removed."""
+    text = _clean_sentence(s, field, allow_empty=allow_empty)
+    plain, found = strip_markdown_markers(text)
+    if found:
+        logger.warning("automation.copy.markdown field=%s", field)
+    return plain
+
+
 def mint_item_ids(items: list[dict]) -> list[dict]:
     """Assign server ids to items that lack them (idempotent)."""
     out = []
@@ -166,7 +211,17 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
         }
 
     if kind in ("agent", "think", "user"):
-        return {"text": _clean_sentence(p.get("text"), f"{kind}.text")}
+        # `user` keeps its own words verbatim — they are the person's,
+        # not ours, and the copy contract only binds what we author.
+        clean = _clean_sentence if kind == "user" else _plain
+        out = {"text": clean(p.get("text"), f"{kind}.text")}
+        if kind == "user" and p.get("client_msg_id"):
+            # The replay key for `POST /thread/messages`. It rides the
+            # turn because the turn is the only durable record of that
+            # message — the alternative is a second table whose only job
+            # is to remember what this row already knows.
+            out["client_msg_id"] = str(p["client_msg_id"])[:64]
+        return out
 
     if kind == "tool":
         action = _clean_sentence(p.get("action"), "tool.action")
@@ -215,8 +270,8 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             rows = []
             for r in g.get("rows") or []:
                 rows.append({
-                    "text": _clean_sentence(r.get("text"), "result.row.text"),
-                    "sub": r.get("sub") or "",
+                    "text": _plain(r.get("text"), "result.row.text"),
+                    "sub": strip_markdown_markers(r.get("sub") or "")[0],
                     "tag": r.get("tag") or "",
                     "item_refs": list(r.get("item_refs") or []),
                 })
@@ -224,7 +279,7 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
                 {"rank": i, "label": label, "tone": tone, "rows": rows}
             )
         return {
-            "title": _clean_sentence(p.get("title"), "result.title"),
+            "title": _plain(p.get("title"), "result.title"),
             "vocabulary": vocab,
             "groups": out_groups,
         }
@@ -232,7 +287,7 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
     if kind == "draft":
         target = p.get("target") or {}
         return {
-            "text": _clean_sentence(p.get("text"), "draft.text"),
+            "text": _plain(p.get("text"), "draft.text"),
             "target": {
                 "account_id": str(target.get("account_id") or ""),
                 "ref": target.get("ref"),
@@ -243,8 +298,42 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
     if kind == "waiting":
         return {
             "pending_action_id": str(p.get("pending_action_id") or ""),
-            "text": _clean_sentence(p.get("text"), "waiting.text"),
+            "text": _plain(p.get("text"), "waiting.text"),
             "expires_at": p.get("expires_at"),
+        }
+
+    if kind == "memory":
+        # The "Memory updated · N facts" chip. `sheet` is the deep link
+        # the chip opens; the count is the only number it may show.
+        count = int(p.get("count") or 0)
+        _require(count > 0, "memory turn needs a positive count")
+        return {
+            "count": count,
+            "sheet": str(p.get("sheet") or "memory"),
+        }
+
+    if kind == "needs_you":
+        # §4.4. Every field is required because the whole point of this
+        # turn is that "could not reach an account" never happens again:
+        # a card without an account_id, a reason or a fix is the same
+        # nameless failure in a new shape.
+        fix = p.get("fix")
+        _require(fix in AUTOMATION_FIXES, f"unknown fix {fix!r}")
+        reason = str(p.get("reason_code") or "")
+        _require(bool(reason), "needs_you turn needs a reason_code")
+        account_id = str(p.get("account_id") or "")
+        _require(bool(account_id), "needs_you turn needs an account_id")
+        return {
+            "account_id": account_id,
+            "connector_id": str(p.get("connector_id") or account_id),
+            "name": _clean_sentence(p.get("name"), "needs_you.name"),
+            "reason_code": reason,
+            "sentence": _plain(p.get("sentence"),
+                               "needs_you.sentence"),
+            "fix": fix,
+            "fix_label": _clean_sentence(p.get("fix_label"),
+                                         "needs_you.fix_label"),
+            "approval_url": p.get("approval_url") or None,
         }
 
     raise LedgerValidationError(f"unhandled kind {kind!r}")  # pragma: no cover
@@ -337,10 +426,60 @@ async def append_turn(
     if broadcast:
         await _broadcast(user_id, {
             "type": "automation.turn",
+            # R31 §4.1: EVERY automation frame carries automation_id.
+            # This one did not, so a client showing one thread could not
+            # attribute a frame without joining through thread_id it
+            # might not hold yet — and the app-level bridge, which runs
+            # with no thread open at all, had nothing to route on.
+            "automation_id": thread.automation_id,
             "thread_id": thread.id,
             "run_id": run_id,
             "turn": turn,
         })
+    return turn
+
+
+async def replace_turn(
+    db: AsyncSession, *, user_id: str, thread: AutomationThread,
+    turn_id: str, kind: str, payload: dict, run_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Rewrite one turn IN PLACE and re-broadcast it (§4.5).
+
+    "An `automation.turn` whose `turn_id` already exists replaces that
+    turn, and `GET /thread` returns the replaced version." This is what
+    makes the per-source merge (§4.2a) visible without a reload: when a
+    reconnected account's catch-up read lands, the run's RESULT turn is
+    rewritten where it already sits, in the run it belongs to, instead
+    of a second brief appearing under the first and leaving the user to
+    work out which one is true.
+
+    Keeps `seq`, so the turn does not jump position in the thread.
+    Returns None if the turn is gone — a replacement for something that
+    no longer exists is not an error, it is a race with a delete.
+    """
+    row = await db.get(AutomationTurn, turn_id)
+    if row is None or row.thread_id != thread.id:
+        return None
+    try:
+        body = validate_turn_payload(kind, payload)
+    except LedgerValidationError as e:
+        if _strict():
+            raise
+        logger.error("[ledger] sanitized invalid %s replacement: %s", kind, e)
+        body = _sanitize_fallback(kind, payload)
+    row.kind = kind
+    row.payload_json = json.dumps(body, default=str)
+    if run_id is not None:
+        row.run_id = run_id
+    await db.commit()
+    turn = _serialize_row(row)
+    await _broadcast(user_id, {
+        "type": "automation.turn",
+        "automation_id": thread.automation_id,
+        "thread_id": thread.id,
+        "run_id": row.run_id,
+        "turn": turn,
+    })
     return turn
 
 
@@ -373,6 +512,103 @@ async def emit_live(
         "type": "automation.run.live",
         "run_id": run_id, "automation_id": automation_id, "text": text,
     })
+
+
+ACTIVITY_PHASES = ("thinking", "tool", "writing", "done")
+
+
+async def emit_activity(
+    user_id: str, *, automation_id: str, thread_id: Optional[str],
+    phase: str, run_id: Optional[str] = None,
+    tool: Optional[dict] = None, detail: Optional[str] = None,
+) -> None:
+    """§4.5 — the thread's live state, one frame per phase change.
+
+    R31-17. The thread showed `Looking at that now…` — three dots and a
+    fixed string — for twenty to forty seconds while the main chat,
+    two taps away, showed the agent-state orb walking its ladder with
+    the tool glyph of whatever it was reading. The difference was not
+    the component: it was that nothing on the wire told the thread what
+    phase the turn was in. This is that information, and it is the same
+    information the chat socket already gives ChatScreen.
+
+    `tool.label` is the verb dictionary's PROGRESSIVE form ("reading
+    your unread mail"), not the past-tense record form — the ladder is
+    describing something still happening.
+    """
+    if phase not in ACTIVITY_PHASES:
+        logger.debug("[ledger] unknown activity phase %r", phase)
+        return
+    frame = {
+        "type": "automation.activity",
+        "automation_id": automation_id,
+        "thread_id": thread_id,
+        "run_id": run_id,
+        "phase": phase,
+    }
+    if tool:
+        frame["tool"] = tool
+    if detail:
+        frame["detail"] = detail
+    await _broadcast(user_id, frame)
+
+
+async def emit_turn_delta(
+    user_id: str, *, automation_id: str, thread_id: str, turn_id: str,
+    text: str,
+) -> None:
+    """§4.5 — the appended CHUNK of a streaming agent turn.
+
+    `text` is what to append, not the whole body: the thread's reply
+    used to be accumulated in the client and painted only at `onDone`,
+    so a forty-second answer arrived as forty seconds of nothing
+    followed by a wall of text.
+    """
+    if not text:
+        return
+    await _broadcast(user_id, {
+        "type": "automation.turn.delta",
+        "automation_id": automation_id,
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "text": text,
+    })
+
+
+async def emit_updated(
+    db: AsyncSession, user_id: str, *, automation_id: str,
+    workflow_rev: Optional[int] = None,
+) -> None:
+    """§4.6 — one automation's summary row changed.
+
+    Emitted after EVERY workflow write, status write, delete and run
+    transition. `summary` is the §4.1 per-automation object exactly as
+    `GET /summary` serves it, so a client replaces one row instead of
+    reloading a screen the user is looking at — which is what made
+    every mutation cost a round trip on a tenant that can boot dark for
+    a minute.
+
+    Best-effort, and computed defensively: a summary that cannot be
+    built must not take the write with it.
+    """
+    payload: Optional[dict] = None
+    try:
+        from .summary import summary_payload
+        full = await summary_payload(db, user_id=user_id)
+        for row in (full or {}).get("automations") or []:
+            if row.get("id") == automation_id:
+                payload = row
+                break
+    except Exception as e:  # noqa: BLE001 — see docstring
+        logger.debug("[ledger] automation.updated summary skipped: %s", e)
+    frame = {
+        "type": "automation.updated",
+        "automation_id": automation_id,
+        "summary": payload,
+    }
+    if workflow_rev is not None:
+        frame["workflow_rev"] = int(workflow_rev)
+    await _broadcast(user_id, frame)
 
 
 # -------------------------------------------------------------- reads

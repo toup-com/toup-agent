@@ -14,8 +14,11 @@ fallback paths; nothing outside this module composes step copy.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # The agent's own (non-connector) work — B renders the orb for these.
 BRAND_ORB = None
@@ -503,7 +506,8 @@ _V2_READ: dict[str, tuple[str, str]] = {
     "gmail": ("Read your unread mail", "{n} new thread(s)"),
     "outlook": ("Read your Outlook mail", "{n} new message(s)"),
     "slack": ("Read your channels", "{n} place(s)"),
-    "jira": ("Checked your board", "{n} issue(s) moved"),
+    # R31-07: "moved" is something the automation DID. It read.
+    "jira": ("Checked your board", "{n} open issue(s)"),
     "github": ("Checked your repositories", "{n} pull request(s)"),
     "teams": ("Read your Teams chats", "{n} new message(s)"),
     "notion": ("Checked your pages", "{n} page(s) changed"),
@@ -607,13 +611,64 @@ _V2_ENGINE_ACTIONS = frozenset({
 })
 
 
-def _n(template: str, count: Optional[int]) -> str:
-    """Interpolate `{n}`/`{count}` and singularise `(s)` markers."""
+_SLOT_RE = re.compile(r"\{[a-z_][a-z0-9_]*\}")
+
+
+def _n(template: str, count: Optional[int], **extra: Any) -> str:
+    """Interpolate `{n}`/`{count}` (+ any `extra`) and singularise `(s)`.
+
+    R31-25. This used to substitute exactly `{n}` and `{count}` and pass
+    everything else through verbatim, so `{count} issues moved ·
+    {need_count} needs you` reached a user's job sheet with the second
+    brace SHOWING — and `is_served_action` could not catch it either,
+    because C's templates are compiled to regexes with `{slot}` → `.+?`
+    and `{need_count}` matches `.+?`.
+
+    The entries module's own docstring already promised the right
+    behaviour — "a template with an unfilled slot renders without its
+    clause, never with braces showing" — and nothing implemented it.
+    This does: fill what we can, then DROP the clause around anything
+    left. Dropping is right rather than guessing, because the alternative
+    to a missing clause is an invented number.
+    """
     if not template:
         return ""
     n = 0 if count is None else int(count)
     out = template.replace("{n}", str(n)).replace("{count}", str(n))
-    return out.replace("(s)", "" if n == 1 else "s")
+    for key, value in (extra or {}).items():
+        if value is None or value == "":
+            continue
+        out = out.replace("{" + key + "}", str(value))
+    out = out.replace("(s)", "" if n == 1 else "s")
+    if not _SLOT_RE.search(out):
+        return out
+    # Drop the clause that still carries a slot. ` · ` is the dictionary's
+    # own clause separator; a comma is the fallback; a template that is
+    # ONE clause with an unfillable slot says nothing rather than showing
+    # a brace.
+    for sep in (" · ", ", "):
+        if sep in out:
+            kept = [c for c in out.split(sep) if not _SLOT_RE.search(c)]
+            out = sep.join(kept)
+            if not _SLOT_RE.search(out):
+                return out.strip()
+    logger.warning("automation.copy.unfilled template=%r", template[:120])
+    return ""
+
+
+# Past-tense verbs that assert the automation CHANGED something. A read
+# step's detail may never wear one: the whole difference between "I
+# looked and nothing had changed" and "I changed nothing" is which of
+# them the user has to act on.
+_WRITE_VOICE_RE = re.compile(
+    r"\b(moved|sent|posted|drafted|created|deleted|updated|archived"
+    r"|replied|commented|filed|scheduled|assigned|closed|merged)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_write_voiced(detail: str) -> bool:
+    return bool(detail) and bool(_WRITE_VOICE_RE.search(detail))
 
 
 _C_ENTRIES_CACHE: Any = None
@@ -662,22 +717,48 @@ def turn_action(
             entry = (ce.get("writes") or {}).get(tool or "")
         entry = entry or _V2_WRITE.get(tool or "")
         if entry:
+            # Every slot on BOTH halves, not just `action_others`.
+            # `Commented on {target}`, `Filed {target}`, `Held {when}`
+            # and `in {target}, nothing overwritten` all reached users
+            # with braces showing, because only `action_others` was ever
+            # interpolated and only with `{target}`/`{channel}`.
+            slots = {"target": target, "channel": target, "when": target}
             if audience == "others" and target and entry.get("action_others"):
-                action = entry["action_others"].replace(
-                    "{target}", str(target)
-                ).replace("{channel}", str(target))
+                action = _n(entry["action_others"], count, **slots)
             else:
-                action = entry["action"]
-            return {"action": action, "detail": entry.get("detail") or ""}
+                action = _n(entry["action"], count, **slots)
+            detail = _n(entry.get("detail") or "", count, **slots)
+            if not action:
+                name = display_name(cid) or "the account"
+                action = f"Made a change in {name}"
+            return {"action": action, "detail": detail}
         name = display_name(cid) or "the account"
         return {"action": f"Made a change in {name}", "detail": ""}
     if ce:
         reads = ce.get("reads") or {}
         entry_c = reads.get(tool or "") or reads.get("*")
         if entry_c:
-            return {"action": entry_c["action"],
-                    "detail": _n(entry_c.get("detail") or "", count)
-                    if count is not None else ""}
+            detail = (
+                _n(entry_c.get("detail") or "", count)
+                if count is not None else ""
+            )
+            if _is_write_voiced(detail):
+                # R31-07: a READ step reporting `0 issues moved`. The
+                # count is real (issues that changed since the last
+                # look), the verb is not — "moved" is something the
+                # automation did, and it did nothing. C owns the string;
+                # A owns not shipping it. Fall back to this module's own
+                # read phrasing and name the entry so C can fix it once.
+                logger.warning(
+                    "automation.copy.write_voiced_read connector=%s "
+                    "tool=%s detail=%r", cid, tool, detail[:80],
+                )
+                builtin = _V2_READ.get(cid)
+                if builtin:
+                    return {"action": entry_c["action"],
+                            "detail": _n(builtin[1], count)}
+                detail = _n("{n} item(s)", count)
+            return {"action": entry_c["action"], "detail": detail}
     entry = _V2_READ.get(cid)
     if entry:
         return {"action": entry[0], "detail": _n(entry[1], count)}
@@ -716,9 +797,21 @@ def live_sentence(
 
 
 _C_FAILURE_ALIASES = {
-    # my reason vocabulary → C's entry keys where they differ
+    # This module's reason vocabulary → C's entry keys where they differ.
+    #
+    # `scope_missing` USED TO ALIAS ONTO `access_expired`, and that one
+    # line is why the founder was told his Outlook "access expired" when
+    # the truth was that the connection had never been granted mail-read
+    # scope. Two different causes, two different repairs: reconnecting an
+    # expired token fixes nothing when the scope was never asked for, so
+    # the user does the OAuth dance and lands exactly where they started.
+    # The built-in table had the right sentence all along ("it needs more
+    # access than you gave it"); this alias made it unreachable.
+    #
+    # `timeout → provider_down` stays: "the service was unreachable" and
+    # "it did not answer in time" are the same event from the user's
+    # side, and C's table has one entry for it.
     "reauth_required": "access_expired",
-    "scope_missing": "access_expired",
     "timeout": "provider_down",
 }
 
@@ -759,17 +852,43 @@ def _lower_first(s: str) -> str:
     return s[:1].lower() + s[1:] if s else s
 
 
-def job_card_label(group: list[dict]) -> str:
-    """The job card's label from its grouped tool turns (§3.4).
+def job_card_label(group: list[dict], failed_accounts: Optional[list] = None) -> str:
+    """The job card's label from its grouped tool turns (§3.4/§4.4).
 
-    Three forms: any not-ok → "Could not reach an account"; any write →
-    the write turns' actions joined with ` · ` (second onward lowered);
-    else "Checked {n} account(s)". Input turns need only
-    `tool_kind`/`ok`/`action`/`account_id`.
+    R31-07. This returned the literal string `Could not reach an
+    account` — no name, no count, no reason — which is what a founder
+    saw at the top of a run that had failed on GitHub AND Outlook while
+    Jira and Gmail answered. It named nobody, so the card could not be
+    acted on and the sheet had to be opened to learn anything at all.
+
+    Now: every name, at any count, from C's `could_not_reach_*` forms.
+
+    And a run whose `accounts_failed` is EMPTY can never wear a failure
+    label (ND-16's rule, applied to the second reader): pass
+    `failed_accounts` and the two are asserted to agree, so a run that
+    died mid-"Wrapping up" with no connector recorded says "it did not
+    finish" rather than accusing an account that never refused.
     """
     turns = [t for t in group or [] if t]
-    if any(not t.get("ok", True) for t in turns):
-        return "Could not reach an account"
+    failed_here = [t for t in turns if not t.get("ok", True)]
+    if failed_here:
+        ids = []
+        for t in failed_here:
+            acc = t.get("account_id") or ""
+            if acc and acc not in ids:
+                ids.append(acc)
+        if failed_accounts is not None:
+            allowed = set(failed_accounts)
+            ids = [i for i in ids if i in allowed]
+        names = [display_name(i) or i for i in ids]
+        if names:
+            from app.agent.automations import account_health as _ah
+            label = _ah.names_sentence(names, prefix="could_not_reach")
+            if label:
+                return label
+            joined = _ah.join_names(names)
+            return f"Could not reach {joined}" if joined else ""
+        return "It did not finish"
     writes = [t for t in turns if t.get("tool_kind") == "write"]
     if writes:
         parts = [writes[0].get("action") or "Made a change"]
@@ -884,10 +1003,20 @@ def _c_served() -> tuple:
 
 def is_served_action(action: Any) -> bool:
     """True iff this module could have emitted `action` — the v3
-    serializer's rejection predicate (CONTRACTS-R30 §1). Total."""
+    serializer's rejection predicate (CONTRACTS-R30 §1). Total.
+
+    R31-25: an UNFILLED SLOT is never served. This predicate used to
+    accept `Held {when}` and `Commented on {target}` because C's
+    templates are compiled to regexes with `{slot}` → `.+?`, and a
+    literal `{target}` matches `.+?` perfectly. So the one check that
+    was supposed to stop raw strings reaching the thread was, for
+    exactly this class, an identity function.
+    """
     if not isinstance(action, str) or not action.strip():
         return False
     if "__" in action:
+        return False
+    if _SLOT_RE.search(action):
         return False
     if action in _SERVED_EXACT:
         return True

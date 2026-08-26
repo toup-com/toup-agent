@@ -175,6 +175,20 @@ class Automation(Base):
     steps_human_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # R31 §4.6. A monotonic revision of the WORKFLOW payload, bumped by
+    # every write that changes it. Two jobs, both about the app holding
+    # local drafts over a server base:
+    #   - `POST …/workflow/commit` carries the rev it was drafted
+    #     against; a mismatch is a `409 stale` that re-bases the store
+    #     with the newer workflow, drafts re-layered, instead of
+    #     silently overwriting an edit made on another device;
+    #   - the committing device dedupes its own response against the
+    #     `automation.updated` frame the same write broadcasts, so a
+    #     commit repaints once rather than twice.
+    workflow_rev: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
     )

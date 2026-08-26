@@ -85,7 +85,7 @@ class ValidatedStep:
     grant_id: Optional[str]
     grant_target: dict
     collect: Optional[dict]
-    on_error: str                   # fail | skip
+    on_error: str                   # fail | skip | continue
 
 
 @dataclass(frozen=True)
@@ -369,15 +369,30 @@ def _validate_step(
         _err(errors, "bad_params", f"{fld}.params", "params must be an object")
         params = {}
 
-    on_error = step.get("on_error", "fail")
-    if on_error not in ("fail", "skip"):
-        _err(errors, "bad_on_error", f"{fld}.on_error",
-             "on_error must be 'fail' or 'skip'")
-        on_error = "fail"
-
     connector = step.get("connector_id")
     tool = step.get("tool")
     grant_id = step.get("grant_id")
+
+    # CONTRACTS-R31 §4.2a. A READ step defaults to `continue`: one
+    # unreachable account must not end the run. On 26 August Jira and
+    # Gmail both answered and GitHub did not, and the whole Morning work
+    # brief stopped at "Stopped before it finished" — Slack was never
+    # posted, so the two accounts that DID answer bought the user
+    # nothing.
+    #
+    # `continue` and `skip` do the same thing to control flow. They
+    # differ in what the user is told: `continue` names the account and
+    # offers the fix (a `needs_you` turn), `skip` is silent, which is
+    # what the Teams `provider_down` precedent wants. `fail` still
+    # exists and is still the default for WRITES — a write that fails is
+    # not a source that is missing, it is a change that did not happen.
+    _is_write = bool(step.get("grant_id") or step.get("grant_target"))
+    _default_on_error = "fail" if _is_write else "continue"
+    on_error = step.get("on_error", _default_on_error)
+    if on_error not in ("fail", "skip", "continue"):
+        _err(errors, "bad_on_error", f"{fld}.on_error",
+             "on_error must be 'fail', 'skip' or 'continue'")
+        on_error = _default_on_error
     mutates = False
 
     cap = registry.get(connector) if isinstance(connector, str) else None
@@ -621,7 +636,9 @@ def validate_spec_v2(
                 "tool": st.tool,
                 "params": st.params_template,
                 **({"collect": st.collect} if st.collect else {}),
-                **({"on_error": st.on_error} if st.on_error != "fail" else {}),
+                **({"on_error": st.on_error}
+                   if st.on_error != ("fail" if st.mutates else "continue")
+                   else {}),
                 **({"grant_id": st.grant_id} if st.grant_id else {}),
                 **({"grant_target": st.grant_target}
                    if st.grant_target else {}),

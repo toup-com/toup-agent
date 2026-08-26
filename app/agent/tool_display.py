@@ -260,10 +260,48 @@ def client_summary(result: object, cap: int = 200,
     A skill tool is first-party by construction — its payload is a shape
     this repo defines, not a vendor's — so it keeps the JSON pass-through.
     """
+BUILTIN_SKILL_PREFIXES: frozenset = frozenset({
+    "app_builder", "app_html", "automations", "routines", "toup",
+    "triggers",
+})
+
+
+def is_first_party_tool(tool_name: str, is_skill_tool: bool = False) -> bool:
+    """Is this a SKILL tool (first-party) rather than a connector's?
+
+    The distinction decides whether a JSON tool result is served or
+    blanked, and getting it wrong is not cosmetic: the reminder CARD is
+    built client-side out of `routines__remind`'s JSON, so a blanked
+    summary is a reminder that renders as a bare text bubble.
+
+    Two sources, deliberately. `is_skill_tool` is the loader's live
+    registration index and is authoritative WHEN THERE IS A LOADER —
+    the write path always has one. The history READ path does not: it
+    is a serializer, it may run in a request that never built a runner,
+    and a lookup that answers "no" because nothing was registered blanks
+    every skill tool in the user's history. So the prefix set is the
+    floor. It is a static list of the builtin skill directories, which
+    is a fact about this repo's layout rather than about runtime state.
+
+    Verified live on 2026-08-26 (R31-C, confirmed here): the read path
+    in `day_chats.py::_with_public_copy` carried its own copy of the old
+    `"__" in tool` predicate with no `is_skill_tool` at all, wrapped in
+    a bare except — so a fix applied only at the write path left history
+    broken, and a fix applied there would have failed silently.
+    """
+    if is_skill_tool:
+        return True
+    name = str(tool_name or "")
+    if "__" not in name:
+        return False
+    return name.split("__", 1)[0] in BUILTIN_SKILL_PREFIXES
+
+
     chosen = display_of(result)
     if chosen is None:
         chosen = sanitize_for_client(str(result))
-        if tool_name and "__" in tool_name and not is_skill_tool:
+        if tool_name and "__" in tool_name and not is_first_party_tool(
+                tool_name, is_skill_tool):
             head = (chosen or "").strip()[:1]
             if head in "{[":
                 return ""

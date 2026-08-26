@@ -1074,6 +1074,8 @@ async def init_db():
         # on build_jobs. Same self-heal reasoning as every ALTER above.
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS rules_json TEXT",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS steps_human_json TEXT",
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS workflow_rev "
+        "INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS stop_requested_at TIMESTAMP",
         # The write's display form snapshotted at staging (R30 §4.8) —

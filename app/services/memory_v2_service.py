@@ -265,12 +265,26 @@ async def add_fact(
     scope = _clean(scope, 36) or MEMORY_V2_SCOPE_GLOBAL
     now = datetime.utcnow()
 
-    # Forget signals outrank every writer (§4.5).
+    # Forget signals outrank every writer (§4.5) — WITHIN THEIR SCOPE.
+    #
+    # This filtered on `user_id + text_hash` alone while `memory_forgets`
+    # carries `scope`, so a forget was global whatever it was written
+    # against. Both directions are wrong and the second is the one that
+    # loses data: forgetting a fact inside one automation suppressed the
+    # same sentence everywhere, including the global memory the main
+    # chat answers from — and the user's own reason for forgetting it
+    # ("not for this automation") was exactly the distinction being
+    # thrown away.
+    #
+    # A GLOBAL forget still reaches a scoped write: "stop remembering
+    # this about me" has to mean everywhere, or it means nothing.
     h = text_hash(clean)
     live_forget = (await db.execute(
         select(MemoryForget)
         .where(MemoryForget.user_id == user_id)
         .where(MemoryForget.text_hash == h)
+        .where(MemoryForget.scope.in_(
+            sorted({scope, MEMORY_V2_SCOPE_GLOBAL})))
         .where(MemoryForget.until > now)
     )).scalars().first()
     if live_forget is not None:

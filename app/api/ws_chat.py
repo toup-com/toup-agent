@@ -297,6 +297,69 @@ async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: st
     return await resolve_day_chat_id_for_now(db_session, user_id, tz_override=tz_override)
 
 
+# ── CONTRACTS-R31 §4.1 — the automation-session refusal ──────────────
+#
+# The first build that speaks the thread route. Below it the app can only
+# reach an automation over this socket, so the refusal would silence it.
+AUTOMATION_THREAD_ROUTE_MIN_BUILD = 92
+
+
+def _is_thread_route_exempt(msg: dict) -> bool:
+    """A frame this rule does not apply to.
+
+    `system_action` turns are structured actions, not conversation, and
+    the automations engine itself never speaks over this socket.
+    """
+    return bool(msg.get("system_action"))
+
+
+def _thread_route_enforced(msg: dict) -> bool:
+    """Is the refusal armed for THIS client?
+
+    Two ways in, either sufficient: the app tells us its build (added by
+    B this round — absent on build 91 and earlier), or the operator has
+    flipped the tenant-wide setting once every client in the field is
+    new enough. Defaults to OFF: a message the user typed is worth more
+    than the tidiness of the rule, and the day-chat filter plus the
+    clean-up migration already keep the leak off the screen.
+    """
+    build = msg.get("client_build")
+    if isinstance(build, int) and build >= AUTOMATION_THREAD_ROUTE_MIN_BUILD:
+        return True
+    try:
+        from app.config import settings
+        return bool(getattr(settings, "automation_thread_route_only", False))
+    except Exception:  # noqa: BLE001 — settings unavailable ⇒ do not refuse
+        return False
+
+
+async def _automation_id_for_session(session_id: str) -> Optional[str]:
+    """The automation this conversation belongs to, or None.
+
+    Its own short-lived session: this runs before the turn's work and
+    must not hold, or share, the turn's transaction. Fails soft — a
+    lookup that errors must never refuse an ordinary chat message.
+    """
+    if not session_id or not isinstance(session_id, str):
+        return None
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import Conversation
+        from app.agent.automations.session import (
+            SESSION_CHANNEL, automation_id_of,
+        )
+        async with async_session_maker() as db:
+            conv = (await db.execute(
+                select(Conversation).where(Conversation.id == session_id)
+            )).scalar_one_or_none()
+            if conv is None or conv.channel != SESSION_CHANNEL:
+                return None
+            return automation_id_of(conv)
+    except Exception as e:  # noqa: BLE001 — see docstring
+        logger.debug("[WS] automation session lookup skipped: %s", e)
+        return None
+
+
 async def broadcast_to_user(
     user_id: str, event: dict, exclude: Optional[asyncio.Queue] = None,
 ) -> int:
@@ -2914,6 +2977,53 @@ async def ws_chat(
                                 client_tz[:64], user_id[:8],
                             )
                             client_tz = None
+                # ── CONTRACTS-R31 §4.1: an automation is asked in its own
+                # thread, never here.
+                #
+                # Every user message on this socket is stamped with
+                # `day_chat_id = resolve_day_chat_id_for_now(...)` a few
+                # hundred lines below — UNCONDITIONALLY, before any
+                # `session_id` is examined. So a message addressed to an
+                # automation's conversation is a day-chat row BY
+                # CONSTRUCTION, and the reply the runner then produces is
+                # an ordinary day-chat turn for the same reason. That is
+                # the whole mechanism behind `Run all of them again`
+                # appearing in the founder's main chat at 10:15 and 10:29
+                # on 26 August, and behind the thread's 11:17 answer
+                # turning up there too.
+                #
+                # The fix is a refusal, not a filter: the thread route
+                # (`POST /api/automations/{id}/thread/messages`) runs the
+                # agent in the thread's own context and persists turns,
+                # and nothing else may.
+                #
+                # It is GATED because build 91 — the build on the
+                # founder's phone — sends thread messages over exactly
+                # this path. Until B's build ships, the frame is accepted
+                # and logged, so no message is dropped mid-round. The
+                # socket carries no build number today, so the gate is a
+                # setting D flips plus an optional `client_build` the
+                # app may start sending; TESTLOG-R31 records the flip.
+                if session_id and not _is_thread_route_exempt(msg):
+                    _auto_id = await _automation_id_for_session(session_id)
+                    if _auto_id:
+                        if _thread_route_enforced(msg):
+                            await websocket.send_json({
+                                "type": "error",
+                                "code": "use_thread_route",
+                                "automation_id": _auto_id,
+                                "sentence": (
+                                    "Ask that in the automation's own "
+                                    "thread."
+                                ),
+                            })
+                            continue
+                        logger.warning(
+                            "automation.thread.legacy_send automation=%s "
+                            "user=%s — accepted; enforcement is off",
+                            _auto_id[:8], user_id[:8],
+                        )
+
                 force_new_session = bool(msg.get("force_new"))  # Skip session reuse (New Thread in app workspace)
                 # system_action: true when a structured action (e.g. customize_app) triggers
                 # an agent turn without a real user message. Skip presave + user message save.

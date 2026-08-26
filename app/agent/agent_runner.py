@@ -3793,39 +3793,27 @@ class AgentRunner:
         async def _background_post_processing():
             try:
                 async with async_session_maker() as bg_db:
-                    # R30 §4.10: an automation-session chat exchange is
-                    # part of the thread's FULL record — mirror the user
-                    # and agent turns into the v3 ledger (best-effort;
-                    # the conversation row stays the legacy surface).
-                    if _automation_ctx_for_bg and final_text:
-                        try:
-                            from app.agent.automations import ledger as _lg
-                            _aid = _automation_ctx_for_bg.get(
-                                "automation_id")
-                            if _aid:
-                                _thread = await _lg.ensure_thread(
-                                    bg_db, user_id=user_id,
-                                    automation_id=_aid,
-                                )
-                                if _curator_user_text:
-                                    await _lg.append_turn(
-                                        bg_db, user_id=user_id,
-                                        thread=_thread, kind="user",
-                                        payload={
-                                            "text": _curator_user_text,
-                                        },
-                                        broadcast=False,
-                                    )
-                                await _lg.append_turn(
-                                    bg_db, user_id=user_id,
-                                    thread=_thread, kind="agent",
-                                    payload={"text": final_text[:4000]},
-                                )
-                        except Exception as _lg_err:  # noqa: BLE001
-                            logger.debug(
-                                "[AGENT] v3 thread mirror skipped: %s",
-                                _lg_err,
-                            )
+                    # RETIRED (CONTRACTS-R31 §4.1).
+                    #
+                    # This mirrored an automation-session chat exchange
+                    # into the v3 thread, on the R30 reading that the
+                    # thread was "the FULL record" of the conversation.
+                    # R31-D's timestamps show what it actually did: the
+                    # day-chat user row landed at 14:29:08, the run
+                    # started at 14:29:26, and the thread's copy of the
+                    # user turn appeared at 14:29:36. The main chat was
+                    # written FIRST and the thread was the copy — so
+                    # this is the writer that put a main-chat turn into
+                    # an automation's thread, the direction §4.1 forbids
+                    # just as firmly as the other one ("a day-chat
+                    # message writes zero thread rows").
+                    #
+                    # It also double-wrote: a client that POSTed to
+                    # `/thread/messages` AND sent over the socket got
+                    # two `user` turns for one message.
+                    #
+                    # The thread route runs its own agent turn and
+                    # persists its own turns. Nothing else may.
                     try:
                         if (
                             settings.auto_extract_memories and final_text

@@ -95,8 +95,17 @@ async def _finalize_job(
     db: AsyncSession, job_id: str, *, status: str,
     outcome: Optional[str] = None, error_class: Optional[str] = None,
     user_message: Optional[str] = None,
-) -> None:
-    """Guarded terminal transition — only a running/queued row moves."""
+) -> bool:
+    """Guarded terminal transition — only a running/queued row moves.
+
+    Returns whether the UPDATE actually applied. R31-31: callers that
+    write a user-facing NOTE after finalizing have to know. `handle_stop`
+    did not, and appended `YOU STOPPED IT HERE` unconditionally — so
+    when the stuck-run reaper had already terminalized the row as
+    `failed/lost`, the thread said the user stopped it while the ledger
+    said it broke. Two surfaces, one run, opposite stories, and the
+    ledger row is the one the home card reads.
+    """
     now = datetime.utcnow()
     job = await db.get(BuildJob, job_id)
     values: dict[str, Any] = {
@@ -177,6 +186,7 @@ async def _finalize_job(
                 "[automations] v3 terminal close skipped job=%s: %s",
                 job_id[:8], e,
             )
+    return result.rowcount == 1
 
 
 def _spec_write_shape(spec_raw: dict) -> tuple[Optional[str], Optional[str],
@@ -258,7 +268,7 @@ async def _stamp_last_outcome(
 
 async def _record_health(
     db: AsyncSession, automation_id: str, *, ok: bool, error: Optional[str],
-    ran: bool = True,
+    ran: bool = True, clean: Optional[bool] = None,
 ) -> None:
     """Success resets the failure streak; failure increments it. The
     sweep (sweep.py) owns the auto-pause decision — one place.
@@ -279,6 +289,23 @@ async def _record_health(
     Health is the observability surface for the ramp, so a false success
     there is worse than a missing one — it is the reading a human trusts
     when deciding whether an automation is working.
+
+    R31-43 adds `clean`, and it is what re-arms the 3-strike rule.
+    `consecutive_failures = 0` was reset on ANY `ok=True` — including an
+    empty poll (`ran=False`), which for a polling automation happens at
+    least every five minutes against a three-strike threshold, so the
+    streak could essentially never reach 3. And measured live on
+    2026-08-26 by R31-D: after a run that came back `partial`, health
+    still read `last_status: "success"`, so an automation losing one
+    source on EVERY run built no streak at all and the auto-pause could
+    not arm on the exact shape it exists for.
+
+    So the streak now moves only on a run that actually happened
+    (`ran`) and came back clean (`clean`). A `partial` is not a failure
+    either — it is not a strike, it just does not clear one. That is
+    deliberate: a source that has been broken for a week should keep its
+    card standing rather than have the streak wiped by the four
+    accounts that still work.
     """
     a = await db.get(Automation, automation_id)
     if a is None:
@@ -286,10 +313,15 @@ async def _record_health(
     if ran:
         a.last_run_at = datetime.utcnow()
     if ok:
-        a.consecutive_failures = 0
+        # `clean` defaults to the old meaning when a caller has not been
+        # taught the distinction; every caller that CAN tell passes it.
+        was_clean = ran if clean is None else bool(clean and ran)
+        if was_clean:
+            a.consecutive_failures = 0
         if ran:
-            a.last_status = "success"
-        a.last_error = None
+            a.last_status = "success" if was_clean else "partial"
+        if was_clean:
+            a.last_error = None
     else:
         a.consecutive_failures = (a.consecutive_failures or 0) + 1
         a.last_status = "failed"

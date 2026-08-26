@@ -106,6 +106,7 @@ async def load_day_context(
         }
     """
     from app.db.models import Message, Conversation
+    from app.db.models.conversation import HIDDEN_DAY_CHANNELS
     from app.db.models.admin_dispatch import ORIGINS_EXCLUDED_FROM_CONTEXT
     from app.db.models.day_chat import DayChat
 
@@ -164,6 +165,24 @@ async def load_day_context(
             or_(
                 Message.origin.is_(None),
                 Message.origin.notin_(list(ORIGINS_EXCLUDED_FROM_CONTEXT)),
+            )
+        )
+        # CONTRACTS-R31 §4.1: an automation's conversation is its OWN
+        # thread and must never be read back into the main chat. The R28
+        # session path wrote those turns as ordinary Messages carrying a
+        # real `day_chat_id` (session.py's docstring called that "part of
+        # the agent's day context by design"), so this predicate is the
+        # only thing standing between the thread and the day. Without it
+        # the founder's 26 August thread answer was re-asked and
+        # re-answered in the main chat (F1, "and back").
+        #
+        # Keyed on the CHANNEL, not on a title or a metadata key: the
+        # channel is the producer, written at row creation, and it is
+        # what the clean-up migration keys on too.
+        .where(
+            or_(
+                Conversation.channel.is_(None),
+                Conversation.channel.notin_(HIDDEN_DAY_CHANNELS),
             )
         )
         # W2.4(a): id tiebreaker — equal-microsecond inserts otherwise leave

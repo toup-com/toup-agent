@@ -86,6 +86,17 @@ async def open_run(
             step=0, total=total_steps, sentence="Starting",
             fraction=0.0, status="running",
         )
+        # A run STARTING is a transition. Without this the home card
+        # learned nothing until the run ended, so pressing Run it now
+        # left the card exactly as it was and the only sign anything
+        # had happened was the notification.
+        await ledger.emit_updated(
+            db, automation.user_id, automation_id=automation.id,
+        )
+        await ledger.emit_activity(
+            automation.user_id, automation_id=automation.id,
+            thread_id=thread.id, run_id=job.id, phase="thinking",
+        )
         return thread
     except Exception as e:  # noqa: BLE001
         logger.warning("[run_v3] open_run skipped job=%s: %s", job.id[:8], e)
@@ -145,7 +156,7 @@ async def handle_stop(
     if job_row is not None:
         job_row.checkpoint_json = json.dumps({"step_index": int(step_index)})
         await db.commit()
-    await _finalize_job(
+    applied = await _finalize_job(
         db, job.id, status="cancelled", outcome="stopped",
         user_message=(
             "You stopped it. Nothing was sent."
@@ -154,6 +165,24 @@ async def handle_stop(
             + ("" if n_writes == 1 else "s") + " already made."
         ),
     )
+    if not applied:
+        # R31-31, with a named writer. The guarded UPDATE lost, so this
+        # run was ALREADY terminal — reaped as `failed/lost`, or ended by
+        # a sibling stop. Writing `YOU STOPPED IT HERE` anyway is how the
+        # founder's run 5f3f57bf ended up with a `stopped` note at seq 47
+        # over a ledger row that still reads `failed/lost` today: the
+        # thread said the user stopped it, the home card said it broke,
+        # and both were reading the same run.
+        #
+        # A note is a claim about what happened. If the transition did
+        # not happen, the claim is false — so say nothing, and log it so
+        # the wedged-stop sweep's own effectiveness stays measurable.
+        logger.info(
+            "[run_v3] stop note withheld run=%s — already terminal "
+            "(status=%s outcome=%s)",
+            job.id, getattr(job, "status", None), getattr(job, "outcome", None),
+        )
+        return
     thread = await ledger.thread_for(db, automation.id)
     if thread is not None:
         await ledger.append_turn(
@@ -172,7 +201,12 @@ async def handle_stop(
 async def on_terminal(db: AsyncSession, job_id: str) -> None:
     """Post-terminal v3 closing — called from `_finalize_job` AFTER its
     guarded UPDATE won (rowcount == 1). Best-effort throughout; a v3
-    failure never un-finalizes a run."""
+    failure never un-finalizes a run.
+
+    §4.2 rule 5: every transition emits `automation.run.progress` AND
+    `automation.updated`, so a client repaints one row rather than
+    reloading a screen the user is looking at.
+    """
     try:
         job = await db.get(BuildJob, job_id)
         if job is None or not job.source_id:
@@ -198,6 +232,9 @@ async def on_terminal(db: AsyncSession, job_id: str) -> None:
             step=int(job.progress_step or total), total=total,
             sentence="Done" if v3 in ("completed", "partial") else "Stopped",
             fraction=1.0, status=v3,
+        )
+        await ledger.emit_updated(
+            db, automation.user_id, automation_id=automation.id,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("[run_v3] on_terminal skipped job=%s: %s",

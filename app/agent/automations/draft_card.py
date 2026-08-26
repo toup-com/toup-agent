@@ -62,14 +62,21 @@ def draft_card_payload(
 
 
 async def write_draft_card(db, row, result: dict) -> Optional[str]:
-    """Persist the card in the automation's session and broadcast.
+    """Broadcast the draft card and record it in the THREAD.
+
     `row` is the executed AutomationOutbox row; `result` the dispatch
-    envelope (kind == "ok"). Best-effort end to end."""
+    envelope (kind == "ok"). Best-effort end to end — a card never
+    fails a send.
+
+    CONTRACTS-R31 §4.1: the durable half is the `draft` turn the outbox
+    already appends to the thread. This used to ALSO write a day-chat
+    Message, so a draft the automation wrote announced itself twice:
+    once where the work happened and once in the main chat.
+    """
     if row.tool_name not in DRAFT_TOOLS:
         return None
     try:
         from app.db.models import Automation
-        from .session import write_session_message
 
         automation = await db.get(Automation, row.automation_id)
         if automation is None:
@@ -96,27 +103,18 @@ async def write_draft_card(db, row, result: dict) -> Optional[str]:
             f"Drafted a reply to {to} — it's waiting in your "
             f"{provider_name} drafts. Nothing was sent."
         )
-        msg_id, _day = await write_session_message(
-            db,
-            user_id=row.user_id,
-            automation_id=row.automation_id,
-            content=text,
-            metadata={"draft_card": card},
-            title=automation.name,
-        )
-        if msg_id:
-            try:
-                from app.api.ws_chat import broadcast_to_user
-                await broadcast_to_user(row.user_id, {
-                    "type": "draft_card",
-                    "message_id": msg_id,
-                    "automation_id": row.automation_id,
-                    "run_id": row.job_id,
-                    **card,
-                })
-            except Exception as e:  # noqa: BLE001 — no socket is normal
-                logger.debug("[automations] draft card broadcast skipped: %s", e)
-        return msg_id
+        del text, automation  # the thread's own `draft` turn carries both
+        try:
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(row.user_id, {
+                "type": "draft_card",
+                "automation_id": row.automation_id,
+                "run_id": row.job_id,
+                **card,
+            })
+        except Exception as e:  # noqa: BLE001 — no socket is normal
+            logger.debug("[automations] draft card broadcast skipped: %s", e)
+        return None
     except Exception as e:  # noqa: BLE001 — a card never fails a send
         logger.warning(
             "[automations] draft card write failed outbox=%s: %s",

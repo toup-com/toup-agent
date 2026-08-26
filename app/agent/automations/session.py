@@ -14,11 +14,21 @@ so admitting "automation" to `INDEXED_SYSTEM_CHANNELS` would make the
 second automation of the day an IntegrityError. Keep it out (the
 `subagent` precedent in conversation_resolver).
 
-Everything automation-shaped lands in the session: connector/grant
-cards once the automation exists, run cards (`role="job"` markers),
-and the auto-pause notice. Messages get a real `day_chat_id`, so the
-thread is part of the agent's day context by design — the agent should
-know what its automations did today.
+**R31: this module no longer WRITES.** The paragraph that used to stand
+here said the session's messages get a real `day_chat_id` "so the thread
+is part of the agent's day context by design". That sentence is the
+whole of F1. It meant the automation's run cards, memory chips,
+auto-pause notices, pending cards and draft cards all rendered in the
+user's main chat — and, because `load_day_context` selected by
+`day_chat_id` with no channel predicate, the agent then read the
+thread back as day context and answered it a second time there.
+
+What survives here is the READ side and the row resolver: `GET /thread`
+still serves the legacy `{session_id, messages}` keys off these rows
+until B flips (CONTRACTS-R30 §9), and the clean-up migration needs the
+resolver to find what it has to move. Every write is now a turn in
+`automation_turns` (`ledger.append_turn`); the one sanctioned day-chat
+row per run is the notification card in `run_v3._write_chat_card`.
 """
 
 from __future__ import annotations
@@ -35,6 +45,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger(__name__)
 
 SESSION_CHANNEL = "automation"
+
+
+class AutomationDayChatWrite(RuntimeError):
+    """An automation tried to write a row into the day chat.
+
+    CONTRACTS-R31 §4.1 allows exactly one: the notification card. Raised
+    in dev/test so a resurrected writer fails at its first call;
+    downgraded to an ERROR log in production, because losing a card is
+    survivable and losing a run is not.
+    """
 
 
 def automation_id_of(conversation) -> Optional[str]:
@@ -156,13 +176,59 @@ async def write_session_message(
     title: Optional[str] = None,
     commit: bool = True,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Persist one message into the automation's session thread.
+    """RETIRED WRITER — refuses, and says so (CONTRACTS-R31 §4.1).
 
-    Returns `(message_id, day_chat_id)`, or `(None, None)` if the write
-    failed — session writes are companions to engine state, never a veto
-    on it (the R27 settle lesson), so callers treat None as "no card,
-    carry on".
+    This wrote a real `Message` with a real `day_chat_id` on
+    `channel="automation"`. The module docstring above used to call that
+    a feature ("part of the agent's day context by design"); the 26
+    August recordings are what it costs. Five callers used it — the run
+    card, the memory chip, the auto-pause notice, the pending card and
+    the draft card — and every one of them put an automation's private
+    conversation into the user's main chat, where the agent then read
+    it back as context and answered it a second time.
+
+    Each of those five now writes a TURN in the automation's thread.
+    Nothing may write a day-chat row on an automation's behalf except
+    `run_v3._write_chat_card` (the one notification card per run).
+
+    Kept as a refusing stub rather than deleted so that a caller
+    resurrected from an older branch fails LOUDLY in dev and merely
+    logs in production — a lost card is survivable, a leaked thread is
+    the defect this round exists to close. `test_thread_isolation_
+    both_directions` drives it.
     """
+    del content, role, metadata, title, commit
+    msg = (
+        "write_session_message is retired (CONTRACTS-R31 §4.1): an "
+        f"automation may not write into the day chat "
+        f"(automation={automation_id[:8]}, user={user_id[:8]}). "
+        "Write a turn with ledger.append_turn instead."
+    )
+    logger.error("[automations] %s", msg)
+    try:
+        from app.config import settings
+        if (getattr(settings, "environment", "") or "").lower() != "production":
+            raise AutomationDayChatWrite(msg)
+    except AutomationDayChatWrite:
+        raise
+    except Exception:  # noqa: BLE001 — settings unavailable ⇒ fail soft
+        pass
+    return None, None
+
+
+async def _retired_write_session_message(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    automation_id: str,
+    content: str,
+    role: str = "assistant",
+    metadata: Optional[dict] = None,
+    title: Optional[str] = None,
+    commit: bool = True,
+) -> tuple[Optional[str], Optional[str]]:
+    """The pre-R31 body, kept only for the clean-up migration's tests to
+    manufacture the rows it has to move. Never called in production."""
     from app.db.models import Message
     from app.db.models.day_chat import DayChat
 
@@ -204,79 +270,29 @@ async def write_session_message(
 
 
 async def on_run_created(db: AsyncSession, *, job, automation) -> None:
-    """The one seam every run-minting site calls (both executors, all
-    six sites): persist the run's card in the automation's session and
-    back-link it from the job (`summary_message_id` + `conversation_id`)
-    so web deep links (`/chat/<date>#m=<id>`) and push data can address
-    it. Best-effort end to end — the run never depends on its card.
+    """RETIRED as a writer (CONTRACTS-R31 §4.1; R31-02).
 
-    The card write uses its OWN session (R27 settle lesson); only the
-    two stamp columns ride the caller's `db`, in a short transaction.
+    This seam is still called from all six run-minting sites, and it
+    still writes NOTHING. Until R31 it minted a `role="job"` marker
+    message in the automation's session — a day-chat row — for every
+    scheduled, push, poll, manual **and test** run. That is where the
+    founder's main chat got `[test] Morning work brief — 5/7 steps —
+    71%`, `[automation] Jira → Slack · Done` and `Morning work brief ·
+    Done in 7 steps` on 26 August: a run wearing a chat job's clothes,
+    with a sheet that read `Nothing recorded for this task yet.`
+    because the real record was in the thread all along.
+
+    A run is not a chat job. The one object a run may put in the main
+    chat is the `automation_notification` card (`run_v3._write_chat_card`),
+    which is minted once per run and updated in place.
+
+    The function is kept rather than deleted so the six call sites stay
+    honest about the seam they are on, and so a future card (of any
+    kind) has one place to be added instead of six. `check-automation
+    -cards.js` and `test_thread_isolation_both_directions` both assert
+    that a run writes no day-chat row but its notification.
     """
-    from app.db.models import BuildJob, Message
-
-    if getattr(job, "summary_message_id", None):
-        return  # idempotency replay — this run's card already exists
-    msg_id, _day = await write_run_card(
-        user_id=automation.user_id,
-        automation_id=automation.id,
-        automation_name=automation.name,
-        job_id=job.id,
-    )
-    if not msg_id:
-        return
-    try:
-        msg = await db.get(Message, msg_id)
-        row = await db.get(BuildJob, job.id)
-        if row is not None:
-            row.summary_message_id = msg_id
-            if msg is not None and msg.conversation_id:
-                row.conversation_id = msg.conversation_id
-            await db.commit()
-    except Exception as e:  # noqa: BLE001 — stamps are conveniences
-        logger.warning(
-            "[automations] run card stamp failed job=%s: %s", job.id[:8], e,
-        )
-        try:
-            await db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def write_run_card(
-    *,
-    user_id: str,
-    automation_id: str,
-    automation_name: str,
-    job_id: str,
-) -> tuple[Optional[str], Optional[str]]:
-    """Persist the run's card — a `role="job"` marker in the session —
-    in its OWN session, best-effort. Call AFTER the run row is
-    committed; a failure here never touches the run.
-
-    Returns `(message_id, day_chat_id)`; the caller stamps
-    `summary_message_id` / config extras onto the job itself.
-    """
-    from app.api.message_cards import job_marker_content
-    from app.db.database import async_session_maker
-
-    try:
-        async with async_session_maker() as db:
-            return await write_session_message(
-                db,
-                user_id=user_id,
-                automation_id=automation_id,
-                role="job",
-                content=job_marker_content(
-                    job_id, automation_name, "automation_run",
-                ),
-                title=automation_name,
-            )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[automations] run card write failed job=%s: %s", job_id[:8], e,
-        )
-        return None, None
+    del db, job, automation  # retired — see docstring
 
 
 async def emit_memory_update(
@@ -287,33 +303,55 @@ async def emit_memory_update(
     count: int,
     title: Optional[str] = None,
 ) -> Optional[str]:
-    """The "Memory updated · N facts" chip (CONTRACTS-R29 §4): one
-    session marker message carrying `memory_update` in its metadata,
-    plus the live `automation_memory_update` frame — NO channel key
-    (the app's frame filter drops channeled frames). Best-effort like
-    every session write; the facts themselves are already committed by
-    the write seam before this is called."""
+    """The "Memory updated · N facts" chip — now a THREAD turn.
+
+    CONTRACTS-R31 §4.1: the chip belongs to the conversation that
+    learned the facts. It used to be a day-chat Message, which is why
+    `Memory updated · 5 facts` appeared in the founder's main chat at
+    11:17 on 26 August, directly under a thread answer that had leaked
+    there too — two rows, one cause.
+
+    The `automation_memory_update` frame is unchanged and still goes
+    out: it is an automation frame (carries `automation_id`, no
+    `channel` key), not a chat frame, and B's bridge routes it to the
+    thread. `message_id` is gone from it — there is no message any
+    more; `turn_id` takes its place, which is also what a deep link
+    now needs.
+
+    Best-effort, as it always was: the facts are already committed by
+    the write seam before this is called, and a chip that fails to
+    render must never look like a fact that failed to save.
+    """
+    del title  # the thread already knows whose it is
     if count <= 0:
         return None
-    at = datetime.utcnow().isoformat() + "Z"
-    noun = "fact" if count == 1 else "facts"
-    msg_id, _day = await write_session_message(
-        db,
-        user_id=user_id,
-        automation_id=automation_id,
-        content=f"Memory updated · {count} {noun}",
-        metadata={"memory_update": {"count": count, "at": at}},
-        title=title,
-    )
-    if msg_id:
-        try:
-            from app.api.ws_chat import broadcast_to_user
-            await broadcast_to_user(user_id, {
-                "type": "automation_memory_update",
-                "automation_id": automation_id,
-                "count": count,
-                "message_id": msg_id,
-            })
-        except Exception as e:  # noqa: BLE001 — no live socket is normal
-            logger.debug("[automations] memory chip broadcast skipped: %s", e)
-    return msg_id
+    from . import ledger as _ledger
+
+    turn_id: Optional[str] = None
+    try:
+        thread = await _ledger.ensure_thread(
+            db, user_id=user_id, automation_id=automation_id,
+        )
+        turn = await _ledger.append_turn(
+            db, user_id=user_id, thread=thread, run_id=None,
+            kind="memory",
+            payload={"count": int(count), "sheet": "memory"},
+        )
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+    except Exception as e:  # noqa: BLE001 — see docstring
+        logger.warning(
+            "[automations] memory chip turn failed automation=%s: %s",
+            automation_id[:8], e,
+        )
+        return None
+    try:
+        from app.api.ws_chat import broadcast_to_user
+        await broadcast_to_user(user_id, {
+            "type": "automation_memory_update",
+            "automation_id": automation_id,
+            "count": count,
+            "turn_id": turn_id,
+        })
+    except Exception as e:  # noqa: BLE001 — no live socket is normal
+        logger.debug("[automations] memory chip broadcast skipped: %s", e)
+    return turn_id

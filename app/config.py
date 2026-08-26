@@ -1280,6 +1280,27 @@ class Settings(BaseSettings):
     # `automations_rollout_pct` (frontend surface gating).
     automations_enabled: bool = False
 
+    # CONTRACTS-R31 §4.1: refuse a chat-socket `message` frame addressed
+    # to an automation's conversation (`use_thread_route`). OFF by
+    # default and deliberately so — build 91, the build in the field
+    # when R31 opened, sends every thread message over that socket, and
+    # refusing it there would leave the founder typing into a thread
+    # that answers nothing. D flips this once B's build is on the
+    # device, and records the flip in TESTLOG-R31. A client that sends
+    # `client_build >= AUTOMATION_THREAD_ROUTE_MIN_BUILD` is refused
+    # regardless, so the flag is the floor and not the ceiling.
+    automation_thread_route_only: bool = False
+
+    # R31: dev-only registration of the automations skill's TEST-RUN
+    # tool. `automations__test_run` sat in the ordinary chat agent's
+    # tool array with the skill prompt making it step 7 of the build
+    # order, so an ordinary sentence reached it — which is how "Run all
+    # of them again" was answered by a staged synthetic run reporting
+    # `TEST RUN STAGED` and a status of `paused` (R31-04). A user
+    # sentence may never reach the test path; the HTTP route stays for
+    # the harness.
+    automations_dev_tools: bool = False
+
     # Round 28 dev fast-lane: allows poll/every_s intervals in SECONDS
     # for dev/e2e tenants so a full trigger→fire loop is watchable.
     # Honored ONLY when `environment != "production"` (checked at the
