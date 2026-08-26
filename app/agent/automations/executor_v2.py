@@ -949,10 +949,14 @@ async def _narrate_phase1(
         if job is None or _ledger.run_kind_of(job) not in ("scheduled",
                                                            "run_now"):
             return None
-        from .draft_card import DRAFT_TOOLS
-        vocabulary = "changes" if any(
-            st.tool not in DRAFT_TOOLS for st in vspec.write_steps
-        ) else "brief"
+        # R31-37. This asked "does it write anything that is not a
+        # draft?", so posting the brief to Slack made a reads-only
+        # brief a change-making run and the founder's morning read
+        # "CHANGED YOUR WEEK · 1 item". The question is whether the run
+        # changed something the user OWNS — `narrator.vocabulary_for`
+        # holds that judgement.
+        from .narrator import vocabulary_for
+        vocabulary = vocabulary_for(st.tool for st in vspec.write_steps)
         steps_record = []
         from app.services import automation_verbs as _verbs
         for st in vspec.steps:

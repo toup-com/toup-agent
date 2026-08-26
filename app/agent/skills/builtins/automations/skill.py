@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
+from app.agent.tool_display import ToolResult
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,29 @@ def _as_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
 
 
+def _n_things(count: int, singular: str, plural: str) -> str:
+    return f"1 {singular}" if count == 1 else f"{count} {plural}"
+
+
+def _recall_summary(result: Dict[str, Any]) -> str:
+    """The user-facing half of a memory read (R31-28).
+
+    A tool's summary says what happened in the user's words. The JSON
+    the model reads is not that, and neither is a line of coaching
+    addressed to the model — both have been on a job sheet.
+    """
+    facts = len(result.get("facts") or [])
+    episodes = len(result.get("episodes") or [])
+    parts = []
+    if facts:
+        parts.append(_n_things(facts, "fact", "facts"))
+    if episodes:
+        parts.append(_n_things(episodes, "run", "runs"))
+    if not parts:
+        return "Looked in memory · nothing matched"
+    return "Looked in memory · " + " and ".join(parts)
+
+
 def _uid(ctx: SkillContext) -> str:
     return (ctx.user_id or getattr(settings, "user_id", "") or "").strip()
 
@@ -46,6 +70,32 @@ def _uid(ctx: SkillContext) -> str:
 # Per-connector "list the pinnable targets" read tools. The kind names
 # what the target IS, so the grant card can say "channel #eng" and not
 # just an opaque id.
+#: R31-04. The synthetic-fire path is a DEV tool and nothing else.
+#:
+#: `automations__test_run` was reachable from an ordinary sentence, and
+#: it is the reason "Run all of them again" produced "TEST RUN STAGED
+#: (the write goes out after the normal undo window)" and a reply that
+#: the automation was paused. Two things make that worse than a wrong
+#: answer. It is not a rehearsal — `stage_only=True` returns before
+#: narration but the staged outbox row is still swept and sent, so a
+#: "test" posts to the user's real channel. And it short-circuits the
+#: ledger's phase-2 close, so the run it opens produces no thread turns,
+#: no progress frames and no notification card: work happens and no
+#: surface says so.
+#:
+#: Gated on the existing dev fast-lane, which is already forced off
+#: outside dev/e2e at its use site — so a stray env var on a prod tenant
+#: changes nothing. `automations__run_now` is the replacement, and it
+#: must ship in the same commit: removing this without it would leave
+#: the model with no way to run an automation at all.
+_DEV_ONLY_TOOLS: frozenset[str] = frozenset({"automations__test_run"})
+
+
+def _dev_tools_active() -> bool:
+    from app.agent.automations.spec import dev_fast_lane_active
+    return dev_fast_lane_active()
+
+
 _TARGET_SOURCES: dict[str, dict] = {
     "slack": {"tool": "slack__list_channels", "items": "channels",
               "id": "id", "label": "name", "kind": "channel"},
@@ -72,6 +122,10 @@ class AutomationsSkill(Skill):
     # Tools
     # ------------------------------------------------------------------
     def get_tools(self) -> List[Dict[str, Any]]:
+        return [t for t in self._all_tools()
+                if t["name"] not in _DEV_ONLY_TOOLS or _dev_tools_active()]
+
+    def _all_tools(self) -> List[Dict[str, Any]]:
         spec_schema = {
             "type": "object",
             "description": (
@@ -263,10 +317,12 @@ class AutomationsSkill(Skill):
             {
                 "name": "automations__test_run",
                 "description": (
-                    "One synthetic fire through the REAL rails "
-                    "(evaluate → prepare → staged write with the normal "
-                    "undo window). Report the sample event and staged "
-                    "action to the user."
+                    "DEV AND END-TO-END TESTS ONLY. One synthetic fire "
+                    "through the real rails, which stages a write that "
+                    "is really sent afterwards — so it is a rehearsal "
+                    "in name only, and it produces no run cards and no "
+                    "notice. Never use it because a user asked to run "
+                    "something: that is automations__run_now."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -367,6 +423,43 @@ class AutomationsSkill(Skill):
                     },
                 },
             },
+            # R31-04. Appended last, per the prefix-stable rule above.
+            #
+            # Until this existed, the model had NO way to run an
+            # automation: `run-now` was a UI-only route, so a user
+            # saying "run all of them again" left the model reaching
+            # for `automations__test_run` — the synthetic path — which
+            # answered "TEST RUN STAGED" and reported a status of
+            # `paused` instead of running anything. The test run was
+            # not even a dry run: its staged write is swept and sent by
+            # the outbox like any other.
+            #
+            # DEPENDENCY (R31-41 / ND-24): the proxy trims the tools
+            # array to 128 FROM THE TAIL, so the last-appended tool is
+            # the first dropped. On a user with many connectors this
+            # tool is unreachable until that cap is fixed, and the
+            # symptom is indistinguishable from the defect it repairs —
+            # the model reaching for whatever run-shaped tool it can
+            # still see. D verifies reachability on the founder's
+            # account after A lands the cap fix.
+            {
+                "name": "automations__run_now",
+                "description": (
+                    "Run one automation immediately, for real. This is "
+                    "the ONLY way to run an automation — use it "
+                    "whenever the user asks to run, re-run, or try one "
+                    "again, in the automation's own thread or in chat. "
+                    "It starts a real run through the engine: the run "
+                    "reports itself, so do not describe what it will "
+                    "do or report a status instead of running it. A "
+                    "paused automation runs once and stays paused."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"automation_id": {"type": "string"}},
+                    "required": ["automation_id"],
+                },
+            },
         ]
 
     def get_system_prompt_section(self) -> Optional[str]:
@@ -385,8 +478,10 @@ class AutomationsSkill(Skill):
             "account it uses — name the account when the registry "
             "shows one, e.g. 'your Gmail (person@gmail.com)'; when "
             "account is null, name just the connector — and the "
-            "constraints that apply (draft-only mail, poll floor, "
-            "undo window). Ask which life domain this belongs to "
+            "constraints that apply (draft-only mail, how often it "
+            "checks, and that anything it writes can be taken back "
+            "for a few seconds afterwards). Ask which life domain "
+            "this belongs to "
             "(work / university / personal, or their own word) unless "
             "it's obvious — then say the one you picked.\n"
             "  3. If the request is ambiguous between connected "
@@ -407,15 +502,30 @@ class AutomationsSkill(Skill):
             "  6. `automations__create` with the full spec (grant_id "
             "from the approved permission) and the `domain`. Fix every "
             "validation error it returns in ONE more call.\n"
-            "  7. `automations__test_run`, report what it staged, then "
-            "`automations__arm` when the user is happy. Once armed, "
-            "the automation gets its own session thread: run cards and "
-            "notices land there, not in this conversation.\n"
+            "  7. `automations__arm` when the user is happy, then "
+            "offer to run it once now with `automations__run_now` if "
+            "they want to see it work. Once armed, the automation gets "
+            "its own thread: run cards and notices land there, not in "
+            "this conversation.\n"
+            "RUNNING ONE, NOW OR AGAIN. 'run it', 'run it again', 'run "
+            "all of them again', 'try again', 'do it now' — here or in "
+            "an automation's own thread — mean `automations__run_now`, "
+            "always, with the id from `automations__list`. Never "
+            "answer a request to RUN with a description of what it "
+            "would do, and never with a status: 'its status is paused' "
+            "is not a reply to 'run it again', it is a way of not "
+            "doing it. For several at once, call the tool once per "
+            "automation. Then say one short line — the run narrates "
+            "itself in its own thread, and anything you add here is a "
+            "second account of the same run that will disagree with "
+            "the first.\n"
             "Hard rules you must repeat to the user when relevant: "
             "checks run at most every 5 minutes; runs are capped at 3 "
-            "minutes; 3 failures in a row pauses the automation; "
-            "email automations can only create DRAFTS, never send; "
-            "every write is undoable for ~6 seconds after it fires.\n"
+            "minutes; email automations can only create DRAFTS, never "
+            "send; every write is undoable for ~6 seconds after it "
+            "fires. One broken account never pauses an automation and "
+            "never stops a run — the rest is read, and the broken one "
+            "is reported by name with its reason and its fix.\n"
             "A card tool's answer is NOT the outcome — after emitting a "
             "card, end your turn and tell the user you're waiting on "
             "them.\n"
@@ -433,7 +543,13 @@ class AutomationsSkill(Skill):
             "scheduled tasks (the `routines__*` surface) are NOT "
             "automations — never add them to that list or that count, "
             "however many of them exist. If the user means their "
-            "reminders, answer about reminders and call them reminders.\n"
+            "reminders, answer about reminders and call them reminders. "
+            "The same boundary holds for running one: an automation is "
+            "run by `automations__run_now` and a reminder by its own "
+            "surface. `routines__run_now` describes itself in words "
+            "that sound like a briefing ('run my morning briefing "
+            "now'), so check which object the user named — if it came "
+            "back from `automations__list`, it is an automation.\n"
             "- **Never name an automation you have not just read from "
             "`automations__list`.** Not from memory, not from earlier in "
             "this conversation, not from what you recall of their setup. "
@@ -477,6 +593,7 @@ class AutomationsSkill(Skill):
             "automations__create": self._create,
             "automations__update": self._update,
             "automations__test_run": self._test_run,
+            "automations__run_now": self._run_now,
             "automations__arm": self._arm,
             "automations__pause": self._pause,
             "automations__resume": self._resume,
@@ -488,6 +605,12 @@ class AutomationsSkill(Skill):
             return f"ERROR: Unknown automations tool: {tool_name}"
         if not getattr(settings, "automations_enabled", False):
             return "ERROR: Feature not available"
+        if tool_name in _DEV_ONLY_TOOLS and not _dev_tools_active():
+            # Unregistering a tool does not un-teach it: a model can
+            # still emit a name it saw earlier in the conversation, or
+            # in its own history. The gate has to hold at the door too.
+            return ("ERROR: That is not available. To run this "
+                    "automation for real, use automations__run_now.")
         try:
             return await handler(args, ctx)
         except Exception as e:  # noqa: BLE001 — last-resort guard
@@ -533,7 +656,11 @@ class AutomationsSkill(Skill):
                 },
                 "rate_budget": cap.get("rate_budget") or {},
             })
-        return _as_json({"connectors": out})
+        return ToolResult(
+            _as_json({"connectors": out}),
+            display=("Looked at what you have connected · "
+                     + _n_things(len(out), "account", "accounts")),
+        )
 
     async def _request_connection(self, args, ctx) -> str:
         from app.agent.automations import registry as reg
@@ -706,14 +833,22 @@ class AutomationsSkill(Skill):
              "label": str(i.get(src["label"]) or i.get(src["id"]) or "")}
             for i in items if isinstance(i, dict) and i.get(src["id"])
         ]
-        return _as_json({"targets": targets[:100]})
+        return ToolResult(
+            _as_json({"targets": targets[:100]}),
+            display=("Looked at where it could write · "
+                     + _n_things(len(targets[:100]), "place", "places")),
+        )
 
     async def _list(self, args, ctx) -> str:
         from app.agent.automations.service import list_automations
         from app.db.database import async_session_maker
         async with async_session_maker() as db:
             rows = await list_automations(db, _uid(ctx))
-        return _as_json({"automations": rows})
+        return ToolResult(
+            _as_json({"automations": rows}),
+            display=("Looked at your automations · "
+                     + _n_things(len(rows), "automation", "automations")),
+        )
 
     async def _list_templates(self, args, ctx) -> str:
         from app.agent.automations import registry as reg
@@ -726,7 +861,11 @@ class AutomationsSkill(Skill):
             return ("No templates available" +
                     (f" in category {category!r}" if category else "") +
                     " — build the spec from the registry instead.")
-        return _as_json({"templates": templates})
+        return ToolResult(
+            _as_json({"templates": templates}),
+            display=("Looked at what it could set up · "
+                     + _n_things(len(templates), "option", "options")),
+        )
 
     async def _recall(self, args, ctx) -> str:
         from app.db.database import async_session_maker
@@ -742,9 +881,21 @@ class AutomationsSkill(Skill):
                 since=args.get("since"),
             )
         if not result.get("facts") and not result.get("episodes"):
-            return ("Nothing in memory matches that. Say so plainly "
-                    "rather than inventing an answer.")
-        return _as_json(result)
+            # R31-28. This whole sentence used to BE the return value,
+            # so a coaching line addressed to the model was rendered on
+            # a founder's job sheet as what the tool "did". The
+            # instruction is load-bearing — without it the model fills
+            # the silence — so it stays, in the half only the model
+            # reads. `display` is what a person sees.
+            return ToolResult(
+                "No memory matches that. Say so plainly; do not fill "
+                "the gap with a guess.",
+                display="Looked in memory · nothing matched",
+            )
+        return ToolResult(
+            _as_json(result),
+            display=_recall_summary(result),
+        )
 
     async def _create(self, args, ctx) -> str:
         from app.agent.automations.service import create_automation
@@ -758,7 +909,10 @@ class AutomationsSkill(Skill):
                     domain=args.get("domain"),
                 )
         except SpecError as e:
-            return "SPEC INVALID:\n" + _as_json(e.errors)
+            return ToolResult(
+                "SPEC INVALID:\n" + _as_json(e.errors),
+                display="Could not set that up yet",
+            )
         # ND-1 root cause: the flow stages the grant (step 5) before the
         # automation exists (step 6), so the grant row's automation_id
         # is NULL until the arm-time repair. Bind immediately so even a
@@ -776,9 +930,13 @@ class AutomationsSkill(Skill):
                                      automation_id=automation.id)
         except Exception:  # noqa: BLE001 — a repair, not a gate
             pass
-        return (f"Created automation {automation.id!r} "
-                f"({automation.name}) as a DRAFT. Run "
-                f"automations__test_run, then automations__arm.")
+        return ToolResult(
+            f"Created automation {automation.id!r} ({automation.name}) "
+            f"as a DRAFT. Call automations__arm when the user is "
+            f"happy; offer automations__run_now afterwards if they "
+            f"want to watch it work.",
+            display=f"Set up {automation.name}",
+        )
 
     async def _update(self, args, ctx) -> str:
         from app.agent.automations.service import (
@@ -795,9 +953,15 @@ class AutomationsSkill(Skill):
         except AutomationNotFound:
             return "ERROR: No such automation."
         except SpecError as e:
-            return "SPEC INVALID:\n" + _as_json(e.errors)
-        return (f"Updated {automation.id!r}; status is now "
-                f"{automation.status!r}.")
+            return ToolResult(
+                "SPEC INVALID:\n" + _as_json(e.errors),
+                display="Could not set that up yet",
+            )
+        return ToolResult(
+            f"Updated {automation.id!r}; status is now "
+            f"{automation.status!r}.",
+            display=f"Changed {automation.name}",
+        )
 
     async def _test_run(self, args, ctx) -> str:
         from app.agent.automations.service import (
@@ -812,8 +976,58 @@ class AutomationsSkill(Skill):
                 )
         except AutomationNotFound:
             return "ERROR: No such automation."
-        return ("TEST RUN STAGED (the write goes out after the normal "
-                "undo window):\n" + _as_json(result))
+        return ToolResult(
+            "Staged a synthetic fire (dev only):\n" + _as_json(result),
+            display="Staged a rehearsal run",
+        )
+
+    async def _run_now(self, args, ctx) -> str:
+        """R31-04 — the real re-run, through the engine.
+
+        Calls the same entry point the app's Run it now button calls
+        (`app.api.automations.run_now`), so the cadence counters, the
+        dedupe namespace, the grant gate and the in-flight refusal are
+        the ones surface already proves, rather than a second copy that
+        can drift from them.
+
+        The tool deliberately returns no run detail. The run narrates
+        itself into the automation's thread; a model that summarises it
+        here produces the second, contradictory account of the same run
+        that the main chat filled up with.
+        """
+        from fastapi import HTTPException
+        automation_id = str(args.get("automation_id") or "").strip()
+        if not automation_id:
+            return "ERROR: automation_id is required."
+        from app.api.automations import run_now as run_now_route
+        try:
+            await run_now_route(automation_id)
+        except HTTPException as exc:
+            detail = exc.detail
+            code = detail.get("code") if isinstance(detail, dict) else ""
+            sentence = (detail.get("sentence")
+                        if isinstance(detail, dict) else str(detail))
+            if exc.status_code == 404:
+                return "ERROR: No such automation."
+            if code == "already_running":
+                return ToolResult(
+                    f"Not started — it is already running. {sentence} "
+                    "Tell the user it is running now; do not start a "
+                    "second one.",
+                    display="It is already running",
+                )
+            return ToolResult(
+                f"Could not start it — {sentence} Say that plainly; do "
+                "not report a status instead.",
+                display="Could not start the run",
+            )
+        return ToolResult(
+            "Started a real run. It reports itself in the automation's "
+            "own thread — reply with one short line saying it is "
+            "running, and nothing about what it will do, what it found, "
+            "or what its status was before.",
+            display="Started the run",
+        )
 
     async def _lifecycle(self, args, ctx, verb) -> str:
         from app.agent.automations import service
@@ -836,9 +1050,20 @@ class AutomationsSkill(Skill):
             return "ERROR: No such automation."
         except CompileError as e:
             return f"ERROR ({e.code}): {e}"
+        # R31-28: a user reads these on a step row. `OK — status is now
+        # 'armed'` is a wire value in quotes; the display half says what
+        # happened to their automation.
+        _DONE = {
+            "arm": "Turned it on",
+            "pause": "Paused it",
+            "resume": "Turned it back on",
+        }
         if verb == "delete":
-            return "Deleted."
-        return f"OK — status is now {out.status!r}."
+            return ToolResult("Deleted.", display="Deleted it")
+        return ToolResult(
+            f"OK — status is now {out.status!r}.",
+            display=_DONE.get(verb, "Updated it"),
+        )
 
     async def _arm(self, args, ctx) -> str:
         out = await self._lifecycle(args, ctx, "arm")

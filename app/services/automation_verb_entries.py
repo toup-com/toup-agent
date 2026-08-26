@@ -14,6 +14,16 @@ grammar), `{when}` (an app-formatted local time), `{channel}` /
 `{target}` (real names). A template with an unfilled slot renders
 without its clause, never with braces showing.
 
+R31-25 pin: **a slot no renderer can fill is a brace on the user's
+screen.** `automation_verbs._n` substitutes `{n}` and `{count}` and
+nothing else, so `"{count} issues moved · {need_count} needs you"`
+rendered as `"0 issues moved · {need_count} needs you"` on a founder's
+job sheet. The old pin could not catch it: it rendered every phrase
+with `str.format(count=3, need_count=1, …)`, a kwargs bag more generous
+than production. Only `{count}`/`{n}`, and the failure table's `{name}`,
+may appear here — the test now renders through the production path and
+scans in rendered mode, so a new unfillable slot fails.
+
 ND-4 pin: a failed or refused step NEVER wears a done-form verb —
 `failures` phrasings are their own table, and the guard test asserts
 none of them collides with a write's done form.
@@ -35,6 +45,23 @@ COMMON_FAILURES: dict[str, dict[str, str]] = {
     "refused": {"action": "{name} refused", "detail": "it said no to the request"},
     "write_failed": {"action": "Could not make the change", "detail": "nothing was changed"},
     "stopped": {"action": "Stopped before this step", "detail": "you stopped the run"},
+    # R31-13 / §4.4 reason codes, entered under their own names so
+    # `failure_action`'s DIRECT lookup wins before `_C_FAILURE_ALIASES`
+    # can reach them. That alias table folds `scope_missing` onto
+    # `access_expired`, which tells a user to reconnect a connection
+    # that is working — the missing thing is a permission, and the fix
+    # is Grant access, not Reconnect. Wording is kept in step with
+    # `fixtures/automations/reason-strings.json`; that file is the
+    # authority and these are its dictionary renderings.
+    "token_expired": {"action": "Could not connect", "detail": "access expired"},
+    "token_revoked": {"action": "Could not connect", "detail": "the connection was removed"},
+    "scope_missing": {"action": "Could not connect",
+                      "detail": "it does not have that access yet"},
+    "org_approval_needed": {"action": "Could not reach {name}",
+                            "detail": "the organisation has not approved Toup"},
+    "vendor_down": {"action": "Could not reach {name}", "detail": "it did not answer"},
+    "timeout": {"action": "Could not reach {name}",
+                "detail": "it did not answer in time"},
 }
 
 ENTRIES: dict[str, dict] = {
@@ -118,7 +145,7 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "slack__read_messages": {
                 "action": "Read your channels",
-                "detail": "{count} places · {need_count} need you",
+                "detail": "{count} new messages",
                 "progressive": "reading your channels",
             },
             "slack__search_messages": {
@@ -159,8 +186,11 @@ ENTRIES: dict[str, dict] = {
         "display": "Jira",
         "reads": {
             "jira__search_issues": {
+                # R31-07: a read verb reads like a read. "issues moved"
+                # is a WRITE phrasing, and it sat on a turn that moved
+                # nothing — "0 issues moved" on a run that only looked.
                 "action": "Checked your board",
-                "detail": "{count} issues moved · {need_count} needs you",
+                "detail": "{count} open issues",
                 "progressive": "checking your board",
             },
             "*": {
@@ -170,16 +200,24 @@ ENTRIES: dict[str, dict] = {
             },
         },
         "writes": {
+            # R31-25: `{target}` belongs in `action_others`, the ONE
+            # field `turn_action` substitutes into. A slot in `action`
+            # is returned verbatim on the default `you` audience — that
+            # is a brace on the user's screen, the same defect as
+            # `{need_count}` and found by the same pin.
             "jira__add_comment": {
-                "action": "Commented on {target}",
+                "action": "Commented on your ticket",
+                "action_others": "Commented on {target}",
                 "detail": "one comment, nothing else touched",
                 "progressive": "writing the comment",
-                "job_label": "commented on {target}",
+                "job_label": "commented on your ticket",
+                "job_label_others": "commented on {target}",
                 "clause": "comment on your tickets",
             },
             "jira__create_issue": {
-                "action": "Filed {target}",
-                "detail": "on your board, assigned to nobody",
+                "action": "Filed an issue on your board",
+                "action_others": "Filed {target}",
+                "detail": "assigned to nobody",
                 "progressive": "filing the issue",
                 "job_label": "filed an issue",
                 "clause": "create a Jira issue",
@@ -208,10 +246,12 @@ ENTRIES: dict[str, dict] = {
         },
         "writes": {
             "github__create_comment": {
-                "action": "Commented on {target}",
+                "action": "Commented on your pull request",
+                "action_others": "Commented on {target}",
                 "detail": "one comment, nothing merged",
                 "progressive": "writing the comment",
-                "job_label": "commented on {target}",
+                "job_label": "commented on your pull request",
+                "job_label_others": "commented on {target}",
                 "clause": "comment on GitHub",
             },
         },
@@ -271,7 +311,10 @@ ENTRIES: dict[str, dict] = {
         "writes": {
             "notion__create_page": {
                 "action": "Added a page",
-                "detail": "in {target}, nothing overwritten",
+                "action_others": "Added a page in {target}",
+                # `detail` is returned raw by `turn_action`; the page's
+                # location rides `action_others`, which is filled.
+                "detail": "nothing overwritten",
                 "progressive": "writing the page",
                 "job_label": "added a page",
                 "clause": "add a Notion page",
@@ -377,10 +420,14 @@ ENTRIES: dict[str, dict] = {
         },
         "writes": {
             "calendar__create_event": {
-                "action": "Held {when}",
+                # `{when}` had no filler anywhere: `turn_action`
+                # substitutes `{target}`/`{channel}` and nothing else,
+                # so every held slot read "Held {when}". The time is on
+                # the item the turn carries; the verb says what it did.
+                "action": "Held time on your calendar",
                 "detail": "only you can see it",
                 "progressive": "holding the time",
-                "job_label": "held {when}",
+                "job_label": "held time on your calendar",
                 "clause": "hold time on your calendar",
             },
         },

@@ -25,6 +25,11 @@ Dispatch record contract (CONTRACTS-R30 §5.1):
       "steps": [
         {"step_ref": str, "connector_name": str, "account_id": str,
          "tool_kind": "read"|"write", "action": str, "detail": str,
+         # R31-07: `failure_reason` is the string table's
+         # `thread_sentence` for this account's reason code
+         # (fixtures/automations/reason-strings.json, §4.4) — the
+         # SENTENCE, already written, not a code and not a provider
+         # error. The narrator quotes it; it does not compose one.
          "ok": bool, "failure_reason": str|None,
          "items": [{"id": str, "title": str, "sub": str,
                     "msgs": [{"who": str, "at": str, "text": str}]}],
@@ -62,6 +67,43 @@ CHANGES_GROUPS: tuple[tuple[int, str, str], ...] = (
     (3, "LEFT ALONE ON PURPOSE", "success"),
 )
 RESULT_TITLES = {"brief": "Your morning, in order", "changes": "What this run changed"}
+
+#: R31-37 — which vocabulary a run's result wears. [C's judgement; A
+#: calls this at `executor_v2` where the run closes.]
+#:
+#: The founder's Morning work brief — five accounts read, one line
+#: posted to Slack — was rendered as `CHANGED YOUR WEEK · 1 item`
+#: (E-35). It changed nothing about his week. It read five places and
+#: told him what was in them.
+#:
+#: The old derivation asked "does this automation write anything that
+#: is not a draft?", so posting the brief made the run a change-making
+#: run. But posting is how a brief is DELIVERED — `workflow.output_block`
+#: already leads a `posts` automation with "A brief on your phone". The
+#: question that separates the two vocabularies is not whether the run
+#: wrote, it is whether it changed something the user owns:
+#:
+#:   `changes` = it modified the user's world and they may want some of
+#:               it undone (a calendar hold, a comment on their ticket,
+#:               a page in their workspace).
+#:   `brief`   = it read, and it told them — including when the telling
+#:               is a Slack line or a staged draft.
+#:
+#: A draft is telling, not changing, for the same reason its own card
+#: says so: "It is a draft — nothing has been sent."
+TELLING_TOOLS: frozenset[str] = frozenset({
+    "slack__send_message",
+    "teams__send_chat_message",
+    "gmail__create_draft",
+    "outlook__create_draft",
+})
+
+
+def vocabulary_for(write_tools) -> str:
+    """`brief` unless the run changed something the user owns."""
+    return "changes" if any(
+        tool not in TELLING_TOOLS for tool in (write_tools or ())
+    ) else "brief"
 
 _MAX_WHY_CHARS = 400
 _MAX_TEXT_CHARS = 1200
@@ -273,12 +315,45 @@ Write-step annotations use rest to say what you deliberately did not do \
 ("I did not tag the channel or the reporter.")."""
 
 _FAILED_RULES = """\
-This run FAILED. No result turn. Open with the honest first line naming \
-the cause and the date ("I could not get into GitHub — the access you \
-gave me ran out on 22 August."). The failed step's items say what was NOT \
-read and why you stopped. One think turn: how many times you retried and \
-why nothing is left half-done. Close by offering the fix ("Reconnect and \
-I will carry on from where I stopped.")."""
+This run FAILED — every source it needed was unreachable. No result \
+turn. Open with the honest first line naming the account, the reason \
+and the fix. The failed step's items say what was NOT read. One think \
+turn: how many times you retried and why nothing is left half-done. \
+Close by offering the fix ("Reconnect and I will carry on from where I \
+stopped.")."""
+
+#: Appended whenever ANY step failed, whatever the run's status.
+#:
+#: R31-07, and the reason the founder was told the wrong thing twice.
+#: `_FAILED_RULES` only fired on `status == "failed"`, so a PARTIAL run
+#: — the ordinary shape, where one account breaks and the rest are read
+#: — reached the model with the brief's ranking rules and no failure
+#: guidance at all. The model improvised from `failure_reason` and
+#: produced "GitHub did not respond" for an account whose actual
+#: problem was that the organisation had never approved Toup. The agent
+#: KNEW the real reason — asked in the thread minutes later it gave it
+#: correctly — so this is not a knowledge gap, it is a narration gap:
+#: nothing told it that the supplied sentence was the answer.
+#:
+#: `failure_reason` carries the string table's `thread_sentence` for
+#: that account's reason code (`fixtures/automations/reason-strings.json`,
+#: CONTRACTS-R31 §4.4). It is quoted, not paraphrased, because a
+#: paraphrase moves the fix: "GitHub did not respond" sends the user to
+#: wait and try again, when what they must do is ask an owner to
+#: approve an OAuth app.
+_FAILED_SOURCE_RULES = """\
+SOME SOURCES FAILED. For each step with ok=false, write one line that \
+uses its failure_reason EXACTLY AS GIVEN — it is already the sentence \
+the product uses everywhere else for that problem, and the user will \
+see the same words on the account's own card. Do not reword it, do not \
+shorten it, do not soften it, and never replace a reason you were given \
+with a vaguer one: "it did not answer" is what you say when a service \
+did not answer, not when you were told the access expired or that an \
+organisation has not approved us. You may add at most one sentence of \
+your own around it. Name the account every time — never "an account". \
+Say plainly what is missing from this run because of it. A source that \
+failed produced NO items: never report a failed read as a count of \
+zero, and never let a tier imply the account was read and empty."""
 
 
 def build_prompt(record: dict) -> str:
@@ -293,6 +368,13 @@ def build_prompt(record: dict) -> str:
     else:
         shape = _RANKING_RULES
 
+    # A partial run is the ORDINARY failure shape — one account breaks,
+    # the rest are read — and it took the brief's rules with no failure
+    # guidance at all. Keyed on the steps, not on the status, so it
+    # cannot be missed by a status the table does not know.
+    failed_steps = [s for s in (record.get("steps") or [])
+                    if isinstance(s, dict) and not s.get("ok", True)]
+
     parts = [
         f'You are narrating one run of the automation "{title}" into its '
         "thread. The engine already did the work — the dispatch record "
@@ -302,6 +384,17 @@ def build_prompt(record: dict) -> str:
         "calls, a draft when an answer is owed, the closing line.",
         _VOICE_RULES,
         shape,
+    ]
+    if failed_steps:
+        parts.append(_FAILED_SOURCE_RULES)
+        parts.append(
+            "The reasons to use, verbatim: " + " · ".join(
+                f"{s.get('connector_name') or s.get('account_id')}: "
+                f"{s.get('failure_reason')}"
+                for s in failed_steps if s.get("failure_reason")
+            )
+        )
+    parts += [
         "Emit turns in §order: agent opening → one annotate per step (whys "
         "for every item and message) → result (unless failed) → think per "
         "judgement call → draft if an answer is owed → agent close. A "

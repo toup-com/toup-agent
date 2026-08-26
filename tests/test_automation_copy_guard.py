@@ -82,11 +82,15 @@ def test_emoji_fails_but_ui_glyphs_pass():
 
 def test_canvas_mandated_workflow_strings_are_the_only_sanctioned_uses():
     assert copy_guard.clean("Edit workflow")
-    assert copy_guard.clean("The whole workflow")
+    assert copy_guard.clean("Workflow")
     assert copy_guard.clean("automation · mobile · routine")
     # The same word outside the sanctioned strings still fails.
     assert not copy_guard.clean("The workflow is live")
     assert not copy_guard.clean("Edit workflow settings for the workflow")
+    # R31-23: the R30 header is retired. Its absence from the whitelist
+    # is the forcing function for the rename — the scanner is what
+    # fails if a surface still draws it.
+    assert not copy_guard.clean("The whole workflow")
 
 
 # ------------------------------------------------------- 2. one list, pinned
@@ -102,6 +106,15 @@ def test_embedded_contract_matches_the_fixture_bytes():
     )
     assert embedded["whitelist_glyphs"] == sorted(emoji_pattern["whitelist_glyphs"])
     assert fixture["matching"] == {"whole_word": True, "case_sensitive": True}
+    # R31: every pattern the contract DOCUMENT publishes must have an
+    # implementation, and the scanner must not enforce a rule the
+    # document does not carry. This comparison was absent, so a rule
+    # could be written into the fixture, published in the contract, and
+    # enforce nothing — with CI green either way, because the parity
+    # test only ever compared the two word lists and the glyphs.
+    assert embedded["banned_pattern_names"] == sorted(
+        p["name"] for p in fixture["banned_patterns"]
+    )
 
 
 # ------------------------------------------------- 3. the C surfaces are clean

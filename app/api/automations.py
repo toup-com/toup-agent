@@ -819,10 +819,15 @@ async def run_now(automation_id: str):
         if live is not None:
             total = int(live.progress_total or 0)
             step = int(live.progress_step or 0)
+            # R31-30 / §4.4 string table: "Already running" is retired.
+            # It was shown for a run the user had STOPPED ("Already
+            # running — step 0 of 5"), which is the one thing it was
+            # not. The form is `run_now_disabled_sub` in
+            # fixtures/automations/reason-strings.json.
             raise HTTPException(status_code=409, detail={
                 "code": "already_running",
-                "sentence": f"Already running — step {max(step, 1)} of "
-                            f"{max(total, 1)}.",
+                "sentence": f"It is running now — step {max(step, 1)} "
+                            f"of {max(total, 1)}.",
             })
         vspec = await parse_spec_live(automation)
         from app.agent.automations.spec_v2 import ValidatedSpecV2
@@ -1254,7 +1259,30 @@ async def from_template(body: FromTemplateBody):
                 )
             except Exception:  # noqa: BLE001
                 first_run = sched.get("sentence") or "soon"
-            drafts = setup_turns(mode, _label, first_run, [])
+            # R31-22 / §5.3: the capability check's lines. These were
+            # `[]`, so the one turn whose whole job is to say what this
+            # automation will and will not be able to do said nothing —
+            # on every automation ever created from a template.
+            scope_lines: list = []
+            try:
+                from app.agent.automations import permissions as _perms
+                from app.agent.automations.setup_script import (
+                    scope_lines_from,
+                )
+                from app.services import automation_verbs as _v
+                for cid in members:
+                    scope_lines += scope_lines_from(
+                        await _perms.resolve(
+                            db, automation=automation, account_id=cid,
+                        ),
+                        connector_name=(_v.display_name(cid) or cid)
+                        if len(members) > 1 else "",
+                    )
+            except Exception:  # noqa: BLE001 — the turn degrades, the
+                # thread does not: an empty capability list is worse
+                # than a short one, but neither is worth losing setup.
+                scope_lines = []
+            drafts = setup_turns(mode, _label, first_run, scope_lines)
             for d in drafts or []:
                 kind = d.get("kind")
                 if kind in ("agent", "think"):
@@ -1313,8 +1341,10 @@ async def describe(body: DescribeBody):
     except ImportError:
         raise HTTPException(status_code=503, detail={
             "code": "compiler_unavailable",
-            "sentence": "Describe it to me in chat and I will set it up "
-                        "there.",
+            # R31-22: the sheet shows this; it never sends the user to
+            # the main chat to set an automation up.
+            "sentence": "I could not set that up just now. Try again in "
+                        "a moment.",
         })
     async with async_session_maker() as db:
         try:

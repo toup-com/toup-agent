@@ -71,9 +71,19 @@ def test_failed_names_the_connector_and_offers_the_fix():
         "It could not finish — GitHub refused. Nothing was missed. "
         "Open the run and I will show you the fix."
     )
-    # No name known: still honest, never a raw identifier.
+    # R31-07. This used to assert "an account refused" and call it
+    # honest. It was not: a run that fails for a reason no account owns
+    # — a drain, the run cap, a crash — has no refusing account, so the
+    # sentence blamed one that did not exist and named nobody. With no
+    # connector there is also no fix to offer, so the invitation says
+    # what it can actually deliver.
     anon = notification_body("automation_run", _run(status="failed"))
-    assert "an account refused" in anon
+    assert anon == (
+        "It could not finish. Nothing was missed. Open the run and "
+        "I will show you what happened."
+    )
+    assert "an account" not in anon
+    assert "refused" not in anon
 
 
 def test_needs_you_expired_access_and_waiting():

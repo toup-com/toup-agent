@@ -249,7 +249,12 @@ def test_describe_retries_spec_errors_then_refuses(monkeypatch):
         asyncio.run(describe_compile.compile_describe(
             None, user_id="u1", text="do something", complete=complete))
     assert err.value.code == "cannot_compile"
-    assert "build it with you" in err.value.sentence
+    # R31-22: it offers another try, not a trip to the main chat. The
+    # sentence used to end "tell me in chat and I will build it with
+    # you" — which is how a setup request became a chat conversation
+    # that created no card at all.
+    assert "Try saying it another way" in err.value.sentence
+    assert "chat" not in err.value.sentence
 
 
 def test_describe_dead_model_maps_to_compiler_unavailable(monkeypatch):
@@ -310,9 +315,12 @@ def test_told_facts_never_raises():
 # ------------------------------------------------------------ skill tools
 
 def test_memory_recall_is_the_last_tool():
+    # R31-04 appended `automations__run_now` after it — the array only
+    # ever grows at the end, so recall is now second from last.
     tools = AutomationsSkill().get_tools()
-    assert tools[-1]["name"] == "automations__memory_recall"
-    description = tools[-1]["description"].lower()
+    assert tools[-1]["name"] == "automations__run_now"
+    assert tools[-2]["name"] == "automations__memory_recall"
+    description = tools[-2]["description"].lower()
     # It must say WHEN it is relevant...
     assert "when the user asks" in description
     # ...but never carry a flow posture: "use it before answering
@@ -388,14 +396,38 @@ def test_every_followup_sentence_passes_the_copy_guard(monkeypatch):
          "should change and I will do it there."),
         ("That plan needs your yes before Slack can make changes — "
          "approve it and I will finish the change."),
-        "Describe it to me in chat and I will set it up there.",
-        ("I could not turn that into a plan — tell me in chat and I "
-         "will build it with you."),
+        # R31-22: both of these used to send the user to the main chat.
+        "I could not set that up just now. Try again in a moment.",
+        ("I could not turn that into a plan. Try saying it another "
+         "way — name what it should watch, and what it should do."),
         ("Here is the plan I built from your sentence. "
          "Nothing runs until you say so."),
-        ("Nothing in memory matches that. Say so plainly rather than "
-         "inventing an answer."),
+        "Looked in memory · nothing matched",
+        "Looked in memory · 1 fact and 2 runs",
     ]
     for sentence in sentences:
         assert copy_guard.clean(sentence), (sentence,
                                             copy_guard.scan(sentence))
+
+
+def test_the_recall_coaching_line_is_not_the_user_facing_summary():
+    """R31-28. `Nothing in memory matches that. Say so plainly rather
+    than inventing an answer.` was the memory tool's whole return value,
+    so a line written to steer the model was rendered on a founder's job
+    sheet as the thing the tool had done (E-15).
+
+    The instruction is not deleted — without it the model fills the
+    silence — it is moved into the half only the model reads.
+    """
+    from app.agent.automations import copy_guard
+    from app.agent.skills.builtins.automations import skill as sk
+
+    for result, expected in (
+        ({}, "Looked in memory · nothing matched"),
+        ({"facts": [1], "episodes": []}, "Looked in memory · 1 fact"),
+        ({"facts": [1, 2], "episodes": [3]},
+         "Looked in memory · 2 facts and 1 run"),
+    ):
+        summary = sk._recall_summary(result)
+        assert summary == expected, (result, summary)
+        assert copy_guard.clean(summary), copy_guard.scan(summary)

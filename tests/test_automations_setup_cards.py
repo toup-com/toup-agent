@@ -54,9 +54,16 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         "automations__get_registry", "automations__request_connection",
         "automations__request_permission", "automations__list_targets",
         "automations__create", "automations__update",
-        "automations__test_run", "automations__arm", "automations__pause",
+        "automations__run_now", "automations__arm", "automations__pause",
         "automations__resume", "automations__delete",
     } <= names
+    # R31-04. `automations__test_run` is DEV-ONLY now and is absent
+    # from the production array. It was the only run-shaped tool the
+    # model could reach, so "Run all of them again" became a synthetic
+    # fire that answered "TEST RUN STAGED" and reported a status of
+    # paused. `automations__run_now` replaces it, and the two must
+    # never both be reachable from an ordinary sentence.
+    assert "automations__test_run" not in names
     for n in names:
         # EVERY tool carries the prefix, `automations__memory_recall`
         # included. This used to permit a bare `memory_recall` on a
@@ -67,7 +74,8 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         assert n.startswith("automations__")
     # And the prefix-stable tools array only ever grows at the END.
     ordered = [t["name"] for t in AutomationsSkill().get_tools()]
-    assert ordered[-1] == "automations__memory_recall"
+    assert ordered[-1] == "automations__run_now"
+    assert ordered[-2] == "automations__memory_recall"
 
 
 @pytest.mark.asyncio

@@ -43,15 +43,61 @@ def test_every_connector_has_a_read_fallback_and_a_trigger_sub():
 
 
 def test_every_phrase_passes_the_copy_guard():
+    """Templates, scanned as templates — slots are legal here."""
     for phrase in entries.every_phrase():
-        # Slots are engine-filled; scan with them filled innocuously so
-        # the braces themselves never mask a violation.
-        rendered = phrase.format(
-            count=3, need_count=1, when="15:30 on Thursday",
-            channel="#platform", target="TP-482", name="GitHub",
-            scope_summary="two repositories",
+        assert copy_guard.clean(phrase, rendered=False), (
+            phrase, copy_guard.scan(phrase, rendered=False)
         )
-        assert copy_guard.clean(rendered), (phrase, copy_guard.scan(rendered))
+
+
+def test_every_phrase_renders_through_production_without_a_brace():
+    """R31-25. The pin that could not fail, made able to fail.
+
+    This test used to render each template with
+    `str.format(count=3, need_count=1, …)` — a kwargs bag more generous
+    than any renderer in the product. `{need_count}` was filled here and
+    nowhere in production, so the suite stayed green while a founder's
+    job sheet read `0 issues moved · {need_count} needs you`.
+
+    A template is now rendered by THE FUNCTIONS THAT SERVE IT and the
+    result is scanned in rendered mode, where a brace is a violation.
+    Declaring a slot no renderer fills fails this test.
+    """
+    from app.services import automation_verbs as verbs
+
+    checked = 0
+    for cid, entry in entries.ENTRIES.items():
+        for tool in entry.get("reads", {}):
+            real = None if tool == "*" else tool
+            for count in (None, 0, 1, 3):
+                got = verbs.turn_action(cid, real, kind="read", count=count)
+                for field in ("action", "detail"):
+                    text = got[field]
+                    assert copy_guard.clean(text), (
+                        cid, tool, count, field, text, copy_guard.scan(text)
+                    )
+                live = verbs.live_sentence(cid, real, count=count)
+                assert copy_guard.clean(live), (cid, tool, count, live)
+                checked += 1
+        for tool in entry.get("writes", {}):
+            for audience in ("you", "others"):
+                got = verbs.turn_action(cid, tool, kind="write",
+                                        target="#all-toup", audience=audience)
+                for field in ("action", "detail"):
+                    text = got[field]
+                    assert copy_guard.clean(text), (
+                        cid, tool, audience, field, text, copy_guard.scan(text)
+                    )
+                checked += 1
+        for reason in entries.V2_FAILURE:
+            got = verbs.failure_action(cid, reason)
+            for field in ("action", "detail"):
+                text = got[field]
+                assert copy_guard.clean(text), (
+                    cid, reason, field, text, copy_guard.scan(text)
+                )
+            checked += 1
+    assert checked > 200, f"the sweep collapsed to {checked} renders"
 
 
 def test_no_failure_phrasing_wears_a_done_form():
@@ -84,8 +130,20 @@ def test_the_canvas_write_phrases_are_verbatim():
     assert slack["action"] == "Told you in Slack"
     assert slack["detail"] == "one line, no thread"
     cal = entries.V2_WRITE["calendar__create_event"]
-    assert cal["action"] == "Held {when}"
     assert cal["detail"] == "only you can see it"
+    # R31-25 parity correction. This used to assert `cal["action"] ==
+    # "Held {when}"` and call it canvas-verbatim. The canvas does not
+    # say that: `Automations.dc.html` draws "Held 15:30 on Thursday" —
+    # a RENDERED example. Someone turned the example into a template
+    # with a `{when}` slot, and `turn_action` fills `{target}` and
+    # `{channel}` and nothing else, so every held slot shipped the
+    # brace. The pin then froze the defect in place as design parity.
+    #
+    # The action is slot-free until A gives the renderer a `when`
+    # filler (CONTRACTS-R31 §2a); the canvas's own wording is the
+    # target once it can be rendered.
+    assert "{" not in cal["action"], cal["action"]
+    assert cal["action"] == "Held time on your calendar"
 
 
 def test_the_canvas_rails_are_in_the_connectors_own_words():

@@ -83,9 +83,16 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
         except Exception as e:  # noqa: BLE001
             logger.warning("[automations] describe LLM failed: %s: %s",
                            type(e).__name__, str(e)[:200])
+            # R31-22. This used to read "Describe it to me in chat and
+            # I will set it up there." — the sentence that sent a
+            # founder's setup into the main chat, where the agent asked
+            # its questions and no card was ever created. Setting one
+            # up happens in its own thread; when nothing could be
+            # created there is no thread to go to either, so this is an
+            # error the sheet shows, not an invitation somewhere else.
             raise DescribeError(
                 "compiler_unavailable",
-                "Describe it to me in chat and I will set it up there.",
+                "I could not set that up just now. Try again in a moment.",
             )
         spec = (payload or {}).get("spec") if isinstance(payload, dict) else None
         if not isinstance(spec, dict):
@@ -105,8 +112,8 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
     if automation is None:
         raise DescribeError(
             "cannot_compile",
-            "I could not turn that into a plan — tell me in chat and I "
-            "will build it with you.",
+            "I could not turn that into a plan. Try saying it another "
+            "way — name what it should watch, and what it should do.",
         )
 
     thread = await _ledger.ensure_thread(
@@ -133,8 +140,22 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
         raw = json.loads(automation.spec_json or "{}")
         mode, label = mode_of(automation, raw)
         sched = schedule_block(automation, raw)
+        # R31-22 / §5.3: the capability check said nothing here too.
+        scope_lines: list = []
+        try:
+            from app.agent.automations import permissions as _perms
+            from app.agent.automations.setup_script import scope_lines_from
+            if automation.connector_id:
+                scope_lines = scope_lines_from(await _perms.resolve(
+                    db, automation=automation,
+                    account_id=automation.connector_id,
+                ))
+        except Exception:  # noqa: BLE001 — a short list beats none,
+            # and neither is worth losing the thread over.
+            scope_lines = []
         for d in setup_turns(mode, label,
-                             sched.get("sentence") or "when you arm it", []):
+                             sched.get("sentence") or "when you arm it",
+                             scope_lines):
             kind = d.get("kind")
             if kind in ("agent", "think"):
                 await _ledger.append_turn(

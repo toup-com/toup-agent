@@ -92,10 +92,21 @@ def notification_body(kind: str, run_summary: dict) -> str:
         return "Something needs you — open the run and I will show you."
 
     if status == "failed":
-        who = connector or "an account"
+        # R31-07. This was `who = connector or "an account"` — so a run
+        # that failed for a reason no account owns (a drain, the run
+        # cap, a crash) told the user "an account refused", naming
+        # nobody and blaming something that had not happened. There is
+        # no fix to offer for that, either, so the invitation changes
+        # with it. When a connector IS named, R30 §5.7's line stands
+        # verbatim.
+        if connector:
+            return (
+                f"It could not finish — {connector} refused. Nothing was "
+                "missed. Open the run and I will show you the fix."
+            )
         return (
-            f"It could not finish — {who} refused. Nothing was missed. "
-            "Open the run and I will show you the fix."
+            "It could not finish. Nothing was missed. Open the run and "
+            "I will show you what happened."
         )
 
     if status == "waiting_on_user":
