@@ -145,6 +145,24 @@ class Skill(abc.ABC):
         """Called once when the skill is loaded at startup."""
         pass
 
+    async def on_entitlements_changed(self) -> None:
+        """Called on every registered skill after a settings reload has
+        newly registered one or more skills.
+
+        Registration used to be resolved once per process, so anything a
+        skill decided in `on_load` about WHICH OTHER skills exist was safe
+        for that process's lifetime. `SkillLoader.refresh_entitlements`
+        breaks that: a container that booted dark can register the
+        automations skill later, and a snapshot taken at boot ("automations
+        is not available, so do not name its tools in my prompt") is then
+        stale in the lit direction — the tool exists and the prompt still
+        says it does not.
+
+        Override this to re-take such a snapshot. The default is a no-op,
+        and a skill that never reasons about its siblings needs nothing.
+        """
+        return None
+
     async def on_unload(self) -> None:
         """Called on shutdown / hot-reload."""
         pass

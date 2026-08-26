@@ -3472,8 +3472,12 @@ class AgentRunner:
                 # the client would render as a "Site: Toup · Is last: true"
                 # detail line (R30, D-17); those serve their `display`
                 # sentence or nothing.
-                _record_summary = client_summary(result, cap=2048,
-                                                 tool_name=tc["name"])
+                _record_summary = client_summary(
+                    result, cap=2048, tool_name=tc["name"],
+                    is_skill_tool=bool(
+                        self.skill_loader
+                        and self.skill_loader.is_skill_tool(tc["name"])),
+                )
                 # Round 4 (items 1/8): attribution + favicon refs ride the
                 # persisted record AND the live frame, so a message re-rendered
                 # from history shows the same steps/favicons a live turn did.
@@ -3554,8 +3558,12 @@ class AgentRunner:
                     # return value. See app/agent/tool_display.py — this line
                     # used to be `result[:200]` and shipped tenant uuids, the
                     # storage layout and internal component names into the chat.
-                    summary = client_summary(result, cap=200,
-                                             tool_name=tc["name"])
+                    summary = client_summary(
+                        result, cap=200, tool_name=tc["name"],
+                        is_skill_tool=bool(
+                            self.skill_loader
+                            and self.skill_loader.is_skill_tool(tc["name"])),
+                    )
                     if _tool_end_meta:
                         _meta: Dict[str, Any] = {
                             "call_id": tc["id"],

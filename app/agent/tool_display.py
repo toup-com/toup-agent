@@ -229,7 +229,8 @@ def sanitize_for_client(text: Optional[str]) -> str:
 
 
 def client_summary(result: object, cap: int = 200,
-                   tool_name: Optional[str] = None) -> str:
+                   tool_name: Optional[str] = None,
+                   is_skill_tool: bool = False) -> str:
     """The one function the emit path calls: the tool's own sentence when it
     has one, otherwise its redacted return value, capped.
 
@@ -242,11 +243,27 @@ def client_summary(result: object, cap: int = 200,
     the caller names a connector tool (``__`` in the wire name) and the tool
     declared no ``display`` sentence, a JSON result serves as EMPTY — the
     step's label carries the row, and the model still reads the full payload.
+
+    ``is_skill_tool``: "connector tool" was originally TESTED as ``"__" in
+    tool_name``, and SKILL tools are prefixed too — so a rule written for
+    vendor payloads silently swallowed every skill tool returning JSON
+    without a declared ``display``: `routines__remind`, `routines__create`,
+    `routines__list`, `triggers__list`. Not a cosmetic loss: the reminder
+    CARD is built client-side from this exact string
+    (`reminders.ts::remindersFromTools` parses
+    `{"status":"created","reminder":{…}}` out of it), and `routines__remind`
+    sits in the client's HIDDEN_TOOLS *because* the card is meant to BE its
+    rendering. Empty summary ⇒ no chip and no card, so a reminder the user
+    had just created rendered as a bare text bubble. `app_html__*` survived
+    only because it declares a `display` sentence and never reaches here.
+
+    A skill tool is first-party by construction — its payload is a shape
+    this repo defines, not a vendor's — so it keeps the JSON pass-through.
     """
     chosen = display_of(result)
     if chosen is None:
         chosen = sanitize_for_client(str(result))
-        if tool_name and "__" in tool_name:
+        if tool_name and "__" in tool_name and not is_skill_tool:
             head = (chosen or "").strip()[:1]
             if head in "{[":
                 return ""

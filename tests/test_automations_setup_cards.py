@@ -292,3 +292,111 @@ def test_all_four_serializers_emit_the_card_keys():
     fields = ChatMessageResponse.model_fields
     assert "automation_connector_card" in fields
     assert "automation_grant_card" in fields
+
+
+@pytest.mark.asyncio
+async def test_a_dark_boot_can_be_lit_without_restarting_the_process(
+    monkeypatch,
+):
+    """The founder's agent had NO automations tools while the API served 200.
+
+    `_register` resolves `skill_enabled` ONCE per process — deliberately,
+    so a DARK tenant's wire array stays byte-identical
+    (`tool_entitlements.skill_enabled:311`). The consequence nobody
+    re-checked is the LIT transition: a container recreated before its
+    `.env` carried `AUTOMATIONS_ENABLED` boots with the skill unregistered,
+    and when the config push flips the flag in place
+    (`tunnel_client.py:301`) the per-REQUEST route gate opens while
+    registration — already past — cannot. `_flag_or_404` answers 200, the
+    app's screens work, and the conversational agent replies "I don't have
+    an automations__list tool available in this session" for the life of
+    that process. Measured on the founder tenant 2026-08-26.
+
+    This reproduces that exact sequence: boot dark, flip, refresh.
+
+    NOT covered here: that `tunnel_client._reload_settings` actually calls
+    `refresh_entitlements`. That wiring is verified by reading the call
+    site and by the live restart, not by this test — said plainly rather
+    than implied, because a pin that proves the mechanism and not the call
+    is the kinder-cage shape twice found in this codebase today.
+    """
+    from app.agent.skills.loader import (
+        SkillLoader, get_active_loader, set_active_loader,
+    )
+
+    # Boot DARK — the flag has not reached this container's env yet.
+    monkeypatch.setattr(settings, "automations_enabled", False)
+    loader = SkillLoader()
+    await loader.load_all()
+    assert "automations" not in loader.skills
+    assert not [t for t in loader.get_all_tool_definitions()
+                if t["name"].startswith("automations__")], (
+        "a dark tenant must register no automations tools")
+
+    # The config push lands and mutates settings in place.
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    added = await loader.refresh_entitlements()
+
+    assert "automations" in added, added
+    tools = [t["name"] for t in loader.get_all_tool_definitions()
+             if t["name"].startswith("automations__")]
+    assert "automations__list" in tools
+    assert "automations__memory_recall" in tools
+    assert loader.is_skill_tool("automations__list")
+
+    # Idempotent — a second reload must not double-register or throw.
+    again = await loader.refresh_entitlements()
+    assert again == [], again
+
+    # And the handle production reaches the live loader through.
+    set_active_loader(loader)
+    assert get_active_loader() is loader
+
+
+@pytest.mark.asyncio
+async def test_a_late_registration_tells_the_other_skills(monkeypatch):
+    """Making registration re-openable makes boot-time snapshots stale.
+
+    R30-C's ND-19 fix takes a snapshot in `on_load` — "is the automations
+    skill available?" — to decide whether its prompt may name
+    `automations__list`. That was safe while registration was resolved
+    once per process. It is not any more: a container that boots dark and
+    lights up later would keep a snapshot saying the tool does not exist
+    while it does, so the prompt would under-claim a tool the model holds.
+
+    `on_entitlements_changed` is the signal to re-take it. Under-claiming
+    is the safe direction, which is exactly why it would have gone
+    unnoticed — hence a pin rather than a note.
+    """
+    from app.agent.skills.loader import SkillLoader
+
+    monkeypatch.setattr(settings, "automations_enabled", False)
+    loader = SkillLoader()
+    await loader.load_all()
+    assert "automations" not in loader.skills
+
+    seen: list[str] = []
+    for name, skill in loader.skills.items():
+        async def _spy(_n=name):
+            seen.append(_n)
+        monkeypatch.setattr(skill, "on_entitlements_changed", _spy,
+                            raising=False)
+    # The loader holds its own instances; patch those.
+    for name, skill in loader._skills.items():
+        async def _spy2(_n=name):
+            seen.append(_n)
+        skill.on_entitlements_changed = _spy2  # type: ignore[method-assign]
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    added = await loader.refresh_entitlements()
+    assert "automations" in added
+
+    # Every skill registered BEFORE the flip was told.
+    assert seen, "no skill was notified that the entitlement set changed"
+    assert "routines" in seen or "toup" in seen, seen
+
+    # A refresh that adds nothing must not fire the hook — it is a change
+    # signal, not a heartbeat.
+    seen.clear()
+    assert await loader.refresh_entitlements() == []
+    assert seen == [], seen

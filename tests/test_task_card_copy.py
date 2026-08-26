@@ -106,6 +106,42 @@ def test_a_connector_display_sentence_still_serves():
         "Found 3 Jira issues"
 
 
+def test_a_skill_tools_json_is_not_a_vendor_payload():
+    """The gap the connector rule fell through, and the reason the reminder
+    card vanished.
+
+    "Connector tool" was TESTED as `"__" in tool_name` — but skill tools are
+    prefixed too, so a rule written for vendor payloads swallowed every
+    skill tool that returns JSON without a declared `display`. Measured on a
+    founder device's API cache: `routines__remind` 2/2 empty,
+    `routines__create` 1/1, `triggers__list` 4/4, and 10 of 13
+    `routines__list` rows — the 3 populated ones being the OLDER rows.
+
+    That is not cosmetic. The reminder CARD is built client-side from this
+    exact string (`reminders.ts::remindersFromTools` parses
+    `{"status":"created","reminder":{…}}` out of it), and `routines__remind`
+    is in the client's HIDDEN_TOOLS *because* the card is meant to BE its
+    rendering. Empty summary ⇒ no chip and no card, so a reminder the user
+    had just created rendered as a bare text bubble.
+
+    Note what the pins above did and did not cover: a connector tool, and an
+    UNPREFIXED first-party tool. Never a prefixed skill tool — the one shape
+    where the predicate and its intent disagree.
+    """
+    payload = json.dumps({"status": "created",
+                          "reminder": {"id": "r1", "text": "call mum"}})
+    # The defect: prefixed, JSON, no display ⇒ swallowed.
+    assert client_summary(payload, tool_name="routines__remind",
+                          is_skill_tool=True) == payload
+    assert client_summary(payload, tool_name="routines__create",
+                          is_skill_tool=True) == payload
+    assert client_summary('[{"id": "r1"}]', tool_name="routines__list",
+                          is_skill_tool=True) == '[{"id": "r1"}]'
+    # ...while a genuine vendor payload is still withheld.
+    assert client_summary(payload, tool_name="jira__search_issues",
+                          is_skill_tool=False) == ""
+
+
 def test_first_party_json_still_binds_the_job_card():
     """The pass-through this rule must NOT break: `create_job` answers JSON
     and the client reads job_id out of it to bind the card to its turn."""
@@ -262,3 +298,40 @@ def test_the_read_path_never_rewrites_what_is_already_clean():
     }
     out = _serialize_tool_events(_msg([clean]))
     assert out == [clean]
+
+
+def test_the_loader_is_what_answers_is_skill_tool():
+    """The pin above SUPPLIES `is_skill_tool`; this one proves production
+    can DERIVE it.
+
+    `agent_runner` computes the flag as
+    `self.skill_loader.is_skill_tool(tc["name"])`, so the whole fix rests on
+    the loader answering True for skill tools and False for connector ones.
+    A test that hands the flag in proves the function honours it and nothing
+    about the thing that decides it — the exact shape that hid two earlier
+    defects in this codebase.
+    """
+    from app.config import settings
+    from app.agent.skills.loader import SkillLoader
+    from app.agent.skills.builtins.routines.skill import RoutinesSkill
+    from app.agent.skills.builtins.automations.skill import AutomationsSkill
+
+    import asyncio
+
+    settings.automations_enabled = True
+    loader = SkillLoader()
+    assert asyncio.run(loader._register(RoutinesSkill())) is True
+    assert asyncio.run(loader._register(AutomationsSkill())) is True
+
+    # Every tool these skills register must be recognised as a skill tool,
+    # or its JSON result is silently withheld from the client again.
+    for skill in (RoutinesSkill(), AutomationsSkill()):
+        for tool in skill.get_tools():
+            assert loader.is_skill_tool(tool["name"]), tool["name"]
+
+    assert loader.is_skill_tool("routines__remind")
+    # ...and a genuine connector tool is NOT one, so vendor payloads stay
+    # withheld.
+    for connector_tool in ("jira__search_issues", "github__list_repos",
+                           "calendar__list_events", "teams__send_message"):
+        assert not loader.is_skill_tool(connector_tool), connector_tool

@@ -589,6 +589,15 @@ async def lifespan(app: FastAPI):
         # Store skill_loader at module level for /agent/capabilities endpoint
         global _skill_loader
         _skill_loader = skill_loader
+        # Publish for `tunnel_client._reload_settings`: a container that
+        # booted before its .env carried a feature flag must be able to
+        # register the newly-entitled skill when the config push lands,
+        # instead of serving the API lit and the agent dark until restart.
+        try:
+            from app.agent.skills.loader import set_active_loader
+            set_active_loader(skill_loader)
+        except Exception as e:  # noqa: BLE001 — never block boot
+            logger.warning("[SKILLS] could not publish active loader: %s", e)
 
         # Wire skill_loader to App MCP server
         try:

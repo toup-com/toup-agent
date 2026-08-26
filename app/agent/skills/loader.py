@@ -17,11 +17,27 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.agent.skills.base import Skill, SkillContext, SkillMeta
 
 logger = logging.getLogger(__name__)
+
+
+#: The process's live loader, published at boot so a settings reload can
+#: reach it. `tunnel_client._reload_settings` refreshes KeyProvider and the
+#: embedding cache for the same reason — a decision cached under
+#: pre-update settings — and skill registration is one of those decisions.
+_ACTIVE_LOADER: Optional["SkillLoader"] = None
+
+
+def set_active_loader(loader: "SkillLoader") -> None:
+    global _ACTIVE_LOADER
+    _ACTIVE_LOADER = loader
+
+
+def get_active_loader() -> Optional["SkillLoader"]:
+    return _ACTIVE_LOADER
 
 
 class SkillLoader:
@@ -200,48 +216,119 @@ class SkillLoader:
         builtins_dir = os.path.join(os.path.dirname(__file__), "builtins")
         dirs_to_scan = [builtins_dir] + self._extra_dirs
 
-        # Imported here rather than at module scope for the same reason
-        # `_register` imports `skill_enabled` locally: `tool_entitlements`
-        # reaches into `app.config`, and the loader is constructed early
-        # enough in boot that a top-level import would order-couple the two.
+        loaded = 0
+        for entry, skill_file in self._discover_skill_files(dirs_to_scan):
+            try:
+                skill = self._load_skill_from_file(skill_file, entry)
+                if skill and await self._register(skill):
+                    loaded += 1
+            except Exception as e:
+                logger.error(
+                    f"[SKILLS] Failed to load skill from {skill_file}: {e}")
+
+        logger.info(f"[SKILLS] Loaded {loaded} skill(s): {list(self._skills.keys())}")
+        return loaded
+
+    def _discover_skill_files(
+        self, dirs_to_scan: Optional[List[str]] = None,
+    ) -> List[Tuple[str, str]]:
+        """[(entry, skill_file)] for every loadable skill dir, retired ones
+        already excluded. Shared by `load_all` and `refresh_entitlements`
+        so the two can never disagree about what a skill IS."""
         from app.agent.tool_entitlements import RETIRED_SKILLS
 
-        loaded = 0
+        if dirs_to_scan is None:
+            builtins_dir = os.path.join(os.path.dirname(__file__), "builtins")
+            dirs_to_scan = [builtins_dir] + self._extra_dirs
+
+        out: List[Tuple[str, str]] = []
         for scan_dir in dirs_to_scan:
             if not os.path.isdir(scan_dir):
                 logger.debug(f"[SKILLS] Skipping non-existent dir: {scan_dir}")
                 continue
-
             for entry in sorted(os.listdir(scan_dir)):
-                skill_dir = os.path.join(scan_dir, entry)
-                skill_file = os.path.join(skill_dir, "skill.py")
-
+                skill_file = os.path.join(scan_dir, entry, "skill.py")
                 if not os.path.isfile(skill_file):
                     continue
-
                 # A retired skill is skipped BEFORE the import, not after.
-                # `_register` would reject it anyway, but `_load_skill_from_file`
-                # execs the module to find the Skill subclass, and
-                # `app_builder/skill.py` is 278 KB whose import pulls in the
-                # AppManager/Metro machinery and leaves a `toup_skill_*` entry
-                # in `sys.modules`. Nothing should pay that to load a skill
-                # that cannot register.
+                # `_register` would reject it anyway, but
+                # `_load_skill_from_file` execs the module to find the Skill
+                # subclass, and `app_builder/skill.py` is 278 KB whose import
+                # pulls in the AppManager/Metro machinery and leaves a
+                # `toup_skill_*` entry in `sys.modules`. Nothing should pay
+                # that to load a skill that cannot register.
                 if entry in RETIRED_SKILLS:
                     logger.info(
-                        "[SKILLS] Skipping retired skill dir '%s' — not imported",
-                        entry,
+                        "[SKILLS] Skipping retired skill dir '%s' — not "
+                        "imported", entry,
                     )
                     continue
+                out.append((entry, skill_file))
+        return out
 
+    async def refresh_entitlements(self) -> list[str]:
+        """Re-register any skill whose tenant entitlement turned ON since boot.
+
+        `skill_enabled` is consulted inside `_register`, and registration
+        happens once per process — deliberately, so a DARK tenant's wire
+        array stays byte-identical (`tool_entitlements.skill_enabled`
+        documents exactly that). The consequence nobody re-checked is the
+        LIT transition: a container recreated before its `.env` carried
+        `AUTOMATIONS_ENABLED` boots with the skill unregistered, and when
+        the config push then flips the flag in place
+        (`tunnel_client.py:301`) the per-request ROUTE gate opens while
+        registration — resolved once, already past — cannot. The API
+        answers 200, the app's screens work, and the conversational agent
+        has no automations tools for the life of that process. Observed on
+        the founder tenant, 2026-08-26.
+
+        ADD-ONLY on purpose. A skill that has become un-entitled is logged
+        rather than unloaded: removing tools from a live process could pull
+        them out from under an in-flight turn, and the dark-tenant
+        invariant this protects is about never ADDING them, which add-only
+        preserves. The one-time array change at the moment a tenant GAINS
+        the feature is the correct place to spend a cache-lineage fork.
+        """
+        from app.agent.tool_entitlements import skill_enabled
+
+        added: list[str] = []
+        for entry, skill_file in self._discover_skill_files():
+            if entry in self._skills:
+                continue
+            try:
+                skill = self._load_skill_from_file(skill_file, entry)
+                if skill and await self._register(skill):
+                    added.append(skill.meta.name)
+            except Exception as e:  # noqa: BLE001 — never break a reload
+                logger.warning(
+                    "[SKILLS] refresh_entitlements: %s failed to load: %s",
+                    entry, e,
+                )
+        for name in list(self._skills):
+            if not skill_enabled(name):
+                logger.warning(
+                    "[SKILLS] '%s' is no longer entitled but stays "
+                    "registered for this process — removing tools from a "
+                    "live process can strand an in-flight turn", name,
+                )
+        if added:
+            # Anything a skill decided in `on_load` about which OTHER
+            # skills exist was safe while registration was once-per-process.
+            # It is not any more, so give every registered skill the chance
+            # to re-take that snapshot before the next turn renders a prompt.
+            for name, skill in list(self._skills.items()):
                 try:
-                    skill = self._load_skill_from_file(skill_file, entry)
-                    if skill and await self._register(skill):
-                        loaded += 1
-                except Exception as e:
-                    logger.error(f"[SKILLS] Failed to load skill from {skill_dir}: {e}")
-
-        logger.info(f"[SKILLS] Loaded {loaded} skill(s): {list(self._skills.keys())}")
-        return loaded
+                    await skill.on_entitlements_changed()
+                except Exception as e:  # noqa: BLE001 — never break a reload
+                    logger.warning(
+                        "[SKILLS] on_entitlements_changed failed for %s: %s",
+                        name, e,
+                    )
+            logger.info(
+                "[SKILLS] refresh_entitlements registered %d newly-entitled "
+                "skill(s): %s", len(added), added,
+            )
+        return added
 
     async def unload_all(self) -> None:
         """Unload all skills (calls on_unload hooks)."""

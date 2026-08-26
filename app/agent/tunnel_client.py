@@ -304,6 +304,29 @@ class AgentTunnelClient:
         except Exception as e:
             logger.warning("[TUNNEL-CLIENT] Failed to reload settings: %s", e)
 
+        # Re-open skill registration for anything the new settings just
+        # entitled. `_register` resolves `skill_enabled` ONCE per process
+        # (deliberately — a dark tenant's wire array stays byte-identical),
+        # so the flag flip above opens the per-request ROUTE gate while
+        # registration, already past, stays shut. Observed on the founder
+        # tenant 2026-08-26: /api/automations answered 200 while the agent
+        # replied "I don't have an automations__list tool available in this
+        # session" for the whole life of that process. Same class as the
+        # KeyProvider and embedding refreshes below — a decision cached
+        # under pre-update settings.
+        try:
+            import asyncio as _asyncio
+            from app.agent.skills.loader import get_active_loader
+            _ld = get_active_loader()
+            if _ld is not None:
+                _asyncio.get_running_loop().create_task(
+                    _ld.refresh_entitlements())
+        except RuntimeError:
+            logger.debug("[TUNNEL-CLIENT] no running loop — skills refresh "
+                         "skipped (boot-time reload)")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[TUNNEL-CLIENT] skills refresh failed: %s", e)
+
         # Refresh KeyProvider so all LLM services pick up new keys
         try:
             from app.services.key_provider import keys
