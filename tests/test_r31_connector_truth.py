@@ -363,3 +363,36 @@ def test_a_stored_placeholder_cannot_reach_the_connector_card():
     assert 'drop_unfilled(body.get("action")' in src, (
         "_last_use serves the stored action verbatim again"
     )
+
+    # BOTH read sites. `account_last_use` is a second, independent copy of
+    # the same loop and it is the one that served the founder's card — the
+    # first pass at this fix guarded the workflow's twin and left the
+    # observed defect in place.
+    from app.api import automations as _api
+    api_src = inspect.getsource(_api.account_last_use)
+    assert 'drop_unfilled(body.get("detail")' in api_src, (
+        "account_last_use serves the stored detail verbatim again"
+    )
+    assert 'drop_unfilled(body.get("action")' in api_src, (
+        "account_last_use serves the stored action verbatim again"
+    )
+
+
+def test_a_clean_use_writes_no_remedy():
+    """`record_use` is the WRITER, and a wrong value written once outlives
+    every read-side fix: `state_for` prefers the stored `row.fix`.
+
+    A successful tool call clears the account; a cleared account has
+    nothing to retry.
+    """
+    import inspect
+    from app.agent.automations import account_health
+
+    assert account_health.fix_for("connected", "") == ""
+    assert account_health.fix_for("connected", "timeout") == "retry"
+    assert account_health.fix_for("expired", "token_expired") == "reconnect"
+
+    src = inspect.getsource(account_health.record_use)
+    assert '("connected", "retry")' not in src, (
+        "record_use stamps a blanket retry on a healthy account again"
+    )

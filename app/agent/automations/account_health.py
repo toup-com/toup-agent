@@ -401,8 +401,14 @@ async def record_use(
     from app.db.models import AccountHealth
 
     code = classify(reason_code, message) if not ok else ""
+    # A successful call clears the account, and a cleared account offers
+    # NO remedy — `fix_for("connected", "")` is "". Writing `retry` here
+    # is how a healthy row still produced a "Try again" button after the
+    # two readers were fixed: `state_for` prefers the stored `row.fix`,
+    # so a wrong value written once outlives every read-side correction.
     account_state, fix = (
-        ("connected", "retry") if ok else state_for_reason(code)
+        ("connected", fix_for("connected", "")) if ok
+        else state_for_reason(code)
     )
     now = datetime.utcnow()
     try:

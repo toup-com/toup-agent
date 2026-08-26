@@ -1711,8 +1711,13 @@ async def account_last_use(
             continue
         if body.get("account_id") != account_id:
             continue
-        action = body.get("action") or "Used it"
-        detail = body.get("detail") or ""
+        # R31-25 at the READ boundary — and THIS is the call that put
+        # `{need_count}` on the founder's Jira card. These fields are
+        # stored verbatim by the turn that wrote them, so making the
+        # renderer total cannot reach a row an older build persisted.
+        from app.services.automation_verbs import drop_unfilled
+        action = drop_unfilled(body.get("action") or "") or "Used it"
+        detail = drop_unfilled(body.get("detail") or "")
         return {
             "sentence": (f"{action} · {detail}" if detail else action)[:120],
             "at": r.created_at.isoformat() + "Z",
