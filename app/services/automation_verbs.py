@@ -640,19 +640,35 @@ def _n(template: str, count: Optional[int], **extra: Any) -> str:
             continue
         out = out.replace("{" + key + "}", str(value))
     out = out.replace("(s)", "" if n == 1 else "s")
+    return drop_unfilled(out, _origin=template)
+
+
+def drop_unfilled(text: str, *, _origin: str = "") -> str:
+    """Return `text` with any clause that still carries a slot removed.
+
+    Extracted from `_n` so the SAME rule can run at read time. `_n` fixes
+    what the engine mints from now on; it cannot fix a string a previous
+    build already persisted — and `workflow._last_use` serves the stored
+    `detail` of a tool turn verbatim, so the founder's Jira card was still
+    reading `Checked your board · 0 issues moved · {need_count} needs you`
+    on a build whose renderer could no longer produce it.
+
+    A surface that can be reached by data written before the fix needs the
+    rule at the boundary it reads, not only at the one it writes.
+    """
+    out = text or ""
     if not _SLOT_RE.search(out):
         return out
-    # Drop the clause that still carries a slot. ` · ` is the dictionary's
-    # own clause separator; a comma is the fallback; a template that is
-    # ONE clause with an unfillable slot says nothing rather than showing
-    # a brace.
+    # ` · ` is the dictionary's own clause separator; a comma is the
+    # fallback; a string that is ONE clause with an unfillable slot says
+    # nothing rather than showing a brace.
     for sep in (" · ", ", "):
         if sep in out:
             kept = [c for c in out.split(sep) if not _SLOT_RE.search(c)]
             out = sep.join(kept)
             if not _SLOT_RE.search(out):
                 return out.strip()
-    logger.warning("automation.copy.unfilled template=%r", template[:120])
+    logger.warning("automation.copy.unfilled template=%r", (_origin or text)[:120])
     return ""
 
 

@@ -319,3 +319,47 @@ def test_the_setup_card_does_not_announce_a_completed_run():
         "needs_count": 0, "run_kind": "scheduled",
     })
     assert "ran on time" in run, run
+
+
+def test_a_stored_placeholder_cannot_reach_the_connector_card():
+    """R31-25 at the READ boundary, from a live reading rather than a
+    hypothesis.
+
+    `_n` was made total so the engine can no longer MINT a slot-bearing
+    string. But `workflow._last_use` serves the `detail` of a stored tool
+    turn verbatim, and rows written by earlier builds are still there —
+    so on 2026-08-26, against a platform whose renderer could not have
+    produced it, `GET /api/accounts/jira/card` still answered:
+
+        Checked your board · 0 issues moved · {need_count} needs you
+
+    A fix at the write boundary does not reach data that was already
+    written. The same rule now runs where the string is read.
+    """
+    from app.services.automation_verbs import drop_unfilled
+
+    live = "Checked your board · 0 issues moved · {need_count} needs you"
+    assert drop_unfilled(live) == "Checked your board · 0 issues moved"
+
+    # A clean sentence is untouched — the guard must not eat real copy.
+    clean = "Read your unread mail · 0 new threads"
+    assert drop_unfilled(clean) == clean
+
+    # A single unfillable clause says nothing rather than showing a brace.
+    assert drop_unfilled("{need_count} needs you") == ""
+
+    # And `_last_use` is the call site that actually put it on the card,
+    # so it must be the one that applies the rule.
+    # Anchored on the CALL, not on the name. A first version asserted
+    # `"drop_unfilled" in src` and survived deleting both calls, because
+    # the import line inside the function still carried the word — a
+    # probe that reads its own explanation and calls it evidence.
+    import inspect
+    from app.agent.automations import workflow
+    src = inspect.getsource(workflow._last_use)
+    assert 'drop_unfilled(body.get("detail")' in src, (
+        "_last_use serves the stored detail verbatim again"
+    )
+    assert 'drop_unfilled(body.get("action")' in src, (
+        "_last_use serves the stored action verbatim again"
+    )

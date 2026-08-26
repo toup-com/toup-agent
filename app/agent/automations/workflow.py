@@ -397,8 +397,13 @@ async def _last_use(
             continue
         if body.get("account_id") != cid:
             continue
-        action = body.get("action") or "Used it"
-        detail = body.get("detail") or ""
+        # R31-25 at the READ boundary. These are stored verbatim from the
+        # turn that wrote them, so a row persisted before the renderer was
+        # made total still carries `{need_count}` — and this is the call
+        # that puts it on the connector card. Drop the clause here too.
+        from app.services.automation_verbs import drop_unfilled
+        action = drop_unfilled(body.get("action") or "") or "Used it"
+        detail = drop_unfilled(body.get("detail") or "")
         sentence = f"{action} · {detail}" if detail else action
         return {"sentence": sentence[:120],
                 "at": r.created_at.isoformat() + "Z"}
