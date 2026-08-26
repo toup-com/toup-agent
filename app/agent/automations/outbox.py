@@ -89,6 +89,28 @@ async def _execute_claimed(db, outbox_id: str) -> str:
                 await db.commit()
                 logger.info("[automations] outbox %s refused: run %s stopped",
                             row.id, row.job_id)
+                # ND-7a: the refusal must also TERMINALIZE the run — a
+                # cancelled row with a still-running job was the live
+                # wedge (stop during the write step never resolved back
+                # to the executor). handle_stop's guarded finalize makes
+                # this exactly-once even when the executor also lands.
+                try:
+                    from .run_v3 import handle_stop
+                    from app.agent import job_steps as _js
+                    automation = await db.get(Automation, row.automation_id)
+                    job = await db.get(BuildJob, row.job_id)
+                    if automation is not None and job is not None:
+                        done = sum(
+                            1 for st in _js.parse_steps(job.steps_json)
+                            if st.get("status") in ("done", "completed")
+                        )
+                        await handle_stop(db, automation=automation,
+                                          job=job, step_index=done)
+                except Exception as e2:  # noqa: BLE001 — sweep backstops
+                    logger.warning(
+                        "[automations] stop terminalize failed run=%s: %s",
+                        row.job_id, e2,
+                    )
                 return row.status
         except Exception as e:  # noqa: BLE001
             # D's design-review note (R30): when the stop CHECK itself

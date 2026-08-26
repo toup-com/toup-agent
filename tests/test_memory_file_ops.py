@@ -855,3 +855,72 @@ async def test_the_repair_still_refuses_the_owner_as_a_person():
 
     assert plan.accepted == []
     assert any("whose memory this is" in c for c in plan.complaints), plan.complaints
+
+
+async def test_nd8_a_match_that_echoes_the_bullet_marker_still_lands():
+    """ND-8 (found in CI memverify P04, root-caused 2026-08-25): the model
+    is SHOWN the file body, so it echoes the line as it reads there —
+    "- lives in Toronto". Bullets are stored marker-less, `match` was only
+    `.strip()`ed, so every such rewrite was refused with "no bullet reads
+    exactly …" and the correction silently lost: the corpus still said
+    Toronto after the user moved to Vancouver. A correction that never
+    lands makes "one memory" dishonest.
+
+    The tolerance must NOT gut the guard — an absent bullet is still
+    refused, and a mid-sentence dash is not a marker.
+    """
+    db, user_id = await _session()
+    await _apply(db, user_id, [
+        _create_ielts(),
+        {"op": "add", "slug": "areas/ielts", "bullet": "lives in Toronto",
+         "change": "Added IELTS: city."},
+    ])
+
+    # The ND-8 case: `match` carries the bullet marker.
+    plan, result = await _apply(db, user_id, [
+        {"op": "rewrite", "slug": "areas/ielts",
+         "match": "- lives in Toronto",
+         "bullet": "lives in Vancouver",
+         "change": "Updated: moved to Vancouver."},
+    ])
+    assert plan.complaints == [], plan.complaints
+    assert result["applied"] == 1
+    file = await ops.get_file(db, user_id, "areas/ielts")
+    assert file["body_md"] == "- lives in Vancouver", file["body_md"]
+
+    # An indented / asterisk marker is tolerated the same way (remove leg).
+    await _apply(db, user_id, [
+        {"op": "add", "slug": "areas/ielts", "bullet": "targeting band 7.5",
+         "change": "Added band target."},
+    ])
+    plan, result = await _apply(db, user_id, [
+        {"op": "remove", "slug": "areas/ielts", "match": "  * targeting band 7.5",
+         "change": "Removed the band target."},
+    ])
+    assert plan.complaints == [], plan.complaints
+    assert result["applied"] == 1
+
+    # THE GUARD IS INTACT: a bullet that genuinely is not there is still
+    # refused — with or without a marker — and never fuzzily matched.
+    for absent in ("- lives in Montreal", "lives in Montreal"):
+        plan, result = await _apply(db, user_id, [
+            {"op": "rewrite", "slug": "areas/ielts", "match": absent,
+             "bullet": "lives in Ottawa", "change": "x"},
+        ])
+        assert result["applied"] == 0, absent
+        assert any("no bullet reads exactly" in c for c in plan.complaints)
+
+    # A dash INSIDE a bullet is not a marker: the text is addressed whole.
+    await _apply(db, user_id, [
+        {"op": "add", "slug": "areas/ielts",
+         "bullet": "reading - writing gap is the weak spot",
+         "change": "Added: the gap."},
+    ])
+    plan, result = await _apply(db, user_id, [
+        {"op": "rewrite", "slug": "areas/ielts",
+         "match": "reading - writing gap is the weak spot",
+         "bullet": "reading and writing are now even",
+         "change": "Updated: gap closed."},
+    ])
+    assert plan.complaints == [], plan.complaints
+    assert result["applied"] == 1

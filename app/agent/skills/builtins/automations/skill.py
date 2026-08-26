@@ -306,6 +306,41 @@ class AutomationsSkill(Skill):
                     "required": ["automation_id"],
                 },
             },
+            # Appended LAST (R30) — the tools array is prefix-stable
+            # per channel; new tools only ever join at the end.
+            {
+                "name": "memory_recall",
+                "description": "Search the one platform memory — facts "
+                               "and episodes about people, channels, "
+                               "tickets, repos and past automation runs, "
+                               "with links to the exact thread turn. Use "
+                               "it BEFORE answering anything about a "
+                               "person, a channel, a ticket, or what an "
+                               "automation did.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string",
+                                  "description": "free-text match"},
+                        "entity": {"type": "string",
+                                   "description": "a person/channel/"
+                                                  "ticket/repo name"},
+                        "category": {
+                            "type": "string",
+                            "enum": ["people", "team_workspace",
+                                     "your_time", "work_you_own",
+                                     "noise_filters"],
+                        },
+                        "scope": {"type": "string",
+                                  "description": "an automation id to "
+                                                 "read its scoped view "
+                                                 "(plus global); omit "
+                                                 "to span everything"},
+                        "since": {"type": "string",
+                                  "description": "ISO date floor"},
+                    },
+                },
+            },
         ]
 
     def get_system_prompt_section(self) -> Optional[str]:
@@ -401,6 +436,7 @@ class AutomationsSkill(Skill):
             "automations__pause": self._pause,
             "automations__resume": self._resume,
             "automations__delete": self._delete,
+            "memory_recall": self._recall,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -647,6 +683,24 @@ class AutomationsSkill(Skill):
                     " — build the spec from the registry instead.")
         return _as_json({"templates": templates})
 
+    async def _recall(self, args, ctx) -> str:
+        from app.db.database import async_session_maker
+        from app.services import memory_v2_service
+
+        async with async_session_maker() as db:
+            result = await memory_v2_service.recall(
+                db, user_id=_uid(ctx),
+                query=args.get("query"),
+                entity=args.get("entity"),
+                category=args.get("category"),
+                scope=args.get("scope"),
+                since=args.get("since"),
+            )
+        if not result.get("facts") and not result.get("episodes"):
+            return ("Nothing in memory matches that. Say so plainly "
+                    "rather than inventing an answer.")
+        return _as_json(result)
+
     async def _create(self, args, ctx) -> str:
         from app.agent.automations.service import create_automation
         from app.agent.automations.spec import SpecError
@@ -660,6 +714,23 @@ class AutomationsSkill(Skill):
                 )
         except SpecError as e:
             return "SPEC INVALID:\n" + _as_json(e.errors)
+        # ND-1 root cause: the flow stages the grant (step 5) before the
+        # automation exists (step 6), so the grant row's automation_id
+        # is NULL until the arm-time repair. Bind immediately so even a
+        # never-armed draft's grants page is honest. Best-effort — arm
+        # retries the repair anyway.
+        try:
+            from app.agent.automations import registry as reg
+            spec = args.get("spec") or {}
+            gids = [s.get("grant_id") for s in (spec.get("steps") or [])
+                    if isinstance(s, dict) and s.get("grant_id")]
+            if (spec.get("action") or {}).get("grant_id"):
+                gids.append(spec["action"]["grant_id"])
+            for gid in gids:
+                await reg.bind_grant(_uid(ctx), grant_id=gid,
+                                     automation_id=automation.id)
+        except Exception:  # noqa: BLE001 — a repair, not a gate
+            pass
         return (f"Created automation {automation.id!r} "
                 f"({automation.name}) as a DRAFT. Run "
                 f"automations__test_run, then automations__arm.")

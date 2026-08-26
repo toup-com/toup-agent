@@ -666,6 +666,13 @@ async def reconcile_managed_rows(db: AsyncSession) -> dict:
             if tag and row.image_tag != tag:
                 changed.append(f"image {row.image_tag}->{tag}")
                 row.image_tag = tag
+            # container_id drifts on every blue-green recreate (D's
+            # live check caught the stale value post-rollout). Docker's
+            # ps id is the short form — prefix-compare before writing.
+            new_cid = (c.get("container_id") or "").strip()
+            if new_cid and not (row.container_id or "").startswith(new_cid):
+                changed.append("container_id")
+                row.container_id = new_cid
             running = bool(c.get("running"))
             if running and row.status != "running":
                 changed.append(f"status {row.status}->running")

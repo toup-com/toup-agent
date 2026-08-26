@@ -76,13 +76,17 @@ def mode_label(mode: str, *, channel_label: str = "") -> str:
 
 def setup_turns(
     mode: str,
-    *,
     channel_label: str = "",
     first_run_label: str = "tonight",
     scope_lines: list[dict] | None = None,
 ) -> list[dict]:
     """TurnDrafts for a fresh setup thread, in order.
 
+    Positional-tolerant on purpose: the from-template endpoint calls it
+    positionally. `channel_label` is only read by `posts` mode (call
+    sites that pass the mode label there are harmless); a
+    `first_run_label` carrying a capitalised schedule sentence
+    ("Weekdays at 8:00") is lowered so the close reads as one sentence.
     `scope_lines` — the capability check's step lines, engine-supplied:
     `[{"text": "Read new mail", "ok": True}, …]` with `ok=False` for a
     denied-by-design scope (rendered muted, §3.5 extension).
@@ -90,14 +94,17 @@ def setup_turns(
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode!r}")
     opening = _OPENINGS[mode].format(channel=channel_label or "the channel you chose")
-    if mode == "drafts_only" and first_run_label == "tonight":
+    label = (first_run_label or "tonight").strip() or "tonight"
+    if label[:1].isupper() and not label.startswith("I "):
+        label = label[:1].lower() + label[1:]
+    if mode == "drafts_only" and label == "tonight":
         close = _CANVAS_DRAFTS_CLOSE
     else:
-        close = f"First run is {first_run_label}. {_CLOSES[mode]}"
+        close = f"First run is {label}. {_CLOSES[mode]}"
     return [
         {"kind": "agent", "text": opening},
         {
-            "kind": "tool_request",
+            "kind": "tool",
             "action": "Checked what I can do",
             "detail": mode_label(mode, channel_label=channel_label),
             "steps": list(scope_lines or []),

@@ -337,3 +337,58 @@ async def test_mode_and_output_derivation():
     confirm_spec = dict(raw)
     confirm_spec["mode"] = "confirm"
     assert mode_of(a, confirm_spec)[0] == "asks_first"
+
+
+@pytest.mark.asyncio
+async def test_from_template_seeds_the_setup_thread(monkeypatch):
+    """The C-caught silent-skip class: the seeding loop's best-effort
+    except swallowed a TypeError and the setup script never ran. Pin:
+    from-template leaves the YOU ADDED THIS note, the mode-aware agent
+    line and the capability-check tool turn in the thread."""
+    from app.api.automations import FromTemplateBody, from_template
+    from app.agent.automations import ledger
+    from app.config import settings
+
+    uid = await _mk_user()
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    template_spec = {
+        "version": 2, "name": "Ledger brief", "mode": "auto",
+        "trigger": {"sources": [
+            {"id": "sched", "mode": "schedule",
+             "schedule": {"cron_local": "0 8 * * 1-5"}},
+        ]},
+        "steps": [
+            {"id": "issues", "connector_id": "jira",
+             "tool": "jira__search_issues", "params": {"jql": "x"},
+             "collect": {"items_path": "issues",
+                         "fields": {"key": "key"},
+                         "format": "{{item.key}}",
+                         "empty_text": "none"},
+             "on_error": "skip"},
+        ],
+    }
+
+    async def _templates(user_id):
+        return [{"id": "t-brief", "slug": "t-brief", "name": "Brief",
+                 "category": "work", "variables": [],
+                 "spec": template_spec}]
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_templates", _templates,
+    )
+    out = await from_template(FromTemplateBody(template_id="t-brief"))
+    thread_id = out["thread_id"]
+    assert out["automation"]["id"]
+
+    async with async_session_maker() as db:
+        turns, _more = await ledger.list_turns(
+            db, thread_id=thread_id, limit=50,
+        )
+    kinds = [t["kind"] for t in turns]
+    assert any(t["kind"] == "note" and t.get("stamp") == "added"
+               for t in turns)
+    assert "agent" in kinds, f"setup script silently skipped: {kinds}"
+    cap = [t for t in turns if t["kind"] == "tool"]
+    assert cap and cap[0]["action"] == "Checked what I can do", kinds

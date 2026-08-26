@@ -549,3 +549,235 @@ async def test_nd4_refused_write_never_wears_the_done_form(monkeypatch):
         j2 = await db.get(BuildJob, job2.id)
         steps2 = {s["id"]: s for s in job_steps.parse_steps(j2.steps_json)}
         assert steps2["post"]["status"] == "done", steps2["post"]
+
+
+@pytest.mark.asyncio
+async def test_nd7a_stop_during_the_write_terminalizes_the_run(monkeypatch):
+    """ND-7 live wedge: the outbox refusal cancelled the ROW but left
+    the RUN running forever. Now the refusal also terminalizes —
+    stopped_by_user, checkpoint, the honest stop note."""
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    from app.agent.automations import ledger, outbox as ob, run_v3
+    from app.db.models import AutomationOutbox
+
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid,
+                                            automation_id=a.id)
+        job = BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            config_json={"thread_id": thread.id, "run_kind": "run_now"},
+        )
+        db.add(job)
+        row = AutomationOutbox(
+            user_id=uid, automation_id=a.id, job_id=job.id,
+            connector_id="slack", tool_name="slack__send_message",
+            payload_json="{}", grant_id="g-1",
+            idempotency_key="w:0", execute_after=datetime.utcnow(),
+            status="executing",
+        )
+        db.add(row)
+        await db.commit()
+        row_id, job_id = row.id, job.id
+        await run_v3.request_stop(db, job_id)
+
+    async def _never(*a_, **k_):
+        raise AssertionError("provider must not be called")
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _never,
+    )
+    async with async_session_maker() as db:
+        status = await ob._execute_claimed(db, row_id)
+    assert status == "cancelled"
+    async with async_session_maker() as db:
+        job2 = await db.get(BuildJob, job_id)
+        from app.agent.automations.ledger import run_v3_status
+        assert run_v3_status(job2) == "stopped_by_user", (
+            job2.status, job2.outcome,
+        )
+        turns = await ledger.run_turns(db, run_id=job_id)
+        assert any(t["kind"] == "note" and t.get("stamp") == "stopped"
+                   for t in turns)
+
+
+@pytest.mark.asyncio
+async def test_nd7b_run_cap_terminalizes_the_scheduled_fire(monkeypatch):
+    """ND-7b: run_schedule_fire_v2's cap handler could not even name
+    the job (minted inside the wait_for) — the row stayed running
+    forever. Now the cap finalizes on a fresh session."""
+    import asyncio as _asyncio
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    from app.agent.automations import executor_v2
+
+    async def _hang(tool_input):
+        await _asyncio.sleep(30)
+        return _ISSUES
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform",
+        _fake_dispatch({"jira__search_issues": _hang}),
+    )
+    monkeypatch.setattr(
+        "app.agent.automations.executor_v2.AUTOMATION_RUN_CAP_S", 1,
+    )
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        status = await executor_v2.run_schedule_fire_v2(
+            db, a2, vspec, vspec.schedule_source(),
+            fire_key=f"cap:{uuid.uuid4()}", run_kind="run_now",
+        )
+    assert status == "failed"
+    job = await _one_run(a.id)
+    assert job.status == "failed" and job.outcome == "run_cap", (
+        job.status, job.outcome,
+    )
+
+
+@pytest.mark.asyncio
+async def test_nd7d_sweep_terminalizes_a_wedged_stop_with_the_honest_shape():
+    """ND-7d: a stop the executor never honoured gets its terminal from
+    the sweep — and the SHAPE must be honest, not merely terminal.
+    A `failed/lost` terminal also "arrives", and it mints a "Fix this"
+    chip offering to diagnose a failure that never happened: the user
+    pressed Stop and the product told them it broke (live run
+    5f3f57bf). Assert stopped_by_user + checkpoint + stop note + NO
+    fix chip."""
+    from datetime import timedelta
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    from app.agent.automations import ledger
+    from app.agent.automations.sweep import _sweep_wedged_stops
+
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid,
+                                            automation_id=a.id)
+        job = BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            config_json={"thread_id": thread.id},
+            stop_requested_at=datetime.utcnow() - timedelta(minutes=5),
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    assert await _sweep_wedged_stops() == 1
+    async with async_session_maker() as db:
+        job2 = await db.get(BuildJob, job_id)
+        from app.agent.automations.ledger import checkpoint_of, run_v3_status
+        assert run_v3_status(job2) == "stopped_by_user", (
+            job2.status, job2.outcome,
+        )
+        # The shape D pinned: never the reaper's lying vocabulary.
+        assert job2.outcome != "lost"
+        assert job2.error_class != "interrupted"
+        assert "interrupted" not in (job2.user_message or "").lower()
+        assert checkpoint_of(job2) is not None
+        turns = await ledger.run_turns(db, run_id=job_id)
+        stop_notes = [t for t in turns if t["kind"] == "note"
+                      and t.get("stamp") == "stopped"]
+        assert len(stop_notes) == 1
+        assert stop_notes[0]["writes_count"] == 0
+
+    # And the runs API must NOT offer to fix a stop: the "Fix this"
+    # chip is minted only for status=failed.
+    from app.agent.automations.service import list_runs
+    async with async_session_maker() as db:
+        runs = await list_runs(db, uid, automation_id=a.id, limit=10)
+    row = next(r for r in runs if r["id"] == job_id)
+    assert row["fix"] is None, row["fix"]
+
+    # Second tick: nothing left to do.
+    assert await _sweep_wedged_stops() == 0
+
+
+@pytest.mark.asyncio
+async def test_nd7d_the_stuck_reaper_never_claims_a_stopped_run():
+    """The live ND-7d mechanism: the stuck-run reaper fires at 360s and
+    ran FIRST in the tick, so it reached a user-stopped run before the
+    wedged-stop leg and stamped failed/lost + a Fix chip. Now the leg
+    runs first AND the reaper's predicate excludes stop-requested rows
+    — so even a stop older than the stuck cutoff ends honestly."""
+    from datetime import timedelta
+    from app.agent.automations import ledger
+    from app.agent.automations.sweep import (
+        _STUCK_AFTER, _sweep_stuck_runs, sweep_automations,
+    )
+    from app.agent.automations.ledger import run_v3_status
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    # Older than the reaper's cutoff — the exact live condition.
+    old_start = datetime.utcnow() - _STUCK_AFTER - timedelta(seconds=30)
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid,
+                                            automation_id=a.id)
+        job = BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            created_at=old_start,
+            config_json={"thread_id": thread.id, "run_kind": "run_now"},
+            stop_requested_at=old_start + timedelta(seconds=120),
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    # The reaper alone must refuse it outright.
+    assert await _sweep_stuck_runs() == 0
+    async with async_session_maker() as db:
+        assert (await db.get(BuildJob, job_id)).status == "running"
+
+    # A full tick terminalises it — honestly.
+    await sweep_automations()
+    async with async_session_maker() as db:
+        job2 = await db.get(BuildJob, job_id)
+        assert run_v3_status(job2) == "stopped_by_user", (
+            job2.status, job2.outcome,
+        )
+        assert job2.outcome != "lost"
+
+
+@pytest.mark.asyncio
+async def test_nd10_a_reaped_run_stamps_the_card_it_belongs_to():
+    """ND-10 (live on the founder): the stuck-run reaper did ONE bulk
+    UPDATE, so `_stamp_last_outcome` (whose only caller is
+    `_finalize_job`) never ran — the automation kept advertising an
+    older, rosier last_outcome while its newest run had failed. The home
+    card's meta and status-aware description both read that stamp, so
+    the card said the last run went fine hours after one broke."""
+    from datetime import timedelta
+    from app.agent.automations.sweep import _STUCK_AFTER, _sweep_stuck_runs
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        # The rosier stamp an earlier run left behind.
+        row.last_outcome = "sent"
+        row.last_outcome_text = "Posted to Slack."
+        row.last_outcome_at = datetime.utcnow() - timedelta(hours=18)
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            created_at=datetime.utcnow() - _STUCK_AFTER
+            - timedelta(minutes=1),
+        ))
+        await db.commit()
+        before = row.last_outcome_at
+
+    assert await _sweep_stuck_runs() == 1
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        # The card now tells the truth about its newest run.
+        assert row.last_outcome == "lost", row.last_outcome
+        assert row.last_outcome_at > before
+        assert "Posted to Slack." not in (row.last_outcome_text or "")

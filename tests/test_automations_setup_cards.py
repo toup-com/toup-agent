@@ -58,7 +58,14 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         "automations__resume", "automations__delete",
     } <= names
     for n in names:
-        assert n.startswith("automations__")
+        # R30 §4.5: `memory_recall` is deliberately outside the skill's
+        # namespace — it reads the ONE platform memory from the main
+        # chat, not an automations-internal surface. Everything else
+        # keeps the prefix.
+        assert n.startswith("automations__") or n == "memory_recall"
+    # And the prefix-stable tools array only ever grows at the END.
+    ordered = [t["name"] for t in AutomationsSkill().get_tools()]
+    assert ordered[-1] == "memory_recall"
 
 
 @pytest.mark.asyncio

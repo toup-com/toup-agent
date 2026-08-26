@@ -215,10 +215,15 @@ into zero or more changes. Kinds:
   account_id, permission (the label or id), direction grant|revoke.
 - account: add or remove a whole account; give account_id, direction.
 A sentence can mean several changes ("never post anywhere" = a rule AND
-revoking the post permission). If the sentence is genuinely ambiguous,
-emit no changes and ask ONE short question instead. If it is not about
-this automation's settings at all, emit no changes and answer in one
-short line that the thread is the place for it.
+revoking the post permission). An imperative about what the automation
+reads, skips or surfaces is ALWAYS at least a rule — "stop reading
+#eng-general" → {"kind": "rule", "text": "Stop reading #eng-general."}
+(plus a step change when a numbered step names that source). If the
+sentence is genuinely ambiguous, emit no changes and ask ONE short
+question instead. If it is not about this automation's settings at
+all, emit no changes and answer in one short line that the thread is
+the place for it. NEVER reply with empty intents AND no question AND
+no answer — a silently dropped sentence is a defect.
 Reply ONLY as JSON, every intent a flat object carrying its "kind":
 {"intents": [
    {"kind": "rule", "text": "..."}
@@ -294,6 +299,17 @@ async def classify_change(
                 and not result["answer"]:
             result["answer"] = str(line)[:300]
             break
+    # By construction the wire always carries applied, needs, or a
+    # question — a model that returns nothing at all (F-1: ~50% on
+    # "stop reading #eng-general" at one point) must never silently
+    # drop the user's sentence.
+    if not result["applied"] and not result["needs"] \
+            and not result["answer"]:
+        result["answer"] = (
+            "I want to get this right — should that become a standing "
+            "rule, a different time, a change to a step, or a change to "
+            "what an account may do?"
+        )
     return result
 
 

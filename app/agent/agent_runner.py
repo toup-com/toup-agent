@@ -3862,6 +3862,37 @@ class AgentRunner:
                                     f" (skipped: {result['skipped']})"
                                     if result.get("skipped") else "",
                                 )
+                                # R30 §5.6: told facts from the day chat
+                                # also reach the one platform memory —
+                                # only on turns the curator found
+                                # durable (its gates already ran), and
+                                # only where the v2 store exists.
+                                if (
+                                    result.get("applied")
+                                    and getattr(settings,
+                                                "automations_enabled", False)
+                                ):
+                                    try:
+                                        from app.agent.automations.told_facts import (  # noqa: E501
+                                            file_told_facts,
+                                        )
+                                        _n_told = await file_told_facts(
+                                            bg_db,
+                                            user_id=user_id,
+                                            user_text=_curator_user_text,
+                                            assistant_text=final_text,
+                                        )
+                                        if _n_told:
+                                            logger.info(
+                                                "[AGENT] Background: told-"
+                                                "facts hook filed %d",
+                                                _n_told,
+                                            )
+                                    except Exception as _tf_err:  # noqa: BLE001
+                                        logger.warning(
+                                            "[AGENT] Told-facts hook failed "
+                                            "(non-fatal): %s", _tf_err,
+                                        )
                             except Exception as _cur_err:
                                 # The end of the line: this runs
                                 # fire-and-forget after the reply is streamed,

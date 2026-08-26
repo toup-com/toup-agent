@@ -1202,9 +1202,18 @@ async def from_template(body: FromTemplateBody):
             )
             mode, _label = mode_of(automation, raw)
             sched = schedule_block(automation, raw)
-            drafts = setup_turns(
-                mode, _label, sched.get("sentence") or "soon", [],
-            )
+            # The close reads best with the REAL next-run label
+            # ("tomorrow 8:00" beats "weekdays at 8:00").
+            try:
+                from app.agent.automations.summary import (
+                    _next_run_at, _tz, _when_label,
+                )
+                first_run = _when_label(
+                    await _next_run_at(db, automation.id), _tz(_user_id()),
+                )
+            except Exception:  # noqa: BLE001
+                first_run = sched.get("sentence") or "soon"
+            drafts = setup_turns(mode, _label, first_run, [])
             for d in drafts or []:
                 kind = d.get("kind")
                 if kind in ("agent", "think"):
@@ -1257,7 +1266,9 @@ async def describe(body: DescribeBody):
     fabricated spec)."""
     _flag_or_404()
     try:
-        from app.agent.automations.describe_compile import compile_describe
+        from app.agent.automations.describe_compile import (
+            DescribeError, compile_describe,
+        )
     except ImportError:
         raise HTTPException(status_code=503, detail={
             "code": "compiler_unavailable",
@@ -1265,10 +1276,15 @@ async def describe(body: DescribeBody):
                         "there.",
         })
     async with async_session_maker() as db:
-        result = await compile_describe(
-            db, user_id=_user_id(), text=body.text,
-        )
-        return result
+        try:
+            return await compile_describe(
+                db, user_id=_user_id(), text=body.text,
+            )
+        except DescribeError as e:
+            raise HTTPException(
+                status_code=503 if e.code == "compiler_unavailable" else 422,
+                detail={"code": e.code, "sentence": e.sentence},
+            )
 
 
 # ── R30 §4.7 — the connector sheet's card (accounts router) ──────────
@@ -1369,3 +1385,28 @@ async def account_reconnect(account_id: str):
         "consent_url": f"/api/oauth/connect/{account_id}?return_to=app",
         "account_id": account_id,
     }
+
+
+# ── R30 §4.11a — the routine-migration trigger (ND-6) ────────────────
+
+
+@router.post("/migrate-routines")
+async def migrate_routines():
+    """Run the §4.11a email-briefing migration for THIS tenant.
+    Idempotent (the `migrated_to` stamp no-ops a second call), so it is
+    safe to drive repeatedly; D's live pass calls it explicitly so the
+    before/after states are captured rather than raced by a boot hook."""
+    _flag_or_404()
+    from app.agent.automations.routine_migration import (
+        migrate_email_briefings,
+    )
+    async with async_session_maker() as db:
+        return await migrate_email_briefings(db, user_id=_user_id())
+
+
+@router.get("/migrate-routines/report")
+async def migrate_routines_report():
+    _flag_or_404()
+    from app.agent.automations.routine_migration import migration_report
+    async with async_session_maker() as db:
+        return await migration_report(db, user_id=_user_id())

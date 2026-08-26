@@ -169,3 +169,24 @@ def test_the_prompt_shows_the_workflow_but_not_raw_json_noise():
     assert "Never post in a channel — DM me instead." in prompt
     assert "Read private DMs" in prompt
     assert "$fixture" not in prompt
+
+
+def test_empty_everything_is_impossible_by_construction():
+    # F-1: a model returning no intents, no question and no answer must
+    # never silently drop the user's sentence.
+    async def complete(prompt):
+        return {"intents": [], "question": None, "answer": None}
+
+    out = asyncio.run(composer.classify_change(
+        "stop reading #eng-general", WORKFLOW, complete=complete))
+    assert out["applied"] == [] and out["needs"] == []
+    assert out["answer"] is not None
+    from app.agent.automations import copy_guard
+    assert copy_guard.clean(out["answer"])
+
+
+def test_the_prompt_teaches_the_read_target_shape():
+    prompt = composer._extraction_prompt("stop reading #eng-general", WORKFLOW)
+    assert "stop reading\n#eng-general" in prompt or \
+        "stop reading #eng-general" in prompt.replace("\n", " ")
+    assert "silently dropped sentence is a defect" in prompt

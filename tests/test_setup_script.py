@@ -29,7 +29,7 @@ def test_drafts_tonight_reproduces_the_canvas_fixture_bytes():
     drafts = setup_turns("drafts_only", scope_lines=[])
     assert [t["text"] for t in drafts if t["kind"] == "agent"] == agent_texts
     assert [t["text"] for t in drafts if t["kind"] == "think"] == think_texts
-    tool_request = next(t for t in drafts if t["kind"] == "tool_request")
+    tool_request = [t for t in drafts if t["kind"] == "tool"][0]
     assert tool_request["action"] == tool_turns[0]["action"] == "Checked what I can do"
     assert tool_request["detail"] == tool_turns[0]["detail"] == "drafts only"
 
@@ -37,7 +37,7 @@ def test_drafts_tonight_reproduces_the_canvas_fixture_bytes():
 def test_turn_order_is_agent_tool_think_agent():
     for mode in MODES:
         kinds = [t["kind"] for t in setup_turns(mode, channel_label="#platform")]
-        assert kinds == ["agent", "tool_request", "think", "agent"], mode
+        assert kinds == ["agent", "tool", "think", "agent"], mode
 
 
 def test_each_mode_states_its_own_limit():

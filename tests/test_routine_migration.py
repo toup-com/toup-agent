@@ -155,29 +155,136 @@ async def test_second_call_migrates_nothing():
 
 
 @pytest.mark.asyncio
-async def test_reminders_and_agent_tasks_are_never_touched():
+async def test_reminders_and_engine_owned_kinds_are_never_touched():
+    """§4.11a: pure reminders keep the main-chat path. The engine-owned
+    kinds are excluded for a different reason — they ARE an automation's
+    own compiled bindings, so "migrating" one would duplicate the
+    automation that owns it."""
     uid = await _mk_user()
-    reminder = await _mk_routine(
-        uid, kind="reminder", reminder_text="stand up", config_json=None,
-    )
-    task = await _mk_routine(
-        uid, kind="agent_task", prompt_text="check deploys",
-        config_json=None,
-    )
+    untouchable = [
+        await _mk_routine(uid, kind="reminder", reminder_text="stand up",
+                          config_json=None),
+        await _mk_routine(uid, kind="automation_schedule",
+                          config_json=None),
+        await _mk_routine(uid, kind="automation_poll", config_json=None),
+    ]
 
     async with async_session_maker() as db:
         result = await mig.migrate_email_briefings(db, user_id=uid)
 
-    assert result == {"migrated": [], "skipped": [], "errors": []}
+    assert result["migrated"] == []
+    assert result["superseded"] == []
     async with async_session_maker() as db:
-        for rid in (reminder, task):
+        for rid in untouchable:
             r = await db.get(Routine, rid)
             assert r.enabled is True
             assert not (r.config_json or {}).get("migrated_to")
+            assert not (r.config_json or {}).get("superseded_by")
         autos = (await db.execute(
             select(Automation).where(Automation.user_id == uid)
         )).scalars().all()
         assert autos == []
+
+
+@pytest.mark.asyncio
+async def test_nd9_the_founders_real_shape_migrates():
+    """ND-9 (live, 2026-08-25): the founder's "Morning new-email
+    briefing" is kind `agent_task` with cron `0 8 * * *` — NOT
+    `email_briefing`. Selecting on the kind vocabulary matched nothing
+    on the real account and returned a clean 200 that migrated nothing,
+    which would have been recorded as "migration done". This drives the
+    ACTUAL production shape, not the kind the name suggests."""
+    uid = await _mk_user()
+    rid = await _mk_routine(
+        uid, kind="agent_task", name="Morning new-email briefing",
+        prompt_text="summarise my new email",
+        schedule_cron_local="0 8 * * *", schedule_kind="cron",
+    )
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(db, user_id=uid)
+
+    assert len(result["migrated"]) == 1, result
+    entry = result["migrated"][0]
+    assert entry["routine_id"] == rid
+    async with async_session_maker() as db:
+        a = await db.get(Automation, entry["automation_id"])
+        raw = json.loads(a.spec_json)
+        crons = [src.get("schedule", {}).get("cron_local")
+                 for src in raw["trigger"]["sources"] if src.get("schedule")]
+        # §4.11b: the routine's cron IS the promised time, verbatim.
+        assert crons == ["0 8 * * *"], crons
+        r = await db.get(Routine, rid)
+        assert r.enabled is False
+        assert (r.config_json or {}).get("migrated_to") == a.id
+
+
+@pytest.mark.asyncio
+async def test_nd9_a_duplicate_intent_is_retired_not_cloned():
+    """D-12 collapse: the founder's per-minute "Jira → Slack new-issue
+    alerts" routine duplicates automation "Jira → Slack". Migrating it
+    would make a THIRD object for one intent; it is retired against the
+    automation that already owns the intent."""
+    uid = await _mk_user()
+    async with async_session_maker() as db:
+        a = Automation(
+            user_id=uid, name="Jira → Slack new-issue alerts",
+            status="armed", spec_json=json.dumps({"version": 2}),
+            trigger_mode="poll", connector_id="jira",
+        )
+        db.add(a)
+        await db.commit()
+        twin_id = a.id
+
+    rid = await _mk_routine(
+        uid, kind="agent_task", name="Jira → Slack new-issue alerts",
+        prompt_text="post new jira issues to slack",
+        schedule_cron_local="* * * * *", schedule_kind="cron",
+    )
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(db, user_id=uid)
+
+    assert result["migrated"] == [], result
+    assert len(result["superseded"]) == 1, result
+    assert result["superseded"][0]["superseded_by"] == twin_id
+    async with async_session_maker() as db:
+        r = await db.get(Routine, rid)
+        assert r.enabled is False, "the per-minute duplicate must stop"
+        assert (r.config_json or {}).get("superseded_by") == twin_id
+        # No third object was created.
+        autos = (await db.execute(
+            select(Automation).where(Automation.user_id == uid)
+        )).scalars().all()
+        assert len(autos) == 1
+
+
+@pytest.mark.asyncio
+async def test_nd9_a_non_mail_task_is_flagged_not_mis_migrated():
+    """The migrated spec READS GMAIL. Converting a Jira alerter into a
+    mail brief would misstate what the user set up, so it is reported
+    for review instead — and a one-shot is a reminder wearing another
+    kind."""
+    uid = await _mk_user()
+    jira = await _mk_routine(
+        uid, kind="agent_task", name="Weekly work recap",
+        prompt_text="summarise closed jira tickets",
+        schedule_cron_local="0 17 * * 5", schedule_kind="cron",
+    )
+    oneshot = await _mk_routine(
+        uid, kind="agent_task", name="Remind me about the mail once",
+        prompt_text="mail me", schedule_kind="at",
+        schedule_cron_local="@at", auto_disable_after_fire=True,
+    )
+    async with async_session_maker() as db:
+        result = await mig.migrate_email_briefings(db, user_id=uid)
+
+    assert result["migrated"] == [], result
+    flagged = {e["routine_id"] for e in result["needs_review"]}
+    assert flagged == {jira, oneshot}, result["needs_review"]
+    async with async_session_maker() as db:
+        for rid in (jira, oneshot):
+            r = await db.get(Routine, rid)
+            # Untouched: a routine we refuse to migrate keeps working.
+            assert r.enabled is True
 
 
 @pytest.mark.asyncio
@@ -245,3 +352,29 @@ def test_promised_time_cron_renders_the_stated_time():
     assert mig.promised_time_cron("22:52") == "52 22 * * *"
     with pytest.raises(ValueError):
         mig.promised_time_cron("25:00")
+
+
+@pytest.mark.asyncio
+async def test_nd6_the_route_actually_triggers_the_migration(monkeypatch):
+    """ND-6: the migration had NO production caller — pinned here: the
+    agent route drives it end to end and stays idempotent."""
+    import uuid as _uuid
+    from app.api.automations import migrate_routines
+    from app.config import settings
+    from app.db.models import Routine
+
+    uid = await _mk_user()
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+    async with async_session_maker() as db:
+        db.add(Routine(
+            id=str(_uuid.uuid4()), user_id=uid, kind="email_briefing",
+            enabled=False, name="Morning new-email briefing",
+            prompt_text="brief me", schedule_cron_local="0 8 * * *",
+            schedule_kind="cron",
+        ))
+        await db.commit()
+    out = await migrate_routines()
+    assert len(out.get("migrated") or []) == 1, out
+    out2 = await migrate_routines()
+    assert not out2.get("migrated"), out2

@@ -51,6 +51,16 @@ async def sweep_automations() -> dict:
     stats = {"stuck_runs": 0, "stale_bindings": 0, "auto_paused": 0,
              "expired_confirms": 0}
     try:
+        # ND-7d ORDER MATTERS: a user-stopped run must be claimed by the
+        # wedged-stop leg BEFORE the stuck-run reaper can see it — the
+        # reaper's terminal is `failed/lost` with a "Fix this" chip, i.e.
+        # the product telling the user it broke when they pressed Stop
+        # (live: run 5f3f57bf reaped at start+363s). The reaper ALSO
+        # excludes stop-requested rows, so this is belt and braces.
+        stats["wedged_stops"] = await _sweep_wedged_stops()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] wedged-stop sweep failed: %s", e)
+    try:
         stats["stuck_runs"] = await _sweep_stuck_runs()
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] stuck-run sweep failed: %s", e)
@@ -84,6 +94,53 @@ async def sweep_automations() -> dict:
 SOFT_DELETE_RETENTION_DAYS = 30
 
 
+_WEDGED_STOP_AFTER = timedelta(seconds=120)
+
+
+async def _sweep_wedged_stops() -> int:
+    """ND-7d: runs whose stop was requested over two minutes ago and
+    which are STILL running never got their terminal from the executor
+    (the stop landed mid-write, or the run task died). Terminalize each
+    through run_v3.handle_stop so the SHAPE is honest — stopped_by_user
+    + checkpoint + the stop note with the real writes count, and NO
+    "Fix this" chip (the chip is minted only for status=failed). This
+    leg runs BEFORE the stuck-run reaper, which is what produced the
+    lying `failed/lost` terminal on the live run 5f3f57bf."""
+    from app.agent import job_steps as _js
+    from .run_v3 import handle_stop
+
+    cutoff = datetime.utcnow() - _WEDGED_STOP_AFTER
+    n = 0
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(BuildJob)
+            .where(BuildJob.job_type == "automation_run")
+            .where(BuildJob.status.in_(("queued", "running")))
+            .where(BuildJob.stop_requested_at.isnot(None))
+            .where(BuildJob.stop_requested_at < cutoff)
+        )).scalars().all()
+        for job in rows:
+            try:
+                automation = await db.get(Automation, job.source_id or "")
+                if automation is None:
+                    continue
+                done = sum(
+                    1 for st in _js.parse_steps(job.steps_json)
+                    if st.get("status") in ("done", "completed")
+                )
+                await handle_stop(db, automation=automation, job=job,
+                                  step_index=done)
+                n += 1
+                logger.info("[automations] wedged stop terminalised "
+                            "run=%s", job.id)
+            except Exception as e:  # noqa: BLE001 — next tick retries
+                await db.rollback()
+                logger.warning("[automations] wedged-stop failed run=%s: "
+                               "%s", job.id, e)
+    return n
+
+
+
 async def sweep_purge_soft_deleted(db) -> int:
     """Hard-delete every automation whose soft delete is older than the
     retention window (§4.8: "memory kept for 30 days then purged")."""
@@ -108,23 +165,50 @@ async def sweep_purge_soft_deleted(db) -> int:
 
 
 async def _sweep_stuck_runs() -> int:
+    """ND-10: this used to be ONE bulk UPDATE, which is why a reaped run
+    left the card lying. `_stamp_last_outcome` has exactly one caller —
+    `_finalize_job` — so a raw UPDATE terminalised the row while the
+    automation kept advertising an older, rosier `last_outcome` (live:
+    the founder's brief still read "Posted to Slack — some sources were
+    unavailable" hours after run 5f3f57bf was reaped). It also skipped
+    the outcome notification and, in R30, the v3 ledger close.
+
+    Every reaper terminal now goes through the SAME gated finalize the
+    live path uses, so stamp + notify + ledger close stay coupled by
+    construction. `_finalize_job`'s guarded UPDATE keeps it exactly-once
+    even if the executor lands at the same moment.
+    """
+    from .executor import _finalize_job
+
     cutoff = datetime.utcnow() - _STUCK_AFTER
+    n = 0
     async with async_session_maker() as db:
-        res = await db.execute(
-            sa_update(BuildJob)
+        rows = (await db.execute(
+            select(BuildJob)
             .where(BuildJob.job_type == "automation_run")
             .where(BuildJob.status.in_(("queued", "running")))
             .where(BuildJob.created_at < cutoff)
-            .values(
-                status="failed",
-                outcome="lost",
-                error_class="interrupted",
-                user_message="This run was interrupted and did not finish.",
-                completed_at=datetime.utcnow(),
-            )
-        )
-        await db.commit()
-        n = res.rowcount or 0
+            # ND-7d: a run the user STOPPED is not a stuck run. Reaping
+            # it as `failed/lost` mints a "Fix this" chip offering to
+            # diagnose a failure that never happened — the write rail
+            # stayed honest (zero sends) but the narrative lied. Those
+            # rows belong to `_sweep_wedged_stops`, which terminalises
+            # them as stopped_by_user with the real writes count.
+            .where(BuildJob.stop_requested_at.is_(None))
+        )).scalars().all()
+        for job in rows:
+            try:
+                await _finalize_job(
+                    db, job.id, status="failed", outcome="lost",
+                    error_class="interrupted",
+                    user_message="This run was interrupted and did not "
+                                 "finish.",
+                )
+                n += 1
+            except Exception as e:  # noqa: BLE001 — next tick retries
+                await db.rollback()
+                logger.warning("[automations] stuck-run finalize failed "
+                               "run=%s: %s", job.id, e)
     if n:
         logger.info("[automations] terminalised %d stuck runs", n)
     return n

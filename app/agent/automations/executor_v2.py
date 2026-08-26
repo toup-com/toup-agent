@@ -606,6 +606,25 @@ async def _run_event_inner(
                             idem_prefix=f"evt:{event.id}")
 
 
+async def _finalize_on_cap(job_id: str) -> None:
+    """ND-7b: terminalize a cap-hit run on a FRESH session — the run's
+    own session was cancelled mid-flight by wait_for and may be wedged
+    in an open transaction; reusing it can hang or raise, which is how
+    the row stayed `running` forever (the R27 zombie class reborn)."""
+    from app.db.database import async_session_maker
+    try:
+        async with async_session_maker() as fresh:
+            await _finalize_job(
+                fresh, job_id, status="failed", outcome="run_cap",
+                error_class="timeout",
+                user_message="The run exceeded the 3-minute cap and was "
+                             "stopped.",
+            )
+    except Exception as e:  # noqa: BLE001 — the sweep is the backstop
+        logger.warning("[automations] cap finalize failed job=%s: %s",
+                       job_id[:8], e)
+
+
 async def run_schedule_fire_v2(
     db,
     automation: Automation,
@@ -614,6 +633,11 @@ async def run_schedule_fire_v2(
     fire_key: str,
     run_kind: str = "scheduled",
 ) -> str:
+    # ND-7b: the job is minted INSIDE the wait_for — the ref carries its
+    # id out so the cap handler can finalize (the old handler could not
+    # even name the job and returned with the row still `running`).
+    job_ref: dict = {}
+
     async def _inner() -> str:
         # §4.3: the next scheduled fire supersedes a still-stopped run —
         # its stop note was already written; no new turn.
@@ -639,6 +663,7 @@ async def run_schedule_fire_v2(
             steps_json=_new_steps_v2(vspec),
             layer=0,
         )
+        job_ref["id"] = job.id
         await on_run_created(db, job=job, automation=automation)
         await _advance_v2(db, job.id, vspec, "evaluate")
         from . import run_v3 as _rv3_open
@@ -651,8 +676,16 @@ async def run_schedule_fire_v2(
     try:
         return await asyncio.wait_for(_inner(), timeout=AUTOMATION_RUN_CAP_S)
     except asyncio.TimeoutError:
-        await _record_health(db, automation.id, ok=False,
-                             error="run cap exceeded")
+        logger.warning("[automations] run cap hit automation=%s fire=%s",
+                       automation.id, fire_key[:40])
+        if job_ref.get("id"):
+            await _finalize_on_cap(job_ref["id"])
+        try:
+            await _record_health(db, automation.id, ok=False,
+                                 error="run cap exceeded")
+        except Exception:  # noqa: BLE001 — the session may be wedged too
+            logger.warning("[automations] cap health record failed "
+                           "automation=%s", automation.id)
         return "failed"
 
 

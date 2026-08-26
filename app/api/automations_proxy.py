@@ -1010,3 +1010,23 @@ async def proxy_account_reconnect(
 ):
     return await _proxy_accounts(request, f"/{account_id}/reconnect",
                                  current_user=current_user, db=db)
+
+
+@router.post("/migrate-routines")
+async def proxy_migrate_routines(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/migrate-routines",
+                        current_user=current_user, db=db)
+
+
+@router.get("/migrate-routines/report")
+async def proxy_migrate_routines_report(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, "/migrate-routines/report",
+                        current_user=current_user, db=db)

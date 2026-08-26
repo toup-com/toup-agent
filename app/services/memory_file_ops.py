@@ -62,6 +62,7 @@ from app.memory_files import (
     is_valid_slug,
     parse_bullets,
     render_bullets,
+    _BULLET_LINE_RE,
     section_of_slug,
     slugify,
     title_from_slug,
@@ -606,6 +607,28 @@ def _secret_problem(text: str) -> Optional[str]:
     return None
 
 
+def _match_key(raw: Any) -> str:
+    """The bullet text a `match` refers to, normalised the SAME way the
+    stored bullets were parsed.
+
+    ND-8 (2026-08-25): `parse_bullets` stores bullet TEXT — the marker is
+    stripped at parse time — but `match` was only `.strip()`ed. The model
+    is shown the file body, so it naturally echoes the line as it reads
+    there ("- lives in Toronto"); that never equals the stored
+    "lives in Toronto", every rewrite/remove was refused with "no bullet
+    reads exactly …", and the contradiction silently lost: the corpus
+    still said Toronto after the user moved to Vancouver. A correction
+    that never lands makes "one memory" dishonest, so this tolerates the
+    marker instead of refusing the fact.
+
+    Strictly MORE permissive: a `match` that already matched still does.
+    """
+    text = raw.strip() if isinstance(raw, str) else ""
+    m = _BULLET_LINE_RE.match(text)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return text
+
 def validate_ops(
     raw_ops: Any,
     existing: Sequence[MemoryFile],
@@ -821,7 +844,7 @@ def validate_ops(
             state = _target("rewrite", op.get("slug"))
             if state is None or not _bullet_ops_allowed(state, "rewrite"):
                 continue
-            match = (op.get("match") or "").strip() if isinstance(op.get("match"), str) else ""
+            match = _match_key(op.get("match"))
             if match not in state.bullets:
                 complaints.append(
                     f"rewrite on {state.slug}: no bullet reads exactly "
@@ -849,7 +872,7 @@ def validate_ops(
             state = _target("remove", op.get("slug"))
             if state is None or not _bullet_ops_allowed(state, "remove"):
                 continue
-            match = (op.get("match") or "").strip() if isinstance(op.get("match"), str) else ""
+            match = _match_key(op.get("match"))
             if match not in state.bullets:
                 complaints.append(
                     f"remove on {state.slug}: no bullet reads exactly {match!r}"
