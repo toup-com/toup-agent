@@ -46,6 +46,21 @@ async def _flag_on():
         await feature_flags.set_rollout_pct(db, "automations", 100)
 
 
+async def _flag_off():
+    """The kill switch, set EXPLICITLY.
+
+    `test_dark_launch_every_route_404s` used to inherit the ambient
+    default, so it was a test of the default rather than of the gate —
+    and it went red the day automations launched, on a day the gate
+    itself had not changed. What is worth proving is that setting 0
+    still closes every route, and that survives the feature launching.
+    """
+    from app.services import feature_flags
+    async with async_session_maker() as db:
+        await feature_flags.set_rollout_pct(db, "automations", 0)
+        await feature_flags.set_allowlist(db, "automations", [])
+
+
 async def _mk_agent_config(user_id: str) -> str:
     key = f"agent-key-{uuid.uuid4().hex}"
     async with async_session_maker() as db:
@@ -81,6 +96,7 @@ async def _mk_pending_grant(user_id: str, **over) -> str:
 
 @pytest.mark.asyncio
 async def test_dark_launch_every_route_404s(client, auth_headers):
+    await _flag_off()
     r = await client.get("/api/automations/templates", headers=auth_headers)
     assert r.status_code == 404
     r = await client.get("/api/automations/grant-requests/nope",

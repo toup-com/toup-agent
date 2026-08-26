@@ -1274,11 +1274,25 @@ class Settings(BaseSettings):
     # `automation_poll`/`automation_schedule`, the trigger action
     # `run_automation`, the outbox flush + reconcile sweeps, and every
     # /api/automations route (404 when off, mirroring routines kinds).
-    # Default False ⇒ zero behavior change: the skill never registers,
-    # so the provider tools array — and with it the cached prompt
-    # prefix — stays byte-identical to today. The platform-side twin is
-    # `automations_rollout_pct` (frontend surface gating).
-    automations_enabled: bool = False
+    # LAUNCHED 2026-08-26, at the founder's instruction ("automations
+    # should work with any user's account"). This was False for the dark
+    # launch, and the platform wrote `AUTOMATIONS_ENABLED=true` into a
+    # tenant's env only when it resolved that tenant as flagged-on — so
+    # every container provisioned while the flag was dark has the engine
+    # OFF and would need an env re-push to light it.
+    #
+    # `resync-env` is that re-push and it carries a standing instruction
+    # not to run it fleet-wide: it re-provisions containers, and a
+    # recreate kills whatever that tenant's agent was mid-way through
+    # (R31-42, still open). Flipping the DEFAULT reaches every tenant on
+    # the next ordinary image rollout instead, with no special operation
+    # and nothing recreated out of band.
+    #
+    # The cost this pays, stated because the old comment promised the
+    # opposite: the skill now registers for everyone, so the provider
+    # tools array changes and the cached system-prompt prefix is busted
+    # ONCE. That is inherent to launching the feature, not a regression.
+    automations_enabled: bool = True
 
     # CONTRACTS-R31 §4.1: refuse a chat-socket `message` frame addressed
     # to an automation's conversation (`use_thread_route`). OFF by
@@ -2092,10 +2106,21 @@ class Settings(BaseSettings):
     # surface (Activity page, card rendering, template suggestions) on
     # the web/app clients. Same storage model as the flags above: this
     # is the fresh-deploy floor, `platform_settings` the runtime
-    # override, buckets stable across the ramp. DEFAULT 0 IS THE DARK
-    # LAUNCH — pair with the agent-side `automations_enabled` bool
-    # (also default off) for the engine itself.
-    automations_rollout_pct: int = 0
+    # override, buckets stable across the ramp.
+    #
+    # LAUNCHED 2026-08-26 at the founder's instruction. 100 ⇒
+    # `is_enabled_for` returns True for every seed, "including anonymous
+    # visitors mid-signup", so the surface is on for every user we have
+    # and every user we get. Paired with the agent-side
+    # `automations_enabled` above — BOTH are required, and the platform
+    # gate alone only gets a request as far as a tenant whose engine is
+    # still dark.
+    #
+    # NOTE: this is the FLOOR. `get_rollout_pct` returns a
+    # `platform_settings` row when one exists and only falls back here
+    # when it does not, so an operator who has explicitly written a
+    # value still wins — which is the right way round for a kill switch.
+    automations_rollout_pct: int = 100
 
     # ── Provisioning bridge (Phase 3, replaces SSH-as-root) ───────
     # mTLS-secured FastAPI service on the VPS. Platform talks to it with a

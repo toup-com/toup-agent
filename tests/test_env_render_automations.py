@@ -82,11 +82,20 @@ async def test_automations_env_flag_reads_the_real_allowlist():
     allowlisted user ON at pct 0, everyone else dark."""
     from app.api.agent_setup import _automations_env_flag
     from app.db.database import async_session_maker
-    from app.services.feature_flags import set_allowlist
+    from app.services.feature_flags import (
+        get_rollout_pct, set_allowlist, set_rollout_pct,
+    )
 
     listed = str(uuid.uuid4())
     unlisted = str(uuid.uuid4())
     async with async_session_maker() as db:
+        # "at pct 0" is the claim, so the test SETS pct 0 rather than
+        # inheriting it. It used to read the ambient default, which made it
+        # a test of the default rather than of the gate — and it went red
+        # the day automations launched (default 100), on a day the gate
+        # itself had not changed at all.
+        before = await get_rollout_pct(db, "automations")
+        await set_rollout_pct(db, "automations", 0)
         await set_allowlist(db, "automations", [listed])
         await db.commit()
     try:
@@ -95,6 +104,7 @@ async def test_automations_env_flag_reads_the_real_allowlist():
     finally:
         async with async_session_maker() as db:
             await set_allowlist(db, "automations", [])
+            await set_rollout_pct(db, "automations", before)
             await db.commit()
 
 

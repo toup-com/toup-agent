@@ -38,8 +38,10 @@ async def _mk_user() -> str:
 
 @pytest.mark.asyncio
 async def test_skill_withheld_while_flag_off(monkeypatch):
+    """Both directions, each SET explicitly. The off-leg used to read the
+    ambient default, so it tested the default rather than the switch."""
     from app.agent.tool_entitlements import skill_enabled
-    assert getattr(settings, "automations_enabled", False) is False
+    monkeypatch.setattr(settings, "automations_enabled", False)
     assert skill_enabled("automations") is False
     monkeypatch.setattr(settings, "automations_enabled", True)
     assert skill_enabled("automations") is True

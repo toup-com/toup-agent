@@ -270,12 +270,25 @@ async def test_auto_pause_after_three_failures_posts_one_notice():
 
 
 @pytest.mark.asyncio
-async def test_flag_off_keeps_routine_kinds_dark():
+async def test_flag_off_keeps_routine_kinds_dark(monkeypatch):
+    """The KILL SWITCH, not the default.
+
+    This asserted `automations_enabled is False` on the ambient settings,
+    so it was a test of what the default happened to be — and it went red
+    the day automations launched, on a day `_kind_enabled` had not
+    changed. What is worth proving is that turning the flag OFF still
+    stops the routine kinds firing, and that survives the launch.
+    """
     from app.agent.routines.runner import RoutineRunner
     from app.config import settings
-    assert getattr(settings, "automations_enabled", False) is False
+    monkeypatch.setattr(settings, "automations_enabled", False)
     assert RoutineRunner._kind_enabled("automation_poll", settings) is False
     assert RoutineRunner._kind_enabled("automation_schedule", settings) is False
+    # And ON, so the assertion above cannot pass because the predicate
+    # always answers False.
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    assert RoutineRunner._kind_enabled("automation_poll", settings) is True
+    assert RoutineRunner._kind_enabled("automation_schedule", settings) is True
 
 
 @pytest.mark.asyncio
