@@ -181,7 +181,13 @@ def _spec_for(routine: Routine) -> dict:
     return {
         "version": 2,
         "name": (routine.name or "").strip() or DEFAULT_NAME,
-        "description": "Migrated from the email briefing routine.",
+        # R31-32. This read "Migrated from the email briefing routine."
+        # on the founder's Automations page — our word for our own
+        # plumbing, in the place the user reads what their automation
+        # DOES. It also told them nothing: every migrated automation
+        # wore the same sentence. This one reads unread Gmail from the
+        # last day and tells them what is in it, so it says that.
+        "description": "Reads your unread mail and tells you what is in it.",
         "mode": "auto",
         "trigger": {
             "sources": [

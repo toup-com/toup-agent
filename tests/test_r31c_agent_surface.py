@@ -67,6 +67,64 @@ async def test_the_test_path_is_refused_at_the_door_too(monkeypatch):
     assert "STAGED" not in out
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,detail,expect_display,forbid", [
+    (404, "Not found", None, "STAGED"),
+    (409, {"code": "already_running",
+           "sentence": "It is running now — step 2 of 5."},
+     "It is already running", "Already running"),
+    (409, {"code": "v1_not_supported",
+           "sentence": "This automation predates run-now."},
+     "Could not start the run", "paused"),
+])
+async def test_every_run_refusal_is_reported_as_itself(
+    monkeypatch, status, detail, expect_display, forbid,
+):
+    """The handler calls the same route the Run it now button calls, so
+    every refusal the UI can meet reaches the model here. None of them
+    may come back as a STATUS — reporting one instead of running is the
+    whole of R31-04.
+    """
+    from fastapi import HTTPException
+
+    import app.api.automations as api
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+
+    async def refuse(_automation_id):
+        raise HTTPException(status_code=status, detail=detail)
+
+    monkeypatch.setattr(api, "run_now", refuse)
+    out = await AutomationsSkill().execute_tool(
+        "automations__run_now", {"automation_id": "a-1"}, _ctx(),
+    )
+    assert getattr(out, "display", None) == expect_display
+    assert forbid not in str(out)
+
+
+@pytest.mark.asyncio
+async def test_a_started_run_tells_the_model_to_say_one_line(monkeypatch):
+    """"I ran the work brief again. Its status is **paused**. This
+    re-run is staged to post…" — the model narrating a run it did not
+    watch. The run reports itself in its own thread; a summary here is
+    a second account of the same run that will disagree with the first.
+    """
+    import app.api.automations as api
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+
+    async def fired(_automation_id):
+        return {"fired": True, "status": "running"}
+
+    monkeypatch.setattr(api, "run_now", fired)
+    out = await AutomationsSkill().execute_tool(
+        "automations__run_now", {"automation_id": "a-1"}, _ctx(),
+    )
+    assert out.display == "Started the run"
+    assert "one short line" in str(out)
+    assert "what it found" in str(out)
+
+
 def test_the_prompt_routes_every_run_phrasing_to_the_engine():
     prompt = AutomationsSkill().get_system_prompt_section()
     assert prompt
@@ -96,6 +154,30 @@ def test_no_prompt_surface_teaches_the_words_the_user_must_not_read():
     prompt = AutomationsSkill().get_system_prompt_section() or ""
     for banned in ("undo window", "TEST RUN"):
         assert banned not in prompt, banned
+
+
+def test_the_hard_rules_promise_only_what_the_engine_actually_does():
+    """These are promises made to a user about the engine's behaviour,
+    so each must be true of the engine as it IS.
+
+    A draft of this section deleted "3 failures in a row pauses the
+    automation" — which is true today (`sweep._sweep_auto_pause`,
+    AUTOMATION_AUTO_PAUSE_FAILURES = 3) — and replaced it with "one
+    broken account never pauses an automation and never stops a run",
+    which is R31 §4.2a's intent and not yet the code: `on_error` still
+    defaults to "fail" and a failed read step finalizes the run as
+    failed. Telling a user their automation cannot be paused by a
+    broken account, and having it paused that afternoon, is worse than
+    saying nothing.
+    """
+    prompt = AutomationsSkill().get_system_prompt_section() or ""
+    assert "3 failed runs in a row pause the automation" in prompt
+    assert "never pauses an automation" not in prompt
+
+    # And the claim is still true of the code that makes it true.
+    from app.config import settings as _s
+    assert int(getattr(_s, "AUTOMATION_AUTO_PAUSE_FAILURES", 0) or
+               getattr(_s, "automation_auto_pause_failures", 3)) == 3
 
 
 # ---------------------------------------------------------------- R31-28
@@ -226,8 +308,15 @@ def test_the_thread_persona_orders_a_failure_account_reason_fix():
     assert "which account, the real reason, and what fixes it" in section
     assert "the organisation has not approved Toup yet" in section
     assert 'Never "an account"' in section
-    # One broken account never stops the rest (R31-12).
-    assert "never stops the rest" in section
+    # An honest unknown beats an inferred cause.
+    assert "I could not tell why" in section
+    # The agent's OWN reading continues past a broken account — but the
+    # persona must not promise anything about what a SCHEDULED run
+    # does, because `on_error` still defaults to "fail" and three failed
+    # runs auto-pause. A draft of this said "one broken account never
+    # pauses an automation"; that is §4.2a's intent, not the code.
+    assert "That is about your own reading" in section
+    assert "never pauses an automation" not in section
 
 
 def test_the_thread_persona_makes_a_fresh_question_a_run():
@@ -415,6 +504,34 @@ def test_any_failed_source_gets_failure_rules_whatever_the_status(status):
     assert _ORG in prompt, status
 
 
+def test_a_question_run_is_answered_not_ranked():
+    """R31-08 / §4.9. The founder asked for "everything latest in all
+    chanels" and got 40 s of a loading pill and then prose — no job
+    card, no per-account rows, and Teams named although it is not on
+    that automation's canvas (E-38).
+
+    A question run carries no result turn: the answer IS the result,
+    and a ranked five-tier brief for "what is the latest in Gmail"
+    would be the changes-vocabulary mistake in another costume.
+    `_validate_result` already exempts this run kind; it had no shape
+    to be narrated into.
+    """
+    from app.agent.automations import narrator
+
+    prompt = narrator.build_prompt(_record("completed", run_kind="question"))
+    assert "NO result turn" in prompt
+    assert "ONE short paragraph per account" in prompt
+    assert "DO FIRST" not in prompt          # the brief's tiers
+    assert "CHANGED YOUR WEEK" not in prompt  # the changes tiers
+    # A count the user cannot check is the thing being fixed.
+    assert "must be a count you actually got back" in prompt
+    # And an unread account is named, not omitted.
+    assert "a silent omission reads as" in prompt
+
+    ranked = narrator.build_prompt(_record("completed"))
+    assert "DO FIRST" in ranked, "a scheduled brief is still ranked"
+
+
 def test_a_run_with_no_failed_source_gets_no_failure_rules():
     from app.agent.automations import narrator
 
@@ -424,7 +541,7 @@ def test_a_run_with_no_failed_source_gets_no_failure_rules():
     assert "SOME SOURCES FAILED" not in prompt
 
 
-def test_the_narrator_is_told_to_quote_the_reason_not_reword_it():
+def test_a_real_reason_is_quoted_verbatim():
     """§4.4: the narration quotes `thread_sentence` verbatim and adds
     at most one sentence. A paraphrase moves the fix — "it did not
     answer" sends the user to wait, when what they must do is ask an
@@ -433,10 +550,52 @@ def test_the_narrator_is_told_to_quote_the_reason_not_reword_it():
 
     prompt = narrator.build_prompt(_record("partial"))
     assert "EXACTLY AS GIVEN" in prompt
-    assert "Do not reword it" in prompt
+    assert "do not reword it" in prompt
     assert 'never "an account"' in prompt
     # And the zero that is not a zero (E-41).
     assert "never report a failed read as a count of zero" in prompt
+
+
+def test_a_fragment_is_never_mandated_as_the_cause():
+    """The fix that would have made things worse.
+
+    `failure_reason` is DOCUMENTED as the string table's
+    `thread_sentence`, but its only producer today is `executor_v2`
+    writing `turn["detail"]` — the verb dictionary's short fragment —
+    and `_failure_reason` does not recognise `org_approval_needed` at
+    all, so the exact GitHub case this was written for arrives as "it
+    did not answer".
+
+    An unconditional "quote it verbatim" would therefore MANDATE the
+    vague answer the block exists to prevent: the model could
+    previously improvise its way to the true reason, and would now be
+    forbidden from doing anything but repeating the wrong one. So the
+    instruction is conditional on what was actually supplied.
+    """
+    from app.agent.automations import narrator
+
+    record = _record("partial")
+    record["steps"][1]["failure_reason"] = "it did not answer"
+    prompt = narrator.build_prompt(record)
+
+    assert "EXACTLY AS GIVEN" not in prompt
+    assert "not diagnoses" in prompt
+    assert "do NOT supply a cause of your own" in prompt
+    assert "say you do not know why" in prompt
+
+
+def test_an_unknown_failure_says_so_instead_of_naming_a_cause():
+    """`_failure_reason` returns "unreachable" for anything it does not
+    recognise, which fell through to the default ("Could not connect",
+    "it did not answer") — so "we do not know why" was rendered as a
+    specific diagnosis, and the user was sent to wait for a service
+    that was answering perfectly well."""
+    from app.services import automation_verbs as verbs
+
+    assert verbs.failure_action("github", "unreachable") == {
+        "action": "Could not reach GitHub",
+        "detail": "I could not tell why",
+    }
 
 
 # ---------------------------------------------------- R31-18 · rules

@@ -170,9 +170,18 @@ def _description_of(
         return ("Paused. It keeps its setup and will not run until you "
                 "resume.")
     if status == "needs_attention":
-        who = expired_name or "An account"
-        return (f"{who} refused the token. Nothing was missed — reconnect "
-                "and it picks up where it stopped.")
+        # R31-07. This was `who = expired_name or "An account"`, so a
+        # card whose whole job is to say which account needs the user
+        # said "An account refused the token." — nobody named, and in
+        # our words rather than theirs ("refused the token" is not what
+        # an expiry looks like from the outside). When the name is not
+        # known we say nothing rather than inventing an account: the
+        # status pill already carries the state, and a description that
+        # names no one is worth less than the sentence that says what
+        # the automation does.
+        if expired_name:
+            return (f"{expired_name} needs you. Nothing was missed — fix "
+                    "it and it picks up where it stopped.")
     return base
 
 

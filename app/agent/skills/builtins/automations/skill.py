@@ -519,13 +519,28 @@ class AutomationsSkill(Skill):
             "itself in its own thread, and anything you add here is a "
             "second account of the same run that will disagree with "
             "the first.\n"
+            # These are promises made to a user about what the engine
+            # will do, so every one of them has to be true of the
+            # engine as it is now — not as the round intends it. The
+            # three-strike rule is restored because it IS true today
+            # (`sweep._sweep_auto_pause`, AUTOMATION_AUTO_PAUSE_FAILURES
+            # = 3), and a draft of this section had replaced it with
+            # "one broken account never pauses an automation and never
+            # stops a run", which is R31 §4.2a's intent and not yet the
+            # code: `on_error` still defaults to "fail" (spec_v2.py) and
+            # a failed read step finalizes the run as failed. Telling a
+            # user their automation cannot be paused by a broken account
+            # and then having it paused that afternoon is worse than
+            # saying nothing. When §4.2a lands, this sentence changes
+            # with it — not before.
             "Hard rules you must repeat to the user when relevant: "
             "checks run at most every 5 minutes; runs are capped at 3 "
-            "minutes; email automations can only create DRAFTS, never "
-            "send; every write is undoable for ~6 seconds after it "
-            "fires. One broken account never pauses an automation and "
-            "never stops a run — the rest is read, and the broken one "
-            "is reported by name with its reason and its fix.\n"
+            "minutes; 3 failed runs in a row pause the automation; "
+            "email automations can only create DRAFTS, never send; "
+            "every write is undoable for ~6 seconds after it fires. "
+            "When one of its accounts is broken, name that account, "
+            "say the real reason, and say what fixes it — never leave "
+            "the user to guess which one it was.\n"
             "A card tool's answer is NOT the outcome — after emitting a "
             "card, end your turn and tell the user you're waiting on "
             "them.\n"

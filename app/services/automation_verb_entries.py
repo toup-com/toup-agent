@@ -62,6 +62,16 @@ COMMON_FAILURES: dict[str, dict[str, str]] = {
     "vendor_down": {"action": "Could not reach {name}", "detail": "it did not answer"},
     "timeout": {"action": "Could not reach {name}",
                 "detail": "it did not answer in time"},
+    # `executor_v2._failure_reason` recognises five tokens in the RPC
+    # error and returns "unreachable" for everything else — including
+    # `org_approval_needed`, the exact case R31-07 was written for.
+    # Without an entry of its own that fell through to
+    # `_V2_FAILURE_DEFAULT` ("Could not connect", "it did not answer"),
+    # so "we do not know why" was rendered as a specific diagnosis, and
+    # the user was sent to wait for a service that was answering fine.
+    # An honest unknown is worth more than a confident wrong cause.
+    "unreachable": {"action": "Could not reach {name}",
+                    "detail": "I could not tell why"},
 }
 
 ENTRIES: dict[str, dict] = {

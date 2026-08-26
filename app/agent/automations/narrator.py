@@ -342,18 +342,82 @@ stopped.")."""
 #: wait and try again, when what they must do is ask an owner to
 #: approve an OAuth app.
 _FAILED_SOURCE_RULES = """\
-SOME SOURCES FAILED. For each step with ok=false, write one line that \
-uses its failure_reason EXACTLY AS GIVEN — it is already the sentence \
-the product uses everywhere else for that problem, and the user will \
-see the same words on the account's own card. Do not reword it, do not \
-shorten it, do not soften it, and never replace a reason you were given \
-with a vaguer one: "it did not answer" is what you say when a service \
-did not answer, not when you were told the access expired or that an \
-organisation has not approved us. You may add at most one sentence of \
-your own around it. Name the account every time — never "an account". \
-Say plainly what is missing from this run because of it. A source that \
-failed produced NO items: never report a failed read as a count of \
-zero, and never let a tier imply the account was read and empty."""
+SOME SOURCES FAILED. For each step with ok=false, write one line naming \
+the account and what is missing from this run because of it. Name the \
+account every time — never "an account". A source that failed produced \
+NO items: never report a failed read as a count of zero, and never let \
+a tier imply the account was read and empty."""
+
+#: Appended only when the supplied reasons are full sentences.
+_QUOTE_THE_REASON = """\
+Each reason below is the sentence the product uses everywhere else for \
+that problem — the user will see the same words on the account's own \
+card. Use it EXACTLY AS GIVEN: do not reword it, do not shorten it, do \
+not soften it. You may add at most one sentence of your own around it."""
+
+#: Appended when they are not.
+#:
+#: This distinction is the whole of the fix, and getting it wrong makes
+#: things WORSE than before. `failure_reason` is documented as the
+#: string table's `thread_sentence`, but its only producer today is
+#: `executor_v2` writing `turn["detail"]` — the verb dictionary's short
+#: fragment — and `_failure_reason` does not recognise
+#: `org_approval_needed` at all, so the exact GitHub case this was
+#: written for arrives as "it did not answer". An unconditional "quote
+#: it verbatim" would therefore MANDATE the vague answer the block
+#: exists to prevent: the model could previously improvise its way to
+#: the true reason, and would now be forbidden from doing anything but
+#: repeating the wrong one. So the instruction is conditional on what
+#: was actually supplied, and when the reason is a fragment the model
+#: is told to be honest about not knowing rather than to dress it up.
+_DO_NOT_INVENT_A_REASON = """\
+The reasons below are short fragments, not full sentences, and some of \
+them mean only "this did not work" — they are not diagnoses. Say which \
+account failed and that you could not read it. Do NOT present a \
+fragment as the cause, and do NOT supply a cause of your own: saying \
+"the access expired" or "the service was down" when you were not told \
+that is a guess the user will act on. If you do not know why, say you \
+do not know why and that you will find out."""
+
+
+def _looks_like_a_sentence(text) -> bool:
+    """A supplied reason is quotable only if it IS a sentence.
+
+    The fragments the dictionary produces ("it did not answer",
+    "access expired") are lower-case clauses; a `thread_sentence`
+    starts with a capital and ends in a full stop.
+    """
+    s = str(text or "").strip()
+    return len(s) > 25 and s[:1].isupper() and s.endswith(".")
+
+
+#: R31-08 / §4.9 — the shape of a QUESTION run's narration.
+#:
+#: A question the user asks in the thread that needs fresh reading is a
+#: run, not a paragraph the model composes from memory. On 26 August the
+#: founder asked for "everything latest in all chanels" and got forty
+#: seconds of a loading pill and then prose: no job card, no per-account
+#: rows, counts nobody could check, and Teams named although it is not
+#: on that automation's canvas.
+#:
+#: There is no result turn — the answer IS the result, and a ranked
+#: five-tier brief for "what is the latest in Gmail" would be the
+#: `changes`-vocabulary mistake in another costume. `_validate_result`
+#: already exempts this run kind from requiring one.
+_QUESTION_RULES = """\
+The user asked a question in the thread and you read to answer it. NO \
+result turn — the answer itself is the result, and a ranked brief here \
+would be an answer to a question nobody asked.
+
+Open with one line saying how many accounts you are about to look at. \
+Then answer: ONE short paragraph per account, naming the account, in \
+the order you read them. Every count you state must be a count you \
+actually got back from that account's step — if a step returned three \
+threads, do not write "a few". Nothing you did not read may appear: not \
+an account the automation does not have, not a name the user mentioned \
+once, not a source that would round the answer out. If an account was \
+not read, say so in its own paragraph rather than leaving it out — a \
+silent omission reads as "nothing there"."""
 
 
 def build_prompt(record: dict) -> str:
@@ -361,7 +425,9 @@ def build_prompt(record: dict) -> str:
     status = record.get("status") or "completed"
     title = (record.get("automation") or {}).get("title") or "this automation"
 
-    if status == "failed":
+    if record.get("run_kind") == "question":
+        shape = _QUESTION_RULES
+    elif status == "failed":
         shape = _FAILED_RULES
     elif vocabulary == "changes":
         shape = _CHANGES_RULES
@@ -387,16 +453,25 @@ def build_prompt(record: dict) -> str:
     ]
     if failed_steps:
         parts.append(_FAILED_SOURCE_RULES)
-        parts.append(
-            "The reasons to use, verbatim: " + " · ".join(
-                f"{s.get('connector_name') or s.get('account_id')}: "
-                f"{s.get('failure_reason')}"
-                for s in failed_steps if s.get("failure_reason")
+        reasons = [
+            (s.get("connector_name") or s.get("account_id") or "that account",
+             s.get("failure_reason"))
+            for s in failed_steps if s.get("failure_reason")
+        ]
+        if reasons:
+            quotable = all(_looks_like_a_sentence(r) for _, r in reasons)
+            parts.append(
+                _QUOTE_THE_REASON if quotable else _DO_NOT_INVENT_A_REASON
             )
-        )
+            parts.append(
+                ("The reasons, to use as they are: " if quotable
+                 else "What came back, which is all you know: ")
+                + " · ".join(f"{who}: {reason}" for who, reason in reasons)
+            )
     parts += [
         "Emit turns in §order: agent opening → one annotate per step (whys "
-        "for every item and message) → result (unless failed) → think per "
+        "for every item and message) → result (unless failed, or unless "
+        "this is a question run) → think per "
         "judgement call → draft if an answer is owed → agent close. A "
         "draft turn MUST carry target_account_id (the account the draft "
         "waits in) and target_ref; emit a draft only when the run's work "

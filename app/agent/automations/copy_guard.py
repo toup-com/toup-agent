@@ -41,7 +41,13 @@ BANNED_PHRASES: tuple[str, ...] = (
     "re-authentication",
     "In progress",
     # R31 §4.3(7) — each one was read off a founder's screen on 26 August.
+    # Both cases: matching is case-SENSITIVE, so banning only the
+    # lower-case form left `"An account refused the token."` — the home
+    # card's own needs-you sentence — passing the guard that existed to
+    # stop exactly it. A sentence-initial noun phrase is the likeliest
+    # place for this defect, not the least.
     "an account",
+    "An account",
     "Reasoned it through",
     "Reasoned over gathered sources",
     "TEST RUN",
