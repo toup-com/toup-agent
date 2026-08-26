@@ -447,9 +447,38 @@ class TestToolsWireHash:
         grown = [{**TOOLS[0], "input_schema": {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}}}]
         assert tools_wire_hash(with_schema) != tools_wire_hash(grown)
 
+    def test_same_length_schema_edit_changes_hash(self):
+        """The detector's one blind spot, closed.
+
+        It hashed the schema's serialized LENGTH, so two different
+        schemas of equal length collided and `tools_array_change` stayed
+        silent while the wire bytes — and the provider's cached prefix —
+        had moved. A schema edit is exactly what this fingerprint exists
+        to catch, and it was the shape it could not see.
+        """
+        base = [{**TOOLS[0], "input_schema": {
+            "type": "object", "properties": {"query": {"type": "string"}}}}]
+        # Same serialized LENGTH, different schema — a renamed property.
+        renamed_prop = [{**TOOLS[0], "input_schema": {
+            "type": "object", "properties": {"quero": {"type": "string"}}}}]
+        # Same serialized LENGTH, different schema — a retyped property.
+        retyped = [{**TOOLS[0], "input_schema": {
+            "type": "object", "properties": {"query": {"type": "number"}}}}]
+
+        import json as _json
+        lens = {len(_json.dumps(t[0]["input_schema"], sort_keys=True))
+                for t in (base, renamed_prop, retyped)}
+        assert len(lens) == 1, (
+            f"fixture must hold length constant to pin the collision: {lens}")
+
+        assert tools_wire_hash(renamed_prop) != tools_wire_hash(base)
+        assert tools_wire_hash(retyped) != tools_wire_hash(base)
+
     def test_description_only_change_does_not_change_hash(self):
         # Descriptions aren't part of the fingerprint (by design — the
-        # hash serializes names + schema lengths only, per the spec).
+        # hash serializes names + schemas only). A description edit DOES
+        # bust the provider's real prefix; `head_hashes` is what
+        # attributes that, and this stays the array-shape detector.
         a = [{**TOOLS[0], "description": "one"}]
         b = [{**TOOLS[0], "description": "two"}]
         assert tools_wire_hash(a) == tools_wire_hash(b)

@@ -122,9 +122,15 @@ def notification_body(kind: str, run_summary: dict) -> str:
             "Open the newer run to see what happened."
         )
     if status == "skipped":
+        # `skipped` covers BOTH "the user declined/let it expire"
+        # (confirm.py maps rejected AND expired to cancelled+skipped) and
+        # "there was nothing to do". Claiming the second at a user who
+        # just tapped "Not now" contradicts the run's own note, so this
+        # stays neutral; the engine prefers the run's recorded sentence
+        # when it has one.
         return (
-            "There was nothing to do this time. "
-            "Open the run to see what it checked."
+            "It ended without making any changes. "
+            "Open the run to see why."
         )
 
     if vocabulary == "changes":

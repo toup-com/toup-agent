@@ -159,10 +159,29 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             checkpoint = ledger.checkpoint_of(last) or {}
             if v3 == "stopped_by_user":
                 step = int(checkpoint.get("step_index") or step)
-            sentence = (
-                f"Paused at step {max(step, 1)}."
-                if v3 == "stopped_by_user" else "Working now"
-            )
+            if v3 == "stopped_by_user":
+                # §3.2's stopped sentence is TWO clauses, and the second
+                # is the point of it: a run the user stopped has to say
+                # whether anything went out before it stopped. This
+                # emitted "Paused at step 6." alone, so the one question
+                # a stop raises — did it already do something? — was the
+                # one the card would not answer. R30-B caught it on the
+                # first live render of the founder's home.
+                #
+                # §4.3 already requires the stop note to carry the honest
+                # writes count, so the number is in the ledger; the card
+                # just was not reading it.
+                from .run_v3 import writes_count as _writes_count
+                n_writes = await _writes_count(db, last.id)
+                if n_writes == 0:
+                    made = "Nothing was sent."
+                elif n_writes == 1:
+                    made = "1 change already made."
+                else:
+                    made = f"{n_writes} changes already made."
+                sentence = f"Paused at step {max(step, 1)}. {made}"
+            else:
+                sentence = "Working now"
             run_in_flight = {
                 "run_id": last.id,
                 "kind": ledger.run_kind_of(last),

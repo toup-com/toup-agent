@@ -282,12 +282,28 @@ def _run_summary(
         "writes_count": db_writes,
         "failed_connector_name": failed_connector_name,
         "automation_name": automation.name,
+        # The run already recorded WHY it ended this way (confirm.py
+        # stamps SKIPPED_REJECTED_COPY / SKIPPED_EXPIRED_COPY). A table
+        # that re-derives a reason from the status alone can only be
+        # wrong where the status covers more than one story.
+        "user_message": (getattr(job, "user_message", "") or ""),
     }
 
 
 def _notification_body(kind: str, summary: dict) -> str:
     """C's seam, with an A-owned fallback. Never a finding — the count
     of things that need the user + the invitation to open the run."""
+    # BEFORE the template seam, deliberately. `run_v3_status` returns
+    # `skipped` for BOTH "the user declined" and "there was nothing to
+    # do" — confirm.py maps rejected AND expired to (cancelled, skipped)
+    # — so no table keyed on status alone can get both right. When the
+    # run recorded its own reason (confirm.py stamps
+    # SKIPPED_REJECTED_COPY / SKIPPED_EXPIRED_COPY onto the job), that
+    # sentence IS the body, and it outranks any generic line. Placed
+    # after the seam this lost to the table every time.
+    said = str(summary.get("user_message") or "").strip()
+    if (summary.get("status") or "") == "skipped" and said:
+        return said[:500]
     try:
         from .notification_templates import notification_body
         body = notification_body(kind, summary)
@@ -318,8 +334,11 @@ def _notification_body(kind: str, summary: dict) -> str:
         return ("A newer run replaced this one. Open the newer run for "
                 "what happened.")
     if status == "skipped":
-        return ("There was nothing to do this time — open the run to see "
-                "what it checked.")
+        # Neutral on purpose: this is the fallback for a skipped run that
+        # recorded no reason, and "nothing to do" is only one of the two
+        # stories `skipped` covers.
+        return ("It ended without making any changes — open the run to "
+                "see why.")
     if status == "running":
         return "It is working now — open the run to watch."
     lead = "It got part of the way." if status == "partial" \
@@ -514,7 +533,7 @@ async def _notify_terminal(
     """Terminal: fill the run notification's body (same string on card,
     push and LA), flip the card, push completed-only, end the LA."""
     await _notify_state(db, automation=automation, job=job, v3=v3,
-                        fraction=100)
+                        fraction=100, push=True)
 
 
 async def on_parked(db: AsyncSession, *, job_id: str) -> None:
@@ -547,8 +566,15 @@ async def on_parked(db: AsyncSession, *, job_id: str) -> None:
         total = int(job.progress_total or 0)
         step = int(job.progress_step or 0)
         pct = int(round(100 * step / total)) if total else 0
+        # push=False: `_park_run_on_card`'s caller already sends the
+        # needs_approval banner on the very next line
+        # (outbox.py:190 `_notify_needs_approval`). Pushing here too gave
+        # the user TWO banners for one park, with two different texts and
+        # two different dedup keys, so the dispatcher could not collapse
+        # them. The park's missing half was the LEDGER ROW and the CARD,
+        # never the push.
         await _notify_state(db, automation=automation, job=job, v3=v3,
-                            fraction=pct)
+                            fraction=pct, push=False)
         await ledger.emit_progress(
             automation.user_id, run_id=job.id, automation_id=automation.id,
             step=step, total=total,
@@ -561,7 +587,7 @@ async def on_parked(db: AsyncSession, *, job_id: str) -> None:
 
 async def _notify_state(
     db: AsyncSession, *, automation: Automation, job: BuildJob, v3: str,
-    fraction: int,
+    fraction: int, push: bool = True,
 ) -> None:
     """One notification pipeline for every state that has a card."""
     cfg = ledger._cfg_of(job)
@@ -601,17 +627,36 @@ async def _notify_state(
     await _write_chat_card(db, automation=automation, row=row)
 
     if v3 == "waiting_on_user":
-        needs_row = await _mint_notification(
-            db, automation=automation, job=job,
-            kind="automation_needs_you", thread_id=thread_id,
-            status=v3, body=body,
-        )
+        # Look BEFORE minting. `automation_needs_you` is under
+        # UniqueConstraint(run_id, kind), and a run can park more than
+        # once — a confirm-mode spec stages one outbox row per write
+        # step, so the second park hits the constraint. `_mint_notification`
+        # absorbs that with `await db.rollback()`, but this session is the
+        # OUTBOX's, and rolling it back underneath the caller is not a
+        # local event. Selecting first keeps the repeat park on the quiet
+        # path instead of the exception one.
+        needs_row = (
+            await db.execute(
+                select(AutomationNotification).where(
+                    AutomationNotification.run_id == job.id,
+                    AutomationNotification.kind == "automation_needs_you",
+                )
+            )
+        ).scalar_one_or_none()
+        if needs_row is None:
+            needs_row = await _mint_notification(
+                db, automation=automation, job=job,
+                kind="automation_needs_you", thread_id=thread_id,
+                status=v3, body=body,
+            )
         if needs_row is not None and needs_row.body != body:
             needs_row.body = body
             await db.commit()
 
     # Push + LA end — completed-only for the OS banner (the R28
     # invariant), the LA end for every terminal so no card goes stale.
+    if not push:
+        return
     try:
         from app.services.agent_notify_client import notify
         event_kind = "mission_completed" if v3 in (

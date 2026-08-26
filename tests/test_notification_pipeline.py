@@ -216,7 +216,11 @@ async def test_notification_body_is_total_over_the_v3_statuses():
         assert "Nothing needs you" not in bodies[status]
     assert "stopped it" in bodies["stopped_by_user"]
     assert "newer run" in bodies["superseded"]
-    assert "nothing to do" in bodies["skipped"]
+    # `skipped` must NOT claim "nothing to do": confirm.py maps BOTH
+    # rejected and expired to (cancelled, skipped), so that line lands on
+    # a user who just tapped "Not now".
+    assert "nothing to do" not in bodies["skipped"]
+    assert "without making any changes" in bodies["skipped"]
     # A partial run does not claim a whole one.
     assert "ran on time" not in bodies["partial"]
     # Distinct statuses get distinct sentences — a table that collapses
@@ -285,9 +289,110 @@ async def test_confirm_park_reaches_the_notification_pipeline(
         assert any("automation_notification" in (m.metadata_json or "")
                    for m in msgs), "no chat card for the park"
 
-    # ...and the push went out under its OWN dedup key, so the later
-    # completion notice is not suppressed as a duplicate.
+    # ...and the park does NOT send its own banner. The outbox already
+    # pushes `needs_approval` on the line after `_park_run_on_card`
+    # (outbox.py:190 `_notify_needs_approval`); pushing here as well gave
+    # the user TWO banners for one park, with different texts and
+    # different dedup keys, so the dispatcher could not collapse them.
+    # The park's missing half was the ledger row and the card.
     park_pushes = [c for c in _notify_spy
                    if str(c.get("dedup_key", "")).endswith(":park")]
-    assert park_pushes, f"no park push in {[c.get('dedup_key') for c in _notify_spy]}"
-    assert park_pushes[0]["event_kind"] == "needs_approval"
+    assert not park_pushes, (
+        f"the park pushed a second banner: {[c.get('dedup_key') for c in park_pushes]}")
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_parks_twice_does_not_break_the_outbox_session(
+    monkeypatch, _notify_spy,
+):
+    """A confirm-mode spec stages one outbox row per write step, so a run
+    can park more than once.
+
+    `automation_needs_you` is under UniqueConstraint(run_id, kind), so the
+    second park's mint raises IntegrityError — which `_mint_notification`
+    absorbs with `await db.rollback()`. That session belongs to the
+    OUTBOX, and rolling it back underneath the caller is not a local
+    event. The second park must take the quiet path.
+    """
+    from app.agent.automations.outbox import _park_run_on_card
+    from app.db.models import AutomationOutbox
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    job = await _one_run(a.id)
+
+    async with async_session_maker() as db:
+        for n in (0, 1):
+            row = AutomationOutbox(
+                id=str(uuid.uuid4()), user_id=uid, automation_id=a.id,
+                job_id=job.id, connector_id="slack",
+                tool_name="slack__send_message",
+                payload_json=json.dumps({}), status="staged",
+                idempotency_key=str(uuid.uuid4()),
+                execute_after=datetime.utcnow(),
+            )
+            db.add(row)
+            await db.commit()
+            # Second call must not raise, and must not roll the session
+            # out from under the caller.
+            await _park_run_on_card(db, row, {
+                "action_id": f"act-{n}",
+                "summary": "Post the digest to #platform",
+            })
+            # The caller keeps using this session afterwards — prove it
+            # still works rather than assuming.
+            still_there = await db.get(BuildJob, job.id)
+            assert still_there is not None
+            assert still_there.status == "waiting_on_user"
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationNotification).where(
+                AutomationNotification.run_id == job.id,
+                AutomationNotification.kind == "automation_needs_you",
+            )
+        )).scalars().all()
+        assert len(rows) == 1, f"expected one needs-you row, got {len(rows)}"
+
+
+@pytest.mark.asyncio
+async def test_a_declined_approval_is_not_reported_as_nothing_to_do():
+    """AUDIT follow-up: `skipped` covers two different stories.
+
+    `confirm.ACTION_OUTCOME_TO_RUN_TERMINAL` maps BOTH "rejected" and
+    "expired" to (cancelled, skipped), so `run_v3_status` returns
+    `skipped` for a user who tapped "Not now" as well as for a run that
+    genuinely found nothing. Telling the first group "there was nothing
+    to do this time" contradicts the run's own note on the same screen.
+    The run records its reason; the body uses it.
+    """
+    from app.agent.automations.run_v3 import _notification_body
+    from app.agent.automations.confirm import (
+        SKIPPED_EXPIRED_COPY, SKIPPED_REJECTED_COPY,
+    )
+
+    declined = _notification_body("automation_run", {
+        "run_kind": "scheduled", "status": "skipped",
+        "needs_count": 0, "writes_count": 0,
+        "user_message": SKIPPED_REJECTED_COPY,
+    })
+    assert declined == SKIPPED_REJECTED_COPY
+    assert "nothing to do" not in declined
+
+    expired = _notification_body("automation_run", {
+        "run_kind": "scheduled", "status": "skipped",
+        "needs_count": 0, "writes_count": 0,
+        "user_message": SKIPPED_EXPIRED_COPY,
+    })
+    assert expired == SKIPPED_EXPIRED_COPY
+
+    # With no recorded reason the fallback must stay neutral — it cannot
+    # know which of the two stories it is describing.
+    silent = _notification_body("automation_run", {
+        "run_kind": "scheduled", "status": "skipped",
+        "needs_count": 0, "writes_count": 0,
+    })
+    assert "nothing to do" not in silent
+    assert "without making any changes" in silent

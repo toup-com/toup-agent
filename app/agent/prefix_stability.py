@@ -203,11 +203,25 @@ def build_turn_context_message(parts: Sequence[str]) -> Optional[Dict[str, str]]
 
 
 def tools_wire_hash(tools: Sequence[Dict[str, Any]]) -> str:
-    """sha256 fingerprint of the wire tools array: (name, serialized-
-    schema length) per tool, order-sensitive. Two turns with identical
-    arrays hash identically; any rename, reorder, add/remove, or schema
-    growth changes the digest. Cheap enough to run every turn — it only
-    serializes schemas, never descriptions.
+    """sha256 fingerprint of the wire tools array: (name, serialized
+    schema) per tool, order-sensitive. Two turns with identical arrays
+    hash identically; any rename, reorder, add/remove or schema EDIT
+    changes the digest. Descriptions are excluded by design (see
+    ``test_description_only_change_does_not_change_hash``) — a
+    description edit does bust the provider's real prefix, but this is
+    the array-shape detector, and ``head_hashes`` is what attributes a
+    byte-level miss.
+
+    This hashed the schema's LENGTH rather than its content, on a
+    "cheap enough to run every turn" rationale that did not survive
+    reading: the expensive part — `json.dumps` of the schema — already
+    happened, and the result was thrown away for its `len()`. So the
+    saving was zero and the cost was real. Two schemas of equal
+    serialized length collided: renaming a property `query` → `quero`,
+    or flipping a type `string` → `number`, left the digest identical,
+    so `tools_array_change` stayed silent while the wire bytes moved and
+    the cached prefix reset. A schema edit is precisely what this exists
+    to catch, and it was the one shape it could not see.
 
     Handles both Anthropic ({'input_schema': ...}) and OpenAI
     ({'function': {'parameters': ...}}) tool shapes, same duality as
@@ -217,13 +231,13 @@ def tools_wire_hash(tools: Sequence[Dict[str, Any]]) -> str:
         [
             [
                 tool_name(t),
-                len(json.dumps(
+                json.dumps(
                     t.get("input_schema")
                     or (t.get("function", {}) or {}).get("parameters")
                     or {},
                     sort_keys=True,
                     default=str,
-                )),
+                ),
             ]
             for t in tools
         ],
@@ -265,8 +279,9 @@ def head_hashes(
 ) -> Tuple[str, str, str]:
     """8-hex full-byte hashes of the three cacheable prefix tiers.
 
-    Unlike ``tools_wire_hash`` (names + schema lengths, cheap change
-    *detector*), these hash the complete serialized bytes of each tier so
+    Unlike ``tools_wire_hash`` (names + schemas, no descriptions —
+    the array-shape change *detector*), these hash the complete
+    serialized bytes of each tier so
     a warm-turn cache miss can be *attributed*: diff two turns'
     ``[PERF] prefix_head`` lines and the tier whose hash moved names the
     culprit. History is hashed as passed — callers hash the persisted

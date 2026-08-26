@@ -707,3 +707,68 @@ async def test_engine_routines_are_not_listed_as_the_users_routines(
     assert names == ["Morning brief"], (
         f"the engine's own rows reached the user: {names}")
     assert not any(n.startswith("[automation]") for n in names)
+
+
+@pytest.mark.asyncio
+async def test_repair_reverses_a_supersede_without_deleting_the_automation(
+    monkeypatch,
+):
+    """The supersede branch was unreversible, and ND-18 made it invisible.
+
+    ND-18 hides `superseded_by` rows from every listing, and
+    `repair_mismigrations` reversed `migrated_to` only — so a routine
+    retired against a PRE-EXISTING automation could not be seen, could
+    not be re-enabled and could not be found. It is the one stamp that
+    fires on a routine the user was actively running.
+
+    Reversal is also NOT symmetric: a `migrated_to` automation was
+    CREATED by the migration, so reversing it means deleting it; a
+    `superseded_by` automation existed beforehand and is the user's
+    independently — deleting it would destroy something the migration
+    never made.
+    """
+    from app.api.routines import list_routines
+    from app.config import settings
+
+    uid = await _mk_user()
+    async with async_session_maker() as db:
+        twin = Automation(
+            id=str(uuid.uuid4()), user_id=uid, name="Ledger brief",
+            status="armed", spec_json=json.dumps({"version": 2}),
+            trigger_mode="schedule", connector_id="gmail",
+        )
+        db.add(twin)
+        await db.commit()
+        twin_id = twin.id
+
+    rid = await _mk_routine(
+        uid, kind="agent_task", name="Ledger brief duplicate",
+        config_json={"superseded_by": twin_id,
+                     "migrated_from_enabled": True},
+        enabled=False,
+    )
+
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    # Hidden from the user while the stamp stands (ND-18).
+    listed = await list_routines()
+    assert rid not in {x.id for x in listed}
+
+    async with async_session_maker() as db:
+        out = await mig.repair_mismigrations(
+            db, user_id=uid, routine_ids=[rid],
+        )
+    actions = {r["action"] for r in out["repaired"]}
+    assert "supersede_reversed" in actions, out
+
+    async with async_session_maker() as db:
+        r = await db.get(Routine, rid)
+        assert r.enabled is True, "the routine was not let go again"
+        assert not (r.config_json or {}).get("superseded_by")
+        # The pre-existing automation is untouched.
+        kept = await db.get(Automation, twin_id)
+        assert kept is not None and kept.deleted_at is None
+
+    listed_after = await list_routines()
+    assert rid in {x.id for x in listed_after}, (
+        "the repaired routine is still hidden")

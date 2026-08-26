@@ -1192,3 +1192,132 @@ async def test_grant_revoked_hook_pauses_the_armed_dependent(monkeypatch):
     async with async_session_maker() as db:
         row = await db.get(Automation, a.id)
         assert row.status == "armed"
+
+
+@pytest.mark.asyncio
+async def test_grant_revoked_hook_demotes_the_write_it_backed(monkeypatch):
+    """The hook must also make the PERMISSION state honest, not just the
+    run state — and it must work out WHICH connector on its own.
+
+    The sibling test above pins the pause. This pins the other half:
+    revoking a grant has to move the write it backed out of IT CAN, or
+    the account sheet — the one surface whose whole job is to answer
+    "what may this thing do?" — keeps naming a permission the platform
+    has already taken away.
+
+    The payload deliberately carries NO `connector_id`. The only way
+    this can pass is if `_connector_of_grant` derives it from the spec's
+    own step, which is the point: a test that HANDED the connector in
+    would pass whether or not the derivation works, and the derivation
+    is the part that can be wrong. (Same shape as the two kinder cages
+    already found here: supplying the decision instead of exercising
+    what makes it.)
+    """
+    from app.config import settings
+    from app.api.automations import GrantHook, grant_decided_hook
+    from app.agent.automations import permissions
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "armed"
+        await db.commit()
+
+    writes = {p["id"] for p in permissions.catalog_for("slack")["writes"]}
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        before = await permissions.resolve(
+            db, automation=row, account_id="slack",
+        )
+        allowed = {p["id"] for p in before["can"]} & writes
+        assert allowed, "fixture must start with an allowed slack write"
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    # `g-1` is the grant the v2 spec's slack step carries.
+    await grant_decided_hook(GrantHook(
+        grant_id="g-1", status="revoked",
+        payload={"automation_id": a.id},
+    ))
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        after = await permissions.resolve(
+            db, automation=row, account_id="slack",
+        )
+        still_can = {p["id"] for p in after["can"]} & writes
+        assert not still_can, (
+            f"the revoked write is still allowed: {still_can}")
+        demoted = [p for p in after["cant"] if p["id"] in allowed]
+        assert demoted and all(p["kind"] == "ungranted" for p in demoted)
+        # Revoking a write is not taking the account away.
+        assert after["can"], "the reads must survive a write revoke"
+        # ...and the run state stayed honest too.
+        assert row.paused_reason == "grant_revoked"
+
+
+@pytest.mark.asyncio
+async def test_grant_revoked_hook_for_an_unknown_grant_touches_nothing(
+    monkeypatch,
+):
+    """A revoke naming a grant this spec does not carry must not guess.
+
+    `_connector_of_grant` returns None and the payload has no
+    `connector_id`, so there is no connector to demote — and demoting
+    the wrong one would take away a permission the user still holds.
+    """
+    from app.config import settings
+    from app.api.automations import GrantHook, grant_decided_hook
+    from app.agent.automations import permissions
+
+    from app.db.models import AutomationAccountPermission
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "armed"
+        await db.commit()
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    spy: list = []
+    real_revoke = permissions.revoke_writes
+
+    async def _spy_revoke(db, *, automation, connector_id):
+        spy.append(connector_id)
+        return await real_revoke(
+            db, automation=automation, connector_id=connector_id)
+    monkeypatch.setattr(permissions, "revoke_writes", _spy_revoke)
+
+    await grant_decided_hook(GrantHook(
+        grant_id="g-not-in-this-spec", status="revoked",
+        payload={"automation_id": a.id},
+    ))
+
+    # Assert the CALL, because that is the subject.
+    #
+    # Two weaker versions of this failed to test anything. Comparing
+    # `permissions.resolve()` before/after broke for an unrelated and
+    # correct reason — the hook also PAUSES the automation (R29 §3.1)
+    # and an unarmed automation no longer defaults its write to CAN.
+    # Asserting "no `automation_account_permissions` row was written"
+    # then looked right but COULD NOT FAIL: by the time `revoke_writes`
+    # runs the automation is already paused, so `can` holds no write,
+    # nothing moves, and no row is written whether the connector was
+    # guessed or not. Mutating `_connector_of_grant` to return "slack"
+    # for every input left it green.
+    #
+    # So spy on the call. A guessed connector is a call that should not
+    # have happened, and only the call itself shows that.
+    assert spy == [], f"the hook guessed a connector: {spy}"
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationAccountPermission).where(
+                AutomationAccountPermission.automation_id == a.id,
+            )
+        )).scalars().all()
+        assert rows == []

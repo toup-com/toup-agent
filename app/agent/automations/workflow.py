@@ -141,7 +141,11 @@ def _member_connectors(raw: dict) -> list[str]:
             if cid and cid not in ids:
                 ids.append(cid)
     else:
-        for part in ((raw.get("trigger") or {}).get("source") or {},
+        # Same v1 shape correction as `_steps_human`: flat, not `.source`.
+        # Pre-existing — a v1 automation's TRIGGER connector was never
+        # counted as a member, so it appeared in no accounts list.
+        _trig = raw.get("trigger") or {}
+        for part in (_trig.get("source") or _trig,
                      raw.get("action") or {}):
             cid = part.get("connector_id")
             if cid and cid not in ids:
@@ -267,7 +271,16 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
         # nothing. A v1 spec is exactly one read (the trigger's source)
         # and one write (its action); derive both through the same verb
         # dictionary, so the sheet reads like a v2 one.
-        source = (raw.get("trigger") or {}).get("source") or {}
+        # A v1 trigger carries its connector FLAT (`spec._TRIGGER_KEYS`
+        # is {mode, connector_id, event, params, poll_interval_s,
+        # schedule, filter} — there is no `source` key and `validate_spec`
+        # REJECTS one). This first read `trigger.source`, so it always
+        # resolved to {} and the read step this branch exists to derive
+        # was never emitted; only the write survived. The pin passed
+        # because its fixture invented a `trigger.source` the validator
+        # would have refused. `source` stays as a tolerated alias.
+        trigger = raw.get("trigger") or {}
+        source = trigger.get("source") or trigger
         action = raw.get("action") or {}
         if source.get("connector_id"):
             cid = source["connector_id"]
@@ -648,11 +661,20 @@ async def composer_ask(
         answer = ("I could not place that change. Tell me in the thread "
                   "and I will do it there.")
 
-    if refused and not answer:
+    if refused:
         # §4.4: `answer` is the slot for "a sentence the agent cannot
         # place". A refusal is exactly that — it is not a `needs` entry,
         # whose kinds are fixed at consent|confirm.
-        answer = " ".join(refused)
+        #
+        # This was `if refused and not answer`, which dropped the refusal
+        # whenever the classifier had ALSO said something — e.g. "never
+        # let slack read private DMs, and move it to 7:15": the rail
+        # remark fills `answer`, the schedule intent is refused by the
+        # writer, and the user was told only about the rail while the
+        # time silently did not move. Both sentences are true; the user
+        # gets both.
+        answer = f"{answer} {' '.join(refused)}".strip() if answer \
+            else " ".join(refused)
     if applied:
         confirmation = " ".join(a["sentence"] for a in applied)
         if refused:
@@ -770,8 +792,15 @@ async def _apply_intent(
                 "sentence": intent.get("sentence")
                 or f"Took {name} out of this automation.",
                 "sheet": "accounts",
+                # The revert carries the WHOLE pre-removal spec, not just
+                # the id: `service.add_connector` rebuilds a connector's
+                # read presence from the automation's TEMPLATE, and a
+                # chat-built automation has `template_slug` NULL — it
+                # raises `no_template_step`. Undo cannot depend on a
+                # template the automation never had.
                 "undo_token": _mint_undo(
-                    "account", {"account_id": account_id})}
+                    "account",
+                    {"account_id": account_id, "spec": raw_before})}
     return None
 
 
@@ -809,5 +838,27 @@ async def composer_undo(
             account_id=revert["account_id"],
             can_ids=revert["can"], cant_ids=cant,
         )
+    elif kind == "account":
+        # AUDIT-5 added the account REMOVAL but not its undo, so an
+        # `account` token fell past every branch to the unconditional
+        # `{"undone": True}` below: the button reported success, stamped
+        # an EDITED note for an edit that never happened, and left the
+        # connector removed. Exactly the shape AUDIT-10 fixed in
+        # `delete_rule` — reintroduced two hundred lines away.
+        from . import service
+        spec = revert.get("spec") or {}
+        if not spec:
+            raise WorkflowError(
+                "undo_unavailable",
+                "I could not put that account back — open the accounts "
+                "sheet and add it there.")
+        await service.update_automation(
+            db, automation_id=automation.id, user_id=user_id, spec=spec,
+        )
+    else:
+        # Never answer "undone" for a kind this function cannot revert.
+        # Silence here is how the account token lied for a whole round.
+        raise WorkflowError(
+            "undo_unavailable", "That change cannot be undone from here.")
     await _edited_note(db, automation)
     return {"undone": True}

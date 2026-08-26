@@ -662,31 +662,47 @@ async def test_v1_automation_has_a_steps_sheet():
     """AUDIT-8: the derivation handled v2 only, so every v1 automation
     opened an EMPTY Steps sheet — the canvas asserting it does nothing.
     """
-    from app.agent.automations.workflow import _steps_human, _spec_raw
+    from app.agent.automations.workflow import (
+        _member_connectors, _spec_raw, _steps_human,
+    )
 
     uid = await _mk_user()
-    v1 = {
-        "trigger": {"mode": "poll", "source": {
-            "connector_id": "jira", "event": "issue_updated"},
-            "poll_interval_s": 900},
+    # Built through the REAL validator. The first version of this test
+    # hand-wrote `trigger.source`, a key `_TRIGGER_KEYS` does not contain
+    # and `validate_spec` rejects — so it pinned a shape no producer can
+    # emit, and passed against a derivation that never fired.
+    v1 = validate_spec({
+        "name": "v1 relay",
+        "trigger": {"mode": "poll", "connector_id": "jira",
+                    "event": "issue_created", "poll_interval_s": 900},
         "action": {"connector_id": "slack",
                    "tool": "slack__send_message",
-                   "params_template": {"text": "{{event.summary}}"}},
-        "dedupe_key": "event.id",
-    }
+                   "params_template": {"text": "{{event.summary}}"},
+                   "grant_id": "g-1"},
+        "dedupe_key": "event.key",
+    }, REGISTRY_V2)
+    assert v1.raw.get("version") != 2, "fixture must be a v1 spec"
+
     async with async_session_maker() as db:
         a = Automation(
             id=str(uuid.uuid4()), user_id=uid, name="v1 relay",
-            spec_json=json.dumps(v1), status="draft",
-            trigger_mode="poll", connector_id="jira",
+            spec_json=json.dumps(v1.raw), status="draft",
+            trigger_mode=v1.trigger_mode,
+            connector_id=v1.trigger_connector_id,
         )
         db.add(a)
         await db.commit()
         steps = _steps_human(a, _spec_raw(a))
+        members = _member_connectors(_spec_raw(a))
 
     assert steps, "a v1 automation showed an empty Steps sheet"
     assert [s["n"] for s in steps] == list(range(1, len(steps) + 1))
     assert all(s["text"] for s in steps)
+    # BOTH halves of a v1 spec: the trigger's read and the action's write.
+    # Only the write survived while the derivation read `trigger.source`.
+    assert len(steps) == 2, f"expected read + write, got {steps}"
+    # ...and the trigger connector is a member, not just the action's.
+    assert set(members) == {"jira", "slack"}, members
 
 
 @pytest.mark.asyncio
@@ -758,3 +774,208 @@ async def test_last_use_is_scoped_to_its_user_and_automation():
         assert (await account_last_use(
             db, user_id=stranger, account_id="slack",
         ))["at"] is None
+
+
+@pytest.mark.asyncio
+async def test_undoing_an_account_removal_actually_puts_it_back():
+    """The undo button must not report a revert it did not perform.
+
+    AUDIT-5 added the composer's account REMOVAL and minted it an undo
+    token; `composer_undo` had branches for rule/schedule/step/permission
+    and no `account`, so the token fell past every one to an
+    unconditional `{"undone": True}` — success reported, an EDITED note
+    stamped for an edit that never happened, and the connector still
+    gone. That is the identical shape AUDIT-10 had just fixed in
+    `delete_rule`, reintroduced in the same change.
+
+    Recovery through the accounts sheet is not a substitute:
+    `service.add_connector` rebuilds a connector from the automation's
+    TEMPLATE and raises `no_template_step` when `template_slug` is NULL,
+    which is every chat-built automation. So the undo has to carry the
+    pre-removal spec itself.
+    """
+    from app.agent.automations.workflow import (
+        _apply_intent, _member_connectors, _spec_raw, composer_undo,
+    )
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+
+    async with async_session_maker() as db:
+        a1 = await db.get(Automation, a.id)
+        assert "jira" in _member_connectors(_spec_raw(a1))
+        entry = await _apply_intent(
+            db, automation=a1, user_id=uid,
+            intent={"kind": "account", "account_id": "jira",
+                    "direction": "remove"},
+        )
+        assert entry is not None and entry["kind"] == "account"
+        token = entry["undo_token"]
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        assert "jira" not in _member_connectors(_spec_raw(a2))
+        out = await composer_undo(
+            db, automation=a2, user_id=uid, token=token,
+        )
+        assert out["undone"] is True
+
+    async with async_session_maker() as db:
+        a3 = await db.get(Automation, a.id)
+        back = _member_connectors(_spec_raw(a3))
+        assert "jira" in back, (
+            f"undo reported success but jira is still gone: {back}")
+        # ...and the read step it removed is genuinely restored, not just
+        # the connector id reappearing somewhere.
+        raw = _spec_raw(a3)
+        assert any(st.get("connector_id") == "jira"
+                   for st in raw.get("steps") or []), raw.get("steps")
+
+
+@pytest.mark.asyncio
+async def test_undo_refuses_a_kind_it_cannot_revert():
+    """An unknown token kind must raise, never answer "undone".
+
+    The `account` token lied for a whole round precisely because the
+    fall-through returned success instead of refusing.
+    """
+    from app.agent.automations import workflow as wf
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+
+    token = wf._mint_undo("something_new", {"whatever": True})
+    before = await _edited_notes(a.id)
+    async with async_session_maker() as db:
+        a1 = await db.get(Automation, a.id)
+        with pytest.raises(wf.WorkflowError) as e:
+            await wf.composer_undo(
+                db, automation=a1, user_id=uid, token=token,
+            )
+        assert e.value.code == "undo_unavailable"
+    assert await _edited_notes(a.id) == before, (
+        "a refused undo stamped an EDITED note")
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_missing_rule_is_a_404_not_a_500(monkeypatch):
+    """The refusal has to survive the ROUTE, not just the function.
+
+    AUDIT-10 taught `delete_rule` to raise `not_found` instead of
+    answering 200 for an edit that never happened — but the DELETE route
+    caught only `AutomationNotFound`, so the honest refusal escaped as a
+    500 with no body the app can read. Its PUT sibling already mapped
+    `WorkflowError`. Fixing the function without its caller just moved
+    the lie one layer out.
+    """
+    from fastapi import HTTPException
+    from app.api.automations import delete_workflow_rule
+    from app.config import settings
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+
+    with pytest.raises(HTTPException) as e:
+        await delete_workflow_rule(a.id, "no-such-rule")
+    assert e.value.status_code == 404, (
+        f"a missing rule answered {e.value.status_code}")
+    assert isinstance(e.value.detail, dict)
+    assert e.value.detail["code"] == "not_found"
+    assert e.value.detail["sentence"]
+
+    # A real delete still succeeds through the same route.
+    from app.agent.automations.workflow import add_rule
+    async with async_session_maker() as db:
+        a1 = await db.get(Automation, a.id)
+        made = await add_rule(db, automation=a1, text="a real rule")
+    out = await delete_workflow_rule(a.id, made["rule"]["id"])
+    assert out["sentence"] == "Removed the rule."
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_survives_an_answer_the_classifier_already_set(
+    monkeypatch,
+):
+    """Two true sentences, and the user gets both.
+
+    `if refused and not answer` dropped the writer's refusal whenever the
+    classifier had also spoken. "never let slack read private DMs, and
+    move it to 7:15": the rail remark fills `answer`, the schedule intent
+    is refused by the writer, and the user heard only about the rail
+    while the time silently did not move.
+    """
+    from app.agent.automations import composer, ledger
+    from app.agent.automations.workflow import composer_ask
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+
+    async def _fake_classify(text, wf, complete=None):
+        return {
+            "applied": [{"kind": "schedule", "preset_id": "not-a-preset",
+                         "sheet": "schedule", "sentence": "Moved it."}],
+            "needs": [],
+            "answer": "Slack already cannot read private DMs.",
+        }
+    monkeypatch.setattr(composer, "classify_change", _fake_classify)
+
+    async with async_session_maker() as db:
+        a1 = await db.get(Automation, a.id)
+        out = await composer_ask(
+            db, automation=a1, user_id=uid,
+            text="never let slack read private DMs, and move it to 7:15",
+        )
+
+    assert out["applied"] == []
+    assert "private DMs" in out["answer"], out["answer"]
+    assert "time" in out["answer"].lower(), (
+        f"the refusal was dropped: {out['answer']!r}")
+
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, a.id)
+        turns = (await db.execute(
+            select(AutomationTurn)
+            .where(AutomationTurn.thread_id == thread.id)
+            .where(AutomationTurn.kind == "agent")
+            .order_by(AutomationTurn.seq)
+        )).scalars().all()
+        said = json.loads(turns[-1].payload_json)["text"]
+        assert "private DMs" in said and "time" in said.lower(), said
+
+
+@pytest.mark.asyncio
+async def test_an_unarmed_automations_write_is_not_already_allowed():
+    """A grant_id in the spec is not an approved grant.
+
+    The setup flow mints the grant request FIRST and passes `grant_id`
+    into create (spec.py requires it for a mutating action), so a DRAFT
+    automation carries a grant_id for a grant the user has not decided.
+    Reading presence alone showed "Post as you" as already allowed on the
+    account sheet of an automation nobody had approved anything for. The
+    compiler is what verifies `status == "approved"`, and it runs at ARM.
+    """
+    from app.agent.automations import permissions
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    writes = {p["id"] for p in permissions.catalog_for("slack")["writes"]}
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "draft"
+        await db.commit()
+        draft = await permissions.resolve(
+            db, automation=row, account_id="slack",
+        )
+        assert not ({p["id"] for p in draft["can"]} & writes), (
+            "an undecided grant showed its write as allowed")
+        # The reads are still allowed — this is not "the account is off".
+        assert draft["can"]
+
+        # Once ARMED (the compiler having checked the grant), it is.
+        row.status = "armed"
+        await db.commit()
+        armed = await permissions.resolve(
+            db, automation=row, account_id="slack",
+        )
+        assert {p["id"] for p in armed["can"]} & writes

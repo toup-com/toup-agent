@@ -144,7 +144,21 @@ async def saved_row(
 
 def _default_can_write(automation: Automation, connector_id: str) -> bool:
     """A write defaults to CAN only when an approved grant backs a write
-    step on this connector (grant_id snapshotted into the spec)."""
+    step on this connector (grant_id snapshotted into the spec).
+
+    ARMED is part of that test, not decoration. The setup flow mints the
+    grant request FIRST and passes `grant_id` into `automations__create`
+    (spec.py requires it for any mutating action), so a DRAFT automation
+    carries a grant_id for a grant the user has not decided yet — and
+    reading presence alone showed "Post as you" as already allowed on
+    the account sheet of an automation nobody had approved anything for.
+    The compiler is what checks `status == "approved"` (compiler.py:347)
+    and it only runs at ARM, so before arming there is nothing that has
+    verified this grant. R30-D proved the same ordering live: grants bind
+    at ARM (ND-1).
+    """
+    if (getattr(automation, "status", "") or "") != "armed":
+        return False
     try:
         raw = json.loads(automation.spec_json or "{}")
     except (ValueError, TypeError):

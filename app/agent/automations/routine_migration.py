@@ -264,8 +264,15 @@ async def migrate_email_briefings(
         if twin is not None:
             # Retire the duplicate against the automation that owns the
             # intent. Disabled + stamped in one commit, nudged AFTER.
+            # Record what repair will need to put back BEFORE changing
+            # it. The migrate branch stamps `migrated_from_enabled`; this
+            # branch did not, so a reversal had nothing to restore from
+            # and would have had to guess.
+            routine.config_json = {
+                **cfg, "superseded_by": twin.id,
+                "migrated_from_enabled": bool(routine.enabled),
+            }
             routine.enabled = False
-            routine.config_json = {**cfg, "superseded_by": twin.id}
             await db.commit()
             await compiler.nudge_routines([routine.id])
             superseded.append({
@@ -402,35 +409,50 @@ async def repair_mismigrations(
     plan: list[dict] = []
     for routine in rows:
         cfg = dict(routine.config_json or {})
-        aid = cfg.get("migrated_to")
+        # Both stamps, not just `migrated_to`. A `superseded_by` routine
+        # is disabled AND (since ND-18) hidden from every listing, so if
+        # repair cannot reverse it the user has no way to see it, no way
+        # to re-enable it, and no way to learn it exists — the one stamp
+        # that fires on a routine the user was actively running.
+        aid = cfg.get("migrated_to") or cfg.get("superseded_by")
+        stamp = "migrated_to" if cfg.get("migrated_to") else "superseded_by"
         if not aid:
             continue
         named = routine_ids is not None and routine.id in routine_ids
         automation = await db.get(_Automation, aid)
         if automation is None:
-            cfg.pop("migrated_to", None)
+            cfg.pop(stamp, None)
             routine.config_json = cfg
             await db.commit()
             repaired.append({"routine_id": routine.id,
                              "automation_id": aid,
                              "action": "stamp_cleared"})
             continue
-        ran = (await db.execute(
-            select(BuildJob.id)
-            .where(BuildJob.source_id == aid)
-            .where(BuildJob.job_type == "automation_run")
-            .limit(1)
-        )).scalar_one_or_none()
-        if ran is not None:
-            kept.append({"routine_id": routine.id, "automation_id": aid,
-                         "reason": "it has already run — kept; a repair "
-                                   "never deletes a record of work"})
-            continue
-        if automation.status == "armed":
-            kept.append({"routine_id": routine.id, "automation_id": aid,
-                         "reason": "it is armed and doing its job — "
-                                   "kept"})
-            continue
+        # These two guards protect the AUTOMATION FROM DELETION, so they
+        # apply only to the branch that deletes. Reversing a supersede
+        # removes nothing — it just lets the routine go again — and
+        # blocking it because the pre-existing automation is armed left
+        # the user with a routine they could not see (ND-18 hides the
+        # stamp), could not re-enable, and could not recover.
+        if stamp == "migrated_to":
+            ran = (await db.execute(
+                select(BuildJob.id)
+                .where(BuildJob.source_id == aid)
+                .where(BuildJob.job_type == "automation_run")
+                .limit(1)
+            )).scalar_one_or_none()
+            if ran is not None:
+                kept.append({
+                    "routine_id": routine.id, "automation_id": aid,
+                    "reason": "it has already run — kept; a repair "
+                              "never deletes a record of work"})
+                continue
+            if automation.status == "armed":
+                kept.append({"routine_id": routine.id,
+                             "automation_id": aid,
+                             "reason": "it is armed and doing its job — "
+                                       "kept"})
+                continue
 
         if not named:
             # Dry run: say what WOULD be reversed, change nothing.
@@ -443,18 +465,28 @@ async def repair_mismigrations(
             })
             continue
 
-        await _svc.delete_automation(
-            db, automation_id=aid, user_id=user_id, undo=True,
-        )
+        if stamp == "migrated_to":
+            # This migration CREATED that automation, so reversing it
+            # means removing it. A `superseded_by` automation existed
+            # BEFORE the migration and belongs to the user independently
+            # — deleting it would destroy something the migration never
+            # made, which is a far worse outcome than the duplicate the
+            # supersede was tidying. Reversing a supersede only lets the
+            # routine go again.
+            await _svc.delete_automation(
+                db, automation_id=aid, user_id=user_id, undo=True,
+            )
         was_enabled = bool(cfg.pop("migrated_from_enabled", False))
-        cfg.pop("migrated_to", None)
+        cfg.pop(stamp, None)
         routine.config_json = cfg
         routine.enabled = was_enabled
         await db.commit()
         await compiler.nudge_routines([routine.id])
         repaired.append({
             "routine_id": routine.id, "name": routine.name,
-            "automation_id": aid, "action": "automation_deleted",
+            "automation_id": aid,
+            "action": ("automation_deleted" if stamp == "migrated_to"
+                       else "supersede_reversed"),
             "routine_enabled_restored": was_enabled,
         })
         logger.info("[automations] repaired mis-migration %s -> %s",

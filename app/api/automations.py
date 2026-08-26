@@ -989,7 +989,7 @@ async def put_workflow_rule(automation_id: str, rule_id: str,
 async def delete_workflow_rule(automation_id: str, rule_id: str):
     _flag_or_404()
     from app.agent.automations.service import _load_owned, AutomationNotFound
-    from app.agent.automations.workflow import delete_rule
+    from app.agent.automations.workflow import WorkflowError, delete_rule
     async with async_session_maker() as db:
         try:
             automation = await _load_owned(db, automation_id, _user_id())
@@ -998,6 +998,16 @@ async def delete_workflow_rule(automation_id: str, rule_id: str):
             )
         except AutomationNotFound:
             raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            # `delete_rule` learned to raise `not_found` rather than
+            # answer 200 for an edit that never happened — but this route
+            # caught only AutomationNotFound, so the honest refusal
+            # surfaced as a 500 with no body the app can read. The PUT
+            # sibling above already maps it; this now matches.
+            raise HTTPException(status_code=404 if e.code == "not_found"
+                                else 409,
+                                detail={"code": e.code,
+                                        "sentence": e.sentence})
 
 
 class PermissionsBody(BaseModel):

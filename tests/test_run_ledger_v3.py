@@ -966,3 +966,94 @@ async def test_nd16_the_card_never_invents_a_connector_failure(monkeypatch):
     async with async_session_maker() as db:
         payload = await summary_payload(db, user_id=uid)
     assert "could not reach Jira" in payload["automations"][0]["meta"]
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_run_says_whether_anything_was_sent(monkeypatch):
+    """§3.2's stopped sentence is TWO clauses, and the second is the point.
+
+    R30-B caught this on the first live render of the founder's home: the
+    running card read exactly "Paused at step 6." with no second
+    sentence. The dispatch pins `"Paused at step 2. Nothing was sent."`
+    and, with writes, `"Paused at step 3. 1 change already made."` — the
+    whole reason that clause exists is that a run the user stopped must
+    answer the one question a stop raises: did it already do something?
+
+    §4.3 already requires the stop note to carry the honest writes count,
+    so the number was in the ledger; the card just was not reading it.
+    """
+    from app.agent.automations import ledger
+    from app.agent.automations.summary import summary_payload
+    from app.db.models import AutomationWrite
+
+    async def _conn(user_id):
+        return {"jira": {"connector_id": "jira", "connected": True,
+                         "status": "active", "account": "TP"},
+                "slack": {"connector_id": "slack", "connected": True,
+                          "status": "active", "account": "ws"}}
+
+    async def _reg(user_id, force=False):
+        return REGISTRY_V2
+
+    async def _tpl(user_id):
+        return []
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_connection_state", _conn)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _reg)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_templates", _tpl)
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    thread = None
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(
+            db, user_id=uid, automation_id=a.id)
+        job_id = str(uuid.uuid4())
+        db.add(BuildJob(
+            id=job_id, user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="cancelled",
+            outcome="stopped", source_kind="automation", source_id=a.id,
+            progress_step=6, progress_total=8,
+            config_json={"thread_id": thread.id,
+                         "checkpoint": {"step_index": 6}},
+        ))
+        await db.commit()
+
+    # Nothing written yet.
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    flight = payload["automations"][0]["run_in_flight"]
+    assert flight and flight["status"] == "stopped_by_user"
+    assert flight["sentence"] == "Paused at step 6. Nothing was sent.", (
+        flight["sentence"])
+
+    # One write already out — the card must say so, not stay silent.
+    async with async_session_maker() as db:
+        db.add(AutomationWrite(
+            id=str(uuid.uuid4()), run_id=job_id, user_id=uid,
+            automation_id=a.id, account_id="slack",
+            what="Posted in #platform", target="#platform",
+            audience="others", reversible=False,
+        ))
+        await db.commit()
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    said = payload["automations"][0]["run_in_flight"]["sentence"]
+    assert said == "Paused at step 6. 1 change already made.", said
+
+    # Two writes pluralise.
+    async with async_session_maker() as db:
+        db.add(AutomationWrite(
+            id=str(uuid.uuid4()), run_id=job_id, user_id=uid,
+            automation_id=a.id, account_id="slack",
+            what="Posted in #eng", target="#eng",
+            audience="others", reversible=False,
+        ))
+        await db.commit()
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    said2 = payload["automations"][0]["run_in_flight"]["sentence"]
+    assert said2 == "Paused at step 6. 2 changes already made.", said2
