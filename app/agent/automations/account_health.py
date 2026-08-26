@@ -326,6 +326,24 @@ def is_transient(reason_code: str) -> bool:
     return head in TRANSIENT_REASONS
 
 
+def fix_for(state: str, reason_code: str) -> str:
+    """The remedy an account offers, from §4.4 and nothing else.
+
+    A CONNECTED account offers one only when its last failure was
+    transient (rate_limited | vendor_down | timeout keep the state
+    `connected` and get `fix: retry`). Absent a transient reason there is
+    nothing to fix — and the app renders ANY non-empty fix, so a blanket
+    `retry` default drew "Try again" on an account that was simply
+    working. R31-13's own class, inverted.
+
+    `is_transient` reads the string table, so this rule and the table can
+    never drift.
+    """
+    if state == "connected":
+        return "retry" if is_transient(reason_code or "") else ""
+    return "reconnect"
+
+
 def sheet_detail(reason_code: str) -> str:
     """The RUN ROW's detail for a failed account ("access expired").
 
@@ -421,7 +439,9 @@ async def state_for(
     from app.db.models import AccountHealth
 
     out = {
-        "account_state": "connected", "reason_code": "", "fix": "retry",
+        # No recorded use and no identity reading: healthy, and a healthy
+        # account offers no remedy (`fix_for`).
+        "account_state": "connected", "reason_code": "", "fix": "",
         "checked_at": None, "source": "default",
     }
     row = None
@@ -448,7 +468,7 @@ async def state_for(
             out.update({
                 "account_state": row.state,
                 "reason_code": row.reason_code or "",
-                "fix": row.fix or "retry",
+                "fix": row.fix or fix_for(row.state, row.reason_code or ""),
                 "checked_at": (
                     row.checked_at.isoformat() + "Z"
                     if row.checked_at else None
@@ -457,11 +477,23 @@ async def state_for(
             })
             if out["account_state"] != "connected":
                 return out
+            # Connected, but the recorded use still NAMED something — a
+            # transient failure keeps the state and keeps its reason. The
+            # identity row below knows only `active`, so falling through
+            # would overwrite `timeout` with "" and drop the retry with
+            # it. That erasure was invisible while every connected
+            # account defaulted to `retry` anyway: the fix survived and
+            # only the reason was lost, so the sheet said an account was
+            # fine and offered a remedy for nothing.
+            if out["reason_code"]:
+                return out
 
     # No recorded use, or the recorded use was clean — fall back to the
     # identity row's own reading.
     mapped = {
-        "active": ("connected", "", "retry"),
+        # `active` is a healthy account: no reason, and so no remedy.
+        # `provider_down` below is transient, which is why IT keeps retry.
+        "active": ("connected", "", ""),
         "reauth_required": ("expired", "token_expired", "reconnect"),
         "revoked": ("revoked", "token_revoked", "reconnect"),
         "provider_down": ("connected", "vendor_down", "retry"),

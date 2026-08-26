@@ -419,6 +419,13 @@ async def test_a_transient_failure_keeps_connected(monkeypatch):
         )
     assert state["account_state"] == "connected"
     assert state["fix"] == "retry"
+    # And the REASON survives. `identity_status="active"` maps to a clean
+    # ("connected", "", "") row, so a connected-but-transient reading used
+    # to fall through and be overwritten by it — the account came back
+    # looking perfectly healthy, with the timeout erased. That was
+    # invisible while every connected account defaulted to `retry`,
+    # because the only surviving evidence was the remedy.
+    assert state["reason_code"] == "timeout", state
 
     cards = [t for t in await _turns(a.id) if t["kind"] == "needs_you"]
     assert [c["fix"] for c in cards] == ["retry"]

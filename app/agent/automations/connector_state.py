@@ -54,15 +54,16 @@ logger = logging.getLogger(__name__)
 _REAUTH_HINTS = ("access", "token", "reconnect", "expired", "reauth")
 
 
-# §4.4 — the three reason codes that keep an account `connected`.
-_TRANSIENT_REASONS = frozenset({"rate_limited", "vendor_down", "timeout"})
-
-
 def _default_fix(state: str, reason_code: str) -> str:
-    """The fix a frame carries when the caller named none."""
-    if state == "connected":
-        return "retry" if (reason_code or "") in _TRANSIENT_REASONS else ""
-    return "reconnect"
+    """The fix a frame carries when the caller named none.
+
+    Delegates to `account_health.fix_for` — §4.4 says one derivation, and
+    two copies of this rule would be two places to forget the string
+    table's `transient` flag. Imported lazily, as every other reference to
+    that module in this file is.
+    """
+    from . import account_health
+    return account_health.fix_for(state, reason_code or "")
 
 
 async def emit_state_frame(
