@@ -35,6 +35,7 @@ from typing import Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -401,6 +402,38 @@ async def _get_agent_target(
     return None
 
 
+# The agent's own gate answers `404 Feature not available` when ITS
+# `automations_enabled` is off — the same status and the same words the
+# PLATFORM gate uses to mean "not for you". Once the platform gate has already
+# passed, those two mean opposite things:
+#
+#   platform 404  the feature is not on for this account
+#   agent    404  it IS on, and this tenant's container has not caught up
+#
+# The second is temporary and self-healing (the bridge's reconciler upgrades
+# assigned pool slots on its own). Passing it through as a 404 told the app the
+# feature was off for a user it had just been switched on for — and because the
+# suggestion routes are platform-native and answer 200, that user saw a full
+# sheet of suggestions and an error the moment they pressed Set up.
+_AGENT_DARK_DETAIL = "Feature not available"
+
+
+def _translate_agent_dark(resp) -> Optional[JSONResponse]:
+    """503 for a tenant whose engine has not caught up, never 404."""
+    if resp.status_code != 404:
+        return None
+    try:
+        if (resp.json() or {}).get("detail") != _AGENT_DARK_DETAIL:
+            return None
+    except Exception:  # noqa: BLE001 — not JSON ⇒ not this case
+        return None
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "agent_starting"},
+        headers={"Retry-After": "120"},
+    )
+
+
 async def _proxy(
     request: Request, sub_path: str, *,
     current_user: User, db: AsyncSession,
@@ -434,6 +467,13 @@ async def _proxy(
         logger.warning("automations_proxy %s %s failed: %s",
                        request.method, url, e)
         raise HTTPException(status_code=502, detail="Agent unreachable")
+    dark = _translate_agent_dark(resp)
+    if dark is not None:
+        logger.warning(
+            "[automations_proxy] tenant engine dark for %s on %s — container "
+            "predates the launch image", uid[:8], sub_path,
+        )
+        return dark
     out_headers = {
         k: v for k, v in resp.headers.items()
         if k.lower() not in _HOP_BY_HOP

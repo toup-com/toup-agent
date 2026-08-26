@@ -396,3 +396,61 @@ def test_a_clean_use_writes_no_remedy():
     assert '("connected", "retry")' not in src, (
         "record_use stamps a blanket retry on a healthy account again"
     )
+
+
+def test_a_dark_tenant_engine_is_503_not_404():
+    """Two gates answer `404 Feature not available` and they mean opposite
+    things once the platform gate has already passed.
+
+    Platform 404 = the feature is not on for this account.
+    Agent    404 = it IS on, and this container has not caught up.
+
+    Passing the second through told the app the feature was off for a user it
+    had just been switched on for. The suggestion routes are platform-native
+    and answer 200, so that user saw a full sheet of suggestions and an error
+    the instant they pressed Set up — which is exactly what the founder
+    reported on 2026-08-26 once automations launched.
+    """
+    from app.api.automations_proxy import _translate_agent_dark
+
+    class _R:
+        def __init__(self, code, body):
+            self.status_code = code
+            self._b = body
+
+        def json(self):
+            if self._b is None:
+                raise ValueError("not json")
+            return self._b
+
+    # The dark-engine case → retryable, and NOT a 404.
+    out = _translate_agent_dark(_R(404, {"detail": "Feature not available"}))
+    assert out is not None and out.status_code == 503
+
+    # Everything else passes through untouched. A 404 for a missing
+    # automation id is a real 404 and must stay one.
+    assert _translate_agent_dark(_R(404, {"detail": "Not found"})) is None
+    assert _translate_agent_dark(_R(404, None)) is None
+    assert _translate_agent_dark(_R(200, {"automations": []})) is None
+    assert _translate_agent_dark(_R(500, {"detail": "boom"})) is None
+
+    # And the CALL SITE, because the checks above pin the function and a
+    # function nobody calls is a green test over a live defect. Found by
+    # falsifying this very test: replacing the call with `dark = None` left
+    # every assertion above passing.
+    #
+    # Anchored on the CALL and on the branch, not on the name — a probe for
+    # `"_translate_agent_dark" in src` would match the import line and survive
+    # both calls being deleted (that mistake was made, and caught, earlier in
+    # this same round).
+    import inspect
+    from app.api import automations_proxy as _px
+    for fn in (_px._proxy,):
+        src = inspect.getsource(fn)
+        assert "dark = _translate_agent_dark(resp)" in src, (
+            f"{fn.__name__} no longer translates a dark tenant engine"
+        )
+        assert src.index("dark = _translate_agent_dark(resp)") < src.index(
+            "out_headers = {"
+        ), f"{fn.__name__} translates AFTER it has already built the passthrough"
+
