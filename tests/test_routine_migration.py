@@ -525,8 +525,18 @@ async def test_nd12_repair_undoes_a_mis_migration_and_restores_the_routine():
         )
     aid = bad["migrated"][0]["automation_id"]
 
+    # Unprompted it is a DRY RUN: it plans, and changes nothing.
     async with async_session_maker() as db:
-        out = await mig.repair_mismigrations(db, user_id=uid)
+        dry = await mig.repair_mismigrations(db, user_id=uid)
+    assert dry["repaired"] == [], dry
+    assert [e["routine_id"] for e in dry["plan"]] == [quote], dry
+    async with async_session_maker() as db:
+        assert await db.get(Automation, aid) is not None
+
+    async with async_session_maker() as db:
+        out = await mig.repair_mismigrations(
+            db, user_id=uid, routine_ids=[quote],
+        )
 
     assert [e["routine_id"] for e in out["repaired"]] == [quote], out
     async with async_session_maker() as db:
@@ -552,8 +562,11 @@ async def test_nd12_repair_undoes_a_mis_migration_and_restores_the_routine():
         ))
         await db.commit()
     async with async_session_maker() as db:
-        out2 = await mig.repair_mismigrations(db, user_id=uid)
+        out2 = await mig.repair_mismigrations(
+            db, user_id=uid, routine_ids=[brief],
+        )
     assert [e["automation_id"] for e in out2["kept"]] == [ok_aid], out2
+    assert "record of work" in out2["kept"][0]["reason"]
     async with async_session_maker() as db:
         assert await db.get(Automation, ok_aid) is not None
 
@@ -593,3 +606,39 @@ async def test_nd13_a_longer_title_still_matches_the_same_intent():
     async with async_session_maker() as db:
         r = await db.get(Routine, dupe)
         assert r.enabled is False, "the per-minute duplicate must stop"
+
+
+@pytest.mark.asyncio
+async def test_nd12_repair_never_touches_an_armed_migration():
+    """D's catch, pre-empted: "would today's rules produce this pair?"
+    is NOT a usable repair criterion — under selection semantics no
+    agent_task migrates unprompted, so that test would undo every
+    correct, explicitly-selected migration, including the one §7
+    requires. An armed automation is live and doing its job: repair
+    refuses it even when named."""
+    uid = await _mk_user()
+    brief = await _mk_routine(
+        uid, kind="agent_task", name="Morning new-email briefing",
+        prompt_text="summarise my new email",
+        schedule_cron_local="0 8 * * *", schedule_kind="cron")
+    async with async_session_maker() as db:
+        res = await mig.migrate_email_briefings(
+            db, user_id=uid, routine_ids=[brief],
+        )
+    aid = res["migrated"][0]["automation_id"]
+    async with async_session_maker() as db:
+        a = await db.get(Automation, aid)
+        a.status = "armed"
+        await db.commit()
+
+    async with async_session_maker() as db:
+        out = await mig.repair_mismigrations(
+            db, user_id=uid, routine_ids=[brief],
+        )
+    assert out["repaired"] == [], out
+    assert [e["automation_id"] for e in out["kept"]] == [aid], out
+    assert "armed" in out["kept"][0]["reason"]
+    async with async_session_maker() as db:
+        assert await db.get(Automation, aid) is not None
+        r = await db.get(Routine, brief)
+        assert (r.config_json or {}).get("migrated_to") == aid

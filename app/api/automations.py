@@ -1417,16 +1417,24 @@ async def migrate_routines(body: Optional[MigrateBody] = None):
 
 
 @router.post("/migrate-routines/repair")
-async def migrate_routines_repair():
+async def migrate_routines_repair(body: Optional[MigrateBody] = None):
     """Undo migrations that should never have been made (ND-12): the
     automation is deleted and the routine restored to the state
-    recorded at migration time. Refuses any automation that has run."""
+    recorded at migration time.
+
+    Without `routine_ids` this is a DRY RUN — it returns the plan and
+    changes nothing, because "would today's rules produce this pair?"
+    would also undo every correct, explicitly-selected migration.
+    Refuses any automation that has RUN or is ARMED even when named."""
     _flag_or_404()
     from app.agent.automations.routine_migration import (
         repair_mismigrations,
     )
     async with async_session_maker() as db:
-        return await repair_mismigrations(db, user_id=_user_id())
+        return await repair_mismigrations(
+            db, user_id=_user_id(),
+            routine_ids=(body.routine_ids if body else None),
+        )
 
 
 @router.get("/migrate-routines/report")

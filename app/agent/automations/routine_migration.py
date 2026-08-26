@@ -368,19 +368,30 @@ def _find_twin(routine: Routine, automations: list):
     return None
 
 
-async def repair_mismigrations(db: AsyncSession, *, user_id: str) -> dict:
+async def repair_mismigrations(
+    db: AsyncSession, *, user_id: str,
+    routine_ids: Optional[list] = None,
+) -> dict:
     """Undo migrations this module should never have made.
 
     ND-12's trap: a mis-migrated routine is STAMPED, so a corrected
-    selector skips it — the bad automation persists and the fix cannot
-    self-heal. This walks the stamps and reverses any pair today's rules
-    would not produce unprompted: the automation is deleted (we created
-    it, and a mis-migration is caught while it is still a draft that
-    never fired) and the routine is restored to the state recorded at
-    migration time.
+    selector skips it — the bad pair persists and the fix cannot
+    self-heal.
 
-    Refuses to touch an automation that has RUN — a repair must never
-    delete a record of work the user can see.
+    The repair does NOT guess which stamped pairs were wrong. "Would
+    today's rules produce this?" is not a usable criterion, because
+    under selection semantics NO agent_task migrates unprompted — so
+    that test would undo every correct, explicitly-selected migration
+    too, including the one §7 requires. Same lesson as the defect it
+    repairs: without `routine_ids` this REPORTS a plan and changes
+    nothing; naming ids acts on exactly those.
+
+    Two refusals it will not cross even when named:
+      - an automation that has RUN — a repair must never delete a
+        record of work the user can see;
+      - an automation that is ARMED — it is live and doing its job.
+    A mis-migration is caught while it is still an unarmed draft that
+    never fired, which is exactly what the refusals leave repairable.
     """
     from app.db.models import Automation as _Automation, BuildJob
     from . import service as _svc
@@ -388,15 +399,13 @@ async def repair_mismigrations(db: AsyncSession, *, user_id: str) -> dict:
     rows = await _candidate_routines(db, user_id)
     repaired: list[dict] = []
     kept: list[dict] = []
+    plan: list[dict] = []
     for routine in rows:
         cfg = dict(routine.config_json or {})
         aid = cfg.get("migrated_to")
         if not aid:
             continue
-        if routine.kind == BRIEFING_KIND:
-            kept.append({"routine_id": routine.id, "automation_id": aid,
-                         "reason": "a briefing by kind — correct"})
-            continue
+        named = routine_ids is not None and routine.id in routine_ids
         automation = await db.get(_Automation, aid)
         if automation is None:
             cfg.pop("migrated_to", None)
@@ -414,8 +423,24 @@ async def repair_mismigrations(db: AsyncSession, *, user_id: str) -> dict:
         )).scalar_one_or_none()
         if ran is not None:
             kept.append({"routine_id": routine.id, "automation_id": aid,
-                         "reason": "it has already run — kept; delete it "
-                                   "by hand if it is wrong"})
+                         "reason": "it has already run — kept; a repair "
+                                   "never deletes a record of work"})
+            continue
+        if automation.status == "armed":
+            kept.append({"routine_id": routine.id, "automation_id": aid,
+                         "reason": "it is armed and doing its job — "
+                                   "kept"})
+            continue
+
+        if not named:
+            # Dry run: say what WOULD be reversed, change nothing.
+            plan.append({
+                "routine_id": routine.id, "name": routine.name,
+                "automation_id": aid,
+                "automation_status": automation.status,
+                "would_restore_enabled": bool(
+                    cfg.get("migrated_from_enabled", False)),
+            })
             continue
 
         await _svc.delete_automation(
@@ -434,7 +459,7 @@ async def repair_mismigrations(db: AsyncSession, *, user_id: str) -> dict:
         })
         logger.info("[automations] repaired mis-migration %s -> %s",
                     routine.id, aid)
-    return {"repaired": repaired, "kept": kept}
+    return {"repaired": repaired, "kept": kept, "plan": plan}
 
 
 async def _candidate_routines(db: AsyncSession, user_id: str):
