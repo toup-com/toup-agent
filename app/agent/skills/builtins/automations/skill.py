@@ -186,8 +186,18 @@ class AutomationsSkill(Skill):
             },
             {
                 "name": "automations__list",
-                "description": "This user's automations with status and "
-                               "health.",
+                # The counterweight. ND-18: this tool answers the
+                # inventory question, but said so in nine bland words
+                # while `routines__list` quoted the question verbatim —
+                # and lost it. The claim belongs to whoever owns the
+                # answer.
+                "description": "This user's automations, with status and "
+                               "health. Call this whenever the user asks "
+                               "what automations they have, how many, or "
+                               "what they are called — it is the ONLY "
+                               "list of their automations. Reminders and "
+                               "scheduled tasks are a different surface "
+                               "and never belong in that answer.",
                 "input_schema": {"type": "object", "properties": {}},
             },
             {
@@ -320,13 +330,19 @@ class AutomationsSkill(Skill):
             # to do with which surface may call the tool.
             {
                 "name": "automations__memory_recall",
+                # Descriptive, never a flow posture: a "do this first"
+                # instruction here competes for the early iterations a
+                # setup conversation needs (CONTRACTS-R30 §14 rule 1).
+                # The recall-first rule lives in the sections that own
+                # those answers — the automations section below and the
+                # automation-thread posture (§5.4).
                 "description": "Search the one platform memory — facts "
                                "and episodes about people, channels, "
                                "tickets, repos and past automation runs, "
                                "with links to the exact thread turn. Use "
-                               "it BEFORE answering anything about a "
-                               "person, a channel, a ticket, or what an "
-                               "automation did.",
+                               "when the user asks about a person, a "
+                               "channel, a ticket, or what an automation "
+                               "did.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -412,11 +428,20 @@ class AutomationsSkill(Skill):
             "- A setup request typed here gets its setup card, and the "
             "conversation continues in the setup thread — say so and "
             "finish there, not here.\n"
-            "- Asked about an automation here ('what did my morning "
-            "brief find?', 'what did Marcus want?'): answer from memory "
-            "(recall first — the platform memory holds everything the "
-            "automations learned and did) and point at the exact run; "
-            "never re-run to answer, never restate the briefing.\n"
+            "- Asked what automations they have, or how many: the answer "
+            "is `automations__list`, and only that. Reminders and "
+            "scheduled tasks (the `routines__*` surface) are NOT "
+            "automations — never add them to that list or that count, "
+            "however many of them exist. If the user means their "
+            "reminders, answer about reminders and call them reminders.\n"
+            "- Asked what an automation FOUND or DID ('what did my "
+            "morning brief find?', 'what did Marcus want?'): answer from "
+            "memory (recall first — the platform memory holds everything "
+            "the automations learned and did) and point at the exact "
+            "run; never re-run to answer, never restate the briefing. "
+            "This is about the contents of past runs — an inventory ask "
+            "(what they have, how many) is the rule above, and memory is "
+            "not the place to count them.\n"
             "- Its status comes from the engine, stated ONCE per reply "
             "— never 'active' in one sentence and 'paused' in another.\n"
             "- Speak about automations in the user's words: it reads, "

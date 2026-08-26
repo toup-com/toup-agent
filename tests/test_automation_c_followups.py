@@ -312,7 +312,15 @@ def test_told_facts_never_raises():
 def test_memory_recall_is_the_last_tool():
     tools = AutomationsSkill().get_tools()
     assert tools[-1]["name"] == "automations__memory_recall"
-    assert "before" in tools[-1]["description"].lower()
+    description = tools[-1]["description"].lower()
+    # It must say WHEN it is relevant...
+    assert "when the user asks" in description
+    # ...but never carry a flow posture: "use it before answering
+    # anything" in a description every automations turn sees competes
+    # with the setup conversation for its early iterations
+    # (CONTRACTS-R30 §14 rule 1). This assertion previously required
+    # the opposite — it was pinning the defect.
+    assert "before answering" not in description
 
 
 def test_memory_recall_dispatch_reads_the_v2_store(monkeypatch):

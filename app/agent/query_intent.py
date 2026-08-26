@@ -798,6 +798,14 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "routines__remind",
     "routines__create",
     "routines__list",
+    # ND-18: "what automations do I have?" classifies `question`, and
+    # `routines__list` was visible on those turns while the automations
+    # inventory was not — so the only list the model could reach was the
+    # wrong one, and it answered from reminders. Prompt wording cannot
+    # fix a tool that is not on the turn. Read-only, and the skill's own
+    # flag gate still applies at execution, so visibility bypasses
+    # nothing: a tenant without automations still has no such tool.
+    "automations__list",
 })
 
 

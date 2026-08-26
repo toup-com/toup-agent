@@ -137,7 +137,7 @@ _DIET_PROPERTY_DESCRIPTIONS = {
     "triggers__create": {
         "kind": "v1: `email_received`.",
         "action": "What each fire does — see tool description.",
-        "name": "Short name (≤100 chars) for Mission Control.",
+        "name": "Short name (≤100 chars) shown to the user in their list.",
         "filter_json": "Optional filter rules (see tool description). Omit for match-all.",
         "delivery_channels": "Where each fire's output goes; `website` always included server-side.",
     },
@@ -248,8 +248,8 @@ class TriggersSkill(Skill):
                         "name": {
                             "type": "string",
                             "description": (
-                                "Short human-readable name (≤100 chars) for "
-                                "Mission Control. e.g. \"GitHub PR pings\", "
+                                "Short human-readable name (≤100 chars) shown "
+                                "to the user. e.g. \"GitHub PR pings\", "
                                 "\"Boss emails\"."
                             ),
                         },
@@ -282,10 +282,12 @@ class TriggersSkill(Skill):
             {
                 "name": "triggers__list",
                 "description": (
-                    "List all of the user's existing triggers + their recent "
-                    "fires. Call this BEFORE creating a new trigger to check "
-                    "for duplicates, or when the user asks \"what triggers "
-                    "do I have?\". Returns id, kind, action, filters, "
+                    "List the existing triggers + their recent fires. Call "
+                    "this BEFORE creating a new trigger to check for "
+                    "duplicates. Triggers are internal wiring, not something "
+                    "the user has a word for: they are NOT the user's "
+                    "automations and never belong in an answer about what "
+                    "the user has set up. Returns id, kind, action, filters, "
                     "delivery channels, last fire, watch provisioning state."
                 ),
                 "input_schema": {
@@ -350,7 +352,7 @@ class TriggersSkill(Skill):
                 "description": (
                     "Fire a synthetic test event against an existing trigger. "
                     "Useful right after `triggers__create` to verify the "
-                    "wiring (Mission Control surface, delivery channels, etc.) "
+                    "wiring (the dashboard surface, delivery channels, etc.) "
                     "without waiting for a real email to arrive. The handler "
                     "will fail at the message-fetch step (the synthetic id "
                     "doesn't match a real Gmail message), which is expected — "
@@ -400,7 +402,7 @@ class TriggersSkill(Skill):
             "  5. ALWAYS ask where to deliver (`delivery_channels`) before "
             "creating: website (default), telegram, whatsapp.\n"
             "  6. Call `triggers__create`. Confirm success + tell the user "
-            "they can manage from Mission Control.\n"
+            "they can manage it later from the dashboard.\n"
             "\n"
             "**Before creating, ALWAYS call `triggers__list` first** to "
             "check for duplicates. Two triggers for the same kind+action+ "
@@ -547,6 +549,6 @@ class TriggersSkill(Skill):
                 "(synthetic id doesn't match a real message) — this is "
                 "EXPECTED. The test proves the dispatch path works. "
                 "Watch the Day-as-Chat surface for a Message; check "
-                "Mission Control for the event status."
+                "the dashboard for the event status."
             ),
         })

@@ -141,7 +141,7 @@ _DIET_PROPERTY_DESCRIPTIONS = {
     "routines__create": {
         "kind": "`email_briefing` = Gmail preset; `agent_task` = any other recurring prompt.",
         "schedule_cron_local": "5-part cron, user's local tz, e.g. `30 6 * * *`.",
-        "name": "Short name (≤100 chars) shown in Mission Control.",
+        "name": "Short name (≤100 chars) shown to the user in their list.",
         "prompt_text": (
             "REQUIRED for kind=`agent_task`: self-contained instruction "
             "executed at fire time (fresh context, no memory of this chat)."
@@ -170,7 +170,7 @@ _DIET_PROPERTY_DESCRIPTIONS = {
             "Optional with `every`: \"HH:MM\" window end; wraps midnight "
             "if end < start."
         ),
-        "name": "Optional short name for Mission Control (defaults from reminder_text).",
+        "name": "Optional short name shown to the user (defaults from reminder_text).",
         "delivery_channels": (
             "OMIT for the default (chat + every connected channel) and do "
             "NOT ask the user where to send it. Set only on explicit user "
@@ -202,8 +202,8 @@ class RoutinesSkill(Skill):
         name="routines",
         version="1.0.0",
         description=(
-            "Self-author scheduled agent automations: morning email briefings, "
-            "daily check-ins, recurring agent tasks."
+            "Reminders and scheduled tasks: morning email briefings, "
+            "daily check-ins, recurring agent work."
         ),
         author="Toup",
     )
@@ -270,7 +270,7 @@ class RoutinesSkill(Skill):
                             "description": (
                                 "Short human-readable name (≤100 chars), e.g. "
                                 "\"Morning email briefing\" or \"Check deploys\". "
-                                "Shown to the user in Mission Control."
+                                "Shown to the user in their list."
                             ),
                         },
                         "prompt_text": {
@@ -418,7 +418,7 @@ class RoutinesSkill(Skill):
                         "name": {
                             "type": "string",
                             "description": (
-                                "Optional short name shown in Mission Control. "
+                                "Optional short name shown to the user. "
                                 "Defaults to first 60 chars of `reminder_text`."
                             ),
                         },
@@ -457,9 +457,12 @@ class RoutinesSkill(Skill):
             {
                 "name": "routines__list",
                 "description": (
-                    "List all of the user's existing routines. Call this BEFORE "
-                    "creating a new routine to check for duplicates, or when "
-                    "the user asks \"what automations do I have set up?\". "
+                    "List the user's existing reminders and scheduled tasks. "
+                    "Call this BEFORE creating a new one to check for "
+                    "duplicates. These are NOT the user's automations — "
+                    "automations are a separate surface with their own tools "
+                    "and their own list, so never answer a question about "
+                    "automations from this one. "
                     "Returns id, kind, name, schedule, enabled flag, last_status, "
                     "next_run_at."
                 ),
@@ -568,15 +571,24 @@ class RoutinesSkill(Skill):
     # ------------------------------------------------------------------
     def get_system_prompt_section(self) -> Optional[str]:
         return (
-            "# Routines — recurring agent automations + reminders\n"
-            "You can create scheduled automations for the user via the "
-            "`routines__*` tools. Trigger this flow whenever the user asks "
-            "for something on a recurring schedule:\n"
+            "# Reminders and scheduled tasks\n"
+            "You can put things on a schedule for the user via the "
+            "`routines__*` tools — reminders (literal text delivered at a "
+            "time) and scheduled tasks (you do the work and report back). "
+            "Use this flow whenever the user asks for something on a "
+            "recurring schedule:\n"
             "  • \"From now on, read my emails before I wake up and summarize them\"\n"
             "  • \"Every weekday at 7am, give me my calendar for the day\"\n"
             "  • \"Check my GitHub notifications every hour during work hours\"\n"
             "  • \"Remind me to call mom at 6pm\" — *use `routines__remind`*\n"
             "  • \"Buzz me every 30 minutes between 9 and 5 to stretch\" — *use `routines__remind`*\n"
+            "\n"
+            "**These are not the user's automations.** Automations are a "
+            "separate surface with their own tools (`automations__*`) and "
+            "their own list. When the user asks what automations they have, "
+            "or how many, answer from `automations__list` alone — never fold "
+            "reminders or scheduled tasks into that list or that count. When "
+            "they ask about these, call them reminders and scheduled tasks.\n"
             "\n"
             "**Tool to pick:**\n"
             "  • If the user wants literal text delivered at a time "
@@ -621,8 +633,8 @@ class RoutinesSkill(Skill):
             "  5. Call `routines__create` with kind + schedule + name "
             "(+ prompt_text for agent_task). Confirm success to the user, "
             "mention the channels it will arrive on (read them from the tool "
-            "result's `delivery_channels`), and tell them they can adjust "
-            "later from Mission Control on the dashboard.\n"
+            "result's `delivery_channels`), and tell them they can change or "
+            "cancel it later from the dashboard.\n"
             "\n"
             "**Before creating a ROUTINE (`routines__create`), call "
             "`routines__list` first** to check if a similar routine already "
@@ -1043,8 +1055,8 @@ class RoutinesSkill(Skill):
                 "delivery_channels": delivery_out,
             },
             "hint": (
-                "Reminder is live. The user can change/cancel it any time "
-                "from Mission Control on the dashboard."
+                "Reminder is live. The user can change or cancel it any time "
+                "from the dashboard."
             ),
         }, default=str, ensure_ascii=False)
 
@@ -1242,9 +1254,8 @@ class RoutinesSkill(Skill):
                 "next_run_at": str(resp.next_run_at) if resp.next_run_at else None,
             },
             "hint": (
-                "The routine is registered with the scheduler and will fire at "
-                "its next cron tick. The user can view/edit it in Mission "
-                "Control on the dashboard."
+                "It is scheduled and will fire at its next slot. The user "
+                "can view or change it later from the dashboard."
             ),
         })
 
