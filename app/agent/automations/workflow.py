@@ -559,6 +559,17 @@ async def save_permissions(
     # for an automation with no grant at all — the consent flow this 409
     # exists to trigger simply never ran. The platform's grant row is
     # the only thing that can answer the question, and it fails closed.
+    #
+    # Close the read transaction FIRST. `_load_owned` autobegins one, and
+    # `has_approved_write_grant` awaits an httpx GET per write grant id
+    # at a 10s timeout — so the green ✓ was holding a database
+    # connection open across N sequential network calls. That is the same
+    # rule as "never await an LLM call inside an open transaction",
+    # which has cost this codebase connection-pool exhaustion before;
+    # HTTP is not different because it is faster on a good day. Nothing
+    # is pending here, so this ends the read txn rather than writing
+    # anything, and `expire_on_commit=False` keeps `automation` usable.
+    await db.commit()
     has_grant = await permissions.has_approved_write_grant(
         automation=automation, user_id=user_id, connector_id=account_id,
     )
@@ -770,6 +781,7 @@ async def _apply_intent(
             return None
         from . import service as _svc
         name = verbs.display_name(account_id) or account_id
+        was_armed = (automation.status == "armed")
         try:
             await _svc.remove_connector(
                 db, automation_id=automation.id, user_id=user_id,
@@ -788,9 +800,22 @@ async def _apply_intent(
                     "This automation needs both of its accounts.",
             }.get(e.code, f"I could not take {name} out."))
         await _edited_note(db, automation)
+        # `update_automation` drops the automation to `draft`, commits,
+        # and only RE-ARMS on a best-effort basis — a CompileError or
+        # SpecError there is logged, not raised. So a removal can leave
+        # an automation that was running silently stopped, and reporting
+        # "Took Jira out of this automation." alone would be a tidy
+        # sentence over a change the user did not ask for and cannot
+        # see. Say the part that matters.
+        await db.refresh(automation)
+        stopped = was_armed and automation.status != "armed"
+        sentence = (intent.get("sentence")
+                    or f"Took {name} out of this automation.")
+        if stopped:
+            sentence = (f"Took {name} out, and this automation stopped "
+                        f"running — it needs setting up again.")
         return {"kind": "account",
-                "sentence": intent.get("sentence")
-                or f"Took {name} out of this automation.",
+                "sentence": sentence,
                 "sheet": "accounts",
                 # The revert carries the WHOLE pre-removal spec, not just
                 # the id: `service.add_connector` rebuilds a connector's

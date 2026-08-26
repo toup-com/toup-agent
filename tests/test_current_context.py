@@ -911,3 +911,70 @@ def test_current_context_is_never_written_through_apply_ops():
     src = _src("app/services/current_context.py")
     assert "apply_ops" not in src
     assert "MemoryFileChange" not in src
+
+
+@pytest.mark.asyncio
+async def test_engine_routines_never_reach_the_agents_schedule(stub_llm):
+    """ND-18, second door — and this one could DISPLACE, not just add.
+
+    The fix for ND-18 excluded the engine's own routines from
+    `GET /api/routines`. `_scheduled_today` is a second reader and it
+    selected EVERY enabled routine, so the engine's compiled bindings
+    arrived here wearing their literal `[automation] …` name and were
+    announced to the agent as the user's own arrangements.
+
+    Worse than noise: this block is capped at MAX_SCHEDULED_LINES, so
+    enough engine rows push the user's real reminders out of it entirely.
+    Seed exactly that shape — the cap's worth of plumbing, plus one real
+    reminder — and require the reminder to survive.
+    """
+    db, user_id, _ = await _session()
+    llm = stub_llm("Has soccer at 5:20 PM.")
+    await _seed_body(db, user_id, CurrentContext())
+
+    # A full cap's worth of engine plumbing, all earlier in the day so
+    # they sort ahead of the reminder and win the truncation.
+    for n in range(cc.MAX_SCHEDULED_LINES):
+        db.add(Routine(
+            user_id=user_id, kind="automation_schedule",
+            name=f"[automation] Morning new-email briefing {n}",
+            schedule_cron_local="0 8 * * *",
+            next_run_at=datetime(2026, 8, 20, 12, n),
+        ))
+    db.add(Routine(
+        user_id=user_id, kind="automation_poll",
+        name="[automation] Jira watch", schedule_cron_local="*/15 * * * *",
+        next_run_at=datetime(2026, 8, 20, 12, 30),
+    ))
+    db.add(Routine(
+        user_id=user_id, kind="autopilot", name="Autopilot heartbeat",
+        schedule_cron_local="*/5 * * * *",
+        next_run_at=datetime(2026, 8, 20, 12, 45),
+    ))
+    # A routine an automation has already taken over (§4.11a stamp).
+    db.add(Routine(
+        user_id=user_id, kind="agent_task", name="Old mail brief",
+        schedule_cron_local="0 7 * * *",
+        config_json={"migrated_to": "a-1"},
+        next_run_at=datetime(2026, 8, 20, 12, 50),
+    ))
+    # ...and the user's own reminder, LAST in the day.
+    db.add(Routine(
+        user_id=user_id, kind="reminder", name="Soccer",
+        reminder_text="soccer", schedule_cron_local="20 17 * * *",
+        next_run_at=datetime(2026, 8, 20, 21, 20),
+    ))
+    await db.commit()
+
+    await cc.refresh_today(
+        db, user_id, now=datetime(2026, 8, 20, 18, 0, tzinfo=UTC))
+    prompt = llm.prompts[0]
+
+    assert "[automation]" not in prompt, (
+        "the engine's own binding names reached the agent")
+    assert "Autopilot heartbeat" not in prompt
+    assert "Old mail brief" not in prompt, (
+        "a routine an automation replaced was announced as current")
+    # The eviction half: the user's real reminder still made it in.
+    assert "soccer" in prompt.lower(), (
+        "engine rows pushed the user's own reminder out of the block")

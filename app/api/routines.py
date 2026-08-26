@@ -801,11 +801,11 @@ async def list_routines():
             # `superseded_by` on the source row and disables it; leaving
             # it listed meant every migration added a phantom, so the
             # count drifted further from the truth with each one.
-            routines = [
-                r for r in routines
-                if not ((r.config_json or {}).get("migrated_to")
-                        or (r.config_json or {}).get("superseded_by"))
-            ]
+            # One predicate, shared with `current_context._scheduled_today`
+            # — this rule was re-derived per reader and kept being got
+            # wrong in a different way each time.
+            from app.db.models.routine import is_user_facing_routine
+            routines = [r for r in routines if is_user_facing_routine(r)]
 
             for r in routines:
                 try:

@@ -23,6 +23,36 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 
 
+#: Routine kinds the ENGINE owns. They are implementation of something
+#: the user sees elsewhere, never an arrangement the user made:
+#: `autopilot` missions live at /api/autopilot/missions, and the two
+#: `automation_*` kinds are an automation's compiled bindings — the
+#: automation itself is the user-visible unit.
+#:
+#: This list exists because the rule kept being re-derived per reader and
+#: kept being got wrong. `list_routines` excluded autopilot (founder bug,
+#: 2026-07-16) and later `automation_poll`; `current_context`
+#: `_scheduled_today` excluded NOTHING, so the engine's own
+#: `[automation] …` names reached the agent's SCHEDULED TODAY block —
+#: and because that block is capped, the phantom lines could EVICT the
+#: user's real reminders. One predicate, every reader.
+ENGINE_OWNED_ROUTINE_KINDS = (
+    "autopilot", "automation_poll", "automation_schedule",
+)
+
+
+def is_user_facing_routine(routine) -> bool:
+    """Is this a routine the USER arranged, as opposed to engine
+    plumbing or a row an automation has already replaced?"""
+    if getattr(routine, "kind", None) in ENGINE_OWNED_ROUTINE_KINDS:
+        return False
+    cfg = getattr(routine, "config_json", None) or {}
+    if not isinstance(cfg, dict):
+        return True
+    # §4.11a stamps these when an automation takes the routine over.
+    return not (cfg.get("migrated_to") or cfg.get("superseded_by"))
+
+
 class Routine(Base):
     """One system-managed scheduled action for a user.
 

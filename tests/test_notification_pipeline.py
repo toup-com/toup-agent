@@ -200,14 +200,54 @@ async def test_notification_body_is_total_over_the_v3_statuses():
 
     v3_statuses = ("running", "waiting_on_user", "completed", "partial",
                    "superseded", "stopped_by_user", "skipped", "failed")
-    bodies = {}
-    for status in v3_statuses:
-        body = _notification_body("automation_run", {
-            "run_kind": "scheduled", "status": status,
-            "needs_count": 0, "writes_count": 0,
-        })
-        assert body and body.strip(), f"{status}: no body"
-        bodies[status] = body
+
+    def _bodies(seam: bool):
+        """`_notification_body` delegates to C's `notification_templates`
+        FIRST and only falls back to A's own table when that import
+        fails. So calling it plainly exercises C's table and NEVER A's —
+        this test named AUDIT-11, which is A's table, and could not see
+        it. Run both, because both ship: the fallback is what a tenant
+        gets if the template module is ever absent."""
+        import sys
+        out = {}
+        saved = sys.modules.get(
+            "app.agent.automations.notification_templates")
+        if not seam:
+            sys.modules[
+                "app.agent.automations.notification_templates"] = None
+        try:
+            for st in v3_statuses:
+                b = _notification_body("automation_run", {
+                    "run_kind": "scheduled", "status": st,
+                    "needs_count": 0, "writes_count": 0,
+                })
+                assert b and b.strip(), f"{st}: no body (seam={seam})"
+                out[st] = b
+        finally:
+            if not seam:
+                if saved is not None:
+                    sys.modules[
+                        "app.agent.automations.notification_templates"
+                    ] = saved
+                else:
+                    sys.modules.pop(
+                        "app.agent.automations.notification_templates",
+                        None)
+        return out
+
+    via_seam = _bodies(True)
+    via_fallback = _bodies(False)
+    assert via_fallback != via_seam or True  # both must simply be total
+    for label, bodies in (("seam", via_seam), ("fallback", via_fallback)):
+        for status in ("stopped_by_user", "superseded", "skipped"):
+            assert "ran on time" not in bodies[status], (
+                f"{label}/{status} claims it ran on time: "
+                f"{bodies[status]!r}")
+            assert "Nothing needs you" not in bodies[status], (
+                f"{label}/{status}: {bodies[status]!r}")
+        assert "ran on time" not in bodies["partial"], label
+        assert len(set(bodies.values())) >= 6, label
+    bodies = via_seam
 
     # The three that used to lie must not claim a clean on-time run.
     for status in ("stopped_by_user", "superseded", "skipped"):

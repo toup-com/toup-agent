@@ -636,7 +636,7 @@ async def test_schedule_sheet_never_offers_a_preset_the_writer_rejects():
     very id it had just served. Selecting it is a no-op, not an error.
     """
     from app.agent.automations.workflow import (
-        schedule_block, set_schedule_preset, _spec_raw,
+        _schedule_of, _spec_raw, schedule_block, set_schedule_preset,
     )
     uid = await _mk_user()
     # A schedule that is none of the four presets.
@@ -650,9 +650,25 @@ async def test_schedule_sheet_never_offers_a_preset_the_writer_rejects():
         a1 = await db.get(Automation, a.id)
         block = schedule_block(a1, _spec_raw(a1))
         assert block["preset_id"] == "current"
+
+        # Selecting `current` is a NO-OP, which is the actual claim —
+        # asserting only that a sentence came back would pass even if it
+        # rewrote the cron, so read the schedule back.
+        before_cron = _schedule_of(_spec_raw(a1))
+        result = await set_schedule_preset(
+            db, automation=a1, user_id=uid, preset_id="current",
+        )
+        assert result["sentence"]
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        assert _schedule_of(_spec_raw(a2)) == before_cron, (
+            "selecting `current` moved the schedule")
+
+        # ...and every OTHER row the sheet offers is still accepted.
         for row in block["presets"]:
             result = await set_schedule_preset(
-                db, automation=a1, user_id=uid, preset_id=row["id"],
+                db, automation=a2, user_id=uid, preset_id=row["id"],
             )
             assert result["sentence"]
 
@@ -979,3 +995,96 @@ async def test_an_unarmed_automations_write_is_not_already_allowed():
             db, automation=row, account_id="slack",
         )
         assert {p["id"] for p in armed["can"]} & writes
+
+
+@pytest.mark.asyncio
+async def test_the_grant_check_holds_no_transaction_open(monkeypatch):
+    """No database transaction may be open across a network call.
+
+    `has_approved_write_grant` awaits an httpx GET per write grant id at
+    a 10s timeout, and `_load_owned` has already autobegun a transaction
+    by the time `save_permissions` runs — so the green ✓ held a
+    connection open across N sequential round trips. This is the same
+    rule as "never await an LLM call inside an open transaction", which
+    has cost this codebase connection-pool exhaustion; HTTP is not
+    exempt because it is usually fast.
+    """
+    from app.agent.automations import permissions
+    from app.agent.automations.workflow import save_permissions
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    cat = permissions.catalog_for("slack")
+
+    seen: list = []
+
+    async def _watching_grant(user_id, grant_id):
+        # Captured INSIDE the network call, which is the only moment
+        # that matters.
+        seen.append(db_ref["db"].in_transaction())
+        return {"id": grant_id, "status": "approved",
+                "connector_id": "slack"}
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_grant", _watching_grant)
+
+    db_ref: dict = {}
+    async with async_session_maker() as db:
+        db_ref["db"] = db
+        a1 = await db.get(Automation, a.id)   # autobegins a transaction
+        assert db.in_transaction(), "fixture must start inside one"
+        await save_permissions(
+            db, automation=a1, user_id=uid, account_id="slack",
+            can_ids=[p["id"] for p in cat["reads"] + cat["writes"]],
+            cant_ids=[],
+        )
+
+    assert seen, "the grant check never ran — the pin proves nothing"
+    assert not any(seen), (
+        f"a transaction was open during {sum(seen)} of {len(seen)} "
+        f"grant round trips")
+
+
+@pytest.mark.asyncio
+async def test_a_removal_that_stops_the_automation_says_so(monkeypatch):
+    """A tidy sentence must not cover a change the user did not ask for.
+
+    `service.update_automation` drops the automation to `draft`, commits,
+    and re-arms only on a BEST-EFFORT basis — a CompileError or SpecError
+    in the re-arm is logged, not raised. So a composer removal can leave
+    a running automation silently stopped while the composer reports
+    "Took Jira out of this automation." and nothing else.
+    """
+    from app.agent.automations import service as svc
+    from app.agent.automations.workflow import _apply_intent
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "armed"
+        await db.commit()
+
+    real_arm = svc.arm_automation
+
+    async def _failing_arm(db, *, automation_id, user_id, **kw):
+        raise svc.compiler.CompileError("no_trigger", "no trigger left")
+    monkeypatch.setattr(svc, "arm_automation", _failing_arm)
+
+    async with async_session_maker() as db:
+        a1 = await db.get(Automation, a.id)
+        entry = await _apply_intent(
+            db, automation=a1, user_id=uid,
+            intent={"kind": "account", "account_id": "jira",
+                    "direction": "remove"},
+        )
+
+    assert entry is not None
+    said = entry["sentence"].lower()
+    assert "stopped running" in said, (
+        f"the composer hid that the automation stopped: {entry['sentence']!r}")
+
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        assert a2.status != "armed"
+
+    monkeypatch.setattr(svc, "arm_automation", real_arm)

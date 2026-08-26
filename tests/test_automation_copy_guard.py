@@ -113,7 +113,7 @@ def _every_notification_body() -> list[str]:
         notification_templates.setup_card("Morning work brief")["title"],
         notification_templates.setup_card("Morning work brief")["body"],
     ]
-    for run_kind, vocabulary, status, n in itertools.product(
+    for run_kind, vocabulary, status, n, connector in itertools.product(
         ("scheduled", "run_now"),
         ("brief", "changes"),
         # The WHOLE v3 enum (ledger.run_v3_status). This listed three of
@@ -122,12 +122,17 @@ def _every_notification_body() -> list[str]:
         ("completed", "failed", "waiting_on_user", "partial",
          "stopped_by_user", "superseded", "skipped", "running"),
         (0, 1, 2, 9, 10, 128),
+        ("GitHub", ""),
     ):
         bodies.append(notification_templates.notification_body(
             "automation_run",
             {"run_kind": run_kind, "status": status, "vocabulary": vocabulary,
              "needs_count": n, "writes_count": n,
-             "failed_connector_name": "GitHub" if status == "failed" else ""},
+             # Both failure shapes. Pinning this to "GitHub" meant the
+             # connector-less failure body — the one ND-16 exists for —
+             # was produced by no row in this sweep and therefore
+             # scanned by nothing.
+             "failed_connector_name": connector},
         ))
     for summary in (
         {"status": "waiting_on_user"},

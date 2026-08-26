@@ -316,13 +316,28 @@ async def _scheduled_today(
     expression, `prompt_text`, `config_json`, `last_state_json` and the id.
     Deduped by routine id, so one arrangement can never be announced twice.
     """
-    from app.db.models.routine import Routine
+    from app.db.models.routine import (
+        ENGINE_OWNED_ROUTINE_KINDS, Routine, is_user_facing_routine,
+    )
 
     rows = (await db.execute(
         select(Routine).where(and_(
             Routine.user_id == user_id, Routine.enabled.is_(True),
+            # ND-18, second door. This read EVERY enabled routine, so the
+            # engine's own bindings arrived here wearing their literal
+            # `[automation] Morning new-email briefing` name and were
+            # announced to the agent as the user's arrangements. Because
+            # this block is CAPPED, those phantom lines could evict the
+            # user's real reminders — the leak did not just add noise, it
+            # displaced signal. `list_routines` had grown the exclusion
+            # twice; this reader never got it.
+            Routine.kind.notin_(ENGINE_OWNED_ROUTINE_KINDS),
         ))
     )).scalars().all()
+    # ...and a routine an automation has already taken over is not on
+    # today's list either (the stamp lives in JSON, so it is filtered
+    # here rather than in SQL).
+    rows = [r for r in rows if is_user_facing_routine(r)]
 
     out: List[Tuple[datetime, str]] = []
     seen: set = set()
