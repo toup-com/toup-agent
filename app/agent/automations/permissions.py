@@ -189,6 +189,92 @@ async def resolve(
     return {"can": can, "cant": cant}
 
 
+def write_grant_ids(automation: Automation, connector_id: str) -> list[str]:
+    """The grant ids the spec's write steps on this connector carry."""
+    try:
+        raw = json.loads(automation.spec_json or "{}")
+    except (ValueError, TypeError):
+        return []
+    if raw.get("version") != 2:
+        action = raw.get("action") or {}
+        gid = action.get("grant_id")
+        return [gid] if gid and action.get(
+            "connector_id") == connector_id else []
+    return [s["grant_id"] for s in raw.get("steps") or []
+            if s.get("connector_id") == connector_id and s.get("grant_id")]
+
+
+async def has_approved_write_grant(
+    *, automation: Automation, user_id: str, connector_id: str,
+) -> bool:
+    """Does an APPROVED platform grant back a write on this connector?
+
+    AUDIT-2: the caller used to read the connector's OAuth `scopes` off
+    the connection state. Scopes say the user once let the platform hold
+    a token with that reach; a grant says the user approved THIS
+    automation to make THAT call to THAT target. Every connected Slack
+    carries a write scope, so the green ✓ accepted "Post as you" for an
+    automation nobody had granted anything — the §3.7 consent flow the
+    409 exists to trigger never ran, and the sheet showed the permission
+    as allowed until the dispatcher failed closed at fire time.
+
+    Fails CLOSED: an unreachable platform means no approved grant, which
+    returns the user to consent rather than through it.
+    """
+    ids = write_grant_ids(automation, connector_id)
+    if not ids:
+        return False
+    from . import registry as _reg
+    for gid in ids:
+        grant = await _reg.fetch_grant(user_id, gid)
+        # Same predicate the compiler arms on (compiler.py:347).
+        if (grant or {}).get("status") == "approved":
+            return True
+    return False
+
+
+async def revoke_writes(
+    db: AsyncSession, *, automation: Automation, connector_id: str,
+) -> list[str]:
+    """Move every allowed write for one connector into IT CANNOT.
+
+    AUDIT-4: revoking a grant paused the automation but left the saved
+    permission row untouched, so the account sheet kept the write in IT
+    CAN — the one surface whose whole job is to answer "what may this
+    thing do?" answered with a permission the platform had already taken
+    away. Writing an EXPLICIT row matters: the spec keeps its `grant_id`
+    after a revoke, so the unsaved default would still resolve to CAN.
+    """
+    cat = catalog_for(connector_id)
+    write_ids = {p["id"] for p in cat["writes"]}
+    if not write_ids:
+        return []
+    current = await resolve(db, automation=automation,
+                            account_id=connector_id)
+    can_ids = [p["id"] for p in current["can"]]
+    moved = sorted(pid for pid in can_ids if pid in write_ids)
+    if not moved:
+        return []
+    row = await saved_row(db, automation.id, connector_id)
+    if row is None:
+        row = AutomationAccountPermission(
+            automation_id=automation.id, account_id=connector_id,
+        )
+        db.add(row)
+    try:
+        prev_cant = set(json.loads(row.cant_json or "[]"))
+    except (ValueError, TypeError):
+        prev_cant = set()
+    row.can_json = json.dumps(
+        sorted(pid for pid in can_ids if pid not in write_ids))
+    row.cant_json = json.dumps(sorted(prev_cant | set(moved)))
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    logger.info("[automations] grant revoke demoted %d write(s) on %s "
+                "for %s", len(moved), connector_id, automation.id)
+    return moved
+
+
 async def save(
     db: AsyncSession, *, automation: Automation, account_id: str,
     can_ids: list[str], cant_ids: list[str], has_write_grant: bool,
@@ -211,10 +297,26 @@ async def save(
     write_allowed = [p for p in can_set
                      if p in {w["id"] for w in cat["writes"]}]
     if write_allowed and not has_write_grant:
+        # §4.4 shape: `consent:{connector_id, mode, scopes}` — the app
+        # reads the NESTED object to run the §3.7 flow and retry. It
+        # was served flat, so the app had nothing to run and the retry
+        # loop had no starting point. Flat keys stay alongside it: a
+        # shipped build reading them keeps working.
+        try:
+            spec = json.loads(automation.spec_json or "{}")
+        except (ValueError, TypeError):
+            spec = {}
+        labels = {w["id"]: w["label"] for w in cat["writes"]}
         raise PermissionError409(
             "needs_consent",
             "Allowing this needs your say-so first.",
-            {"connector_id": account_id, "permissions": write_allowed},
+            {"consent": {
+                "connector_id": account_id,
+                "mode": (spec.get("mode") or "auto"),
+                "scopes": [{"id": p, "label": labels.get(p, p)}
+                           for p in write_allowed],
+             },
+             "connector_id": account_id, "permissions": write_allowed},
         )
     row = await saved_row(db, automation.id, account_id)
     if row is None:

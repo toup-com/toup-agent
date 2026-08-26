@@ -116,7 +116,11 @@ def _every_notification_body() -> list[str]:
     for run_kind, vocabulary, status, n in itertools.product(
         ("scheduled", "run_now"),
         ("brief", "changes"),
-        ("completed", "failed", "waiting_on_user"),
+        # The WHOLE v3 enum (ledger.run_v3_status). This listed three of
+        # the eight, so the four statuses whose bodies were wrong were
+        # also the four this guard never scanned.
+        ("completed", "failed", "waiting_on_user", "partial",
+         "stopped_by_user", "superseded", "skipped", "running"),
         (0, 1, 2, 9, 10, 128),
     ):
         bodies.append(notification_templates.notification_body(

@@ -261,6 +261,32 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
                 "n": i + 1, "text": act["action"],
                 "sub": act["detail"] or name,
             })
+    else:
+        # AUDIT-8: only v2 was derived, so every v1 automation opened an
+        # EMPTY Steps sheet — the canvas asserting the thing does
+        # nothing. A v1 spec is exactly one read (the trigger's source)
+        # and one write (its action); derive both through the same verb
+        # dictionary, so the sheet reads like a v2 one.
+        source = (raw.get("trigger") or {}).get("source") or {}
+        action = raw.get("action") or {}
+        if source.get("connector_id"):
+            cid = source["connector_id"]
+            act = verbs.turn_action(cid, None, kind="read", ok=True)
+            out.append({
+                "n": len(out) + 1, "text": act["action"],
+                "sub": act["detail"] or verbs.display_name(cid) or "",
+            })
+        if action.get("tool"):
+            cid = action.get("connector_id") or ""
+            act = verbs.turn_action(
+                cid, action["tool"], kind="write", ok=True,
+                audience="you" if action["tool"] in DRAFT_TOOLS
+                else "others",
+            )
+            out.append({
+                "n": len(out) + 1, "text": act["action"],
+                "sub": act["detail"] or verbs.display_name(cid) or "",
+            })
     return out
 
 
@@ -392,6 +418,15 @@ async def set_schedule_preset(
     db: AsyncSession, *, automation: Automation, user_id: str,
     preset_id: str,
 ) -> dict:
+    # AUDIT-7: the payload offers a synthetic `current` row so the sheet
+    # can show a schedule that is none of the four presets. Selecting it
+    # is a no-op, not an error — the writer used to 409 on the very id
+    # it had just served.
+    if preset_id == "current":
+        raw_now = _spec_raw(automation)
+        block = schedule_block(automation, raw_now)
+        return {"schedule": block,
+                "sentence": "Left the time as it was."}
     preset = next((p for p in SCHEDULE_PRESETS if p["id"] == preset_id),
                   None)
     if preset is None:
@@ -485,7 +520,13 @@ async def update_rule(
 async def delete_rule(
     db: AsyncSession, *, automation: Automation, rule_id: str,
 ) -> dict:
-    rules = [r for r in rules_list(automation) if r.get("id") != rule_id]
+    before = rules_list(automation)
+    rules = [r for r in before if r.get("id") != rule_id]
+    # AUDIT-10: deleting a rule that does not exist used to answer 200
+    # "Removed the rule." and stamp an EDITED note into the thread — a
+    # record of an edit that never happened.
+    if len(rules) == len(before):
+        raise WorkflowError("not_found", "That rule is gone.")
     automation.rules_json = json.dumps(rules)
     await db.commit()
     await _edited_note(db, automation)
@@ -499,15 +540,15 @@ async def save_permissions(
     """The green ✓ (§4.4). The consent question is answered by the
     platform grant: allowing a write with no approved grant behind it
     returns needs_consent and the app runs the §3.7 flow first."""
-    has_grant = permissions._default_can_write(automation, account_id)
-    if not has_grant:
-        # A grant may exist without a spec write step yet (consent
-        # granted ahead of the recompile) — ask the platform.
-        try:
-            conn = await reg.fetch_connection_state(user_id)
-            has_grant = bool((conn.get(account_id) or {}).get("scopes"))
-        except Exception:  # noqa: BLE001
-            has_grant = False
+    # AUDIT-2: this used to fall back to the connector's OAuth `scopes`
+    # when the spec carried no grant_id. Every connected Slack has a
+    # write scope, so the fallback made the green ✓ accept "Post as you"
+    # for an automation with no grant at all — the consent flow this 409
+    # exists to trigger simply never ran. The platform's grant row is
+    # the only thing that can answer the question, and it fails closed.
+    has_grant = await permissions.has_approved_write_grant(
+        automation=automation, user_id=user_id, connector_id=account_id,
+    )
     try:
         result = await permissions.save(
             db, automation=automation, account_id=account_id,
@@ -556,6 +597,7 @@ async def composer_ask(
 
     applied: list[dict] = []
     needs: list[dict] = []
+    refused: list[str] = []
     answer: Optional[str] = None
     try:
         from .composer import classify_change
@@ -566,9 +608,27 @@ async def composer_ask(
         needs = outcome.get("needs") or []
         answer = outcome.get("answer")
         for intent in intents:
-            entry = await _apply_intent(
-                db, automation=automation, user_id=user_id, intent=intent,
-            )
+            # AUDIT-6: every applier commits its own write, so letting a
+            # WorkflowError out of this loop left the earlier intents
+            # COMMITTED, answered the whole call 409, and skipped the
+            # `agent` turn below — a half-applied change with no record
+            # of itself in the thread. "Move it to 7:15 and add a rule"
+            # was enough to do it. A refusal is now a sentence, not an
+            # abort: the safe siblings still land and the agent turn says
+            # what did not.
+            try:
+                entry = await _apply_intent(
+                    db, automation=automation, user_id=user_id,
+                    intent=intent,
+                )
+            except WorkflowError as e:
+                refused.append(e.sentence)
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[workflow] intent %s failed: %s",
+                               intent.get("kind"), e)
+                refused.append("I could not make that one.")
+                continue
             if entry is not None:
                 applied.append(entry)
     except ImportError:
@@ -588,8 +648,15 @@ async def composer_ask(
         answer = ("I could not place that change. Tell me in the thread "
                   "and I will do it there.")
 
+    if refused and not answer:
+        # §4.4: `answer` is the slot for "a sentence the agent cannot
+        # place". A refusal is exactly that — it is not a `needs` entry,
+        # whose kinds are fixed at consent|confirm.
+        answer = " ".join(refused)
     if applied:
         confirmation = " ".join(a["sentence"] for a in applied)
+        if refused:
+            confirmation = f"{confirmation} {' '.join(refused)}"
     else:
         confirmation = answer or (
             "That needs your say-so first — nothing was changed."
@@ -639,8 +706,14 @@ async def _apply_intent(
                 "undo_token": _mint_undo("step", {"steps": before})}
     if kind == "permission":
         # Only REMOVALS apply silently; allows go through needs.
+        # AUDIT-1: the classifier emits `permission_id`; this read
+        # `remove_id` and silently dropped every revoke — "slack must
+        # never post as me" answered "Added a rule …" while the account
+        # kept the permission. `remove_id` stays as an alias so an older
+        # caller keeps working.
         account_id = intent.get("account_id") or ""
-        remove_id = intent.get("remove_id") or ""
+        remove_id = (intent.get("permission_id")
+                     or intent.get("remove_id") or "")
         current = await permissions.resolve(
             db, automation=automation, account_id=account_id,
         )
@@ -662,6 +735,43 @@ async def _apply_intent(
                 "undo_token": _mint_undo(
                     "permission",
                     {"account_id": account_id, "can": before_can})}
+    if kind == "account":
+        # AUDIT-5: the classifier emits account add/remove; there was no
+        # branch, so "take Jira out of this automation" reported nothing
+        # wrong while the account stayed wired in. Only REMOVAL applies
+        # silently — an add grants new reach and belongs in `needs`.
+        if (intent.get("direction") or "remove") != "remove":
+            return None
+        account_id = intent.get("account_id") or ""
+        raw_before = _spec_raw(automation)
+        if account_id not in _member_connectors(raw_before):
+            return None
+        from . import service as _svc
+        name = verbs.display_name(account_id) or account_id
+        try:
+            await _svc.remove_connector(
+                db, automation_id=automation.id, user_id=user_id,
+                connector_id=account_id,
+            )
+        except _svc.MembershipError as e:
+            # Refuse out loud. The spec says why it cannot absorb the
+            # removal; silence here reads as "done" to the user.
+            if e.code == "not_member":
+                return None
+            raise WorkflowError(e.code, {
+                "connector_required":
+                    f"{name} is doing work this automation depends on, "
+                    f"so I left it in.",
+                "not_supported_v1":
+                    "This automation needs both of its accounts.",
+            }.get(e.code, f"I could not take {name} out."))
+        await _edited_note(db, automation)
+        return {"kind": "account",
+                "sentence": intent.get("sentence")
+                or f"Took {name} out of this automation.",
+                "sheet": "accounts",
+                "undo_token": _mint_undo(
+                    "account", {"account_id": account_id})}
     return None
 
 

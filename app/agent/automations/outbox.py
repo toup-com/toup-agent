@@ -399,6 +399,14 @@ async def _park_run_on_card(db, row: AutomationOutbox,
     job.completed_at = None
     await db.commit()
 
+    # R30 §4.10 (AUDIT-12): tell the notification pipeline. The park
+    # writes `job.status` straight onto the row — no finalize gate runs,
+    # so without this call the run that is waiting for the user is the
+    # one run that never tells them. AFTER the commit, for the R28-D
+    # reason: a reader inside the transaction sees the old row.
+    from . import run_v3 as _run_v3
+    await _run_v3.on_parked(db, job_id=row.job_id)
+
     # R30 §4.9: the park is a `waiting` turn in the thread — the
     # WAITING ON YOU card with Approve / Not now. Best-effort; the
     # R29 pending card above stays the resolve surface.

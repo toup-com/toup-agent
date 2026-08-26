@@ -10,6 +10,7 @@ parity for the `automation_notification` card key.
 
 import json
 import uuid
+from datetime import datetime
 
 import pytest
 from sqlalchemy import select
@@ -183,3 +184,110 @@ def test_notification_body_fallback_never_a_finding():
     assert "TP-" not in body
     body2 = _notification_body("automation_needs_you", {"status": "waiting_on_user"})
     assert "waiting" in body2.lower()
+
+
+@pytest.mark.asyncio
+async def test_notification_body_is_total_over_the_v3_statuses():
+    """AUDIT-11: every status `run_v3_status` can return has a sentence.
+
+    The table knew `waiting_on_user` and `failed`; the other six fell
+    through to the closing line, so a run the user stopped, a run a
+    newer one superseded and a run that found nothing to do all pushed
+    "It ran on time. Nothing needs you" — the notification asserting the
+    opposite of what happened.
+    """
+    from app.agent.automations.run_v3 import _notification_body
+
+    v3_statuses = ("running", "waiting_on_user", "completed", "partial",
+                   "superseded", "stopped_by_user", "skipped", "failed")
+    bodies = {}
+    for status in v3_statuses:
+        body = _notification_body("automation_run", {
+            "run_kind": "scheduled", "status": status,
+            "needs_count": 0, "writes_count": 0,
+        })
+        assert body and body.strip(), f"{status}: no body"
+        bodies[status] = body
+
+    # The three that used to lie must not claim a clean on-time run.
+    for status in ("stopped_by_user", "superseded", "skipped"):
+        assert "ran on time" not in bodies[status], (
+            f"{status} claims it ran on time: {bodies[status]!r}")
+        assert "Nothing needs you" not in bodies[status]
+    assert "stopped it" in bodies["stopped_by_user"]
+    assert "newer run" in bodies["superseded"]
+    assert "nothing to do" in bodies["skipped"]
+    # A partial run does not claim a whole one.
+    assert "ran on time" not in bodies["partial"]
+    # Distinct statuses get distinct sentences — a table that collapses
+    # them is the defect in a different shape.
+    assert len(set(bodies.values())) >= 6
+
+
+@pytest.mark.asyncio
+async def test_confirm_park_reaches_the_notification_pipeline(
+    monkeypatch, _notify_spy,
+):
+    """AUDIT-12: the park is a state §4.10 must hear.
+
+    `_park_run_on_card` writes `job.status = "waiting_on_user"` straight
+    onto the row — no finalize gate runs. Without the post-commit hop
+    the run that is waiting for the user was the one run that never told
+    them: no `automation_needs_you` row, no card, no push.
+    """
+    from app.agent.automations.outbox import _park_run_on_card
+    from app.db.models import AutomationOutbox
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    job = await _one_run(a.id)
+    _notify_spy.clear()
+
+    async with async_session_maker() as db:
+        row = AutomationOutbox(
+            id=str(uuid.uuid4()), user_id=uid, automation_id=a.id,
+            job_id=job.id, connector_id="slack",
+            tool_name="slack__send_message",
+            payload_json=json.dumps({}), status="staged",
+            idempotency_key=str(uuid.uuid4()),
+            execute_after=datetime.utcnow(),
+        )
+        db.add(row)
+        await db.commit()
+        await _park_run_on_card(db, row, {
+            "action_id": "act-1",
+            "summary": "Post the digest to #platform",
+        })
+
+    async with async_session_maker() as db:
+        parked = await db.get(BuildJob, job.id)
+        assert parked.status == "waiting_on_user"
+        rows = (await db.execute(
+            select(AutomationNotification).where(
+                AutomationNotification.run_id == job.id,
+            )
+        )).scalars().all()
+        kinds = {r.kind for r in rows}
+        assert "automation_needs_you" in kinds, (
+            "the park minted no needs-you notification")
+        run_row = next(r for r in rows if r.kind == "automation_run")
+        assert run_row.status == "waiting_on_user"
+        # A park is not a finished run: it must not claim 100%.
+        assert run_row.fraction < 100
+        assert "waiting" in (run_row.body or "").lower()
+
+        # The card message the app renders.
+        msgs = (await db.execute(
+            select(Message).where(Message.source == "automation")
+        )).scalars().all()
+        assert any("automation_notification" in (m.metadata_json or "")
+                   for m in msgs), "no chat card for the park"
+
+    # ...and the push went out under its OWN dedup key, so the later
+    # completion notice is not suppressed as a duplicate.
+    park_pushes = [c for c in _notify_spy
+                   if str(c.get("dedup_key", "")).endswith(":park")]
+    assert park_pushes, f"no park push in {[c.get('dedup_key') for c in _notify_spy]}"
+    assert park_pushes[0]["event_kind"] == "needs_approval"

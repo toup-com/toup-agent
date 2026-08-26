@@ -301,16 +301,38 @@ def _notification_body(kind: str, summary: dict) -> str:
         return "Continue setting it up ›"
     if kind == "automation_needs_you" or status == "waiting_on_user":
         return "One thing is waiting on you — open the run to decide."
-    if status in ("failed",):
+    # AUDIT-11 (ND-14's class, in the notification body): this table knew
+    # `waiting_on_user` and `failed` out of the EIGHT statuses
+    # `ledger.run_v3_status` can return, and everything else fell to the
+    # closing line. A run the user STOPPED, a run SUPERSEDED by a newer
+    # one and a run that found nothing to do all pushed "It ran on time.
+    # Nothing needs you" — the notification asserting the opposite of
+    # what happened. Every status now has its own sentence.
+    if status == "failed":
         return ("It could not finish. Open the run and I will show you "
                 "what stopped it.")
+    if status == "stopped_by_user":
+        return ("You stopped it. Nothing else went out — open the run to "
+                "see how far it got.")
+    if status == "superseded":
+        return ("A newer run replaced this one. Open the newer run for "
+                "what happened.")
+    if status == "skipped":
+        return ("There was nothing to do this time — open the run to see "
+                "what it checked.")
+    if status == "running":
+        return "It is working now — open the run to watch."
+    lead = "It got part of the way." if status == "partial" \
+        else "It ran on time."
     if n == 1:
-        return ("It ran on time. One thing needs you today — open the run "
+        return (f"{lead} One thing needs you today — open the run "
                 "and I will walk you through it there.")
     if n > 1:
-        return (f"It ran on time. {n} things need you today — open the run "
+        return (f"{lead} {n} things need you today — open the run "
                 "and I will walk you through them there.")
-    return "It ran on time. Nothing needs you — the full run is inside."
+    if status == "partial":
+        return f"{lead} Open the run and I will show you what is left."
+    return f"{lead} Nothing needs you — the full run is inside."
 
 
 async def _accounts_payload(automation: Automation) -> list[dict]:
@@ -491,6 +513,57 @@ async def _notify_terminal(
 ) -> None:
     """Terminal: fill the run notification's body (same string on card,
     push and LA), flip the card, push completed-only, end the LA."""
+    await _notify_state(db, automation=automation, job=job, v3=v3,
+                        fraction=100)
+
+
+async def on_parked(db: AsyncSession, *, job_id: str) -> None:
+    """§4.10 for the confirm park — the state the pipeline never heard.
+
+    AUDIT-12 (ND-10's class): the outbox parked a run by writing
+    `job.status = "waiting_on_user"` straight onto the row. Nothing else
+    ran, so the §4.10 pipeline never minted the `automation_needs_you`
+    notification, never flipped the chat card and never pushed — the run
+    that is *literally waiting for the user* was the one run that did
+    not tell them. `_notify_terminal` already knew how to render this
+    status; nothing ever reached it with it, because the only caller is
+    the terminal gate and a park is not terminal.
+
+    Deliberately NOT `on_terminal`: a park closes no ledger. The run
+    resumes when the card is decided.
+    """
+    try:
+        job = await db.get(BuildJob, job_id)
+        if job is None or not job.source_id:
+            return
+        if not ledger._cfg_of(job).get("thread_id"):
+            return  # pre-v3 run
+        automation = await db.get(Automation, job.source_id)
+        if automation is None:
+            return
+        v3 = ledger.run_v3_status(job)
+        if v3 != "waiting_on_user":
+            return
+        total = int(job.progress_total or 0)
+        step = int(job.progress_step or 0)
+        pct = int(round(100 * step / total)) if total else 0
+        await _notify_state(db, automation=automation, job=job, v3=v3,
+                            fraction=pct)
+        await ledger.emit_progress(
+            automation.user_id, run_id=job.id, automation_id=automation.id,
+            step=step, total=total,
+            sentence="Waiting for your approval",
+            fraction=(step / total) if total else 0.0, status=v3,
+        )
+    except Exception as e:  # noqa: BLE001 — a park never fails on its notice
+        logger.warning("[run_v3] park notify failed for %s: %s", job_id, e)
+
+
+async def _notify_state(
+    db: AsyncSession, *, automation: Automation, job: BuildJob, v3: str,
+    fraction: int,
+) -> None:
+    """One notification pipeline for every state that has a card."""
     cfg = ledger._cfg_of(job)
     thread_id = cfg.get("thread_id")
     n_writes = await writes_count(db, job.id)
@@ -521,8 +594,9 @@ async def _notify_terminal(
             return
     row.status = v3
     row.body = body[:500]
-    row.fraction = 100
-    row.sentence = None
+    row.fraction = fraction
+    row.sentence = ("Waiting for your approval"
+                    if v3 == "waiting_on_user" else None)
     await db.commit()
     await _write_chat_card(db, automation=automation, row=row)
 
@@ -551,13 +625,17 @@ async def _notify_terminal(
             title=automation.name[:200],
             body=body[:500],
             priority="default",
-            dedup_key=f"autorun:{job.id}:done",
+            # A park and its later completion are two notices about the
+            # same run — one dedup key would suppress the second.
+            dedup_key=(f"autorun:{job.id}:park"
+                       if v3 == "waiting_on_user"
+                       else f"autorun:{job.id}:done"),
             data={
                 "kind": "automation", "route": "automation",
                 "mission_id": _mission_id(job.id),
                 "automation_id": automation.id, "run_id": job.id,
                 "thread_id": thread_id or "",
-                "progress": 100,
+                "progress": fraction,
                 "no_agent_fallback": True,
                 **({} if push_worthy else {"silent": True}),
             },

@@ -627,6 +627,24 @@ async def connector_connected_hook(body: ConnectorHook):
     return {"updated": updated}
 
 
+def _connector_of_grant(automation, grant_id: str) -> Optional[str]:
+    """Which connector does this grant back? Read from the spec, not
+    from the hook payload — the payload is the caller's word for it."""
+    try:
+        raw = json.loads(automation.spec_json or "{}")
+    except (ValueError, TypeError):
+        return None
+    if raw.get("version") != 2:
+        action = raw.get("action") or {}
+        if action.get("grant_id") == grant_id:
+            return action.get("connector_id")
+        return None
+    for step in raw.get("steps") or []:
+        if isinstance(step, dict) and step.get("grant_id") == grant_id:
+            return step.get("connector_id")
+    return None
+
+
 class GrantHook(BaseModel):
     grant_id: str = Field(..., min_length=1, max_length=36)
     status: str = Field(..., max_length=16)
@@ -686,6 +704,19 @@ async def grant_decided_hook(body: GrantHook):
                             db, automation_id=automation_id,
                             user_id=_user_id(), reason="grant_revoked",
                         )
+                    # R30 AUDIT-4: pausing made the RUN state honest but
+                    # left the PERMISSION state lying — the account sheet
+                    # kept showing the write in IT CAN after the platform
+                    # had taken the grant away. Demote it here, at the
+                    # event, rather than re-deriving on every read.
+                    if a is not None:
+                        from app.agent.automations import permissions
+                        cid = _connector_of_grant(a, body.grant_id) or (
+                            (body.payload or {}).get("connector_id"))
+                        if cid:
+                            await permissions.revoke_writes(
+                                db, automation=a, connector_id=cid,
+                            )
             except Exception as e:  # noqa: BLE001 — state stays honest
                 logger.warning(
                     "[automations] revoke-pause failed for %s: %s",
@@ -1292,6 +1323,49 @@ async def describe(body: DescribeBody):
 accounts_router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 
+async def account_last_use(
+    db, *, user_id: str, account_id: str,
+    automation_id: Optional[str] = None,
+) -> dict:
+    """The §4.7 "Last use" line — newest `tool` turn for that account.
+
+    AUDIT-9: this scanned the 60 newest tool turns across EVERY thread
+    with no user or automation scope, so the sheet opened inside an
+    automation reported a neighbour's activity as this one's — and when
+    a busier automation filled those 60 rows, an account that had just
+    run read "No runs yet". A route-inline loop also could not be
+    tested; it lives here now for both reasons.
+    """
+    from app.db.models import AutomationTurn as _Turn
+    from app.db.models import AutomationThread as _Thread
+
+    q = (
+        select(_Turn)
+        .join(_Thread, _Thread.id == _Turn.thread_id)
+        .where(_Turn.kind == "tool")
+        .where(_Thread.user_id == user_id)
+    )
+    if automation_id:
+        q = q.where(_Thread.automation_id == automation_id)
+    rows = (await db.execute(
+        q.order_by(_Turn.created_at.desc()).limit(200)
+    )).scalars().all()
+    for r in rows:
+        try:
+            body = json.loads(r.payload_json)
+        except (ValueError, TypeError):
+            continue
+        if body.get("account_id") != account_id:
+            continue
+        action = body.get("action") or "Used it"
+        detail = body.get("detail") or ""
+        return {
+            "sentence": (f"{action} · {detail}" if detail else action)[:120],
+            "at": r.created_at.isoformat() + "Z",
+        }
+    return {"sentence": "No runs yet", "at": None}
+
+
 @accounts_router.get("/{account_id}/card")
 async def account_card(account_id: str,
                        automation_id: Optional[str] = Query(default=None)):
@@ -1339,29 +1413,10 @@ async def account_card(account_id: str,
                 cant = [p["label"] for p in cat["writes"]] \
                     + [p["label"] for p in cat["rails"]]
 
-        # Last use from the newest tool turn on ANY of this user's
-        # threads for that account (the ledger is the truth).
-        last_use = {"sentence": "No runs yet", "at": None}
-        from app.db.models import AutomationTurn as _Turn
-        rows = (await db.execute(
-            select(_Turn).where(_Turn.kind == "tool")
-            .order_by(_Turn.created_at.desc()).limit(60)
-        )).scalars().all()
-        for r in rows:
-            try:
-                body = json.loads(r.payload_json)
-            except (ValueError, TypeError):
-                continue
-            if body.get("account_id") != account_id:
-                continue
-            action = body.get("action") or "Used it"
-            detail = body.get("detail") or ""
-            last_use = {
-                "sentence": (f"{action} · {detail}" if detail
-                             else action)[:120],
-                "at": r.created_at.isoformat() + "Z",
-            }
-            break
+        last_use = await account_last_use(
+            db, user_id=_user_id(), account_id=account_id,
+            automation_id=automation_id,
+        )
 
         return {
             "account_id": account_id,
