@@ -108,6 +108,24 @@ def _dispatch_returning(result: dict):
     return _dispatch
 
 
+async def _thread_turns(aid: str, kind: str = "") -> list[dict]:
+    """The automation's TURNS — where R31 moved everything the session
+    used to write into the day chat (CONTRACTS-R31 §4.1).
+
+    `_session_messages` below still exists because two tests assert the
+    day chat is EMPTY, which needs a reader pointed at it.
+    """
+    from app.agent.automations import ledger
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, aid)
+        if thread is None:
+            return []
+        turns, _more = await ledger.list_turns(
+            db, thread_id=thread.id, limit=200,
+        )
+    return [t for t in turns if not kind or t.get("kind") == kind]
+
+
 async def _session_messages(uid: str, aid: str) -> list[Message]:
     async with async_session_maker() as db:
         convs = (await db.execute(
@@ -164,18 +182,20 @@ async def test_confirm_park_stamps_class_and_writes_card(monkeypatch):
         cfg = job.config_json or {}
         assert cfg.get("pending_action_id") == "act-1"
         assert cfg.get("pending_action_expires_at")
-        assert cfg.get("pending_card_message_id")
 
-    msgs = await _session_messages(uid, aid)
-    cards = [m for m in msgs
-             if "pending_action" in (m.metadata_json or "")]
-    assert len(cards) == 1
-    card = json.loads(cards[0].metadata_json)["pending_action"]
-    assert card["action_id"] == "act-1"
-    assert card["automation_id"] == aid and card["run_id"] == job_id
-    assert card["status"] == "pending"
+    # R31 §4.1: the park's DURABLE half is the `waiting` turn in the
+    # automation's thread. It used to also write a day-chat Message
+    # carrying `**{name}** staged an action…` — raw markdown bold, in
+    # the main chat, for an automation the main chat should not be
+    # narrating. The live `pending_action` frame still goes out.
+    waiting = await _thread_turns(aid, "waiting")
+    assert len(waiting) == 1
+    assert waiting[0]["pending_action_id"] == "act-1"
+    assert waiting[0]["text"]
     # No raw tool name in the human copy.
-    assert "__" not in cards[0].content
+    assert "__" not in waiting[0]["text"]
+    # And nothing reached the day chat.
+    assert await _session_messages(uid, aid) == []
 
 
 async def test_resolutions_use_run_vocabulary_and_spare_health(monkeypatch):
@@ -240,15 +260,22 @@ async def test_resolutions_use_run_vocabulary_and_spare_health(monkeypatch):
         job = await db.get(BuildJob, j1)
         assert (job.status, job.outcome) == ("cancelled", "skipped")
 
-    # Card statuses followed the resolutions.
-    msgs = await _session_messages(uid, aid)
-    statuses = {
-        json.loads(m.metadata_json)["pending_action"]["action_id"]:
-            json.loads(m.metadata_json)["pending_action"]["status"]
-        for m in msgs if "pending_action" in (m.metadata_json or "")
-    }
-    assert statuses == {"act-r": "rejected", "act-e": "approved",
-                        "act-f": "failed"}
+    # R31 §4.1: the THREAD followed the resolutions.
+    #
+    # This read the day-chat cards' metadata. There are no such cards
+    # now, and the surface that asked "Nothing happens until you
+    # approve." has to be the one that reports what was decided — a
+    # card that cannot answer the question it asked is worse than no
+    # card. The `waiting` turn is REPLACED by the decision, so the
+    # thread never carries a standing approval request underneath its
+    # own answer.
+    assert await _session_messages(uid, aid) == []
+    assert await _thread_turns(aid, "waiting") == []
+    said = " ".join(t.get("text") or ""
+                    for t in await _thread_turns(aid, "agent"))
+    assert "You said no, so nothing was sent." in said
+    assert "You approved it, so I went ahead." in said
+    assert "the change did not go through" in said
 
 
 async def test_expiry_sweep_closes_only_expired_and_reaper_abstains(
@@ -401,16 +428,35 @@ async def test_executed_draft_leaves_truthful_card(monkeypatch):
         assert await outbox._claim(db, oid)
         assert await outbox._execute_claimed(db, oid) == "executed"
 
-    msgs = await _session_messages(uid, aid)
-    cards = [m for m in msgs if "draft_card" in (m.metadata_json or "")]
-    assert len(cards) == 1
-    card = json.loads(cards[0].metadata_json)["draft_card"]
+    # R31 §4.1: the draft's durable half is its `draft` turn in the
+    # thread; the card rides the live frame. It used to ALSO write a
+    # day-chat message, so a draft announced itself twice — once where
+    # the work happened and once in the main chat.
+    assert await _session_messages(uid, aid) == []
+    # The honest record is the write's TOOL turn — the verb dictionary's
+    # own "Drafted a reply · waiting in Gmail — nothing sent". (The
+    # `draft` turn beside it carries the drafted BODY, and this staged
+    # row has none.)
+    writes = [t for t in await _thread_turns(aid, "tool")
+              if t.get("tool_kind") == "write"]
+    assert len(writes) == 1
+    line = f"{writes[0]['action']} {writes[0]['detail']}".lower()
+    assert "draft" in line
+    assert "nothing sent" in line or "nothing was sent" in line
+    assert "__" not in line
+
+    # The card payload itself is still built correctly — it is what the
+    # frame carries.
+    from app.agent.automations.draft_card import draft_card_payload
+    card = draft_card_payload(
+        tool_name="gmail__create_draft", connector_id="gmail",
+        staged_payload={"to": "sarah@acme.com", "subject": "Re: contract"},
+        result_content={"draft_id": "d-1", "id": "m-77"},
+    )
     assert card["provider"] == "gmail"
     assert card["sender"] == "sarah@acme.com"
     assert card["subject"] == "Re: contract"
     assert card["open_url"].endswith("/m-77")
-    assert "nothing was sent" in cards[0].content.lower()
-    assert "__" not in cards[0].content
 
 
 async def test_non_draft_write_gets_no_card(monkeypatch):
@@ -445,16 +491,23 @@ async def test_auto_pause_notice_carries_fix_chip():
         a.last_error = "tool_error: upstream 500"
         await _post_error_notice(db, a)
 
-    msgs = await _session_messages(uid, aid)
-    notices = [m for m in msgs if "fix_chip" in (m.metadata_json or "")]
+    # R31 §4.1: the notice lands in the automation's own THREAD. It
+    # used to be a day-chat Message plus a `type: "message"` chat frame
+    # — an automation speaking in the main chat's own voice. The push
+    # is untouched: a paused automation must still reach a closed app.
+    assert await _session_messages(uid, aid) == []
+    notices = await _thread_turns(aid, "agent")
     assert len(notices) == 1
-    chip = json.loads(notices[0].metadata_json)["fix_chip"]
-    assert chip["label"] and chip["prompt"]
-    assert "Flaky one" in chip["prompt"]
-    # The chip replaced the navigate directive into a page the web
-    # app does not have.
-    assert "[[navigate" not in notices[0].content
-    assert "__" not in chip["label"] and "__" not in chip["prompt"]
+    text = notices[0]["text"] or ""
+    assert text
+    # C's sentence, not A's fallback. `auto_pause_body` is ZERO-arg and
+    # was called with two, so the bare except swallowed the TypeError
+    # and C's copy — written to replace a live string wearing an emoji
+    # and markdown bold — had never reached a user.
+    from app.agent.automations.notification_templates import auto_pause_body
+    assert text == auto_pause_body()
+    assert "[[navigate" not in text
+    assert "__" not in text
 
 
 async def test_memory_update_marker_shape():
@@ -469,12 +522,15 @@ async def test_memory_update_marker_shape():
             db, user_id=uid, automation_id=aid, count=2, title="X")
         assert mid
 
-    msgs = await _session_messages(uid, aid)
-    markers = [m for m in msgs if "memory_update" in (m.metadata_json or "")]
+    # R31 §4.1: `Memory updated · N facts` belongs to the conversation
+    # that LEARNED the facts. It appeared in the founder's main chat at
+    # 11:17 on 26 August, directly under a thread answer that had leaked
+    # there too — two rows, one cause.
+    assert await _session_messages(uid, aid) == []
+    markers = await _thread_turns(aid, "memory")
     assert len(markers) == 1
-    payload = json.loads(markers[0].metadata_json)["memory_update"]
-    assert payload["count"] == 2 and payload["at"]
-    assert "2 facts" in markers[0].content
+    assert markers[0]["count"] == 2
+    assert markers[0]["sheet"] == "memory"
 
 
 def test_serializers_pass_r29_keys_through():
@@ -511,14 +567,16 @@ async def test_session_conversation_yields_prompt_section():
     from app.agent.automations.interview import (
         build_automation_context, prompt_section,
     )
-    from app.agent.automations.session import write_session_message
+    # The conversation row, without the retired writer: this test is
+    # about the prompt section, not about who put a message in it.
+    from app.agent.automations.session import resolve_session_conversation
 
     uid = await _mk_user()
     aid = await _mk_automation(uid, "Morning brief")
     async with async_session_maker() as db:
-        await write_session_message(
-            db, user_id=uid, automation_id=aid, content="hello",
-            title="Morning brief")
+        await resolve_session_conversation(
+            db, user_id=uid, automation_id=aid, title="Morning brief")
+        await db.commit()
     async with async_session_maker() as db:
         conv = (await db.execute(
             select(Conversation).where(
@@ -627,11 +685,12 @@ async def test_interview_extractor_records_via_seam_and_emits_chip(
     assert all(r["source"] == "agent" and r["source_kind"] == "interview"
                for r in recorded)
 
-    # The chip marker landed in the session.
-    msgs = await _session_messages(uid, aid)
-    markers = [m for m in msgs if "memory_update" in (m.metadata_json or "")]
+    # R31 §4.1: the chip is a `memory` turn in the thread that learned
+    # the facts, not a row in the main chat.
+    assert await _session_messages(uid, aid) == []
+    markers = await _thread_turns(aid, "memory")
     assert len(markers) == 1
-    assert json.loads(markers[0].metadata_json)["memory_update"]["count"] == 2
+    assert markers[0]["count"] == 2
 
 
 async def test_interview_extractor_refuses_status_and_definition_facts(
@@ -679,10 +738,11 @@ async def test_interview_extractor_refuses_status_and_definition_facts(
     assert [t for r in recorded for t in r["facts"]] == [
         "Marcus Webb gets same-day answers."]
 
-    msgs = await _session_messages(uid, aid)
-    markers = [m for m in msgs if "memory_update" in (m.metadata_json or "")]
+    # R31 §4.1: the chip is a thread turn.
+    assert await _session_messages(uid, aid) == []
+    markers = await _thread_turns(aid, "memory")
     assert len(markers) == 1
-    assert json.loads(markers[0].metadata_json)["memory_update"]["count"] == 1
+    assert markers[0]["count"] == 1
 
 
 async def test_prompt_section_states_status_once_and_hides_raw_errors():

@@ -1401,3 +1401,180 @@ async def _narrate_phase2(
                 )
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] narration phase 2 skipped: %s", e)
+
+
+# ── §4.2a — per-source resume ────────────────────────────────────────
+
+async def resume_source(
+    db, *, automation: Automation, job_id: str, account_id: str,
+) -> dict:
+    """Re-run ONE source's step of an existing run and merge the result.
+
+    CONTRACTS-R31 §4.2a, and the difference between a fix that works
+    and a fix that means "start over". On 26 August the only route from
+    a broken account to a repaired brief was to fix the connector and
+    wait for tomorrow's run — the four accounts that HAD answered were
+    re-read from scratch, or not at all.
+
+    What happens instead: the failed step runs again, alone; a
+    `RECONNECTED` note and its catch-up tool turn are appended; the
+    run's result turn is REPLACED IN PLACE (`ledger.replace_turn`, so
+    `GET /thread` returns the merged version and no second brief
+    appears under the first); and the run's status is recomputed —
+    `partial` becomes `completed` when nothing is left failing.
+
+    Returns `{"resumed": bool, "status": str, "reason": str}`. Never
+    raises: this runs from a connector callback and a hook that throws
+    loses the reconnect the user just performed.
+    """
+    from . import account_health, ledger as _ledger, run_v3
+    from .service import parse_spec_live
+    from app.services import automation_verbs as _verbs
+    import time as _time
+
+    job = await db.get(BuildJob, job_id)
+    if job is None:
+        return {"resumed": False, "reason": "no_run"}
+    cfg = _ledger._cfg_of(job)
+    failed = list(cfg.get("accounts_failed") or [])
+    if account_id not in failed:
+        return {"resumed": False, "reason": "not_failed"}
+
+    # §4.2a: a run older than its own cadence is not worth merging into
+    # — the reads would be about a day that has passed. The caller
+    # fires a fresh `run_now` instead.
+    started = job.created_at or datetime.utcnow()
+    if (datetime.utcnow() - started) > timedelta(hours=24):
+        return {"resumed": False, "reason": "too_old"}
+
+    vspec = await parse_spec_live(automation)
+    from .spec_v2 import ValidatedSpecV2
+    if not isinstance(vspec, ValidatedSpecV2):
+        return {"resumed": False, "reason": "v1_not_supported"}
+    step = next(
+        (st for st in vspec.steps
+         if not st.mutates and st.connector_id == account_id),
+        None,
+    )
+    if step is None:
+        return {"resumed": False, "reason": "no_step"}
+
+    thread = await _ledger.thread_for(db, automation.id)
+    if thread is not None:
+        await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=job_id,
+            kind="note",
+            payload={"stamp": "reconnected",
+                     "at": datetime.utcnow().isoformat() + "Z"},
+        )
+
+    ctx: dict = {"steps": {}, "var": {}, "event": {}}
+    t0 = _time.monotonic()
+    ok, reason = True, ""
+    try:
+        result = await _execute_read_step(automation, step, ctx)
+    except Exception as e:  # noqa: BLE001
+        ok, result = False, None
+        reason = _reason_code_of(e, _failure_reason(e))
+
+    await _append_read_turn(
+        db, thread=thread, automation=automation, job_id=job_id,
+        step=step, result=result,
+        ms=int((_time.monotonic() - t0) * 1000), ok=ok,
+        reason=_failure_reason(Exception(reason)) if not ok else None,
+        turn_index={},
+    )
+    await account_health.record_use(
+        db, user_id=automation.user_id, account_id=account_id, ok=ok,
+        reason_code=reason,
+    )
+
+    if not ok:
+        await db.commit()
+        return {"resumed": True, "status": "partial", "reason": reason}
+
+    # The source is fixed: drop it from the run's failed list and
+    # recompute the terminal.
+    still_failed = [a for a in failed if a != account_id]
+    sources = [
+        dict(f) for f in (cfg.get("failed_sources") or [])
+        if f.get("account_id") != account_id
+    ]
+    touched = list(cfg.get("accounts_touched") or [])
+    if account_id not in touched:
+        touched.append(account_id)
+    await merge_job_config(
+        db, job_id, accounts_failed=still_failed,
+        failed_sources=sources, accounts_touched=touched,
+    )
+
+    await _replace_result_turn(
+        db, automation=automation, thread=thread, job_id=job_id,
+        still_failed=still_failed,
+    )
+
+    if not still_failed and (job.outcome or "") == "partial":
+        # Every source is in now. The run is what it would have been.
+        row = await db.get(BuildJob, job_id)
+        if row is not None:
+            row.outcome = "sent"
+            await db.commit()
+        await _record_health(db, automation.id, ok=True, error=None,
+                             ran=True, clean=True)
+
+    try:
+        await run_v3.notify_resume(db, job_id=job_id)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[automations] resume notify skipped: %s", e)
+    await _ledger.emit_updated(
+        db, automation.user_id, automation_id=automation.id,
+    )
+    return {
+        "resumed": True,
+        "status": "completed" if not still_failed else "partial",
+        "reason": "",
+    }
+
+
+async def _replace_result_turn(
+    db, *, automation: Automation, thread, job_id: str,
+    still_failed: list,
+) -> None:
+    """Rewrite the run's honest line where it already sits (§4.5).
+
+    The RESULT turn itself is the narrator's and is not re-narrated
+    here — re-running the ranking for one extra account would rewrite
+    judgements the user has already read. What is replaced is the line
+    that says what is MISSING, because that is the sentence the merge
+    makes false.
+    """
+    if thread is None:
+        return
+    from . import account_health, ledger as _ledger
+    turns = await _ledger.run_turns(db, run_id=job_id)
+    target = None
+    for t in turns:
+        if t.get("kind") != "agent":
+            continue
+        text = t.get("text") or ""
+        if "missing from this" in text or "Could not reach" in text:
+            target = t
+    if target is None:
+        return
+    names = [_display_name(a) for a in still_failed if a]
+    if names:
+        text = (account_health.names_sentence(
+                    names, prefix="missing_from_this")
+                or account_health.names_sentence(
+                    names, prefix="could_not_reach"))
+    else:
+        text = account_health.form("reconnected_just_now") \
+            or "Everything it needed is in this now."
+    try:
+        await _ledger.replace_turn(
+            db, user_id=automation.user_id, thread=thread,
+            turn_id=target["id"], kind="agent",
+            payload={"text": text}, run_id=job_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] result merge skipped: %s", e)

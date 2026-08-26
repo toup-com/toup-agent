@@ -622,6 +622,68 @@ async def on_parked(db: AsyncSession, *, job_id: str) -> None:
         logger.warning("[run_v3] park notify failed for %s: %s", job_id, e)
 
 
+async def notify_resume(db: AsyncSession, *, job_id: str) -> None:
+    """Re-flip a TERMINAL run's card back to running (§4.2a / R31-29).
+
+    A per-source resume reopens a run the notification card has already
+    reported as finished. The card must follow, or the user fixes an
+    account and watches a card that still says `NEEDS YOU` for a run
+    that is now complete.
+
+    The frame carries `resume: true`, which is the ONE case where B's
+    rank ordering may move a card backwards: `starting < running <
+    {terminal}` is what stops an out-of-order frame resurrecting a
+    finished run, and without this flag the correct update would be
+    dropped by the very rule that protects the card.
+    """
+    try:
+        job = await db.get(BuildJob, job_id)
+        if job is None or not job.source_id:
+            return
+        automation = await db.get(Automation, job.source_id)
+        if automation is None:
+            return
+        v3 = ledger.run_v3_status(job)
+        cfg = ledger._cfg_of(job)
+        row = await _existing_notification(db, job_id)
+        if row is None:
+            return
+        row.status = v3
+        n_writes = await writes_count(db, job.id)
+        needs, vocab = await _needs_count(db, job)
+        summary = _run_summary(
+            n_writes, job=job, automation=automation, v3=v3,
+            needs_count=needs, vocabulary=vocab,
+        )
+        row.body = _notification_body(row.kind, summary)
+        await db.commit()
+        payload = {**_notification_payload(row), "resume": True}
+        from .cards import broadcast_card, update_card_message
+        if row.message_id:
+            await update_card_message(
+                db, message_id=row.message_id,
+                metadata_key="automation_notification", payload=payload,
+            )
+        await broadcast_card(
+            automation.user_id, "automation_notification",
+            {**payload, "message_id": row.message_id},
+        )
+        del cfg
+    except Exception as e:  # noqa: BLE001 — a card never fails a resume
+        logger.warning("[run_v3] resume notify skipped %s: %s", job_id, e)
+
+
+async def _existing_notification(db: AsyncSession, job_id: str):
+    from sqlalchemy import select as _select
+    from app.db.models import AutomationNotification
+    return (await db.execute(
+        _select(AutomationNotification)
+        .where(AutomationNotification.run_id == job_id)
+        .order_by(AutomationNotification.created_at.desc())
+        .limit(1)
+    )).scalars().first()
+
+
 async def _notify_state(
     db: AsyncSession, *, automation: Automation, job: BuildJob, v3: str,
     fraction: int, push: bool = True,

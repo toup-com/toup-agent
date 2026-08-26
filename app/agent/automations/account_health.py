@@ -478,3 +478,144 @@ async def state_for(
             "fix": "connect", "source": "identity",
         })
     return out
+
+
+# ── the scope probe ──────────────────────────────────────────────────
+#
+# The scopes an automation's READS actually need, per connector. These
+# are the four §4.4 names and nothing more: a probe that enumerated
+# every scope a connector could want would fail accounts that work.
+#
+# `scopes_read` has existed in the manifests since R26 and had NO
+# consumer — three references in the whole repo, all of them printing
+# it. So "does this connection hold what this automation needs" was
+# never asked anywhere except reactively, from a provider's 403, which
+# is why an Outlook connection with no `Mail.Read` presented as
+# `IT CAN Read new mail` right up until the run failed.
+REQUIRED_READ_SCOPES: dict[str, tuple[str, ...]] = {
+    "outlook": ("Mail.Read",),
+    "slack": ("channels:history", "groups:history"),
+    "github": ("repo",),
+    "teams": ("Chat.Read",),
+}
+
+# Any ONE of these is enough (Slack's two history scopes cover public
+# and private channels; an account with either can read something).
+_ANY_OF: frozenset = frozenset({"slack"})
+
+
+def missing_scopes(connector_id: str, granted: list) -> list[str]:
+    """Which required read scopes this grant does not hold."""
+    need = REQUIRED_READ_SCOPES.get(connector_id) or ()
+    if not need:
+        return []
+    have = {str(s).strip() for s in (granted or []) if str(s).strip()}
+    if not have:
+        # `scopes_json` empty means the provider did not tell us. Not
+        # knowing is not the same as knowing it is missing — claiming a
+        # scope problem here would send a working account to a consent
+        # screen it does not need.
+        return []
+    missing = [s for s in need if s not in have]
+    if connector_id in _ANY_OF and len(missing) < len(need):
+        return []
+    return missing
+
+
+async def probe(
+    db, *, user_id: str, account_id: str, force: bool = False,
+) -> dict:
+    """Ask what this account can actually do, and record the answer.
+
+    Order matters. The identity's own status is checked first because a
+    dead token makes every other question moot; the scope check runs
+    only on a live one. A probe never invents a failure: if we cannot
+    tell, the recorded state is unchanged.
+    """
+    from . import registry as reg
+
+    cached = await state_for(db, user_id=user_id, account_id=account_id)
+    if not force and cached.get("checked_at"):
+        try:
+            seen = datetime.fromisoformat(
+                str(cached["checked_at"]).rstrip("Z"))
+            if (datetime.utcnow() - seen).total_seconds() < PROBE_CACHE_S:
+                return {**cached, "cached": True}
+        except (ValueError, TypeError):
+            pass
+
+    state, reason, fix = "connected", "", "retry"
+    granted: list = []
+    try:
+        conn = (await reg.fetch_connection_state(user_id)).get(
+            account_id) or {}
+        granted = list(conn.get("scopes") or [])
+        status = (conn.get("status") or "").lower()
+        if not conn:
+            state, reason, fix = "not_connected", "not_connected", "connect"
+        elif status == "revoked":
+            state, reason, fix = "revoked", "token_revoked", "reconnect"
+        elif status == "reauth_required":
+            state, reason, fix = "expired", "token_expired", "reconnect"
+        elif status == "provider_down":
+            # Transient: the credential is fine, the vendor is not.
+            state, reason, fix = "connected", "vendor_down", "retry"
+        elif not conn.get("connected"):
+            state, reason, fix = "not_connected", "not_connected", "connect"
+        else:
+            gap = missing_scopes(account_id, granted)
+            if gap:
+                state = "scope_missing"
+                reason = f"scope_missing:{gap[0]}"
+                fix = "grant"
+    except Exception as e:  # noqa: BLE001 — a probe never invents news
+        logger.warning("[account_health] probe failed %s: %s",
+                       account_id[:12], e)
+        return {**cached, "cached": False, "probed": False}
+
+    # An org-approval refusal is only visible from a real call, and this
+    # probe does not make one — so a standing `org_approval_needed`
+    # SURVIVES a clean scope probe. Clearing it here would tell the user
+    # their owner had approved when nothing had happened.
+    if cached.get("reason_code") == "org_approval_needed" \
+            and state == "connected":
+        return {**cached, "cached": False, "probed": True}
+
+    now = datetime.utcnow()
+    try:
+        from sqlalchemy import select
+        from app.db.models import AccountHealth
+        row = (await db.execute(
+            select(AccountHealth).where(
+                AccountHealth.user_id == user_id,
+                AccountHealth.account_id == account_id,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            row = AccountHealth(user_id=user_id, account_id=account_id)
+            db.add(row)
+        row.state = state
+        row.reason_code = reason
+        row.fix = fix
+        row.checked_at = now
+        row.source = "probe"
+        row.scopes_json = json.dumps(granted, default=str)[:4000]
+        await db.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[account_health] probe write skipped %s: %s",
+                       account_id[:12], e)
+
+    out = {
+        "account_state": state, "reason_code": reason, "fix": fix,
+        "checked_at": now.isoformat() + "Z", "source": "probe",
+        "cached": False, "probed": True,
+    }
+    try:
+        from .connector_state import emit_state_frame
+        await emit_state_frame(
+            user_id, connector_id=account_id, state=state,
+            reason_code=reason, fix=fix,
+        )
+    except Exception as e:  # noqa: BLE001 — no live socket is normal
+        logger.debug("[account_health] probe frame skipped: %s", e)
+    return out

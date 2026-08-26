@@ -161,11 +161,69 @@ def _status_of(a: Automation, missing_account: bool) -> tuple[str, str]:
     return "paused", "Paused"
 
 
+# Copy that must never reach a card, whatever is stored on the row.
+# `Migrated from the email briefing routine.` is the migration's own
+# hard-coded description (routine_migration.py) and it is written onto
+# EVERY migrated automation — an internal note about how a row came to
+# exist, presented to the user as what their automation does.
+_STORED_DESCRIPTION_BANS = ("migrated from",)
+
+
+def derived_description(a: Automation, raw: dict) -> str:
+    """The card's sentence, COMPUTED from the workflow (R31-32 / §4.7).
+
+    The stored description is free text copied from `spec["description"]`
+    at create time and re-copied on every update — including a schedule
+    change, which is why the founder's card read:
+
+        One-time evening work brief: open Jira issues, GitHub repo
+        issues, Teams messages, unread Gmail and Outlook, post…
+
+    under a derived schedule label of `Daily 22:52`. Two independent
+    sources for one fact, one of them frozen at creation, and nothing
+    reconciling them. Preferring the derived sentence is necessary and
+    not sufficient — that description ALSO names Teams, which is not on
+    the automation's canvas, so any derivation that cannot see the
+    account list would still have been wrong about it.
+
+    So this reads the workflow: what it touches, and what it does with
+    it. `mode_of` decides the verb (a reads-only brief TELLS you; a
+    posting automation CHANGES something), and the accounts come from
+    the spec's own membership — which makes naming a connector that is
+    not there unrepresentable rather than merely unlikely.
+    """
+    from . import workflow as _wf
+    try:
+        members = list(_wf._member_connectors(raw))
+    except Exception:  # noqa: BLE001
+        members = []
+    names = [verbs.display_name(c) or c for c in members]
+    if not names:
+        return ""
+    reads = _and_list(names[:4]) + (" and more" if len(names) > 4 else "")
+    try:
+        mode, _label = _wf.mode_of(a, raw)
+    except Exception:  # noqa: BLE001
+        mode = "reads_only"
+    try:
+        targets = [t for _tool, _cid, tgt in _wf._write_tools(raw)
+                   for t in [(tgt or {}).get("label") or ""] if t]
+    except Exception:  # noqa: BLE001
+        targets = []
+    if mode == "reads_only":
+        return f"Reads {reads} and tells you what matters."
+    if mode == "drafts_only":
+        return f"Reads {reads} and drafts replies for you to send."
+    if mode == "asks_first":
+        return f"Reads {reads} and asks before it changes anything."
+    if targets:
+        return f"Reads {reads} and posts to {_and_list(targets[:2])}."
+    return f"Reads {reads} and acts on what it finds."
+
+
 def _description_of(
     a: Automation, status: str, raw: dict, expired_name: Optional[str],
 ) -> str:
-    base = (a.description or "").strip() \
-        or (verbs.rule_sentence(raw) or "Runs on your behalf.")
     if status == "paused":
         return ("Paused. It keeps its setup and will not run until you "
                 "resume.")
@@ -182,7 +240,18 @@ def _description_of(
         if expired_name:
             return (f"{expired_name} needs you. Nothing was missed — fix "
                     "it and it picks up where it stopped.")
-    return base
+        # Falls through to the derived sentence below, deliberately.
+    # DERIVED first (R31-32). The stored text is the fallback, not the
+    # source — and a stored line on the ban list is never served even as
+    # a fallback.
+    derived = derived_description(a, raw)
+    if derived:
+        return derived
+    stored = (a.description or "").strip()
+    if stored and not any(b in stored.lower()
+                          for b in _STORED_DESCRIPTION_BANS):
+        return stored
+    return verbs.rule_sentence(raw) or "Runs on your behalf."
 
 
 async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:

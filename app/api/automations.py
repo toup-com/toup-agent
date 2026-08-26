@@ -636,8 +636,14 @@ async def connector_connected_hook(body: ConnectorHook):
                     db, user_id=_user_id(), connector_id=body.connector_id,
                 )
             else:
+                # R31 §4.4: `body.error` was accepted here and never
+                # forwarded, so "reauth_required" (a dead credential)
+                # and "provider_down" (a vendor having a bad minute)
+                # produced an identical `expired` frame — and only one
+                # of them should move the account off `connected`.
                 await connector_state.on_connector_expired(
                     db, user_id=_user_id(), connector_id=body.connector_id,
+                    error=getattr(body, "error", "") or "",
                 )
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] connector state hook skipped: %s", e)
@@ -896,6 +902,42 @@ async def run_now(automation_id: str):
             fire_key=f"manual:{_uuid.uuid4()}", run_kind="run_now",
         )
         return {"fired": True, "status": status}
+
+
+class ResumeSourceBody(BaseModel):
+    account_id: str = Field(..., max_length=64)
+
+
+@router.post("/{automation_id}/runs/{run_id}/resume-source")
+async def resume_source_route(automation_id: str, run_id: str,
+                              body: ResumeSourceBody):
+    """§4.4's `retry` fix — re-run ONE account's step and merge it.
+
+    This is what the `Try again` button on a `needs_you` card calls,
+    and what the E-1 line's button calls. It is deliberately not
+    `run-now`: the other accounts already read successfully, and
+    starting over both wastes their work and produces a different
+    brief than the one the user is looking at.
+    """
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations import executor_v2
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        out = await executor_v2.resume_source(
+            db, automation=automation, job_id=run_id,
+            account_id=body.account_id,
+        )
+        if not out.get("resumed"):
+            raise HTTPException(status_code=409, detail={
+                "code": out.get("reason") or "not_resumable",
+                "sentence": "That one cannot be picked up now — run it "
+                            "again instead.",
+            })
+        return out
 
 
 class ThreadMessageBody(BaseModel):
@@ -1517,10 +1559,17 @@ async def from_template(body: FromTemplateBody):
             # ("tomorrow 8:00" beats "weekdays at 8:00").
             try:
                 from app.agent.automations.summary import (
-                    _next_run_at, _tz, _when_label,
+                    _next_run_at, _tz_name, _when_label, _zone,
                 )
+                # R31-26: the tz resolver gained a DB fallback and split
+                # in two — the cache-then-row lookup is async now,
+                # because a summary served by a cold worker had no tz at
+                # all and rendered every stamp in UTC. A setup thread's
+                # first-run label is exactly the kind of line that gets
+                # read once, at the moment the automation is created.
                 first_run = _when_label(
-                    await _next_run_at(db, automation.id), _tz(_user_id()),
+                    await _next_run_at(db, automation.id),
+                    _zone(await _tz_name(db, _user_id())),
                 )
             except Exception:  # noqa: BLE001
                 first_run = sched.get("sentence") or "soon"
@@ -1685,14 +1734,22 @@ async def account_card(account_id: str,
     from app.services.automation_verbs import display_name
 
     async with async_session_maker() as db:
+        from app.agent.automations import account_health as _health
         connections = await _reg.fetch_connection_state(_user_id())
         conn = connections.get(account_id) or {}
         status = conn.get("status") or ""
         connected = bool(conn.get("connected"))
-        state = "connected" if connected and status == "active" else (
-            "expired" if status in ("reauth_required", "provider_down")
-            else ("connected" if connected else "missing")
+        # R31-13 / §4.4: ONE derivation, and the last REAL USE outranks
+        # the identity's opinion of the credential. This route used to
+        # collapse four server states into `connected|expired|missing`
+        # from `conn` alone — which is how the Connectors page read
+        # `Connected · 10` while this same account's sheet, two taps
+        # away, read `Last use · Could not connect · access expired`.
+        health = await _health.state_for(
+            db, user_id=_user_id(), account_id=account_id,
+            identity_status=status or ("active" if connected else None),
         )
+        state = health["account_state"]
         cat = _perms.catalog_for(account_id)
         if automation_id:
             from app.agent.automations.service import (
@@ -1723,28 +1780,122 @@ async def account_card(account_id: str,
             automation_id=automation_id,
         )
 
+        name = _health.display_of(account_id, display_name(account_id) or "")
+        reason = health["reason_code"]
         return {
             "account_id": account_id,
             "connector_id": account_id,
-            "name": display_name(account_id) or account_id,
+            "name": name,
             "account_label": conn.get("account") or "",
+            # The R30 keys, unchanged, so B's card keeps rendering.
             "state": state,
             "can": can,
             "cant": cant,
             "last_use": last_use,
+            # R31 §4.4 — additive. Without these the card could show
+            # that something was wrong and not what, or what to press.
+            "account_state": state,
+            "reason_code": reason,
+            "fix": health["fix"],
+            "fix_label": _health.fix_button(health["fix"], account_id, name),
+            "sentence": _health.sentence_for(
+                account_state=state, reason_code=reason,
+                connector_id=account_id, name=name,
+                surface="sheet_subtitle",
+            ),
+            "checked_at": health["checked_at"],
         }
 
 
+class ReconnectBody(BaseModel):
+    # §4.4's `grant` fix: reconnect asking for the ONE scope that was
+    # missing, rather than the whole optional set. A user who is told
+    # "it needs more access than you gave it" and then sees a consent
+    # screen listing everything has been asked a different question.
+    add_scopes: list[str] = Field(default_factory=list, max_length=16)
+
+
 @accounts_router.post("/{account_id}/reconnect")
-async def account_reconnect(account_id: str):
-    """§4.7: the consent URL for the in-app flow. The callback emits
-    ONE connector.state frame and auto-resumes everything blocked on
-    this account (the _connector_connected hook)."""
+async def account_reconnect(account_id: str,
+                            body: Optional[ReconnectBody] = None):
+    """§4.7/§4.4: the consent URL for the in-app flow.
+
+    The callback emits ONE `connector.state` frame and resumes what was
+    blocked on this account (the `_connector_connected` hook). With
+    `add_scopes` the round trip asks for exactly those scopes on top of
+    what is already granted — the `grant` fix, as distinct from
+    `reconnect`, which the two were indistinguishable from until R31
+    because `scope_missing` aliased onto `access_expired`.
+    """
     _flag_or_404()
+    url = f"/api/oauth/connect/{account_id}?return_to=app"
+    scopes = [s for s in ((body.add_scopes if body else []) or []) if s]
+    if scopes:
+        from urllib.parse import quote
+        url += "&add_scopes=" + quote(",".join(scopes), safe="")
     return {
-        "consent_url": f"/api/oauth/connect/{account_id}?return_to=app",
+        "consent_url": url,
         "account_id": account_id,
+        "add_scopes": scopes,
     }
+
+
+class ProbeBody(BaseModel):
+    force: bool = False
+
+
+@accounts_router.post("/{account_id}/probe")
+async def account_probe(account_id: str,
+                        body: Optional[ProbeBody] = None):
+    """§4.4 — ask the vendor, now, and tell every surface the answer.
+
+    The reason this exists is the GitHub org-approval case. An owner
+    approves Toup in GitHub's own UI; nothing about that reaches us,
+    and the account sits at `Waiting for the organisation` until the
+    next scheduled run happens to try again. The card's `I approved it`
+    calls this, the thread calls it on open, and A's scheduler polls it
+    every ten minutes while a `needs_you` stands.
+
+    Cached ten minutes by default because these are vendor calls under
+    vendor rate limits; `force` bypasses the cache and is what the two
+    user-initiated paths send. Emits `connector.state` with the same
+    three fields it returns, so a client that is not the one who asked
+    still repaints.
+    """
+    _flag_or_404()
+    from app.agent.automations import account_health as _health
+    from app.agent.automations import registry as _reg
+    force = bool(body.force if body else False)
+    async with async_session_maker() as db:
+        out = await _health.probe(
+            db, user_id=_user_id(), account_id=account_id, force=force,
+        )
+        return out
+
+
+class CleanupBody(BaseModel):
+    # Dry run by default. A migration that MOVES a user's history should
+    # have to be asked twice — the routine-migration repair route sets
+    # the same precedent, and for the same reason.
+    apply: bool = False
+
+
+@router.post("/cleanup-day-chat")
+async def cleanup_day_chat_route(body: Optional[CleanupBody] = None):
+    """§4.1's clean-up — move the leaked rows out of the day chat.
+
+    R31 stops the writers; this moves what they already wrote, so a user
+    who opens 26 August after the fix does not still see the defect.
+    Identified by PRODUCER (`Message.source` / the job row), never by
+    title. Idempotent. Dry run unless `apply` is true.
+    """
+    _flag_or_404()
+    from app.agent.automations.daychat_cleanup import cleanup_day_chat
+    apply_it = bool(body.apply if body else False)
+    async with async_session_maker() as db:
+        return await cleanup_day_chat(
+            db, user_id=_user_id(), dry_run=not apply_it,
+        )
 
 
 # ── R30 §4.11a — the routine-migration trigger (ND-6) ────────────────

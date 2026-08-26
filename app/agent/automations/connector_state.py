@@ -60,6 +60,8 @@ async def emit_state_frame(
     connector_id: str,
     state: str,
     reconnected_at: Optional[object] = None,
+    reason_code: str = "",
+    fix: str = "",
 ) -> None:
     """Broadcast one `connector.state` frame. Best-effort; the durable
     record is the identity row on the platform, not this frame.
@@ -77,6 +79,14 @@ async def emit_state_frame(
         "connector_id": connector_id,
         "state": state,
         "reconnected_at": at,
+        # R31 §4.4 — additive. The R30 frame carried a two-value `state`
+        # and nothing else, so a client learned that something was wrong
+        # and could not say what or offer the fix; the platform hook's
+        # own `error` field ("reauth_required" vs "provider_down") was
+        # accepted at the boundary and discarded, which made a dead
+        # token and an outage the same event.
+        "reason_code": reason_code or "",
+        "fix": fix or ("retry" if state == "connected" else "reconnect"),
     }
     try:
         from app.api.ws_chat import broadcast_to_user
@@ -187,7 +197,15 @@ async def on_connector_connected(
             elif _reauth_shaped_failure(latest):
                 reauth_failed = True
 
-        if not (paused_on_reauth or stopped_job is not None or reauth_failed):
+        # A PARTIAL run holding this account in `accounts_failed` is
+        # reason enough on its own — the automation is neither paused
+        # nor stopped nor "reauth-shaped failed", it simply came back
+        # missing one source, which is the whole point of §4.2a.
+        has_failed_source = await _has_failed_source(
+            db, automation_id=automation.id, connector_id=connector_id,
+        )
+        if not (paused_on_reauth or stopped_job is not None
+                or reauth_failed or has_failed_source):
             continue
 
         # (c1) RECONNECTED note. Own try/except: the note is honesty,
@@ -209,6 +227,28 @@ async def on_connector_connected(
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "[connector_state] RECONNECTED note failed for %s: %s",
+                automation.id, e,
+            )
+
+        # (c0) §4.2a — the PER-SOURCE resume, and the first thing tried.
+        #
+        # The R30 auto-resume below is whole-run: it restarts a stopped
+        # run or re-arms a paused automation. Neither describes what
+        # actually happens when one of five accounts is fixed — the
+        # other four already read successfully, and re-reading them is
+        # both wasted work and a different brief.
+        try:
+            resumed_source = await _resume_failed_source(
+                db, user_id=user_id, automation=automation,
+                connector_id=connector_id,
+            )
+            if resumed_source:
+                result["resumed"].append(resumed_source)
+                continue
+        except Exception as e:  # noqa: BLE001 — one automation's merge
+            # never blocks another's recovery
+            logger.warning(
+                "[connector_state] per-source resume failed for %s: %s",
                 automation.id, e,
             )
 
@@ -253,6 +293,7 @@ async def on_connector_connected(
 
 async def on_connector_expired(
     db: AsyncSession, *, user_id: str, connector_id: str,
+    error: str = "",
 ) -> None:
     """An identity flipped to reauth_required/provider_down (§4.7).
 
@@ -266,10 +307,25 @@ async def on_connector_expired(
     `db` is accepted for signature parity with the connected leg (and
     for the day this hook grows an honest read); it is not written.
     """
-    del db  # read-only leg — see docstring
+    # R31 §4.4: the hook's `error` reaches the frame now. It was
+    # accepted at the route boundary and never read, so a revoked
+    # connection, an expired token and a provider outage all arrived as
+    # the single word "expired" — and the last of those is transient,
+    # so the account should not have moved off `connected` at all.
+    from . import account_health
+    code = account_health.classify(error or "reauth_required", error or "")
+    state, fix = account_health.state_for_reason(code)
+    try:
+        await account_health.record_use(
+            db, user_id=user_id, account_id=connector_id, ok=False,
+            reason_code=code, message=error or "",
+        )
+        await db.commit()
+    except Exception as e:  # noqa: BLE001 — the frame still goes out
+        logger.debug("[connector_state] expiry health write skipped: %s", e)
     await emit_state_frame(
-        user_id, connector_id=connector_id, state="expired",
-        reconnected_at=None,
+        user_id, connector_id=connector_id, state=state,
+        reconnected_at=None, reason_code=code, fix=fix,
     )
 
 
@@ -294,3 +350,59 @@ async def on_connector_expired(
 # identities to provider_down and is NOT hooked yet (file owned
 # elsewhere) — `connector_vault.notify_agent_connector_state` is
 # importable for exactly that call site.
+
+
+async def _has_failed_source(
+    db: AsyncSession, *, automation_id: str, connector_id: str,
+) -> bool:
+    """Does this automation's last run hold this account as failed?"""
+    from app.agent.automations import ledger
+    job = await _latest_run(db, automation_id)
+    if job is None:
+        return False
+    failed = (ledger._cfg_of(job).get("accounts_failed") or [])
+    return connector_id in failed
+
+
+async def _resume_failed_source(
+    db: AsyncSession, *, user_id: str, automation, connector_id: str,
+) -> Optional[str]:
+    """§4.2a. Returns the run id merged into, or None.
+
+    A run older than a day gets a fresh `run_now` instead — merging
+    yesterday's reads into yesterday's brief is not what the user
+    expects from fixing an account today.
+    """
+    from app.agent.automations import executor_v2, ledger
+    job = await _latest_run(db, automation.id)
+    if job is None:
+        return None
+    if connector_id not in (ledger._cfg_of(job).get("accounts_failed") or []):
+        return None
+    out = await executor_v2.resume_source(
+        db, automation=automation, job_id=job.id, account_id=connector_id,
+    )
+    if out.get("resumed"):
+        return job.id
+    if out.get("reason") == "too_old":
+        try:
+            from app.agent.automations.service import parse_spec_live
+            vspec = await parse_spec_live(automation)
+            from app.agent.automations.spec_v2 import ValidatedSpecV2
+            if isinstance(vspec, ValidatedSpecV2):
+                import uuid as _uuid
+                source = vspec.schedule_source() or (
+                    vspec.sources[0] if vspec.sources else None)
+                if source is not None:
+                    await executor_v2.run_schedule_fire_v2(
+                        db, automation, vspec, source,
+                        fire_key=f"reconnect:{_uuid.uuid4()}",
+                        run_kind="run_now",
+                    )
+                    return job.id
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[connector_state] catch-up fire failed for %s: %s",
+                automation.id, e,
+            )
+    return None

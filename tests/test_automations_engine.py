@@ -1353,7 +1353,7 @@ async def test_a_poll_with_nothing_fresh_is_not_a_run(monkeypatch):
 
     async with async_session_maker() as db:
         row = await db.get(Automation, a.id)
-        row.consecutive_failures = 2      # a streak the clean poll may reset
+        row.consecutive_failures = 2      # a streak from two real runs
         await db.commit()
         vspec = _poll_spec()
         stats = await executor.poll_and_run(db, row, vspec)
@@ -1362,8 +1362,28 @@ async def test_a_poll_with_nothing_fresh_is_not_a_run(monkeypatch):
 
     async with async_session_maker() as db:
         row = await db.get(Automation, a.id)
-        # The connector answered, so the streak resets — that IS health.
-        assert row.consecutive_failures == 0
+        # R31-43 REVERSES this assertion, and the reason is the
+        # arithmetic. It read "the connector answered, so the streak
+        # resets — that IS health", which is true about the CONNECTOR
+        # and false about the automation: every value the streak counts
+        # is a RUN failure (a step, a write, the cap), and an empty poll
+        # is not a run.
+        #
+        # With AUTOMATION_POLL_FLOOR_S = 300 against a 3-strike
+        # threshold, a polling automation's streak was cleared at least
+        # every five minutes, so `_sweep_auto_pause` could essentially
+        # never fire. R31-D measured the same disarm from the other side
+        # on 2026-08-26: a run that came back `partial` still wrote
+        # `last_status: "success"`, so an automation losing one source on
+        # EVERY run built no streak at all — the exact shape the rule
+        # exists for.
+        #
+        # The cost is bounded and was weighed: an automation that
+        # recovers clears its streak on its next real RUN, and one that
+        # never runs again cannot reach strike three either. A stale 2
+        # needs one more genuine failure to pause.
+        assert row.consecutive_failures == 2, (
+            "an empty poll must not clear a streak of run failures")
         # ...but nothing ran, so no run may be claimed.
         assert row.last_run_at is None, (
             f"a poll with nothing fresh stamped a run at {row.last_run_at}")

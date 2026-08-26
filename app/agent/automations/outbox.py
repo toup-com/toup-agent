@@ -430,7 +430,16 @@ async def _park_run_on_card(db, row: AutomationOutbox,
     if action_id:
         try:
             from . import ledger as _ledger
-            thread = await _ledger.thread_for(db, row.automation_id)
+            # `ensure_thread`, not `thread_for`. R30 wrote this turn
+            # only if a thread already existed, because the day-chat
+            # pending card was the guaranteed surface and this was the
+            # extra one. R31 retired that card, so this IS the surface —
+            # and a park with no card at all is the run that is
+            # literally waiting for the user being the one run that does
+            # not tell them (AUDIT-12's shape, in a new place).
+            thread = await _ledger.ensure_thread(
+                db, user_id=row.user_id, automation_id=row.automation_id,
+            )
             if thread is not None:
                 await _ledger.append_turn(
                     db, user_id=row.user_id, thread=thread,
@@ -524,7 +533,13 @@ async def _append_write_turn(db, row: AutomationOutbox, write_row) -> None:
     try:
         from . import ledger
         from .run_v3 import notify_progress  # noqa: F401 — module load check
-        thread = await ledger.thread_for(db, row.automation_id)
+        # `ensure_thread` for the same reason as the park above: the
+        # day-chat card that used to be the guaranteed surface is gone,
+        # so a write's record in the thread cannot be conditional on a
+        # thread happening to exist already.
+        thread = await ledger.ensure_thread(
+            db, user_id=row.user_id, automation_id=row.automation_id,
+        )
         if thread is None:
             return
         d = _display_of(row)

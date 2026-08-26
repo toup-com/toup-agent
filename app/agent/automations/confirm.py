@@ -121,41 +121,81 @@ async def update_pending_card(
     db,
     *,
     user_id: str,
-    message_id: Optional[str],
     status: str,
+    automation_id: Optional[str] = None,
+    action_id: Optional[str] = None,
+    message_id: Optional[str] = None,
 ) -> None:
-    """Flip the persisted card's status and re-broadcast — clients
-    upsert by `action_id`. Missing message is fine (the park may have
-    written no card)."""
-    if not message_id:
+    """Record the decision where the card lives — the THREAD.
+
+    CONTRACTS-R31 §4.1. This used to flip a day-chat Message's metadata
+    in place; there is no such message any more, so the surface that
+    told the user "Nothing happens until you approve." would have said
+    it forever, whatever they then pressed. A card that cannot report
+    the decision it asked for is worse than no card.
+
+    `message_id` is accepted and ignored so a caller carrying an old
+    `config_json.pending_card_message_id` (there are runs with one) does
+    not have to be found first.
+    """
+    del message_id
+    if not automation_id or not action_id:
         return
-    from app.db.models import Message
+    from . import ledger as _ledger
+    from app.db.models import AutomationTurn
 
     try:
-        msg = await db.get(Message, message_id)
-        if msg is None:
+        thread = await _ledger.thread_for(db, automation_id)
+        if thread is None:
             return
-        try:
-            meta = json.loads(msg.metadata_json) if msg.metadata_json else {}
-        except (ValueError, TypeError):
-            meta = {}
-        card = meta.get("pending_action")
-        if not isinstance(card, dict):
+        turns, _more = await _ledger.list_turns(
+            db, thread_id=thread.id, limit=200,
+        )
+        target = None
+        for t in turns:
+            if t.get("kind") == "waiting" \
+                    and t.get("pending_action_id") == action_id:
+                target = t
+        if target is None:
             return
-        card = {**card, "status": status}
-        meta["pending_action"] = card
-        msg.metadata_json = json.dumps(meta, default=str)
-        await db.commit()
-        await _broadcast_pending(user_id, card, message_id=message_id)
+        # The waiting turn BECOMES the record of what was decided. It is
+        # replaced rather than appended to, so the thread does not carry
+        # a standing "waiting" card under the answer to it (§4.5's
+        # replacement-by-turn_id, the same seam the per-source merge
+        # uses).
+        await _ledger.replace_turn(
+            db, user_id=user_id, thread=thread, turn_id=target["id"],
+            kind="agent",
+            payload={"text": _DECISION_TEXT.get(
+                status, "That is decided.")},
+        )
+        await _broadcast_pending(
+            user_id,
+            {"action_id": action_id, "automation_id": automation_id,
+             "status": status},
+            message_id=None,
+        )
     except Exception as e:  # noqa: BLE001 — the card is a companion
         logger.warning(
-            "[automations] pending card update failed msg=%s: %s",
-            str(message_id)[:8], e,
+            "[automations] pending card update failed action=%s: %s",
+            str(action_id)[:16], e,
         )
         try:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
+
+
+# What the thread says once a park is decided. Plain sentences, the
+# user's vocabulary, and no status word doing the work of a sentence.
+_DECISION_TEXT = {
+    "approved": "You approved it, so I went ahead.",
+    "executed": "You approved it, so I went ahead.",
+    "rejected": "You said no, so nothing was sent.",
+    "skipped": "You said no, so nothing was sent.",
+    "expired": "You did not get to this in time, so nothing was sent.",
+    "failed": "You approved it, but the change did not go through.",
+}
 
 
 async def _broadcast_pending(user_id: str, card: dict,
@@ -225,7 +265,8 @@ async def resolve_parked_run(
     await update_pending_card(
         db,
         user_id=job.user_id,
-        message_id=cfg.get("pending_card_message_id"),
+        automation_id=job.source_id,
+        action_id=cfg.get("pending_action_id"),
         status=_OUTCOME_TO_CARD_STATUS.get(outcome, outcome),
     )
 
