@@ -785,8 +785,12 @@ async def list_routines():
                     # ` name prefix. Measured on the founder tenant: the
                     # agent, asked how many automations exist, answered
                     # nine against a ground truth of four.
-                    # (literal, not compiler.ROUTINE_KIND_SCHEDULE —
-                    # the platform image ships no app/agent/.)
+                    # Literal, like `automation_poll` above: this
+                    # module is agent-side (agent_main mounts it;
+                    # platform_main mounts routines_proxy instead), but
+                    # an api → automations.compiler import would still
+                    # be a new edge for a constant, so both kinds are
+                    # spelled the same way in one place.
                     Routine.kind != "automation_schedule",
                 )
                 .order_by(Routine.created_at)
