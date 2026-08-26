@@ -290,8 +290,38 @@ class JobRunner:
                 return
             if fresh.status in ("completed", "failed"):
                 return  # handler already wrote terminal state
+            # ND-15 (live): an automation run must never reach a terminal
+            # state outside the automations' gated finalize — that seam
+            # is what couples the terminal to the last_outcome stamp, the
+            # outcome notification and the v3 ledger close (CONTRACTS-R30
+            # §12). Landing here left a run `failed` with outcome,
+            # error_class and user_message ALL null, and the runs API
+            # then offered a "Fix this" chip for a failure with no story.
+            if fresh.job_type == "automation_run":
+                title = fresh.title
+                try:
+                    from app.agent.automations.executor import _finalize_job
+                    await _finalize_job(
+                        db, job_id, status="failed", outcome="lost",
+                        error_class="interrupted",
+                        user_message="This run stopped before it "
+                                     "finished.",
+                    )
+                    return
+                except Exception as e:  # noqa: BLE001 — never lose the terminal
+                    logger.warning(
+                        "[job_runner] automation finalize failed for %s, "
+                        "falling back to a plain terminal: %s", job_id, e,
+                    )
             fresh.status = "failed"
             fresh.error_message = error_message
+            # Even the fallback leaves a story: a failure the user can
+            # see must say something true about itself.
+            fresh.error_class = fresh.error_class or "interrupted"
+            fresh.user_message = (
+                fresh.user_message
+                or "This run stopped before it finished."
+            )
             fresh.completed_at = datetime.utcnow()
             title = fresh.title
             await db.commit()

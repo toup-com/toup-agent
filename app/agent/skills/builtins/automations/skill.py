@@ -308,8 +308,18 @@ class AutomationsSkill(Skill):
             },
             # Appended LAST (R30) — the tools array is prefix-stable
             # per channel; new tools only ever join at the end.
+            #
+            # The `automations__` prefix is MANDATORY, not cosmetic:
+            # SkillLoader._register RAISES on the first tool name that
+            # lacks it and load_all swallows the raise, so a bare name
+            # here does not "register one unprefixed tool" — it discards
+            # the ENTIRE automations skill. Registered bare, this cost
+            # the chat agent all thirteen automations tools on main
+            # (wire 90 → 77, zero tool calls in a live run). The prefix
+            # is a namespace for the loader's tool index; it has nothing
+            # to do with which surface may call the tool.
             {
-                "name": "memory_recall",
+                "name": "automations__memory_recall",
                 "description": "Search the one platform memory — facts "
                                "and episodes about people, channels, "
                                "tickets, repos and past automation runs, "
@@ -436,7 +446,7 @@ class AutomationsSkill(Skill):
             "automations__pause": self._pause,
             "automations__resume": self._resume,
             "automations__delete": self._delete,
-            "memory_recall": self._recall,
+            "automations__memory_recall": self._recall,
         }
         handler = dispatch.get(tool_name)
         if not handler:

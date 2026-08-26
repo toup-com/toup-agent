@@ -5,7 +5,7 @@ Pure monkeypatch tests, platform sweep. The seams under test:
   recompiler.recompile_steps      (§4.4 Steps-sheet recompile)
   describe_compile.compile_describe (§4.6 Describe your own)
   told_facts.file_told_facts       (§5.6 day-chat told facts)
-  AutomationsSkill memory_recall   (§4.5 recall from the main chat)
+  AutomationsSkill automations__memory_recall  (§4.5 recall from the main chat)
   AutomationsSkill._create         (ND-1: grants bound at create)
 """
 
@@ -311,7 +311,7 @@ def test_told_facts_never_raises():
 
 def test_memory_recall_is_the_last_tool():
     tools = AutomationsSkill().get_tools()
-    assert tools[-1]["name"] == "memory_recall"
+    assert tools[-1]["name"] == "automations__memory_recall"
     assert "before" in tools[-1]["description"].lower()
 
 
@@ -334,7 +334,7 @@ def test_memory_recall_dispatch_reads_the_v2_store(monkeypatch):
                         raising=False)
     skill = AutomationsSkill()
     out = asyncio.run(skill.execute_tool(
-        "memory_recall", {"entity": "Marcus"},
+        "automations__memory_recall", {"entity": "Marcus"},
         SkillContext(user_id="u1")))
     assert "same-day answers" in out
 

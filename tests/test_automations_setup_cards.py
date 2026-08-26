@@ -58,14 +58,86 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         "automations__resume", "automations__delete",
     } <= names
     for n in names:
-        # R30 §4.5: `memory_recall` is deliberately outside the skill's
-        # namespace — it reads the ONE platform memory from the main
-        # chat, not an automations-internal surface. Everything else
-        # keeps the prefix.
-        assert n.startswith("automations__") or n == "memory_recall"
+        # EVERY tool carries the prefix, `automations__memory_recall`
+        # included. This used to permit a bare `memory_recall` on a
+        # §4.5 rationale §4.5 does not contain — the prefix is the
+        # loader's tool-index namespace, not a statement about which
+        # surface may call the tool, and SkillLoader._register RAISES
+        # on the first name that lacks it.
+        assert n.startswith("automations__")
     # And the prefix-stable tools array only ever grows at the END.
     ordered = [t["name"] for t in AutomationsSkill().get_tools()]
-    assert ordered[-1] == "memory_recall"
+    assert ordered[-1] == "automations__memory_recall"
+
+
+@pytest.mark.asyncio
+async def test_every_builtin_skill_tool_carries_its_skill_prefix():
+    """The loader's rule, applied to every builtin — statically.
+
+    `SkillLoader._register` raises `ValueError` on the first tool whose
+    name lacks `f"{skill.meta.name}__"`, and `load_all()` catches that
+    raise per-directory. So one mis-named tool does not register one bad
+    tool; it silently DISCARDS THE WHOLE SKILL, tools, prompt section,
+    commands, hooks and execution path together. Every suite here passed
+    with the automations skill entirely absent from the agent, because
+    they all call `get_tools()` and `execute_tool()` directly and never
+    touch the component that enforces the rule.
+    """
+    import importlib.util
+    import os
+    from app.agent.skills.base import Skill
+
+    root = os.path.join(os.path.dirname(
+        importlib.util.find_spec("app.agent.skills.loader").origin),
+        "builtins")
+    checked = 0
+    for entry in sorted(os.listdir(root)):
+        skill_file = os.path.join(root, entry, "skill.py")
+        if not os.path.isfile(skill_file):
+            continue
+        spec = importlib.util.spec_from_file_location(
+            f"prefixpin_{entry}", skill_file)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for obj in vars(mod).values():
+            if not (isinstance(obj, type) and issubclass(obj, Skill)
+                    and obj is not Skill):
+                continue
+            if getattr(obj, "meta", None) is None:
+                continue
+            prefix = f"{obj.meta.name}__"
+            for tool in obj().get_tools():
+                assert tool["name"].startswith(prefix), (
+                    f"{entry}: tool {tool['name']!r} lacks {prefix!r} — "
+                    f"the loader will discard the entire skill"
+                )
+                checked += 1
+    assert checked > 20, f"the sweep found only {checked} tools"
+
+
+@pytest.mark.asyncio
+async def test_automations_skill_registers_through_the_real_loader(
+    monkeypatch,
+):
+    """The funnel itself — not a re-implementation of its rule.
+
+    This is the only test in the tree that would have caught a bare
+    `memory_recall`: it drives `SkillLoader._register`, the code that
+    actually raises, and asserts the skill ends up registered with all
+    of its tools in the loader's tool index.
+    """
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    from app.agent.skills.loader import SkillLoader
+    from app.agent.skills.builtins.automations.skill import AutomationsSkill
+
+    loader = SkillLoader()
+    registered = await loader._register(AutomationsSkill())
+    assert registered is True, "the automations skill refused to register"
+    indexed = {n for n, owner in loader._tool_index.items()
+               if owner == "automations"}
+    assert "automations__memory_recall" in indexed
+    assert "automations__request_connection" in indexed
+    assert len(indexed) == len(AutomationsSkill().get_tools())
 
 
 @pytest.mark.asyncio

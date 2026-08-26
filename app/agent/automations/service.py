@@ -819,7 +819,13 @@ async def list_runs(
         except (ValueError, TypeError):
             pass
         fix = None
-        if j.status == "failed":
+        # ND-15: a "Fix this" chip asserts there is something to
+        # diagnose. A failure recorded with NO story — no outcome, no
+        # user_message, no error_class — has nothing to offer, and a
+        # chip on it invites the agent to investigate a blank.
+        if j.status == "failed" and (
+            j.outcome or j.user_message or j.error_class
+        ):
             fix = verbs.fix_chip(
                 names.get(j.source_id or "", "this automation") or
                 "this automation",

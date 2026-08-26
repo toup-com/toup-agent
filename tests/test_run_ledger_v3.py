@@ -850,3 +850,119 @@ async def test_nd14_the_card_and_the_thread_tell_the_same_story(monkeypatch):
         from app.agent.automations.service import list_runs
         runs = await list_runs(db, uid, automation_id=a.id, limit=5)
         assert next(r for r in runs if r["id"] == job.id)["fix"] is None
+
+
+@pytest.mark.asyncio
+async def test_nd15_a_crashed_run_still_tells_a_story():
+    """ND-15 (live): JobRunner._mark_failed terminalised an automation
+    run with status=failed and outcome / error_class / user_message ALL
+    null — bypassing the gated finalize that couples the terminal to the
+    stamp, the notify and the ledger close — and the runs API then
+    offered a "Fix this" chip for a failure with no story."""
+    from app.agent.job_runner import JobRunner
+    from app.agent.automations.service import list_runs
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        job = BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    await JobRunner()._mark_failed(job_id, "handler blew up")
+
+    async with async_session_maker() as db:
+        row = await db.get(BuildJob, job_id)
+        assert row.status == "failed"
+        # A failure the user can see must say something true about itself.
+        assert row.outcome, "no outcome — the story is missing"
+        assert row.error_class, "no error_class"
+        assert row.user_message, "no user_message"
+        # And the stamp fired, because it went through the gate.
+        automation = await db.get(Automation, a.id)
+        assert automation.last_outcome, "the gated finalize was bypassed"
+
+    async with async_session_maker() as db:
+        runs = await list_runs(db, uid, automation_id=a.id, limit=5)
+    assert next(r for r in runs if r["id"] == job_id)["fix"] is not None
+
+
+@pytest.mark.asyncio
+async def test_nd15_no_fix_chip_for_a_failure_with_no_story():
+    """Defence in depth: even if some unaccounted path lands a bare
+    `failed`, the chip must not offer to diagnose a blank."""
+    from app.agent.automations.service import list_runs
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="failed",
+            source_kind="automation", source_id=a.id,
+        ))
+        await db.commit()
+    async with async_session_maker() as db:
+        runs = await list_runs(db, uid, automation_id=a.id, limit=5)
+    assert runs[0]["fix"] is None, runs[0]
+
+
+@pytest.mark.asyncio
+async def test_nd16_the_card_never_invents_a_connector_failure(monkeypatch):
+    """ND-16 (live): the home card read "Tried 1:20 · could not reach an
+    account" for a run that died mid-"Wrapping up" with accounts_failed
+    EMPTY — asserting a refusal that never happened. Only claim a
+    connector when the ledger recorded one."""
+    from app.agent.automations.summary import summary_payload
+
+    async def _conn(user_id):
+        return {"jira": {"connector_id": "jira", "connected": True,
+                         "status": "active", "account": "TP"},
+                "slack": {"connector_id": "slack", "connected": True,
+                          "status": "active", "account": "ws"}}
+
+    async def _reg(user_id, force=False):
+        return REGISTRY_V2
+
+    async def _tpl(user_id):
+        return []
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_connection_state", _conn)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _reg)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_templates", _tpl)
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="failed", outcome="lost",
+            error_class="interrupted", source_kind="automation",
+            source_id=a.id, completed_at=datetime.utcnow(),
+            config_json={"accounts_failed": []},
+        ))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    meta = payload["automations"][0]["meta"]
+    assert "could not reach" not in meta, meta
+    assert "did not finish" in meta, meta
+
+    # When a connector DID fail, name it — the honest form survives.
+    async with async_session_maker() as db:
+        job = (await db.execute(
+            select(BuildJob).where(BuildJob.source_id == a.id)
+        )).scalars().first()
+        job.config_json = {"accounts_failed": ["jira"]}
+        await db.commit()
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    assert "could not reach Jira" in payload["automations"][0]["meta"]

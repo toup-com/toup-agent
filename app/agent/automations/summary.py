@@ -186,10 +186,24 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             meta = f"{_acct_count(len(members))} · needs reconnecting"
         elif v3 == "waiting_on_user":
             meta = f"Waiting for you since {_clock(last.created_at, tz)}"
-        elif v3 in ("failed",):
-            who = expired_name or "an account"
-            meta = f"Tried {_clock(last.completed_at, tz)} · " \
-                   f"could not reach {who}"
+        elif v3 == "failed":
+            # ND-16 (live): this used to read "could not reach an
+            # account" for EVERY failure. §4.1's failed form names a
+            # connector because it describes a connector problem —
+            # applying it to a run that died mid-"Wrapping up" asserts a
+            # refusal that never happened, on the home screen. Only
+            # claim a connector when the ledger recorded one.
+            failed_ids = ledger._cfg_of(last).get("accounts_failed") or []
+            failed_names = [x["name"] for x in accounts
+                            if x["account_id"] in failed_ids]
+            when = _clock(last.completed_at or last.created_at, tz)
+            if failed_names:
+                meta = (f"Tried {when} · could not reach "
+                        f"{failed_names[0]}")
+            elif expired_name and status == "needs_attention":
+                meta = f"Tried {when} · could not reach {expired_name}"
+            else:
+                meta = f"Tried {when} · it did not finish"
         elif missing_account:
             missing_names = [x["name"] for x in accounts
                              if x["state"] == "expired"]
