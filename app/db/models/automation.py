@@ -6,7 +6,9 @@ An Automation is a compiled composition of the four existing primitives:
                platform's Pub/Sub webhook path; dedupe/coalescing reused.
   - poll     → a hidden system `Routine` (kind="automation_poll") that
                calls connector read tools on an interval and diffs.
-  - schedule → a user-visible `Routine` (kind="automation_schedule").
+  - schedule → a `Routine` (kind="automation_schedule"). Listed to the
+    user until R30 (ND-18); the automation now has its own surface, so
+    the binding is an engine internal like the poll one.
   - execute  → a `BuildJob` (job_type="automation_run") — the run ledger
                is the unified jobs table, NOT a parallel runs table (the
                repo just retired `routine_runs`/`trigger_events` as

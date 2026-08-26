@@ -642,3 +642,68 @@ async def test_nd12_repair_never_touches_an_armed_migration():
         assert await db.get(Automation, aid) is not None
         r = await db.get(Routine, brief)
         assert (r.config_json or {}).get("migrated_to") == aid
+
+
+@pytest.mark.asyncio
+async def test_engine_routines_are_not_listed_as_the_users_routines(
+    monkeypatch,
+):
+    """ND-18: one automation must not read as three objects.
+
+    D measured it on the founder tenant: the agent, asked how many
+    automations exist, answered NINE against a ground truth of four. It
+    was counting the engine's own `[automation] …` schedule binding
+    alongside the automation it belongs to, plus the source routines the
+    migration had already replaced. It degrades with use — every
+    migration mints a binding AND retires a source, so each one added
+    two phantoms.
+
+    R26 listed `automation_schedule` deliberately ("it IS a schedule the
+    user asked for in words"), which was true when the automation had no
+    surface of its own. R30 gives it one.
+    """
+    from app.api.routines import list_routines
+    from app.db.models import Routine
+
+    uid = await _mk_user()
+    async with async_session_maker() as db:
+        rows = [
+            # The user's own routine — always listed.
+            Routine(id=str(uuid.uuid4()), user_id=uid, kind="briefing",
+                    name="Morning brief", enabled=True,
+                    schedule_kind="cron", schedule_cron_local="0 8 * * *"),
+            # Engine plumbing for an automation the user sees elsewhere.
+            Routine(id=str(uuid.uuid4()), user_id=uid,
+                    kind="automation_schedule",
+                    name="[automation] Morning new-email briefing",
+                    enabled=True, schedule_kind="cron",
+                    schedule_cron_local="0 8 * * *",
+                    config_json={"automation_id": "a-1"}),
+            Routine(id=str(uuid.uuid4()), user_id=uid,
+                    kind="automation_poll",
+                    name="[automation] Jira watch", enabled=True,
+                    schedule_kind="every", schedule_cron_local="",
+                    schedule_interval_seconds=900,
+                    config_json={"automation_id": "a-2"}),
+            # A routine an automation has REPLACED.
+            Routine(id=str(uuid.uuid4()), user_id=uid, kind="briefing",
+                    name="Old mail brief", enabled=False,
+                    schedule_kind="cron", schedule_cron_local="0 7 * * *",
+                    config_json={"migrated_to": "a-1"}),
+            Routine(id=str(uuid.uuid4()), user_id=uid, kind="briefing",
+                    name="Duplicate brief", enabled=False,
+                    schedule_kind="cron", schedule_cron_local="0 7 * * *",
+                    config_json={"superseded_by": "a-1"}),
+        ]
+        for r in rows:
+            db.add(r)
+        await db.commit()
+
+    from app.config import settings
+    monkeypatch.setattr(settings, "user_id", uid)
+    listed = await list_routines()
+
+    names = [r.name for r in listed]
+    assert names == ["Morning brief"], (
+        f"the engine's own rows reached the user: {names}")
+    assert not any(n.startswith("[automation]") for n in names)

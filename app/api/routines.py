@@ -772,14 +772,36 @@ async def list_routines():
                     # Round 26: poll bindings are engine internals for
                     # the same reason (a hidden system routine); the
                     # automation itself is the user-visible unit at
-                    # /api/automations. `automation_schedule` stays
-                    # listed deliberately — it IS a schedule the user
-                    # asked for in words.
+                    # /api/automations.
                     Routine.kind != "automation_poll",
+                    # R30 (ND-18) RETIRES the R26 carve-out that kept
+                    # `automation_schedule` listed "because it IS a
+                    # schedule the user asked for in words". That was
+                    # true when the automation had no surface of its
+                    # own. It now has one — the home card, the canvas
+                    # and its own schedule sheet — so listing the
+                    # binding here shows ONE thing the user set up as
+                    # TWO, the second wearing the engine's `[automation]
+                    # ` name prefix. Measured on the founder tenant: the
+                    # agent, asked how many automations exist, answered
+                    # nine against a ground truth of four.
+                    # (literal, not compiler.ROUTINE_KIND_SCHEDULE —
+                    # the platform image ships no app/agent/.)
+                    Routine.kind != "automation_schedule",
                 )
                 .order_by(Routine.created_at)
             )
             routines = list(result.scalars().all())
+            # ...and a routine an automation has REPLACED is not a
+            # second routine either. §4.11a stamps `migrated_to` /
+            # `superseded_by` on the source row and disables it; leaving
+            # it listed meant every migration added a phantom, so the
+            # count drifted further from the truth with each one.
+            routines = [
+                r for r in routines
+                if not ((r.config_json or {}).get("migrated_to")
+                        or (r.config_json or {}).get("superseded_by"))
+            ]
 
             for r in routines:
                 try:
