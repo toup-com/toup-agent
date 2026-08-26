@@ -100,9 +100,18 @@ def notification_body(kind: str, run_summary: dict) -> str:
         # with it. When a connector IS named, R30 §5.7's line stands
         # verbatim.
         if connector:
+            # R31-07. This said "{connector} refused", which is true of
+            # exactly one failure and wrong about the rest: access that
+            # ran out did not refuse, an organisation that has not
+            # approved Toup did not refuse, and a service that timed out
+            # did not refuse. `run_summary` carries the NAME but not the
+            # reason, so the honest body names the account and sends the
+            # user to where the real reason is written, rather than
+            # inventing a mechanism to fill the gap. (The canvas does
+            # not mandate this line — it was R30 §5.7's own wording.)
             return (
-                f"It could not finish — {connector} refused. Nothing was "
-                "missed. Open the run and I will show you the fix."
+                f"It could not finish — {connector} needs you. Nothing "
+                "was missed. Open the run and I will show you the fix."
             )
         return (
             "It could not finish. Nothing was missed. Open the run and "

@@ -487,7 +487,11 @@ class AutomationsSkill(Skill):
             "  3. If the request is ambiguous between connected "
             "services (e.g. 'my email' with both Gmail and Outlook "
             "connected), ask with quick-reply chips on their own "
-            "line — `[[Gmail]] [[Outlook]] [[Both]]` — and wait.\n"
+            "line — `[[Gmail]] [[Outlook]] [[Both]]` — and wait. "
+            "That syntax works HERE, in the main chat, and only here: "
+            "inside an automation's own thread it is not a button, it "
+            "is four literal brackets in a sentence. Ask in words "
+            "there.\n"
             "     When a template variable is a fact the user may "
             "already have told you (their boss's email address, a "
             "channel they always use), check `memory_search` first "
@@ -580,9 +584,14 @@ class AutomationsSkill(Skill):
             "memory (recall first — the platform memory holds everything "
             "the automations learned and did) and point at the exact "
             "run; never re-run to answer, never restate the briefing. "
-            "This is about the contents of past runs — an inventory ask "
+            "This is about the contents of PAST runs — an inventory ask "
             "(what they have, how many) is the rule above, and memory is "
-            "not the place to count them.\n"
+            "not the place to count them. It is also not about a request "
+            "for something NEW: 'what is in my inbox now' is a fresh "
+            "read, not a question about a run that already happened, and "
+            "inside the automation's own thread that read is a run of "
+            "its own. The rule here is that a finished run is not "
+            "repeated to describe itself.\n"
             "- Its status comes from the engine, stated ONCE per reply "
             "— never 'active' in one sentence and 'paused' in another.\n"
             "- Speak about automations in the user's words: it reads, "
@@ -1053,7 +1062,7 @@ class AutomationsSkill(Skill):
             return "ERROR: automation_id is required."
         from app.api.automations import run_now as run_now_route
         try:
-            await run_now_route(automation_id)
+            fired = await run_now_route(automation_id)
         except HTTPException as exc:
             detail = exc.detail
             code = detail.get("code") if isinstance(detail, dict) else ""
@@ -1072,6 +1081,21 @@ class AutomationsSkill(Skill):
                 f"Could not start it — {sentence} Say that plainly; do "
                 "not report a status instead.",
                 display="Could not start the run",
+            )
+        # The route AWAITS the run — `run_schedule_fire_v2` is not
+        # dispatched, it is executed — so by the time this returns the
+        # run is usually over. Telling the model to say "it is running"
+        # regardless would have it announce a present tense that is
+        # already false, to a user who just waited out the whole run.
+        status = str((fired or {}).get("status") or "").strip()
+        if status in ("completed", "partial", "failed", "stopped_by_user"):
+            return ToolResult(
+                f"The run finished ({status}). It has already written "
+                "itself into the automation's own thread — say in one "
+                "short line that it ran and point them there. Do not "
+                "summarise what it found; the thread has the real "
+                "account of it and yours would be a second one.",
+                display="Ran it",
             )
         return ToolResult(
             "Started a real run. It reports itself in the automation's "

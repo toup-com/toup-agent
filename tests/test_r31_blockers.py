@@ -363,3 +363,51 @@ def test_the_accounts_proxy_forwards_the_body():
     src = inspect.getsource(automations_proxy._proxy_accounts)
     assert "await request.body()" in src
     assert "content=" in src
+
+
+# ── R31-46: a dry run that predicted a different run ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_migration_report_mirrors_the_migration():
+    """A preview whose classes differ from the run it previews is worse
+    than no preview: it is read as permission.
+
+    `migration_report`'s docstring claimed it mirrored
+    `migrate_email_briefings` "exactly" and did not. It detected twins
+    by EXACT normalised name equality while the migration uses the
+    SUBSET test `_same_intent` — and ND-13 records that exact equality
+    never fires, which is precisely why `_same_intent` exists. So the
+    report's `would_supersede` branch was effectively dead and it
+    predicted `would_migrate` for routines the run supersedes.
+
+    It also tested the twin BEFORE `enabled` while the migration tests
+    `enabled` first, so a disabled routine with a twin came back
+    `would_supersede` in the preview and `needs_review` in the run.
+    """
+    import inspect
+    from app.agent.automations import routine_migration as rm
+
+    report = inspect.getsource(rm.migration_report)
+    run = inspect.getsource(rm.migrate_email_briefings)
+
+    # One twin test, shared.
+    assert "_find_twin(" in report, (
+        "the report has its own twin test again"
+    )
+    assert "by_name.get(" not in report
+
+    # And the same branch ORDER: enabled before twin, in both.
+    #
+    # Anchored on the BRANCH text, not on the words. A first draft used
+    # `src.index("enabled")` and matched the prose in a comment forty
+    # lines above the branch — a probe that reads its own explanation
+    # and calls it evidence.
+    assert (report.index("elif not r.enabled:")
+            < report.index("elif twin is not None:")), (
+        "the report tests the twin before enabled"
+    )
+    assert (run.index("if not routine.enabled and not selected:")
+            < run.index("twin = _find_twin(")), (
+        "the migration tests the twin before enabled"
+    )

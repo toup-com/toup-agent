@@ -113,8 +113,54 @@ async def test_state_frame_shape_and_no_channel_key(monkeypatch):
         "connector_id": "gmail",
         "state": "connected",
         "reconnected_at": "2026-08-25T12:00:00Z",
+        # R31 §4.4 — additive, and both EMPTY on the reconnect leg: this
+        # account is simply working, so there is nothing to name and
+        # nothing to offer.
+        "reason_code": "",
+        "fix": "",
     }
     assert "channel" not in frame
+
+
+@pytest.mark.asyncio
+async def test_a_healthy_account_offers_no_fix_and_a_transient_one_offers_retry(
+    monkeypatch,
+):
+    """§4.4. `buttonLabel` renders ANY non-empty `fix`, so a blanket
+    default of `retry` for every `connected` frame drew "Try again" on an
+    account that had just started working — R31-13's class, inverted.
+
+    Only the three transient reason codes keep the state `connected` AND
+    earn a remedy.
+    """
+    for reason, expected in (
+        ("", ""),                       # the reconnect leg — healthy
+        ("rate_limited", "retry"),
+        ("vendor_down", "retry"),
+        ("timeout", "retry"),
+        # A credential problem may not present as `connected` at all, but
+        # if a caller ever does, it must not be offered a bare retry.
+        ("token_expired", ""),
+    ):
+        frames = _capture_frames(monkeypatch)
+        await connector_state.emit_state_frame(
+            "u-1", connector_id="gmail", state="connected", reason_code=reason,
+        )
+        assert frames[0][1]["fix"] == expected, (reason, frames[0][1]["fix"])
+
+    # An account that is NOT connected still defaults to reconnect.
+    frames = _capture_frames(monkeypatch)
+    await connector_state.emit_state_frame(
+        "u-1", connector_id="gmail", state="expired",
+    )
+    assert frames[0][1]["fix"] == "reconnect"
+
+    # An explicit fix always wins over the default.
+    frames = _capture_frames(monkeypatch)
+    await connector_state.emit_state_frame(
+        "u-1", connector_id="gmail", state="scope_missing", fix="grant",
+    )
+    assert frames[0][1]["fix"] == "grant"
 
 
 @pytest.mark.asyncio

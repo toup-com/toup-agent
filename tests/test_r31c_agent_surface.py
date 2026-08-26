@@ -125,6 +125,55 @@ async def test_a_started_run_tells_the_model_to_say_one_line(monkeypatch):
     assert "what it found" in str(out)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,display", [
+    ("running", "Started the run"),
+    ("queued", "Started the run"),
+    ("completed", "Ran it"),
+    ("partial", "Ran it"),
+    ("failed", "Ran it"),
+])
+async def test_a_finished_run_is_not_reported_as_running(
+    monkeypatch, status, display,
+):
+    """The route AWAITS the run — `run_schedule_fire_v2` is executed,
+    not dispatched — so by the time the tool returns the run is usually
+    over. Telling the model to say "it is running" regardless would
+    have it announce a present tense that is already false, to a user
+    who has just sat through the whole run waiting for the answer.
+    """
+    import app.api.automations as api
+
+    monkeypatch.setattr(settings, "automations_enabled", True)
+
+    async def fired(_automation_id):
+        return {"fired": True, "status": status}
+
+    monkeypatch.setattr(api, "run_now", fired)
+    out = await AutomationsSkill().execute_tool(
+        "automations__run_now", {"automation_id": "a-1"}, _ctx(),
+    )
+    assert out.display == display
+    if display == "Ran it":
+        assert "finished" in str(out)
+        assert "Do not summarise what it found" in str(out)
+
+
+def test_a_failed_run_does_not_assert_an_account_was_unreachable():
+    """`_FAILED_RULES` opened "every source it needed was unreachable",
+    which it never checked. A run can fail with no account failing at
+    all — stopped, out of time, or broken — and the drain/cap/crash row
+    of §4.2 is exactly that case."""
+    from app.agent.automations import narrator
+
+    record = _record("failed")
+    record["steps"] = [s for s in record["steps"] if s["ok"]]
+    prompt = narrator.build_prompt(record)
+    assert "every source it needed was unreachable" not in prompt
+    assert "do not assert that a source was unreachable" in prompt
+    assert "SOME SOURCES FAILED" not in prompt
+
+
 def test_the_prompt_routes_every_run_phrasing_to_the_engine():
     prompt = AutomationsSkill().get_system_prompt_section()
     assert prompt
@@ -154,6 +203,31 @@ def test_no_prompt_surface_teaches_the_words_the_user_must_not_read():
     prompt = AutomationsSkill().get_system_prompt_section() or ""
     for banned in ("undo window", "TEST RUN"):
         assert banned not in prompt, banned
+
+
+def test_the_two_prompt_surfaces_do_not_contradict_each_other():
+    """Both sections are assembled into the SAME turn for a thread
+    message, so a rule stated unscoped in one is a rule the model reads
+    beside its opposite.
+
+    Two of them were: the skill orders `[[Gmail]] [[Outlook]]` chips
+    while the thread persona forbids double square brackets outright,
+    and "never re-run to answer" sat next to "a question that needs
+    fresh reading IS a run". Neither was wrong — both were unscoped.
+    """
+    skill = AutomationsSkill().get_system_prompt_section() or ""
+    thread = _thread_prompt()
+
+    # The chip syntax is main-chat only, and says so.
+    assert "[[Gmail]]" in skill
+    assert "in the main chat, and only here" in skill
+    assert "double square brackets" in thread
+
+    # "Never re-run" is about a PAST run describing itself, not about a
+    # request for something new.
+    assert "never re-run to answer" in skill
+    assert "not about a request for something NEW" in skill
+    assert "is a run, not a paragraph you compose" in thread
 
 
 def test_the_hard_rules_promise_only_what_the_engine_actually_does():
@@ -216,7 +290,8 @@ def test_a_failure_with_an_account_names_it():
         {"run_kind": "scheduled", "status": "failed", "vocabulary": "brief",
          "failed_connector_name": "GitHub"},
     )
-    assert "GitHub refused" in body
+    assert "GitHub needs you" in body
+    assert "refused" not in body
     assert copy_guard.clean(body), copy_guard.scan(body)
 
 
@@ -276,7 +351,7 @@ def test_the_thread_persona_forbids_markdown_and_says_why():
     list feels clearer.
     """
     section = _thread_prompt()
-    assert "plain text" in section
+    assert "Markdown is not formatted here, it is DISPLAYED" in section
     for forbidden in ("No bold", "no italics", "no backticks"):
         assert forbidden in section, forbidden
     # It must beat the formatting section, which is assembled AFTER
@@ -294,7 +369,11 @@ def test_the_thread_persona_forbids_quick_reply_syntax():
     that appeared as USER messages nobody typed (E-01, E-40).
     """
     section = _thread_prompt()
-    assert "double square brackets" in section
+    # Assert the POLARITY, not the noun phrase. Asserting "double
+    # square brackets" appears is satisfied by "You may write double
+    # square brackets" — a mutation that reverses the rule and keeps
+    # the words survived this test until it was written this way.
+    assert "Never write double square brackets around anything" in section
     assert "never said" in section
 
 
@@ -678,6 +757,43 @@ def test_the_canvas_rules_round_trip_byte_for_byte(rule):
     assert [r["text"] for r in rows] == [rule]
 
 
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_a_phone_apostrophe_does_not_drop_the_rule(apostrophe):
+    """iOS substitutes the typographic apostrophe by default, and the
+    founder types on a phone. `don'?t` matched "dont" and "don't" and
+    silently dropped "don’t post anywhere" — a line the user drew that
+    the workflow would then not show and the agent would then cross."""
+    from app.agent.automations import rule_extraction as rx
+
+    rows = rx.extract_rules(description=f"Don{apostrophe}t post anywhere.")
+    assert [r["text"] for r in rows] == ["Never post anywhere."]
+
+
+def test_only_is_a_rule_at_a_clause_start_and_an_adjective_elsewhere():
+    """"It reads the only inbox you use." produced the rule "Only inbox
+    you use." — a line the user never drew, in the one place that
+    claims to list exactly the lines they did."""
+    from app.agent.automations import rule_extraction as rx
+
+    assert rx.extract_rules(
+        description="It reads the only inbox you use.") == []
+    assert [r["text"] for r in rx.extract_rules(description="Only unread.")] \
+        == ["Only unread."]
+
+
+def test_rather_than_stops_at_the_next_constraint():
+    """Unbounded, it ran through the comma and swallowed the following
+    constraint, so two lines the user drew separately became one row
+    they cannot edit apart."""
+    from app.agent.automations import rule_extraction as rx
+
+    rows = rx.extract_rules(
+        description="Hold time rather than booking, and never post anywhere.")
+    assert sorted(r["text"] for r in rows) == [
+        "Hold time rather than booking.", "Never post anywhere.",
+    ]
+
+
 def test_a_fragment_is_not_a_rule():
     from app.agent.automations import rule_extraction as rx
 
@@ -812,6 +928,136 @@ def test_the_capability_check_says_what_it_can_and_cannot_do():
     turns = setup_turns(mode="drafts_only", channel_label="",
                         first_run_label="tonight", scope_lines=lines)
     assert turns[1]["steps"] == lines
+
+
+@pytest.mark.parametrize("count,expected", [
+    (0, "0 open issues"), (1, "1 open issue"), (4, "4 open issues"),
+])
+def test_a_count_of_one_reads_as_one(count, expected):
+    """"1 open issues" on a job sheet. Twenty-four details in the table
+    carried a bare plural and none used the `(s)` marker the renderer
+    has supported all along — including the ones on camera. Counts
+    singularised is C's own review_only rule."""
+    from app.services import automation_verbs as verbs
+
+    got = verbs.turn_action("jira", "jira__search_issues",
+                            kind="read", count=count)
+    assert got["detail"] == expected
+
+
+def test_no_read_detail_carries_a_bare_plural():
+    from app.services import automation_verb_entries as entries
+
+    offenders = [
+        (cid, tool, verb["detail"])
+        for cid, entry in entries.ENTRIES.items()
+        for tool, verb in entry.get("reads", {}).items()
+        if "{count}" in (verb.get("detail") or "")
+        and "(s)" not in verb["detail"]
+    ]
+    assert not offenders, offenders
+
+
+def test_a_write_target_with_no_name_falls_back_not_through():
+    """`mode_of` returns the bare word "posts" when the write target has
+    no label; passing that through rendered "post one line in posts,
+    nothing else." """
+    from app.agent.automations.setup_script import setup_turns
+
+    opening = setup_turns("posts", "posts", "tomorrow", [])[0]["text"]
+    assert "in the channel you chose" in opening
+    assert "in posts," not in opening
+
+
+def test_a_transient_failure_never_says_the_account_needs_you():
+    """A rate limit or a timeout leaves the account `connected`
+    (R31-13), so a home card reading "Gmail needs you" beside a pill
+    reading "Connected" is the E-27 shape this round exists to kill —
+    two surfaces disagreeing about the same account, in the same
+    glance. Nothing about the account needs the user; the RUN can be
+    tried again, and the button already says so."""
+    table = _reason_strings()
+    for code, row in table["reason_codes"].items():
+        if code.startswith("$") or not row.get("transient"):
+            continue
+        assert "needs you" not in (row.get("home_meta") or ""), code
+        assert row["home_meta"] == "{Connector} did not finish", code
+    assert table["forms"]["tried_name_did_not_finish"] == (
+        "Tried {t} · {A} did not finish"
+    )
+
+
+@pytest.mark.parametrize("state,code,surface,expected", [
+    ("org_approval_needed", "org_approval_needed", "pill",
+     "Waiting for the organisation"),
+    ("org_approval_needed", "org_approval_needed", "button_label",
+     "Approve in GitHub"),
+    ("scope_missing", "scope_missing", "sheet_subtitle",
+     "Needs more access · it cannot read your repositories yet"),
+    ("expired", "token_expired", "home_meta", "GitHub needs you"),
+    ("connected", "timeout", "pill", "Connected"),
+    ("connected", "timeout", "home_meta", "GitHub did not finish"),
+    ("connected", "timeout", "button_label", "Try again"),
+])
+def test_the_table_renders_through_the_engines_own_wiring(
+    state, code, surface, expected,
+):
+    """The seam neither half can test alone.
+
+    C authors the strings and A wires them; each side passing its own
+    tests proves only that the halves are fine apart. Rendering C's
+    table through A's `account_health` is what proves a slot the table
+    declares is one the wiring fills — and it caught two gaps in the
+    table: a transient reason earned `fix: retry` but no
+    `button_label`, so the button was empty on the surface that reads
+    it directly rather than through `fix_button`.
+    """
+    from app.agent.automations import account_health as ah
+
+    got = ah.sentence_for(account_state=state, reason_code=code,
+                          connector_id="github", surface=surface)
+    assert got == expected, (state, code, surface, got)
+    assert "{" not in got
+
+
+def test_no_state_and_surface_pair_renders_a_brace():
+    """R31-25, at the seam. A slot the table declares and the wiring
+    cannot fill is a brace on the screen."""
+    from app.agent.automations import account_health as ah
+
+    table = _reason_strings()
+    surfaces = table["surfaces"]
+    for state in table["states"]:
+        for code, row in table["reason_codes"].items():
+            if code.startswith("$") or row.get("state") != state:
+                continue
+            for surface in surfaces:
+                got = ah.sentence_for(
+                    account_state=state, reason_code=code,
+                    connector_id="outlook", surface=surface,
+                )
+                assert "{" not in got and "}" not in got, (
+                    state, code, surface, got
+                )
+
+
+def test_every_legacy_state_value_resolves_to_a_row():
+    """`workflow._account_entry` still emits `connected | expired |
+    missing`, and `missing` has no row. A blank is the state a user
+    cannot act on, and it looks identical to one nobody checked."""
+    table = _reason_strings()
+    for legacy, target in table["state_aliases"].items():
+        if legacy.startswith("$"):
+            continue
+        assert target in table["states"], (legacy, target)
+
+
+def test_the_failure_meta_has_a_singular_form():
+    """`{names} need you` renders "Gmail need you" at n=1, one row above
+    a card reading "Gmail needs you"."""
+    forms = _reason_strings()["forms"]
+    assert forms["tried_name_needs_you"] == "Tried {t} · {A} needs you"
+    assert forms["tried_names_need_you"] == "Tried {t} · {names} need you"
 
 
 def test_capability_lines_name_the_account_when_there_are_several():

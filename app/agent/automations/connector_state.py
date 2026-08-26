@@ -54,6 +54,17 @@ logger = logging.getLogger(__name__)
 _REAUTH_HINTS = ("access", "token", "reconnect", "expired", "reauth")
 
 
+# §4.4 — the three reason codes that keep an account `connected`.
+_TRANSIENT_REASONS = frozenset({"rate_limited", "vendor_down", "timeout"})
+
+
+def _default_fix(state: str, reason_code: str) -> str:
+    """The fix a frame carries when the caller named none."""
+    if state == "connected":
+        return "retry" if (reason_code or "") in _TRANSIENT_REASONS else ""
+    return "reconnect"
+
+
 async def emit_state_frame(
     user_id: str,
     *,
@@ -86,7 +97,14 @@ async def emit_state_frame(
         # accepted at the boundary and discarded, which made a dead
         # token and an outage the same event.
         "reason_code": reason_code or "",
-        "fix": fix or ("retry" if state == "connected" else "reconnect"),
+        # A CONNECTED account offers a remedy only when its last failure
+        # was transient (§4.4: rate_limited | vendor_down | timeout keep
+        # the state `connected` and get `fix: retry`). A plainly healthy
+        # account — the reconnect leg, where `reason_code` is empty —
+        # gets NO fix: `buttonLabel` renders any non-empty fix, so the
+        # blanket default drew "Try again" on an account that had just
+        # started working. That is R31-13's own class, inverted.
+        "fix": fix or _default_fix(state, reason_code),
     }
     try:
         from app.api.ws_chat import broadcast_to_user

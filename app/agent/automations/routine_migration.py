@@ -227,7 +227,10 @@ async def migrate_email_briefings(
         .where(_Automation.user_id == user_id)
         .where(_Automation.deleted_at.is_(None))
     )).scalars().all()
-    by_name = {_norm_name(a.name): a for a in existing if a.name}
+    # (`by_name` lived here and was never read — the migration uses
+    # `_find_twin`/`_same_intent`. It survived only in the report, which
+    # is how the two drifted apart. Deleted rather than left as a hint
+    # that exact-name matching is still a thing this module does.)
 
     migrated: list[dict] = []
     superseded: list[dict] = []
@@ -532,8 +535,15 @@ async def migration_report(db: AsyncSession, *, user_id: str) -> dict:
         .where(_Automation.user_id == user_id)
         .where(_Automation.deleted_at.is_(None))
     )).scalars().all()
-    by_name = {_norm_name(a.name): a for a in existing if a.name}
-
+    # R31-46. The report used its OWN twin test — exact normalised name
+    # equality via a `by_name` dict — while the migration uses the
+    # SUBSET test `_same_intent`. ND-13 records that exact equality
+    # never fires, which is why `_same_intent` exists: so the report's
+    # `would_supersede` branch was effectively dead, and it predicted
+    # `would_migrate` for routines the run actually supersedes.
+    #
+    # A dry run whose classes differ from the run it previews is worse
+    # than no dry run. It is read as permission.
     out = []
     for r in rows:
         cfg = r.config_json or {}
@@ -546,7 +556,7 @@ async def migration_report(db: AsyncSession, *, user_id: str) -> dict:
             "migrated_to": cfg.get("migrated_to"),
             "superseded_by": cfg.get("superseded_by"),
         }
-        twin = by_name.get(_norm_name(r.name))
+        twin = _find_twin(r, existing)
         if cfg.get("migrated_to"):
             entry["outcome"] = "already_migrated"
         elif cfg.get("superseded_by"):
@@ -554,13 +564,18 @@ async def migration_report(db: AsyncSession, *, user_id: str) -> dict:
         elif not _recurring(r):
             entry["outcome"] = "would_need_review"
             entry["reason"] = "one-shot — a reminder, not an automation"
+        # ORDER: enabled BEFORE twin, matching the migration. The report
+        # tested the twin first, so a disabled routine with a twin came
+        # back `would_supersede` in the preview and `needs_review` in the
+        # run — the same row, two answers, and the preview was the one
+        # the operator read.
+        elif not r.enabled:
+            entry["outcome"] = "would_need_review"
+            entry["reason"] = "disabled — the user turned it off"
         elif twin is not None:
             entry["outcome"] = "would_supersede"
             entry["superseded_by"] = twin.id
             entry["automation_name"] = twin.name
-        elif not r.enabled:
-            entry["outcome"] = "would_need_review"
-            entry["reason"] = "disabled — the user turned it off"
         elif r.kind != BRIEFING_KIND:
             entry["outcome"] = "would_need_review"
             entry["likely_mail"] = _likely_mail(r)

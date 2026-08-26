@@ -989,9 +989,38 @@ async def get_messages_by_date(
     from app.agent.reply_quote import resolve_reply_targets_for_serialization
     reply_targets = await resolve_reply_targets_for_serialization(db, messages)
 
-    return JSONResponse(content=[
-        r.model_dump(mode="json") for r in attach_run_to_cards([
-            _message_to_response(m, build_jobs, reply_targets, conversation_channels)
-            for m in messages
-        ])
-    ])
+    # R31-D: say when the answer is clipped.
+    #
+    # The session cap this route used to carry was invisible — the
+    # response looked complete whether or not it was, which is what let
+    # eleven rows go missing for hours without anyone reading an error.
+    # Bounding by `limit` instead of by session count is correct, but it
+    # has exactly the same property: at 500 rows a busy day truncates
+    # and the body still says nothing about it. D's census now prints
+    # `<-- AT LIMIT` for that reason; a consumer should not have to
+    # infer it from the row count matching the parameter.
+    #
+    # Headers rather than a wrapper object: the body is a bare array and
+    # four clients read it that way, so a shape change here is a
+    # migration. `X-Truncated` is loud for anything that looks and inert
+    # for anything that does not.
+    truncated = len(messages) >= limit
+    if truncated:
+        logger.warning(
+            "[sessions] by-date TRUNCATED user=%s date=%s limit=%d — the "
+            "day has more rows than were returned",
+            str(current_user.id)[:8], date_str, limit,
+        )
+    return JSONResponse(
+        content=[
+            r.model_dump(mode="json") for r in attach_run_to_cards([
+                _message_to_response(m, build_jobs, reply_targets,
+                                     conversation_channels)
+                for m in messages
+            ])
+        ],
+        headers={
+            "X-Returned-Count": str(len(messages)),
+            "X-Truncated": "true" if truncated else "false",
+        },
+    )

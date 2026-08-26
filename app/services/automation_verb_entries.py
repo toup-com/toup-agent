@@ -80,7 +80,7 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "gmail__list_messages": {
                 "action": "Read your unread mail",
-                "detail": "{count} new threads",
+                "detail": "{count} new thread(s)",
                 "progressive": "reading {count} unread messages",
             },
             "gmail__get_message": {
@@ -90,12 +90,12 @@ ENTRIES: dict[str, dict] = {
             },
             "gmail__search_threads": {
                 "action": "Searched your mail",
-                "detail": "{count} threads matched",
+                "detail": "{count} thread(s) matched",
                 "progressive": "searching your mail",
             },
             "*": {
                 "action": "Checked Gmail",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking Gmail",
             },
         },
@@ -120,7 +120,7 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "outlook__list_messages": {
                 "action": "Read your unread mail",
-                "detail": "{count} new threads",
+                "detail": "{count} new thread(s)",
                 "progressive": "reading {count} unread messages",
             },
             "outlook__get_message": {
@@ -130,7 +130,7 @@ ENTRIES: dict[str, dict] = {
             },
             "*": {
                 "action": "Checked Outlook",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking Outlook",
             },
         },
@@ -155,22 +155,22 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "slack__read_messages": {
                 "action": "Read your channels",
-                "detail": "{count} new messages",
+                "detail": "{count} new message(s)",
                 "progressive": "reading your channels",
             },
             "slack__search_messages": {
                 "action": "Searched Slack",
-                "detail": "{count} messages matched",
+                "detail": "{count} message(s) matched",
                 "progressive": "searching Slack",
             },
             "slack__list_channels": {
                 "action": "Looked at your channels",
-                "detail": "{count} channels",
+                "detail": "{count} channel(s)",
                 "progressive": "looking at your channels",
             },
             "*": {
                 "action": "Checked Slack",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking Slack",
             },
         },
@@ -200,12 +200,12 @@ ENTRIES: dict[str, dict] = {
                 # is a WRITE phrasing, and it sat on a turn that moved
                 # nothing — "0 issues moved" on a run that only looked.
                 "action": "Checked your board",
-                "detail": "{count} open issues",
+                "detail": "{count} open issue(s)",
                 "progressive": "checking your board",
             },
             "*": {
                 "action": "Checked Jira",
-                "detail": "{count} issues",
+                "detail": "{count} issue(s)",
                 "progressive": "checking Jira",
             },
         },
@@ -245,12 +245,12 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "github__list_issues": {
                 "action": "Read your repositories",
-                "detail": "{count} open pull requests",
+                "detail": "{count} open pull request(s)",
                 "progressive": "reading your repositories",
             },
             "*": {
                 "action": "Checked GitHub",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking GitHub",
             },
         },
@@ -277,12 +277,12 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "teams__read_chat_messages": {
                 "action": "Read your chats",
-                "detail": "{count} new messages",
+                "detail": "{count} new message(s)",
                 "progressive": "reading your chats",
             },
             "*": {
                 "action": "Checked Teams",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking Teams",
             },
         },
@@ -309,12 +309,12 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "notion__search": {
                 "action": "Read your pages",
-                "detail": "{count} pages changed",
+                "detail": "{count} page(s) changed",
                 "progressive": "reading your pages",
             },
             "*": {
                 "action": "Checked Notion",
-                "detail": "{count} pages",
+                "detail": "{count} page(s)",
                 "progressive": "checking Notion",
             },
         },
@@ -342,7 +342,7 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "drive__list_files": {
                 "action": "Looked at your files",
-                "detail": "{count} new files",
+                "detail": "{count} new file(s)",
                 "progressive": "looking at your files",
             },
             "drive__get_file_text": {
@@ -352,7 +352,7 @@ ENTRIES: dict[str, dict] = {
             },
             "*": {
                 "action": "Checked Drive",
-                "detail": "{count} files",
+                "detail": "{count} file(s)",
                 "progressive": "checking Drive",
             },
         },
@@ -382,7 +382,7 @@ ENTRIES: dict[str, dict] = {
             },
             "*": {
                 "action": "Checked Docs",
-                "detail": "{count} docs",
+                "detail": "{count} doc(s)",
                 "progressive": "checking Docs",
             },
         },
@@ -414,7 +414,7 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "calendar__list_events": {
                 "action": "Read your week",
-                "detail": "{count} events",
+                "detail": "{count} event(s)",
                 "progressive": "reading your week",
             },
             "calendar__check_availability": {
@@ -424,7 +424,7 @@ ENTRIES: dict[str, dict] = {
             },
             "*": {
                 "action": "Checked your calendar",
-                "detail": "{count} events",
+                "detail": "{count} event(s)",
                 "progressive": "checking your calendar",
             },
         },
@@ -453,12 +453,12 @@ ENTRIES: dict[str, dict] = {
         "reads": {
             "stub__list_items": {
                 "action": "Read the test feed",
-                "detail": "{count} test items",
+                "detail": "{count} test item(s)",
                 "progressive": "reading the test feed",
             },
             "*": {
                 "action": "Checked the test feed",
-                "detail": "{count} items",
+                "detail": "{count} item(s)",
                 "progressive": "checking the test feed",
             },
         },

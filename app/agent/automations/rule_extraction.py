@@ -61,8 +61,25 @@ ORIGINS = ("description", "setup", "steps", "user")
 #: "Only unread mail, and never post anywhere" came out as a single
 #: rule reading "Only unread mail, and never post anywhere." — which
 #: is two lines the user drew, recorded as one they cannot edit apart.
-_CONSTRAINT_OPENERS = r"and|or|but|never|only|skip|ignore|do\s+not|don'?t"
+#: An apostrophe is `'` on a keyboard and `’` on a phone — iOS
+#: substitutes the typographic one by default, and the founder types on
+#: a phone. `don'?t` matched "dont" and "don't" and silently dropped
+#: "don’t post anywhere", which is a constraint the user drew and the
+#: workflow would then not show. A dropped rule is the expensive
+#: direction: the agent crosses a line nobody recorded.
+_APOS = r"['’]"
+
+_CONSTRAINT_OPENERS = (
+    rf"and|or|but|never|only|skip|ignore|do\s+not|don{_APOS}?t"
+)
 _CLAUSE_END = rf"(?=[.;\n]|,\s*(?:{_CONSTRAINT_OPENERS})\b|$)"
+
+#: A constraint word only starts a constraint when it starts a CLAUSE.
+#: Mid-sentence, "only" is an ordinary adjective: "It reads the only
+#: inbox you use." produced the rule "Only inbox you use." — a line the
+#: user never drew, in the one place that claims to list exactly the
+#: lines they did.
+_CLAUSE_START = r"(?:^|(?<=[.;:,])\s*|(?<=\s)(?:and|or|but|then)\s+)"
 
 #: Explicit constraint language only. Each pattern captures the clause
 #: and `render` turns the match into the row's text.
@@ -75,19 +92,24 @@ _PATTERNS: tuple[tuple[str, str], ...] = (
     # "never post anywhere", "never reply to recruiters"
     (rf"\bnever\s+(?P<body>.+?){_CLAUSE_END}", "Never {body}."),
     # "don't post in #general", "do not send anything"
-    (rf"\b(?:don'?t|do not)\s+(?P<body>.+?){_CLAUSE_END}", "Never {body}."),
+    (rf"\b(?:don{_APOS}?t|do not)\s+(?P<body>.+?){_CLAUSE_END}",
+     "Never {body}."),
     # "skip anything from recruiters", "ignore newsletters"
     (rf"\bskip\s+(?P<body>.+?){_CLAUSE_END}", "Skip {body}."),
     (rf"\bignore\s+(?P<body>.+?){_CLAUSE_END}", "Ignore {body}."),
-    # "only unread", "only from my team"
-    (rf"\bonly\s+(?P<body>.+?){_CLAUSE_END}", "Only {body}."),
+    # "only unread", "only from my team" — clause-initial only, or
+    # every "the only X" in a description becomes a rule.
+    (rf"{_CLAUSE_START}only\s+(?P<body>.+?){_CLAUSE_END}", "Only {body}."),
     # "hold time on my calendar rather than booking meetings" — the
     # canvas's third example. A constraint stated as a preference
     # rather than a prohibition: the line it will not cross is the
     # second half. Kept whole and in the user's words, because
     # rewriting it as "Never book meetings." drops the alternative
-    # that tells the agent what to do instead.
-    (r"(?P<body>[^.;\n]*?\brather than\b[^.;\n]+)", "{body}."),
+    # that tells the agent what to do instead. Bounded by the same
+    # clause end as everything else — unbounded it ran through the
+    # comma and swallowed the NEXT constraint, so two lines the user
+    # drew separately became one row they cannot edit apart.
+    (rf"(?P<body>[^.;\n]*?\brather than\b.+?){_CLAUSE_END}", "{body}."),
     # "one line, no thread" — two constraints, matched separately.
     (r"\bone line\b", "One line only."),
     (r"\bno thread\b", "No thread."),

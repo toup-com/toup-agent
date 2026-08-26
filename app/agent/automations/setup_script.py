@@ -75,6 +75,12 @@ def _channel_only(channel_label: str) -> str:
     for prefix in ("posts to ", "post to "):
         if lowered.startswith(prefix):
             return text[len(prefix):].strip()
+    # `mode_of` returns the bare word "posts" when the write target has
+    # no label, and a caller passing that mode label would otherwise
+    # render "post one line in posts, nothing else." The fallback
+    # ("the channel you chose") is what that case is for.
+    if lowered in ("posts", "post"):
+        return ""
     return text
 
 

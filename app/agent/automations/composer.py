@@ -306,9 +306,13 @@ async def classify_change(
     if not result["applied"] and not result["needs"] \
             and not result["answer"]:
         result["answer"] = (
+            # `an account` is a banned phrase (CONTRACTS-R31 §4.4): every
+            # surface NAMES the account it means. This fallback knows no
+            # specific one — it is a menu of change categories — so it takes
+            # the plural, which is the string table's own noun.
             "I want to get this right — should that become a standing "
             "rule, a different time, a change to a step, or a change to "
-            "what an account may do?"
+            "what your accounts may do?"
         )
     return result
 

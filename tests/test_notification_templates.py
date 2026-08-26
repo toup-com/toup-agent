@@ -68,7 +68,12 @@ def test_failed_names_the_connector_and_offers_the_fix():
         "automation_run", _run(status="failed", failed_connector_name="GitHub")
     )
     assert body == (
-        "It could not finish — GitHub refused. Nothing was missed. "
+        # R31-07: "refused" is true of exactly one failure and wrong
+        # about the rest — expired access did not refuse, and neither
+        # did an organisation that has not approved Toup. run_summary
+        # carries the name but not the reason, so the body names the
+        # account and sends the user where the reason is written.
+        "It could not finish — GitHub needs you. Nothing was missed. "
         "Open the run and I will show you the fix."
     )
     # R31-07. This used to assert "an account refused" and call it

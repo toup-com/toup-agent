@@ -48,6 +48,9 @@ test_round4_reminders.py  # agent-mode: routines + users on the agent side, same
 test_round8_stuck_jobs.py  # agent-mode: build_jobs / job_events / agent_notify_outbox / messages are AGENT_ONLY — the end-to-end turn runs the REAL create_job/update_job against them
 test_voice_turn_jobs.py  # agent-mode: build_jobs / job_events / agent_notify_outbox / messages / conversations are AGENT_ONLY — the end-to-end voice turn opens a REAL job against them (test_job_titles.py is the pure half and stays in the platform sweep)
 test_r21_apps_files_memory.py  # agent-mode: user_files/user_folders/apps/build_jobs are AGENT_ONLY — it publishes a real app and then lists Files, which is the only way to see that the row is there on the NEXT listing rather than the one after the sync throttle
+test_r31_run_engine.py  # agent-mode: automations/automation_runs/automation_turns + messages are AGENT_ONLY — the partial-run tests drive the real executor against them
+test_r31_thread_isolation.py  # agent-mode: automation_threads/automation_turns are AGENT_ONLY — the whole point is that a thread turn is NOT a day-chat row, which needs both tables
+
 test_job_card_readers.py  # agent-mode: seeds a real voice turn (messages / conversations / day_chats / build_jobs, all AGENT_ONLY) and calls the three real history routes — the only honest proof a serializer does not leak its job marker (test_job_card_leak.py is the pure half and stays in the platform sweep)
 test_signup_hardening.py  # agent-mode
 test_subagent_context_isolation.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY); 8/8 green under agent, 3 of 4 platform failures were this lane and not staleness

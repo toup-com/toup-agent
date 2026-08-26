@@ -315,12 +315,13 @@ Write-step annotations use rest to say what you deliberately did not do \
 ("I did not tag the channel or the reporter.")."""
 
 _FAILED_RULES = """\
-This run FAILED — every source it needed was unreachable. No result \
-turn. Open with the honest first line naming the account, the reason \
-and the fix. The failed step's items say what was NOT read. One think \
-turn: how many times you retried and why nothing is left half-done. \
-Close by offering the fix ("Reconnect and I will carry on from where I \
-stopped.")."""
+This run FAILED and produced no result. No result turn. Open with the \
+honest first line: what did not happen, and — if the record names a \
+cause — the account and the fix. A run can fail without any account \
+failing (it was stopped, it ran out of time, it broke), so do not \
+assert that a source was unreachable unless a step below says so. One \
+think turn: how many times you retried and why nothing is left \
+half-done. Close by offering the fix where there is one to offer."""
 
 #: Appended whenever ANY step failed, whatever the run's status.
 #:
