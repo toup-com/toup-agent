@@ -228,38 +228,6 @@ def sanitize_for_client(text: Optional[str]) -> str:
         return ""
 
 
-def client_summary(result: object, cap: int = 200,
-                   tool_name: Optional[str] = None,
-                   is_skill_tool: bool = False) -> str:
-    """The one function the emit path calls: the tool's own sentence when it
-    has one, otherwise its redacted return value, capped.
-
-    ``tool_name`` (R30, D-17): the JSON pass-through above exists for
-    first-party tools whose payload the client parses structurally
-    (`create_job`'s job_id binds the card to its turn). A CONNECTOR tool's
-    JSON is a different animal — a vendor API response the client renders as
-    text, which is how ``{"site": "Toup", "is_last": true}`` became the
-    detail line "Site: Toup · Is last: true" on a founder's job sheet. When
-    the caller names a connector tool (``__`` in the wire name) and the tool
-    declared no ``display`` sentence, a JSON result serves as EMPTY — the
-    step's label carries the row, and the model still reads the full payload.
-
-    ``is_skill_tool``: "connector tool" was originally TESTED as ``"__" in
-    tool_name``, and SKILL tools are prefixed too — so a rule written for
-    vendor payloads silently swallowed every skill tool returning JSON
-    without a declared ``display``: `routines__remind`, `routines__create`,
-    `routines__list`, `triggers__list`. Not a cosmetic loss: the reminder
-    CARD is built client-side from this exact string
-    (`reminders.ts::remindersFromTools` parses
-    `{"status":"created","reminder":{…}}` out of it), and `routines__remind`
-    sits in the client's HIDDEN_TOOLS *because* the card is meant to BE its
-    rendering. Empty summary ⇒ no chip and no card, so a reminder the user
-    had just created rendered as a bare text bubble. `app_html__*` survived
-    only because it declares a `display` sentence and never reaches here.
-
-    A skill tool is first-party by construction — its payload is a shape
-    this repo defines, not a vendor's — so it keeps the JSON pass-through.
-    """
 BUILTIN_SKILL_PREFIXES: frozenset = frozenset({
     "app_builder", "app_html", "automations", "routines", "toup",
     "triggers",
@@ -297,6 +265,38 @@ def is_first_party_tool(tool_name: str, is_skill_tool: bool = False) -> bool:
     return name.split("__", 1)[0] in BUILTIN_SKILL_PREFIXES
 
 
+def client_summary(result: object, cap: int = 200,
+                   tool_name: Optional[str] = None,
+                   is_skill_tool: bool = False) -> str:
+    """The one function the emit path calls: the tool's own sentence when it
+    has one, otherwise its redacted return value, capped.
+
+    ``tool_name`` (R30, D-17): the JSON pass-through above exists for
+    first-party tools whose payload the client parses structurally
+    (`create_job`'s job_id binds the card to its turn). A CONNECTOR tool's
+    JSON is a different animal — a vendor API response the client renders as
+    text, which is how ``{"site": "Toup", "is_last": true}`` became the
+    detail line "Site: Toup · Is last: true" on a founder's job sheet. When
+    the caller names a connector tool (``__`` in the wire name) and the tool
+    declared no ``display`` sentence, a JSON result serves as EMPTY — the
+    step's label carries the row, and the model still reads the full payload.
+
+    ``is_skill_tool``: "connector tool" was originally TESTED as ``"__" in
+    tool_name``, and SKILL tools are prefixed too — so a rule written for
+    vendor payloads silently swallowed every skill tool returning JSON
+    without a declared ``display``: `routines__remind`, `routines__create`,
+    `routines__list`, `triggers__list`. Not a cosmetic loss: the reminder
+    CARD is built client-side from this exact string
+    (`reminders.ts::remindersFromTools` parses
+    `{"status":"created","reminder":{…}}` out of it), and `routines__remind`
+    sits in the client's HIDDEN_TOOLS *because* the card is meant to BE its
+    rendering. Empty summary ⇒ no chip and no card, so a reminder the user
+    had just created rendered as a bare text bubble. `app_html__*` survived
+    only because it declares a `display` sentence and never reaches here.
+
+    A skill tool is first-party by construction — its payload is a shape
+    this repo defines, not a vendor's — so it keeps the JSON pass-through.
+    """
     chosen = display_of(result)
     if chosen is None:
         chosen = sanitize_for_client(str(result))

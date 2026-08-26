@@ -92,10 +92,20 @@ async def day_tables():
 # writes day-stamped messages, it belongs here.
 SURFACE_CHANNELS = [
     "web", "app", "mobile", "extension", "telegram", "whatsapp",
-    # R28: the per-automation session thread writes day-stamped rows too —
-    # the agent is supposed to see what its automations did today.
-    "automation",
 ]
+
+# SUPERSEDED BY CONTRACTS-R31 §4.1, and deliberately kept as its own name so
+# the reversal is visible rather than a deletion.
+#
+# R28 listed `automation` among the surfaces that share the day context, on
+# the reasoning that "the agent is supposed to see what its automations did
+# today". R31 reverses it: an automation's conversation is its OWN thread and
+# must never be read back into the main chat. The R28 session path wrote those
+# turns as ordinary Messages carrying a real `day_chat_id`, so the loader's
+# channel predicate is what makes the isolation true on the READ side — the
+# founder's 26 August day chat had a thread's whole conversation in it, and
+# the agent answered it a second time there.
+EXCLUDED_FROM_DAY_CONTEXT = ["automation"]
 
 
 @pytest.mark.asyncio
@@ -129,7 +139,7 @@ async def test_all_surfaces_share_one_day_chat_context(day_tables):
 
         # Interleave the channels in time so a per-channel (rather than
         # per-day) loader would produce a visibly different order.
-        for i, ch in enumerate(SURFACE_CHANNELS):
+        for i, ch in enumerate(SURFACE_CHANNELS + EXCLUDED_FROM_DAY_CONTEXT):
             conv_id = str(uuid.uuid4())
             db.add(Conversation(
                 id=conv_id, user_id=user_id, channel=ch, day_chat_id=dc_id,
@@ -149,6 +159,12 @@ async def test_all_surfaces_share_one_day_chat_context(day_tables):
 
     contents = [m["content"] for m in ctx["messages"]]
     assert len(contents) == len(SURFACE_CHANNELS), contents
+
+    # §4.1, asserted POSITIVELY rather than by a count that happens to match:
+    # the automation row was written into this very day chat above, and the
+    # loader must not return it. A count-only check passes just as well when
+    # the loader drops the wrong row.
+    assert not any("automation" in c for c in contents), contents
 
     # Chronological, and each row carries ITS OWN channel tag — that tag
     # is the whole point of the shared window (the model has to know

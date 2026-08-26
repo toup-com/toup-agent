@@ -354,7 +354,16 @@ def test_debt_is_not_growing_silently():
     # routine_migration = 81 — the three sibling sessions' bumps raced
     # and two collapsed into one; 81 is the honest sum.)
     # R30-A ledger/workflow/notification suites: 81 + 3 = 84.
-    CEILING = 84
+    # R31: +2 for test_r31_run_engine.py and test_r31_thread_isolation.py —
+    # both create AGENT_ONLY tables (automations/automation_runs/
+    # automation_turns/automation_threads/messages) and drive the real
+    # executor and the real thread store against them. They RUN, in the
+    # agent-mode step; these are ROUTING entries, not excuses. They landed
+    # UNLISTED, which meant the platform sweep picked them up and they failed
+    # there with "no such table" — a mis-invocation, not a defect. Every
+    # session had run them with RUN_MODE unset, where they pass, and only the
+    # sweep chooses a mode.
+    CEILING = 86
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
