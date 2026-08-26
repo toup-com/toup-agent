@@ -346,3 +346,112 @@ async def test_a_day_chat_write_outside_the_sanctioned_keys_is_refused():
             )
     assert await _day_rows(uid) == []
     del aid
+
+
+# ── R31-18: the two back-fills ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rules_extracted_and_backfilled():
+    """`LINES IT WILL NOT CROSS 0` on an automation that states three.
+
+    `rules_json` had three writers and all three were the user typing
+    into the Rules sheet. Nothing ever read a constraint out of the
+    description the automation was created from, or out of the setup
+    conversation where the user said it — so the founder's Morning work
+    brief, whose own description says "post ONE line, no thread", opened
+    its Workflow with an empty Rules tab.
+    """
+    from app.agent.automations import workflow
+    from app.agent.automations.backfill_r31 import backfill_rules
+
+    uid = await _mk_user()
+    aid = await _mk_automation(uid, "Morning work brief")
+    async with async_session_maker() as db:
+        a = await db.get(Automation, aid)
+        a.description = ("Read unread Gmail and post one line in "
+                         "#all-toup — no thread, and only unread.")
+        await db.commit()
+
+    async with async_session_maker() as db:
+        plan = await backfill_rules(db, user_id=uid, dry_run=True)
+    assert plan["scanned"] == 1
+    assert plan["added"] >= 1, plan
+    # A dry run writes nothing.
+    async with async_session_maker() as db:
+        assert workflow.rules_list(await db.get(Automation, aid)) == []
+
+    async with async_session_maker() as db:
+        out = await backfill_rules(db, user_id=uid, dry_run=False)
+    assert out["added"] == plan["added"]
+
+    async with async_session_maker() as db:
+        rules = workflow.rules_list(await db.get(Automation, aid))
+    assert rules, "the back-fill recorded nothing"
+    assert all(r.get("text") for r in rules)
+
+    # Idempotent — running it twice adds nothing the second time, which
+    # is what makes it safe to re-run over a tenant whose first pass
+    # half-finished.
+    async with async_session_maker() as db:
+        again = await backfill_rules(db, user_id=uid, dry_run=False)
+    assert again["added"] == 0
+    async with async_session_maker() as db:
+        assert len(workflow.rules_list(
+            await db.get(Automation, aid))) == len(rules)
+
+
+@pytest.mark.asyncio
+async def test_thread_facts_rescoped():
+    """Five memory groups at `0 things` on an automation that has run
+    for days.
+
+    `curator_v2` files a thread-learned fact as `global` unless the
+    extraction model literally emits the word "automation", while the
+    Memory tab reads `scope == automation_id` exactly. So the facts an
+    automation learned in its own thread were invisible in its own
+    Memory tab.
+
+    The move is one-directional on purpose: `global → automation_id`
+    only, and only when the fact NAMES the automation. C's ambiguity
+    note is why — deleting an automation hard-deletes
+    `MemoryFact WHERE scope == automation_id`, so a fact wrongly
+    narrowed is destroyed rather than misfiled.
+    """
+    from app.db.models import MemoryFact
+    from app.agent.automations.backfill_r31 import rescope_thread_facts
+
+    uid = await _mk_user()
+    aid = await _mk_automation(uid, "Morning work brief")
+
+    async with async_session_maker() as db:
+        db.add(MemoryFact(
+            user_id=uid, domain="work", category="work_you_own",
+            scope="global", source="agent",
+            text="The Morning work brief should skip Dependabot noise.",
+            why="Said in setup",
+        ))
+        db.add(MemoryFact(
+            user_id=uid, domain="work", category="people",
+            scope="global", source="agent",
+            text="Marcus gets same-day answers.",
+            why="Said in setup",
+        ))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        out = await rescope_thread_facts(db, user_id=uid, dry_run=False)
+    assert out["moved"] == 1, out
+
+    async with async_session_maker() as db:
+        rows = list((await db.execute(
+            select(MemoryFact).where(MemoryFact.user_id == uid)
+        )).scalars())
+    by_scope = {r.scope for r in rows}
+    assert aid in by_scope, "the automation's own fact was not scoped to it"
+    assert "global" in by_scope, (
+        "a fact about the PERSON was narrowed — it would be destroyed "
+        "the day they delete this automation"
+    )
+    named = next(r for r in rows if r.scope == aid)
+    assert "Morning work brief" in named.text

@@ -1061,6 +1061,17 @@ async def proxy_resume_source(
         current_user=current_user, db=db)
 
 
+@router.post("/backfill")
+async def proxy_backfill(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R31-18 — rules + thread-fact scope back-fill."""
+    return await _proxy(request, "/backfill",
+                        current_user=current_user, db=db)
+
+
 @router.post("/cleanup-day-chat")
 async def proxy_cleanup_day_chat(
     request: Request,

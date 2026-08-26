@@ -285,3 +285,37 @@ def test_the_catch_up_branch_reads_the_bound():
     assert guard < fire, (
         "the staleness check must gate the reschedule, not follow it"
     )
+
+
+# ── R31-22: the setup card that said the run went fine ───────────────
+
+
+def test_the_setup_card_does_not_announce_a_completed_run():
+    """`notification_templates.notification_body` has no
+    `automation_setup` branch, so a setup card fell through its status
+    ladder to the completed-run line.
+
+    Measured: `notification_body("automation_setup", {})` returns "It
+    ran on time. Nothing needs you today — it is all there when you
+    want it." — on a card that exists precisely because setup has NOT
+    started. And because that string is non-empty, the A-owned fallback
+    was unreachable: the wrong answer won by being confident rather
+    than by being right.
+
+    A seam that cannot say "I have nothing for this kind" needs its
+    exceptions checked BEFORE it.
+    """
+    from app.agent.automations.run_v3 import _notification_body
+
+    body = _notification_body("automation_setup", {})
+    assert "ran on time" not in body, body
+    assert "Nothing needs you today" not in body, body
+    assert body.strip(), "a setup card with no body at all"
+
+    # And the ordinary run body is untouched — the guard must be a
+    # branch, not a replacement.
+    run = _notification_body("automation_run", {
+        "status": "completed", "vocabulary": "brief",
+        "needs_count": 0, "run_kind": "scheduled",
+    })
+    assert "ran on time" in run, run

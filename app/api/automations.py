@@ -1880,6 +1880,29 @@ class CleanupBody(BaseModel):
     apply: bool = False
 
 
+@router.post("/backfill")
+async def backfill_route(body: Optional[CleanupBody] = None):
+    """R31-18 — the two back-fills: rules, and thread-fact scope.
+
+    `rules_json` had three writers and all three were the user typing
+    into the Rules sheet, so an automation whose description says "post
+    ONE line, no thread" and whose steps say it again opened its
+    Workflow reading `LINES IT WILL NOT CROSS 0`.
+
+    And `curator_v2` files a thread-learned fact as `global` unless the
+    model literally says "automation", while the Memory tab reads
+    `scope == automation_id` exactly — so an automation that has run
+    for days showed five memory groups at `0 things`.
+
+    Dry run unless `apply` is true. Idempotent.
+    """
+    _flag_or_404()
+    from app.agent.automations.backfill_r31 import run_all
+    apply_it = bool(body.apply if body else False)
+    async with async_session_maker() as db:
+        return await run_all(db, user_id=_user_id(), dry_run=not apply_it)
+
+
 @router.post("/cleanup-day-chat")
 async def cleanup_day_chat_route(body: Optional[CleanupBody] = None):
     """§4.1's clean-up — move the leaked rows out of the day chat.

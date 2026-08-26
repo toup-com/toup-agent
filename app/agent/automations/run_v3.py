@@ -351,6 +351,32 @@ def _notification_body(kind: str, summary: dict) -> str:
     said = str(summary.get("user_message") or "").strip()
     if (summary.get("status") or "") == "skipped" and said:
         return said[:500]
+    # BEFORE the seam, for the same reason as the branch above.
+    #
+    # `notification_templates.notification_body` has no
+    # `automation_setup` branch, so a setup card falls through its
+    # status ladder to the COMPLETED-RUN line: measured,
+    # `notification_body("automation_setup", {})` returns "It ran on
+    # time. Nothing needs you today — it is all there when you want
+    # it." — on a card that exists precisely because setup has NOT
+    # started. And because that string is non-empty, the A-owned
+    # fallback below is unreachable, so the wrong answer wins by being
+    # confident rather than by being right.
+    #
+    # A seam that cannot say "I have nothing for this kind" needs its
+    # exceptions checked before it, not after. Flagged to C; this is
+    # the structural half.
+    if kind == "automation_setup":
+        try:
+            from .notification_templates import setup_card
+            card = setup_card()
+            if isinstance(card, dict) and card.get("body"):
+                return str(card["body"])[:500]
+            if isinstance(card, str) and card.strip():
+                return card[:500]
+        except Exception:  # noqa: BLE001
+            pass
+        return "Continue setting it up ›"
     try:
         from .notification_templates import notification_body
         body = notification_body(kind, summary)

@@ -945,6 +945,43 @@ class AutomationsSkill(Skill):
                                      automation_id=automation.id)
         except Exception:  # noqa: BLE001 — a repair, not a gate
             pass
+
+        # §4.10 / R31-22: a setup typed in the MAIN CHAT posts ONE
+        # `automation_setup` card there — and only that. The card is the
+        # user's way back to the thread where the rest of the setup
+        # happens; without it a conversation that created something has
+        # nothing on screen pointing at what it created.
+        #
+        # `run_v3.notify_setup` has existed since R30 with ZERO callers,
+        # which is why the founder's 11:51 "Set up the Replies drafted
+        # before you wake automation for me." produced setup questions
+        # in the main chat and no card and no automation. The other half
+        # of that defect is B's fallback and is fixed there; this is the
+        # half that was missing on the wire.
+        #
+        # Its own try/except: a missing card is a missing signpost, and
+        # an automation that exists without one is better than a create
+        # that raises after the row is committed.
+        try:
+            from app.agent.automations import ledger as _ledger
+            from app.agent.automations import run_v3 as _run_v3
+            from app.db.database import async_session_maker as _sm
+            from app.db.models import Automation as _Automation
+            async with _sm() as _db:
+                _thread = await _ledger.ensure_thread(
+                    _db, user_id=_uid(ctx), automation_id=automation.id,
+                )
+                _row = await _db.get(_Automation, automation.id)
+                if _row is not None and _thread is not None:
+                    await _run_v3.notify_setup(
+                        _db, automation=_row, thread_id=_thread.id,
+                    )
+        except Exception as e:  # noqa: BLE001 — see above
+            logger.warning(
+                "[automations] setup card skipped for %s: %s",
+                automation.id, e,
+            )
+
         return ToolResult(
             f"Created automation {automation.id!r} ({automation.name}) "
             f"as a DRAFT. Call automations__arm when the user is "
