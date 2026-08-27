@@ -718,9 +718,21 @@ async def test_done_writes_one_clean_chat_message(notify_calls, chat_writes):
 
 def test_read_paths_hide_autopilot_channel():
     """Historical raw tick rows are hidden at the two user-visible
-    read paths (no data migration needed)."""
+    read paths (no data migration needed).
+
+    R31 replaced the literal `!= "autopilot"` with the shared
+    HIDDEN_DAY_CHANNELS tuple, a strictly BROADER predicate (autopilot
+    + automation), so the contract this pin protects still holds. The
+    pin was written against the spelling, not the contract, so it went
+    red on a correct change — re-anchored on the tuple AND on autopilot
+    being in it, which is the thing that actually has to stay true.
+    """
     import inspect
     from app.api import day_chats, messages_recover
+    from app.db.models.conversation import HIDDEN_DAY_CHANNELS
 
-    assert inspect.getsource(day_chats).count('Conversation.channel != "autopilot"') == 2
-    assert 'Conversation.channel != "autopilot"' in inspect.getsource(messages_recover)
+    assert "autopilot" in HIDDEN_DAY_CHANNELS
+
+    pred = "Conversation.channel.notin_(HIDDEN_DAY_CHANNELS)"
+    assert inspect.getsource(day_chats).count(pred) == 2
+    assert pred in inspect.getsource(messages_recover)

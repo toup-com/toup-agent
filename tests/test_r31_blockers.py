@@ -411,3 +411,99 @@ async def test_the_migration_report_mirrors_the_migration():
             < run.index("twin = _find_twin(")), (
         "the migration tests the twin before enabled"
     )
+
+
+# ── R31-47: a shared constant with a use and no binding ──────────────
+
+
+def _unbound_uses_of(name: str) -> list:
+    """Every `app/` module that READS `name` without BINDING it.
+
+    Python resolves globals at call time, so a module can carry a use
+    with no import for as long as the line stays unexecuted. `tsc` has
+    no equivalent here and this repo runs no linter, so the only thing
+    that ever reports it is a test that happens to reach the line.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    offenders = []
+
+    for path in sorted(root.rglob("*.py")):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        if name not in src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:                              # pragma: no cover
+            continue
+
+        def bound_here(node) -> bool:
+            """Names this scope binds, WITHOUT descending into nested
+            scopes — a name bound in a sibling function is not in
+            scope here."""
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef, ast.Lambda)):
+                    # a `def name(): ...` binds it; the BODY is a
+                    # different scope, so do not descend.
+                    if getattr(child, "name", None) == name:
+                        return True
+                    continue
+                if isinstance(child, (ast.Import, ast.ImportFrom)):
+                    for a in child.names:
+                        if (a.asname or a.name.split(".")[0]) == name:
+                            return True
+                elif isinstance(child, ast.Name) and isinstance(
+                        child.ctx, (ast.Store, ast.Del)):
+                    if child.id == name:
+                        return True
+                elif isinstance(child, ast.arg) and child.arg == name:
+                    return True
+                if bound_here(child):
+                    return True
+            return False
+
+        def visit(node, scopes):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.Lambda, ast.ClassDef)):
+                    visit(child, scopes + [child])
+                    continue
+                if (isinstance(child, ast.Name)
+                        and isinstance(child.ctx, ast.Load)
+                        and child.id == name):
+                    if not any(bound_here(s) for s in scopes):
+                        offenders.append(
+                            f"{path.relative_to(root.parent)}:{child.lineno}")
+                visit(child, scopes)
+
+        visit(tree, [tree])
+
+    return sorted(set(offenders))
+
+
+def test_every_reader_of_the_hidden_channel_tuple_can_resolve_it():
+    """The defect, and the class it belongs to.
+
+    R31 (`b28d2cee`) swapped three day readers off the literal
+    `Conversation.channel != "autopilot"` and onto the shared
+    HIDDEN_DAY_CHANNELS tuple. Two of them gained the import;
+    `app/api/messages_recover.py` did not — so `GET /api/messages/since`
+    raised `NameError` and returned 500 on EVERY WebSocket reconnect,
+    which is the one path whose whole job is to recover the assistant
+    reply a dropped socket lost.
+
+    Nothing caught it for a day: the module imports fine (the name is
+    read at query-build time, not at import), the R31 pin that mentions
+    HIDDEN_DAY_CHANNELS reads a DIFFERENT module's source, and the CI
+    step that does execute the line runs only after the platform sweep
+    is green — which it wasn't, for an unrelated reason of mine.
+
+    `ruff` is pinned in requirements.txt and invoked by no workflow;
+    its F821 names this exact line. Until that is wired up, this is the
+    check: the tuple is shared across readers, so a rename sweeping
+    them again has to keep every binding.
+    """
+    assert _unbound_uses_of("HIDDEN_DAY_CHANNELS") == []

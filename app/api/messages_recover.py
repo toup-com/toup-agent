@@ -32,6 +32,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.db.models import User, Conversation, Message
+# The hidden-day-channel tuple is used in the tail query below.
+# R31 swapped three readers from a literal `!= "autopilot"` to this
+# shared tuple and this module kept the USE without the BINDING, so
+# every WS-reconnect recovery raised NameError -> 500 (CI's agent-mode
+# sweep was the only thing that ran the line).
+from app.db.models.conversation import HIDDEN_DAY_CHANNELS
 from app.api.auth import get_current_user
 from app.api.day_chats import (
     _serialize_admin_notice, _serialize_app_artifact, _serialize_attachments,
