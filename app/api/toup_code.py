@@ -37,7 +37,7 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Literal
+from typing import Any, AsyncIterator, Iterator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse

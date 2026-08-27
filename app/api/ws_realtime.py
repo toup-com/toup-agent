@@ -2590,10 +2590,17 @@ async def _finalize_onboarding(
 
             logger.info("[REALTIME] Pushed Identity records to VPS for user %s", user_id[:8])
 
+        # Names what this function actually wrote. It used to report
+        # `len(agent_memories)` / `len(user_memories)`, and the v3
+        # rewiring above deleted both lists while leaving the message —
+        # so EVERY successful finalize raised NameError here, was caught
+        # by the `except Exception` below, and told the model
+        # "Onboarding finalized with some issues". The success path had
+        # never once been reached. Post-v3 the unit is two Identity
+        # records, not a count of memories.
         return (
-            f"Onboarding finalized! Agent soul profile ({len(agent_memories)} memories) "
-            f"and user profile ({len(user_memories)} memories) saved to VPS. "
-            "The user will be redirected to the Hub."
+            "Onboarding finalized! The agent soul and the user profile "
+            "were saved. The user will be redirected to the Hub."
         )
 
     except Exception as e:

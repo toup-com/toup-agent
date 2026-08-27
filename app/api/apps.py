@@ -832,7 +832,7 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                         from app.agent.subagent_orchestrator import notify_job_needs_user
 
                         await notify_job_needs_user(
-                            job_id=job_id, label=title,
+                            job_id=job_id, label=req.title,
                             summary=_v.user_message or "Your agent needs your input.",
                             action_type=_v.required_action,
                         )

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 

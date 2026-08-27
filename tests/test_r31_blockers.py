@@ -413,97 +413,303 @@ async def test_the_migration_report_mirrors_the_migration():
     )
 
 
-# ── R31-47: a shared constant with a use and no binding ──────────────
+# ── R31-47: a use with no binding, anywhere in app/ ──────────────────
 
 
-def _unbound_uses_of(name: str) -> list:
-    """Every `app/` module that READS `name` without BINDING it.
+def _unbound_names(root=None) -> list:
+    """Every runtime name read in `app/` that nothing binds.
 
-    Python resolves globals at call time, so a module can carry a use
-    with no import for as long as the line stays unexecuted. `tsc` has
-    no equivalent here and this repo runs no linter, so the only thing
-    that ever reports it is a test that happens to reach the line.
+    Built on `symtable`, which IS CPython's own scope pass, so
+    comprehension scopes, class scopes, `global`/`nonlocal`,
+    `except ... as`, match captures and the walrus all come out right
+    without being modelled by hand. The first version of this guard DID
+    model them by hand and was wrong in both directions — silent on a
+    `TYPE_CHECKING`-only import (the exact class it exists to catch) and
+    noisy on comprehension targets and `global` writes.
+
+    Two things `symtable` cannot know, added here:
+      - a binding whose ONLY site is under `if TYPE_CHECKING:` does not
+        exist at runtime, though the compiler sees an import;
+      - `global NAME` + an assignment inside any function DOES create
+        the module global.
+
+    Deliberately blind to string annotations: `Mapped[List["Memory"]]`
+    is a string, not a name read, so SQLAlchemy's forward-ref idiom
+    produces nothing here. `ruff --select F821` reports 21 of those and
+    they are all noise for this question.
     """
     import ast
+    import builtins
     import pathlib
+    import symtable
 
-    root = pathlib.Path(__file__).resolve().parent.parent / "app"
-    offenders = []
+    BUILTINS = set(dir(builtins)) | {
+        "__file__", "__name__", "__doc__", "__package__", "__spec__",
+        "__loader__", "__builtins__", "__debug__", "__annotations__",
+    }
+    SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+              ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    COMPS = {ast.ListComp: "listcomp", ast.SetComp: "setcomp",
+             ast.DictComp: "dictcomp", ast.GeneratorExp: "genexpr"}
 
+    root = root or (pathlib.Path(__file__).resolve().parent.parent / "app")
+
+    def is_tc(test) -> bool:
+        return ((isinstance(test, ast.Name) and test.id == "TYPE_CHECKING")
+                or (isinstance(test, ast.Attribute)
+                    and test.attr == "TYPE_CHECKING"))
+
+    def kind(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return "function", node.name
+        if isinstance(node, ast.Lambda):
+            return "function", "lambda"
+        if isinstance(node, ast.ClassDef):
+            return "class", node.name
+        return "function", COMPS[type(node)]
+
+    def tables(st, out):
+        out.setdefault((st.get_type(), st.get_name(), st.get_lineno()), st)
+        for c in st.get_children():
+            tables(c, out)
+        return out
+
+    findings = []
     for path in sorted(root.rglob("*.py")):
         src = path.read_text(encoding="utf-8", errors="replace")
-        if name not in src:
-            continue
         try:
             tree = ast.parse(src)
-        except SyntaxError:                              # pragma: no cover
+            st = symtable.symtable(src, str(path), "exec")
+        except (SyntaxError, ValueError):        # pragma: no cover
             continue
 
-        def bound_here(node) -> bool:
-            """Names this scope binds, WITHOUT descending into nested
-            scopes — a name bound in a sibling function is not in
-            scope here."""
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                      ast.ClassDef, ast.Lambda)):
-                    # a `def name(): ...` binds it; the BODY is a
-                    # different scope, so do not descend.
-                    if getattr(child, "name", None) == name:
-                        return True
-                    continue
-                if isinstance(child, (ast.Import, ast.ImportFrom)):
-                    for a in child.names:
-                        if (a.asname or a.name.split(".")[0]) == name:
-                            return True
-                elif isinstance(child, ast.Name) and isinstance(
-                        child.ctx, (ast.Store, ast.Del)):
-                    if child.id == name:
-                        return True
-                elif isinstance(child, ast.arg) and child.arg == name:
-                    return True
-                if bound_here(child):
-                    return True
-            return False
+        for n in ast.walk(tree):
+            if isinstance(n, ast.If) and is_tc(n.test):
+                for c in ast.walk(n):
+                    c._tc = True
 
-        def visit(node, scopes):
+        tc, real = set(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                names = {(a.asname or a.name.split(".")[0]) for a in n.names}
+                (tc if getattr(n, "_tc", False) else real).update(names)
+        tc_only = tc - real
+
+        bound = {y.get_name() for y in st.get_symbols()
+                 if y.is_assigned() or y.is_imported()} - tc_only
+
+        def global_writes(t):
+            for y in t.get_symbols():
+                if y.is_global() and y.is_assigned():
+                    bound.add(y.get_name())
+            for c in t.get_children():
+                global_writes(c)
+        global_writes(st)
+
+        tbl = tables(st, {})
+
+        def visit(node, chain):
             for child in ast.iter_child_nodes(node):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
-                                      ast.Lambda, ast.ClassDef)):
-                    visit(child, scopes + [child])
+                if isinstance(child, SCOPES):
+                    visit(child, chain + [tbl.get((*kind(child), child.lineno))])
                     continue
                 if (isinstance(child, ast.Name)
                         and isinstance(child.ctx, ast.Load)
-                        and child.id == name):
-                    if not any(bound_here(s) for s in scopes):
-                        offenders.append(
-                            f"{path.relative_to(root.parent)}:{child.lineno}")
-                visit(child, scopes)
+                        and not getattr(child, "_tc", False)
+                        and child.id not in BUILTINS
+                        and child.id not in bound):
+                    # Walk OUTWARD. A name can be missing from the
+                    # innermost table entirely — the outer iterable of a
+                    # genexpr is evaluated in the ENCLOSING scope, so
+                    # `sum(x for x in self.items)` puts `self` in the
+                    # method's table and not the genexpr's. Reporting on
+                    # that KeyError instead of looking outward produced
+                    # 446 false positives, `self` first.
+                    for here in reversed(chain):
+                        if here is None:
+                            continue
+                        try:
+                            sym = here.lookup(child.id)
+                        except KeyError:
+                            continue
+                        if not (sym.is_local() or sym.is_free()
+                                or sym.is_assigned()):
+                            findings.append(
+                                f"{path.relative_to(root.parent)}:"
+                                f"{child.lineno} {child.id}")
+                        break
+                visit(child, chain)
 
-        visit(tree, [tree])
+        visit(tree, [st])
 
-    return sorted(set(offenders))
+    return sorted(set(findings))
 
 
-def test_every_reader_of_the_hidden_channel_tuple_can_resolve_it():
-    """The defect, and the class it belongs to.
+def test_nothing_in_app_reads_a_name_that_nothing_binds():
+    """The defect, and the whole class it belongs to.
 
     R31 (`b28d2cee`) swapped three day readers off the literal
     `Conversation.channel != "autopilot"` and onto the shared
-    HIDDEN_DAY_CHANNELS tuple. Two of them gained the import;
+    HIDDEN_DAY_CHANNELS tuple. Two gained the import;
     `app/api/messages_recover.py` did not — so `GET /api/messages/since`
-    raised `NameError` and returned 500 on EVERY WebSocket reconnect,
-    which is the one path whose whole job is to recover the assistant
+    raised `NameError` and answered 500 on EVERY WebSocket reconnect,
+    which is the one route whose whole job is recovering the assistant
     reply a dropped socket lost.
 
-    Nothing caught it for a day: the module imports fine (the name is
-    read at query-build time, not at import), the R31 pin that mentions
-    HIDDEN_DAY_CHANNELS reads a DIFFERENT module's source, and the CI
-    step that does execute the line runs only after the platform sweep
-    is green — which it wasn't, for an unrelated reason of mine.
+    Nothing caught it: the module imports fine (the name is read when
+    the query is built, not at import), the R31 pin that mentions the
+    tuple reads a DIFFERENT module's source, and the CI step that does
+    execute the line runs only after the platform sweep is green, which
+    it was not.
 
-    `ruff` is pinned in requirements.txt and invoked by no workflow;
-    its F821 names this exact line. Until that is wired up, this is the
-    check: the tuple is shared across readers, so a rename sweeping
-    them again has to keep every binding.
+    Widened from that one constant to every name in `app/` after the
+    narrow version was audited: three MORE live instances of the same
+    class were sitting in the tree, none of them R31's, and the narrow
+    guard could not see any of them —
+
+      - `toup_code.py` used `Optional` in two Pydantic models and never
+        imported it. `from __future__ import annotations` defers the
+        annotation, so the module imports clean and the model fails when
+        pydantic first builds it: **500 on POST /api/code/save-to-workspace**.
+        "It imports fine" is not a proof, which is the same sentence
+        this docstring already contained.
+      - `ws_realtime.py::_finalize_onboarding` returned an f-string over
+        `agent_memories` / `user_memories` that the memory-v3 rewiring
+        had deleted, so every SUCCESSFUL onboarding raised, was caught by
+        a bare `except Exception`, and reported
+        "finalized with some issues". The success path had never been
+        reached.
+      - `apps.py` passed `label=title` where every sibling line reads
+        `req.title`, inside a `try/except Exception: logger.debug`, so
+        the waiting-on-user Live Activity never fired.
+
+    All three are fixed. This asserts ZERO, with no baseline, so the
+    next one fails the build instead of hiding behind a swallow.
     """
-    assert _unbound_uses_of("HIDDEN_DAY_CHANNELS") == []
+    assert _unbound_names() == []
+
+
+def test_the_unbound_name_check_gets_python_scoping_right():
+    """The guard's own falsification, kept in the suite.
+
+    The first version of this check hand-rolled the scope rules and was
+    wrong in BOTH directions — it treated a `TYPE_CHECKING`-only import
+    as a real binding (silent on the very class it exists to catch) and
+    it treated a comprehension target and a `global` write as unbound.
+    A guard that models its subject has to prove the model.
+    """
+    import pathlib
+    import tempfile
+
+    cases = {
+        # name              source                                       reported?
+        "typechecking": ("from typing import TYPE_CHECKING\n"
+                         "if TYPE_CHECKING:\n    from foo import T\n"
+                         "def q():\n    return T\n", True),
+        "local_import": ("def q():\n    from foo import T\n    return T\n", False),
+        "comprehension": ("def q(xs):\n    return [T for T in xs]\n", False),
+        "class_body":   ("class K:\n    T = 1\n"
+                         "    def m(self):\n        return T\n", True),
+        "global_write": ("def s():\n    global T\n    T = 1\n"
+                         "def u():\n    return T\n", False),
+        "except_as":    ("def q():\n    try:\n        pass\n"
+                         "    except Exception as T:\n        return T\n", False),
+        "docstring":    ('def q():\n    """mentions T only in prose."""\n'
+                         "    return 1\n", False),
+        "closure":      ("def outer():\n    from foo import T\n"
+                         "    def inner():\n        return T\n"
+                         "    return inner\n", False),
+        "truly_absent": ("def q():\n    return T\n", True),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        pkg = pathlib.Path(d) / "app"
+        pkg.mkdir()
+        for name, (src, _) in cases.items():
+            (pkg / f"{name}.py").write_text(src)
+        got = _unbound_names(pkg)
+
+    hit = {f.split("/")[-1].split(".py")[0] for f in got}
+    for name, (_, should) in cases.items():
+        assert (name in hit) is should, (
+            f"{name}: expected {'a report' if should else 'silence'}, "
+            f"got {sorted(hit)}"
+        )
+
+
+def _unbound_annotation_names(root=None) -> list:
+    """Names used in an ANNOTATION that the module never binds.
+
+    A second instrument, because the first one structurally cannot see
+    this: under `from __future__ import annotations` the interpreter
+    never evaluates an annotation, so `symtable` records nothing and a
+    missing import is invisible to any scope analysis. Pydantic DOES
+    evaluate them — when it builds the model, on first use — which is
+    how `toup_code.py` used `Optional` in two models without importing
+    it, imported clean, registered its route clean, and answered **500
+    on POST /api/code/save-to-workspace**.
+
+    Reads only real `ast.Name` nodes, so a STRING forward reference is
+    invisible by design. That is the whole difference between this and
+    `ruff --select F821`, which resolves strings and therefore reports
+    20 `Mapped[List["Memory"]]`-shaped findings that are all correct
+    SQLAlchemy and none of them defects.
+    """
+    import ast
+    import builtins
+    import pathlib
+
+    KNOWN = set(dir(builtins)) | {"None", "True", "False"}
+    root = root or (pathlib.Path(__file__).resolve().parent.parent / "app")
+    out = []
+
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:                              # pragma: no cover
+            continue
+        bound = set()
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Import, ast.ImportFrom)):
+                bound |= {(a.asname or a.name.split(".")[0]) for a in n.names}
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                ast.ClassDef)):
+                bound.add(n.name)
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                bound.add(n.id)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.AnnAssign):
+                anns = [n.annotation]
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                a = n.args
+                anns = [x.annotation for x in
+                        (a.posonlyargs + a.args + a.kwonlyargs)] + [n.returns]
+            else:
+                continue
+            for ann in anns:
+                if ann is None:
+                    continue
+                for nm in ast.walk(ann):
+                    if (isinstance(nm, ast.Name)
+                            and isinstance(nm.ctx, ast.Load)
+                            and nm.id not in KNOWN and nm.id not in bound):
+                        out.append(
+                            f"{path.relative_to(root.parent)}:"
+                            f"{nm.lineno} {nm.id}")
+    return sorted(set(out))
+
+
+def test_no_annotation_names_a_module_never_imported():
+    """`toup_code.py`'s 500, and the reason the other guard missed it.
+
+    `project: Optional[str] = None` in a pydantic model, with
+    `Optional` absent from the line-40 `from typing import ...` and
+    `from __future__ import annotations` at the top. The module imports.
+    The router registers. `TypeAdapter` fails when pydantic first builds
+    the model, and the route answers 500 forever.
+
+    Found by the audit of the FIRST version of this guard, which had
+    been written for exactly this class of defect and could not see it —
+    the same shape as the pin that watched the wrong module. Asserts
+    zero, with no baseline.
+    """
+    assert _unbound_annotation_names() == []
