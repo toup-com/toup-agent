@@ -713,3 +713,112 @@ def test_no_annotation_names_a_module_never_imported():
     zero, with no baseline.
     """
     assert _unbound_annotation_names() == []
+
+
+# ── R31-48: two holes an audit found in R31's own pins ───────────────
+
+
+def test_every_promotion_to_db_ready_syncs_the_template_catalog():
+    """"No suggestions" for everyone, with nothing logged.
+
+    `automation_templates` is populated at boot by `sync_template_catalog`,
+    under `if app.state.db_ready:`. When the boot path finds the database
+    down it hands off to `_heal_db_schema`, which retries `init_db()` and,
+    on success, sets `db_ready = True` — and used to return. It never
+    synced. A replica that booted degraded and healed therefore served an
+    EMPTY catalog for its whole life, and `GET /api/automations/catalog`
+    returns every enabled template to every caller, so empty means every
+    user sees no suggestions at all. Nothing raises, nothing logs: the
+    heal prints a success line.
+
+    So the rule is about the STATE, not the function: every place that
+    promotes the app to ready must sync.
+    """
+    import ast
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "platform_main.py").read_text()
+    tree = ast.parse(src)
+
+    def sets_ready(node) -> bool:
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Assign):
+                continue
+            for t in n.targets:
+                if (isinstance(t, ast.Attribute) and t.attr == "db_ready"
+                        and isinstance(t.value, ast.Attribute)
+                        and t.value.attr == "state"):
+                    return True
+        return False
+
+    def calls_sync(node) -> bool:
+        return any(
+            isinstance(n, ast.Call) and (
+                (isinstance(n.func, ast.Name)
+                 and n.func.id == "_sync_template_catalog")
+                or (isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "_sync_template_catalog"))
+            for n in ast.walk(node)
+        )
+
+    promoters = [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and sets_ready(n)]
+    assert promoters, "nothing sets app.state.db_ready — did it move?"
+
+    missing = [n.name for n in promoters if not calls_sync(n)]
+    assert missing == [], (
+        f"these promote the app to db_ready without syncing the template "
+        f"catalog, so their replica serves an empty catalog: {missing}"
+    )
+
+
+def test_the_hidden_channel_readers_bind_the_canonical_tuple():
+    """The re-anchored pin's own hole, found by auditing it.
+
+    `test_read_paths_hide_autopilot_channel` matches the source TEXT
+    `Conversation.channel.notin_(HIDDEN_DAY_CHANNELS)` and checks
+    membership on the tuple the TEST imports. Mutation testing against
+    the real sources showed two ways to satisfy it while autopilot rows
+    are returned, neither of which existed when the predicate was an
+    inline literal:
+
+      - a reader rebinds `HIDDEN_DAY_CHANNELS = ("automation",)` locally
+      - a reader imports the name from a DIFFERENT module
+
+    Both are indirection, which is what the re-anchor introduced. Note
+    the shape is not hypothetical here: R31 shipped the opposite half of
+    it — a reader that used the name and imported it from nowhere.
+
+    So: every reader must import it from `app.db.models.conversation`
+    and none may rebind it.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "app"
+    CANON = "app.db.models.conversation"
+    NAME = "HIDDEN_DAY_CHANNELS"
+    bad = []
+
+    for path in sorted(root.rglob("*.py")):
+        src = path.read_text(encoding="utf-8", errors="replace")
+        if NAME not in src or path.name == "conversation.py":
+            continue
+        tree = ast.parse(src)
+        for n in ast.walk(tree):
+            if isinstance(n, ast.ImportFrom):
+                if any((a.asname or a.name) == NAME for a in n.names):
+                    if n.module != CANON:
+                        bad.append(f"{path.name}:{n.lineno} imports {NAME} "
+                                   f"from {n.module!r}, not {CANON!r}")
+            elif isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name) and t.id == NAME:
+                        bad.append(f"{path.name}:{n.lineno} rebinds {NAME}")
+            elif isinstance(n, ast.AnnAssign):
+                if isinstance(n.target, ast.Name) and n.target.id == NAME:
+                    bad.append(f"{path.name}:{n.lineno} rebinds {NAME}")
+
+    assert bad == [], "\n".join(bad)
