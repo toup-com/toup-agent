@@ -50,6 +50,8 @@ test_voice_turn_jobs.py  # agent-mode: build_jobs / job_events / agent_notify_ou
 test_r21_apps_files_memory.py  # agent-mode: user_files/user_folders/apps/build_jobs are AGENT_ONLY — it publishes a real app and then lists Files, which is the only way to see that the row is there on the NEXT listing rather than the one after the sync throttle
 test_r31_run_engine.py  # agent-mode: automations/automation_runs/automation_turns + messages are AGENT_ONLY — the partial-run tests drive the real executor against them
 test_r31_thread_isolation.py  # agent-mode: automation_threads/automation_turns are AGENT_ONLY — the whole point is that a thread turn is NOT a day-chat row, which needs both tables
+test_r31_thread_agent.py  # agent-mode: drives thread_agent against real automations/automation_threads/_turns/build_jobs rows — AGENT_ONLY every one
+
 
 test_job_card_readers.py  # agent-mode: seeds a real voice turn (messages / conversations / day_chats / build_jobs, all AGENT_ONLY) and calls the three real history routes — the only honest proof a serializer does not leak its job marker (test_job_card_leak.py is the pure half and stays in the platform sweep)
 test_signup_hardening.py  # agent-mode

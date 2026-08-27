@@ -1,4 +1,8 @@
-# agent-mode: account_health/automation_turns are AGENT_ONLY tables.
+# Runs in the ORDINARY platform sweep. It imports `account_health` and
+# reads its source, but creates no AGENT_ONLY rows — verified: 25 passed
+# under both RUN_MODE=platform and RUN_MODE=agent. It used to carry an
+# `# agent-mode` header naming tables it never writes, which would have
+# routed it out of the sweep on a claim that was not true.
 """R31 §4.4 / §4.7 / §4.10 — connector truth, copy, and the two writers.
 
 Pins:

@@ -363,7 +363,12 @@ def test_debt_is_not_growing_silently():
     # there with "no such table" — a mis-invocation, not a defect. Every
     # session had run them with RUN_MODE unset, where they pass, and only the
     # sweep chooses a mode.
-    CEILING = 86
+    # R31: +1 for test_r31_thread_agent.py — same reason as the two above,
+    # and added one commit AFTER they were, by writing `# agent-mode` as a
+    # comment at the top of the test FILE. That marker does nothing there;
+    # the sweep reads THIS file. The check below now catches that locally
+    # instead of spending a CI cycle on it.
+    CEILING = 87
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
@@ -385,3 +390,52 @@ if __name__ == "__main__":
             print(f"FAIL {t.__name__}: {e}")
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
+
+
+def test_the_agent_mode_marker_in_a_test_file_matches_this_list():
+    """A `# agent-mode` comment at the top of a test FILE does nothing.
+
+    The sweep reads COVERAGE_DEBT.txt and nothing else, so a file that
+    creates AGENT_ONLY tables and is not listed here gets run under
+    RUN_MODE=platform and fails with "no such table" — a mis-invocation
+    that looks exactly like a broken test.
+
+    This has now happened three times in one round: A's
+    test_r31_run_engine.py and test_r31_thread_isolation.py, and then
+    test_r31_thread_agent.py — added by the same person who had just
+    fixed the other two, by writing the marker in the file header where
+    it reads convincingly and means nothing.
+
+    Every occurrence cost a full CI cycle, because the only thing that
+    reports it is the sweep. This makes the two representations agree,
+    in both directions, in under a second:
+
+      marker in the file  ⇒  entry here
+
+    ONE direction only. The reverse was written first and is wrong: 44 of
+    the files routed here carry no header at all, because the marker has
+    always lived in this list and a header is an optional courtesy.
+    Asserting it would have edited 44 files to satisfy a convention nobody
+    adopted. The direction kept is the one that actually misroutes a test.
+    """
+    tests_dir = pathlib.Path(__file__).parent
+    listed = {
+        line.split("#")[0].strip()
+        for line in (tests_dir / "COVERAGE_DEBT.txt").read_text().splitlines()
+        if re.search(r"#\s*agent-mode", line) and not line.strip().startswith("#")
+    }
+    listed = {f for f in listed if f}
+
+    marked = set()
+    for path in sorted(tests_dir.glob("test_*.py")):
+        head = "\n".join(path.read_text().splitlines()[:3])
+        if re.search(r"#\s*agent-mode", head):
+            marked.add(path.name)
+
+    missing = sorted(marked - listed)
+    assert not missing, (
+        "these files carry a `# agent-mode` header and are NOT in "
+        f"COVERAGE_DEBT.txt, so the platform sweep will run them: {missing}"
+    )
+
+    # No reverse assertion — see the docstring.
