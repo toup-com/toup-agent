@@ -127,6 +127,14 @@ async def test_readout_reflects_the_allowlist_for_the_listed_caller():
 async def test_admin_put_allow_replaces_and_snapshots(client):
     admin = await _mk_user("admin")
     dev = await _mk_user()
+    # What this route must not do is move the PERCENTAGE. Read it first and
+    # compare, rather than asserting a literal 0: that literal was the
+    # ambient default, so this test went red the day automations launched —
+    # on a day the allowlist route had not changed at all. An assertion that
+    # inherits state is testing the state.
+    before = (await client.get(
+        "/api/admin/feature-flags/flag/automations", headers=admin["h"],
+    )).json()["rollout_pct"]
     r = await client.put(
         "/api/admin/feature-flags/flag/automations/allow",
         headers=admin["h"], json={"user_ids": [dev["id"]]},
@@ -135,7 +143,7 @@ async def test_admin_put_allow_replaces_and_snapshots(client):
     body = r.json()
     assert body["flag"] == "automations"
     assert body["allow_user_ids"] == [dev["id"]]
-    assert body["rollout_pct"] == 0
+    assert body["rollout_pct"] == before
     r = await client.get(
         "/api/admin/feature-flags/flag/automations", headers=admin["h"],
     )

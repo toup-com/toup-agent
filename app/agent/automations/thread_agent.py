@@ -149,9 +149,17 @@ async def _facts_for(db: AsyncSession, automation: Automation) -> list[dict]:
     """This automation's scoped facts plus the user's global ones."""
     try:
         from app.services import memory_v2_service as mem
-        return await mem.recall(
+        # `recall` answers {"facts": [...], "episodes": [...]} — a DICT. This
+        # returned it whole while the annotation said list[dict] and
+        # `_grounding` sliced it, so every past-tense question died on
+        # `KeyError: slice(None, 20, None)`. The annotation was the only thing
+        # that ever described the intent.
+        out = await mem.recall(
             db, user_id=automation.user_id, scope=automation.id, limit=20,
-        ) or []
+        ) or {}
+        if isinstance(out, dict):
+            return list(out.get("facts") or [])
+        return list(out or [])
     except Exception as e:  # noqa: BLE001 — memory is context, not a gate
         logger.debug("[thread_agent] recall skipped: %s", e)
         return []
@@ -271,16 +279,25 @@ async def open_question_run(
     if not accounts:
         return None
 
+    # `create_job` is keyword-only and takes no `db`; `job_type` and `title`
+    # are ITS arguments, not TaskSpec's, and TaskSpec has neither. This was
+    # `create_job(db, TaskSpec(title=..., job_type=...))` — wrong on all three
+    # counts, so every fresh-read question raised TypeError before it reached
+    # the model and the route replaced it with "Something went wrong
+    # answering that". Shaped after executor_v2's call, which is the one that
+    # has always worked.
     job = await JobRunner().create_job(
-        db,
-        TaskSpec(
+        job_type="automation_run",
+        spec=TaskSpec(
             user_id=user_id,
-            title=automation.name[:200],
-            prompt="(automation question)",
-            job_type="automation_run",
+            channel="automation",
             source_kind="automation",
             source_id=automation.id,
+            config_json={"question": True},
         ),
+        title=f"{automation.name}"[:100],
+        status="running",
+        layer=0,
     )
     await run_v3.open_run(
         db, automation=automation, job=job, kind="question",
