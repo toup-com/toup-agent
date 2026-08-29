@@ -110,6 +110,15 @@ _KNOWN_CHANNELS = frozenset({
     # automation / unattended (also in the dispatcher deny sets)
     "autopilot", "routine", "trigger", "heartbeat", "cron",
     "agent_task", "email_briefing", "background",
+    # R33: the automation THREAD's own agent turn. Named here on purpose
+    # rather than left to _UNKNOWN_CHANNEL_CLAMP: the clamp gave it the
+    # right policy (reads pass, mutating connectors deny) by accident,
+    # logged a warning on every tool call a thread ever made, and would
+    # have changed the thread's permissions silently the day the clamp
+    # target moved. The deny is kept explicitly in the dispatcher's
+    # unattended set — a thread question reads the automation's accounts
+    # and does not write to them (thread_agent's documented boundary).
+    "automation_thread",
     # internal orchestration turns — pass through so the dispatcher applies its
     # normal policy instead of being fail-closed-clamped (re-audit round 6 found
     # the round-5 clamp over-denied these, breaking their connector calls).

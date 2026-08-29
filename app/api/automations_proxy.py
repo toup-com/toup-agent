@@ -1101,6 +1101,17 @@ async def proxy_resume_source(
         current_user=current_user, db=db)
 
 
+@router.post("/purge-junk-facts")
+async def proxy_purge_junk_facts(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Round 33, item 6 — purge the curator's own failure reports."""
+    return await _proxy(request, "/purge-junk-facts",
+                        current_user=current_user, db=db)
+
+
 @router.post("/backfill")
 async def proxy_backfill(
     request: Request,

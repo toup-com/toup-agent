@@ -619,6 +619,48 @@ async def init_db():
         "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS builder_mode VARCHAR(10)",
         # Reconciliation log cleanup
         "DELETE FROM reconciliation_logs WHERE created_at < NOW() - INTERVAL '30 days'",
+        # ── Round 33, item 6: purge the curator's own failure reports ─────
+        # Curator v2 filed the AGENT's connector failures and third-party
+        # ticket states as facts about the USER, re-voiced in the second
+        # person ("You cannot read messages in GitHub because the org
+        # blocks Toup's GitHub access", "You stated that GitHub access is
+        # blocked"). The write gate refuses that class now
+        # (`curation_rules.refuse_reason` → agent_capability / item_status),
+        # but nothing removes the rows already written — and they are read
+        # back into every run and every thread answer, so a stale "you
+        # cannot read GitHub" keeps telling the agent GitHub is blocked
+        # after an owner has approved it. Purging is a correctness fix for
+        # the RUNS, not only for the screen.
+        #
+        # Every tenant's agent runs init_db on boot, so pushing this is how
+        # it reaches the fleet. Idempotent, and scoped to `source` values
+        # the CURATOR writes — a fact the user typed is never touched.
+        """
+        DELETE FROM memory_facts
+         WHERE source IN ('agent', 'told')
+           AND (
+                text ILIKE '%message-reading access%'
+             OR text ILIKE '%cannot read messages%'
+             OR text ILIKE '%cannot read inbox%'
+             OR text ILIKE '%needs re-authentication%'
+             OR text ILIKE '%OAuth app policy%'
+             OR text ILIKE '%blocks Toup%'
+             OR text ILIKE '%still To Do%'
+             OR text ILIKE '%last updated %'
+             OR text ~* 'you (cannot|can''t|do not have|don''t have) .{0,80}(access|permission|scope)'
+           )
+        """,
+        # The entities those facts minted — every one typed `person`,
+        # because the curator hardcoded the kind. A channel, a ticket and
+        # a repo are not people; the ones nothing points at any more go.
+        """
+        DELETE FROM memory_entities e
+         WHERE e.kind = 'person'
+           AND (e.name LIKE '#%' OR e.name LIKE '%/%' OR e.name ~ '^[A-Z]+-[0-9]+$')
+           AND NOT EXISTS (
+                SELECT 1 FROM memory_facts f WHERE f.subject_entity_id = e.id
+           )
+        """,
         # Job type classification (auto_builder, vibe_code, agent_task)
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS job_type VARCHAR(20) DEFAULT 'auto_builder'",
         # Backfill: existing rows without job_type get auto_builder

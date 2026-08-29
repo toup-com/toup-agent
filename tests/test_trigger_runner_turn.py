@@ -453,7 +453,12 @@ def test_suppress_tools_and_ephemeral_trigger_session_exist_in_runner():
     )
     src = inspect.getsource(AgentRunner._run_inner)
     assert "suppress_tools" in src and "shadow turn" in src
-    assert '== "trigger"' in src and "_ephemeral_session" in src, (
+    # Round 33: the rail widened from `== "trigger"` to a membership test,
+    # because an automation-thread turn needs it for the same reason (its
+    # record is the automation ledger, not `messages`). The INVARIANT is
+    # unchanged and is what this asserts: whatever shape the condition
+    # takes, a trigger turn still gets an ephemeral session.
+    assert '"trigger"' in src and "_ephemeral_session" in src, (
         "trigger turns lost the ephemeral-session rail — one litter "
         "Conversation row per fire (and per shadow fire) returns"
     )

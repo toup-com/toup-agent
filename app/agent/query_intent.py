@@ -180,6 +180,26 @@ TOOLS_SCHEDULING: FrozenSet[str] = frozenset({
 TOOLS_CODE_FULL: FrozenSet[str] = TOOLS_CODE | TOOLS_WEB | TOOLS_MEMORY | TOOLS_ADMIN
 TOOLS_WEB_FULL: FrozenSet[str] = TOOLS_WEB | TOOLS_MEMORY
 
+# ── What ANSWERS a question (round 33, item 2) ──────────────────────────
+# A `question` turn carried `frozenset()`, so its allowed set on iteration 0
+# was `_ALWAYS_INCLUDED_TOOLS` alone — memory, recall, navigate, spawn,
+# routines and (then) `automations__list`. `web_search` was not in it. So
+# "King Charles vs reza pahlavi" could reach the automations inventory and a
+# memory file but NOT the web, and it took what it was given: a guessed
+# `memory_read_file`, then `automations__list`, and only on the next
+# iteration a search.
+#
+# Deliberately NOT `TOOLS_WEB_FULL`: that carries `TOOLS_WORK_TRACKING`
+# (`create_job` / `update_job` / `start_mission`) and `browser`. A question
+# is not a do-something ask — handing it `create_job` is how a factual
+# question becomes a background job the user is not looking at, which is the
+# incident `prompt_profile.VOICE_DISABLED_TOOLS` is written about — and
+# `browser` drives a real headless session at tens of seconds per step for
+# something a search answers. Two tools and recall: read, and answer.
+TOOLS_QUESTION: FrozenSet[str] = frozenset({
+    "web_search", "web_fetch",
+}) | TOOLS_RECALL
+
 
 # ---------------------------------------------------------------------------
 # Intent result
@@ -485,6 +505,40 @@ def with_document_tools(intent: QueryIntent) -> QueryIntent:
     return replace(intent, tool_names=frozenset(intent.tool_names) | TOOLS_DOCGEN)
 
 
+# ── Automations: on the turn when the turn is about them ────────────────
+# ND-18 put `automations__list` in `_ALWAYS_INCLUDED_TOOLS` because "what
+# automations do I have?" classifies `question` and had no inventory tool.
+# That made it one of ten legal moves on iteration 0 of EVERY short
+# question, which is how a plain factual ask spent a round trip on the
+# automations inventory before it searched anything. Orthogonal, like the
+# document gate above: the word decides, not the category.
+#
+# Deliberately narrow — the NOUN, in the user's own words. "automate this"
+# and "set up an automation" match; "my morning routine" does not, because
+# that is a routine and `routines__*` is a different family the model gets
+# to confuse quite enough already.
+TOOLS_AUTOMATIONS: FrozenSet[str] = frozenset({
+    "automations__list",
+})
+
+_AUTOMATION_RE = re.compile(
+    r'\bautomations?\b|\bautomate[ds]?\b|\bautomating\b',
+    re.IGNORECASE,
+)
+
+
+def has_automation_intent(normalized: str) -> bool:
+    return bool(_AUTOMATION_RE.search(normalized or ""))
+
+
+def with_automation_tools(intent: QueryIntent) -> QueryIntent:
+    """Merge the automations inventory onto an intent whose text named it."""
+    if intent.category == "full":
+        return intent
+    return replace(intent,
+                   tool_names=frozenset(intent.tool_names) | TOOLS_AUTOMATIONS)
+
+
 # Short but meaningful messages that should NOT be classified as greetings
 _SHORT_BUT_MEANINGFUL_RE = re.compile(
     r'\b(?:delete|remove|cancel|stop|abort|undo|redo|reset|clear|wipe)\b'
@@ -510,7 +564,16 @@ INTENT_GREETING = QueryIntent(
 
 INTENT_QUESTION = QueryIntent(
     category="question",
-    tool_names=frozenset(),
+    # ── A question turn must be able to ANSWER a question (round 33) ────
+    # This was `frozenset()`, so a `question` turn's allowed set was
+    # `_ALWAYS_INCLUDED_TOOLS` alone — memory, recall, navigate, spawn,
+    # routines and (until this round) `automations__list`. `web_search`
+    # was NOT in it. So on iteration 0 of "King Charles vs reza pahlavi"
+    # the model's only legal moves were memory and automations, and it
+    # took them: a guessed `memory_read_file`, then `automations__list`,
+    # and only on the next iteration a web search. The observed sequence
+    # was the tool gate, not the model.
+    tool_names=TOOLS_QUESTION,
     include_skills=False,
     include_skill_prompts=False,
     include_environment=False,
@@ -620,9 +683,11 @@ def classify_query_intent(message: str) -> QueryIntent:
     # shortcuts: "yes pdf please" (first word a greeting, ≤4 words) is a
     # follow-up accepting an offered export, not a greeting.
     _doc = has_document_intent(normalized)
+    _auto = has_automation_intent(normalized)
 
     def _finish(intent: QueryIntent) -> QueryIntent:
-        return with_document_tools(intent) if _doc else intent
+        out = with_document_tools(intent) if _doc else intent
+        return with_automation_tools(out) if _auto else out
 
     # 1. Emoji-only messages
     if _EMOJI_ONLY_RE.match(stripped):
@@ -798,14 +863,16 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "routines__remind",
     "routines__create",
     "routines__list",
-    # ND-18: "what automations do I have?" classifies `question`, and
-    # `routines__list` was visible on those turns while the automations
-    # inventory was not — so the only list the model could reach was the
-    # wrong one, and it answered from reminders. Prompt wording cannot
-    # fix a tool that is not on the turn. Read-only, and the skill's own
-    # flag gate still applies at execution, so visibility bypasses
-    # nothing: a tenant without automations still has no such tool.
-    "automations__list",
+    # ND-18 put `automations__list` here — "what automations do I have?"
+    # classifies `question`, and the inventory tool was not on the turn.
+    # The fix was right about the problem and wrong about the layer:
+    # ALWAYS-included means always, so an inventory tool was one of the
+    # ten moves the model could make on iteration 0 of EVERY short
+    # question, and it took it — "King Charles vs reza pahlavi" called
+    # `automations__list` before it searched anything, twice on "give me
+    # my last 5 gmail". It is classified now instead (`_AUTOMATION_RE`
+    # below), so the family is on the turn when the turn is about
+    # automations and off it otherwise.
 })
 
 

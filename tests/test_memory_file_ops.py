@@ -596,11 +596,18 @@ async def test_load_brain_reads_the_three_files_plus_a_ranked_index():
     brain = await ops.load_brain(db, user_id, "how is the ielts exam prep going")
     assert brain.profile == "- uses an Android phone"
     assert brain.current_context == ""
-    assert [t for t, _ in brain.index] == ["Music", "IELTS"]     # section order
-    assert all(d for _, d in brain.index), "the index carries descriptions"
+    # Round 33: the index carries the SLUG too. Four prompt surfaces tell the
+    # model to "use the slug from the index" and it published titles only, so
+    # the model passed the title — `memory_read_file('Nariman HOSSEINI')` —
+    # and the refusal reached the user's screen.
+    assert [t for t, _, _ in brain.index] == ["Music", "IELTS"]  # section order
+    assert all(d for _, d, _ in brain.index), "the index carries descriptions"
+    assert all(sl and " " not in sl for _, _, sl in brain.index), (
+        "the index carries each file's slug, and a slug never has a space"
+    )
     assert [t for t, _ in brain.relevant] == ["IELTS"]           # query-ranked
     # The three always-injected files are never ALSO in the index.
-    assert "Profile" not in [t for t, _ in brain.index]
+    assert "Profile" not in [t for t, _, _ in brain.index]
 
 
 async def test_an_empty_file_is_not_advertised_in_the_index():

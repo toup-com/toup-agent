@@ -279,6 +279,13 @@ _SUBAGENT_PARAM_CALLERS = {
         "routes map the caller's `save` flag onto all three.",
     "app/agent/agent_runner.py":
         "The definition site; it forwards `prompt_profile` to itself.",
+    "app/agent/automations/thread_agent.py":
+        "Round 33: a thread turn is answered by the SAME loop the main chat "
+        "runs, and the automation ledger — not `messages` — is its record. "
+        "`save_user_message`/`save_assistant_message` are False because a "
+        "thread turn saved as a day-chat row is the R31 leak this module "
+        "exists to close, and `disable_post_processing` is what stops a "
+        "thread's connector failures being curated into the user's memory.",
 }
 
 

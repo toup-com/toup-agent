@@ -138,6 +138,12 @@ _MUTATES_UNATTENDED_DENY_CHANNELS = frozenset({
     # user's explicit per-tool ConnectorUserPreference allow still overrides,
     # same resolution order as autopilot.
     "subagent", "app_builder",
+    # The automation thread's agent turn (R33). The user IS present, but the
+    # thread reads the automation's accounts and does not write to them —
+    # thread_agent's boundary since R31 — so it keeps the deny it already had
+    # when mcp_auth clamped the unknown channel to "background". Listed with
+    # its real name so the policy is greppable rather than incidental.
+    "automation_thread",
 })
 
 

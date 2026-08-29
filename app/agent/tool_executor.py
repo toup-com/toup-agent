@@ -1869,9 +1869,24 @@ class ToolExecutor:
                 file = await memory_file_ops.get_file(db, self._current_user_id, slug)
 
             if file is None:
-                return (
-                    f"No memory file '{slug}'. The index in # User Brain "
-                    "lists every file that exists."
+                # ── The model's half and the person's half (round 33) ────
+                # This returned one bare string, and `client_summary` ships
+                # a tool's return value verbatim when it declares no
+                # `display` — so the user read
+                # "No memory file 'Nariman HOSSEINI'. The index in # User
+                # Brain lists every file that exists." on their own screen.
+                # A `display` sentence is the half a person sees; the model
+                # still gets the specifics, INCLUDING the real slug, which
+                # is what turns a wrong guess into one more call instead of
+                # a search. It stays un-prefixed on purpose: an absent file
+                # is an answer, not a failure (test_memory_tools_v3).
+                near = await self._nearest_memory_slug(slug)
+                hint = f" Did you mean '{near}'?" if near else ""
+                return ToolResult(
+                    f"No memory file '{slug}'.{hint} The index in "
+                    f"# User Brain lists each file's title AND its slug — "
+                    f"pass the slug.",
+                    display="Looked for a memory file — it isn’t there",
                 )
             head = f"# {file['title']} ({file['slug']})"
             if file.get("description"):
@@ -1888,6 +1903,38 @@ class ToolExecutor:
         except Exception as exc:
             logger.exception("memory_read_file failed")
             return f"ERROR: {exc}"
+
+    async def _nearest_memory_slug(self, wanted: str) -> Optional[str]:
+        """The slug whose TITLE the model most likely meant.
+
+        The `# User Brain` index published titles only while four prompt
+        surfaces told the model to "use the slug from the index", so it
+        passed the title — 'Nariman HOSSEINI' — and got a refusal. The
+        index carries slugs now; this makes the retry cost one call
+        rather than a search, for the many turns already in flight.
+        """
+        try:
+            from app.db.database import async_session_maker
+            from app.services import memory_file_ops
+            want = " ".join(str(wanted or "").lower().split())
+            if not want:
+                return None
+            async with async_session_maker() as db:
+                listed = await memory_file_ops.list_files(db, self._current_user_id)
+            # `list_files` answers {sections: [{section, files: [...]}]}.
+            rows = [f for sec in (listed or {}).get("sections") or []
+                    for f in sec.get("files") or []]
+            for r in rows or []:
+                title = " ".join(str(r.get("title") or "").lower().split())
+                if title and title == want:
+                    return str(r.get("slug") or "") or None
+            for r in rows or []:
+                title = " ".join(str(r.get("title") or "").lower().split())
+                if title and (want in title or title in want):
+                    return str(r.get("slug") or "") or None
+        except Exception:  # noqa: BLE001 — a hint never fails a tool
+            return None
+        return None
 
     # ------------------------------------------------------------------
     # 6. memory_store — "the user asked you to remember this" (v3 §2.1.3)
@@ -6933,10 +6980,23 @@ class ToolExecutor:
             refresh_if_started=bool(chat_id),
         )
 
-        return _json.dumps({
-            "job_id": job_id, "title": title, "steps": len(steps),
-            "job_type": job_type,
-        })
+        # ── An action's result may not be its own label (round 33) ────────
+        # `readableResult`'s object branch returns null by design (a
+        # prettified argument dump is still an argument), so this JSON has
+        # no readable form and the app's row fell back to `info.label` —
+        # "Setting up your task" expanding to "Setting up your task",
+        # guaranteed, every time. A `display` sentence is the shape the
+        # tool layer already has for exactly this.
+        _n = len(steps)
+        return ToolResult(
+            _json.dumps({
+                "job_id": job_id, "title": title, "steps": _n,
+                "job_type": job_type,
+            }),
+            display=(f"Opened “{title}” — {_n} step{'' if _n == 1 else 's'}"
+                     if title else f"Opened a task — {_n} step"
+                                   f"{'' if _n == 1 else 's'}"),
+        )
 
     async def _tool_update_job(self, inp: Dict[str, Any]) -> str:
         """Update an existing job's status and steps."""

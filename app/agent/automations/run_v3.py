@@ -264,6 +264,12 @@ async def _flip_head_note(
               "skipped": "ran"}.get(v3)
     if target is None:
         return
+    # A run that could not read one of its sources did not simply RAN —
+    # and the app's card already says so ("NEEDS YOU"). One status, one
+    # stamp: the thread agrees with the card rather than contradicting
+    # it two screens apart (round 33, item 4).
+    if v3 == "partial" and (ledger._cfg_of(job).get("failed_sources") or []):
+        target = "needs_you"
     rows = list(
         (await db.execute(
             select(AutomationTurn)
@@ -734,8 +740,13 @@ async def _notify_state(
         needs_count=needs, vocabulary=vocab,
         failed_connector_name=await _failed_connector(db, job),
     )
-    kind = "automation_needs_you" if v3 == "waiting_on_user" \
-        else "automation_run"
+    # A partial run with a broken source needs the user just as much as
+    # one waiting on an approval does — and only the `needs_you` kind
+    # reaches `notification_body`'s connector-naming branch, which is
+    # what puts "Jira needs you" on the card instead of a generic line.
+    kind = "automation_needs_you" if (
+        v3 == "waiting_on_user" or (v3 == "partial" and needs > 0)
+    ) else "automation_run"
     body = _notification_body(kind, summary)
 
     row = (
@@ -838,6 +849,15 @@ async def _needs_count(
             for g in (t.get("groups") or [])[:2]:
                 needs += len(g.get("rows") or [])
         elif t["kind"] in ("draft", "waiting"):
+            needs += 1
+        elif t["kind"] == "needs_you":
+            # ── A broken connector NEEDS YOU (round 33, item 4) ────────
+            # This counted brief rows, drafts and waiting turns and
+            # nothing else, so a run that wrote four needs-you cards
+            # scored zero — and `_brief_body` answers a zero with
+            # "Nothing needs you today — it is all there when you want
+            # it", which is what the founder's card said about a run
+            # that read nothing from any of its four accounts.
             needs += 1
     return needs, vocab
 

@@ -224,8 +224,21 @@ def test_no_skill_string_the_model_can_read_carries_a_banned_phrase(phrase):
 
 # ------------------------------------------------------------- §14
 
+# Round 33, item 2: the first alternative is the original — a posture that
+# fires on ORDINARY conversation ("before answering anything"). The two
+# added ones are the UNCONDITIONAL shape, which "ALWAYS call this before
+# proposing an automation" had in `automations__get_registry` while the
+# guard stayed green.
+#
+# Deliberately NOT widened to `before (creating|building|starting)`:
+# `routines__list` and `triggers__list` both say "check the list BEFORE
+# creating one", which is a scoped, correct instruction — it cannot fire
+# on a turn that is not already creating something. The rule is about
+# imperatives with no scope, not about the word "before".
 _PREEMPTIVE = re.compile(
-    r"\b(use (it|this) )?before (answering|doing|replying|responding)\b",
+    r"\b(use (it|this) )?before (answering|doing|replying|responding)\b"
+    r"|\balways call (this|it)\b"
+    r"|\bcall (this|it) first\b",
     re.I,
 )
 
@@ -341,10 +354,17 @@ def test_an_automations_inventory_ask_can_reach_the_automations_list():
     reminders were all it had.
     """
     from app.agent.query_intent import (
-        _ALWAYS_INCLUDED_TOOLS, classify_query_intent, filter_tools_by_intent,
+        classify_query_intent, filter_tools_by_intent, has_automation_intent,
     )
 
-    assert "automations__list" in _ALWAYS_INCLUDED_TOOLS
+    # Round 33: the MECHANISM moved, the invariant did not. ND-18 put
+    # `automations__list` in `_ALWAYS_INCLUDED_TOOLS`, which made an
+    # inventory tool reachable on every short question in the product —
+    # "King Charles vs reza pahlavi" called it before it searched anything.
+    # It is classified now, off the noun the user actually says, so the
+    # behavioural loop below is the whole test.
+    assert has_automation_intent("what automations do i have?")
+    assert not has_automation_intent("king charles vs reza pahlavi")
 
     tools = [{"name": n, "input_schema": {"type": "object"}}
              for n in ("automations__list", "routines__list",
@@ -404,7 +424,27 @@ def test_every_user_inventory_tool_is_reachable_on_a_question_turn():
     A new inventory tool therefore fails here on the day it is added,
     not on the day a user asks about it in four words.
     """
-    from app.agent.query_intent import _ALWAYS_INCLUDED_TOOLS
+    from app.agent.query_intent import (
+        _ALWAYS_INCLUDED_TOOLS, classify_query_intent, filter_tools_by_intent,
+    )
+
+    # Round 33: reachability is the rule, membership was only ever one way
+    # of getting it. A tool may be always-included OR classified off its own
+    # noun — the automations family is the latter now, because an inventory
+    # tool that is always on the turn gets CALLED on turns that are not
+    # about it. So the assertion is the one that matters: ask for the thing
+    # in four words, and the tool that answers must be reachable.
+    def _reachable(name: str, noun: str) -> bool:
+        if name in _ALWAYS_INCLUDED_TOOLS:
+            return True
+        defs = [{"name": name, "input_schema": {"type": "object"}}]
+        for ask in (f"what {noun} do i have?", f"list my {noun}",
+                    f"how many {noun} do i have?"):
+            intent = classify_query_intent(ask)
+            survivors = {t["name"] for t in filter_tools_by_intent(defs, intent)}
+            if name not in survivors:
+                return False
+        return True
 
     missing = []
     for skill in ALL_SKILLS:
@@ -420,7 +460,8 @@ def test_every_user_inventory_tool_is_reachable_on_a_question_turn():
                 continue  # not a list of the user's own things
             if name in _NOT_AN_INVENTORY:
                 continue
-            if name not in _ALWAYS_INCLUDED_TOOLS:
+            noun = name.split("__", 1)[0]
+            if not _reachable(name, noun):
                 missing.append(name)
     assert not missing, (
         "these tools answer 'what do I have' but a short question-intent "

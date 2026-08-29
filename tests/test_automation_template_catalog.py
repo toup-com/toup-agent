@@ -110,10 +110,18 @@ def test_flagship_morning_work_brief_pins(registry):
     assert isinstance(v, ValidatedSpecV2)
     reads = [st for st in v.steps if not st.mutates]
     writes = [st for st in v.steps if st.mutates]
-    # Five sources of news, every one skip-tolerant — a dead Jira must
-    # not kill the whole brief.
+    # Five sources of news, every one tolerant of a dead source — a dead
+    # Jira must not kill the whole brief.
+    #
+    # Round 33: `continue`, not `skip`. `skip` is the engine's SILENT mode:
+    # it substitutes the step's `empty_text` and writes no failure record,
+    # so a Gmail read that never happened was published as "Gmail inbox is
+    # clear." and the run reported nothing wrong. `continue` is the same
+    # tolerance with an account NAMED, a reason code, and a fix button —
+    # and it is the spec's own default for a read (spec_v2), which this
+    # template was overriding on every step.
     assert len(reads) == 5
-    assert all(st.on_error == "skip" for st in reads)
+    assert all(st.on_error == "continue" for st in reads)
     assert all(st.collect for st in reads)
     # Exactly one write, to Slack — mail is only ever READ here.
     assert len(writes) == 1 and writes[0].tool == "slack__send_message"

@@ -1,0 +1,345 @@
+{
+  "$fixture": "reason-strings",
+  "$owner": "R31-C",
+  "version": 1,
+  "$contract": "CONTRACTS-R31 §4.4 — the one `account_state × surface` string table. Shape conforms to the contract's published jsonc; the extra blocks below (`reason_codes`, `fix_buttons`, `names_join`, `run_meta`, `menu`) are additive and are what the wiring needs to pick a row.",
+  "$rule": "Every surface that names an account's state reads THIS file: the Connectors page, the connector sheet, the account sheet, the accounts picker, the workflow node caption, the home card meta, the run card label, the run sheet subtitle, the thread's needs-you card, the notification body and the ⋯ menu. A wires the verb dictionary to it and EDITS NO STRING; C owns every string here. Two surfaces that disagree is a defect with an owner, not a display quirk.",
+  "$slots": {
+    "$note": "This file holds TEMPLATES. The copy guard's brace ban (§4.3(7)) is a rule about RENDERED output, not about this file: a rendered string containing `{` or `}` is a defect (R31-25), and every slot below must be filled or its whole clause dropped. A slot no caller can fill must not appear here — that is exactly how `{need_count} needs you` reached a founder's screen, and how four more of the same class survived beside it.",
+    "Connector": "the connector's display name, in its own capitalisation (Gmail, Outlook, Slack, Jira, GitHub, Teams, Notion, Drive, Docs, Calendar)",
+    "capability": "the connector's capability phrase from `per_connector.<id>.capability`, lower case, e.g. 'read your mail'",
+    "last_use": "the verb dictionary's last-use phrase for this account ('Read your unread mail · 3 new threads')",
+    "t": "an app-formatted LOCAL time, no leading zero on the hour (8:02, 21:44). Never UTC, never ISO (R31-26).",
+    "names": "the failed accounts' display names, joined by `names_join`",
+    "A": "the first failed account's display name",
+    "B": "the second failed account's display name",
+    "LIST": "every failed account name but the last, joined with ', '",
+    "LAST": "the last failed account's display name",
+    "n": "a count",
+    "m": "a count",
+    "k": "a step number",
+    "channel": "a real channel name, as the user wrote it (#all-toup)"
+  },
+  "surfaces": [
+    "pill",
+    "home_meta",
+    "job_card_label",
+    "sheet_subtitle",
+    "thread_sentence",
+    "notification_body",
+    "button_label",
+    "menu_sub",
+    "card_stamp"
+  ],
+  "states": {
+    "connected": {
+      "fix": null,
+      "tone": "success",
+      "pill": "Connected",
+      "home_meta": null,
+      "job_card_label": null,
+      "sheet_subtitle": "Last use · {last_use}",
+      "$sheet_subtitle_requires": "`last_use`. With no value the clause drops and the row reads a bare 'Last use', which is a label with nothing after it — a caller that cannot supply the phrase should draw nothing here rather than the label alone.",
+      "thread_sentence": null,
+      "notification_body": null,
+      "button_label": null,
+      "menu_sub": null,
+      "card_stamp": null,
+      "workflow_caption": "Connected",
+      "picker_caption": "Connected"
+    },
+    "expired": {
+      "fix": "reconnect",
+      "tone": "warning",
+      "pill": "Needs reconnecting",
+      "home_meta": "{Connector} needs you",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Needs reconnecting · the access you gave it ran out",
+      "thread_sentence": "I could not read {Connector} — the access you gave me ran out. Reconnect it below and I will pick up from there.",
+      "notification_body": "{Connector} access ran out, so it stopped where it was. Reconnect and it picks up from there.",
+      "button_label": "Reconnect",
+      "menu_sub": "The access you gave {Connector} ran out.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Needs reconnecting",
+      "picker_caption": "Needs reconnecting"
+    },
+    "revoked": {
+      "fix": "reconnect",
+      "tone": "warning",
+      "pill": "Needs reconnecting",
+      "home_meta": "{Connector} needs you",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Needs reconnecting · its connection to Toup was removed",
+      "thread_sentence": "I could not read {Connector} — its connection to Toup was removed. Reconnect it below and I will pick up from there.",
+      "notification_body": "{Connector}'s connection to Toup was removed, so it stopped where it was. Reconnect and it picks up from there.",
+      "button_label": "Reconnect",
+      "menu_sub": "{Connector}'s connection to Toup was removed.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Needs reconnecting",
+      "picker_caption": "Needs reconnecting"
+    },
+    "scope_missing": {
+      "fix": "grant",
+      "tone": "warning",
+      "pill": "Needs more access",
+      "home_meta": "{Connector} needs you",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Needs more access · it cannot {capability} yet",
+      "thread_sentence": "I could not read {Connector} — this connection cannot {capability} yet. Grant that below and I will pick up from there.",
+      "notification_body": "{Connector} needs one more permission before it can read. Grant it and it picks up from there.",
+      "button_label": "Grant access",
+      "menu_sub": "{Connector} cannot {capability} yet.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Needs more access",
+      "picker_caption": "Needs more access"
+    },
+    "org_approval_needed": {
+      "fix": "approve",
+      "tone": "danger",
+      "pill": "Waiting for the organisation",
+      "home_meta": "{Connector} needs you",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Waiting for the organisation to approve Toup",
+      "thread_sentence": "I could not read {Connector} — the organisation has not approved Toup yet. An owner can approve it from the button below, and I will pick up from there.",
+      "notification_body": "{Connector} is waiting for the organisation to approve Toup. An owner can approve it, and it picks up from there.",
+      "button_label": "Approve in {Connector}",
+      "menu_sub": "The organisation has not approved Toup in {Connector} yet.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Waiting for the organisation",
+      "picker_caption": "Waiting for the organisation",
+      "button_label_after_tap": "I approved it",
+      "pending_pill": "Waiting for the organisation",
+      "$two_buttons": "The card shows `button_label` until the user taps it, then `button_label_after_tap` beside `pending_pill` — the approval happens in the vendor's UI, so the only thing our card can do afterwards is offer to look again (§4.4 `probe {force: true}`)."
+    },
+    "not_connected": {
+      "fix": "connect",
+      "tone": "warning",
+      "pill": "Not connected",
+      "home_meta": "{Connector} needs you",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Not connected",
+      "thread_sentence": "I could not read {Connector} — it is not connected yet. Connect it below and I will pick up from there.",
+      "notification_body": "{Connector} is not connected yet. Connect it and it picks up from there.",
+      "button_label": "Connect",
+      "menu_sub": "{Connector} is not connected.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Not connected",
+      "picker_caption": "Not connected"
+    },
+    "needs_check": {
+      "fix": "check",
+      "tone": "warning",
+      "pill": "Needs a check",
+      "home_meta": "{Connector} needs a look",
+      "job_card_label": "Could not read {Connector}",
+      "sheet_subtitle": "Could not be read — the reason is not clear yet",
+      "thread_sentence": "I could not read {Connector}, and it did not tell me why. Check it below and I will pick up from there.",
+      "notification_body": "{Connector} could not be read and did not say why. Check it and it picks up from there.",
+      "button_label": "Check it",
+      "menu_sub": "{Connector} could not be read, and did not say why.",
+      "card_stamp": "NEEDS YOU",
+      "workflow_caption": "Needs a check",
+      "picker_caption": "Needs a check"
+    }
+  },
+  "state_aliases": {
+    "$note": "`account_health` (§4.4) emits the six-value vocabulary above. An older producer, `workflow._account_entry`, still emits its own three — `connected | expired | missing` — and `missing` has no row of its own here. A consumer that meets a value it does not recognise must resolve it through this map rather than render a blank: a blank is the state a user cannot act on, and it looks identical to a state nobody has checked.",
+    "missing": "not_connected",
+    "reauth_required": "expired",
+    "provider_down": "connected"
+  },
+  "forms": {
+    "could_not_reach_1": "Could not reach {A}",
+    "could_not_reach_2": "Could not reach {A} and {B}",
+    "could_not_reach_n": "Could not reach {LIST} and {LAST}",
+    "missing_from_this_1": "{A} is missing from this — I could not read it.",
+    "missing_from_this_2": "{A} and {B} are missing from this — I could not read them.",
+    "missing_from_this_n": "{LIST} and {LAST} are missing from this — I could not read them.",
+    "checked_1": "Checked 1 account",
+    "checked_n": "Checked {n} accounts",
+    "tried_name_needs_you": "Tried {t} · {A} needs you",
+    "tried_name_did_not_finish": "Tried {t} · {A} did not finish",
+    "tried_names_need_you": "Tried {t} · {names} need you",
+    "tried_did_not_finish": "Tried {t} · it did not finish",
+    "ran_n_of_m": "Ran {t} · {n} of {m} accounts · needs you",
+    "ran_brief_not_posted": "Ran {t} · brief not posted · needs you",
+    "ran_m_accounts": "Ran {t} · {m} accounts touched",
+    "ran_1_account": "Ran {t} · 1 account touched",
+    "paused_ran_once": "Paused · ran once {t}",
+    "paused_at_step": "Paused at step {k}",
+    "start_it_over": "Start it over — the stopped run is dropped.",
+    "running_now": "It is running now — step {k} of {n}.",
+    "waiting_org_full": "Waiting for the organisation to approve Toup",
+    "waiting_org_short": "Waiting for the organisation",
+    "needs_reconnecting": "Needs reconnecting",
+    "reconnected_just_now": "Reconnected just now",
+    "just_added": "Just added",
+    "working_now": "Working now",
+    "paused": "Paused",
+    "needs_you_stamp": "NEEDS YOU",
+    "started_stamp": "STARTED",
+    "ran_stamp": "RAN",
+    "tried_stamp": "TRIED"
+  },
+  "$forms_notes": {
+    "could_not_reach_n": "R31-07: every name, at ANY count — three names read 'Could not reach A, B and C'. The R30 branch returned the literal `Could not reach an account`, on a card whose entire job is to say who. A run whose `accounts_failed` is empty may never wear any of these.",
+    "missing_from_this_n": "§4.2a — the honest line a PARTIAL brief owes INSIDE the brief, which is a different surface from the run card's label and needs a different sentence. `Could not reach GitHub and Outlook` is a label: it names a state. Inside a brief the user is reading findings, and what they need to know is that the findings are incomplete and why — so it leads with the absence and says it in the first person, because the brief is the agent talking. A partial brief that omits this line is the worst of the three outcomes: it reads as complete.",
+    "tried_did_not_finish": "The drain / cap / crash row of §4.2 — the ONLY meta that may omit a name, because no account failed. Everything else names one.",
+    "tried_name_needs_you": "The singular. `{names} need you` reads 'Gmail need you' at n=1, one row above a card that says 'Gmail needs you' — the review_only rule about singularised counts, in the place it is most visible. A picks this form when exactly one account failed.",
+    "tried_name_did_not_finish": "For a TRANSIENT failure, where `needs you` would be wrong. A rate limit or a timeout leaves the account `connected` (R31-13), so a home card reading 'Gmail needs you' beside a pill reading 'Connected' is the E-27 shape this round exists to kill — two surfaces disagreeing about the same account. Nothing about the account needs the user; the RUN can be tried again, and the button says so.",
+    "running_now": "Replaces `Already running — step 0 of 5`, which was shown for a run the user had STOPPED (E-25). Only a genuinely running run disables Run it now.",
+    "paused_at_step": "R31-30. A stopped run reads this, with Resume beside it.",
+    "just_added": "R31-32. Only until the first run. An automation that has run for days is not just added.",
+    "card_stamps": "R31-29. `STARTED` while running, `RAN` on completion, `TRIED` on failure, `NEEDS YOU` for partial and waiting_on_user. In the THREAD a partial run's own note stays `RAN` (R30 §3.4) — it ran, and it says underneath what it could not reach. Only the main-chat card flips."
+  },
+  "names_join": {
+    "$note": "How `{names}` is built from the failed accounts.",
+    "one": "{A}",
+    "two": "{A} and {B}",
+    "many": "{LIST} and {LAST}",
+    "$many_note": "`LIST` is every name but the last, joined with ', ' — so three names read 'A, B and C'."
+  },
+  "reason_codes": {
+    "$note": "Every failure carries a reason_code. `state` is the account_state it derives, `fix` the button it earns. A TRANSIENT reason keeps the account `connected` (R31-13) — the connection is fine, the moment was not — and earns `Try again`. A non-transient reason may NEVER leave any surface reading `Connected`.",
+    "$sheet_detail_note": "`sheet_detail` is the RUN ROW's detail, rendered by the verb dictionary, which knows only the connector's `{Connector}` — so it carries no other slot. The connector sheet's own subtitle lives in `states[*].sheet_subtitle` and may name the capability, because that surface knows which connector it is drawing. Two surfaces, two renderers, one meaning; a slot only one of them can fill belongs only to that one (R31-25).",
+    "token_expired": {
+      "state": "expired",
+      "fix": "reconnect",
+      "transient": false,
+      "sheet_detail": "access expired"
+    },
+    "token_revoked": {
+      "state": "revoked",
+      "fix": "reconnect",
+      "transient": false,
+      "sheet_detail": "the connection was removed"
+    },
+    "scope_missing": {
+      "state": "scope_missing",
+      "fix": "grant",
+      "transient": false,
+      "sheet_detail": "it does not have that access yet",
+      "$scope_slot": "the wire carries `scope_missing:{scope}`; the scope id never reaches a sentence — it selects `per_connector.<id>.capability`, which the connector sheet names and the run row does not."
+    },
+    "org_approval_needed": {
+      "state": "org_approval_needed",
+      "fix": "approve",
+      "transient": false,
+      "sheet_detail": "the organisation has not approved Toup"
+    },
+    "rate_limited": {
+      "state": "connected",
+      "fix": "retry",
+      "transient": true,
+      "sheet_detail": "{Connector} asked me to slow down",
+      "button_label": "Try again",
+      "thread_sentence": "I could not finish reading {Connector} — it asked me to slow down. Try again below and I will pick up from there.",
+      "job_card_label": "Could not read {Connector}",
+      "home_meta": "{Connector} did not finish"
+    },
+    "vendor_down": {
+      "state": "connected",
+      "fix": "retry",
+      "transient": true,
+      "sheet_detail": "it did not answer",
+      "button_label": "Try again",
+      "thread_sentence": "I could not read {Connector} — it did not answer. Try again below and I will pick up from there.",
+      "job_card_label": "Could not read {Connector}",
+      "home_meta": "{Connector} did not finish"
+    },
+    "timeout": {
+      "state": "connected",
+      "fix": "retry",
+      "transient": true,
+      "sheet_detail": "it did not answer in time",
+      "button_label": "Try again",
+      "thread_sentence": "I could not read {Connector} — it did not answer in time. Try again below and I will pick up from there.",
+      "job_card_label": "Could not read {Connector}",
+      "home_meta": "{Connector} did not finish"
+    },
+    "unknown_error": {
+      "state": "needs_check",
+      "fix": "check",
+      "transient": false,
+      "sheet_detail": "the reason is not clear yet",
+      "button_label": "Check it",
+      "thread_sentence": "I could not read {Connector}, and it did not tell me why. Check it below and I will pick up from there.",
+      "job_card_label": "Could not read {Connector}",
+      "home_meta": "{Connector} needs a look"
+    }
+  },
+  "fix_buttons": {
+    "$note": "One entry point for all four callers (§4.4): the thread's needs-you card, the run card's per-account line (E-1), the home card action and the Connectors page.",
+    "reconnect": "Reconnect",
+    "grant": "Grant access",
+    "approve": "Approve in {Connector}",
+    "connect": "Connect",
+    "retry": "Try again",
+    "check": "Check it"
+  },
+  "menu": {
+    "$note": "The ⋯ menu's rows and their sub-lines.",
+    "run_now_enabled_sub": null,
+    "run_now_after_stop_sub": "Start it over — the stopped run is dropped.",
+    "run_now_disabled_sub": "It is running now — step {k} of {n}.",
+    "resume_sub": "It picks up from step {k}.",
+    "paused_run_now_sub": "It runs once and stays paused.",
+    "delete_writes": "What it already posted in {channel} stays.",
+    "delete_drafts": "Drafts it already wrote stay in {Connector}.",
+    "delete_no_writes": "Nothing it wrote is touched.",
+    "$delete_note": "R31-38: derived from the automation's actual write targets, never a fixed sentence. An automation whose only write is a Slack post may not claim drafts stay in Gmail."
+  },
+  "per_connector": {
+    "$note": "`capability` is the phrase a scope-missing sentence uses, lower case. A nested state key overrides that state's strings for this connector only.",
+    "gmail": {
+      "display": "Gmail",
+      "capability": "read your mail"
+    },
+    "outlook": {
+      "display": "Outlook",
+      "capability": "read your mail"
+    },
+    "slack": {
+      "display": "Slack",
+      "capability": "read your messages"
+    },
+    "jira": {
+      "display": "Jira",
+      "capability": "read your board"
+    },
+    "github": {
+      "display": "GitHub",
+      "capability": "read your repositories",
+      "org_approval_needed": {
+        "button_label": "Approve in GitHub",
+        "menu_sub": "An owner has not approved Toup in your GitHub organisation yet.",
+        "thread_sentence": "I could not read GitHub — the organisation has not approved Toup yet. An owner can approve it from the button below, and I will pick up from there."
+      }
+    },
+    "teams": {
+      "display": "Teams",
+      "capability": "read your messages"
+    },
+    "notion": {
+      "display": "Notion",
+      "capability": "read your pages"
+    },
+    "drive": {
+      "display": "Drive",
+      "capability": "read your files"
+    },
+    "docs": {
+      "display": "Docs",
+      "capability": "read your documents"
+    },
+    "calendar": {
+      "display": "Calendar",
+      "capability": "read your calendar"
+    },
+    "stub": {
+      "display": "the test feed",
+      "capability": "read the test feed"
+    }
+  },
+  "$narration_rule": "The agent quotes `thread_sentence` VERBATIM and adds at most one sentence of its own (§4.4). It never paraphrases a reason: the reason is the one fact the user cannot check, and a paraphrase of 'the organisation has not approved Toup' that comes out as 'GitHub refused' sends them to fix the wrong thing."
+}

@@ -430,11 +430,31 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             .where(AutomationThread.automation_id == a.id)
         )).scalar_one_or_none()
 
+        # ── `last_outcome`: the app's whole fix path needs a run id ──────
+        # Round 33, item 4. The app models this field completely
+        # (`LastOutcome`), reads it for the thread's "Try again"
+        # (`runFix({runId: summary?.last_outcome?.run_id})`), for
+        # "Run again" and for the org-approval re-probe — and nothing
+        # here has ever emitted it. `runFix` early-returns without a run
+        # id, which is exactly why tapping the button did nothing at
+        # all: no request, no spinner, no error.
+        last_cfg = ledger._cfg_of(last) if last is not None else {}
+        last_outcome = None if last is None else {
+            "run_id": last.id,
+            "status": v3,
+            "at": (last.completed_at or last.created_at).isoformat() + "Z"
+            if (last.completed_at or last.created_at) else None,
+            "accounts_touched": last_cfg.get("accounts_touched") or [],
+            "accounts_failed": last_cfg.get("accounts_failed") or [],
+            "failed_sources": last_cfg.get("failed_sources") or [],
+        }
+
         items.append({
             "id": a.id,
             "title": a.name,
             "status": status,
             "pill": pill,
+            "last_outcome": last_outcome,
             "description": _description_of(a, status, raw, expired_name),
             "accounts": accounts,
             "meta": meta,

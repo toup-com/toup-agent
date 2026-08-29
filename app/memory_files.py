@@ -428,11 +428,23 @@ HEADING_LEARNED = "## Learned (how to work with this user)"
 HEADING_INDEX = "## Memory files"
 
 
-def index_line(title: str, description: Optional[str]) -> str:
-    """One line of the file index. The description IS the signal — round
-    8's index dropped it, so the model had a list of filenames and no
-    reason to open any."""
-    return f"- {title} — {description}" if description else f"- {title}"
+def index_line(
+    title: str, description: Optional[str], slug: Optional[str] = None,
+) -> str:
+    """One line of the file index.
+
+    The description IS the signal — round 8's index dropped it, so the
+    model had a list of filenames and no reason to open any.
+
+    The SLUG is the address (round 33, item 2). Four prompt surfaces tell
+    the model to "use the slug from the index" and the index published
+    titles only, so it passed the title: `memory_read_file('Nariman
+    HOSSEINI')` — a space, which `is_valid_slug` rejects — and the user
+    read the refusal on their screen. The real slug is
+    `people/nariman-hosseini`, and it was never shown to anybody.
+    """
+    head = f"- {title}" if not slug else f"- {title} ({slug})"
+    return f"{head} — {description}" if description else head
 
 
 def render_user_brain(
@@ -440,7 +452,7 @@ def render_user_brain(
     profile_body: str = "",
     current_context_body: str = "",
     learned_body: str = "",
-    index: Sequence[Tuple[str, Optional[str]]] = (),
+    index: Sequence[Tuple[str, ...]] = (),
     relevant: Sequence[Tuple[str, str]] = (),
     cap_profile: int = CAP_PROFILE,
     cap_current_context: int = CAP_CURRENT_CONTEXT,
@@ -468,7 +480,12 @@ def render_user_brain(
         )
     if (learned_body or "").strip():
         parts.append(f"{HEADING_LEARNED}\n{truncate_body(learned_body.strip(), cap_learned)}")
-    lines = [index_line(t, d) for t, d in list(index)[:max_index]]
+    # Tolerates both shapes: (title, description) from an older caller and
+    # (title, description, slug) from the current one.
+    lines = [
+        index_line(row[0], row[1], row[2] if len(row) > 2 else None)
+        for row in list(index)[:max_index]
+    ]
     if lines:
         parts.append(HEADING_INDEX + "\n" + "\n".join(lines))
     for title, body in list(relevant)[:max_relevant]:

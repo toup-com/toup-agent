@@ -156,8 +156,13 @@ class AutomationsSkill(Skill):
                     "What can be automated: per-connector events "
                     "(push/poll + floor), write actions with their "
                     "pinned-target parameter, rate budgets, and this "
-                    "user's current connection state. ALWAYS call this "
-                    "before proposing an automation."
+                    "user's current connection state."
+                    # Round 33, item 2: this said "ALWAYS call this before
+                    # proposing an automation." A tool description is an
+                    # instruction the model competes over (§14 rule 1), and
+                    # an unconditional imperative in one rides EVERY turn.
+                    # The ordering already lives in the section that owns
+                    # the flow, which is where a flow rule belongs.
                 ),
                 "input_schema": {"type": "object", "properties": {}},
             },

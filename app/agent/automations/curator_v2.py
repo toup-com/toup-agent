@@ -17,6 +17,7 @@ A's migration re-files legacy rows into v2 shapes.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from .curation_rules import (
@@ -60,13 +61,67 @@ def normalize_candidate(item: Any) -> Optional[dict]:
         return None
     scope = str(item.get("scope") or "").strip().lower()
     subject = item.get("subject")
+    subject_name = " ".join(str(subject).split())[:80] if subject else None
+    # ── One subject, one entity (round 33, item 6) ───────────────────────
+    # A comma-joined subject was resolved as ONE entity, which is how
+    # "#all-toup, #social" became a single row on the People & things tab.
+    # Two channels are two things; if the model gives us a list we cannot
+    # honestly index the fact under one of them, so it goes unindexed —
+    # the fact is still stored and still readable, it just does not claim
+    # to be about an entity that does not exist.
+    if subject_name and ("," in subject_name or " and " in subject_name):
+        subject_name = None
     return {
         "text": text,
         "category": category,
         "scope": "automation" if scope == "automation" else "global",
-        "subject": " ".join(str(subject).split())[:80] if subject else None,
+        "subject": subject_name,
+        # What the subject IS. The model is asked for it; when it does not
+        # answer, the NAME's shape decides — and the three shapes that
+        # decide are exactly the three that were mis-typed on the founder's
+        # Memory page ("#all-toup" a channel, "SCRUM-1" a ticket,
+        # "toup-com/toup-platform" a repo, every one of them filed as a
+        # person). Anything else is a person, which is what it was and what
+        # it usually is: dropping the entity for every unlabelled fact
+        # would un-index real people to fix three rows.
+        "subject_kind": _entity_kind(item.get("subject_kind"), subject_name),
         "why": " ".join(str(item.get("why") or "").split())[:400] or None,
     }
+
+
+#: `memory_v2.MEMORY_ENTITY_KINDS`, restated here so this module does not
+#: import the model layer for one frozenset.
+_ENTITY_KINDS = ("person", "channel", "ticket", "repo", "project", "account")
+
+
+#: Names whose shape says what they are. Narrow on purpose — a guess that is
+#: wrong is the defect this replaces.
+_TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d+$")
+
+
+def _subject_entity(fact: dict) -> Optional[dict]:
+    """`{kind, name}` for a fact's subject, or None when it names none."""
+    name = fact.get("subject")
+    if not name:
+        return None
+    kind = _entity_kind(fact.get("subject_kind"), str(name))
+    return {"kind": kind, "name": name} if kind else None
+
+
+def _entity_kind(raw, name: Optional[str] = None) -> Optional[str]:
+    kind = str(raw or "").strip().lower()
+    if kind in _ENTITY_KINDS:
+        return kind
+    n = (name or "").strip()
+    if not n:
+        return None
+    if n.startswith("#"):
+        return "channel"
+    if _TICKET_RE.match(n):
+        return "ticket"
+    if "/" in n:
+        return "repo"
+    return "person"
 
 
 async def file_facts(
@@ -102,8 +157,16 @@ async def file_facts(
                     why=fact.get("why"),
                     source=source,
                     domain=domain,
-                    subject_entity=({"kind": "person", "name": fact["subject"]}
-                                    if fact.get("subject") else None),
+                    # Only index a fact under an entity when we know BOTH
+                    # what it is called and what it IS. This hardcoded
+                    # "person" for every subject, so every channel, ticket
+                    # and repo the curator ever saw is typed as a person in
+                    # `memory_entities` — and the app prints that kind raw.
+                    # `_entity_kind` again, not `fact["subject_kind"]`: this
+                    # is a public entry point and is called with raw dicts
+                    # that never went through `normalize_candidate`, so it
+                    # cannot assume the key is there.
+                    subject_entity=_subject_entity(fact),
                     run_id=run_id,
                 )
                 if result and result.get("saved"):

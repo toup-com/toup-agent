@@ -147,15 +147,45 @@ def fact_payload(row: MemoryFact) -> dict:
         "scope": row.scope,
         "source": row.source,
         "learned_at": _iso(row.learned_at),
+        # ── The raw ISO row must never reach a UI (round 33, item 6) ──────
+        # `automations.py`'s own docstring says exactly that, and this
+        # payload shipped `2026-08-26T15:17:33.226653Z` straight through it
+        # onto a card that printed "Learned 2026-08-26T15:17:33.226653Z".
+        # Both keys ride: the ISO for machines, a human phrase for screens,
+        # so a client cannot be the only thing standing between the two.
+        "learned_at_label": _when_label(row.learned_at),
         "last_confirmed_at": _iso(row.last_confirmed_at),
         "subject_entity_id": row.subject_entity_id,
     }
+
+
+def _when_label(dt) -> Optional[str]:
+    """"Today", "Yesterday", "3 days ago", "12 Aug", "12 Aug 2025"."""
+    if dt is None:
+        return None
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        when = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        days = (now.date() - when.date()).days
+        if days <= 0:
+            return "Today"
+        if days == 1:
+            return "Yesterday"
+        if days < 7:
+            return f"{days} days ago"
+        if when.year == now.year:
+            return when.strftime("%-d %b")
+        return when.strftime("%-d %b %Y")
+    except Exception:  # noqa: BLE001 — a label never fails a payload
+        return None
 
 
 def _episode_payload(row: MemoryEpisode) -> dict:
     return {
         "id": row.id,
         "at": _iso(row.at),
+        "at_label": _when_label(row.at),
         "text": row.text,
         "outcome": row.outcome,
         "automation_id": row.automation_id,

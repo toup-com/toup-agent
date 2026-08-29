@@ -354,14 +354,38 @@ def test_step_rules_never_move_backwards_and_tolerate_junk():
     assert advance_steps([], 0, t0) == []
 
 
-def test_untouched_job_finishes_with_one_shared_window():
+def test_untouched_job_gives_its_window_to_ONE_step():
     """The model never called update_job: every step closes at delivery,
-    sharing the [create, delivery] window (never 0ms, never unknown)."""
+    and exactly ONE of them may claim that window.
+
+    This test used to assert the opposite — `duration_ms == 9000` on
+    BOTH steps — and it was the defect's own specification. The founder
+    photographed it on 2026-08-28: a three-step plan whose rows read
+    "16.2s", "16.2s", "16.2s", which is the JOB's elapsed time printed
+    once per step. The speed contract forbids calling `update_job`
+    alone, so a turn with no tick is the ORDINARY case and that window
+    is the whole job.
+
+    The round-8 rule it replaces — "never 0ms, never unknown" — still
+    holds where it was written: an `update_job` tick closes inside a
+    real, observed, short window and a step it jumped over shares it
+    (`test_one_tick_closing_two_steps_gives_no_zero_ms_step`). At turn
+    end there is no such window, and a duration nobody measured is
+    unknown rather than the enclosing span. Clients render nothing for
+    an absent one, so the row shows a step that is done and says
+    nothing about how long — which is what we actually know.
+    """
     from app.agent.job_steps import finish_all_steps, open_first_step
     t0 = datetime(2026, 8, 19, 3, 0, 0)
     st = open_first_step(_steps(2), t0)
     finish_all_steps(st, t0 + timedelta(seconds=9))
-    assert all(s["status"] == "done" and s["duration_ms"] == 9000 for s in st)
+    assert all(s["status"] == "done" and s.get("completed_at") for s in st)
+    measured = [s for s in st if s.get("duration_ms") is not None]
+    assert len(measured) == 1, [s.get("duration_ms") for s in st]
+    # The one that owns it is the step that was RUNNING, and it gets the
+    # real window — not a zero, which is the other half of round 8.
+    assert measured[0]["duration_ms"] == 9000
+    assert measured[0] is st[0]
 
 
 # ── The reconciler ───────────────────────────────────────────────────────
@@ -461,7 +485,14 @@ async def test_reconciler_completes_a_delivered_job_and_leaves_the_rest(monkeypa
     assert d.summary_message_id == mid
     assert d.config_json.get("reconciled_reason") == "answer_delivered"
     steps = json.loads(d.steps_json)
-    assert all(s["status"] == "done" and s["duration_ms"] > 0 for s in steps)
+    # Every step is closed; exactly one carries the window it was closed
+    # in, and it is never 0ms. See
+    # `test_untouched_job_gives_its_window_to_ONE_step` for why the other
+    # two say nothing rather than repeating the job's own total.
+    assert all(s["status"] == "done" and s.get("completed_at") for s in steps)
+    measured = [s["duration_ms"] for s in steps if s.get("duration_ms") is not None]
+    assert len(measured) == 1 and measured[0] > 0, [
+        s.get("duration_ms") for s in steps]
     assert (await _job_row(legacy)).status == "completed"
     for jid in (pending, handed, dash, young, legacy2):
         assert (await _job_row(jid)).status == "running", jid

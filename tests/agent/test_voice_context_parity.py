@@ -644,7 +644,9 @@ async def test_voice_context_renders_the_same_memory_files_as_text_chat(voice_ta
     assert body.startswith("# User Brain (this user's memory files")
     assert "## Profile\n- drinks a flat white, no sugar" in body
     assert "## Learned (how to work with this user)\n- speak plainly" in body
-    assert "## Memory files\n- Music — Music taste — artists" in body
+    # Round 33: the index line carries the slug, on BOTH assemblers — which
+    # is why the renderer is shared in the first place.
+    assert "## Memory files\n- Music (topics/music) — Music taste — artists" in body
     # The agent brain is the `learned` FILE now — no second section.
     assert "agent_brain" not in ctx.sections
     assert "agent_brain" not in VOICE_SECTION_ORDER

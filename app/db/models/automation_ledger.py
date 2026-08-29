@@ -56,9 +56,16 @@ AUTOMATION_TURN_KINDS = frozenset({
 AUTOMATION_ACCOUNT_STATES = frozenset({
     "connected", "expired", "revoked", "scope_missing",
     "org_approval_needed", "not_connected",
+    # Round 33: a read failed and the reason is not known yet. Distinct
+    # from `connected` on purpose — see AUTOMATION_TRANSIENT_REASONS.
+    "needs_check",
 })
 AUTOMATION_FIXES = frozenset({
     "reconnect", "grant", "approve", "connect", "retry",
+    # Round 33: ask the vendor. The honest remedy for a read that failed
+    # with no cause we recognise — offering `retry` there claimed the
+    # failure was a bad minute when nothing had established that.
+    "check",
 })
 # Transient reasons keep `connected` and get `fix: retry`; only a
 # credential, scope or approval problem may move an account off
@@ -70,6 +77,12 @@ AUTOMATION_TRANSIENT_REASONS = frozenset({
 AUTOMATION_NOTE_STAMPS = frozenset({
     "started", "ran", "tried", "added", "reconnected", "stopped",
     "skipped", "edited",
+    # Round 33, item 4: a `partial` run with a broken source used to
+    # stamp the thread RAN while the main-chat card for the same run
+    # said NEEDS YOU — two tables, two repos, one status. RAN also
+    # claims a result: the founder's brief read nothing from four of
+    # its four accounts and the thread said it ran.
+    "needs_you",
 })
 
 AUTOMATION_RUN_KINDS = frozenset({

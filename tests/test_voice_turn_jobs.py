@@ -230,8 +230,18 @@ async def test_the_steps_are_the_work_the_turn_actually_did(monkeypatch, tmp_pat
         "Search the web", "Read the sources", "Put the answer together",
     ]
     assert all(s["status"] == "done" for s in steps), steps
-    # Round 8 timing rules, from the same module `update_job` writes through.
-    assert all(s.get("durationMs") is not None for s in steps), steps
+    # Round 8 timing rules, from the same module `update_job` writes through —
+    # amended in round 33. A step reports a duration it MEASURED, or none.
+    # Sharing the enclosing window between every step closed in it is what
+    # printed a job's whole elapsed time on each of its three steps ("16.2s ·
+    # 16.2s · 16.2s" on a founder's card), so a step the turn passed through
+    # without ever running now says nothing rather than borrowing its
+    # neighbour's number. At least one step measured a real window, and every
+    # duration present is a positive one.
+    measured = [s for s in steps if s.get("durationMs") is not None]
+    assert measured, steps
+    assert all(s["durationMs"] > 0 for s in measured), measured
+    assert all(s.get("completed_at") for s in steps), steps
     # And a REAL window on the step the turn actually spent time in. The
     # search step opens when the card does; closing it with `now` on both
     # edges is the fabricated 0ms Round 8 exists to remove.

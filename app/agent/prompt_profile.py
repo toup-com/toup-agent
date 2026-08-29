@@ -358,6 +358,54 @@ TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
 })
 
 
+# Round 33, item 8: an automation THREAD turn is the user asking a
+# question inside one automation. Until now it was answered by a bare
+# `llm_service.complete()` with no tools at all, so "give me my last
+# five gmail" was answered "I could not read Gmail" in the thread and
+# answered correctly in the main chat a minute later, on the same
+# account. The thread now runs the SAME agent loop the main chat runs —
+# same MCP connector tools, same `connector_dispatcher.execute`, same
+# credentials — which is the only way the two surfaces can agree.
+#
+# What it loses is the set with no business in a thread:
+# `create_job`/`update_job` would draw a progress card in a surface that
+# has its own run ledger; `spawn`/`start_mission` move the answer
+# somewhere the user is not looking; the memory writers are what filed a
+# run's connector failures as facts about the user (item 6); the
+# routine/trigger mutators would let "why did this fail?" quietly
+# reschedule something. Prompts are advisory — tool-list omission is
+# hard.
+#
+# What it deliberately KEEPS is the connector surface, reads and writes
+# alike — which widens the module's old "no write tools at all", and
+# does so knowingly. A thread turn is ATTENDED: the user typed it and is
+# looking at the answer, so its situation is the main chat's, not a
+# routine's, and `connector_dispatcher`'s unattended deny list
+# (`_MUTATES_UNATTENDED_DENY_CHANNELS`) is correctly not extended to it.
+# A mutating call still meets the same per-tool `elevation` confirmation
+# the main chat puts in front of it. "Post that to Slack", asked inside
+# the automation whose job is posting to Slack, is a reasonable thing to
+# be able to say.
+AUTOMATION_THREAD_DISABLED_TOOLS: frozenset[str] = frozenset({
+    "create_job",
+    "update_job",
+    "spawn",
+    "start_mission",
+    "save_streaming_credential",
+    "memory_store",
+    "memory_write_file",
+    "memory_edit_file",
+    "memory_delete",
+    "routines__create",
+    "routines__update",
+    "routines__delete",
+    "routines__remind",
+    "triggers__create",
+    "triggers__update",
+    "triggers__delete",
+})
+
+
 def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
     """Extra tool-disable set implied by the SURFACE, independent of profile.
 
@@ -369,4 +417,6 @@ def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
         return VOICE_DISABLED_TOOLS
     if (channel or "").strip().lower() == "trigger":
         return TRIGGER_DISABLED_TOOLS
+    if (channel or "").strip().lower() == "automation_thread":
+        return AUTOMATION_THREAD_DISABLED_TOOLS
     return frozenset()

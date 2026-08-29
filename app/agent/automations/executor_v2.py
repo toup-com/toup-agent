@@ -242,9 +242,31 @@ def _collect_result(step: ValidatedStep, content: dict,
             "lines": lines, "raw_fields": raw_fields}
 
 
-def _skipped_result(step: ValidatedStep) -> dict:
+def _skipped_result(step: ValidatedStep, *, silent: bool = True) -> dict:
+    """The placeholder a failed read leaves behind in the context.
+
+    `silent` is `on_error: "skip"` — the mode whose whole point is that an
+    optional source says nothing when it is down (the Teams provider_down
+    precedent). It keeps its `empty_text`.
+
+    `on_error: "continue"` is the mode that owes the user a named account
+    and a reason, and its section must SAY the read did not happen. Round
+    33, item 4: both modes used to return `empty_text`, so a Gmail read
+    that failed was interpolated into the brief as "Gmail inbox is clear."
+    and posted to Slack as a fact about the user's morning. The flagship
+    template asked for `skip` on all five reads, which is what made the
+    silent mode the one every user met; it asks for `continue` now.
+    """
     empty = (step.collect or {}).get("empty_text") or ""
-    return {"ok": False, "text": empty, "count": 0}
+    if silent:
+        return {"ok": False, "text": empty, "count": 0}
+    name = _display_name(step.connector_id or "") or (step.connector_id or "it")
+    return {
+        "ok": False,
+        "failed": True,
+        "text": f"Could not read {name}.",
+        "count": 0,
+    }
 
 
 async def _execute_read_step(
@@ -442,7 +464,8 @@ async def _run_steps(
                 return "failed"
             logger.info("[automations] step %s continued past %s on %s",
                         st.id, e, automation.id)
-            ctx["steps"][st.id] = _skipped_result(st)
+            ctx["steps"][st.id] = _skipped_result(
+                st, silent=st.on_error != "continue")
             partial = True
             if st.on_error == "continue":
                 # `skip` stays SILENT (the Teams provider_down
@@ -453,6 +476,11 @@ async def _run_steps(
                     "reason_code": _reason_code_of(e, step_failed_reason),
                     "step_id": st.id,
                     "at": datetime.utcnow().isoformat() + "Z",
+                    # The provider's own words. `classify` reads them to
+                    # tell an expired token from an org policy from a
+                    # rate limit, and `record_use` could not fire either
+                    # of its regexes without them (round 33, item 4).
+                    "message": str(e)[:300],
                 })
         else:
             if st.connector_id and st.connector_id not in read_ok:
@@ -1052,7 +1080,11 @@ async def _append_needs_you_turns(
                 account_id=account_id,
                 connector_id=account_id,
                 name=_display_name(account_id),
-                reason_code=src.get("reason_code") or "timeout",
+                # `timeout` is a TRANSIENT state — it kept the account
+                # reading "Connected" with a "Try again" button for a
+                # failure nobody had classified. An unclassified failure
+                # is `unknown_error`, which offers the probe instead.
+                reason_code=src.get("reason_code") or "unknown_error",
             )
             await _ledger.append_turn(
                 db, user_id=automation.user_id, thread=thread,
@@ -1061,6 +1093,11 @@ async def _append_needs_you_turns(
             await account_health.record_use(
                 db, user_id=automation.user_id, account_id=account_id,
                 ok=False, reason_code=src.get("reason_code") or "",
+                # Without this `classify`'s org-approval and scope
+                # regexes can never fire here, so the projection every
+                # other surface reads said "connected" for an account
+                # the run had just failed to read.
+                message=str(src.get("message") or ""),
             )
         except Exception as e:  # noqa: BLE001 — see docstring
             logger.warning(
@@ -1141,6 +1178,7 @@ async def _append_read_turn(
         from . import ledger as _ledger
         from app.services import automation_verbs as _verbs
         if ok:
+            extra = {}
             count = (result or {}).get("count")
             act = _verbs.turn_action(
                 step.connector_id, step.tool, kind="read", ok=True,
@@ -1160,6 +1198,25 @@ async def _append_read_turn(
                 {"text": act["detail"].capitalize() or "It did not answer",
                  "ok": False},
             ]
+            # ── The line and the button, ON the job card (round 33) ──────
+            # The app's `AccountLines` renders one tone-coloured line per
+            # account with its own fix button — the closer of the two
+            # affordances this round shipped — and it filters on `t.line`,
+            # which nothing has ever set. It is the same reason and the
+            # same fix the needs-you card carries; one derivation.
+            from . import account_health as _ah
+            code = _ah.classify(reason or "", "")
+            state, fix = _ah.state_for_reason(code)
+            extra = {
+                "line": _ah.sentence_for(
+                    account_state=state, reason_code=code,
+                    connector_id=step.connector_id or "",
+                    name=_ah.display_of(step.connector_id or ""),
+                ) or act["detail"] or f"Could not read {name}.",
+                "tone": "success" if state == "connected" else "warning",
+                "fix": fix or None,
+                "reason_code": code,
+            }
         turn = await _ledger.append_turn(
             db, user_id=automation.user_id, thread=thread, run_id=job_id,
             kind="tool",
@@ -1170,6 +1227,7 @@ async def _append_read_turn(
                 "ok": ok, "ms": max(int(ms), 0),
                 "steps": steps_lines, "items": items,
                 "write_ids": [], "rest": "",
+                **{k: v for k, v in extra.items() if v},
             },
         )
         turn_index[step.id] = turn

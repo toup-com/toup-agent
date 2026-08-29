@@ -75,6 +75,13 @@ _REASON_MAP: dict[str, tuple[str, str]] = {
     "rate_limited": ("connected", "retry"),
     "vendor_down": ("connected", "retry"),
     "timeout": ("connected", "retry"),
+    # ── "I do not know why" is not "it is fine" (round 33, item 4) ──────
+    # Every unclassified failure used to alias to `timeout`, which is a
+    # TRANSIENT state — so the card said "Connected" with a "Try again"
+    # button for a 401, a 403 org policy and a missing scope alike. An
+    # unknown failure keeps the account out of `connected` and offers the
+    # PROBE, which is the only honest next step: ask the vendor.
+    "unknown_error": ("needs_check", "check"),
 }
 
 # The engine's older, looser failure tokens (`executor_v2._failure_reason`
@@ -87,7 +94,12 @@ _LEGACY_REASON_ALIASES: dict[str, str] = {
     "access_expired": "token_expired",
     "revoked": "token_revoked",
     "provider_down": "vendor_down",
-    "unreachable": "timeout",
+    # `unreachable` is what `_failure_reason` answers for everything it
+    # does not recognise — a real 401/403/404 included — so aliasing it to
+    # a transient `timeout` told the user their broken connector was
+    # having a bad minute. It is now what it says: unknown.
+    "unreachable": "unknown_error",
+    "tool_error": "unknown_error",
     "": "timeout",
 }
 
@@ -115,16 +127,43 @@ _TABLE: Optional[dict] = None
 
 
 def _table_path() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.abspath(os.path.join(here, "..", "..", "..", ".."))
-    return os.path.join(root, "fixtures", "automations",
-                        "reason-strings.json")
+    """The table SHIPPED WITH THE PACKAGE (round 33, item 4).
+
+    This used to resolve four directories above this module — the repo
+    root locally, and `/` inside the agent image, because
+    `.github/workflows/build-agent.yml` builds with `context: ./backend`
+    and `fixtures/` lives at the repo root. So in production the table
+    was never found, `strings()` answered `{}`, and EVERY sentence and
+    EVERY button label on every connector card fell through to its
+    hardcoded fallback: "I could not read Jira." with a "Try again"
+    button, for a token that had expired and needed reconnecting.
+    Four cards, four different real reasons, one wrong sentence.
+
+    `copy_guard.py` already said this in writing — "a deployed image
+    that ships no fixtures directory" — and solved it by embedding its
+    data in the module. This does the same thing with a file, because
+    the table is 18KB of copy: it lives in the package, and
+    `fixtures/automations/reason-strings.json` stays the contract
+    document, held byte-identical by
+    `test_automation_reason_strings_ship_with_the_package`.
+    """
+    # Beside the module, NOT in a `data/` subdirectory: `.gitignore` has a
+    # bare `data/` rule, so a copy filed there is never committed and never
+    # reaches the image — the same defect this function is fixing, one
+    # directory deeper.
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "reason_strings.json")
 
 
 def strings() -> dict:
-    """C's `account_state × surface` table. Loaded once; a missing or
-    unreadable file yields `{}` rather than raising — a run must never
-    die because a copy fixture moved."""
+    """C's `account_state × surface` table. Loaded once.
+
+    An unreadable table is not survivable — every card, every button
+    label and every honest line degrades to a fallback that says the
+    wrong thing confidently — so it is logged at ERROR. It still does
+    not RAISE: a run that dies because a copy file moved is worse than
+    a run that reports plainly.
+    """
     global _TABLE
     if _TABLE is not None:
         return _TABLE
@@ -133,7 +172,11 @@ def strings() -> dict:
             data = json.load(fh)
         _TABLE = data if isinstance(data, dict) else {}
     except Exception as e:  # noqa: BLE001 — see docstring
-        logger.warning("[account_health] reason-strings unreadable: %s", e)
+        logger.error(
+            "[account_health] reason-strings UNREADABLE at %s: %s — every "
+            "connector card will fall back to generic copy",
+            _table_path(), e,
+        )
         _TABLE = {}
     return _TABLE
 
@@ -293,7 +336,43 @@ def classify(reason: Optional[str], message: str = "") -> str:
         return "org_approval_needed"
     if _SCOPE_RE.search(message or ""):
         return "scope_missing"
+    # ── Read the provider's own status before giving up (round 33) ──────
+    # The RPC envelope kind is the engine's word for what happened, and
+    # for anything it does not model it says `tool_error`/`unreachable`.
+    # The provider's message still carries the real answer — a 401, an
+    # `invalid_grant`, a 429 — and reading it here is the difference
+    # between "reconnect Gmail" and a "Try again" button on an account
+    # that will never answer until it is reconnected.
+    if token not in _LEGACY_REASON_ALIASES and token in _REASON_MAP:
+        return token
+    hit = _PROVIDER_STATUS_RE.search(message or "")
+    if hit:
+        return hit.group(0) and _status_reason(hit)
     return _LEGACY_REASON_ALIASES.get(token, token) or "timeout"
+
+
+# The provider signals worth recognising by name. Narrow on purpose: a
+# wrong confident code is worse than `unknown_error`, which at least
+# offers the probe.
+_PROVIDER_STATUS_RE = re.compile(
+    r"\b(invalid_grant|unauthorized|unauthenticated|401"
+    r"|rate.?limit|too many requests|429"
+    r"|50[0234]|bad gateway|service unavailable|gateway timeout"
+    r"|timed? ?out)\b",
+    re.IGNORECASE,
+)
+
+
+def _status_reason(hit) -> str:
+    text = hit.group(0).lower()
+    if text in ("invalid_grant", "unauthorized", "unauthenticated", "401"):
+        return "token_expired"
+    if "429" in text or "rate" in text or "many requests" in text:
+        return "rate_limited"
+    if text.startswith("50") or text in ("bad gateway", "service unavailable",
+                                         "gateway timeout"):
+        return "vendor_down"
+    return "timeout"
 
 
 def reason_block(reason_code: str) -> dict:
@@ -371,13 +450,35 @@ def needs_you_payload(
     label = sentence_for(
         account_state=account_state, reason_code=reason_code,
         connector_id=connector_id, name=display, surface="button_label",
-    ) or fix_button(fix, connector_id, display) or "Try again"
+    ) or fix_button(fix, connector_id, display)
+    # ── A label may never contradict the fix it runs (round 33, item 4) ──
+    # These two lines used to end `or "Try again"` and
+    # `or f"I could not read {display}."`. With the table unreadable in
+    # production (see `_table_path`) they fired for EVERY reason code, so
+    # an expired token wore a "Try again" button that retried a read that
+    # could not succeed, over a sentence that named no cause. The label now
+    # comes from the fix or from nowhere: the app renders no button for an
+    # empty label, and no button is honest where a wrong one is not.
+    if not label and fix:
+        logger.error(
+            "[account_health] no button label for fix=%s reason=%s — the "
+            "card will render without one", fix, reason_code,
+        )
+    if not sentence:
+        # The reason's own words, at minimum. `reason_block` is the row
+        # `sentence_for` failed to render a surface from; its `sheet_detail`
+        # is the short cause ("access expired"), which is strictly more than
+        # a bare "I could not read X."
+        detail = sheet_detail(reason_code)
+        sentence = (f"I could not read {display} — {detail}." if detail
+                    else f"I could not read {display}, and I do not yet "
+                         f"know why.")
     return {
         "account_id": account_id,
         "connector_id": connector_id,
         "name": display,
         "reason_code": reason_code,
-        "sentence": sentence or f"I could not read {display}.",
+        "sentence": sentence,
         "fix": fix,
         "fix_label": label,
         "approval_url": approval_url,
@@ -386,7 +487,7 @@ def needs_you_payload(
 
 async def record_use(
     db, *, user_id: str, account_id: str, ok: bool,
-    reason_code: str = "", message: str = "",
+    reason_code: str = "", message: str = "", broadcast: bool = True,
 ) -> None:
     """Write the LAST REAL USE for this account.
 
@@ -422,6 +523,7 @@ async def record_use(
         if row is None:
             row = AccountHealth(user_id=user_id, account_id=account_id)
             db.add(row)
+        changed = (row.state != account_state or row.reason_code != code)
         row.state = account_state
         row.reason_code = code
         row.fix = fix
@@ -430,6 +532,35 @@ async def record_use(
         await db.flush()
     except Exception as e:  # noqa: BLE001 — see docstring
         logger.debug("[account_health] record_use skipped %s: %s",
+                     account_id[:12], e)
+        return
+    # ── One state, every surface (round 33, item 4) ─────────────────────
+    # `AccountHealth` is the record of what a REAL call did, and until now
+    # only the account sheet read it — the thread card, the Connectors page
+    # and the drawer each derived their own answer, so a run could fail to
+    # read Jira while every other surface still said "Connected". The
+    # `connector.state` frame is the app's one ingress for this
+    # (`store.connectors`, via the app-level bridge), and it was emitted
+    # only on OAuth connect/expire hooks: a failed READ broadcast nothing.
+    # Now it does — on a CHANGE, so a run that reads four accounts every
+    # morning does not narrate four unchanged states every morning.
+    #
+    # `broadcast=False` is for the two OAuth hooks, which record the use
+    # and then emit their OWN frame a few lines later: without it the app
+    # got the same `connector.state` twice for one event, and the second
+    # is not free — every frame re-renders the Connectors page and the
+    # drawer count.
+    if not changed or not broadcast:
+        return
+    try:
+        from .connector_state import emit_state_frame
+        await emit_state_frame(
+            user_id, connector_id=account_id, state=account_state,
+            reason_code=code, fix=fix,
+            reconnected_at=now if ok else None,
+        )
+    except Exception as e:  # noqa: BLE001 — a frame never fails a run
+        logger.debug("[account_health] state frame skipped %s: %s",
                      account_id[:12], e)
 
 

@@ -338,6 +338,8 @@ async def on_connector_expired(
         await account_health.record_use(
             db, user_id=user_id, account_id=connector_id, ok=False,
             reason_code=code, message=error or "",
+            # This hook emits the authoritative frame itself, below.
+            broadcast=False,
         )
         await db.commit()
     except Exception as e:  # noqa: BLE001 — the frame still goes out

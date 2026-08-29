@@ -239,7 +239,15 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
                 "text": _clean_sentence(s.get("text"), "tool.steps.text"),
                 "ok": bool(s.get("ok")),
             })
-        return {
+        # ── The per-account line and its button (round 33, item 4) ──────
+        # The app's E-1 surface (`AccountLines`) opens with
+        # `tools.filter((t) => !!t.line)` and then renders `t.tone`,
+        # `t.line`, `t.fix` and `t.reason_code` — the four fields declared
+        # on its `ToolTurn`. This whitelist dropped all four, so the
+        # closer of the two fix affordances the round shipped could not
+        # render on any device, ever. Validated like everything else here:
+        # an unknown fix or tone is refused rather than passed through.
+        out = {
             "account_id": str(p.get("account_id") or ""),
             "tool_kind": tool_kind,
             "action": action,
@@ -251,6 +259,21 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             "write_ids": list(p.get("write_ids") or []),
             "rest": p.get("rest") or "",
         }
+        line = p.get("line")
+        if line:
+            out["line"] = _clean_sentence(line, "tool.line")
+            tone = p.get("tone")
+            _require(tone in ("success", "warning", "danger", None),
+                     f"unknown tool tone {tone!r}")
+            if tone:
+                out["tone"] = tone
+            fix = p.get("fix")
+            if fix:
+                _require(fix in AUTOMATION_FIXES, f"unknown fix {fix!r}")
+                out["fix"] = fix
+            if p.get("reason_code"):
+                out["reason_code"] = str(p["reason_code"])
+        return out
 
     if kind == "result":
         vocab = p.get("vocabulary")

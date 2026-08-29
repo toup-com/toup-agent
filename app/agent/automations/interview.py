@@ -294,6 +294,11 @@ def prompt_section(ctx: dict) -> str:
 
 
 def _extraction_prompt(ctx: dict, user_text: str, assistant_text: str) -> str:
+    # Imported, not forked — one list of what is durable, shared with the
+    # v3 curator and with `told_facts` (round 33, item 6).
+    from app.services.memory_curator import (
+        TURN_DURABILITY_RULES as _DURABILITY_RULES,
+    )
     existing = json.dumps(ctx.get("facts") or {}, ensure_ascii=False)
     return (
         "You file durable facts about the user into one platform "
@@ -319,17 +324,36 @@ def _extraction_prompt(ctx: dict, user_text: str, assistant_text: str) -> str:
         'deleted with that automation.\n'
         '- "subject": the person/channel/ticket/repo it is about, or '
         "null.\n"
+        '- "subject_kind": what that subject IS — one of person, '
+        "channel, ticket, repo, project, account. Omit it when there is "
+        "no subject. Do not guess: an unindexed fact is better than a "
+        "Jira ticket filed as a person.\n"
         '- "why": the evidence in one second-person sentence '
-        '("You said Sarah is your boss.").\n'
+        '("You said Sarah is your boss."). It must quote or paraphrase '
+        "something in the USER block. If the only support for a fact is "
+        "in the reply, the fact is not the user's and does not belong "
+        "here.\n"
         "Rules: only what the USER stated or clearly confirmed this "
         "turn; nothing inferred; nothing already known (either scope). "
         "NEVER file what an automation is or does, its schedule, its "
-        "status, or run outcomes. One short self-contained sentence "
-        f"each; dates absolute; at most {_MAX_FACTS_PER_TURN}; an "
+        "status, or run outcomes; never what YOU can or cannot read, "
+        "reach or access — a connector that refused you is a fact about "
+        "the connection, not about the person; and never the status of "
+        "a ticket, issue or message in someone else's system. One short "
+        f"self-contained sentence each; dates absolute; at most "
+        f"{_MAX_FACTS_PER_TURN}; an "
         "empty list is the right answer for small talk.\n\n"
-        f"USER: {user_text[:2000]}\n\nASSISTANT: {assistant_text[:1500]}\n\n"
+        # Round 33, item 6: labelled, not symmetric. See told_facts for
+        # the incident — the same two blocks, presented as co-equal
+        # sources, put the agent's own connector failures in the user's
+        # mouth ("You stated that GitHub access is blocked").
+        f"{_DURABILITY_RULES}\n\n"
+        f"WHAT THE USER SAID (the ONLY source of facts):\n"
+        f"{user_text[:2000]}\n\n"
+        f"WHAT YOU REPLIED (CONTEXT ONLY — never a source of facts):\n"
+        f"{assistant_text[:1500]}\n\n"
         'Reply as JSON: {"facts": [{"text", "category", "scope", '
-        '"subject", "why"}]}'
+        '"subject", "subject_kind", "why"}]}'
     )
 
 
@@ -346,6 +370,21 @@ async def extract_and_record_facts(
     companion, never a veto)."""
     text = (user_text or "").strip()
     if not text:
+        return 0
+    # ── The v3 pre-gate, before an LLM call (round 33, item 6) ──────────
+    # This gated on non-empty user text alone, so a pure QUESTION — "can
+    # you read messages in all my channels?" — was handed to the extractor
+    # with the agent's failure report attached, and the only assertions in
+    # the window were the agent's own. The v3 writer skips that turn by
+    # name (`question_only`), and running the same gate here costs one
+    # function call and saves the LLM round trip as well.
+    try:
+        from app.services.memory_curator import turn_skip_reason
+        _skip = turn_skip_reason(text)
+    except Exception:  # noqa: BLE001 — the gate never vetoes on its own failure
+        _skip = None
+    if _skip:
+        logger.info("[automations] curator skipped this turn (%s)", _skip)
         return 0
     automation_id = ctx["automation_id"]
     try:

@@ -451,7 +451,13 @@ def test_the_string_table_covers_every_state_on_every_surface():
     table = _reason_strings()
     surfaces = set(table["surfaces"])
     expected_states = {"connected", "expired", "revoked", "scope_missing",
-                       "org_approval_needed", "not_connected"}
+                       "org_approval_needed", "not_connected",
+                       # Round 33: a read failed and the provider did not say
+                       # why. It is NOT `connected` — that state's transient
+                       # `retry` is what put a green "Connected" badge and a
+                       # "Try again" button on four accounts that could not
+                       # be read at all.
+                       "needs_check"}
     assert set(table["states"]) == expected_states
     for state, row in table["states"].items():
         assert surfaces <= set(row), (state, sorted(surfaces - set(row)))

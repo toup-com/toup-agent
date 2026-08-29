@@ -986,7 +986,8 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
                 # second run — the expensive half of this route is the
                 # agent turn, not the insert.
                 return {"turn": existing, "thread_id": thread.id,
-                        "replayed": True}
+                        "replayed": True,
+                        "client_msg_id": body.client_msg_id}
 
         turn = await ledger.append_turn(
             db, user_id=_user_id(), thread=thread, run_id=None,
@@ -994,24 +995,93 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
             payload={"text": body.text,
                      "client_msg_id": body.client_msg_id},
         )
+        thread_id = thread.id
+        automation_id_str = automation.id
 
-        run_id = None
+    # ── 202 means 202 (round 33, item 7) ──────────────────────────────
+    # This route answered the WHOLE agent turn before replying, while
+    # `append_turn` had already broadcast the user's own sentence on its
+    # way in. So the broadcast always beat the response by the length of
+    # a model call, the client had no way to recognise its own turn
+    # coming back, and every sentence appeared twice until the answer
+    # landed. The answer now runs on its own task with its own session,
+    # which is what the `status_code=202` on this route has always
+    # claimed and what CONTRACTS-R31 §4.1 documents. The reply reaches
+    # the client the way it always did — `automation.activity` →
+    # `automation.turn.delta` → `automation.turn` frames — so nothing
+    # downstream depended on holding the connection open.
+    _schedule_thread_answer(automation_id_str, thread_id, body.text)
+    return {"turn": turn, "thread_id": thread_id, "run_id": None,
+            # Echoed at the top level as well as inside `turn`, so a
+            # client can match its optimistic row without reaching into
+            # the turn body.
+            "client_msg_id": body.client_msg_id}
+
+
+# Strong references to in-flight thread answers: `asyncio.create_task`
+# keeps only a WEAK one, so without this the loop can collect an answer
+# mid-flight and the thread simply never replies.
+_PENDING_THREAD_ANSWERS: set = set()
+
+
+def _schedule_thread_answer(
+    automation_id: str, thread_id: str, user_text: str,
+) -> None:
+    """Answer a thread turn off the request's hot path, on its own session."""
+    import asyncio
+    try:
+        task = asyncio.create_task(
+            _answer_thread_turn(automation_id, thread_id, user_text),
+        )
+    except RuntimeError:
+        logger.warning(
+            "[automations] no event loop to answer thread turn for %s",
+            automation_id,
+        )
+        return
+    _PENDING_THREAD_ANSWERS.add(task)
+    task.add_done_callback(_PENDING_THREAD_ANSWERS.discard)
+
+
+async def _answer_thread_turn(
+    automation_id: str, thread_id: str, user_text: str,
+) -> None:
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations import ledger, thread_agent
+    async with async_session_maker() as db:
         try:
-            if thread_agent.needs_fresh_read(body.text):
-                run_id = await thread_agent.open_question_run(
-                    db, automation=automation, thread=thread,
-                    user_text=body.text,
-                )
-            if run_id is None:
-                await thread_agent.answer_in_thread(
-                    db, automation=automation, thread=thread,
-                    user_text=body.text,
-                )
+            automation = await _load_owned(db, automation_id, _user_id())
+        except AutomationNotFound:
+            return
+        thread = await ledger.ensure_thread(
+            db, user_id=_user_id(), automation_id=automation.id,
+        )
+        if thread.id != thread_id:
+            # The thread was recreated under us; answering into a
+            # different one would put the reply where nobody is looking.
+            logger.warning(
+                "[automations] thread moved while answering (%s → %s)",
+                thread_id, thread.id,
+            )
+        try:
+            await thread_agent.answer_in_thread(
+                db, automation=automation, thread=thread,
+                user_text=user_text,
+            )
         except Exception as e:  # noqa: BLE001
             # The user's turn is already durable; an answer that failed
             # must say so in the thread rather than leave the live state
             # spinning (R31-17's silence).
             logger.warning("[automations] thread answer failed: %s", e)
+            # Retire the live surface, or the thread shows the agent-state
+            # ladder forever behind an answer that is never coming.
+            try:
+                await ledger.emit_activity(
+                    _user_id(), automation_id=automation.id,
+                    thread_id=thread.id, run_id=None, phase="done",
+                )
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await ledger.append_turn(
                     db, user_id=_user_id(), thread=thread, run_id=None,
@@ -1023,7 +1093,6 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
                 )
             except Exception:  # noqa: BLE001
                 pass
-        return {"turn": turn, "thread_id": thread.id, "run_id": run_id}
 
 
 async def _thread_turn_by_client_id(
@@ -1493,10 +1562,25 @@ async def from_template(body: FromTemplateBody):
         raise HTTPException(status_code=404, detail="No such template")
     spec = dict(template.get("spec") or {})
     variables = dict(spec.get("variables") or {})
+    # ── An EXAMPLE is not a default (round 33, item 8) ─────────────────
+    # `example` is the placeholder shown in the setup form ("toup-com",
+    # "toup-platform"). Substituting it when the user has not answered
+    # meant every adopted Morning work brief polled TOUP'S OWN repo and
+    # an empty Teams chat id — reads that fail, are swallowed by the
+    # step's on_error, and are then published as "No open repo issues."
+    # and "No new Teams messages." as if they were facts about the
+    # user's work. Only a `default` is an answer; a variable with
+    # neither stays unset, and the compile below refuses to arm an
+    # automation whose required params are empty.
+    unanswered: list[str] = []
     for v in template.get("variables") or []:
         name = v.get("name")
-        if name and not variables.get(name):
-            variables[name] = v.get("default") or v.get("example") or ""
+        if not name or variables.get(name):
+            continue
+        if v.get("default"):
+            variables[name] = v["default"]
+        else:
+            unanswered.append(str(v.get("label") or name))
     spec["variables"] = variables
 
     async with async_session_maker() as db:
@@ -1529,7 +1613,7 @@ async def from_template(body: FromTemplateBody):
         ) or any("{{grant.target.id}}" in json.dumps(s.get("params") or {})
                  for s in (raw.get("steps") or []) if isinstance(s, dict))
         armed = False
-        if all_connected and not has_ungranted_write:
+        if all_connected and not has_ungranted_write and not unanswered:
             try:
                 await arm_automation(
                     db, automation_id=automation.id, user_id=_user_id(),
@@ -1596,6 +1680,22 @@ async def from_template(body: FromTemplateBody):
                 # thread does not: an empty capability list is worse
                 # than a short one, but neither is worth losing setup.
                 scope_lines = []
+            # What it still needs from the user, named, before the
+            # capability list — an automation that cannot run without an
+            # answer must say which answer, in the thread where the
+            # conversation is (round 33, item 8).
+            if unanswered:
+                names = ", ".join(unanswered[:-1]) + (
+                    f" and {unanswered[-1]}" if len(unanswered) > 1
+                    else unanswered[0]
+                ) if len(unanswered) > 1 else unanswered[0]
+                await _ledger.append_turn(
+                    db, user_id=_user_id(), thread=thread, run_id=None,
+                    kind="agent", payload={"text": (
+                        f"Before this can run I need {names}. Tell me here "
+                        f"and I will set it up."
+                    )},
+                )
             drafts = setup_turns(mode, _label, first_run, scope_lines)
             for d in drafts or []:
                 kind = d.get("kind")
@@ -1883,6 +1983,26 @@ class CleanupBody(BaseModel):
     # have to be asked twice — the routine-migration repair route sets
     # the same precedent, and for the same reason.
     apply: bool = False
+
+
+@router.post("/purge-junk-facts")
+async def purge_junk_facts_route(body: Optional[CleanupBody] = None):
+    """Round 33, item 6 — remove the curator's own failure reports.
+
+    Curator v2 filed what the AGENT could not reach, and the state of
+    tickets in other people's systems, as durable facts about the USER.
+    The write gate refuses that class now; this removes what it already
+    wrote, and projects the removal into the brain so the agent stops
+    repeating it. Dry run unless `apply` is true; idempotent.
+
+    The fleet-wide half is `database._alter_statements`, which every
+    agent runs at boot — this is the immediate, reportable one.
+    """
+    _flag_or_404()
+    from app.agent.automations.junk_facts import purge
+    apply_it = bool(body.apply if body else False)
+    async with async_session_maker() as db:
+        return await purge(db, user_id=_user_id(), apply=apply_it)
 
 
 @router.post("/backfill")

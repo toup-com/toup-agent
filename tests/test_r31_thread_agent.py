@@ -51,29 +51,69 @@ async def _mk(automation_steps=True) -> tuple[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_a_fresh_read_question_opens_a_run_instead_of_raising(monkeypatch):
-    """`Run it now` → `needs_fresh_read` → `open_question_run`.
+async def test_a_thread_question_runs_the_agent_loop_on_its_own_channel(monkeypatch):
+    """Round 33 item 8: a thread question uses the MAIN CHAT's tool loop.
 
-    It built its job as `create_job(db, TaskSpec(title=..., job_type=...))`.
-    `create_job` is keyword-only and takes no `db`; `job_type` and `title`
-    are ITS arguments and TaskSpec has neither — wrong on three counts, so
-    this raised before reaching the model every single time.
+    R31 answered it with a toolless completion, and its "needs new
+    reading" branch resolved a read tool from the capability registry's
+    `source_tool` — which Gmail and Slack do not declare. So "give me my
+    last five gmail" was answered "I could not read Gmail" in the thread
+    and answered correctly in the main chat a minute later, on the same
+    account. This pins the three things that make the two agree: the
+    runner is used, the channel is `automation_thread` (which is what
+    withholds the writers), and NEITHER side of the turn is persisted as
+    a day-chat row.
     """
     from app.agent.automations import thread_agent, ledger
 
-    monkeypatch.setattr(thread_agent, "_complete",
-                        lambda *a, **k: _async("Checked your mail. Nothing new."))
+    seen = {}
+
+    class _FakeRunner:
+        async def run(self, **kw):
+            seen.update(kw)
+            chunk = kw.get("on_text_chunk")
+            if chunk:
+                await chunk("Here are your five latest emails.")
+
+            class _R:
+                text = "Here are your five latest emails."
+            return _R()
+
+    monkeypatch.setattr(thread_agent, "_runner", lambda: _FakeRunner())
     uid, aid = await _mk()
-    assert thread_agent.needs_fresh_read("Run it now") is True
 
     async with async_session_maker() as db:
         automation = await db.get(Automation, aid)
         thread = await ledger.ensure_thread(db, user_id=uid, automation_id=aid)
         await db.commit()
-        run_id = await thread_agent.open_question_run(
-            db, automation=automation, thread=thread, user_text="Run it now",
+        turn = await thread_agent.answer_in_thread(
+            db, automation=automation, thread=thread,
+            user_text="Give me my last five gmail",
         )
-    assert run_id, "a fresh-read question produced no run"
+
+    assert turn and turn.get("kind") == "agent", turn
+    assert turn.get("text") == "Here are your five latest emails."
+    assert seen.get("channel") == "automation_thread", seen.get("channel")
+    assert seen.get("save_user_message") is False
+    assert seen.get("save_assistant_message") is False
+    assert seen.get("disable_post_processing") is True
+
+
+@pytest.mark.asyncio
+async def test_the_thread_channel_withholds_every_writer():
+    """The bound is the CHANNEL, not the absence of tools. A thread turn
+    may read and answer; it may not defer work, write memory, or mutate
+    the user's schedule."""
+    from app.agent.prompt_profile import disabled_tools_for_channel
+
+    off = disabled_tools_for_channel("automation_thread")
+    for name in ("create_job", "update_job", "spawn", "start_mission",
+                 "memory_store", "routines__create", "routines__remind",
+                 "triggers__create"):
+        assert name in off, name
+    # …and it keeps the reads, which is the whole point of the change.
+    assert "web_search" not in off
+    assert "gmail__list_messages" not in off
 
 
 @pytest.mark.asyncio
@@ -90,7 +130,6 @@ async def test_a_past_question_is_answered_instead_of_raising(monkeypatch):
     monkeypatch.setattr(thread_agent, "_complete",
                         lambda *a, **k: _async("Yesterday I checked your mail."))
     uid, aid = await _mk()
-    assert thread_agent.needs_fresh_read("what did you do yesterday") is False
 
     async with async_session_maker() as db:
         automation = await db.get(Automation, aid)
@@ -126,6 +165,106 @@ async def test_facts_for_always_answers_a_list(monkeypatch):
             assert isinstance(facts, list), (shape, facts)
             # The slice `_grounding` performs must not raise.
             assert facts[:20] == facts[:20]
+
+
+@pytest.mark.asyncio
+async def test_the_thread_channel_is_named_rather_than_clamped():
+    """`automation_thread` is a REGISTERED channel, and it keeps the deny.
+
+    Before this, the string existed only in the agent: `mcp_auth` had
+    never heard of it, so every connector call a thread made hit
+    `_UNKNOWN_CHANNEL_CLAMP` and arrived at the dispatcher as
+    "background". The POLICY that produced was right — reads pass,
+    mutating connectors deny — but it was right by accident, it wrote a
+    `logger.warning` on every tool call a thread ever made, and the day
+    the clamp target moves the thread's permissions move with it,
+    silently. Both halves are asserted because either one alone is the
+    bug: named-but-not-denied would hand an unattended-shaped surface
+    the write tools, and denied-but-not-named is where we started.
+    """
+    from app.mcp_auth import _KNOWN_CHANNELS, _UNKNOWN_CHANNEL_CLAMP
+    from app.services.connector_dispatcher import (
+        _MUTATES_UNATTENDED_DENY_CHANNELS,
+    )
+
+    assert "automation_thread" in _KNOWN_CHANNELS
+    assert "automation_thread" in _MUTATES_UNATTENDED_DENY_CHANNELS
+    # The clamp target is still in the deny set, so the two agree and a
+    # channel we forget to register stays fail-closed.
+    assert _UNKNOWN_CHANNEL_CLAMP in _MUTATES_UNATTENDED_DENY_CHANNELS
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_question_run_stops_speaking_for_the_automation():
+    """R31's question runs wrote failures that never happened.
+
+    `open_question_run` called every account with an empty tool input,
+    and for gmail — whose manifest declares no `source_tool` — it never
+    called anything: `_default_read_tool` returned None and the ledger
+    got "Could not reach Gmail / I could not tell why". Deleting that
+    code stops NEW ones; the rows already written are durable, and the
+    grounding replays the newest turns verbatim, so the thread would go
+    on answering "the last run did not read any account data" with a
+    fabricated read for as long as they stayed in the window.
+
+    A REAL run's failure is kept — that is the thread's whole job.
+    """
+    from app.agent.automations import thread_agent, ledger
+    from app.db.models import BuildJob
+
+    uid, aid = await _mk()
+    q_id, real_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid, automation_id=aid)
+        for jid, kind in ((q_id, "question"), (real_id, "scheduled")):
+            db.add(BuildJob(
+                id=jid, user_id=uid, title="Morning work brief", prompt="",
+                job_type="automation_run", status="completed",
+                config_json={"run_kind": kind},
+            ))
+        await db.commit()
+
+        async def _tool(run_id: str, action: str):
+            await ledger.append_turn(
+                db, user_id=uid, thread=thread, run_id=run_id, kind="tool",
+                payload={"account_id": "gmail", "tool_kind": "read",
+                         "action": action, "detail": "I could not tell why",
+                         "ok": False, "ms": 3, "steps": [], "items": [],
+                         "write_ids": [], "rest": ""},
+                broadcast=False,
+            )
+
+        await _tool(q_id, "Could not reach Gmail")
+        await _tool(real_id, "Could not reach Gmail")
+        await ledger.append_turn(
+            db, user_id=uid, thread=thread, run_id=q_id, kind="agent",
+            payload={"text": "Looking at your 4 accounts now."},
+            broadcast=False,
+        )
+        await db.commit()
+
+        legacy = await thread_agent._legacy_question_run_ids(
+            db, [{"run_id": q_id}, {"run_id": real_id}],
+        )
+        assert legacy == {q_id}, legacy
+
+        turns = await thread_agent._recent_turns(db, thread.id)
+
+    runs_of = lambda k: [t.get("run_id") for t in turns if t.get("kind") == k]
+    assert runs_of("tool") == [real_id], runs_of("tool")
+    # The sentence the user actually saw is not rewritten out from under
+    # them — only the claim about an account goes.
+    assert q_id in runs_of("agent"), runs_of("agent")
+
+    automation_name = "Boss email -> draft reply"
+    grounding = thread_agent._grounding(
+        type("A", (), {"name": automation_name, "id": aid,
+                       "user_id": uid, "rules_json": "[]",
+                       "spec_json": "{}"})(),
+        turns, [],
+    )
+    assert grounding.count("Could not reach Gmail") == 1, grounding
 
 
 def _async(value):

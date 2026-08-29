@@ -343,9 +343,11 @@ half-done. Close by offering the fix where there is one to offer."""
 #: wait and try again, when what they must do is ask an owner to
 #: approve an OAuth app.
 _FAILED_SOURCE_RULES = """\
-SOME SOURCES FAILED. For each step with ok=false, write one line naming \
-the account and what is missing from this run because of it. Name the \
-account every time — never "an account". A source that failed produced \
+SOME SOURCES FAILED. The user is ALREADY seeing a card for each one, \
+with its name, its reason and the button that fixes it — do not write \
+that card again as prose. Write at most ONE sentence for the whole \
+group, saying what is missing from this run because of them, and name \
+the account every time — never "an account". A source that failed produced \
 NO items: never report a failed read as a count of zero, and never let \
 a tier imply the account was read and empty."""
 

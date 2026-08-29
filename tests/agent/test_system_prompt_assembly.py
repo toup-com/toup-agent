@@ -140,10 +140,13 @@ async def test_memory_files_reach_the_assembled_prompt():
     assert "## Profile\n- uses an Android phone" in prompt
     assert "## Current context" in prompt
     assert "Debugging the CSS sidebar" in prompt
-    # The index carries the DESCRIPTION. Round 8 dropped it, so the model
-    # had a list of filenames and no reason to open any of them.
+    # The index carries the DESCRIPTION (round 8 dropped it, so the model had
+    # a list of filenames and no reason to open any) AND the SLUG (round 33:
+    # four prompt surfaces tell the model to "use the slug from the index"
+    # and it published titles only, so the model passed the TITLE and the
+    # refusal reached the user's screen).
     assert "## Memory files" in prompt
-    assert "- Toup — The product they are building" in prompt
+    assert "- Toup (areas/toup) — The product they are building" in prompt
     # …and a lexically relevant file arrives in full.
     assert "the Brave Search gateway is live" in prompt
     # The injection fence is applied to the block.

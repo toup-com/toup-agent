@@ -33,6 +33,7 @@ incident is re-asserted below so the two incidents cannot trade places.
 """
 from app.agent.query_intent import (
     TOOLS_DOCGEN,
+    TOOLS_QUESTION,
     TOOLS_WORK_TRACKING,
     INTENT_AGENT, INTENT_CODE, INTENT_MEDIA, INTENT_MEMORY,
     INTENT_SCHEDULING, INTENT_WEB, INTENT_GREETING, INTENT_QUESTION,
@@ -119,14 +120,27 @@ def test_work_tracking_in_every_work_intent():
 
 
 def test_work_tracking_not_on_greeting_or_question():
-    """A greeting/question turn has no do-something ask; the always-
-    included affordances are the only tools it carries."""
-    for intent in (INTENT_GREETING, INTENT_QUESTION):
-        assert not intent.tool_names
+    """A greeting/question turn has no do-something ask.
+
+    Round 33: a QUESTION now carries the two tools that ANSWER one
+    (`web_search`, `web_fetch`) plus recall — it carried nothing before,
+    so on iteration 0 the model could reach memory and the automations
+    inventory but not the web, and it took them. What it must still never
+    carry is the do-something set: `create_job` on a factual question is
+    how an answer becomes a background job the user is not looking at.
+    """
+    assert not INTENT_GREETING.tool_names
+    assert not (TOOLS_WORK_TRACKING & INTENT_QUESTION.tool_names)
+    assert "browser" not in INTENT_QUESTION.tool_names
+    assert {"web_search", "web_fetch"} <= INTENT_QUESTION.tool_names
     for msg in ("hi", "thanks", "what's the weather in toronto"):
         allowed = _allowed(msg)
         assert "create_job" not in allowed, msg
-        assert allowed <= _ALWAYS_INCLUDED_TOOLS, msg
+        assert "start_mission" not in allowed, msg
+        # The always-included affordances PLUS the answering tools — the
+        # weather is a question, and a question turn that cannot search is
+        # a turn that spends its first iteration somewhere else.
+        assert allowed <= (_ALWAYS_INCLUDED_TOOLS | TOOLS_QUESTION), msg
 
 
 def test_research_asks_across_categories_can_open_with_create_job():

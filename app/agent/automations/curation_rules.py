@@ -64,10 +64,73 @@ _STATUS_PATTERNS = (
 )
 
 
+# ── The agent's own reach is not a fact about the user (round 33, item 6)
+#
+# Six rows reached the founder's Memory page from ONE automation run, each
+# one the agent's own connector failure re-voiced in the second person:
+#
+#   "You have access to the Slack channels #all-toup and #social, but you
+#    don't have message-reading access there."
+#   "You cannot read messages in GitHub because the org blocks Toup's
+#    GitHub access and an org owner needs to approve it in GitHub's OAuth
+#    app policy."
+#   "You cannot read messages in Teams because its connection needs
+#    re-authentication."
+#   "You cannot read inbox messages through the currently available
+#    Outlook connection."
+#
+# None of them matched `definition` or `run_status`, which are the only two
+# classes this gate knew. They are all the same class: what the AGENT can
+# or cannot reach. That belongs to the connection, it changes the moment
+# someone reconnects, and it is read back into every later run as if the
+# user had said it.
+_CAPABILITY_PATTERNS = (
+    re.compile(r"\b(?:you|it)\s+(?:cannot|can't|can not)\b.{0,80}"
+               r"\b(?:read|access|reach|see|view|send|post|write)\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:you|it)\s+(?:do(?:n't| not)\s+have|lacks?|is missing)\b"
+               r".{0,80}\b(?:access|permission|scope|rights?)\b",
+               re.IGNORECASE),
+    re.compile(r"\bneeds?\s+re-?authenticat", re.IGNORECASE),
+    re.compile(r"\borg(?:anisation|anization)?\s+(?:owner|admin)\b.{0,60}"
+               r"\bapprov", re.IGNORECASE),
+    re.compile(r"\bOAuth app polic", re.IGNORECASE),
+    re.compile(r"\bmessage-reading access\b", re.IGNORECASE),
+    re.compile(r"\bblocks?\s+Toup\b", re.IGNORECASE),
+    re.compile(r"\bconnection (?:needs|is|has)\b.{0,40}"
+               r"\b(?:expired|re-?auth|broken|unavailable)\b", re.IGNORECASE),
+)
+
+# ── A ticket's state is the ticket's, and it is stale by tomorrow ────────
+# "You have an open Jira item: SCRUM-1: R29-D live loop test — Jira to
+# Slack, Medium priority, unassigned, still To Do; last updated Aug 24."
+# was stored as a PERMANENT fact about the user. It is a row in someone
+# else's system, read once; the automation reads it fresh every morning.
+_ITEM_STATUS_PATTERNS = (
+    re.compile(r"\b(?:still|currently)\s+"
+               r"(?:to ?do|in progress|done|blocked|open|closed)\b",
+               re.IGNORECASE),
+    re.compile(r"\blast updated\b", re.IGNORECASE),
+    re.compile(r"\b(?:unassigned|assigned to)\b.{0,40}"
+               r"\b(?:priority|status|ticket|issue)\b", re.IGNORECASE),
+    re.compile(r"\b(?:medium|high|low|highest|lowest)\s+priority\b",
+               re.IGNORECASE),
+    re.compile(r"\b(?:open|closed)\s+"
+               r"(?:jira|linear|github|asana|trello)\s+"
+               r"(?:item|issue|ticket|pr|pull request)\b", re.IGNORECASE),
+    re.compile(r"\b(?:unread|new)\s+(?:messages?|emails?|mentions?)\b"
+               r".{0,30}\bin\b", re.IGNORECASE),
+)
+
+
 def refuse_reason(text: str) -> Optional[str]:
     """Why this text may not become a fact — or None when it may.
+
     `definition` = the automation's own rule restated (D-20/ND-3);
-    `run_status` = engine state wearing a sentence (ND-2)."""
+    `run_status` = engine state wearing a sentence (ND-2);
+    `agent_capability` = what the AGENT can or cannot reach (round 33);
+    `item_status` = the state of a row in a third-party system (round 33).
+    """
     candidate = " ".join((text or "").split())
     if not candidate:
         return "empty"
@@ -77,6 +140,12 @@ def refuse_reason(text: str) -> Optional[str]:
     for pattern in _STATUS_PATTERNS:
         if pattern.search(candidate):
             return "run_status"
+    for pattern in _CAPABILITY_PATTERNS:
+        if pattern.search(candidate):
+            return "agent_capability"
+    for pattern in _ITEM_STATUS_PATTERNS:
+        if pattern.search(candidate):
+            return "item_status"
     return None
 
 

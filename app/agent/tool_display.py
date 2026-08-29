@@ -299,7 +299,19 @@ def client_summary(result: object, cap: int = 200,
     """
     chosen = display_of(result)
     if chosen is None:
-        chosen = sanitize_for_client(str(result))
+        raw = str(result)
+        # ── A failure speaks in the PRODUCT's words (round 33, item 2) ──────
+        # A tool's `ERROR:` return is written for the MODEL — it names slugs,
+        # paths, exception types and whatever the vendor said. This function
+        # is the guarantee layer for exactly that class and had no branch for
+        # it, so a refusal shipped verbatim as `tool_end.summary` and the
+        # user read "No memory file 'Nariman HOSSEINI'. The index in # User
+        # Brain lists every file that exists." on their own screen. A tool
+        # that wants to say something specific about its failure declares a
+        # `display`; absent one, the honest sentence is that it did not work.
+        if raw.lstrip()[:6].upper().startswith("ERROR:"):
+            return "That didn’t work."
+        chosen = sanitize_for_client(raw)
         if tool_name and "__" in tool_name and not is_first_party_tool(
                 tool_name, is_skill_tool):
             head = (chosen or "").strip()[:1]

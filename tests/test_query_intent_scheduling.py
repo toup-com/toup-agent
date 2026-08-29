@@ -88,7 +88,12 @@ def test_typoed_reminder_still_reaches_the_tools():
     kept = {t["name"] for t in filter_tools_by_intent(all_tools, intent)}
     assert "routines__remind" in kept
     assert "routines__create" in kept
-    assert "web_search" not in kept, "question stays lean otherwise"
+    # Round 33: a question turn DOES carry the two tools that answer one —
+    # it carried none, and the model spent its first iteration on whatever
+    # the always-included set happened to hold. What it must not carry is
+    # the do-something set, which `test_work_tracking_not_on_greeting_or_
+    # question` pins.
+    assert "exec" not in kept, "question stays lean otherwise"
 
 
 def test_always_included_set_pins():

@@ -1776,7 +1776,16 @@ class AgentRunner:
                 _ephemeral_session = (
                     (
                         prompt_profile == PromptProfile.AUTOPILOT
-                        or (channel or "").strip().lower() == "trigger"
+                        or (channel or "").strip().lower() in (
+                            "trigger",
+                            # Round 33: an automation THREAD turn. Its record
+                            # is the automation ledger, not `messages` — a
+                            # thread turn saved as a day-chat row is the R31
+                            # leak — so a Conversation per typed sentence
+                            # would be a stream of empty day chats nobody
+                            # asked for.
+                            "automation_thread",
+                        )
                     )
                     and not session_id
                     and not save_user_message
@@ -3312,6 +3321,20 @@ class AgentRunner:
             # searches push progress, and the step index is set before the
             # batch's tool_end frames are attributed.
             _bk_tcs = [tc for tc in pending_tool_calls if tc["name"] in BOOKKEEPING_TOOLS]
+            # ── The job id cannot wait for the batch (round 33, item 1) ──────
+            # `on_tool_end` is the ONLY frame carrying a tool's result to the
+            # client, and it is emitted in the SEQUENTIAL loop below — which
+            # does not begin until the slowest parallel tool has finished. So
+            # for the ordinary shape of a research turn (`create_job` in the
+            # same response as the web searches, which the speed contract
+            # asks for), `create_job`'s `{"job_id": …}` was withheld for the
+            # entire search. The app claims its turn's job off that result, so
+            # for that whole window the turn owned no job: the card fell to
+            # the ambient footer ABOVE the animation, and moved when the claim
+            # finally landed. A bookkeeping tool's end frame is emitted the
+            # moment it completes, and its id recorded so the loop below does
+            # not send it twice.
+            _early_end_ids: set = set()
 
             async def _run_bookkeeping() -> None:
                 for tc in _bk_tcs:
@@ -3350,6 +3373,38 @@ class AgentRunner:
                         "elapsed_ms": _bk_done_ms - _bk_started_ms,
                         **_steps.event_fields(),
                     })
+                    # …and the CLIENT's end frame, now rather than after the
+                    # batch. `_steps.observe` ran just above, so
+                    # `event_fields()` already carries the job this call
+                    # created — which is the whole point of sending it early.
+                    if on_tool_end:
+                        try:
+                            _bk_summary = client_summary(
+                                _bk_result, cap=200, tool_name=tc["name"],
+                                is_skill_tool=bool(
+                                    self.skill_loader
+                                    and self.skill_loader.is_skill_tool(tc["name"])),
+                            )
+                            if _tool_end_meta:
+                                await on_tool_end(
+                                    tc["name"], _bk_summary, tc.get("input"),
+                                    meta={
+                                        "call_id": tc["id"],
+                                        "elapsed_ms": _bk_done_ms - _bk_started_ms,
+                                        "started_ms": _bk_started_ms,
+                                        "completed_ms": _bk_done_ms,
+                                        **_steps.event_fields(),
+                                    },
+                                )
+                            else:
+                                await on_tool_end(
+                                    tc["name"], _bk_summary, tc.get("input"))
+                            _early_end_ids.add(tc["id"])
+                        except Exception:  # noqa: BLE001 — a frame never fails a turn
+                            logger.debug(
+                                "[AGENT] early bookkeeping tool_end failed",
+                                exc_info=True,
+                            )
 
             _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
             # The web batch runs concurrently when there are ≥2 web calls, OR
@@ -3553,7 +3608,11 @@ class AgentRunner:
                                 "tool record", exc_info=True,
                             )
                 tool_event_records.append(_rec)
-                if on_tool_end:
+                # `_early_end_ids`: a bookkeeping tool already sent its end
+                # frame from `_run_bookkeeping`, the moment it finished. The
+                # persisted record above still happens here — only the client
+                # frame is not sent twice.
+                if on_tool_end and tc["id"] not in _early_end_ids:
                     # The tool's USER-facing sentence, never its model-facing
                     # return value. See app/agent/tool_display.py — this line
                     # used to be `result[:200]` and shipped tenant uuids, the

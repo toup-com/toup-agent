@@ -73,10 +73,21 @@ def dump_steps(steps: List[Dict[str, Any]]) -> str:
     return json.dumps(steps)
 
 
-def _stamp_close(step: Dict[str, Any], started: Optional[datetime], now: datetime) -> None:
+def _stamp_close(
+    step: Dict[str, Any], started: Optional[datetime], now: datetime,
+    measured: bool = True,
+) -> None:
     """Close ``step`` at ``now``, opening it at ``started`` when it never
-    opened. Idempotent: an already-closed step keeps its window."""
+    opened. Idempotent: an already-closed step keeps its window.
+
+    ``measured=False`` closes the step WITHOUT a duration: the step is
+    done, and how long it took is not known. Writing a number there is
+    what put the job's whole elapsed time on every one of its steps.
+    """
     if step.get("completed_at"):
+        return
+    if not measured:
+        step["completed_at"] = _iso(now)
         return
     if not step.get("started_at"):
         step["started_at"] = _iso(started or now)
@@ -138,6 +149,14 @@ def advance_steps(
     for i, s in enumerate(steps):
         if i <= k:
             if s.get("status") != "done":
+                # MEASURED, always — deliberately NOT `finish_all_steps`'s
+                # owner rule. An `update_job` tick closes inside a REAL,
+                # observed window (the running step's own run, typically a
+                # second or two), so a step the tick jumped over sharing it
+                # is an honest approximation and the round-8 contract this
+                # path was built for: "never zero, never unknown". The
+                # window at TURN END is a different animal — there it is
+                # the whole job, which is why only that one has an owner.
                 s["status"] = "done"
                 _stamp_close(s, window_start, now)
         elif i == k + 1:
@@ -158,10 +177,36 @@ def finish_all_steps(
     if not steps:
         return steps
     window_start = _last_window_start(steps, len(steps) - 1, now, fallback_start)
-    for s in steps:
+    # ── One window belongs to ONE step (round 33, item 1) ───────────────
+    # This closed every outstanding step inside the SAME window, on the
+    # rule "a step closed in this window shares it". For a turn where the
+    # model never called `update_job` — the ordinary case, because the
+    # speed contract forbids calling one alone — that window is the whole
+    # job, so a three-step plan reported 16.2s, 16.2s and 16.2s: the job's
+    # own total, printed three times as if each step had taken it.
+    #
+    # `_last_window_start` answers when the window now closing OPENED, and
+    # exactly one step can honestly claim it:
+    #   • the step that was RUNNING, if one was — it is the step that has
+    #     been in that window; nothing after it ever started; or
+    #   • when none was running, the FIRST step being closed — it began
+    #     when its predecessor finished, which is a real edge.
+    # Every other step is closed WITHOUT a duration. A duration nobody
+    # measured is unknown, not the enclosing window, and every client
+    # already renders nothing for an absent one (`formatDurationMs`
+    # answers null).
+    running_idx = next(
+        (i for i, s in enumerate(steps) if s.get("status") == "running"), None,
+    )
+    owner_idx = running_idx if running_idx is not None else next(
+        (i for i, s in enumerate(steps) if s.get("status") != "done"), None,
+    )
+    for i, s in enumerate(steps):
         if s.get("status") != "done":
+            owns = i == owner_idx
             s["status"] = "done"
-            _stamp_close(s, window_start, now)
+            _stamp_close(s, window_start if owns else None, now,
+                         measured=owns)
     return steps
 
 

@@ -490,7 +490,9 @@ class BrainFiles:
     current_context: str = ""
     learned: str = ""
     #: (title, description) for every other non-empty file.
-    index: List[Tuple[str, Optional[str]]] = field(default_factory=list)
+    #: (title, description, slug) — the slug is the address the model is
+    #: told to pass to `memory_read_file` (round 33, item 2).
+    index: List[Tuple[str, Optional[str], str]] = field(default_factory=list)
     #: (title, body) for up to N lexically relevant files.
     relevant: List[Tuple[str, str]] = field(default_factory=list)
     file_count: int = 0
@@ -561,7 +563,7 @@ async def load_brain(
         r for r in sorted(rows, key=_sort_key)
         if r.slug not in ALWAYS_INJECTED_SLUGS and (r.body_md or "").strip()
     ]
-    brain.index = [(r.title, r.description) for r in others][:max_index]
+    brain.index = [(r.title, r.description, r.slug) for r in others][:max_index]
     brain.relevant = [
         (r.title, r.body_md or "") for r in lexical_rank(query, others)[:max_relevant]
     ]
