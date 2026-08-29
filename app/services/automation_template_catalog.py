@@ -301,6 +301,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Weekly work log",
             "mode": "auto",
+            "narration": {
+                "style": "digest",
+                "title": 'Your week, written up',
+                "goal": ("Write the week's work into a readable log entry - what moved, what shipped, what stalled - grouped by project, never a to-do triage."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "0 16 * * 5"}},
@@ -344,6 +349,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Daily standup notes",
             "mode": "auto",
+            "narration": {
+                "style": "digest",
+                "title": 'Your standup notes',
+                "goal": ("Turn yesterday's activity into standup notes - done, in flight, blocked - in the user's own voice, ready to post."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "0 9 * * 1-5"}},
@@ -595,6 +605,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Daily repo digest",
             "mode": "auto",
+            "narration": {
+                "style": "digest",
+                "title": 'The repo today',
+                "goal": ("Digest the repository's open issues - group them by area or theme and say what actually changed, never a personal task triage."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "30 17 * * 1-5"}},
@@ -730,6 +745,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Daily agenda",
             "mode": "auto",
+            "narration": {
+                "style": "digest",
+                "title": "Your day's agenda",
+                "goal": ("Lay the day's calendar out in order, with what each meeting needs - a schedule, not a task triage."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "30 7 * * 1-5"}},
@@ -793,6 +813,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Week-ahead digest",
             "mode": "confirm",
+            "narration": {
+                "style": "digest",
+                "title": 'Your week ahead',
+                "goal": ("Fold next week's calendar into one readable preview - group by day, flag the heavy days - a preview, not a task triage."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "0 8 * * 1"}},
@@ -890,6 +915,11 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Class email digest",
             "mode": "auto",
+            "narration": {
+                "style": "digest",
+                "title": "Today's class mail",
+                "goal": ("Collect the day's class emails into one digest - group by course or sender - a record, not a task triage."),
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "0 17 * * 1-5"}},
@@ -988,6 +1018,16 @@ CATALOG: list[dict] = [
             "version": 2,
             "name": "Newsletter roundup",
             "mode": "confirm",
+            # R36-7: this automation's result is a DIGEST of its own
+            # material, never the morning triage.
+            "narration": {
+                "style": "digest",
+                "title": "This week's newsletters",
+                "goal": "Fold the week's newsletters into one readable "
+                        "roundup — group them by theme or sender, pull "
+                        "out anything genuinely worth a click, and stage "
+                        "the whole thing as one Gmail draft.",
+            },
             "trigger": {"sources": [
                 {"id": "sched", "mode": "schedule",
                  "schedule": {"cron_local": "0 9 * * 0"}},

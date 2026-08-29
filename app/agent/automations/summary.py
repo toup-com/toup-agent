@@ -377,7 +377,13 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             # says nothing about the two that are broken.
             failed_ids = ledger._cfg_of(last).get("accounts_failed") or []
             when = _clock(last.completed_at or last.created_at, tz)
-            n_ok = max(touched - len(failed_ids), 0)
+            # R36-10: an account with one ok read and one failed call
+            # WAS read — count reads, not the absence of failures.
+            # `accounts_read_ok` is stamped by close_ledger since R36;
+            # older runs fall back to the old derivation.
+            read_ok_ids = ledger._cfg_of(last).get("accounts_read_ok")
+            n_ok = (len(read_ok_ids) if read_ok_ids is not None
+                    else max(touched - len(failed_ids), 0))
             total_accounts = max(len(members), touched)
             if _brief_not_posted(last):
                 meta = account_health.form("ran_brief_not_posted", t=when)

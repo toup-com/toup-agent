@@ -199,3 +199,52 @@ async def test_payload_carries_category_and_variables(synced_db):
     assert payload["category"] == "email"
     assert any(v["name"] == "boss_email" for v in payload["variables"])
     assert payload["spec"]["version"] == 2
+
+
+def test_the_set_up_button_path_validates_for_every_template(registry):
+    """R36-1 — the ENDPOINT's exact pre-create mutations, not the bare
+    spec. The lint above stayed green for weeks while 19 of 28
+    templates 422'd on "Set up", because `from_template` stamped
+    `variables` onto v1 specs (an unknown top-level field there) and
+    never passed `template_vars` — so a required variable with no
+    default was an `unknown_variable` error instead of a setup-thread
+    question. This test IS that endpoint path; if it and the endpoint
+    ever drift again, drift the test first."""
+    failures = []
+    for e in CATALOG:
+        spec = dict(e.get("spec") or {})
+        variables = dict(spec.get("variables") or {})
+        declared: set = set()
+        for v in e.get("variables") or []:
+            name = v.get("name")
+            if not name:
+                continue
+            declared.add(str(name))
+            if not variables.get(name) and v.get("default"):
+                variables[name] = v["default"]
+        if spec.get("version") == 2:
+            spec["variables"] = variables
+        if spec.get("description") is None and e.get("description"):
+            spec["description"] = e.get("description")
+        try:
+            validate_spec(spec, registry, template_mode=True,
+                          template_vars=declared)
+        except SpecError as exc:
+            failures.append((e["slug"], exc.errors))
+    assert not failures, failures
+
+
+def test_digest_templates_carry_their_own_narration():
+    """R36-7 — a template whose product is a digest names it, so the
+    narrator stops dressing every result as the morning triage."""
+    by_slug = {e["slug"]: e for e in CATALOG}
+    hint = (by_slug["newsletter-roundup"]["spec"].get("narration") or {})
+    assert hint.get("style") == "digest"
+    assert hint.get("title") == "This week's newsletters"
+    assert hint.get("goal")
+    for slug in ("daily-repo-digest", "week-ahead-digest",
+                 "class-email-digest", "daily-agenda",
+                 "weekly-work-log", "daily-standup-notes"):
+        h = by_slug[slug]["spec"].get("narration") or {}
+        assert h.get("style") == "digest", slug
+        assert 1 <= len(h.get("title") or "") <= 80, slug

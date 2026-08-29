@@ -1087,11 +1087,13 @@ class AutomationsSkill(Skill):
                 "not report a status instead.",
                 display="Could not start the run",
             )
-        # The route AWAITS the run — `run_schedule_fire_v2` is not
-        # dispatched, it is executed — so by the time this returns the
-        # run is usually over. Telling the model to say "it is running"
-        # regardless would have it announce a present tense that is
-        # already false, to a user who just waited out the whole run.
+        # R36-2: the route DETACHES the run and answers "started"
+        # immediately (holding the HTTP response open for minutes
+        # taught the app's client to declare "Nothing ran" about a run
+        # the server was mid-way through). The terminal branch below
+        # stays for the day a caller gets a finished status back —
+        # announcing "it is running" about a run that ended would be
+        # the same lie in the other direction.
         status = str((fired or {}).get("status") or "").strip()
         if status in ("completed", "partial", "failed", "stopped_by_user"):
             return ToolResult(

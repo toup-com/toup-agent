@@ -129,7 +129,7 @@
     "needs_check": {
       "fix": "check",
       "tone": "warning",
-      "pill": "Needs a check",
+      "pill": "Needs you",
       "home_meta": "{Connector} needs a look",
       "job_card_label": "Could not read {Connector}",
       "sheet_subtitle": "Could not be read — the reason is not clear yet",
@@ -138,8 +138,8 @@
       "button_label": "Check it",
       "menu_sub": "{Connector} could not be read, and did not say why.",
       "card_stamp": "NEEDS YOU",
-      "workflow_caption": "Needs a check",
-      "picker_caption": "Needs a check"
+      "workflow_caption": "Needs you",
+      "picker_caption": "Needs you"
     }
   },
   "state_aliases": {
@@ -266,6 +266,17 @@
       "thread_sentence": "I could not read {Connector}, and it did not tell me why. Check it below and I will pick up from there.",
       "job_card_label": "Could not read {Connector}",
       "home_meta": "{Connector} needs a look"
+    },
+    "grant_missing": {
+      "state": "needs_check",
+      "fix": "grant",
+      "transient": false,
+      "sheet_detail": "it needs your permission first",
+      "button_label": "Grant access",
+      "thread_sentence": "It does not have your permission to write to {Connector} yet. Grant it below and I will pick up from there.",
+      "job_card_label": "Needs your permission for {Connector}",
+      "home_meta": "{Connector} needs your permission",
+      "notification_body": "It stopped before writing to {Connector} - it does not have your permission for that yet. Open the run and grant it there."
     }
   },
   "fix_buttons": {

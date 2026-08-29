@@ -91,14 +91,26 @@ def test_failed_names_the_connector_and_offers_the_fix():
     assert "refused" not in anon
 
 
-def test_needs_you_expired_access_and_waiting():
-    expired = notification_body(
+def test_needs_you_carries_the_real_reason_and_never_guesses():
+    # R36-6. This branch used to assert "access ran out" for EVERY
+    # named connector — one Gmail failure read "it did not tell me why"
+    # in the thread and "access ran out, reconnect" on the card. When
+    # run_v3 resolved the classified reason, the card says it; when it
+    # could not, the card says where the reason is written — it never
+    # invents a mechanism.
+    classified = notification_body("automation_needs_you", {
+        "failed_connector_name": "GitHub",
+        "failed_reason_body": "GitHub access ran out, so it stopped "
+                              "where it was. Reconnect and it picks up "
+                              "from there.",
+    })
+    assert classified.startswith("GitHub access ran out")
+    unclassified = notification_body(
         "automation_needs_you", {"failed_connector_name": "GitHub"}
     )
-    assert expired == (
-        "GitHub access ran out, so it stopped where it was. "
-        "Reconnect and it picks up from there."
-    )
+    assert "ran out" not in unclassified
+    assert "GitHub" in unclassified
+    assert "thread" in unclassified
     waiting = notification_body("automation_needs_you", {"status": "waiting_on_user"})
     assert waiting == (
         "It prepared a change and is waiting on you — "

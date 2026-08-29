@@ -117,6 +117,20 @@ _SCOPE_RE = re.compile(
     r"|scope_missing|needs? more access",
     re.IGNORECASE,
 )
+# The dispatcher's own grant-gate refusal (connector_dispatcher.
+# _resolve_automation_grant). R36-6: this is a permission the user was
+# never asked for, not a connector that broke — it must never render as
+# "Could not reach {Connector}" / "it did not tell me why", which is
+# exactly what it did when a template's ungranted draft step reached
+# the gate. Matched BEFORE the scope regex: the gate's wording contains
+# "permission", and scope_missing's "grant more access" button is the
+# wrong fix for a grant that needs approving in the thread.
+_GRANT_GATE_RE = re.compile(
+    r"no approved permission backs this automation call"
+    r"|automations fail closed"
+    r"|permission backing this automation",
+    re.IGNORECASE,
+)
 
 PROBE_CACHE_S = 600  # ten minutes — vendor rate limits, §4.4
 
@@ -332,6 +346,8 @@ def classify(reason: Optional[str], message: str = "") -> str:
     token = (reason or "").strip()
     if token.startswith("scope_missing"):
         return token                      # already carries its scope
+    if _GRANT_GATE_RE.search(message or ""):
+        return "grant_missing"
     if _ORG_APPROVAL_RE.search(message or ""):
         return "org_approval_needed"
     if _SCOPE_RE.search(message or ""):

@@ -141,6 +141,8 @@ async def _execute_claimed(db, outbox_id: str) -> str:
     row.attempts = (row.attempts or 0) + 1
     await db.commit()
 
+    import time as _time
+    _t0 = _time.monotonic()
     result = await reg.dispatch_via_platform(
         row.user_id,
         connector_id=row.connector_id,
@@ -150,6 +152,7 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         automation_id=row.automation_id,
         request_id=f"outbox:{row.id}",
     )
+    _ms = int((_time.monotonic() - _t0) * 1000)
     kind = result.get("kind")
     now = datetime.utcnow()
 
@@ -177,7 +180,7 @@ async def _execute_claimed(db, outbox_id: str) -> str:
                           .get("steps_partial"))
         await _record_health(db, row.automation_id, ok=True, error=None,
                              clean=_clean)
-        await _append_write_turn(db, row, write_row)
+        await _append_write_turn(db, row, write_row, ms=_ms)
         if row.tool_name in _DRAFT_TOOLS:
             # The proactive-draft surface (R29): a session card that
             # names the draft and tells the "nothing was sent" truth.
@@ -218,6 +221,18 @@ async def _execute_claimed(db, outbox_id: str) -> str:
     row.result_json = json.dumps(result, default=str)[:8000]
     await db.commit()
     await _mark_write_step(db, row, ok=False)
+    # R35: a delivery that hard-failed used to vanish — no tool turn,
+    # no needs-you card, absent from `accounts_failed` — so the run
+    # said "Could not reach GitHub and Teams" while the one step the
+    # automation exists FOR had also failed, silently. The founder's
+    # Slack card on the fleet came from the deleted question-run path;
+    # this is the honest replacement: the turn (with the real call
+    # under it), the card with its button, and membership in the
+    # failed list so `resume_source` can pick it up.
+    await _append_failed_write_turn(
+        db, row, ms=_ms,
+        reason_kind=str(kind or ""), message=str(result.get("message") or ""),
+    )
     await _finalize_run(
         db, row, status="failed", outcome="write_failed",
         error_class="tool_error",
@@ -526,13 +541,15 @@ def _write_ledger_row(row: AutomationOutbox):
         return None
 
 
-async def _append_write_turn(db, row: AutomationOutbox, write_row) -> None:
+async def _append_write_turn(db, row: AutomationOutbox, write_row,
+                             *, ms: int = 0) -> None:
     """The v3 write tool turn (+ the draft turn for draft tools) into
     the automation's thread. Best-effort: the ledger row above is the
     durable record; the turn is its display."""
     try:
         from . import ledger
         from .run_v3 import notify_progress  # noqa: F401 — module load check
+        from .executor_v2 import _action_record
         # `ensure_thread` for the same reason as the park above: the
         # day-chat card that used to be the guaranteed surface is gone,
         # so a write's record in the thread cannot be conditional on a
@@ -554,7 +571,11 @@ async def _append_write_turn(db, row: AutomationOutbox, write_row) -> None:
             payload={
                 "account_id": row.connector_id, "tool_kind": "write",
                 "action": act["action"], "detail": act["detail"],
-                "ok": True, "ms": 0, "steps": [], "items": [],
+                "ok": True, "ms": max(int(ms), 0), "steps": [], "items": [],
+                "actions": [_action_record(
+                    row.tool_name, ok=True, ms=ms,
+                    summary=act["detail"] or None,
+                )],
                 "write_ids": [write_row.id] if write_row is not None else [],
                 "rest": "",
             },
@@ -578,6 +599,94 @@ async def _append_write_turn(db, row: AutomationOutbox, write_row) -> None:
                 )
     except Exception as e:  # noqa: BLE001
         logger.debug("[automations] write turn skipped: %s", e)
+
+
+async def _append_failed_write_turn(
+    db, row: AutomationOutbox, *, ms: int,
+    reason_kind: str, message: str,
+) -> None:
+    """R35: the failed delivery's honest record — the ok=False tool
+    turn (which is what puts the account into `close_ledger`'s
+    `accounts_failed`, and with it inside `resume_source`'s reach), the
+    needs-you card with its button, and the health projection update.
+    Best-effort like its success twin: the outbox row is the durable
+    record; these are its display."""
+    try:
+        from . import account_health as _ah, ledger
+        from .executor_v2 import _action_record, merge_job_config
+        from app.services import automation_verbs as _verbs
+        thread = await ledger.ensure_thread(
+            db, user_id=row.user_id, automation_id=row.automation_id,
+        )
+        if thread is None:
+            return
+        code = _ah.classify(reason_kind, message)
+        state, fix = _ah.state_for_reason(code)
+        name = _verbs.display_name(row.connector_id) or "the account"
+        act = _verbs.failure_action(row.connector_id, reason_kind or None)
+        line = _ah.sentence_for(
+            account_state=state, reason_code=code,
+            connector_id=row.connector_id or "",
+            name=_ah.display_of(row.connector_id or ""),
+        ) or act["detail"] or f"Could not post to {name}."
+        await ledger.append_turn(
+            db, user_id=row.user_id, thread=thread, run_id=row.job_id,
+            kind="tool",
+            payload={
+                "account_id": row.connector_id, "tool_kind": "write",
+                "action": act["action"], "detail": act["detail"],
+                "ok": False, "ms": max(int(ms), 0),
+                "steps": [
+                    {"text": f"Asked {name} to take the post", "ok": True},
+                    {"text": (act["detail"] or "It did not answer")
+                     .capitalize(), "ok": False},
+                ],
+                "actions": [_action_record(
+                    row.tool_name, ok=False, ms=ms,
+                    summary=(message or reason_kind or None),
+                )],
+                "items": [], "write_ids": [], "rest": "",
+                "line": line, "tone": "warning",
+                **({"fix": fix} if fix else {}),
+                "reason_code": code,
+            },
+        )
+        await ledger.append_turn(
+            db, user_id=row.user_id, thread=thread, run_id=row.job_id,
+            kind="needs_you",
+            payload=_ah.needs_you_payload(
+                account_id=row.connector_id,
+                connector_id=row.connector_id,
+                name=name,
+                reason_code=code or "unknown_error",
+            ),
+        )
+        if row.job_id:
+            job = await db.get(BuildJob, row.job_id)
+            cfg = (job.config_json or {}) if job is not None else {}
+            failed = list(cfg.get("accounts_failed") or [])
+            if row.connector_id not in failed:
+                failed.append(row.connector_id)
+            sources = list(cfg.get("failed_sources") or [])
+            if not any(f.get("account_id") == row.connector_id
+                       for f in sources):
+                sources.append({
+                    "account_id": row.connector_id,
+                    "reason_code": code,
+                    "step_id": (_display_of(row).get("step_id") or ""),
+                    "at": datetime.utcnow().isoformat() + "Z",
+                    "message": (message or reason_kind or "")[:300],
+                })
+            await merge_job_config(
+                db, row.job_id,
+                accounts_failed=failed, failed_sources=sources,
+            )
+        await _ah.record_use(
+            db, user_id=row.user_id, account_id=row.connector_id,
+            ok=False, reason_code=reason_kind or "", message=message or "",
+        )
+    except Exception as e:  # noqa: BLE001 — display beside a durable row
+        logger.warning("[automations] failed-write turn skipped: %s", e)
 
 
 async def _mark_write_step(db, row: AutomationOutbox, *, ok: bool) -> None:

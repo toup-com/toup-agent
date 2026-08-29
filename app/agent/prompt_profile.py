@@ -376,16 +376,17 @@ TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
 # reschedule something. Prompts are advisory — tool-list omission is
 # hard.
 #
-# What it deliberately KEEPS is the connector surface, reads and writes
-# alike — which widens the module's old "no write tools at all", and
-# does so knowingly. A thread turn is ATTENDED: the user typed it and is
-# looking at the answer, so its situation is the main chat's, not a
-# routine's, and `connector_dispatcher`'s unattended deny list
-# (`_MUTATES_UNATTENDED_DENY_CHANNELS`) is correctly not extended to it.
-# A mutating call still meets the same per-tool `elevation` confirmation
-# the main chat puts in front of it. "Post that to Slack", asked inside
-# the automation whose job is posting to Slack, is a reasonable thing to
-# be able to say.
+# What it deliberately KEEPS is the connector READ surface. Writes are
+# refused one layer down: `automation_thread` IS in
+# `connector_dispatcher._MUTATES_UNATTENDED_DENY_CHANNELS` (b44815f7),
+# because the elevation-confirmation card a mutating call would need
+# has no proven surface in the thread yet, and a confirmation the
+# surface cannot show is a wedge. The earlier position recorded here —
+# attended surface, so writes should meet the main chat's elevation
+# flow ("Post that to Slack", asked inside the automation whose job is
+# posting to Slack, is a reasonable thing to be able to say) — is the
+# direction of travel once the thread can render that card; until then
+# the deny list is the enforcement and this comment matches it.
 AUTOMATION_THREAD_DISABLED_TOOLS: frozenset[str] = frozenset({
     "create_job",
     "update_job",

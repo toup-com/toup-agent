@@ -59,16 +59,21 @@ async def create_automation(
     template_slug: Optional[str] = None,
     domain: Optional[str] = None,
     template_mode: bool = False,
+    template_vars: Optional[set] = None,
 ) -> tuple[Automation, ValidatedSpec]:
     """Validate + persist a spec as a DRAFT automation with compiled
     (but disabled) bindings. Raises SpecError with every problem.
     `template_mode` (R30 from-template): write steps may lack grants —
     the draft cannot ARM until the grant conversation completes
-    (arm_automation verifies fail-closed), so nothing weakens."""
+    (arm_automation verifies fail-closed), so nothing weakens.
+    `template_vars` (R36-1): the template's DECLARED variable names —
+    an unanswered required variable is a setup-thread question, not a
+    validation error, so its references must count as declared here."""
     from app.agent.automations.memory_notes import normalize_domain
 
     capability = await reg.fetch_registry(user_id)
-    vspec = validate_spec(spec, capability, template_mode=template_mode)
+    vspec = validate_spec(spec, capability, template_mode=template_mode,
+                          template_vars=template_vars)
 
     automation = Automation(
         user_id=user_id,
@@ -280,6 +285,46 @@ async def delete_automation(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] notification cleanup skipped %s: %s",
+                       automation_id, e)
+
+    # R36-8: the day-chat cards stop pointing at a thread that no
+    # longer opens. The card stays (it is the user's record that this
+    # ran), but its status says so and its body stops inviting a tap
+    # into a dead screen — the founder's 6:54 card still read "open the
+    # run" two hours after he deleted the automation.
+    try:
+        from sqlalchemy import select as _select
+        from .cards import update_card_message, broadcast_card
+        rows = (await db.execute(
+            _select(AutomationNotification)
+            .where(AutomationNotification.automation_id == automation_id)
+            .where(AutomationNotification.message_id.isnot(None))
+        )).scalars().all()
+        seen_msgs: set = set()
+        for row in rows:
+            if row.message_id in seen_msgs:
+                continue
+            seen_msgs.add(row.message_id)
+            row.status = "deleted"
+            row.body = "This automation was deleted."
+            payload = None
+            try:
+                from .run_v3 import _notification_payload
+                payload = _notification_payload(row)
+            except Exception:  # noqa: BLE001
+                payload = None
+            if payload is not None:
+                await update_card_message(
+                    db, message_id=row.message_id,
+                    metadata_key="automation_notification",
+                    payload=payload,
+                )
+                await broadcast_card(
+                    user_id, "automation_notification",
+                    {**payload, "message_id": row.message_id},
+                )
+    except Exception as e:  # noqa: BLE001 — retiring copy never blocks
+        logger.warning("[automations] card retire skipped %s: %s",
                        automation_id, e)
 
     await db.commit()
@@ -565,7 +610,12 @@ def _parse_spec(automation: Automation) -> ValidatedSpec:
     would silently observe nothing."""
     raw = json.loads(automation.spec_json)
     if raw.get("version") == 2:
-        return validate_spec(raw, _permissive_registry_v2(raw))
+        # template_mode: a persisted spec already passed the create
+        # gate; this re-parse is shape recovery, not re-litigation — an
+        # ungranted write (legal for a from-template draft) must parse
+        # as the WRITE it is, not fail or demote to a read (R36-5).
+        return validate_spec(raw, _permissive_registry_v2(raw),
+                             template_mode=True)
     trig = raw.get("trigger") or {}
     act = raw.get("action") or {}
     dk = str(raw.get("dedupe_key") or "")
@@ -627,7 +677,14 @@ def _permissive_registry_v2(raw: dict) -> dict:
         if not cid:
             continue
         entry = _entry(cid)
-        if step.get("grant_id") and step.get("tool"):
+        # R36-5: writes are writes by TOOL. Keying this on grant_id let
+        # an ungranted template draft re-validate as a READ, and the
+        # fire path then executed gmail__create_draft through the read
+        # loop — straight into the dispatcher's grant gate, whose
+        # refusal the thread reported as "Could not reach Gmail".
+        from app.services.automation_verbs import is_write_tool
+        if step.get("tool") and (step.get("grant_id")
+                                 or is_write_tool(step.get("tool"))):
             entry["scopes_write_by_action"][step["tool"]] = []
     return permissive
 
@@ -643,7 +700,13 @@ async def parse_spec_live(automation: Automation) -> ValidatedSpec:
     raw = json.loads(automation.spec_json)
     if capability:
         try:
-            return validate_spec(raw, capability)
+            # template_mode (R36-5): grants are enforced at DISPATCH
+            # (the grant gate) and at ARM (fail-closed verify) — not by
+            # this parse. Without it, every from-template automation
+            # whose write is still ungranted failed `write_without_
+            # grant` HERE on the fire path, fell back to the permissive
+            # shape, and ran its draft step as a read.
+            return validate_spec(raw, capability, template_mode=True)
         except SpecError as e:
             logger.warning(
                 "[automations] persisted spec no longer validates against "

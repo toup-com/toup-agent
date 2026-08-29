@@ -291,6 +291,22 @@ _WRITE_CLAUSES = {
 }
 
 
+def is_write_tool(tool: Optional[str]) -> bool:
+    """True when `tool` is a declared write action (R36-5).
+
+    The manifests' `scopes_write_by_action` keys and this table are the
+    same ten tools, and this one is importable without the registry —
+    which is what the raw-spec derivations (`workflow._write_tools`,
+    `service._permissive_registry_v2`) need: an UNGRANTED template
+    write step carries no grant_id and no grant_target key, so grant
+    presence cannot be the test for "is this a write". It was, and a
+    from-template draft automation derived "reads only" on every
+    surface while its draft step ran as a read straight into the
+    dispatcher's grant gate.
+    """
+    return str(tool or "") in _WRITE_CLAUSES
+
+
 def _trigger_clause(raw: dict) -> str:
     trig = raw.get("trigger") or {}
     sources = trig.get("sources")

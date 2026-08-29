@@ -33,9 +33,14 @@ this module always claimed are enforced by the channel rather than by
 having no tools —
 `prompt_profile.AUTOMATION_THREAD_DISABLED_TOOLS` withholds every
 deferral tool, every memory writer and every routine/trigger mutator.
-The connector surface it KEEPS, reads and writes alike: a thread turn
-is attended, so a mutating call meets the same per-tool `elevation`
-confirmation the main chat puts in front of it. Persistence
+The connector surface it keeps is the READ half: `automation_thread`
+sits in `connector_dispatcher._MUTATES_UNATTENDED_DENY_CHANNELS`, so a
+mutating connector call is refused at the dispatcher. An earlier
+version of this note argued the opposite (attended surface ⇒ writes
+meet the same elevation confirmation as main chat) — that stays the
+direction of travel, but the elevation CARD has no proven surface in
+the thread yet, and a confirmation the surface cannot show is a wedge,
+not a safeguard. Reads are the whole founder ask here. Persistence
 stays with the ledger, which is what keeps a thread question out of
 the day chat (the R31 leak this module was written to close).
 """

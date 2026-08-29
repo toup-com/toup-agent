@@ -91,3 +91,33 @@ def test_mode_label_names_the_real_target():
 def test_unknown_mode_refuses():
     with pytest.raises(ValueError):
         setup_turns("autonomous")
+
+
+def test_setup_turns_cover_every_account():
+    """R35: one capability turn PER account. The flattened single turn
+    was stamped `members[0]` at both call sites, so a six-account brief
+    opened with "Checked 1 account" and a lone Jira chip."""
+    from app.agent.automations.setup_script import setup_turns
+    drafts = setup_turns(
+        "reads_only", "", "tonight",
+        accounts=[
+            {"account_id": "jira",
+             "steps": [{"text": "Read your board", "ok": True}]},
+            {"account_id": "gmail",
+             "steps": [{"text": "Read new mail", "ok": True}]},
+            {"account_id": "slack", "steps": []},
+        ],
+    )
+    tools = [d for d in drafts if d.get("kind") == "tool"]
+    assert [t["account_id"] for t in tools] == ["jira", "gmail", "slack"]
+    assert tools[0]["steps"] == [{"text": "Read your board", "ok": True}]
+    # The agent open and close still frame the checks, in order.
+    assert drafts[0]["kind"] == "agent" and drafts[-1]["kind"] == "agent"
+
+
+def test_setup_turns_without_accounts_keeps_the_legacy_shape():
+    from app.agent.automations.setup_script import setup_turns
+    drafts = setup_turns("reads_only", "", "tonight",
+                         [{"text": "Read new mail", "ok": True}])
+    tools = [d for d in drafts if d.get("kind") == "tool"]
+    assert len(tools) == 1 and "account_id" not in tools[0]

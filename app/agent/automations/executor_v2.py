@@ -1165,6 +1165,33 @@ def _write_display(st: ValidatedStep) -> dict:
     }
 
 
+def _action_record(
+    tool: Optional[str], *, ok: bool, ms: int,
+    summary: Optional[str] = None,
+) -> dict:
+    """One executed tool call, in the main chat's vocabulary.
+
+    `label` comes from the SAME table the main chat's job card reads
+    (`tool_display.public_step_label`), so "Retrieve latest messages"
+    is one string on both surfaces rather than two translations of one
+    call. Total: a missing label degrades to the raw tool id's verb
+    half, never to an exception — this runs inside ledger appends.
+    """
+    label = ""
+    try:
+        from app.agent.tool_display import public_step_label
+        label = public_step_label(tool or "") or ""
+    except Exception:  # noqa: BLE001 — display only
+        label = ""
+    return {
+        "tool": str(tool or ""),
+        "label": label,
+        "ok": bool(ok),
+        "ms": max(int(ms), 0),
+        "summary": (str(summary)[:200] if summary else ""),
+    }
+
+
 async def _append_read_turn(
     db, *, thread, automation: Automation, job_id: str,
     step: ValidatedStep, result: Optional[dict], ms: int, ok: bool,
@@ -1227,6 +1254,15 @@ async def _append_read_turn(
                 "ok": ok, "ms": max(int(ms), 0),
                 "steps": steps_lines, "items": items,
                 "write_ids": [], "rest": "",
+                # R35: the REAL call, under the sentence. The app's act
+                # page had a slot for this and nothing ever filled it —
+                # every step read as a claim with no work behind it,
+                # which the founder read (reasonably) as "the run never
+                # actually calls the connector tools".
+                "actions": [_action_record(
+                    step.tool, ok=ok, ms=ms,
+                    summary=act["detail"] or None,
+                )],
                 **{k: v for k, v in extra.items() if v},
             },
         )
@@ -1301,6 +1337,13 @@ async def _narrate_phase1(
         # holds that judgement.
         from .narrator import vocabulary_for
         vocabulary = vocabulary_for(st.tool for st in vspec.write_steps)
+        # R36-7: an automation whose spec names its own narration style
+        # speaks it — a Newsletter roundup is a digest of newsletters,
+        # not a morning triage, however its delivery tool classifies.
+        narration_hint = dict((vspec.raw or {}).get("narration") or {})
+        if str(narration_hint.get("style") or "") in ("digest", "brief",
+                                                      "changes"):
+            vocabulary = str(narration_hint["style"])
         steps_record = []
         from app.services import automation_verbs as _verbs
         for st in vspec.steps:
@@ -1351,7 +1394,15 @@ async def _narrate_phase1(
             })
         record = {
             "automation": {"title": automation.name,
-                           "mode": (vspec.raw or {}).get("mode") or "auto"},
+                           "mode": (vspec.raw or {}).get("mode") or "auto",
+                           # R36-7: the task statement. Every automation
+                           # was narrated with nothing but its name, so
+                           # every one of them got the same treatment.
+                           "description": (
+                               (vspec.raw or {}).get("description")
+                               or automation.description or ""
+                           )},
+            "narration": narration_hint,
             "run_kind": _ledger.run_kind_of(job),
             "vocabulary": vocabulary,
             "status": "partial" if partial else "completed",
@@ -1548,7 +1599,17 @@ async def resume_source(
         None,
     )
     if step is None:
-        return {"resumed": False, "reason": "no_step"}
+        # R35: the founder's Slack "Try again". A connector whose only
+        # step is the WRITE has no read to re-run, and this returned
+        # `no_step` — a 409 the app rendered as "Nothing ran" while the
+        # failed outbox row sat there holding the exact payload, tool
+        # and grant the retry needs. Re-stage that row and flush it
+        # inline; the outbox's own machinery appends the write turn,
+        # flips the step and aggregates the terminal.
+        return await _resume_write_source(
+            db, automation=automation, job=job, job_id=job_id,
+            account_id=account_id, cfg=cfg, failed=failed,
+        )
 
     thread = await _ledger.thread_for(db, automation.id)
     if thread is not None:
@@ -1612,6 +1673,99 @@ async def resume_source(
             await db.commit()
         await _record_health(db, automation.id, ok=True, error=None,
                              ran=True, clean=True)
+
+    try:
+        await run_v3.notify_resume(db, job_id=job_id)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[automations] resume notify skipped: %s", e)
+    await _ledger.emit_updated(
+        db, automation.user_id, automation_id=automation.id,
+    )
+    return {
+        "resumed": True,
+        "status": "completed" if not still_failed else "partial",
+        "reason": "",
+    }
+
+
+async def _resume_write_source(
+    db, *, automation: Automation, job, job_id: str,
+    account_id: str, cfg: dict, failed: list,
+) -> dict:
+    """Re-run ONE failed write of an existing run (R35).
+
+    The outbox row is the durable intent — payload, tool, grant — so a
+    retry is re-staging that exact row and flushing it inline. Its own
+    machinery then appends the write turn (with the real call under
+    it), flips the step, records health and aggregates the terminal;
+    the only thing left to this function is the run's failed-list
+    bookkeeping and the terminal flip `_finalize_job`'s guard refuses
+    on an already-terminal row.
+    """
+    from sqlalchemy import select as _select
+    from app.db.models import AutomationOutbox
+    from . import ledger as _ledger, run_v3
+    from .outbox import flush_row_when_due
+
+    rows = (await db.execute(
+        _select(AutomationOutbox)
+        .where(AutomationOutbox.job_id == job_id)
+        .where(AutomationOutbox.connector_id == account_id)
+        .where(AutomationOutbox.status == "failed")
+        .order_by(AutomationOutbox.created_at.desc())
+    )).scalars().all()
+    row = rows[0] if rows else None
+    if row is None:
+        return {"resumed": False, "reason": "no_step"}
+
+    thread = await _ledger.thread_for(db, automation.id)
+    if thread is not None:
+        await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=job_id,
+            kind="note",
+            payload={"stamp": "tried",
+                     "at": datetime.utcnow().isoformat() + "Z"},
+        )
+
+    # A fresh 3-attempt budget: the user asked, and the old count is
+    # about a different moment at the provider.
+    row.status = "staged"
+    row.attempts = 0
+    row.execute_after = datetime.utcnow()
+    row.next_attempt_at = datetime.utcnow()
+    await db.commit()
+    status = await flush_row_when_due(db, row.id)
+
+    if status != "executed":
+        # Failed again (a fresh turn + card were appended by the flush
+        # path) or went back to backoff — either way the run is still
+        # owed this write, and saying so is the honest answer.
+        return {"resumed": True, "status": "partial", "reason": ""}
+
+    still_failed = [a for a in failed if a != account_id]
+    sources = [
+        dict(f) for f in (cfg.get("failed_sources") or [])
+        if f.get("account_id") != account_id
+    ]
+    await merge_job_config(
+        db, job_id, accounts_failed=still_failed, failed_sources=sources,
+    )
+    if not still_failed:
+        # `_finalize_run` already tried to close the run as sent, and
+        # `_finalize_job`'s guard rightly refused to move a terminal
+        # row — the flip is this function's to make, exactly like the
+        # read path's partial→sent.
+        jrow = await db.get(BuildJob, job_id)
+        if jrow is not None and jrow.status == "failed" \
+                and (jrow.outcome or "") == "write_failed":
+            partial = bool((jrow.config_json or {}).get("steps_partial"))
+            jrow.status = "completed"
+            jrow.outcome = "partial" if partial else "sent"
+            jrow.error_class = None
+            jrow.user_message = None
+            await db.commit()
+            await _record_health(db, automation.id, ok=True, error=None,
+                                 ran=True, clean=not partial)
 
     try:
         await run_v3.notify_resume(db, job_id=job_id)

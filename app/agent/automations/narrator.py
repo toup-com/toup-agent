@@ -68,6 +68,30 @@ CHANGES_GROUPS: tuple[tuple[int, str, str], ...] = (
 )
 RESULT_TITLES = {"brief": "Your morning, in order", "changes": "What this run changed"}
 
+#: R36-7 — the tones a free-form ("digest") result may use. The app's
+#: tier chrome falls back to neutral for anything else, so this set is
+#: a wire contract, not a style preference.
+RESULT_TONES: tuple[str, ...] = ("danger", "warning", "slate", "success",
+                                 "ghost")
+
+
+def expected_result_title(vocabulary: str, record: dict) -> str:
+    """The one title this run's result turn must carry.
+
+    `brief`/`changes` are the fixed §3.6 titles. `digest` (R36-7) is
+    the automation's OWN title — the whole point of the vocabulary is
+    that a Newsletter roundup's result says "This week's newsletters",
+    not "Your morning, in order".
+    """
+    if vocabulary == "digest":
+        hint = record.get("narration") or {}
+        return str(
+            hint.get("title")
+            or (record.get("automation") or {}).get("title")
+            or "What this run found"
+        ).strip()
+    return RESULT_TITLES[vocabulary]
+
 #: R31-37 — which vocabulary a run's result wears. [C's judgement; A
 #: calls this at `executor_v2` where the run closes.]
 #:
@@ -194,7 +218,10 @@ def validate_drafts(drafts: list[dict], record: dict) -> list[str]:
             if d.get("rest"):
                 _guard(problems, f"{where}.rest", d.get("rest"))
         elif kind == "result":
-            problems.extend(_validate_result(d, vocabulary, all_item_ids, where))
+            problems.extend(_validate_result(
+                d, vocabulary, all_item_ids, where,
+                expected_title=expected_result_title(vocabulary, record),
+            ))
         else:
             problems.append(f"{where}: unknown kind {kind!r}")
 
@@ -215,26 +242,50 @@ def validate_drafts(drafts: list[dict], record: dict) -> list[str]:
 
 
 def _validate_result(
-    d: dict, vocabulary: str, all_item_ids: set, where: str
+    d: dict, vocabulary: str, all_item_ids: set, where: str,
+    *, expected_title: Optional[str] = None,
 ) -> list[str]:
     problems: list[str] = []
-    expected = BRIEF_GROUPS if vocabulary == "brief" else CHANGES_GROUPS
     if d.get("vocabulary") != vocabulary:
         problems.append(f"{where}: vocabulary must be {vocabulary!r}")
     # Whitespace-canonical title compare: a model copying a wrapped
     # prompt literal emits the newline too — canonicalize in place, the
     # title is prescribed anyway.
+    want_title = expected_title if expected_title is not None \
+        else RESULT_TITLES.get(vocabulary, "")
     title = " ".join(str(d.get("title") or "").split())
-    if title == RESULT_TITLES[vocabulary]:
+    if title == " ".join(str(want_title).split()):
         d["title"] = title
     else:
-        problems.append(f"{where}: title must be {RESULT_TITLES[vocabulary]!r}")
+        problems.append(f"{where}: title must be {want_title!r}")
     groups = d.get("groups") or []
-    got = [(g.get("rank"), g.get("label"), g.get("tone")) for g in groups]
-    if got != list(expected):
-        problems.append(
-            f"{where}: groups must be exactly {list(expected)!r} in order; got {got!r}"
-        )
+    if vocabulary == "digest":
+        # R36-7: free-form groups — the automation's own organisation of
+        # its own material. The rails that survive: sequential ranks,
+        # short non-empty CAPS-ish labels, tones from the app's tone
+        # set, and (below, shared) every item exactly once.
+        if not (1 <= len(groups) <= 6):
+            problems.append(f"{where}: digest needs 1-6 groups, "
+                            f"got {len(groups)}")
+        for gi, g in enumerate(groups, start=1):
+            if int(g.get("rank", gi)) != gi:
+                problems.append(f"{where}: group {gi} rank mismatch")
+            label = str(g.get("label") or "").strip()
+            if not (1 <= len(label) <= 48):
+                problems.append(f"{where}: group {gi} label must be "
+                                "1-48 characters")
+            if g.get("tone") not in RESULT_TONES:
+                problems.append(f"{where}: group {gi} tone must be one "
+                                f"of {list(RESULT_TONES)!r}")
+    else:
+        expected = BRIEF_GROUPS if vocabulary == "brief" else CHANGES_GROUPS
+        got = [(g.get("rank"), g.get("label"), g.get("tone"))
+               for g in groups]
+        if got != list(expected):
+            problems.append(
+                f"{where}: groups must be exactly {list(expected)!r} "
+                f"in order; got {got!r}"
+            )
     seen_refs: set[str] = set()
     for gi, g in enumerate(groups):
         for ri, row in enumerate(g.get("rows") or []):
@@ -253,7 +304,7 @@ def _validate_result(
                     )
                 seen_refs.add(ref)
     missing = sorted(all_item_ids - seen_refs)
-    if missing and vocabulary == "brief":
+    if missing and vocabulary in ("brief", "digest"):
         problems.append(
             "unaccounted items (every item the run touched appears exactly "
             f"once): {missing}"
@@ -302,6 +353,37 @@ named categories.
 Every item id must appear in exactly one row's item_refs. A row's text is \
 a bold one-line statement; its sub is one sentence of consequence; its tag \
 is short ("P1 · due Thu", "Waiting since 21:44", "128")."""
+
+def _digest_rules(record: dict) -> str:
+    """R36-7 — the rules for a run whose automation has ONE named job
+    that is not a task triage. Item 7 of the founder's automationbugs3
+    list: a Newsletter roundup ran the morning-triage prompt and
+    produced DO FIRST / ANSWER TODAY about newsletters, because nothing
+    below `automation.name` ever reached this module."""
+    title = expected_result_title("digest", record)
+    hint = record.get("narration") or {}
+    goal = str(hint.get("goal") or "").strip()
+    desc = str((record.get("automation") or {}).get("description")
+               or "").strip()
+    job = goal or desc or "deliver exactly what its name promises"
+    return (
+        f'This automation has ONE job, and it is NOT a task triage: '
+        f'{job}\n'
+        f'The result turn: title EXACTLY "{title}", vocabulary "digest".\n'
+        "Invent 1 to 6 groups that organise THIS run's material the way "
+        "its job calls for — by theme, by sender, by project, by day: "
+        "whatever serves the reader of this particular digest. Labels "
+        "are SHORT CAPS phrases (never the triage tiers — no DO FIRST, "
+        "no ANSWER TODAY); each group's tone is one of danger | warning "
+        "| slate | success | ghost, and calm material is slate or ghost. "
+        "Every item id appears in EXACTLY ONE row's item_refs — never "
+        "two rows, never zero. A row's text is a bold one-line "
+        "statement; its sub is one sentence of substance from the item "
+        "itself; its tag is short. Do not rank by urgency, do not "
+        "invent tasks, do not tell the user what to do first — this is "
+        "a digest of material, not a to-do list."
+    )
+
 
 _CHANGES_RULES = """\
 This run CHANGED things. The result turn:
@@ -432,6 +514,8 @@ def build_prompt(record: dict) -> str:
         shape = _QUESTION_RULES
     elif status == "failed":
         shape = _FAILED_RULES
+    elif vocabulary == "digest":
+        shape = _digest_rules(record)
     elif vocabulary == "changes":
         shape = _CHANGES_RULES
     else:
@@ -444,9 +528,16 @@ def build_prompt(record: dict) -> str:
     failed_steps = [s for s in (record.get("steps") or [])
                     if isinstance(s, dict) and not s.get("ok", True)]
 
+    # R36-7: the automation's own task statement, when it has one. The
+    # record used to carry nothing but the name, so every run of every
+    # automation was narrated as if its job were the same.
+    desc = str((record.get("automation") or {}).get("description")
+               or "").strip()
+    job_line = f' Its job, in the user\'s words: "{desc}"' if desc else ""
     parts = [
         f'You are narrating one run of the automation "{title}" into its '
-        "thread. The engine already did the work — the dispatch record "
+        f"thread.{job_line} The engine already did the work — the "
+        "dispatch record "
         "below is everything it read and changed, with minted item ids. "
         "You supply the judgement and the voice: the opening line, a why "
         "for every item, the ranked result, think turns for judgement "
@@ -500,9 +591,17 @@ def build_prompt(record: dict) -> str:
 # The pass
 # ---------------------------------------------------------------------------
 
-def _emit_turns_tool(vocabulary: str) -> dict:
+def _emit_turns_tool(vocabulary: str,
+                     expected_title: Optional[str] = None) -> dict:
     """The `automation_emit_turns` structured-output tool schema (§4.2)."""
-    groups = BRIEF_GROUPS if vocabulary == "brief" else CHANGES_GROUPS
+    if vocabulary == "digest":
+        # R36-7: labels are the automation's own; tones stay enumerated.
+        label_schema: dict = {"type": "string", "maxLength": 48}
+        tone_schema: dict = {"enum": list(RESULT_TONES)}
+    else:
+        groups = BRIEF_GROUPS if vocabulary == "brief" else CHANGES_GROUPS
+        label_schema = {"enum": [g[1] for g in groups]}
+        tone_schema = {"enum": [g[2] for g in groups]}
     return {
         "name": "automation_emit_turns",
         "description": "Emit the run's turns, in order, exactly once.",
@@ -531,14 +630,14 @@ def _emit_turns_tool(vocabulary: str) -> dict:
                         }}},
                     "rest": {"type": "string"},
                     "title": {"type": "string"},
-                    "vocabulary": {"enum": ["brief", "changes"]},
+                    "vocabulary": {"enum": ["brief", "changes", "digest"]},
                     "groups": {"type": "array", "items": {
                         "type": "object",
                         "required": ["rank", "label", "tone", "rows"],
                         "properties": {
                             "rank": {"type": "integer"},
-                            "label": {"enum": [g[1] for g in groups]},
-                            "tone": {"enum": [g[2] for g in groups]},
+                            "label": label_schema,
+                            "tone": tone_schema,
                             "rows": {"type": "array", "items": {
                                 "type": "object",
                                 "required": ["text", "sub", "item_refs"],
@@ -570,7 +669,10 @@ async def narrate_run(record: dict, *, complete=None) -> dict:
     """
     if complete is None:
         complete = _default_complete
-    tool = _emit_turns_tool(record.get("vocabulary") or "brief")
+    vocab = record.get("vocabulary") or "brief"
+    tool = _emit_turns_tool(
+        vocab, expected_title=expected_result_title(vocab, record),
+    )
     prompt = build_prompt(record)
     drafts: list[dict] = []
     problems: list[str] = ["not attempted"]

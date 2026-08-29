@@ -122,6 +122,8 @@ def setup_turns(
     channel_label: str = "",
     first_run_label: str = "tonight",
     scope_lines: list[dict] | None = None,
+    *,
+    accounts: list[dict] | None = None,
 ) -> list[dict]:
     """TurnDrafts for a fresh setup thread, in order.
 
@@ -143,6 +145,15 @@ def setup_turns(
     `scope_lines` — the capability check's step lines, engine-supplied:
     `[{"text": "Read new mail", "ok": True}, …]` with `ok=False` for a
     denied-by-design scope (rendered muted, §3.5 extension).
+
+    `accounts` — round 35: `[{"account_id": cid, "steps": [...]}, …]`,
+    ONE capability turn per account the automation uses. The single
+    flattened turn was stamped `members[0]` at both call sites, so a
+    six-account Morning work brief opened with "Checked 1 account" and
+    a lone Jira chip — the founder read that as "it only looked at
+    Jira", which is exactly what the card said. When `accounts` is
+    given it wins over `scope_lines`; the legacy single-turn shape
+    survives for a caller that has nothing better.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode!r}")
@@ -155,14 +166,29 @@ def setup_turns(
         close = _CANVAS_DRAFTS_CLOSE
     else:
         close = f"First run is {label}. {_CLOSES[mode]}"
-    return [
-        {"kind": "agent", "text": opening},
-        {
+    detail = mode_label(mode, channel_label=channel_label)
+    if accounts:
+        checks = [
+            {
+                "kind": "tool",
+                "account_id": str(a.get("account_id") or ""),
+                "action": "Checked what I can do",
+                "detail": detail,
+                "steps": list(a.get("steps") or []),
+            }
+            for a in accounts
+            if a.get("account_id")
+        ]
+    else:
+        checks = [{
             "kind": "tool",
             "action": "Checked what I can do",
-            "detail": mode_label(mode, channel_label=channel_label),
+            "detail": detail,
             "steps": list(scope_lines or []),
-        },
+        }]
+    return [
+        {"kind": "agent", "text": opening},
+        *checks,
         {"kind": "think", "text": _THINKS[mode]},
         {"kind": "agent", "text": close},
     ]

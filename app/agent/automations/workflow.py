@@ -154,15 +154,25 @@ def _member_connectors(raw: dict) -> list[str]:
 
 
 def _write_tools(raw: dict) -> list[tuple[str, str, dict]]:
-    """[(connector_id, tool, grant_target)] for the spec's writes."""
+    """[(connector_id, tool, grant_target)] for the spec's writes.
+
+    R36-5: a write is a write by its TOOL, never by its grant. The old
+    predicate required `grant_id` (or a grant_target, which canonical
+    form drops when empty), so an UNGRANTED template write step was
+    invisible here — and everything derived from this function told the
+    user the opposite of the spec's purpose: `mode_of` said "reads
+    only" about an automation whose whole job is a Gmail draft, the
+    setup script said "I cannot change anything", and the menu label
+    agreed. The founder read all three on a Newsletter roundup whose
+    template promises a draft.
+    """
     out = []
     if raw.get("version") == 2:
         for s in raw.get("steps") or []:
-            if s.get("grant_id") or (s.get("tool") and s.get("grant_target")):
-                if s.get("grant_id"):
-                    out.append((s.get("connector_id") or "",
-                                s.get("tool") or "",
-                                s.get("grant_target") or {}))
+            if s.get("grant_id") or verbs.is_write_tool(s.get("tool")):
+                out.append((s.get("connector_id") or "",
+                            s.get("tool") or "",
+                            s.get("grant_target") or {}))
     else:
         action = raw.get("action") or {}
         if action.get("tool"):

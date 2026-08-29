@@ -889,7 +889,6 @@ async def run_now(automation_id: str):
                 "code": "v1_not_supported",
                 "sentence": "This automation predates run-now.",
             })
-        from app.agent.automations.executor_v2 import run_schedule_fire_v2
         source = vspec.schedule_source() or (
             vspec.sources[0] if vspec.sources else None
         )
@@ -897,11 +896,80 @@ async def run_now(automation_id: str):
             raise HTTPException(status_code=409, detail={
                 "code": "no_source", "sentence": "Nothing to fire.",
             })
-        status = await run_schedule_fire_v2(
-            db, automation, vspec, source,
-            fire_key=f"manual:{_uuid.uuid4()}", run_kind="run_now",
+        # R36-2a: an unpinned write cannot produce what the automation
+        # promises. Firing anyway sent gmail__create_draft into the
+        # dispatcher's grant gate wearing a read's clothes, and the
+        # thread reported "Could not reach Gmail" about a permission
+        # that was simply never asked for. Refuse with the true need.
+        from app.services import automation_verbs as _verbs
+        for st in vspec.write_steps:
+            needs_pin = ("{{grant.target." in json.dumps(
+                st.params_template or {},
+            ) and not (st.grant_target or {}).get("id"))
+            if needs_pin or not st.grant_id:
+                clause = _verbs._WRITE_CLAUSES.get(st.tool) or "write"
+                raise HTTPException(status_code=409, detail={
+                    "code": "needs_setup",
+                    "sentence": (
+                        f"It is not finished being set up — before it "
+                        f"can {clause}, tell me in its thread where "
+                        f"that should go and I will pin it."
+                    ),
+                })
+
+    # R36-2: the fire is DETACHED. A run is minutes of reads plus two
+    # narration phases; holding the HTTP response open for all of it
+    # taught the app's 15 s client to declare "Nothing ran" about a run
+    # the server was mid-way through. The route now answers the only
+    # question it was asked — did it start — and the run reports itself
+    # through the ledger and the activity frames like any other.
+    fire_key = f"manual:{_uuid.uuid4()}"
+    _detach_run_now(automation_id, _user_id(), source.id, fire_key)
+    return {"fired": True, "status": "started"}
+
+
+# Strong refs: a bare create_task can be garbage-collected mid-run.
+_RUN_NOW_TASKS: set = set()
+
+
+def _detach_run_now(automation_id: str, user_id: str, source_id: str,
+                    fire_key: str) -> None:
+    import asyncio as _asyncio
+
+    async def _go() -> None:
+        from app.agent.automations.service import (
+            _load_owned, AutomationNotFound, parse_spec_live,
         )
-        return {"fired": True, "status": status}
+        from app.agent.automations.executor_v2 import run_schedule_fire_v2
+        try:
+            async with async_session_maker() as db:
+                try:
+                    automation = await _load_owned(db, automation_id, user_id)
+                except AutomationNotFound:
+                    return
+                vspec = await parse_spec_live(automation)
+                source = next(
+                    (s for s in getattr(vspec, "sources", ()) or ()
+                     if s.id == source_id),
+                    None,
+                ) or (vspec.sources[0] if getattr(vspec, "sources", None)
+                      else None)
+                if source is None:
+                    return
+                status = await run_schedule_fire_v2(
+                    db, automation, vspec, source,
+                    fire_key=fire_key, run_kind="run_now",
+                )
+                logger.info("[automations] run-now detached finished "
+                            "automation=%s status=%s", automation_id, status)
+        except Exception:  # noqa: BLE001 — the run's own record is the
+            # user-facing account; this log line is the operator's.
+            logger.exception("[automations] run-now detached crashed "
+                             "automation=%s", automation_id)
+
+    task = _asyncio.create_task(_go())
+    _RUN_NOW_TASKS.add(task)
+    task.add_done_callback(_RUN_NOW_TASKS.discard)
 
 
 class ResumeSourceBody(BaseModel):
@@ -1573,15 +1641,31 @@ async def from_template(body: FromTemplateBody):
     # neither stays unset, and the compile below refuses to arm an
     # automation whose required params are empty.
     unanswered: list[str] = []
+    declared_vars: set[str] = set()
     for v in template.get("variables") or []:
         name = v.get("name")
-        if not name or variables.get(name):
+        if not name:
+            continue
+        declared_vars.add(str(name))
+        if variables.get(name):
             continue
         if v.get("default"):
             variables[name] = v["default"]
         else:
             unanswered.append(str(v.get("label") or name))
-    spec["variables"] = variables
+    # R36-1: two seam bugs made 19 of 26 templates 422 on "Set up".
+    # `variables` is a v2-only key — stamping it on a v1 spec fails
+    # `unknown_field` for EVERY v1 template; and an unanswered required
+    # variable ({{var.github_owner}} with no default) must reach the
+    # validator as DECLARED (that is exactly what `template_vars` is
+    # for) or every template that needs an answer fails
+    # `unknown_variable` before the setup thread can ask for it.
+    if spec.get("version") == 2:
+        spec["variables"] = variables
+    if spec.get("description") is None and template.get("description"):
+        # The catalog card's sentence is the automation's own task
+        # statement — without it the narrator knows nothing but a name.
+        spec["description"] = template.get("description")
 
     async with async_session_maker() as db:
         try:
@@ -1590,10 +1674,17 @@ async def from_template(body: FromTemplateBody):
                 template_slug=template.get("slug"),
                 domain=template.get("category"),
                 template_mode=True,
+                template_vars=declared_vars,
             )
         except SpecError as e:
-            raise HTTPException(status_code=422,
-                                detail={"errors": e.errors})
+            # Never a bare status code on a phone screen: the app shows
+            # `sentence` and files `errors` where a developer looks.
+            raise HTTPException(status_code=422, detail={
+                "errors": e.errors,
+                "sentence": "That template is broken on our side — "
+                            "nothing was created. It is ours to fix, "
+                            "not yours.",
+            })
         # Arm only when nothing is missing: every member account
         # connected AND no write step without a grant.
         connections = await _reg.fetch_connection_state(_user_id())
@@ -1661,25 +1752,34 @@ async def from_template(body: FromTemplateBody):
             # `[]`, so the one turn whose whole job is to say what this
             # automation will and will not be able to do said nothing —
             # on every automation ever created from a template.
-            scope_lines: list = []
+            # R35: one check PER member. Flattening every account's
+            # lines into one turn stamped `members[0]` opened a
+            # six-account brief with "Checked 1 account" and a lone
+            # Jira chip.
+            account_scopes: list = []
             try:
                 from app.agent.automations import permissions as _perms
                 from app.agent.automations.setup_script import (
                     scope_lines_from,
                 )
-                from app.services import automation_verbs as _v
                 for cid in members:
-                    scope_lines += scope_lines_from(
-                        await _perms.resolve(
-                            db, automation=automation, account_id=cid,
+                    # No `· Gmail` suffix per line: each account's turn
+                    # carries its own chip, so the name would repeat
+                    # what the row already shows.
+                    account_scopes.append({
+                        "account_id": cid,
+                        "steps": scope_lines_from(
+                            await _perms.resolve(
+                                db, automation=automation, account_id=cid,
+                            ),
                         ),
-                        connector_name=(_v.display_name(cid) or cid)
-                        if len(members) > 1 else "",
-                    )
+                    })
             except Exception:  # noqa: BLE001 — the turn degrades, the
                 # thread does not: an empty capability list is worse
                 # than a short one, but neither is worth losing setup.
-                scope_lines = []
+                account_scopes = [
+                    {"account_id": cid, "steps": []} for cid in members
+                ]
             # What it still needs from the user, named, before the
             # capability list — an automation that cannot run without an
             # answer must say which answer, in the thread where the
@@ -1696,7 +1796,38 @@ async def from_template(body: FromTemplateBody):
                         f"and I will set it up."
                     )},
                 )
-            drafts = setup_turns(mode, _label, first_run, scope_lines)
+            # R36-2a: the promised grant conversation, actually seeded.
+            # A template whose write is grant-gated used to open with
+            # "reads only — I cannot change anything" and then NOTHING
+            # asked for the pin, so the draft the card advertises could
+            # never exist and run-now walked into the grant gate.
+            if has_ungranted_write:
+                try:
+                    from app.services.automation_verbs import (
+                        _WRITE_CLAUSES,
+                    )
+                    clauses = [
+                        _WRITE_CLAUSES.get(s.get("tool") or "")
+                        for s in (raw.get("steps") or [])
+                        if isinstance(s, dict)
+                        and _WRITE_CLAUSES.get(s.get("tool") or "")
+                        and not s.get("grant_id")
+                    ]
+                    clause = clauses[0] if clauses else "write"
+                    await _ledger.append_turn(
+                        db, user_id=_user_id(), thread=thread, run_id=None,
+                        kind="agent", payload={"text": (
+                            f"One thing before it can {clause}: tell me "
+                            f"here where that should go, and I will pin "
+                            f"it and ask for your permission."
+                        )},
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[automations] grant ask skipped: %s", e,
+                    )
+            drafts = setup_turns(mode, _label, first_run,
+                                 accounts=account_scopes)
             for d in drafts or []:
                 kind = d.get("kind")
                 if kind in ("agent", "think"):

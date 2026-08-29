@@ -141,21 +141,33 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
         mode, label = mode_of(automation, raw)
         sched = schedule_block(automation, raw)
         # R31-22 / §5.3: the capability check said nothing here too.
-        scope_lines: list = []
+        # R35: EVERY member, not `automation.connector_id` alone — a
+        # described multi-account automation opened with one account's
+        # check (or none), same defect as the template path.
+        account_scopes: list = []
         try:
             from app.agent.automations import permissions as _perms
             from app.agent.automations.setup_script import scope_lines_from
-            if automation.connector_id:
-                scope_lines = scope_lines_from(await _perms.resolve(
-                    db, automation=automation,
-                    account_id=automation.connector_id,
-                ))
+            from app.agent.automations.workflow import _member_connectors
+            members = _member_connectors(raw) or (
+                [automation.connector_id] if automation.connector_id else []
+            )
+            for cid in members:
+                account_scopes.append({
+                    "account_id": cid,
+                    "steps": scope_lines_from(await _perms.resolve(
+                        db, automation=automation, account_id=cid,
+                    )),
+                })
         except Exception:  # noqa: BLE001 — a short list beats none,
             # and neither is worth losing the thread over.
-            scope_lines = []
+            account_scopes = (
+                [{"account_id": automation.connector_id, "steps": []}]
+                if automation.connector_id else []
+            )
         for d in setup_turns(mode, label,
                              sched.get("sentence") or "when you arm it",
-                             scope_lines):
+                             accounts=account_scopes):
             kind = d.get("kind")
             if kind in ("agent", "think"):
                 await _ledger.append_turn(
@@ -166,7 +178,8 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
                 await _ledger.append_turn(
                     db, user_id=user_id, thread=thread, run_id=None,
                     kind="tool", payload={
-                        "account_id": automation.connector_id or "",
+                        "account_id": d.get("account_id")
+                        or automation.connector_id or "",
                         "tool_kind": "read",
                         "action": d.get("action") or "Checked what I can do",
                         "detail": d.get("detail") or "",

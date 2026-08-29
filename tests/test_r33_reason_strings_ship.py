@@ -54,3 +54,40 @@ def test_the_contract_document_and_the_shipped_copy_are_identical():
         "the shipped table and fixtures/automations/reason-strings.json "
         "have drifted — copy the fixture over the package file"
     )
+
+
+def test_the_grant_gate_refusal_is_named_not_blamed_on_the_connector():
+    """R36-6 — the dispatcher's own fail-closed refusal ('no approved
+    permission backs this automation call') is a permission that was
+    never asked for, not a connector that broke. Classified as
+    `unknown_error` it rendered "Could not reach Gmail — I could not
+    tell why" about a healthy, connected account."""
+    from app.agent.automations import account_health as ah
+    code = ah.classify("tool_error", (
+        "'gmail__create_draft' modifies data and no approved permission "
+        "backs this automation call. Automations fail closed — ask the "
+        "user for permission first."
+    ))
+    assert code == "grant_missing"
+    state, fix = ah.state_for_reason("grant_missing")
+    assert state == "needs_check"
+    assert fix == "grant"
+    sentence = ah.sentence_for(
+        account_state=state, reason_code="grant_missing",
+        connector_id="gmail", name="Gmail",
+    )
+    assert "permission" in sentence
+    assert "Could not reach" not in sentence
+    body = ah.sentence_for(
+        account_state=state, reason_code="grant_missing",
+        connector_id="gmail", name="Gmail", surface="notification_body",
+    )
+    assert "permission" in body
+
+
+def test_the_needs_check_pill_uses_the_agreed_vocabulary():
+    """R36-10d — 'Needs a check' was a status word outside the agreed
+    set; the pill is 'Needs you', same as the card stamp."""
+    from app.agent.automations import account_health as ah
+    states = ah.strings().get("states") or {}
+    assert (states.get("needs_check") or {}).get("pill") == "Needs you"

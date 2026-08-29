@@ -14,6 +14,9 @@ invitation, never a finding: what the run learned stays in the thread.
                            pending waiting turns (changes)
     writes_count           rows in the honest write ledger
     failed_connector_name  display name, failed runs only
+    failed_reason_body     the classified reason's notification_body
+                           string (R36-6), resolved by run_v3 from the
+                           same table the thread's needs-you card reads
 
 Every string here passes the copy guard; `test_notification_templates`
 pins that, the canvas line, and the count grammar.
@@ -84,10 +87,20 @@ def notification_body(kind: str, run_summary: dict) -> str:
                 "It prepared a change and is waiting on you — "
                 "nothing happens until you approve."
             )
+        # R36-6: the run's own classified reason, resolved by run_v3
+        # from the same (state, reason) table the thread reads. This
+        # branch used to assert "access ran out" for EVERY named
+        # connector — a specific mechanism it could not know — so one
+        # Gmail failure read "it did not tell me why" in the thread and
+        # "access ran out, reconnect" on the card. When no reason was
+        # recorded, say where the real one is written, never invent one.
+        body = str(run_summary.get("failed_reason_body") or "").strip()
+        if body:
+            return body
         if connector:
             return (
-                f"{connector} access ran out, so it stopped where it was. "
-                "Reconnect and it picks up from there."
+                f"It stopped at {connector} — the reason is written in "
+                "the thread. Open it and I will show you the fix."
             )
         return "Something needs you — open the run and I will show you."
 

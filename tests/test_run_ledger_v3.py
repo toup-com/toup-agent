@@ -1076,3 +1076,124 @@ async def test_a_stopped_run_says_whether_anything_was_sent(monkeypatch):
         payload = await summary_payload(db, user_id=uid)
     said2 = payload["automations"][0]["run_in_flight"]["sentence"]
     assert said2 == "Paused at step 6. 2 changes already made.", said2
+
+
+# ── R35: the failed write's card, and Try again re-sending it ──────────
+
+
+@pytest.mark.asyncio
+async def test_a_failed_write_gets_its_card_and_its_actions(monkeypatch):
+    """R35 (founder repro, 2026-08-28): a delivery that hard-failed used
+    to vanish — no tool turn, no needs-you card, absent from
+    `accounts_failed` — so the run named every broken READ and said
+    nothing about the one step the automation exists for. The failed
+    write now leaves the ok=False turn (with the real call recorded
+    under it), the needs-you card with its button, and membership in
+    the failed list."""
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": _ISSUES,
+        "slack__send_message": {
+            "kind": "tool_error", "retryable": False,
+            "message": "channel_not_found",
+        },
+    })
+    job = await _one_run(a.id)
+    async with async_session_maker() as db:
+        j = await db.get(BuildJob, job.id)
+        assert j.status == "failed" and j.outcome == "write_failed"
+        assert "slack" in ((j.config_json or {}).get("accounts_failed") or [])
+        rows = (await db.execute(
+            select(AutomationTurn).where(AutomationTurn.run_id == job.id)
+        )).scalars().all()
+    turns = [json.loads(r.payload_json) | {"kind": r.kind} for r in rows]
+    failed_writes = [t for t in turns if t["kind"] == "tool"
+                     and t.get("tool_kind") == "write" and not t.get("ok")]
+    assert len(failed_writes) == 1, turns
+    ft = failed_writes[0]
+    # The real call, under the sentence — tool id, verdict, elapsed.
+    assert ft["actions"] and ft["actions"][0]["tool"] == "slack__send_message"
+    assert ft["actions"][0]["ok"] is False
+    assert ft.get("reason_code"), ft
+    needs = [t for t in turns if t["kind"] == "needs_you"
+             and t.get("account_id") == "slack"]
+    assert needs, "the failed delivery owes the user its card"
+
+
+@pytest.mark.asyncio
+async def test_try_again_restages_the_failed_write_and_closes_the_run(
+        monkeypatch):
+    """R35: the founder's Slack "Try again" answered 409 `no_step` —
+    a write-only connector has no read to resume, while the failed
+    outbox row sat there holding the exact payload the retry needs.
+    `resume_source` now re-stages that row; on success the run closes
+    as sent and the failed list empties."""
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": _ISSUES,
+        "slack__send_message": {
+            "kind": "tool_error", "retryable": False,
+            "message": "channel_not_found",
+        },
+    })
+    job = await _one_run(a.id)
+
+    from app.agent.automations import executor_v2
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform",
+        _fake_dispatch({"slack__send_message": _OK}),
+    )
+    async with async_session_maker() as db:
+        a2 = await db.get(Automation, a.id)
+        out = await executor_v2.resume_source(
+            db, automation=a2, job_id=job.id, account_id="slack",
+        )
+    assert out["resumed"] is True, out
+    assert out["status"] == "completed", out
+
+    async with async_session_maker() as db:
+        j = await db.get(BuildJob, job.id)
+        assert j.status == "completed" and j.outcome == "sent", (
+            j.status, j.outcome)
+        assert ((j.config_json or {}).get("accounts_failed") or []) == []
+        from app.db.models import AutomationOutbox
+        ob = (await db.execute(
+            select(AutomationOutbox).where(AutomationOutbox.job_id == job.id)
+        )).scalars().all()
+        assert any(r.status == "executed" for r in ob), [r.status for r in ob]
+        rows = (await db.execute(
+            select(AutomationTurn).where(AutomationTurn.run_id == job.id)
+        )).scalars().all()
+    turns = [json.loads(r.payload_json) | {"kind": r.kind} for r in rows]
+    sent = [t for t in turns if t["kind"] == "tool"
+            and t.get("tool_kind") == "write" and t.get("ok")]
+    assert sent, "the retried write owes the thread its ok turn"
+    assert sent[-1]["actions"][0]["tool"] == "slack__send_message"
+
+
+@pytest.mark.asyncio
+async def test_read_turns_carry_the_real_call(monkeypatch):
+    """R35: every read turn records the tool call behind its sentence —
+    the app's act page renders these exactly like the main chat's job
+    card, from the same `public_step_label` vocabulary."""
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    job = await _one_run(a.id)
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationTurn).where(AutomationTurn.run_id == job.id)
+        )).scalars().all()
+    turns = [json.loads(r.payload_json) | {"kind": r.kind} for r in rows]
+    reads = [t for t in turns if t["kind"] == "tool"
+             and t.get("tool_kind") == "read"]
+    assert reads
+    for t in reads:
+        assert t.get("actions"), t
+        assert t["actions"][0]["tool"] == "jira__search_issues"
+        assert isinstance(t["actions"][0]["ms"], int)

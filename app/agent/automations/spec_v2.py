@@ -46,7 +46,7 @@ COLLECT_LIMIT_DEFAULT = 10
 COLLECT_LIMIT_MAX = 25
 
 _TOP_KEYS = {"version", "name", "description", "mode", "variables",
-             "trigger", "steps"}
+             "trigger", "steps", "narration"}
 _SOURCE_KEYS = {"id", "mode", "connector_id", "event", "params",
                 "poll_interval_s", "schedule", "filter", "dedupe_key"}
 # `grant_target` is SYSTEM-written per write step (arm snapshots the
@@ -496,6 +496,38 @@ def validate_spec_v2(
     else:
         name = name.strip()
 
+    # R36-7: how this automation's result should read. Optional; a
+    # template stamps it so a Newsletter roundup narrates a newsletter
+    # digest instead of the morning triage.
+    narration = spec.get("narration")
+    if narration is not None:
+        if not isinstance(narration, dict):
+            _err(errors, "bad_narration", "narration",
+                 "narration must be an object")
+            narration = None
+        else:
+            unknown_n = set(narration) - {"style", "title", "goal"}
+            if unknown_n:
+                _err(errors, "unknown_field", "narration",
+                     f"unknown narration fields {sorted(unknown_n)}")
+            style = narration.get("style")
+            if style not in ("digest", "brief", "changes"):
+                _err(errors, "bad_narration", "narration.style",
+                     "narration.style must be 'digest', 'brief' or "
+                     "'changes'")
+            n_title = narration.get("title")
+            if n_title is not None and not (
+                isinstance(n_title, str) and 1 <= len(n_title.strip()) <= 80
+            ):
+                _err(errors, "bad_narration", "narration.title",
+                     "narration.title must be 1-80 characters")
+            n_goal = narration.get("goal")
+            if n_goal is not None and not (
+                isinstance(n_goal, str) and 1 <= len(n_goal.strip()) <= 300
+            ):
+                _err(errors, "bad_narration", "narration.goal",
+                     "narration.goal must be 1-300 characters")
+
     mode = spec.get("mode", "confirm")
     if mode not in ("auto", "confirm"):
         _err(errors, "bad_mode", "mode", "mode must be 'auto' or 'confirm'")
@@ -610,6 +642,7 @@ def validate_spec_v2(
         "name": name,
         "description": spec.get("description") or None,
         "mode": mode,
+        **({"narration": narration} if narration else {}),
         **({"variables": variables} if variables else {}),
         "trigger": {
             "sources": [

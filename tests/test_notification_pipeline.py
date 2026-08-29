@@ -80,7 +80,12 @@ async def test_one_notification_per_run_same_body_card_and_push(
             "automation_notification"]
         assert card["status"] == "completed"
         assert card["body"] == row.body
-        assert card["id"] == row.id
+        # R36-8: the card's id is STABLE per automation — the app's
+        # registry and the day-chat message both key on it, so a fresh
+        # id per run meant a fresh card per attempt (the founder's four
+        # "NEEDS YOU" cards in one evening). One automation, one card.
+        assert card["id"] == f"auto:{a.id}"
+        assert card["run_id"] == job.id
 
     # Push: LA start at run start (silent), terminal with the SAME body.
     started = [c for c in _notify_spy

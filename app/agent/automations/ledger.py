@@ -239,6 +239,22 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
                 "text": _clean_sentence(s.get("text"), "tool.steps.text"),
                 "ok": bool(s.get("ok")),
             })
+        # R35: the executed tool calls behind the sentence — tool id,
+        # main-chat label, ok, elapsed, one-line summary. Validated the
+        # same way as everything here: bounded strings, typed fields,
+        # nothing passed through unread.
+        actions = []
+        for a in p.get("actions") or []:
+            tool = str(a.get("tool") or "")[:120]
+            if not tool:
+                continue
+            actions.append({
+                "tool": tool,
+                "label": str(a.get("label") or "")[:120],
+                "ok": bool(a.get("ok", True)),
+                "ms": max(int(a.get("ms") or 0), 0),
+                "summary": str(a.get("summary") or "")[:200],
+            })
         # ── The per-account line and its button (round 33, item 4) ──────
         # The app's E-1 surface (`AccountLines`) opens with
         # `tools.filter((t) => !!t.line)` and then renders `t.tone`,
@@ -255,6 +271,7 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             "ok": bool(p.get("ok", True)),
             "ms": int(p.get("ms") or 0),
             "steps": steps,
+            "actions": actions,
             "items": mint_item_ids(p.get("items") or []),
             "write_ids": list(p.get("write_ids") or []),
             "rest": p.get("rest") or "",
@@ -277,10 +294,43 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
 
     if kind == "result":
         vocab = p.get("vocabulary")
-        tiers = RESULT_VOCABULARIES.get(vocab or "")
-        _require(tiers is not None,
+        _require(vocab in RESULT_VOCABULARIES,
                  f"unknown result vocabulary {vocab!r}")
+        tiers = RESULT_VOCABULARIES.get(vocab or "")
         groups = p.get("groups") or []
+        if tiers is None:
+            # R36-7 `digest`: free-form groups. The serializer's job
+            # here is shape, not vocabulary — sequential ranks, short
+            # non-empty labels, tones the app can draw.
+            from app.db.models.automation_ledger import RESULT_TONES
+            _require(1 <= len(groups) <= 6,
+                     f"digest needs 1-6 groups, got {len(groups)}")
+            out_groups = []
+            for i, g in enumerate(groups, start=1):
+                _require(int(g.get("rank", i)) == i,
+                         f"group {i} rank mismatch")
+                label = str(g.get("label") or "").strip()
+                _require(1 <= len(label) <= 48,
+                         f"group {i} label must be 1-48 characters")
+                tone = g.get("tone")
+                _require(tone in RESULT_TONES,
+                         f"group {i} tone {tone!r} outside {RESULT_TONES!r}")
+                rows = []
+                for r in g.get("rows") or []:
+                    rows.append({
+                        "text": _plain(r.get("text"), "result.row.text"),
+                        "sub": strip_markdown_markers(r.get("sub") or "")[0],
+                        "tag": r.get("tag") or "",
+                        "item_refs": list(r.get("item_refs") or []),
+                    })
+                out_groups.append(
+                    {"rank": i, "label": label, "tone": tone, "rows": rows}
+                )
+            return {
+                "title": _plain(p.get("title"), "result.title"),
+                "vocabulary": vocab,
+                "groups": out_groups,
+            }
         _require(len(groups) == len(tiers),
                  f"{vocab} needs exactly {len(tiers)} tiers, got {len(groups)}")
         out_groups = []
@@ -772,23 +822,42 @@ async def run_v3_payload(
 def _expected_vocabulary(automation, job) -> Optional[str]:
     """What this run's result turn should be speaking (R31-37).
 
-    Derived from the automation's WRITE STEPS, which is the same source
-    the narrator uses — so a mismatch means the two disagreed, not that
-    this function has an opinion of its own.
+    Derived from the automation's spec, which is the same source the
+    narrator uses — so a mismatch means the two disagreed, not that
+    this function has an opinion of its own. R36-7: a spec carrying a
+    `narration.style` speaks that; and a write is a write by its TOOL
+    (an ungranted template draft used to be invisible here).
     """
     try:
         from .narrator import vocabulary_for
+        from app.services.automation_verbs import is_write_tool
         raw = json.loads(automation.spec_json or "{}")
         if raw.get("version") != 2:
             return None
+        style = str(((raw.get("narration") or {}).get("style")) or "")
+        if style in ("digest", "brief", "changes"):
+            return style
         tools = [
             s.get("tool") for s in (raw.get("steps") or [])
             if isinstance(s, dict) and (s.get("grant_id")
-                                        or s.get("grant_target"))
+                                        or is_write_tool(s.get("tool")))
         ]
         return vocabulary_for([t for t in tools if t])
     except Exception:  # noqa: BLE001
         return None
+
+
+def _digest_title_of(automation) -> str:
+    """The digest result's title — the spec's narration hint, then the
+    automation's own name (R36-7)."""
+    try:
+        raw = json.loads(automation.spec_json or "{}")
+        hint = str(((raw.get("narration") or {}).get("title")) or "").strip()
+        if hint:
+            return hint
+    except Exception:  # noqa: BLE001
+        pass
+    return str(getattr(automation, "name", "") or "What this run found")
 
 
 async def close_ledger(
@@ -810,12 +879,21 @@ async def close_ledger(
 
     touched: list[str] = []
     failed: list[str] = []
+    read_ok: list[str] = []
     for t in tool_turns:
         acc = t.get("account_id") or ""
         if acc and acc not in touched:
             touched.append(acc)
         if acc and not t.get("ok", True) and acc not in failed:
             failed.append(acc)
+        # R36-10: an account that READ successfully was read, whatever
+        # else went wrong beside it. The home meta counted an account
+        # with one ok read and one failed call as fully failed — "Ran
+        # 18:54 · 0 of 1 accounts" about a run that had just listed
+        # five threads.
+        if (acc and t.get("ok", True) and t.get("tool_kind") == "read"
+                and acc not in read_ok):
+            read_ok.append(acc)
 
     result_rows = [t for t in turns if t["kind"] == "result"]
     invariant_applies = (
@@ -838,23 +916,33 @@ async def close_ledger(
         if thread is not None:
             all_ids = [it["id"] for t in tool_turns
                        for it in (t.get("items") or [])]
-            vocab = "brief"
-            tiers = RESULT_VOCABULARIES[vocab]
             n = len(all_ids)
-            groups = [
-                {"rank": i + 1, "label": label, "tone": tone, "rows": []}
-                for i, (label, tone) in enumerate(tiers)
-            ]
-            groups[-1]["rows"].append({
+            vocab = _expected_vocabulary(automation, job) or "brief"
+            count_row = {
                 "text": (f"{n} item(s) read — I could not rank them this "
                          "time").replace("(s)", "" if n == 1 else "s"),
                 "sub": "Everything the run read is here, unranked.",
                 "tag": str(n), "item_refs": all_ids,
-            })
+            }
+            if vocab == "digest":
+                # R36-7: a digest automation's mechanical fallback keeps
+                # its own title — never "Your morning, in order".
+                title = _digest_title_of(automation)
+                groups = [{"rank": 1, "label": "EVERYTHING IT READ",
+                           "tone": "slate", "rows": [count_row]}]
+            else:
+                vocab = "brief"
+                title = "Your morning, in order"
+                tiers = RESULT_VOCABULARIES[vocab]
+                groups = [
+                    {"rank": i + 1, "label": label, "tone": tone, "rows": []}
+                    for i, (label, tone) in enumerate(tiers)
+                ]
+                groups[-1]["rows"].append(count_row)
             appended = await append_turn(
                 db, user_id=user_id, thread=thread, run_id=job.id,
                 kind="result",
-                payload={"title": "Your morning, in order",
+                payload={"title": title,
                          "vocabulary": vocab, "groups": groups},
             )
             result_rows = [appended]
@@ -924,6 +1012,7 @@ async def close_ledger(
         await merge_job_config(
             db, job.id,
             accounts_touched=touched, accounts_failed=failed,
+            accounts_read_ok=read_ok,
         )
     except Exception as e:  # noqa: BLE001
         logger.debug("[ledger] accounts stamp skipped: %s", e)

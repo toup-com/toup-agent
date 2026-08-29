@@ -325,6 +325,7 @@ def _run_summary(
     db_writes: int, *, job: BuildJob, automation: Automation, v3: str,
     needs_count: int = 0, failed_connector_name: Optional[str] = None,
     vocabulary: Optional[str] = None,
+    failed_reason_body: Optional[str] = None,
 ) -> dict:
     """The exact fields C's notification templates consume (§5.7)."""
     return {
@@ -334,6 +335,7 @@ def _run_summary(
         "needs_count": needs_count,
         "writes_count": db_writes,
         "failed_connector_name": failed_connector_name,
+        "failed_reason_body": failed_reason_body,
         "automation_name": automation.name,
         # The run already recorded WHY it ended this way (confirm.py
         # stamps SKIPPED_REJECTED_COPY / SKIPPED_EXPIRED_COPY). A table
@@ -502,8 +504,17 @@ def _notification_payload(row: AutomationNotification) -> dict:
         accounts = json.loads(row.accounts_json or "[]")
     except (ValueError, TypeError):
         accounts = []
+    # R36-8: run cards carry a STABLE per-automation id. The app's
+    # registry and the day-chat message both key on `id`, so a fresh id
+    # per run meant a fresh card per attempt — the founder's four
+    # "NEWSLETTER ROUNDUP NEEDS YOU" cards in one evening. One
+    # automation, one card, updated in place.
+    payload_id = (f"auto:{row.automation_id}"
+                  if row.kind in ("automation_run", "automation_needs_you")
+                  else row.id)
     return {
-        "id": row.id, "kind": row.kind, "automation_id": row.automation_id,
+        "id": payload_id, "kind": row.kind,
+        "automation_id": row.automation_id,
         "run_id": row.run_id, "thread_id": row.thread_id,
         "turn_id": row.turn_id, "title": row.title, "accounts": accounts,
         "sentence": row.sentence,
@@ -522,6 +533,40 @@ async def _write_chat_card(
     main chat (D-05)."""
     from .cards import write_card_message, update_card_message, broadcast_card
     payload = _notification_payload(row)
+    if not row.message_id and row.kind in ("automation_run",
+                                           "automation_needs_you"):
+        # R36-8: a NEW run adopts the automation's EXISTING day-chat
+        # card message instead of minting a second one. The payload id
+        # is already stable per automation, so the app's registry and
+        # the persisted message converge on one card whichever path
+        # delivered it.
+        prev = (await db.execute(
+            select(AutomationNotification)
+            .where(AutomationNotification.automation_id == row.automation_id)
+            .where(AutomationNotification.message_id.isnot(None))
+            .where(AutomationNotification.kind.in_(
+                ("automation_run", "automation_needs_you")))
+            .order_by(AutomationNotification.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if prev is not None and prev.message_id:
+            # Same-day only: a card updated in place inside yesterday's
+            # chat is a card nobody sees. A new day gets a new card.
+            try:
+                from app.db.message_helpers import (
+                    resolve_day_chat_id_for_now,
+                )
+                from app.db.models import Message
+                prev_msg = await db.get(Message, prev.message_id)
+                today = await resolve_day_chat_id_for_now(
+                    db, automation.user_id,
+                )
+                if prev_msg is not None and prev_msg.day_chat_id == today:
+                    row.message_id = prev.message_id
+                    await db.commit()
+            except Exception as e:  # noqa: BLE001 — dedupe degrades to
+                # the old one-card-per-run shape, never to a lost card
+                logger.debug("[run_v3] card adopt skipped: %s", e)
     if row.message_id:
         await update_card_message(
             db, message_id=row.message_id,
@@ -731,14 +776,39 @@ async def _notify_state(
     fraction: int, push: bool = True,
 ) -> None:
     """One notification pipeline for every state that has a card."""
+    # R35: a `question` run never announces itself in the main chat.
+    # Nothing mints the kind any more (`open_question_run` is deleted),
+    # but rows with it exist in real tenants, and this ungated notifier
+    # is exactly how the founder's "MORNING WORK BRIEF NEEDS YOU" card
+    # landed in the day chat for a question typed in the thread.
+    if ledger.run_kind_of(job) == "question":
+        return
     cfg = ledger._cfg_of(job)
     thread_id = cfg.get("thread_id")
     n_writes = await writes_count(db, job.id)
     needs, vocab = await _needs_count(db, job)
+    failed_name, failed_cid, failed_code = await _failed_source_info(db, job)
+    failed_body = None
+    if failed_name and failed_code:
+        # R36-6: the same (state, reason) table every other surface
+        # reads, on its `notification_body` surface — which existed for
+        # every reason code and had no consumer, while the card guessed
+        # "access ran out" for every named connector.
+        try:
+            from . import account_health as _ah
+            state, _fix = _ah.state_for_reason(failed_code)
+            failed_body = _ah.sentence_for(
+                account_state=state, reason_code=failed_code,
+                connector_id=failed_cid, name=failed_name,
+                surface="notification_body",
+            ) or None
+        except Exception as e:  # noqa: BLE001 — copy degrades, never gates
+            logger.debug("[run_v3] reason body skipped: %s", e)
     summary = _run_summary(
         n_writes, job=job, automation=automation, v3=v3,
         needs_count=needs, vocabulary=vocab,
-        failed_connector_name=await _failed_connector(db, job),
+        failed_connector_name=failed_name,
+        failed_reason_body=failed_body,
     )
     # A partial run with a broken source needs the user just as much as
     # one waiting on an approval does — and only the `needs_you` kind
@@ -846,8 +916,12 @@ async def _needs_count(
     for t in turns:
         if t["kind"] == "result":
             vocab = t.get("vocabulary")
-            for g in (t.get("groups") or [])[:2]:
-                needs += len(g.get("rows") or [])
+            # R36-7: a digest's groups are material, not urgency — its
+            # top tiers are never "things that need you". Drafts,
+            # waiting turns and needs-you cards still count below.
+            if vocab != "digest":
+                for g in (t.get("groups") or [])[:2]:
+                    needs += len(g.get("rows") or [])
         elif t["kind"] in ("draft", "waiting"):
             needs += 1
         elif t["kind"] == "needs_you":
@@ -865,12 +939,30 @@ async def _needs_count(
 async def _failed_connector(
     db: AsyncSession, job: BuildJob,
 ) -> Optional[str]:
+    name, _cid, _code = await _failed_source_info(db, job)
+    return name
+
+
+async def _failed_source_info(
+    db: AsyncSession, job: BuildJob,
+) -> tuple[Optional[str], str, str]:
+    """(display name, connector_id, reason_code) of the first failed
+    tool turn — the notification body's grounding (R36-6).
+
+    The ledger has carried `reason_code` on every failed tool turn
+    since R33, and the notification pipeline never read it: the card
+    guessed "access ran out" for every named connector while the
+    thread said "it did not tell me why" about the same failure. One
+    failure, one reason, every surface.
+    """
     from app.services.automation_verbs import display_name
     turns = await ledger.run_turns(db, run_id=job.id)
     for t in turns:
         if t["kind"] == "tool" and not t.get("ok", True):
-            return display_name(t.get("account_id"))
-    return None
+            cid = str(t.get("account_id") or "")
+            return (display_name(cid), cid,
+                    str(t.get("reason_code") or ""))
+    return None, "", ""
 
 
 # ----------------------------------------------------- setup notification

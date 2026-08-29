@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -1102,38 +1103,88 @@ class EmailReceivedHandler:
         model_used: Optional[str],
         title_suffix: str,
     ) -> tuple[str, str]:
-        writer = self._writer or write_trigger_message
+        """R36-9: the day chat gets the sanctioned notification CARD,
+        never the email's content as an agent message.
+
+        This writer used to persist the full "📧 **sender** — _subject_"
+        markdown body as an ordinary assistant message — a whole email,
+        bullets and all, sitting in the founder's main chat at 7:43 PM
+        wearing the agent's own bubble. The card keeps the gist (title
+        + a trimmed plain-text body); the mail itself is in Gmail.
+        The injected `self._writer` test seam keeps the old shape —
+        tests that inject a writer are asserting the WRITE, not the
+        card contract."""
+        title = f"{trigger.name or 'Email trigger'} — {title_suffix}"
+        from app.agent.automations.ledger import strip_markdown_markers
+        plain, _had = strip_markdown_markers(content or "")
+        plain = " ".join(plain.split())
+        body = plain[:280] + ("…" if len(plain) > 280 else "")
+
+        if self._writer is not None:
+            msg_id, day_chat_id = await self._writer(
+                db,
+                user_id=trigger.user_id,
+                content=content,
+                source=self.kind,
+                trigger_id=trigger.id,
+                title=title,
+                model_used=model_used,
+            )
+        else:
+            from app.agent.automations.cards import (
+                write_card_message, broadcast_card,
+            )
+            payload = {
+                "id": f"trigger:{uuid.uuid4()}",
+                "kind": "automation_run",
+                "automation_id": "", "run_id": f"trigger:{trigger.id}",
+                "thread_id": "", "turn_id": "",
+                "title": (trigger.name or "Email trigger")[:80],
+                "accounts": ["gmail"], "sentence": None,
+                "fraction": 1.0, "status": "completed",
+                "body": body,
+            }
+            msg_id, day_chat_id = await write_card_message(
+                db, user_id=trigger.user_id, content="",
+                metadata_key="automation_notification", payload=payload,
+                title=title[:80],
+            )
+            try:
+                await broadcast_card(
+                    trigger.user_id, "automation_notification",
+                    {**payload, "message_id": msg_id},
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("[trigger_email] card broadcast skipped: %s", e)
+
+        # The website's live copy is the card broadcast above; other
+        # channels (telegram) keep their fan-out, with the trimmed body
+        # — a channel is not the day chat, but it is not a dumping
+        # ground either.
         broadcaster = self._broadcaster
         if broadcaster is None:
             broadcaster = broadcast_trigger_message
-
-        title = f"{trigger.name or 'Email trigger'} — {title_suffix}"
-        msg_id, day_chat_id = await writer(
-            db,
-            user_id=trigger.user_id,
-            content=content,
-            source=self.kind,
-            trigger_id=trigger.id,
-            title=title,
-            model_used=model_used,
-        )
-
-        delivery_channels = list(
-            (trigger.config_json or {}).get("delivery_channels") or ["website"]
-        )
-        try:
-            await broadcaster(
-                trigger.user_id,
-                message_id=msg_id,
-                day_chat_id=day_chat_id,
-                source=self.kind,
-                content=content,
-                model_used=model_used,
-                delivery_channels=delivery_channels,
-                trigger_name=trigger.name or trigger.kind,
+        delivery_channels = [
+            c for c in (
+                (trigger.config_json or {}).get("delivery_channels")
+                or ["website"]
             )
-        except Exception as e:  # pragma: no cover — defensive
-            logger.warning("[trigger_email] broadcast failed: %s", e)
+            if c != "website" or self._writer is not None
+        ]
+        if delivery_channels:
+            try:
+                await broadcaster(
+                    trigger.user_id,
+                    message_id=msg_id,
+                    day_chat_id=day_chat_id,
+                    source=self.kind,
+                    content=body if self._writer is None else content,
+                    model_used=model_used,
+                    delivery_channels=delivery_channels,
+                    trigger_name=trigger.name or trigger.kind,
+                )
+            except Exception as e:  # pragma: no cover — defensive
+                logger.warning("[trigger_email] broadcast failed: %s", e)
 
         return msg_id, (model_used or "n/a")
 

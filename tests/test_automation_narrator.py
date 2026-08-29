@@ -278,3 +278,95 @@ def test_the_failed_prompt_swaps_the_shape_rules():
     prompt = narrator.build_prompt(record)
     assert "This run FAILED" in prompt
     assert "DO FIRST · BLOCKS OTHERS" not in prompt
+
+
+# ------------------------------------------------------------- digest (R36)
+
+def _digest_record():
+    record = copy.deepcopy(RECORD)
+    record["vocabulary"] = "digest"
+    record["automation"] = {
+        "title": "Newsletter roundup", "mode": "confirm",
+        "description": "Sunday morning: the week's newsletters folded "
+                       "into one Gmail draft to an address you pin.",
+    }
+    record["narration"] = {
+        "style": "digest", "title": "This week's newsletters",
+        "goal": "Fold the week's newsletters into one readable roundup.",
+    }
+    return record
+
+
+def test_digest_prompt_speaks_the_automations_own_job():
+    prompt = narrator.build_prompt(_digest_record())
+    assert "This week's newsletters" in prompt
+    assert "Fold the week's newsletters" in prompt
+    assert "NOT a task triage" in prompt
+    # The triage tiers must not leak into a digest prompt.
+    assert "DO FIRST · BLOCKS OTHERS" not in prompt
+    assert "Your morning, in order" not in prompt
+
+
+def test_digest_title_comes_from_the_automation():
+    record = _digest_record()
+    assert narrator.expected_result_title("digest", record) == \
+        "This week's newsletters"
+    record["narration"] = {}
+    assert narrator.expected_result_title("digest", record) == \
+        "Newsletter roundup"
+    assert narrator.expected_result_title("brief", record) == \
+        "Your morning, in order"
+
+
+def test_digest_result_accepts_free_groups_and_rejects_the_triage():
+    ids = {"gmail-01"}
+    good = {
+        "vocabulary": "digest", "title": "This week's newsletters",
+        "groups": [
+            {"rank": 1, "label": "WORTH A CLICK", "tone": "warning",
+             "rows": [{"text": "One standout piece.", "sub": "Why it "
+                       "matters this week.", "tag": "1",
+                       "item_refs": ["gmail-01"]}]},
+            {"rank": 2, "label": "THE REST, BY THEME", "tone": "ghost",
+             "rows": []},
+        ],
+    }
+    record = _digest_record()
+    problems = narrator._validate_result(
+        good, "digest", ids, "turn[1]",
+        expected_title=narrator.expected_result_title("digest", record),
+    )
+    assert problems == [], problems
+
+    wrong_title = copy.deepcopy(good)
+    wrong_title["title"] = "Your morning, in order"
+    assert narrator._validate_result(
+        wrong_title, "digest", ids, "t",
+        expected_title="This week's newsletters",
+    )
+
+    bad_tone = copy.deepcopy(good)
+    bad_tone["groups"][0]["tone"] = "neon"
+    assert any("tone" in p for p in narrator._validate_result(
+        bad_tone, "digest", ids, "t",
+        expected_title="This week's newsletters",
+    ))
+
+    unaccounted = copy.deepcopy(good)
+    unaccounted["groups"][0]["rows"][0]["item_refs"] = []
+    assert any("unaccounted" in p for p in narrator._validate_result(
+        unaccounted, "digest", ids, "t",
+        expected_title="This week's newsletters",
+    ))
+
+
+def test_digest_tool_schema_frees_the_labels_and_pins_the_tones():
+    tool = narrator._emit_turns_tool(
+        "digest", expected_title="This week's newsletters",
+    )
+    props = (tool["input_schema"]["properties"]["turns"]["items"]
+             ["properties"])
+    group_props = props["groups"]["items"]["properties"]
+    assert "enum" not in group_props["label"]
+    assert set(group_props["tone"]["enum"]) == set(narrator.RESULT_TONES)
+    assert "digest" in props["vocabulary"]["enum"]

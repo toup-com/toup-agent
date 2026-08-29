@@ -119,7 +119,14 @@ CHANGES_TIERS = (
     ("TOLD YOU ONLY", "slate"),
     ("LEFT ALONE ON PURPOSE", "success"),
 )
-RESULT_VOCABULARIES = {"brief": BRIEF_TIERS, "changes": CHANGES_TIERS}
+# R36-7: `digest` is the free-form vocabulary — an automation with one
+# named job (a newsletter roundup, a repo digest) organises its OWN
+# material instead of wearing the morning triage. `None` means the
+# serializer checks shape (sequential ranks, short labels, tones from
+# RESULT_TONES) rather than a fixed tier list.
+RESULT_TONES = ("danger", "warning", "slate", "success", "ghost")
+RESULT_VOCABULARIES = {"brief": BRIEF_TIERS, "changes": CHANGES_TIERS,
+                       "digest": None}
 
 
 class AutomationThread(Base):
