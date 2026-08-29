@@ -371,6 +371,45 @@ def strip_vault_tool_for_channel(tools, channel):
     ]
 
 
+def intent_for_channel(intent: "QueryIntent", channel: Optional[str]) -> "QueryIntent":
+    """R37: an automation-thread turn always runs at FULL intent.
+
+    The classifier is a text gate, and the thread's composed message
+    always contains the word "automation" without ever classifying
+    `full` — so the operator of a workflow was fielding "run it" with
+    every `automations__*` tool but `list` stripped, every connector
+    read stripped, and the skill prompt that names them absent. Sized
+    for the wire by `scope_connector_tools`, not by the classifier.
+    """
+    if channel == "automation_thread":
+        return INTENT_FULL
+    return intent
+
+
+def scope_connector_tools(tools: list, scope, mcp_names) -> list:
+    """Keep only the connector tools whose connector is in `scope`.
+
+    `scope=None` means no scoping (every caller today but the
+    automation thread). Non-connector tools always pass — membership in
+    `mcp_names` is what makes a tool a connector tool, so a skill tool
+    whose name happens to carry `__` (`automations__run_now`) is never
+    touched. This is what keeps a thread turn's wire array under the
+    proxy's 128-tool tail-trim (ND-24): the trim eats from the END,
+    connector tools are appended last, and the first casualties were
+    exactly the reads the thread needed (`slack__list_channels`).
+    """
+    if scope is None:
+        return tools
+    allowed = set(scope)
+    out = []
+    for t in tools:
+        name = t.get("name", "") or t.get("function", {}).get("name", "")
+        if name in mcp_names and name.split("__", 1)[0] not in allowed:
+            continue
+        out.append(t)
+    return out
+
+
 # Per-channel formatting guidance. Hardcoded table today; channel_config
 # wire-up is a follow-up (TODO(time-channel-fix followup)). Keep values
 # short — this goes into every system prompt, tokens matter.
@@ -1515,6 +1554,10 @@ class AgentRunner:
         # receipt stamp is the honest base for request-anchored offsets
         # (routines__remind); absent → run() entry, as before.
         received_at: Optional[float] = None,
+        # R37: connector ids whose tools may ride this turn's wire array.
+        # None = all (every caller but the automation thread). See
+        # `scope_connector_tools` for why the thread must scope.
+        connector_scope: Optional[List[str]] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -1649,6 +1692,18 @@ class AgentRunner:
         # ── Classify query intent (lightweight, <1ms) ─────────────────
         t_classify = time.perf_counter()
         query_intent = classify_query_intent(user_message)
+        # R37: an automation-thread turn is the automation's OPERATOR
+        # speaking. The classifier reads the composed grounding (which
+        # always says "automation") and still lands on `question` for
+        # "run it" / "use whatever is there" — and a non-full intent
+        # drops every `automations__*` tool but `list`, every connector
+        # read like `slack__list_channels`, AND the skill prompt that
+        # says what those tools are for (include_skill_prompts). The
+        # agent then has one legal move: ask the user a question it was
+        # just asked. Full intent is what the main chat gets for the
+        # same sentence once a tool has run; the thread starts there.
+        # The tool-count cost is contained by `connector_scope` below.
+        query_intent = intent_for_channel(query_intent, channel)
         # Tool-gating above is text-only. An inbound image almost always means
         # the user wants it looked at or edited, but a short caption like "make
         # a six pack" / "fix this" (or no caption at all) names no image-noun
@@ -2606,6 +2661,13 @@ class AgentRunner:
             filtered_tools, channel,
             strip_vault_tool_for_channel=strip_vault_tool_for_channel,
         )
+        _mcp_names = frozenset(
+            (t.get("name", "") or t.get("function", {}).get("name", ""))
+            for t in (getattr(self.tools, "mcp_tool_defs", None) or [])
+        )
+        current_tools = scope_connector_tools(
+            current_tools, connector_scope, _mcp_names,
+        )
 
         _vibe_job_id: Optional[str] = None
         _vibe_app_id: Optional[str] = None
@@ -2701,6 +2763,13 @@ class AgentRunner:
                     strip_vault_tool_for_channel=strip_vault_tool_for_channel,
                 )
                 _channel_banned = frozenset()
+            # R37: the scope is part of the wire array on every path —
+            # scoping only the legacy branch would let a stable-prefix
+            # user's thread turn ship every connector again (and an
+            # allowed_tools restriction naming absent tools is a 400).
+            _stable_tools = scope_connector_tools(
+                _stable_tools, connector_scope, _mcp_names,
+            )
             _stable_names = {_tool_name(t) for t in _stable_tools}
             _gated_names = (
                 {_tool_name(t) for t in current_tools} & _stable_names
@@ -3686,6 +3755,12 @@ class AgentRunner:
                 current_tools = strip_tools_for_channel(
                     all_tools, channel,
                     strip_vault_tool_for_channel=strip_vault_tool_for_channel,
+                )
+                # Escalation must not undo the connector scoping — full
+                # intent skips this branch today, but the scope is a
+                # channel property, not an intent property.
+                current_tools = scope_connector_tools(
+                    current_tools, connector_scope, _mcp_names,
                 )
                 logger.info(f"[AGENT] Escalated to full toolset ({len(current_tools)} tools) after tool use")
 

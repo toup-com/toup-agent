@@ -707,6 +707,51 @@ async def grant_decided_hook(body: GrantHook):
                 _user_id(), cards.GRANT_CARD_KEY, card,
             )
 
+    # R37: an APPROVED grant finishes what `automations__set_destination`
+    # started. The pin stamped grant_id + grant_target onto the step and
+    # left the automation a draft; approval is the moment every arm
+    # check can finally pass — and before this branch existed, nothing
+    # ran it: the user approved the card and the automation sat in
+    # draft until they happened to say something in the thread. Best
+    # effort, its own session — the grant row is the record either way.
+    if body.status == "approved":
+        automation_id = (body.payload or {}).get("automation_id")
+        if automation_id:
+            try:
+                from app.agent.automations.service import arm_automation
+                from app.agent.automations import ledger as _ledger
+                async with async_session_maker() as db:
+                    a = (await db.execute(
+                        select(Automation)
+                        .where(Automation.id == automation_id)
+                        .where(Automation.user_id == _user_id())
+                        .where(Automation.deleted_at.is_(None))
+                    )).scalar_one_or_none()
+                    if a is not None and a.status != "armed":
+                        await arm_automation(
+                            db, automation_id=automation_id,
+                            user_id=_user_id(),
+                        )
+                        thread = await _ledger.ensure_thread(
+                            db, user_id=_user_id(),
+                            automation_id=automation_id,
+                        )
+                        await _ledger.append_turn(
+                            db, user_id=_user_id(), thread=thread,
+                            run_id=None, kind="agent",
+                            payload={"text": (
+                                "You approved it — the permission is in "
+                                "place and this automation is armed. Say "
+                                "run it to watch the first one."
+                            )},
+                        )
+            except Exception as e:  # noqa: BLE001 — approval stands;
+                # the next thread turn can still arm by hand.
+                logger.info(
+                    "[automations] post-approval arm skipped for %s: %s",
+                    automation_id, e,
+                )
+
     # R29 §3.1: a revoked grant pauses its armed automation — the
     # dispatcher already fails closed, this makes the STATE honest
     # (feeds the `attention: grant_revoked` pill). Best-effort in its
@@ -882,7 +927,22 @@ async def run_now(automation_id: str):
                     "sentence": f"It is running now — step "
                                 f"{max(step, 1)} of {max(total, 1)}.",
                 })
-        vspec = await parse_spec_live(automation)
+        from app.agent.automations.spec import SpecError as _SpecError
+        try:
+            vspec = await parse_spec_live(automation)
+        except _SpecError as se:
+            # A spec that no longer parses is a SETUP state, not a
+            # server error. Answering 500 here is how the founder's Run
+            # button died silently: the app's non-409 path asked the
+            # summary what happened, the summary said nothing, and the
+            # honest 409 sentence below was never reached.
+            raise HTTPException(status_code=409, detail={
+                "code": "needs_setup",
+                "sentence": (
+                    "It is not finished being set up — finish the "
+                    "questions in its thread and I will run it."
+                ),
+            }) from se
         from app.agent.automations.spec_v2 import ValidatedSpecV2
         if not isinstance(vspec, ValidatedSpecV2):
             raise HTTPException(status_code=409, detail={
@@ -915,6 +975,37 @@ async def run_now(automation_id: str):
                         f"can {clause}, tell me in its thread where "
                         f"that should go and I will pin it."
                     ),
+                })
+            # R37: a pinned step whose grant the user has not yet
+            # approved used to pass this gate and fire — the reads ran
+            # and the write met the dispatcher's fail-closed refusal,
+            # so "run it now" mid-approval produced a NEEDS YOU card
+            # about a permission the user was already looking at.
+            # Refuse with the true state instead. Unreachable platform
+            # fires anyway — the dispatcher stays the enforcement.
+            from app.agent.automations.registry import fetch_grant
+            try:
+                grant = await fetch_grant(_user_id(), st.grant_id)
+            except Exception:  # noqa: BLE001
+                grant = None
+            if grant is not None and grant.get("status") != "approved":
+                clause = _verbs._WRITE_CLAUSES.get(st.tool) or "write"
+                if grant.get("status") == "pending":
+                    sentence = (
+                        f"It is waiting on your permission to {clause} "
+                        f"— approve the permission card first and it "
+                        f"runs on its own."
+                    )
+                else:
+                    # Expired, denied, revoked — the card is gone; the
+                    # actionable move is a fresh ask, not a hunt for it.
+                    sentence = (
+                        f"The permission it needs to {clause} was never "
+                        f"granted — tell me in its thread where that "
+                        f"should go and I will ask again."
+                    )
+                raise HTTPException(status_code=409, detail={
+                    "code": "needs_setup", "sentence": sentence,
                 })
 
     # R36-2: the fire is DETACHED. A run is minutes of reads plus two
@@ -1052,7 +1143,27 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
             if existing is not None:
                 # A replay. Return the turn we already have and start no
                 # second run — the expensive half of this route is the
-                # agent turn, not the insert.
+                # agent turn, not the insert. R37: unless the first
+                # attempt's answer never happened. The app's Try again
+                # now re-sends the SAME client_msg_id precisely so a
+                # retry cannot mint a duplicate user turn — which made
+                # this branch the place where a lost answer went to die:
+                # the turn came back `replayed` and nothing was ever
+                # scheduled to answer it (the original answer task lives
+                # in process memory, so a restart or a crash between the
+                # 202 and the agent turn orphaned the question for good).
+                from app.db.models import AutomationTurn
+                answered = (await db.execute(
+                    select(AutomationTurn.id)
+                    .where(AutomationTurn.thread_id == thread.id)
+                    .where(AutomationTurn.kind == "agent")
+                    .where(AutomationTurn.seq > int(existing.get("seq") or 0))
+                    .limit(1)
+                )).scalar_one_or_none()
+                if answered is None and thread.id not in _ANSWERING_THREADS:
+                    _schedule_thread_answer(
+                        automation.id, thread.id, body.text,
+                    )
                 return {"turn": existing, "thread_id": thread.id,
                         "replayed": True,
                         "client_msg_id": body.client_msg_id}
@@ -1091,6 +1202,16 @@ async def post_thread_message(automation_id: str, body: ThreadMessageBody):
 # mid-flight and the thread simply never replies.
 _PENDING_THREAD_ANSWERS: set = set()
 
+# Threads with an answer task LIVE right now. The replay branch's whole
+# licence to re-schedule is "the first answer is LOST" — a restart, a
+# crash between the 202 and the agent turn. An answer still RUNNING is
+# not lost, and re-scheduling beside it ran two full agent turns for
+# one question: two reply bubbles, doubled tool side effects (two
+# permission cards from one 'post it to #general'). In-process on
+# purpose: after the restart this set is empty, which is exactly the
+# case the retry exists for.
+_ANSWERING_THREADS: set = set()
+
 
 def _schedule_thread_answer(
     automation_id: str, thread_id: str, user_text: str,
@@ -1108,7 +1229,11 @@ def _schedule_thread_answer(
         )
         return
     _PENDING_THREAD_ANSWERS.add(task)
-    task.add_done_callback(_PENDING_THREAD_ANSWERS.discard)
+    _ANSWERING_THREADS.add(thread_id)
+    def _done(t, _tid=thread_id):
+        _PENDING_THREAD_ANSWERS.discard(t)
+        _ANSWERING_THREADS.discard(_tid)
+    task.add_done_callback(_done)
 
 
 async def _answer_thread_turn(

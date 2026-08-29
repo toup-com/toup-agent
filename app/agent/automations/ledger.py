@@ -407,6 +407,10 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             "fix_label": _clean_sentence(p.get("fix_label"),
                                          "needs_you.fix_label"),
             "approval_url": p.get("approval_url") or None,
+            # R37: a `grant` fix that names its request can be decided
+            # right on the card — without it the button's only move is
+            # an OAuth round trip about a permission OAuth already has.
+            "grant_request_id": str(p.get("grant_request_id") or "") or None,
         }
 
     raise LedgerValidationError(f"unhandled kind {kind!r}")  # pragma: no cover

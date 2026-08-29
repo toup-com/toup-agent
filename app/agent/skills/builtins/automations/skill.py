@@ -465,6 +465,62 @@ class AutomationsSkill(Skill):
                     "required": ["automation_id"],
                 },
             },
+            # R37. Appended last, per the prefix-stable rule above.
+            #
+            # The one-call write-back for the decision every setup
+            # thread ends on: WHERE the result goes. Before this, a
+            # destination change needed `automations__update` with a
+            # complete replacement spec — a round trip through
+            # `automations__list` plus a hand-rebuilt steps array, with
+            # a grant id the model does not have — so the agent agreed
+            # in words ("I'll keep it in this chat") and the workflow
+            # never moved (the founder watched the canvas still say
+            # "Told you in Slack" three messages later).
+            {
+                "name": "automations__set_destination",
+                "description": (
+                    "Point one automation's delivery somewhere, for "
+                    "real. destination 'chat' removes the outside write "
+                    "entirely — the result lands in the automation's "
+                    "own thread (plus its chat card), no permission "
+                    "needed, and the automation is armed if its "
+                    "accounts are connected. A connector target (e.g. "
+                    "a Slack channel from automations__list_targets) "
+                    "pins the write there and asks the user for the "
+                    "permission it needs — the run stays blocked until "
+                    "they approve. Never claim a destination changed "
+                    "without calling this."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "destination": {
+                            "type": "string",
+                            "enum": ["chat", "connector"],
+                            "description": "'chat' = this thread; "
+                                           "'connector' pins `target` "
+                                           "on the write step",
+                        },
+                        "connector_id": {
+                            "type": "string",
+                            "description": "required for 'connector'",
+                        },
+                        "target": {
+                            "type": "object",
+                            "description": "for 'connector': the pinned "
+                                           "place, from "
+                                           "automations__list_targets",
+                            "properties": {
+                                "kind": {"type": "string"},
+                                "id": {"type": "string"},
+                                "label": {"type": "string"},
+                            },
+                        },
+                    },
+                    "required": ["automation_id", "destination"],
+                },
+            },
         ]
 
     def get_system_prompt_section(self) -> Optional[str]:
@@ -523,11 +579,37 @@ class AutomationsSkill(Skill):
             "answer a request to RUN with a description of what it "
             "would do, and never with a status: 'its status is paused' "
             "is not a reply to 'run it again', it is a way of not "
-            "doing it. For several at once, call the tool once per "
+            "doing it. If the tool refuses, say the refusal's own "
+            "sentence and then DO the fix it names when you have a "
+            "tool for it (an unpinned destination is yours to fix: "
+            "offer the places, then `automations__set_destination`). "
+            "For several at once, call the tool once per "
             "automation. Then say one short line — the run narrates "
             "itself in its own thread, and anything you add here is a "
             "second account of the same run that will disagree with "
             "the first.\n"
+            "INSIDE AN AUTOMATION'S OWN THREAD you are the OPERATOR of "
+            "this one workflow, and the turn's context carries its "
+            "setup RIGHT NOW — answer from that block, never from "
+            "older turns that describe how it used to be. The rules:\n"
+            "  - Use what you can already see before asking anything. "
+            "'Which Slack channel?' is a failure when "
+            "`slack__list_channels` (or `automations__list_targets`) "
+            "is one call away — offer the real ones by name, at most "
+            "once.\n"
+            "  - 'whatever', 'any of them', 'you pick' is an ANSWER: "
+            "pick the most sensible existing target yourself, apply "
+            "it, and say which you picked in the same breath. Do not "
+            "re-ask.\n"
+            "  - A decision the user states ('keep it in this chat', "
+            "'post it to #general', 'make it 9am') is applied WITH A "
+            "TOOL in the same turn — `automations__set_destination` "
+            "for where it delivers, `automations__update` for the "
+            "rest. Saying 'got it' without the tool call is the lie "
+            "the canvas exposes three messages later.\n"
+            "  - After a confirmed decision, never re-confirm it. "
+            "'Yep' means move: apply it, then name the next real step "
+            "or offer the first run.\n"
             # These are promises made to a user about what the engine
             # will do, so every one of them has to be true of the
             # engine as it is now — not as the round intends it. The
@@ -628,6 +710,7 @@ class AutomationsSkill(Skill):
             "automations__resume": self._resume,
             "automations__delete": self._delete,
             "automations__memory_recall": self._recall,
+            "automations__set_destination": self._set_destination,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -1027,6 +1110,188 @@ class AutomationsSkill(Skill):
             f"Updated {automation.id!r}; status is now "
             f"{automation.status!r}.",
             display=f"Changed {automation.name}",
+        )
+
+    async def _set_destination(self, args, ctx) -> str:
+        """R37 — the one-call write-back for WHERE the result goes.
+
+        'chat' is a spec change with no permission attached, so it
+        applies and (accounts permitting) ARMS in this one call.
+        'connector' is two systems moving together: the write step is
+        pinned to the target AND the permission that write needs is
+        requested — as a card in the main chat, and as a needs_you
+        turn in the automation's own thread, because a promise that
+        "I will ask for your permission" which never surfaces anywhere
+        the user is looking is the founder's item 7.
+        """
+        from app.agent.automations.service import (
+            AutomationNotFound, pin_destination, set_destination_chat,
+        )
+        from app.agent.automations.spec import SpecError
+        from app.db.database import async_session_maker
+
+        uid = _uid(ctx)
+        automation_id = (args.get("automation_id") or "").strip()
+        destination = (args.get("destination") or "").strip()
+
+        if destination == "chat":
+            try:
+                async with async_session_maker() as db:
+                    out = await set_destination_chat(
+                        db, automation_id=automation_id, user_id=uid,
+                    )
+            except AutomationNotFound:
+                return "ERROR: No such automation."
+            except SpecError as e:
+                return ToolResult(
+                    "COULD NOT CHANGE IT:\n" + _as_json(e.errors),
+                    display="Could not move the delivery",
+                )
+            missing = [m for m in out.get("missing") or []]
+            tail = (f" Its accounts are not all connected yet "
+                    f"({', '.join(missing)}), so it stays a draft."
+                    if missing else "")
+            return ToolResult(
+                f"DONE — {out['sentence']}{tail} Tell the user in one "
+                f"short line; the workflow canvas already shows it.",
+                display="Delivery moved to this chat",
+            )
+
+        if destination != "connector":
+            return "ERROR: destination must be 'chat' or 'connector'."
+
+        connector_id = (args.get("connector_id") or "").strip()
+        target = args.get("target") or {}
+        if not connector_id or not target.get("id"):
+            return ("ERROR: a connector destination needs connector_id "
+                    "and a target from automations__list_targets.")
+
+        # The grant request first — if the platform refuses (bad
+        # target, missing OAuth scope), nothing has been half-pinned.
+        from app.agent.automations import registry as reg
+        from app.agent.automations.service import _load_owned
+        async with async_session_maker() as db:
+            try:
+                automation = await _load_owned(db, automation_id, uid)
+            except AutomationNotFound:
+                return "ERROR: No such automation."
+            raw_spec = json.loads(automation.spec_json or "{}")
+        from app.services.automation_verbs import (
+            _WRITE_CLAUSES, is_write_tool,
+        )
+        tool = next(
+            (s.get("tool") for s in raw_spec.get("steps") or []
+             if s.get("connector_id") == connector_id
+             and (s.get("grant_id") or is_write_tool(s.get("tool")))),
+            None,
+        )
+        if not tool:
+            return (f"ERROR: this automation has no {connector_id} "
+                    f"write to point anywhere.")
+        grant = await reg.create_grant_request(
+            uid,
+            connector_id=connector_id,
+            tool_name=tool,
+            target=target,
+            cadence=None,
+            mode=raw_spec.get("mode") or "auto",
+            summary=f"{automation.name}: "
+                    f"{_WRITE_CLAUSES.get(tool) or 'write'} in "
+                    f"{target.get('label') or target.get('id')}",
+            preview=None,
+            automation_id=automation_id,
+        )
+        if grant is None:
+            return ("ERROR: The permission request could not be "
+                    "prepared (invalid target, a missing OAuth scope, "
+                    "or the platform is unreachable). Nothing changed.")
+
+        try:
+            async with async_session_maker() as db:
+                await pin_destination(
+                    db, automation_id=automation_id, user_id=uid,
+                    connector_id=connector_id, tool=tool, grant=grant,
+                    target=target,
+                )
+        except SpecError as e:
+            return ToolResult(
+                "COULD NOT PIN IT:\n" + _as_json(e.errors),
+                display="Could not pin the destination",
+            )
+
+        # The ask, where the user is looking: the grant card in the
+        # main chat (the surface that can decide it) AND a needs_you
+        # turn in this thread (the surface the conversation is in).
+        clause = _WRITE_CLAUSES.get(tool) or "write"
+        label = target.get("label") or target.get("id")
+        payload = {
+            "id": grant["id"],
+            "automation_id": grant.get("automation_id") or automation_id,
+            "connector_id": grant["connector_id"],
+            "action": grant["tool_name"],
+            "action_label": grant["tool_name"].split("__", 1)[-1]
+            .replace("_", " "),
+            "target": grant.get("target") or {},
+            "cadence": grant.get("cadence") or {},
+            "mode": grant.get("mode"),
+            "summary": grant.get("summary"),
+            "preview": None,
+            "status": grant.get("status"),
+            "created_at": grant.get("created_at"),
+            "expires_at": grant.get("expires_at"),
+            "decided_at": None,
+            "decided_via": None,
+        }
+        try:
+            from app.agent.automations import cards
+            async with async_session_maker() as db:
+                await cards.write_card_message(
+                    db,
+                    user_id=uid,
+                    content=f"Permission needed: {grant.get('summary')}",
+                    metadata_key=cards.GRANT_CARD_KEY,
+                    payload=payload,
+                    title="Permission request",
+                )
+            await cards.broadcast_card(uid, cards.GRANT_CARD_KEY, payload)
+        except Exception as e:  # noqa: BLE001 — the thread turn below
+            # still carries the ask; a missing card is a missing
+            # duplicate, not a missing ask.
+            logger.warning("[automations] grant card skipped: %s", e)
+        from app.services.automation_verbs import display_name
+        name = display_name(connector_id) or connector_id.title()
+        try:
+            from app.agent.automations import ledger as _ledger
+            async with async_session_maker() as db:
+                thread = await _ledger.ensure_thread(
+                    db, user_id=uid, automation_id=automation_id,
+                )
+                await _ledger.append_turn(
+                    db, user_id=uid, thread=thread, run_id=None,
+                    kind="needs_you",
+                    payload={
+                        "account_id": connector_id,
+                        "connector_id": connector_id,
+                        "name": name,
+                        "reason_code": "grant_missing",
+                        "sentence": (f"It needs your permission to "
+                                     f"{clause} in {label}."),
+                        "fix": "grant",
+                        "fix_label": "Allow it",
+                        "grant_request_id": grant["id"],
+                    },
+                )
+        except Exception as e:  # noqa: BLE001 — the main-chat card
+            # stands; the thread just lost its copy of the ask.
+            logger.warning("[automations] thread grant ask skipped: %s", e)
+
+        return ToolResult(
+            f"PINNED to {label}, waiting on the user's permission "
+            f"(grant_id={grant['id']}, expires in 1 hour). The ask is "
+            f"in this thread and in their chat. It arms itself when "
+            f"they approve — end your turn telling them that in one "
+            f"line.",
+            display="Pinned — waiting on you",
         )
 
     async def _test_run(self, args, ctx) -> str:

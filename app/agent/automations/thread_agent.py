@@ -155,6 +155,7 @@ def _grounding(automation: Automation, turns: list[dict],
         f"Accounts it can reach: "
         f"{', '.join(account_health.display_of(a) for a in _account_ids(automation)) or 'none'}",
     ]
+    lines.extend(_setup_lines(automation))
     try:
         rules = json.loads(automation.rules_json or "[]")
         for r in rules:
@@ -184,6 +185,76 @@ def _grounding(automation: Automation, turns: list[dict],
         elif kind == "note":
             lines.append(f"[{t.get('stamp')}]")
     return "\n".join(lines)
+
+
+def _setup_lines(automation: Automation) -> list[str]:
+    """The CURRENT SETUP, derived from the spec at answer time.
+
+    R37, the founder's item 6: the agent said "I'll keep the inbox
+    summary in this chat" twice, and one message later answered "before
+    it can post to Slack, tell me which channel" — because nothing in
+    its context was the automation NOW. The grounding carried the name,
+    the account names, rules and old turns; schedule, destination, mode
+    and status were all absent, so the setup it answered from was
+    whatever the last 40 turns happened to claim. Derived fresh per
+    turn, never cached — the same derived-first rule `summary_payload`
+    follows.
+    """
+    from app.services import automation_verbs as verbs
+    from . import workflow
+    try:
+        raw = workflow._spec_raw(automation)
+    except Exception as e:  # noqa: BLE001 — grounding, not a gate
+        logger.debug("[thread_agent] setup lines skipped: %s", e)
+        return []
+    lines = ["Its setup RIGHT NOW (trust this over anything older in "
+             "the thread):"]
+    try:
+        sentence = workflow.schedule_block(automation, raw).get("sentence")
+        if sentence:
+            lines.append(f"- Runs: {sentence}")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[thread_agent] schedule line skipped: %s", e)
+    status = getattr(automation, "status", None) or "draft"
+    if status == "armed":
+        lines.append("- Status: armed — it fires on its schedule.")
+    elif status == "paused":
+        _reason = getattr(automation, "paused_reason", None)
+        why = f" ({_reason})" if _reason else ""
+        lines.append(f"- Status: paused{why}.")
+    else:
+        lines.append("- Status: draft — not armed yet.")
+    try:
+        writes = workflow._write_tools(raw)
+        # The v1 branch of `_write_tools` hard-codes the target to {}
+        # even when arm snapshotted one onto the action — and an
+        # authoritative "NOT pinned yet — it cannot" about a delivering
+        # automation, in the block the prompt says to trust, is worse
+        # than no line at all.
+        if raw.get("version") != 2 and writes:
+            v1_target = (raw.get("action") or {}).get("grant_target") or {}
+            if v1_target:
+                cid0, tool0, _ = writes[0]
+                writes = [(cid0, tool0, v1_target)] + writes[1:]
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[thread_agent] write lines skipped: %s", e)
+        writes = []
+    if not writes:
+        lines.append(
+            "- Delivers: its brief lands here in this thread (with a card "
+            "in the main chat) — it writes to no outside service."
+        )
+    for _cid, tool, target in writes:
+        clause = verbs._WRITE_CLAUSES.get(tool) or "write"
+        label = (target or {}).get("label") or (target or {}).get("id")
+        if label:
+            lines.append(f"- Delivers: it can {clause} — pinned to {label}.")
+        else:
+            lines.append(
+                f"- Delivers: it is supposed to {clause}, but the "
+                f"destination is NOT pinned yet — until it is, it cannot."
+            )
+    return lines
 
 
 async def _facts_for(db: AsyncSession, automation: Automation) -> list[dict]:
@@ -338,6 +409,11 @@ async def answer_in_thread(
             disable_post_processing=True,
             on_tool_start=_on_tool_start,
             on_text_chunk=_on_text_chunk,
+            # R37: only THIS automation's connectors ride the wire. The
+            # full array put the thread turn over the proxy's 128-tool
+            # tail-trim on connector-heavy accounts, and the trimmed
+            # tail was exactly the reads this surface exists for.
+            connector_scope=_account_ids(automation),
         )
         text = (getattr(response, "text", "") or "").strip()
     except Exception as e:  # noqa: BLE001

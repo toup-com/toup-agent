@@ -318,9 +318,11 @@ def test_memory_recall_is_the_last_tool():
     # R31-04 appended `automations__run_now` after it — the array only
     # ever grows at the end, so recall is now second from last.
     tools = AutomationsSkill().get_tools()
-    assert tools[-1]["name"] == "automations__run_now"
-    assert tools[-2]["name"] == "automations__memory_recall"
-    description = tools[-2]["description"].lower()
+    # R37 appended set_destination; the earlier tail keeps its order.
+    assert tools[-1]["name"] == "automations__set_destination"
+    assert tools[-2]["name"] == "automations__run_now"
+    assert tools[-3]["name"] == "automations__memory_recall"
+    description = tools[-3]["description"].lower()
     # It must say WHEN it is relevant...
     assert "when the user asks" in description
     # ...but never carry a flow posture: "use it before answering

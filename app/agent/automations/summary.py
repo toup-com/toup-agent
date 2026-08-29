@@ -428,9 +428,13 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
             action = None
 
         sched = workflow.schedule_block(a, raw)
-        sched["next_run_label"] = _when_label(
-            await _next_run_at(db, a.id), tz,
-        )
+        # `_when_label(None)` answers "soon" — right for the meta line
+        # ("First run soon") and wrong HERE, because the one consumer of
+        # this field composes a preposition over it: the app's Run-it-now
+        # sub rendered "Without waiting for soon" on every draft (R37,
+        # founder's item 9). This field is a noun phrase or it is wrong.
+        _nrl = _when_label(await _next_run_at(db, a.id), tz)
+        sched["next_run_label"] = "its next run" if _nrl == "soon" else _nrl
         thread = (await db.execute(
             select(AutomationThread.id)
             .where(AutomationThread.automation_id == a.id)

@@ -192,6 +192,157 @@ async def arm_automation(
     return automation
 
 
+async def _replace_spec_template(
+    db: AsyncSession, automation: Automation, new_raw: dict,
+) -> Automation:
+    """Persist a replacement spec for a possibly-MID-SETUP automation.
+
+    `update_automation` validates with template_mode=False, which is
+    right for a finished spec and wrong for the drafts the R37
+    write-backs exist to move: a from-template draft may still carry a
+    dangling {{var.x}} or another connector's ungranted write, and
+    refusing the WHOLE change over those reproduces the founder's
+    item 6 through the very tool that was built to end it. Grants are
+    enforced at ARM and DISPATCH — the same rule parse_spec_live
+    follows — so validation here matches the spec's actual state.
+    """
+    capability = await reg.fetch_registry(automation.user_id)
+    vspec = validate_spec(new_raw, capability, template_mode=True)
+    automation.name = vspec.name
+    automation.description = vspec.raw.get("description")
+    automation.spec_json = json.dumps(vspec.raw, sort_keys=True)
+    automation.trigger_mode = vspec.trigger_mode
+    automation.connector_id = (
+        vspec.trigger_connector_id or vspec.action_connector_id
+    )
+    automation.status = "draft"
+    automation.paused_reason = None
+    await compiler.compile_bindings(db, automation, vspec)
+    await db.commit()
+    await db.refresh(automation)
+    return automation
+
+
+async def set_destination_chat(
+    db: AsyncSession, *, automation_id: str, user_id: str,
+) -> dict:
+    """R37: "send it here in the chat" becomes a real spec change.
+
+    The chat destination is not a new delivery lane — it is the
+    reads-only shape the engine has always had: the run's brief lands
+    as typed turns in the automation's own thread plus the one
+    notification card in the day chat. So "in this chat" = remove the
+    outside write steps, which also removes the grant the write was
+    blocked on, which is what lets a template draft finally ARM. The
+    founder's Inbox summary sat unarmed for exactly this: the agent
+    agreed "I'll keep it in this chat" twice and nothing could ever
+    move, because agreeing was the only tool it had.
+    """
+    from app.services.automation_verbs import is_write_tool
+    from . import workflow
+
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = workflow._spec_raw(automation)
+    if raw.get("version") != 2:
+        raise SpecError([{"code": "v1_spec",
+                          "message": "This automation predates "
+                                     "destination changes."}])
+    steps = [dict(s) for s in raw.get("steps") or []]
+    kept = [s for s in steps
+            if not (s.get("grant_id") or is_write_tool(s.get("tool")))]
+    if len(kept) == len(steps):
+        return {"changed": False, "armed": automation.status == "armed",
+                "sentence": "It already lands here — nothing to change."}
+    if not kept:
+        raise SpecError([{"code": "no_steps",
+                          "message": "Removing the write would leave "
+                                     "this automation with nothing to "
+                                     "do."}])
+    was_armed = automation.status == "armed"
+    new_raw = dict(raw)
+    new_raw["steps"] = kept
+    automation = await _replace_spec_template(db, automation, new_raw)
+
+    # Arm when it was armed before (removing a write can only narrow
+    # what fires), or when every remaining member is connected — the
+    # same predicate from-template uses. An armed automation whose only
+    # source is disconnected fires straight into a NEEDS YOU card.
+    missing: list[str] = []
+    if not was_armed:
+        try:
+            state = await reg.fetch_connection_state(user_id) or {}
+            members = workflow._member_connectors(new_raw)
+            missing = [c for c in members
+                       if not (state.get(c) or {}).get("connected")]
+        except Exception as e:  # noqa: BLE001 — unknown state arms nothing
+            logger.warning("[automations] connection state unreadable: %s", e)
+            missing = ["(unknown)"]
+    armed = False
+    if was_armed or not missing:
+        try:
+            automation = await arm_automation(
+                db, automation_id=automation_id, user_id=user_id,
+            )
+            armed = True
+        except (compiler.CompileError, SpecError) as e:
+            logger.info("[automations] chat destination left %s in "
+                        "draft: %s", automation_id, e)
+    await workflow._edited_note(db, automation)
+    sentence = (
+        "The brief lands here in this thread now — nothing posts "
+        "anywhere else" + (", and it is armed." if armed else
+                           ", but it is not armed yet.")
+    )
+    return {"changed": True, "armed": armed, "sentence": sentence,
+            "missing": missing}
+
+
+async def pin_destination(
+    db: AsyncSession, *, automation_id: str, user_id: str,
+    connector_id: str, tool: str, grant: dict, target: dict,
+) -> dict:
+    """R37: pin ONE write step's target and remember the grant that was
+    just requested for it. The automation stays DRAFT until the user
+    approves — `_grant_decided` finishes the arm.
+
+    Exactly one step: the grant was minted for one (connector, tool,
+    target) triple, and stamping every write of the connector silently
+    redirected an ALREADY-APPROVED sibling destination on multi-write
+    specs. The first unpinned step with that tool is the one being set
+    up; with none unpinned, the first with that tool is the redirect
+    the user asked for."""
+    from . import workflow
+
+    automation = await _load_owned(db, automation_id, user_id)
+    raw = workflow._spec_raw(automation)
+    if raw.get("version") != 2:
+        raise SpecError([{"code": "v1_spec",
+                          "message": "This automation predates "
+                                     "destination changes."}])
+    steps = [dict(s) for s in raw.get("steps") or []]
+    matching = [s for s in steps
+                if s.get("connector_id") == connector_id
+                and s.get("tool") == tool]
+    if not matching:
+        raise SpecError([{"code": "no_write_step",
+                          "message": f"No {connector_id} write to pin."}])
+    chosen = next(
+        (s for s in matching if not (s.get("grant_target") or {}).get("id")),
+        matching[0],
+    )
+    chosen["grant_id"] = str(grant.get("id") or "")
+    chosen["grant_target"] = {
+        "kind": str((target or {}).get("kind") or ""),
+        "id": str((target or {}).get("id") or ""),
+        "label": str((target or {}).get("label") or ""),
+    }
+    new_raw = dict(raw)
+    new_raw["steps"] = steps
+    automation = await _replace_spec_template(db, automation, new_raw)
+    await workflow._edited_note(db, automation)
+    return {"changed": True, "armed": False}
+
+
 async def pause_automation(
     db: AsyncSession, *, automation_id: str, user_id: str,
     reason: str = "user",

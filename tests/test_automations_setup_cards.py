@@ -76,8 +76,10 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         assert n.startswith("automations__")
     # And the prefix-stable tools array only ever grows at the END.
     ordered = [t["name"] for t in AutomationsSkill().get_tools()]
-    assert ordered[-1] == "automations__run_now"
-    assert ordered[-2] == "automations__memory_recall"
+    # R37 appended set_destination; the earlier tail keeps its order.
+    assert ordered[-3:] == ["automations__memory_recall",
+                            "automations__run_now",
+                            "automations__set_destination"]
 
     # Under the dev fast lane it comes back. The array is FILTERED
     # rather than appended to, so it returns to its original position —

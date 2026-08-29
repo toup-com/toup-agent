@@ -628,11 +628,21 @@ def validate_spec_v2(
              f"at most {MAX_WRITE_STEPS} write steps")
 
     # ── variables actually referenced must exist ─────────────────────
+    # …except on a template-mode re-parse with NO declared set. The
+    # create path and the catalog lint both pass `template_vars`, so an
+    # unknown reference there is a real authoring error. A PERSISTED
+    # template draft carries only the ANSWERED variables (`from_template`
+    # stamps the values dict), and its unanswered required variable is a
+    # setup-thread question — the same rule template_mode already applies
+    # to grants. Enforcing it at re-parse made `parse_spec_live` RAISE on
+    # every such draft, which reached the founder as run-now answering
+    # 500 about an automation whose thread was mid-setup (R37).
     declared = set(variables) | set(template_vars or ())
-    for where, var_name in _iter_var_refs(spec):
-        if var_name not in declared:
-            _err(errors, "unknown_variable", where,
-                 f"{{{{var.{var_name}}}}} is not declared in variables")
+    if not (template_mode and template_vars is None):
+        for where, var_name in _iter_var_refs(spec):
+            if var_name not in declared:
+                _err(errors, "unknown_variable", where,
+                     f"{{{{var.{var_name}}}}} is not declared in variables")
 
     if errors:
         raise SpecError(errors)

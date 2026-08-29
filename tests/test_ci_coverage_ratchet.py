@@ -368,7 +368,11 @@ def test_debt_is_not_growing_silently():
     # comment at the top of the test FILE. That marker does nothing there;
     # the sweep reads THIS file. The check below now catches that locally
     # instead of spending a CI cycle on it.
-    CEILING = 87
+    # R37: +1 for test_r37_thread_operator.py — drives real automations/
+    # automation_threads/automation_turns rows (AGENT_ONLY all three) for
+    # the thread-operator proofs; it RUNS in the agent-mode step (a
+    # ROUTING entry, not an excuse).
+    CEILING = 88
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
