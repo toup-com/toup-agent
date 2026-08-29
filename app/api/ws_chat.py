@@ -422,6 +422,49 @@ def _unregister_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
 _active_turns: Dict[str, dict] = {}
 _TURN_STALE_S = 900.0  # 15 min: longer than any real turn, short enough to self-heal
 
+# ── The turn's cancel handle ─────────────────────────────────────────────
+# `_wait_for_stop` below reads only the socket that RECEIVED the message, so
+# for the whole life of the stop protocol a client could cancel its turn from
+# exactly one connection — and the phone loses that connection on every
+# backgrounding, every network blip and every container swap, while the turn
+# keeps running headless (that is the point of the registry above). A stop from
+# the reconnected socket landed in the main receive loop and came back as
+# "Unknown message type: stop": the agent carried on, and the client was told
+# its own frame was a protocol error.
+#
+# One entry per user, keyed exactly like `_active_turns`, and correct for the
+# same reason: the turn lives in THIS process. Held beside that registry rather
+# than inside it because `_set_active_turn` starts a fresh dict on a new mission
+# id, and a task is not a status field. `(mission_id, task)` so the teardown can
+# identity-guard its own removal the way `_clear_active_turn` does.
+_stoppable_turns: Dict[str, tuple] = {}
+
+
+def _register_stoppable_turn(user_id: str, mission_id: Optional[str], task) -> None:
+    """Publish this turn's cancel handle for every socket this user has."""
+    _stoppable_turns[user_id] = (mission_id, task)
+
+
+def _retire_stoppable_turn(user_id: str, mission_id: Optional[str]) -> None:
+    """Drop it. Identity-guarded on the mission id for exactly the reason
+    `_clear_active_turn` is: a NEWER turn's handle must survive an older one's
+    teardown, and both teardowns run."""
+    entry = _stoppable_turns.get(user_id)
+    if entry is not None and entry[0] == mission_id:
+        _stoppable_turns.pop(user_id, None)
+
+
+def _cancel_active_turn(user_id: str) -> bool:
+    """Cancel this user's in-flight turn from any of their sockets. Returns
+    whether there was live work to cancel — a stop with nothing to stop is a
+    no-op the client has already applied locally, never an error."""
+    entry = _stoppable_turns.get(user_id)
+    task = entry[1] if entry else None
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
 
 def _set_active_turn(user_id: str, **fields) -> None:
     """Create or update this user's in-flight turn entry. A different mission
@@ -2923,6 +2966,25 @@ async def ws_chat(
                     asyncio.create_task(_handle_radio_display_mode(user_id, msg))
                     continue
 
+                # ── "Stop whatever is running for me" ──
+                # The out-of-band lane. `_wait_for_stop` owns the receive stream
+                # of the socket that started the turn and is the fast path; this
+                # is for every other socket the same user has — which, after a
+                # reconnect, is the ONLY one they have. See `_stoppable_turns`.
+                if msg_type == "stop":
+                    if _cancel_active_turn(user_id):
+                        logger.info("[WS] Agent stopped by user (out-of-band): %s", user_id[:8])
+                    # Answered either way, and never as an error. The turn's own
+                    # CancelledError branch replies on the socket that STARTED
+                    # it — which in the case this lane exists for is precisely
+                    # the socket that is gone — and a stop with nothing left to
+                    # stop is a no-op the client has already applied locally.
+                    try:
+                        await websocket.send_json({"type": "stopped", "message": "Generation stopped"})
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+
                 if msg_type != "message":
                     await websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
                     continue
@@ -4008,6 +4070,10 @@ async def ws_chat(
                     force_new_session=force_new_session,
                     received_at=_turn_received_ts,
                 ))
+                # From here any of this user's sockets can cancel this turn —
+                # see the `stop` branch in the receive loop. The per-socket
+                # watcher below is still the fast path for the common case.
+                _register_stoppable_turn(user_id, _turn_mission_id, agent_task)
 
                 # Wait for agent to finish, but also listen for stop via a receiver task
                 async def _wait_for_stop():
@@ -4390,9 +4456,55 @@ async def ws_chat(
                         await stop_task
                     except (asyncio.CancelledError, Exception):
                         pass
-                    # Save partial response on user-stop so it's not lost
+                    # Consistent with the answer and error branches: this turn
+                    # is over, so nothing downstream should still be scheduling
+                    # "working on your answer" for it.
+                    _turn_flags["finished"] = True
+                    # …and so is its chat-task job. The answer branch completes
+                    # it and the error branch fails it; this branch did neither,
+                    # so a stopped turn left a `running` BuildJob row behind
+                    # forever and both clients drew it as an "In progress" card
+                    # on every load, under a reply that had visibly stopped.
+                    # Reproduced on the simulator 2026-08-25, first stop ever
+                    # sent from the phone. `cancelled` is already terminal in
+                    # both clients (JobProgressCard renders it "Cancelled",
+                    # neutral) — it just had no producer.
+                    if _chat_task_job_id:
+                        try:
+                            from app.db.database import async_session_maker as _sm3
+                            from app.db.models import BuildJob as _BJ3
+                            async with _sm3() as _cdb:
+                                _cj = await _cdb.get(_BJ3, _chat_task_job_id)
+                                if _cj and _cj.status == "running":
+                                    _cj.status = "cancelled"
+                                    _cj.completed_at = datetime.utcnow()
+                                    await _cdb.commit()
+                            # So a client still on this socket folds the card now
+                            # rather than on its next poll — the answer branch
+                            # broadcasts for the same reason.
+                            await broadcast_queue.put({
+                                "type": "job_update",
+                                "job_id": _chat_task_job_id,
+                                "status": "cancelled",
+                            })
+                        except Exception as _ce:  # noqa: BLE001
+                            logger.warning("[TASK] Failed to cancel task job: %s", _ce)
+                    # Save partial response on user-stop so it's not lost.
+                    # `conversation_id` is NOT NULL, and a brand-new user's FIRST
+                    # message arrives with session_id=null (see the note at the
+                    # top of this file) — so stopping it used to raise
+                    # IntegrityError into a bare `except: pass` and lose the
+                    # partial with no log line at all. Skipped explicitly and
+                    # recorded instead: the clients keep their own copy of the
+                    # partial for the session either way, so the loss is a
+                    # reload away rather than immediate, and it is now visible.
                     _partial = "".join(_streamed_chunks).strip()
-                    if _partial:
+                    if _partial and not session_id:
+                        logger.warning(
+                            "[WS] stop: partial not persisted, no conversation yet (user=%s)",
+                            user_id[:8],
+                        )
+                    elif _partial:
                         try:
                             async with async_session_maker() as _err_db:
                                 _err_dc = await _resolve_day_chat_id_for_now(_err_db, user_id, tz_override=client_tz)
@@ -4401,8 +4513,8 @@ async def ws_chat(
                                     content=_partial + "\n\n*[Generation stopped by user]*",
                                 ))
                                 await _err_db.commit()
-                        except Exception:
-                            pass
+                        except Exception as _pe:  # noqa: BLE001
+                            logger.warning("[WS] stop: partial save failed: %s", _pe)
                     await _safe_send({"type": "stopped", "message": "Generation stopped"})
                 except Exception as e:
                     stop_task.cancel()
@@ -4514,6 +4626,7 @@ async def ws_chat(
                     # not told to wait on finished work) and tell any resumed
                     # socket to drop its working orb.
                     _clear_active_turn(user_id, _turn_mission_id)
+                    _retire_stoppable_turn(user_id, _turn_mission_id)
                     try:
                         await broadcast_to_user(user_id, {
                             "type": "turn_ended",
@@ -4532,6 +4645,7 @@ async def ws_chat(
             # announce. Guarded by mission id, so a NEWER turn is untouched.
             if _conn_turn_mission:
                 _clear_active_turn(user_id, _conn_turn_mission)
+                _retire_stoppable_turn(user_id, _conn_turn_mission)
             # Phase A/B: release this WS from the drain counter. Match
             # the increment above; if drain has been engaged and this
             # was the last in-flight WS, the drain watcher will exit
