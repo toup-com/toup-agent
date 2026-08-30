@@ -463,3 +463,232 @@ async def test_summary_next_run_label_is_a_noun_phrase(monkeypatch):
         items = (await summary_payload(db, user_id=uid))["automations"]
     mine = next(i for i in items if i["id"] == aid)
     assert mine["schedule"]["next_run_label"] == "its next run"
+
+
+# ── 10. R38: a run-now refusal is a thread turn, said once ──────────
+
+@pytest.mark.asyncio
+async def test_run_now_refusal_writes_one_thread_turn(monkeypatch):
+    """rec1 f020–f030: the 409 was server silence, so the app alerted
+    AND posted its own bubble while a phantom card completed itself.
+    The refusal now lands ONCE as an agent turn in the thread, the 409
+    detail carries refusal_turn, and the sentence no longer says "in
+    its thread" — it IS in the thread."""
+    from fastapi import HTTPException
+    from app.api import automations as api
+    from app.agent.automations import ledger
+
+    async def _registry(user_id, *, force=False):
+        return REGISTRY
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _registry)
+
+    uid, aid = await _mk(_inbox_spec())  # unpinned Slack write
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+    with pytest.raises(HTTPException) as exc:
+        await api.run_now(aid)
+    detail = exc.value.detail
+    assert exc.value.status_code == 409
+    assert detail["code"] == "needs_setup"
+    assert detail.get("refusal_turn") is True
+    assert "in its thread" not in detail["sentence"]
+    assert "post to Slack" in detail["sentence"]
+
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, aid)
+        assert thread is not None
+        turns, _ = await ledger.list_turns(db, thread_id=thread.id)
+    agents = [t for t in turns if t["kind"] == "agent"]
+    assert len(agents) == 1
+    assert agents[0]["text"] == detail["sentence"]
+
+    # A second press re-raises the same 409 but stacks NO second bubble.
+    with pytest.raises(HTTPException) as exc2:
+        await api.run_now(aid)
+    assert exc2.value.detail.get("refusal_turn") is True
+    async with async_session_maker() as db:
+        turns2, _ = await ledger.list_turns(db, thread_id=thread.id)
+    assert len([t for t in turns2 if t["kind"] == "agent"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_now_spec_error_refusal_is_a_turn_too(monkeypatch):
+    """The unanswered-variable draft's 409 (item 8 of R37) writes its
+    refusal into the thread as well — every needs_setup variant does."""
+    from fastapi import HTTPException
+    from app.agent.automations.service import create_automation
+    from app.agent.automations import ledger
+    from app.api import automations as api
+
+    async def _registry(user_id, *, force=False):
+        return REGISTRY
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _registry)
+
+    spec = {
+        "version": 2,
+        "name": "Boss email -> draft reply",
+        "mode": "confirm",
+        "trigger": {"sources": [
+            {"id": "mail", "mode": "push", "connector_id": "gmail",
+             "event": "message_received",
+             "filter": {"id": ["{{var.boss_email}}"]},
+             "dedupe_key": "event.id"},
+        ]},
+        "steps": [
+            {"id": "draft", "connector_id": "gmail",
+             "tool": "gmail__create_draft",
+             "params": {"to": "{{grant.target.id}}",
+                        "subject": "Re: x", "body": "y"}},
+        ],
+        "variables": {},
+    }
+    uid = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"{uid[:8]}@example.com",
+                    hashed_password="x", name="R38"))
+        await db.commit()
+    async with async_session_maker() as db:
+        automation, _ = await create_automation(
+            db, user_id=uid, spec=spec, template_slug="boss-email-draft",
+            template_mode=True, template_vars={"boss_email"},
+        )
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+    with pytest.raises(HTTPException) as exc:
+        await api.run_now(automation.id)
+    detail = exc.value.detail
+    assert detail["code"] == "needs_setup"
+    assert detail.get("refusal_turn") is True
+    assert "in its thread" not in detail["sentence"]
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, automation.id)
+        turns, _ = await ledger.list_turns(db, thread_id=thread.id)
+    assert any(t["kind"] == "agent" and t["text"] == detail["sentence"]
+               for t in turns)
+
+
+@pytest.mark.asyncio
+async def test_already_running_refusal_stays_silent(monkeypatch):
+    """already_running is NOT a setup state — the run is announcing
+    itself in the thread already; a refusal bubble beside it would be
+    the second account of the same run."""
+    from fastapi import HTTPException
+    from app.api import automations as api
+    from app.agent.automations import ledger
+    from app.db.models import BuildJob
+
+    uid, aid = await _mk(_inbox_spec(pinned=True, grant_id="g-1"))
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="running",
+            source_kind="automation", source_id=aid,
+        ))
+        await db.commit()
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+    with pytest.raises(HTTPException) as exc:
+        await api.run_now(aid)
+    assert exc.value.detail["code"] == "already_running"
+    assert "refusal_turn" not in exc.value.detail
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, aid)
+        if thread is not None:
+            turns, _ = await ledger.list_turns(db, thread_id=thread.id)
+            assert not [t for t in turns if t["kind"] == "agent"]
+
+
+# ── 11. R38: #general is unrepresentable ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_list_targets_offers_only_joined_slack_channels(monkeypatch):
+    """rec1 f056: the provider row carries is_member and the projection
+    dropped it, so the agent offered '#general' — a channel this
+    workspace never joined and (no chat:write.public in the manifest)
+    could never post to. Un-joined channels are filtered out; the
+    survivors say joined: true."""
+    from app.agent.skills.base import SkillContext
+    from app.agent.skills.builtins.automations.skill import (
+        AutomationsSkill,
+    )
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        **kw):
+        assert connector_id == "slack"
+        assert tool_name == "slack__list_channels"
+        return {"kind": "ok", "content": json.dumps({"channels": [
+            {"id": "C1", "name": "all-toup", "type": "public_channel",
+             "is_member": True},
+            {"id": "C2", "name": "general", "type": "public_channel",
+             "is_member": False},
+            {"id": "C3", "name": "social", "type": "public_channel",
+             "is_member": True},
+        ]})}
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _dispatch)
+
+    out = await AutomationsSkill().execute_tool(
+        "automations__list_targets", {"connector_id": "slack"},
+        SkillContext(user_id=str(uuid.uuid4())),
+    )
+    payload = json.loads(str(out))
+    labels = [t["label"] for t in payload["targets"]]
+    assert labels == ["all-toup", "social"]
+    assert "general" not in labels
+    assert all(t.get("joined") is True for t in payload["targets"])
+
+
+@pytest.mark.asyncio
+async def test_list_targets_keeps_jira_untouched(monkeypatch):
+    """Only Slack has a joined-ness; a Jira project listing is served
+    exactly as before, with no joined key."""
+    from app.agent.skills.base import SkillContext
+    from app.agent.skills.builtins.automations.skill import (
+        AutomationsSkill,
+    )
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        **kw):
+        return {"kind": "ok", "content": json.dumps({"projects": [
+            {"key": "TP", "name": "Toup Platform"},
+        ]})}
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _dispatch)
+
+    out = await AutomationsSkill().execute_tool(
+        "automations__list_targets", {"connector_id": "jira"},
+        SkillContext(user_id=str(uuid.uuid4())),
+    )
+    payload = json.loads(str(out))
+    assert payload["targets"] == [
+        {"kind": "project", "id": "TP", "label": "Toup Platform"},
+    ]
+
+
+def test_prompt_says_only_joined_channels():
+    from app.agent.skills.builtins.automations.skill import (
+        AutomationsSkill,
+    )
+    section = AutomationsSkill().get_system_prompt_section()
+    assert "channels the workspace has actually joined" in section
+    assert "Never name a channel that is not in the tool's answer" \
+        in section
+
+
+def test_prompt_carries_the_r38_honesty_rules():
+    """7a/7b: prose never points at a control it is not attaching, a
+    removed account is named out loud, and a do-it-NOW ask runs in the
+    same turn as the setting it changes."""
+    from app.agent.skills.builtins.automations.skill import (
+        AutomationsSkill,
+    )
+    section = AutomationsSkill().get_system_prompt_section()
+    assert "Never say 'below' or 'above' about a card" in section
+    assert "I took Outlook out of this" in section
+    assert "`automations__run_now` in the SAME turn" in section

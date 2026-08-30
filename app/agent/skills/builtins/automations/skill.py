@@ -8,7 +8,8 @@ Eleven tools mirror the round brief exactly:
   automations__list_targets       — pinnable targets for a connector
   automations__create             — validate + save a DRAFT
   automations__update             — replace spec, re-compile
-  automations__test_run           — one synthetic fire (real rails)
+  automations__test_run           — a rehearsal: reads for real, reports
+                                    what it WOULD write, sends nothing
   automations__arm / pause / resume / delete
 
 Card-emitting tools return "card shown — STOP" prose immediately; the
@@ -67,28 +68,52 @@ def _uid(ctx: SkillContext) -> str:
     return (ctx.user_id or getattr(settings, "user_id", "") or "").strip()
 
 
+def _workflow_digest(wf: Dict[str, Any]) -> Dict[str, Any]:
+    """The automation as it stands, in the fields an edit needs next.
+
+    The five edit tools answer with this so the model never has to
+    guess a rule id, a step number or a permission label — and so a
+    refusal ("there is no step 4") arrives beside the three steps that
+    do exist. The full §4.4 payload carries presets, connection states
+    and last-use sentences that no edit reads; sending them would be
+    the largest tool result in the skill for the least use.
+    """
+    return {
+        "runs": (wf.get("schedule") or {}).get("sentence") or "",
+        "steps": [{"n": s.get("n"), "text": s.get("text")}
+                  for s in (wf.get("steps") or [])],
+        "rules": [{"id": r.get("id"), "text": r.get("text")}
+                  for r in (wf.get("rules") or [])],
+        "accounts": [
+            {"account_id": a.get("account_id"), "name": a.get("name"),
+             "can": [p.get("label") for p in (a.get("can") or [])],
+             "cannot": [p.get("label") for p in (a.get("cant") or [])]}
+            for a in (wf.get("accounts") or [])
+        ],
+    }
+
+
 # Per-connector "list the pinnable targets" read tools. The kind names
 # what the target IS, so the grant card can say "channel #eng" and not
 # just an opaque id.
-#: R31-04. The synthetic-fire path is a DEV tool and nothing else.
+#: Tools the model may not see outside dev/e2e. EMPTY since R38 — kept,
+#: with its history, because it is the door gate as well as the array
+#: filter and the next dev-only tool needs both.
 #:
-#: `automations__test_run` was reachable from an ordinary sentence, and
-#: it is the reason "Run all of them again" produced "TEST RUN STAGED
-#: (the write goes out after the normal undo window)" and a reply that
-#: the automation was paused. Two things make that worse than a wrong
-#: answer. It is not a rehearsal — `stage_only=True` returns before
-#: narration but the staged outbox row is still swept and sent, so a
-#: "test" posts to the user's real channel. And it short-circuits the
-#: ledger's phase-2 close, so the run it opens produces no thread turns,
-#: no progress frames and no notification card: work happens and no
-#: surface says so.
+#: `automations__test_run` was the entry here, for two reasons that
+#: were both true of the OLD implementation. It was not a rehearsal:
+#: `stage_only=True` returned before narration, but the outbox row it
+#: had committed was swept and sent by `outbox.flush_loop` like any
+#: other, so a "test" posted to the user's real channel seconds later.
+#: And it short-circuited the ledger's phase-2 close, so the run it
+#: opened produced no result turn and was later reaped as failed.
 #:
-#: Gated on the existing dev fast-lane, which is already forced off
-#: outside dev/e2e at its use site — so a stray env var on a prod tenant
-#: changes nothing. `automations__run_now` is the replacement, and it
-#: must ship in the same commit: removing this without it would leave
-#: the model with no way to run an automation at all.
-_DEV_ONLY_TOOLS: frozenset[str] = frozenset({"automations__test_run"})
+#: R38 fixed the implementation instead of keeping the gate:
+#: `service.rehearse` stages NOTHING and opens no run, so no loop,
+#: restart or retry can turn a rehearsal into a send. The gate came off
+#: only once that was structurally true — a flag over the old path
+#: would have been the same tool with a smaller audience.
+_DEV_ONLY_TOOLS: frozenset[str] = frozenset()
 
 
 def _dev_tools_active() -> bool:
@@ -322,12 +347,16 @@ class AutomationsSkill(Skill):
             {
                 "name": "automations__test_run",
                 "description": (
-                    "DEV AND END-TO-END TESTS ONLY. One synthetic fire "
-                    "through the real rails, which stages a write that "
-                    "is really sent afterwards — so it is a rehearsal "
-                    "in name only, and it produces no run cards and no "
-                    "notice. Never use it because a user asked to run "
-                    "something: that is automations__run_now."
+                    "A REHEARSAL: read this automation's sources for "
+                    "real and answer with exactly what it WOULD write, "
+                    "without writing it. Nothing is sent, nothing is "
+                    "saved, and it does not count as a run. Use it to "
+                    "show someone what a draft automation will produce "
+                    "before they arm it, or to find out why one is "
+                    "producing the wrong thing. It is NOT how you run "
+                    "something a user asked you to run — that is "
+                    "automations__run_now, which does the work for "
+                    "real."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -521,6 +550,201 @@ class AutomationsSkill(Skill):
                     "required": ["automation_id", "destination"],
                 },
             },
+            # R38. Appended last, per the prefix-stable rule above; the
+            # five join in the order the canvas reads top to bottom.
+            #
+            # The five change kinds of `composer.CHANGE_KINDS`, as five
+            # tools. Before these, the ONLY way for the agent to change
+            # a live automation was `automations__update` with a
+            # complete replacement spec: a round trip through
+            # `automations__list`, a hand-rebuilt steps array, and a
+            # grant id the model does not have. So the agent agreed in
+            # words and the workflow did not move — R37's item, one
+            # layer up.
+            #
+            # Every one of them goes through `workflow.apply_intents`,
+            # which is `composer.apply_policy` (the deterministic gate)
+            # followed by `workflow._apply_intent` (the same writers the
+            # canvas sheet uses). That means: the same validation, the
+            # same undo token, the same EDITED note, the same
+            # `automation.updated` broadcast — and the same refusals. A
+            # tool cannot widen access that a sentence cannot: a grant,
+            # an account add and a hard rail all come back unapplied,
+            # with the sentence that says so.
+            {
+                "name": "automations__edit_schedule",
+                "description": (
+                    "Change WHEN one automation runs, for real. Give "
+                    "either a preset_id (weekdays-8, weekdays-730, "
+                    "daily-8, weekdays-9) or a time like '07:30' with "
+                    "the days it should run. The change applies "
+                    "immediately and the automation says so in its own "
+                    "thread. Never tell the user a time changed "
+                    "without calling this."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "preset_id": {
+                            "type": "string",
+                            "enum": ["weekdays-8", "weekdays-730",
+                                     "daily-8", "weekdays-9"],
+                        },
+                        "time": {
+                            "type": "string",
+                            "description": "24-hour local time, 'HH:MM'. "
+                                           "Use instead of preset_id "
+                                           "for a time the presets do "
+                                           "not carry.",
+                        },
+                        "days": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "ISO weekdays for `time` — "
+                                           "1=Monday … 7=Sunday. Omit "
+                                           "for every day.",
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "'YYYY-MM-DD' for a one-time "
+                                           "run at `time` instead of a "
+                                           "repeating one.",
+                        },
+                    },
+                    "required": ["automation_id"],
+                },
+            },
+            {
+                "name": "automations__edit_rules",
+                "description": (
+                    "Add, reword or drop the standing lines one "
+                    "automation will not cross ('never post anywhere "
+                    "else', 'only unread mail'). A rule is stored in "
+                    "the user's own words. To remove or reword one, "
+                    "give its id or its exact current text — the tool "
+                    "answers with every rule and its id, so one call is "
+                    "always enough to find it."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "add": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "new rules, the user's own "
+                                           "words, one sentence each",
+                        },
+                        "remove": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "rule ids, or the exact text "
+                                           "of the rule to drop",
+                        },
+                        "edit": {
+                            "type": "array",
+                            "description": "reword an existing rule",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "rule_id": {"type": "string"},
+                                    "text": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                    "required": ["automation_id"],
+                },
+            },
+            {
+                "name": "automations__edit_steps",
+                "description": (
+                    "Reword what a numbered step of one automation "
+                    "does. `n` is the step's position as the thread and "
+                    "the canvas show it, counting from 1. This changes "
+                    "the WORDING the user reads and asks the engine to "
+                    "recompile the plan behind it; it cannot add or "
+                    "remove a step, and it cannot point a step at a "
+                    "different account — use automations__update for a "
+                    "different plan, and automations__set_destination "
+                    "to move where the result goes."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "n": {"type": "integer",
+                              "description": "1-based step position"},
+                        "text": {"type": "string",
+                                 "description": "what that step should "
+                                                "do, in one line"},
+                    },
+                    "required": ["automation_id", "n", "text"],
+                },
+            },
+            {
+                "name": "automations__edit_permissions",
+                "description": (
+                    "Take one permission away from one account on one "
+                    "automation ('Slack must never post as me'). "
+                    "`permission` is the label or id the account's card "
+                    "shows. Taking one away applies immediately. GIVING "
+                    "one is the user's call and this tool will not do "
+                    "it — it answers with what to ask for, and "
+                    "automations__request_permission is what asks."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "account_id": {
+                            "type": "string",
+                            "description": "the connector, e.g. 'slack'",
+                        },
+                        "permission": {
+                            "type": "string",
+                            "description": "the label or id of the one "
+                                           "permission to change",
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["revoke", "grant"],
+                            "description": "'revoke' applies; 'grant' "
+                                           "comes back needing the "
+                                           "user's yes",
+                        },
+                    },
+                    "required": ["automation_id", "account_id",
+                                 "permission", "direction"],
+                },
+            },
+            {
+                "name": "automations__edit_accounts",
+                "description": (
+                    "Take one account out of an automation ('stop using "
+                    "Jira for this'). Removing applies immediately, and "
+                    "the answer says whether the automation stopped "
+                    "running as a result. CONNECTING a new account is "
+                    "the user's call and this tool will not do it — it "
+                    "answers with what to ask for, and "
+                    "automations__request_connection is what asks."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "automation_id": {"type": "string"},
+                        "account_id": {
+                            "type": "string",
+                            "description": "the connector, e.g. 'jira'",
+                        },
+                        "direction": {
+                            "type": "string",
+                            "enum": ["remove", "add"],
+                        },
+                    },
+                    "required": ["automation_id", "account_id",
+                                 "direction"],
+                },
+            },
         ]
 
     def get_system_prompt_section(self) -> Optional[str]:
@@ -572,6 +796,18 @@ class AutomationsSkill(Skill):
             "they want to see it work. Once armed, the automation gets "
             "its own thread: run cards and notices land there, not in "
             "this conversation.\n"
+            "SHOWING SOMEONE WHAT IT WILL DO, BEFORE IT DOES IT. "
+            "`automations__test_run` is a REHEARSAL: it reads the "
+            "automation's sources for real and answers with exactly "
+            "what it would write, and it sends nothing, saves nothing "
+            "and does not count as a run. Reach for it when the user "
+            "wants to see what a draft will produce before arming it, "
+            "or when one is producing the wrong thing and you need to "
+            "see why. It is NEVER the answer to 'run it' or 'run it "
+            "again': a rehearsal writes nothing, so reporting one as a "
+            "run is a lie about work that did not happen. And never "
+            "describe its answer as something the automation did — it "
+            "did not post, send, draft or tell anyone anything.\n"
             "RUNNING ONE, NOW OR AGAIN. 'run it', 'run it again', 'run "
             "all of them again', 'try again', 'do it now' — here or in "
             "an automation's own thread — mean `automations__run_now`, "
@@ -597,19 +833,60 @@ class AutomationsSkill(Skill):
             "`slack__list_channels` (or `automations__list_targets`) "
             "is one call away — offer the real ones by name, at most "
             "once.\n"
+            "  - Only offer channels the workspace has actually joined "
+            "— `automations__list_targets` already answers with exactly "
+            "those. Never name a channel that is not in the tool's "
+            "answer: a channel named from habit ('#general') may not "
+            "exist here, and one the workspace has not joined can never "
+            "be posted to.\n"
             "  - 'whatever', 'any of them', 'you pick' is an ANSWER: "
             "pick the most sensible existing target yourself, apply "
             "it, and say which you picked in the same breath. Do not "
             "re-ask.\n"
             "  - A decision the user states ('keep it in this chat', "
             "'post it to #general', 'make it 9am') is applied WITH A "
-            "TOOL in the same turn — `automations__set_destination` "
-            "for where it delivers, `automations__update` for the "
-            "rest. Saying 'got it' without the tool call is the lie "
-            "the canvas exposes three messages later.\n"
+            "TOOL in the same turn. Saying 'got it' without the tool "
+            "call is the lie the canvas exposes three messages later. "
+            "One tool per kind of change, and each one applies for "
+            "real:\n"
+            "      · where it delivers → `automations__set_destination`\n"
+            "      · when it runs → `automations__edit_schedule`\n"
+            "      · a line it must not cross ('never post anywhere "
+            "else', 'only unread') → `automations__edit_rules`\n"
+            "      · what a numbered step does → "
+            "`automations__edit_steps`\n"
+            "      · taking a permission away ('never post as me') → "
+            "`automations__edit_permissions`\n"
+            "      · taking one account out ('stop using Jira for "
+            "this') → `automations__edit_accounts`\n"
+            "      · anything else about the plan itself → "
+            "`automations__update`\n"
+            "    Each edit tool answers with what CHANGED, what did "
+            "NOT and why, and what the automation looks like now. Read "
+            "all three. If it says nothing changed, say that reason in "
+            "your own words — never report a change you did not make. "
+            "GIVING a permission and CONNECTING a new account are the "
+            "user's call: those come back unapplied, and the way to ask is "
+            "`automations__request_permission` / "
+            "`automations__request_connection`.\n"
             "  - After a confirmed decision, never re-confirm it. "
             "'Yep' means move: apply it, then name the next real step "
             "or offer the first run.\n"
+            "  - When the ask is for NOW — 'show me', 'do it', 'run "
+            "it', 'read at least 10 and show me here', any present-"
+            "tense imperative — apply the setting AND call "
+            "`automations__run_now` in the SAME turn. Restating the "
+            "schedule ('It will summarize here every weekday at 8:00') "
+            "without running is the failure mode: they asked for now, "
+            "and a description of later is a way of not doing it.\n"
+            "  - Never say 'below' or 'above' about a card or button "
+            "you are not attaching in that same message. The account "
+            "cards carry their own buttons; your prose states the fact "
+            "('I could not read Outlook — the access ran out') and "
+            "stops. And if you remove one of its accounts, name it in "
+            "one plain sentence ('I took Outlook out of this "
+            "automation.') — never remove one silently while talking "
+            "about something else.\n"
             # These are promises made to a user about what the engine
             # will do, so every one of them has to be true of the
             # engine as it is now — not as the round intends it. The
@@ -711,6 +988,11 @@ class AutomationsSkill(Skill):
             "automations__delete": self._delete,
             "automations__memory_recall": self._recall,
             "automations__set_destination": self._set_destination,
+            "automations__edit_schedule": self._edit_schedule,
+            "automations__edit_rules": self._edit_rules,
+            "automations__edit_steps": self._edit_steps,
+            "automations__edit_permissions": self._edit_permissions,
+            "automations__edit_accounts": self._edit_accounts,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -939,12 +1221,28 @@ class AutomationsSkill(Skill):
         except (ValueError, TypeError):
             content = {}
         items = content.get(src["items"]) or []
-        targets = [
-            {"kind": src["kind"],
-             "id": str(i.get(src["id"]) or ""),
-             "label": str(i.get(src["label"]) or i.get(src["id"]) or "")}
-            for i in items if isinstance(i, dict) and i.get(src["id"])
-        ]
+        targets = []
+        for i in items:
+            if not isinstance(i, dict) or not i.get(src["id"]):
+                continue
+            row = {
+                "kind": src["kind"],
+                "id": str(i.get(src["id"]) or ""),
+                "label": str(i.get(src["label"]) or i.get(src["id"]) or ""),
+            }
+            if connector_id == "slack":
+                # R38 — rec1 f056: the provider row carries `is_member`
+                # and this projection DROPPED it, so every public
+                # channel in the workspace was offered as a place to
+                # post and the agent named #general, a channel this
+                # workspace never joined. The Slack manifest has no
+                # chat:write.public, so posting to an un-joined channel
+                # can never work — an un-joined channel is not a
+                # target, and it is filtered out, not merely marked.
+                if not bool(i.get("is_member")):
+                    continue
+                row["joined"] = True
+            targets.append(row)
         return ToolResult(
             _as_json({"targets": targets[:100]}),
             display=("Looked at where it could write · "
@@ -1098,6 +1396,10 @@ class AutomationsSkill(Skill):
                 automation, _ = await update_automation(
                     db, automation_id=args.get("automation_id") or "",
                     user_id=_uid(ctx), spec=args.get("spec"),
+                    # R38: an agent edit stamps EDITED and broadcasts
+                    # like every other write-back — one of the founder's
+                    # two edits got a divider and the other did not.
+                    edited_note=True,
                 )
         except AutomationNotFound:
             return "ERROR: No such automation."
@@ -1294,23 +1596,219 @@ class AutomationsSkill(Skill):
             display="Pinned — waiting on you",
         )
 
-    async def _test_run(self, args, ctx) -> str:
+    # ------------------------------------------------------------------
+    # R38 — the five edit tools, one door
+    # ------------------------------------------------------------------
+
+    async def _edit(
+        self, args, ctx, *, intents: List[Dict[str, Any]],
+        done: str, nothing: str,
+    ) -> str:
+        """Every `automations__edit_*` tool, through
+        `workflow.apply_intents` — one policy, one set of writers, one
+        undo, one EDITED note. See that function's docstring for why
+        the tools do not get their own copy of any of it.
+        """
         from app.agent.automations.service import (
-            AutomationNotFound, test_run,
+            AutomationNotFound, _load_owned,
+        )
+        from app.agent.automations.workflow import apply_intents
+        from app.db.database import async_session_maker
+
+        automation_id = str(args.get("automation_id") or "").strip()
+        if not automation_id:
+            return "ERROR: automation_id is required."
+        try:
+            async with async_session_maker() as db:
+                automation = await _load_owned(db, automation_id, _uid(ctx))
+                out = await apply_intents(
+                    db, automation=automation, user_id=_uid(ctx),
+                    intents=intents,
+                )
+        except AutomationNotFound:
+            return "ERROR: No such automation."
+
+        applied = out.get("applied") or []
+        payload = {
+            "changed": [a.get("sentence") for a in applied],
+            # Not applied, and WHY — the model has to be able to say
+            # this out loud. A tool that answers an unmade change with
+            # silence is the shape R38 exists to remove.
+            "not_changed": list(out.get("refused") or [])
+                           + ([out["answer"]] if out.get("answer") else []),
+            "needs_your_approval": [
+                n.get("sentence") for n in (out.get("needs") or [])
+            ],
+            "it_now_looks_like": _workflow_digest(out.get("workflow") or {}),
+        }
+        if payload["needs_your_approval"]:
+            payload["next"] = (
+                "Nothing about that part changed. Say the sentence in "
+                "needs_your_approval and, if they want it, ask for it "
+                "with automations__request_permission (a permission) or "
+                "automations__request_connection (a new account)."
+            )
+        elif not applied:
+            payload["next"] = (
+                "NOTHING changed. Say the sentence in not_changed as "
+                "your own words — do not report success."
+            )
+        return ToolResult(
+            _as_json(payload),
+            display=done if applied else nothing,
+        )
+
+    async def _edit_schedule(self, args, ctx) -> str:
+        intent: Dict[str, Any] = {"kind": "schedule"}
+        if args.get("preset_id"):
+            intent["preset_id"] = str(args["preset_id"])
+        elif args.get("time"):
+            custom: Dict[str, Any] = {"time": str(args["time"])}
+            if args.get("days"):
+                custom["days"] = list(args["days"])
+            if args.get("date"):
+                custom["date"] = str(args["date"])
+            intent["custom"] = custom
+        else:
+            return ("ERROR: Give either preset_id or time — a schedule "
+                    "change needs a time to move to.")
+        return await self._edit(
+            args, ctx, intents=[intent],
+            done="Changed when it runs", nothing="Left the time as it was",
+        )
+
+    async def _edit_rules(self, args, ctx) -> str:
+        # A rule id OR its exact text: the model has the user's words
+        # ("drop the no-thread rule") far more often than it has an id,
+        # and a tool that can only be driven by an id it was never
+        # given is a tool the model will not reach for.
+        from app.agent.automations.service import (
+            AutomationNotFound, _load_owned,
+        )
+        from app.agent.automations.workflow import rules_list
+        from app.db.database import async_session_maker
+
+        automation_id = str(args.get("automation_id") or "").strip()
+        by_text: Dict[str, str] = {}
+        if automation_id:
+            try:
+                async with async_session_maker() as db:
+                    automation = await _load_owned(
+                        db, automation_id, _uid(ctx),
+                    )
+                    by_text = {
+                        " ".join(str(r.get("text") or "").split()).lower():
+                            str(r.get("id") or "")
+                        for r in rules_list(automation)
+                    }
+            except AutomationNotFound:
+                return "ERROR: No such automation."
+
+        def _rule_id(needle: str) -> str:
+            key = " ".join(str(needle or "").split())
+            return by_text.get(key.lower()) or key
+
+        intents: List[Dict[str, Any]] = []
+        for text in (args.get("add") or []):
+            intents.append({"kind": "rule", "op": "add", "text": str(text)})
+        for edit in (args.get("edit") or []):
+            if not isinstance(edit, dict):
+                continue
+            intents.append({
+                "kind": "rule", "op": "edit",
+                "rule_id": _rule_id(edit.get("rule_id") or ""),
+                "text": str(edit.get("text") or ""),
+            })
+        for needle in (args.get("remove") or []):
+            intents.append({"kind": "rule", "op": "remove",
+                            "rule_id": _rule_id(needle)})
+        if not intents:
+            return ("ERROR: Give at least one of add, remove or edit — "
+                    "there is nothing here to change.")
+        return await self._edit(
+            args, ctx, intents=intents,
+            done="Changed its rules", nothing="Left the rules alone",
+        )
+
+    async def _edit_steps(self, args, ctx) -> str:
+        try:
+            n = int(args.get("n"))
+        except (TypeError, ValueError):
+            return "ERROR: n must be the step's position, counting from 1."
+        return await self._edit(
+            args, ctx,
+            intents=[{"kind": "step", "n": n,
+                      "text": str(args.get("text") or "")}],
+            done="Changed a step", nothing="Left the steps alone",
+        )
+
+    async def _edit_permissions(self, args, ctx) -> str:
+        return await self._edit(
+            args, ctx,
+            intents=[{
+                "kind": "permission",
+                "account_id": str(args.get("account_id") or ""),
+                "permission": str(args.get("permission") or ""),
+                "direction": str(args.get("direction") or "revoke"),
+            }],
+            done="Changed what it may do",
+            nothing="Left the permissions alone",
+        )
+
+    async def _edit_accounts(self, args, ctx) -> str:
+        return await self._edit(
+            args, ctx,
+            intents=[{
+                "kind": "account",
+                "account_id": str(args.get("account_id") or ""),
+                "direction": str(args.get("direction") or "remove"),
+            }],
+            done="Changed which accounts it uses",
+            nothing="Left the accounts alone",
+        )
+
+    async def _test_run(self, args, ctx) -> str:
+        """A rehearsal — reads for real, writes rendered and reported.
+
+        The tool keeps its wire name because the array is prefix-stable
+        (see `_all_tools`); what changed is that `service.rehearse`
+        stages no outbox row, so there is nothing for the flush loop to
+        send.
+        """
+        from app.agent.automations.service import (
+            AutomationNotFound, rehearse,
         )
         from app.db.database import async_session_maker
         try:
             async with async_session_maker() as db:
-                result = await test_run(
+                result = await rehearse(
                     db, automation_id=args.get("automation_id") or "",
                     user_id=_uid(ctx),
                 )
         except AutomationNotFound:
             return "ERROR: No such automation."
-        return ToolResult(
-            "Staged a synthetic fire (dev only):\n" + _as_json(result),
-            display="Staged a rehearsal run",
-        )
+        writes = result.get("writes") or []
+        blocked = [w for w in writes if w.get("blocked")]
+        payload = {
+            "nothing_was_sent": True,
+            "it_read": result.get("reads") or [],
+            "it_would_write": writes,
+            "sample_event": result.get("sample_event") or {},
+            "next": (
+                "Say what it WOULD write, in the user's words. Never "
+                "say it ran, posted, sent or drafted anything — none "
+                "of that happened. If a write carries `blocked`, say "
+                "that reason instead: it is what stops the real run "
+                "too."
+            ),
+        }
+        if blocked:
+            display = "Rehearsed it — something is in the way"
+        elif writes:
+            display = "Rehearsed it — nothing was sent"
+        else:
+            display = "Rehearsed it — it writes nothing"
+        return ToolResult(_as_json(payload), display=display)
 
     async def _run_now(self, args, ctx) -> str:
         """R31-04 — the real re-run, through the engine.
@@ -1346,6 +1844,38 @@ class AutomationsSkill(Skill):
                     "Tell the user it is running now; do not start a "
                     "second one.",
                     display="It is already running",
+                )
+            if isinstance(detail, dict) and detail.get("refusal_turn"):
+                # R38: the route posted the refusal sentence into the
+                # automation's OWN thread as an agent turn. Whether that
+                # makes a reply a duplicate depends entirely on where this
+                # turn is being answered.
+                #
+                # In the thread, the two land side by side and the repeat is
+                # the double bubble rec1 recorded. ANYWHERE ELSE — the day
+                # chat, WhatsApp, voice — the user cannot see that thread, so
+                # "do not repeat it, otherwise add nothing" is an instruction
+                # to answer "run my morning brief" with silence. The first
+                # cut of this branch did exactly that.
+                from app.agent.tool_executor import current_channel
+                in_thread = (current_channel() or "") == "automation_thread"
+                if in_thread:
+                    return ToolResult(
+                        f"Could not start it — {sentence} That sentence is "
+                        "already posted in this thread; do not repeat it. "
+                        "If you have a tool for the fix it names, do the "
+                        "fix now (an unpinned destination is "
+                        "automations__set_destination); otherwise add "
+                        "nothing.",
+                        display="Could not start the run",
+                    )
+                return ToolResult(
+                    f"Could not start it — {sentence} Say that plainly "
+                    "here, in your own words — the user is not looking at "
+                    "the automation's thread. If you have a tool for the "
+                    "fix it names, do the fix now (an unpinned destination "
+                    "is automations__set_destination).",
+                    display="Could not start the run",
                 )
             return ToolResult(
                 f"Could not start it — {sentence} Say that plainly; do "

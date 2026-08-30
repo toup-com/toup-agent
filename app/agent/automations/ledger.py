@@ -163,8 +163,53 @@ def _plain(s: Any, field: str, *, allow_empty: bool = False) -> str:
     return plain
 
 
+# R38 — "<b>Google Workspace product notifications.</b>" reached a
+# founder's screen, literally (rec2, the 9:48 briefing). Vendor content
+# is quoted, never rewritten — but HTML MARKUP is not content, it is a
+# rendering instruction for a surface we do not have, and provider
+# strings arrive carrying it (Gmail snippets especially).
+#
+# A KNOWN-TAG allowlist, deliberately NOT a generic `<[^>]+>` regex:
+# "Google <no-reply@accounts.google.com>" is a real sender string and
+# the angle brackets are the address, so a generic strip would delete
+# the very thing the line exists to show. Entities are unescaped FIRST
+# (&amp; &lt; &gt; &quot; &#39; and numeric, via html.unescape), so an
+# escaped `&lt;b&gt;bold&lt;/b&gt;` also renders as its text.
+_HTML_TAG_NAMES: tuple[str, ...] = (
+    "b", "i", "em", "strong", "u", "a", "p", "br", "div", "span",
+    "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+    "font", "small", "big",
+)
+_HTML_TAG_RE = re.compile(
+    r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?:\s[^<>]*)?/?\s*>",
+    re.IGNORECASE,
+)
+_WS_RUN_RE = re.compile(r"[ \t]{2,}")
+
+
+def strip_html(s: Any) -> str:
+    """Unescape HTML entities and strip known HTML tags. Total — never
+    raises, never touches a string with no markup in it, and never
+    strips an email address's angle brackets."""
+    if not isinstance(s, str) or not s:
+        return s if isinstance(s, str) else ""
+    if "<" not in s and "&" not in s:
+        return s
+    import html as _html
+    out = _html.unescape(s)
+    out, n = _HTML_TAG_RE.subn(" ", out)
+    if n:
+        out = _WS_RUN_RE.sub(" ", out).strip()
+    return out
+
+
 def mint_item_ids(items: list[dict]) -> list[dict]:
-    """Assign server ids to items that lack them (idempotent)."""
+    """Assign server ids to items that lack them (idempotent).
+
+    R38: item title/sub and msg text are HTML-sanitized at mint — this
+    is the one seam every quoted vendor string passes on its way into a
+    persisted turn, whichever producer minted it.
+    """
     out = []
     for it in items or []:
         it = dict(it)
@@ -174,14 +219,14 @@ def mint_item_ids(items: list[dict]) -> list[dict]:
             msgs.append({
                 "who": m.get("who", ""),
                 "at": m.get("at", ""),
-                "text": m.get("text", ""),
+                "text": strip_html(m.get("text", "")),
                 "why": m.get("why", ""),
             })
         it["msgs"] = msgs
         out.append({
             "id": it["id"],
-            "title": it.get("title", ""),
-            "sub": it.get("sub", ""),
+            "title": strip_html(it.get("title", "")),
+            "sub": strip_html(it.get("sub", "")),
             "why": it.get("why", ""),
             "msgs": it["msgs"],
         })
@@ -343,8 +388,13 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             rows = []
             for r in g.get("rows") or []:
                 rows.append({
-                    "text": _plain(r.get("text"), "result.row.text"),
-                    "sub": strip_markdown_markers(r.get("sub") or "")[0],
+                    # R38: strip_html too — a result row quotes vendor
+                    # titles, and "<b>…</b>" reached the founder's
+                    # briefing through exactly this field.
+                    "text": strip_html(
+                        _plain(r.get("text"), "result.row.text")),
+                    "sub": strip_html(
+                        strip_markdown_markers(r.get("sub") or "")[0]),
                     "tag": r.get("tag") or "",
                     "item_refs": list(r.get("item_refs") or []),
                 })
@@ -411,6 +461,15 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
             # right on the card — without it the button's only move is
             # an OAuth round trip about a permission OAuth already has.
             "grant_request_id": str(p.get("grant_request_id") or "") or None,
+            # R38: an `approve` fix that names its staged call. This is
+            # the automation thread's elevation surface — the agent
+            # asked a connector to write, the dispatcher staged it, and
+            # the card's two buttons are
+            # POST /api/connectors/pending-actions/{id}/approve|reject.
+            # Same precedent as `grant_request_id` above: the id rides
+            # the turn because the turn is what the user is looking at.
+            "pending_action_id": str(p.get("pending_action_id") or "")
+                                 or None,
         }
 
     raise LedgerValidationError(f"unhandled kind {kind!r}")  # pragma: no cover
@@ -649,6 +708,52 @@ async def emit_turn_delta(
         "thread_id": thread_id,
         "turn_id": turn_id,
         "text": text,
+    })
+
+
+#: R38 — the terminal frame's note stamp, per v3 status. Kept ONLY as a
+#: last-resort default for a caller that has no run config to refine
+#: with; the decision of record is `run_v3.head_note_stamp`, which the
+#: frame and the divider both go through. Two tables disagreed on two of
+#: six reachable statuses and a declined confirm card flipped the divider
+#: to TRIED and back to RAN on the next refetch. Do not add a status here
+#: without adding it there.
+RUN_FINISHED_NOTE_STAMPS: dict[str, str] = {
+    "completed": "ran",
+    "partial": "needs_you",
+    "waiting_on_user": "needs_you",
+    "failed": "tried",
+    "skipped": "ran",
+}
+
+
+async def emit_run_finished(
+    user_id: str, *, automation_id: str, thread_id: Optional[str],
+    run_id: str, status: str, note_stamp: Optional[str] = None,
+) -> None:
+    """R38 — the dedicated terminal frame, `automation.run.finished`.
+
+    Until this round a run's end had NO frame of its own: clients had to
+    infer it from `automation.updated` (whose summary is best-effort and
+    can arrive as null) or wait for a refetch — the founder's card read
+    "In progress · 99%" through two narration phases and a crash. One
+    frame, emitted from EVERY terminal path (they all funnel through
+    `_finalize_job` → `run_v3.on_terminal`): the finalize variants
+    (all_sources_failed and the reads-only terminal included), the user
+    stop, the run cap, and the stuck-run sweep.
+    """
+    await _broadcast(user_id, {
+        "type": "automation.run.finished",
+        "automation_id": automation_id,
+        "thread_id": thread_id,
+        "run_id": run_id,
+        "status": status,
+        # May be None on purpose: the run's opening note keeps what it
+        # has (a stop note; the STARTED a superseded run leaves for the
+        # run that replaced it). A client must read that as "say nothing
+        # about the divider", never as a stamp of its own choosing.
+        "note_stamp": note_stamp,
+        "at": datetime.utcnow().isoformat() + "Z",
     })
 
 

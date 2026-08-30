@@ -212,10 +212,16 @@ def test_describe_creates_and_seeds_the_thread(monkeypatch):
     out = asyncio.run(describe_compile.compile_describe(
         None, user_id="u1", text="every Friday, summarise my week",
         complete=complete))
+    # R38 added `build_history` — the automation the app just made,
+    # with the record of how it was built, so the sheet can draw it
+    # without a second round trip. This stub's fake automation has no
+    # spec columns, so the recorder degrades to None rather than
+    # failing the create, which is the contract.
     assert out == {"automation": {"id": "auto-x",
                                   "name": "Morning work brief",
                                   "status": "draft"},
-                   "thread_id": "th-x"}
+                   "thread_id": "th-x",
+                   "build_history": None}
     kinds = [k for k, _ in turns]
     assert kinds[:3] == ["note", "user", "agent"]
     assert turns[0][1]["stamp"] == "added"
@@ -318,11 +324,22 @@ def test_memory_recall_is_the_last_tool():
     # R31-04 appended `automations__run_now` after it — the array only
     # ever grows at the end, so recall is now second from last.
     tools = AutomationsSkill().get_tools()
-    # R37 appended set_destination; the earlier tail keeps its order.
-    assert tools[-1]["name"] == "automations__set_destination"
-    assert tools[-2]["name"] == "automations__run_now"
-    assert tools[-3]["name"] == "automations__memory_recall"
-    description = tools[-3]["description"].lower()
+    # R37 appended set_destination; R38 appended the five edit tools after
+    # it. The array only ever GROWS at the end — that is the whole rule this
+    # test protects — so the assertion is on the relative order of the block
+    # it names, not on a fixed distance from the tail. Pinning `tools[-3]`
+    # made every future append a red test with nothing wrong behind it, and
+    # this round is the second time it has come due.
+    names = [t["name"] for t in tools]
+    assert names.index("automations__memory_recall") \
+        < names.index("automations__run_now") \
+        < names.index("automations__set_destination")
+    assert names[-5:] == [
+        "automations__edit_schedule", "automations__edit_rules",
+        "automations__edit_steps", "automations__edit_permissions",
+        "automations__edit_accounts",
+    ]
+    description = tools[names.index("automations__memory_recall")]["description"].lower()
     # It must say WHEN it is relevant...
     assert "when the user asks" in description
     # ...but never carry a flow posture: "use it before answering

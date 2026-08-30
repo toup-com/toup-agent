@@ -106,7 +106,7 @@ def _err(errors: list, code: str, fld: str, message: str) -> None:
 
 
 _TOP_KEYS = {"name", "description", "trigger", "action", "dedupe_key", "mode",
-             "version"}
+             "version", "focus"}
 _TRIGGER_KEYS = {
     "mode", "connector_id", "event", "params", "poll_interval_s",
     "schedule", "filter",
@@ -117,6 +117,137 @@ _TRIGGER_KEYS = {
 _ACTION_KEYS = {"connector_id", "tool", "params_template", "grant_id",
                 "grant_target"}
 _SCHEDULE_KEYS = {"cron_local", "at", "every_s"}
+
+
+# ── Sub-node focus (R38) ─────────────────────────────────────────────
+#
+# `focus` is where the automation STARTS, per account: the channel, the
+# person, the ticket or the thread the user pinned under that connector
+# on the canvas. It is not a filter and it is not a permission — a pin
+# narrows nothing the grant already allows and widens nothing it does
+# not. It is the answer to "when this runs, look HERE first", and it
+# has to live in the spec rather than in a side table because three
+# readers need the same answer: the workflow payload the canvas draws,
+# the run context the steps render against, and the grounding the
+# thread agent answers from. A side table would be a fourth truth.
+#
+#   focus: {"slack": [{"kind": "channel", "id": "C123",
+#                      "label": "#eng"}]}
+#
+# Shape only is enforced here. MEMBERSHIP (is this connector actually
+# in the spec?) is the workflow writer's gate, deliberately: a pin
+# whose account is removed must not make the whole spec unparseable at
+# run time — `remove_connector` drops the pins with the account, and a
+# stale pin that survives some other path is inert rather than fatal.
+
+FOCUS_KINDS = frozenset({
+    "channel", "thread", "person", "ticket", "project",
+    "repo", "label", "folder", "board", "doc",
+})
+MAX_FOCUS_PER_ACCOUNT = 10
+FOCUS_ID_MAX = 200
+FOCUS_LABEL_MAX = 120
+
+_FOCUS_KEYS = {"kind", "id", "label"}
+
+
+def validate_focus(spec: dict, errors: list) -> dict:
+    """`spec["focus"]` → the canonical `{connector_id: [pin]}` map.
+
+    Shared by the v1 and v2 validators so the two grammars cannot
+    drift. Every problem is reported; the return value carries only the
+    pins that survived, so a caller that ignores `errors` still never
+    persists a malformed pin.
+    """
+    focus = spec.get("focus")
+    if focus is None:
+        return {}
+    if not isinstance(focus, dict):
+        _err(errors, "bad_focus", "focus",
+             "focus must map a connector id to a list of pins")
+        return {}
+    out: dict[str, list] = {}
+    for cid, pins in focus.items():
+        fld = f"focus.{cid}"
+        if not isinstance(cid, str) or not cid.strip():
+            _err(errors, "bad_focus", "focus",
+                 "focus keys must be connector ids")
+            continue
+        if not isinstance(pins, list):
+            _err(errors, "bad_focus", fld, "each account's focus is a list")
+            continue
+        if len(pins) > MAX_FOCUS_PER_ACCOUNT:
+            _err(errors, "too_many_focus", fld,
+                 f"at most {MAX_FOCUS_PER_ACCOUNT} pins per account")
+            pins = pins[:MAX_FOCUS_PER_ACCOUNT]
+        kept: list = []
+        seen: set = set()
+        for i, pin in enumerate(pins):
+            pfld = f"{fld}[{i}]"
+            if not isinstance(pin, dict):
+                _err(errors, "bad_focus", pfld, "each pin must be an object")
+                continue
+            unknown = set(pin) - _FOCUS_KEYS
+            if unknown:
+                _err(errors, "unknown_field", pfld,
+                     f"unknown focus fields {sorted(unknown)}")
+                continue
+            kind = pin.get("kind")
+            if kind not in FOCUS_KINDS:
+                _err(errors, "bad_focus_kind", f"{pfld}.kind",
+                     f"kind must be one of {sorted(FOCUS_KINDS)}")
+                continue
+            pid = pin.get("id")
+            if not isinstance(pid, str) or not (1 <= len(pid.strip())
+                                                <= FOCUS_ID_MAX):
+                _err(errors, "bad_focus_id", f"{pfld}.id",
+                     f"id must be 1-{FOCUS_ID_MAX} characters")
+                continue
+            pid = pid.strip()
+            label = pin.get("label")
+            if label is not None and not isinstance(label, str):
+                _err(errors, "bad_focus_label", f"{pfld}.label",
+                     "label must be a string")
+                continue
+            label = (label or "").strip()[:FOCUS_LABEL_MAX] or pid
+            if (kind, pid) in seen:
+                # Not an error: the same place pinned twice is one pin.
+                continue
+            seen.add((kind, pid))
+            kept.append({"kind": kind, "id": pid, "label": label})
+        if kept:
+            out[cid] = kept
+    return out
+
+
+def focus_render_ctx(focus: dict) -> dict:
+    """The `{{focus.…}}` root the run context renders against.
+
+    Flat leaves only, because `render_value` interpolates a leaf and
+    `str()`s anything else — `{{focus.slack}}` on a list would put a
+    Python repr into a connector's params. `ids`/`labels` are the
+    joined forms a params template actually wants; `first` is the
+    single-target case (a pinned channel to read, a pinned ticket to
+    comment on), which is the overwhelming majority of pins.
+    """
+    out: dict = {}
+    for cid, pins in (focus or {}).items():
+        pins = [p for p in (pins or []) if isinstance(p, dict)]
+        if not pins:
+            continue
+        first = pins[0]
+        out[cid] = {
+            "ids": ",".join(str(p.get("id") or "") for p in pins),
+            "labels": ", ".join(str(p.get("label") or p.get("id") or "")
+                                for p in pins),
+            "count": len(pins),
+            "first": {
+                "kind": str(first.get("kind") or ""),
+                "id": str(first.get("id") or ""),
+                "label": str(first.get("label") or first.get("id") or ""),
+            },
+        }
+    return out
 
 
 def validate_spec(
@@ -329,12 +460,15 @@ def validate_spec(
         # against the live manifest at arm/execute time by the
         # dispatcher (unknown tool ⇒ tool_error, fail closed).
 
+    focus = validate_focus(spec, errors)
+
     if errors:
         raise SpecError(errors)
 
     canonical = {
         "name": name,
         "description": spec.get("description") or None,
+        **({"focus": focus} if focus else {}),
         "trigger": {
             "mode": t_mode,
             **({"connector_id": t_connector} if t_connector else {}),

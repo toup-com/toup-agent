@@ -97,20 +97,147 @@ async def create_automation(
     return automation, vspec
 
 
+def _carry_grants_forward(old_raw: dict, spec: dict) -> dict:
+    """R38 — an edit that does not touch a write step must not lose its
+    grant.
+
+    A model editing a spec routinely drops the grant id — the payload
+    carries it, but a recompiled or hand-edited step comes back without
+    one — and every `automations__update` then stripped the write's grant
+    and hit the wall it could never climb. A new step lacking `grant_id`
+    inherits the OLD spec's grant (and its pinned target, unless the edit
+    pinned its own).
+
+    Matched BY STEP ID first. The first cut keyed a pool on
+    (connector_id, tool) and popped in list order, which is stable only
+    for order-preserving edits: two writes on the same connector and tool
+    (post to #eng, post to #ops) plus a drop or a reorder handed the
+    survivor the FIRST old grant — and since the canonical param is
+    `{{grant.target.id}}`, it renders to the inherited grant's target and
+    the dispatcher's pinned-target check passes. A silent post to the
+    wrong channel. The id is what the model echoes back unchanged, so it
+    is what pairs; (connector_id, tool) order remains the fallback for a
+    step that was genuinely re-created, where there is nothing better.
+
+    A genuinely NEW write matches nothing and stays ungranted — legal at
+    parse (template_mode), un-armable until granted
+    (`verify_grants_for_arm_v2` fail-closes).
+    """
+    if not isinstance(spec, dict) or spec.get("version") != 2 \
+            or (old_raw or {}).get("version") != 2:
+        return spec
+    # A grant a new step already claims is not up for inheritance — a
+    # SECOND write with the same tool is genuinely new and must stay
+    # ungranted rather than quietly wearing its sibling's permission.
+    claimed = {
+        s.get("grant_id") for s in (spec.get("steps") or [])
+        if isinstance(s, dict) and s.get("grant_id")
+    }
+    granted_old = [
+        s for s in (old_raw.get("steps") or [])
+        if isinstance(s, dict) and s.get("grant_id")
+        and s.get("grant_id") not in claimed
+    ]
+    by_id: dict[str, dict] = {
+        str(s.get("id")): s for s in granted_old if s.get("id")
+    }
+    pool: dict[tuple, list[dict]] = {}
+    for s in granted_old:
+        pool.setdefault((s.get("connector_id"), s.get("tool")), []).append(s)
+    if not granted_old:
+        return spec
+
+    def _take(step: dict) -> Optional[dict]:
+        """The old granted step this one IS, or the next one that merely
+        looks like it. An id match must also agree on connector and tool:
+        a step that kept its id while being pointed at a different tool is
+        a different write, and inheriting there is the widening this
+        function exists to avoid."""
+        sid = str(step.get("id") or "")
+        old = by_id.get(sid)
+        if old is not None \
+                and old.get("connector_id") == step.get("connector_id") \
+                and old.get("tool") == step.get("tool"):
+            by_id.pop(sid, None)
+            bucket = pool.get((old.get("connector_id"), old.get("tool")))
+            if bucket and old in bucket:
+                bucket.remove(old)
+            return old
+        candidates = pool.get((step.get("connector_id"), step.get("tool")))
+        while candidates:
+            cand = candidates.pop(0)
+            cid = str(cand.get("id") or "")
+            if cid and cid not in by_id:
+                continue  # already paired by id above
+            by_id.pop(cid, None)
+            return cand
+        return None
+
+    steps: list = []
+    changed = False
+    for s in (spec.get("steps") or []):
+        if isinstance(s, dict) and not s.get("grant_id"):
+            old = _take(s)
+            if old is not None:
+                s = dict(s)
+                s["grant_id"] = old.get("grant_id")
+                if old.get("grant_target") and not s.get("grant_target"):
+                    s["grant_target"] = old.get("grant_target")
+                changed = True
+        steps.append(s)
+    if not changed:
+        return spec
+    out = dict(spec)
+    out["steps"] = steps
+    return out
+
+
 async def update_automation(
     db: AsyncSession,
     *,
     automation_id: str,
     user_id: str,
     spec: dict,
+    edited_note: bool = False,
 ) -> tuple[Automation, ValidatedSpec]:
     """Replace the spec and re-compile bindings. An armed automation
     stays armed only if the new spec passes the same arm checks —
     otherwise it drops to draft (never silently keep firing an old
-    shape)."""
+    shape).
+
+    R38: validates with template_mode=True — grants are enforced at ARM
+    and DISPATCH, never by parse (the R36 doctrine `parse_spec_live`
+    and `_replace_spec_template` already follow); refusing an edit over
+    an unpinned write reproduced the founder's item 6 through the tool
+    built to end it. Grants carry forward for unchanged write steps
+    (`_carry_grants_forward`). `edited_note=True` (the agent-facing
+    surfaces: `automations__update`, PATCH) appends the EDITED note and
+    broadcasts `automation.updated` — one edit showed a divider and the
+    next did not, because only the workflow writers ever stamped it.
+    Internal callers that stamp their own note keep the default.
+    """
     automation = await _load_owned(db, automation_id, user_id)
     capability = await reg.fetch_registry(user_id)
-    vspec = validate_spec(spec, capability)
+    try:
+        old_raw = json.loads(automation.spec_json or "{}")
+    except (ValueError, TypeError):
+        old_raw = {}
+    spec = _carry_grants_forward(old_raw, spec)
+    # `template_vars=None` (the default) waives the grant rule AND the
+    # undeclared-variable rule, and BOTH waivers are deliberate: a spec
+    # mid-setup legitimately carries a variable whose question the user
+    # has not answered yet, which is the state run-now used to answer 500
+    # about (R37, the founder's dead Run button). `parse_spec_live` — and
+    # therefore ARM — waives it the same way.
+    #
+    # Known gap, recorded rather than closed here: nothing downstream
+    # enforces it either. `render_value` resolves a missing path to "", so
+    # an automation armed with a dangling `{{var.summary}}` fires and posts
+    # " today" instead of refusing. Tightening THIS call would reject the
+    # mid-setup state the doctrine exists to allow; the fix belongs at
+    # dispatch, where the difference between "not answered yet" and "will
+    # never be answered" is actually knowable.
+    vspec = validate_spec(spec, capability, template_mode=True)
 
     was_armed = automation.status == "armed"
     automation.name = vspec.name
@@ -135,6 +262,9 @@ async def update_automation(
                 "[automations] update left %s in draft (re-arm failed: %s)",
                 automation.id, e,
             )
+    if edited_note:
+        from . import workflow as _workflow
+        await _workflow._edited_note(db, automation)
     await db.refresh(automation)
     return automation, vspec
 
@@ -524,22 +654,28 @@ async def _hard_delete(
                 automation_id, user_id[:8])
 
 
-async def test_run(
+async def rehearse(
     db: AsyncSession, *, automation_id: str, user_id: str,
 ) -> dict:
-    """One synthetic fire: builds a sample event from the spec (or
-    polls once for a real one), runs the full evaluate→prepare path,
-    and STOPS at the staged outbox row — the write goes out only after
-    the normal undo window, exactly like a real fire, so a test run is
-    a real run with a synthetic trigger."""
+    """A rehearsal: the reads run for real against live data, the
+    writes are RENDERED and reported, and nothing is staged.
+
+    R38, and the reason this replaced `test_run` outright rather than
+    growing a flag: the old path committed the outbox row and returned,
+    and `outbox.flush_loop` sweeps every staged row whose undo window
+    has closed — so the "rehearsal" posted to the user's real channel
+    seconds later, from a background loop, with the caller gone. There
+    is no outbox row now, so no loop, restart or retry can turn one
+    into a send.
+    """
     from . import executor
     automation = await _load_owned(db, automation_id, user_id)
     vspec = await parse_spec_live(automation)
     from .spec_v2 import ValidatedSpecV2
     if isinstance(vspec, ValidatedSpecV2):
         from . import executor_v2
-        return await executor_v2.execute_test_run_v2(db, automation, vspec)
-    return await executor.execute_test_run(db, automation, vspec)
+        return await executor_v2.rehearse_v2(db, automation, vspec)
+    return await executor.rehearse(db, automation, vspec)
 
 
 class MembershipError(ValueError):
@@ -738,6 +874,17 @@ async def remove_connector(
     trig["sources"] = sources
     raw["trigger"] = trig
     raw["steps"] = steps
+    # R38: the pins go with the account. A pin under a connector the
+    # spec no longer uses is a place nothing will ever start from, and
+    # re-adding the account later would silently restore a target the
+    # user last saw months ago.
+    focus = raw.get("focus")
+    if isinstance(focus, dict) and connector_id in focus:
+        focus = {k: v for k, v in focus.items() if k != connector_id}
+        if focus:
+            raw["focus"] = focus
+        else:
+            raw.pop("focus", None)
     try:
         return await update_automation(
             db, automation_id=automation_id, user_id=user_id, spec=raw,

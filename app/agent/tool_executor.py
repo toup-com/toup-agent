@@ -16,6 +16,7 @@ Per-tool output limits prevent bloating context:
 """
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -431,6 +432,52 @@ def created_job_ids() -> tuple:
     beside it (`app_html.steps._adopt_turn_job`). Reads the shared list in
     place; never replaces it (see _CREATED_JOB_IDS_CTX)."""
     return tuple(_created_job_registry())
+
+
+# R38 — the confirmation cards a turn staged, for a caller that has to
+# DRAW them itself. The main chat does not need this: `_last_pending_action`
+# rides the assistant message's metadata_json and ws_chat broadcasts the
+# card. The automation thread has neither of those surfaces — its cards are
+# `needs_you` turns in its own ledger — so `thread_agent` collects them here
+# and renders one turn each.
+#
+# A ContextVar rather than an attribute on the shared ToolExecutor, and for
+# the reason `_CREATED_JOB_IDS_CTX` spells out one screen up: the executor is
+# a single instance serving every concurrent turn in the process, so an
+# instance list would let one user's staged card be drawn into another user's
+# thread. A child Task inherits the REFERENCE to this list, so an append
+# inside a gathered tool call is visible to the collector, while a different
+# turn (its own `collect_staged_actions()`, its own list) cannot see it.
+_STAGED_ACTIONS_CTX: contextvars.ContextVar[Optional[list]] = \
+    contextvars.ContextVar("tool_executor_staged_actions", default=None)
+
+
+def current_channel() -> Optional[str]:
+    """The channel this turn is being answered in, module-level.
+
+    R38. `_CHANNEL_CTX` had only a private property on the executor, so a
+    skill that needs to know WHERE its answer will land had no way to ask —
+    and the run-now refusal shipped a rule that only holds in one channel
+    (see the automations skill). A read-only accessor, so nothing has to
+    import the executor class or reach for an underscore name.
+    """
+    return _CHANNEL_CTX.get()
+
+
+@contextlib.contextmanager
+def collect_staged_actions():
+    """Collect the confirmation cards staged inside this block.
+
+    ``with collect_staged_actions() as cards: await runner.run(...)`` —
+    `cards` is the list, in staging order. Nested use is safe: the token
+    resets to whatever was there before.
+    """
+    sink: list = []
+    token = _STAGED_ACTIONS_CTX.set(sink)
+    try:
+        yield sink
+    finally:
+        _STAGED_ACTIONS_CTX.reset(token)
 # The assistant message id this turn's answer will be persisted under.
 # AgentRunner pre-mints it at run start (so generate_* attachments can
 # reference it before the row exists) and hands it to set_session_id();
@@ -1261,6 +1308,13 @@ class ToolExecutor:
                 # Separate, unconsumed record for the job finalizer — see the
                 # field's docstring for why it can't just read the above.
                 self.staged_pending_action_ids.append(str(action_id))
+                # R38: a caller that has to DRAW the card itself (the
+                # automation thread renders one `needs_you` turn per
+                # staged action). Per-task, so one turn's card can never
+                # be drawn into another turn's surface.
+                _sink = _STAGED_ACTIONS_CTX.get()
+                if isinstance(_sink, list):
+                    _sink.append(dict(card))
                 # Live render, so the card is on screen the moment the
                 # turn's text lands rather than after a refresh. The
                 # metadata_json write above is the DURABLE path — this

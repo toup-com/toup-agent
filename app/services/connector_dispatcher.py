@@ -94,7 +94,40 @@ logger = logging.getLogger(__name__)
 # `elevation: true` tool called from anywhere else is REFUSED, never
 # silently executed — see the gate in `execute`. Kept as a frozenset
 # next to the other channel policy so the two are read together.
-_CONFIRMABLE_CHANNELS = frozenset({"web", "app", "mobile"})
+#
+# `automation_thread` joined in R38, and only once the surface existed:
+# `thread_agent` renders each staged action as a `needs_you` turn with
+# `fix="approve"` carrying its `pending_action_id`, and the approve
+# endpoint re-enters `execute` with `approved_action_id` set — which
+# `_resolve_channel_policy` now honours, so the tap actually runs the
+# call. Adding the channel here without that would have been a card
+# nobody could draw; adding the card without the policy change would
+# have been a button that reports failure on every tap.
+_CONFIRMABLE_CHANNELS = frozenset({"web", "app", "mobile",
+                                   "automation_thread"})
+
+# Channels where a MUTATING connector tool is staged for the user's
+# approval rather than denied. `automation_thread` is attended — the
+# user is sitting in the thread, watching — so the honest answer to
+# "post that to Slack", asked inside the automation whose job is
+# posting to Slack, is a card and not a refusal. Every write from here
+# meets the elevation gate whether or not the manifest marks the tool
+# `elevation: true`, which is the same posture a confirm-mode
+# automation grant already has.
+_MUTATES_CONFIRM_CHANNELS = frozenset({"automation_thread"})
+
+
+def stages_writes_for_approval(channel: str) -> bool:
+    """Whether a mutating call on `channel` is staged for a tap rather
+    than refused — and, therefore, whether an approval offered on that
+    channel can actually be honoured.
+
+    Exported so the surface that DRAWS the approve button and the code
+    that would EXECUTE it read one predicate. `thread_agent` asks
+    before offering approval; if this ever answered False the turn says
+    it cannot run the call instead of offering a tap that fails.
+    """
+    return (channel or "") in _MUTATES_CONFIRM_CHANNELS
 
 # How long a staged draft stays actionable. Long enough to survive
 # "I'll deal with this after lunch", short enough that a card found by
@@ -138,11 +171,13 @@ _MUTATES_UNATTENDED_DENY_CHANNELS = frozenset({
     # user's explicit per-tool ConnectorUserPreference allow still overrides,
     # same resolution order as autopilot.
     "subagent", "app_builder",
-    # The automation thread's agent turn (R33). The user IS present, but the
-    # thread reads the automation's accounts and does not write to them —
-    # thread_agent's boundary since R31 — so it keeps the deny it already had
-    # when mcp_auth clamped the unknown channel to "background". Listed with
-    # its real name so the policy is greppable rather than incidental.
+    # The automation thread's agent turn (R33). The user IS present, and
+    # since R38 it also has a surface to approve on — so it is in
+    # `_MUTATES_CONFIRM_CHANNELS` below, which SUBTRACTS it from this set
+    # inside `_resolve_channel_policy`. It stays listed here on purpose:
+    # the subtraction is what carries the reasoning, and deleting the name
+    # would make "why is this channel allowed to write?" unanswerable from
+    # the policy the way it was before the surface existed.
     "automation_thread",
 })
 
@@ -581,6 +616,24 @@ async def execute(
         # Round 26: a confirm-mode grant previews EVERY fire, even for
         # write tools the manifest does not mark elevation (drafts).
         _needs_card = True
+    if (
+        approved_action_id is None
+        and manifest_tool.mutates
+        and channel in _MUTATES_CONFIRM_CHANNELS
+    ):
+        # R38. On a staging channel EVERY mutating tool draws a card,
+        # not just the `elevation: true` ones — otherwise a `mutates`
+        # tool the manifest does not elevate (a draft, a label change)
+        # would run unattended on a surface whose whole licence to write
+        # is that the user approves each call.
+        #
+        # LAST, and unconditionally, so nothing above can clear it. An
+        # auto-mode automation grant is standing approval for the
+        # AUTOMATION's own scheduled write, not for a call the agent
+        # made in a thread; today `grant_id` is refused outside the
+        # `automation` channel so that branch cannot fire here at all,
+        # and this ordering is what keeps that true if it ever can.
+        _needs_card = True
     if _needs_card:
         if channel not in _CONFIRMABLE_CHANNELS and automation_grant is None:
             # Fail SAFE. Every elevation:true tool today is also
@@ -941,6 +994,21 @@ def _resolve_channel_policy(
       3. Manifest channel_policy.deny → reject
       4. Manifest mutates: true AND channel in {voice, telegram} → reject
       5. Default
+
+    A channel that STAGES rather than denies (`_MUTATES_CONFIRM_CHANNELS`,
+    which R38 added `automation_thread` to) keeps its mutating tools on
+    both passes — the first, where the elevation gate turns the call into
+    a card, and the re-entry, where the user has tapped approve. Denying
+    at this layer would make the staging unreachable on the first pass and
+    the tap unhonourable on the second: a button that reports a failure
+    for every write it offered, which is worse than the deny it replaced.
+
+    That is decided by the CHANNEL alone, above. This function took an
+    `approved_action_id` for a while and never read it, while its
+    docstring said the parameter was what made re-entry safe and that the
+    agent path could not lift its own gate through it — both false, and
+    exactly the shape that gets "simplified" wrongly later. The real gate
+    is `_needs_card`, which forces a card for anything that mutates here.
     """
     cp = manifest_tool.channel_policy
     if channel in cp.deny:
@@ -952,6 +1020,13 @@ def _resolve_channel_policy(
     from app.config import settings as _settings
     if getattr(_settings, "injection_fencing_v2", False):
         _deny_channels = _MUTATES_DEFAULT_DENY_CHANNELS | _MUTATES_UNATTENDED_DENY_CHANNELS
+    if channel in _MUTATES_CONFIRM_CHANNELS:
+        # This channel does not deny a mutating tool — it STAGES one
+        # (the elevation gate below forces a card for anything that
+        # mutates here) and executes it on the user's tap. Denying at
+        # this layer would make the staging unreachable, and denying
+        # the re-entry would make the tap unhonourable.
+        _deny_channels = _deny_channels - _MUTATES_CONFIRM_CHANNELS
     if manifest_tool.mutates and channel in _deny_channels:
         return ConnectorToolError(
             message=(

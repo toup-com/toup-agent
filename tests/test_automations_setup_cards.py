@@ -59,13 +59,12 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         "automations__run_now", "automations__arm", "automations__pause",
         "automations__resume", "automations__delete",
     } <= names
-    # R31-04. `automations__test_run` is DEV-ONLY now and is absent
-    # from the production array. It was the only run-shaped tool the
-    # model could reach, so "Run all of them again" became a synthetic
-    # fire that answered "TEST RUN STAGED" and reported a status of
-    # paused. `automations__run_now` replaces it, and the two must
-    # never both be reachable from an ordinary sentence.
-    assert "automations__test_run" not in names
+    # R31-04 pulled `automations__test_run` from the production array
+    # because its "staged" write was swept and sent by the outbox loop
+    # like any other. R38 replaced that implementation — a rehearsal
+    # stages nothing and opens no run — so it is reachable again, and
+    # `automations__run_now` stays the only tool that does work.
+    assert "automations__test_run" in names
     for n in names:
         # EVERY tool carries the prefix, `automations__memory_recall`
         # included. This used to permit a bare `memory_recall` on a
@@ -76,21 +75,32 @@ async def test_skill_tools_match_round_brief(monkeypatch):
         assert n.startswith("automations__")
     # And the prefix-stable tools array only ever grows at the END.
     ordered = [t["name"] for t in AutomationsSkill().get_tools()]
-    # R37 appended set_destination; the earlier tail keeps its order.
-    assert ordered[-3:] == ["automations__memory_recall",
+    # R38 appended the five edit tools; every earlier tail keeps its
+    # order and its position.
+    assert ordered[-8:] == ["automations__memory_recall",
                             "automations__run_now",
-                            "automations__set_destination"]
+                            "automations__set_destination",
+                            "automations__edit_schedule",
+                            "automations__edit_rules",
+                            "automations__edit_steps",
+                            "automations__edit_permissions",
+                            "automations__edit_accounts"]
 
-    # Under the dev fast lane it comes back. The array is FILTERED
-    # rather than appended to, so it returns to its original position —
-    # which keeps the two arrays' shared entries in the same order and
-    # is what a dev tenant's cache lineage needs.
-    monkeypatch.setattr(
-        "app.agent.skills.builtins.automations.skill._dev_tools_active",
-        lambda: True,
-    )
-    dev_names = {t["name"] for t in AutomationsSkill().get_tools()}
-    assert "automations__test_run" in dev_names
+    # The dev filter still FILTERS rather than appends, so a dev-only
+    # tool returns to its original position — which keeps the two
+    # arrays' shared entries in the same order and is what a dev
+    # tenant's cache lineage needs. The set is empty today, so this
+    # drives it with a name of its own.
+    import app.agent.skills.builtins.automations.skill as _sk
+    monkeypatch.setattr(_sk, "_DEV_ONLY_TOOLS",
+                        frozenset({"automations__test_run"}))
+    monkeypatch.setattr(_sk, "_dev_tools_active", lambda: False)
+    assert "automations__test_run" not in {
+        t["name"] for t in AutomationsSkill().get_tools()}
+    monkeypatch.setattr(_sk, "_dev_tools_active", lambda: True)
+    dev = [t["name"] for t in AutomationsSkill().get_tools()]
+    assert dev.index("automations__test_run") == ordered.index(
+        "automations__test_run")
 
 
 @pytest.mark.asyncio

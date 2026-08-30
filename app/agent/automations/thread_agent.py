@@ -33,16 +33,26 @@ this module always claimed are enforced by the channel rather than by
 having no tools —
 `prompt_profile.AUTOMATION_THREAD_DISABLED_TOOLS` withholds every
 deferral tool, every memory writer and every routine/trigger mutator.
-The connector surface it keeps is the READ half: `automation_thread`
-sits in `connector_dispatcher._MUTATES_UNATTENDED_DENY_CHANNELS`, so a
-mutating connector call is refused at the dispatcher. An earlier
-version of this note argued the opposite (attended surface ⇒ writes
-meet the same elevation confirmation as main chat) — that stays the
-direction of travel, but the elevation CARD has no proven surface in
-the thread yet, and a confirmation the surface cannot show is a wedge,
-not a safeguard. Reads are the whole founder ask here. Persistence
-stays with the ledger, which is what keeps a thread question out of
-the day chat (the R31 leak this module was written to close).
+The connector surface it keeps is now BOTH halves, and R38 is what
+made the second one honest. A mutating connector call from this channel
+used to be refused outright at the dispatcher, for one reason: the
+elevation card it would need had no surface here, and a confirmation
+the surface cannot show is a wedge, not a safeguard. The surface exists
+now — `_append_approval_turns` draws one `needs_you` turn per staged
+call, `fix="approve"`, carrying the `pending_action_id` its two buttons
+POST to — so `automation_thread` is in `_CONFIRMABLE_CHANNELS` and
+every mutating call from here is STAGED rather than run. Nothing writes
+without a tap; what changed is that there is a tap to make.
+
+The order that keeps it honest: the dispatcher only stages on a channel
+it can also EXECUTE on approval (`stages_writes_for_approval`), and
+this module asks that question before it offers the button. If it ever
+answered no, the turn says the call cannot be run from here instead of
+drawing a button that fails.
+
+Persistence stays with the ledger, which is what keeps a thread
+question out of the day chat (the R31 leak this module was written to
+close).
 """
 
 from __future__ import annotations
@@ -224,6 +234,21 @@ def _setup_lines(automation: Automation) -> list[str]:
         lines.append(f"- Status: paused{why}.")
     else:
         lines.append("- Status: draft — not armed yet.")
+    # R38: the pins. Ahead of the delivery lines because they answer a
+    # question that comes first — "where does it look?" — and because a
+    # thread that does not know the user pinned #eng will offer to read
+    # the whole workspace, which is the setup they explicitly narrowed.
+    try:
+        for cid, pins in (workflow.focus_of(raw) or {}).items():
+            name = verbs.display_name(cid) or cid
+            labels = ", ".join(p.get("label") or p.get("id") for p in pins)
+            if labels:
+                lines.append(
+                    f"- Starts at: in {name} it starts at {labels} — "
+                    f"look there first, not across the whole account."
+                )
+    except Exception as e:  # noqa: BLE001 — grounding, not a gate
+        logger.debug("[thread_agent] focus lines skipped: %s", e)
     try:
         writes = workflow._write_tools(raw)
         # The v1 branch of `_write_tools` hard-codes the target to {}
@@ -305,7 +330,17 @@ _ANSWER_RULES = (
     "no backticks, no bullet characters, no headings. Name accounts by "
     "their display name. Never name an account this automation does not "
     "have. If a read failed, say which account and why, using the "
-    "sentence given to you word for word. Never invent a count."
+    "sentence given to you word for word. Never invent a count. "
+    # R38. Every write from this surface is STAGED for the user's tap —
+    # the tool's own answer says so, and this repeats it because "Posted
+    # it to Slack" about a card still waiting is the single worst thing
+    # the elevation surface can produce. The card is a turn in this
+    # thread, so "below" is literally true here and nowhere else.
+    "If you ask an account to write, post, send or change anything, it "
+    "has NOT happened: it is waiting for the user to approve it on the "
+    "card below. Say that it is ready and waiting for them. Never say "
+    "it is done, and never ask for the same write twice — a second ask "
+    "produces the same card."
 )
 
 
@@ -394,36 +429,136 @@ async def answer_in_thread(
             except Exception as e:  # noqa: BLE001
                 logger.debug("[thread_agent] writing frame failed: %s", e)
 
+    from app.agent.tool_executor import collect_staged_actions
+
+    staged: list[dict] = []
     try:
-        response = await runner.run(
-            user_message=(
-                f"{_ANSWER_RULES}\n\n{grounding}\n\n"
-                f"The user just asked, inside this automation's thread: "
-                f"{user_text}"
-            ),
-            display_user_message=user_text,
-            user_id=user_id,
-            channel="automation_thread",
-            save_user_message=False,
-            save_assistant_message=False,
-            disable_post_processing=True,
-            on_tool_start=_on_tool_start,
-            on_text_chunk=_on_text_chunk,
-            # R37: only THIS automation's connectors ride the wire. The
-            # full array put the thread turn over the proxy's 128-tool
-            # tail-trim on connector-heavy accounts, and the trimmed
-            # tail was exactly the reads this surface exists for.
-            connector_scope=_account_ids(automation),
-        )
+        # R38: a mutating connector call from this channel is STAGED,
+        # not run — and the card that lets the user run it is a turn in
+        # this thread, so this turn has to collect the staged calls
+        # itself. Per-task (a ContextVar list), so a concurrent turn's
+        # card can never be drawn here.
+        with collect_staged_actions() as cards:
+            response = await runner.run(
+                user_message=(
+                    f"{_ANSWER_RULES}\n\n{grounding}\n\n"
+                    f"The user just asked, inside this automation's "
+                    f"thread: {user_text}"
+                ),
+                display_user_message=user_text,
+                user_id=user_id,
+                channel="automation_thread",
+                save_user_message=False,
+                save_assistant_message=False,
+                disable_post_processing=True,
+                on_tool_start=_on_tool_start,
+                on_text_chunk=_on_text_chunk,
+                # R37: only THIS automation's connectors ride the wire.
+                # The full array put the thread turn over the proxy's
+                # 128-tool tail-trim on connector-heavy accounts, and
+                # the trimmed tail was exactly the reads this surface
+                # exists for.
+                connector_scope=_account_ids(automation),
+            )
+            staged = list(cards)
         text = (getattr(response, "text", "") or "").strip()
     except Exception as e:  # noqa: BLE001
         logger.warning("[thread_agent] answer failed: %s", e)
         text = ""
 
-    return await _persist_answer(
+    turn = await _persist_answer(
         db, automation=automation, thread=thread, run_id=run_id,
         text=text, t0=t0, streamed=False,
     )
+    # AFTER the answer, so the card follows the sentence that explains
+    # it — the tool result already told the model to say the write is
+    # waiting on them.
+    await _append_approval_turns(
+        db, automation=automation, thread=thread, run_id=run_id,
+        staged=staged,
+    )
+    return turn
+
+
+async def _append_approval_turns(
+    db: AsyncSession, *, automation: Automation, thread, run_id,
+    staged: list[dict],
+) -> None:
+    """One `needs_you` turn per connector call the turn staged.
+
+    This IS the automation thread's elevation surface. `fix="approve"`
+    and `pending_action_id` are what the app's two buttons POST to
+    (`/api/connectors/pending-actions/{id}/approve|reject`), which
+    re-enters `connector_dispatcher.execute` with `approved_action_id`
+    set and actually makes the call.
+
+    The button is only offered when that re-entry would work. A card
+    the user can tap and that then reports a refusal is worse than the
+    deny this replaced — so the turn asks the dispatcher itself
+    (`stages_writes_for_approval`) and, if the answer is no, says the
+    call cannot be run from here rather than offering a tap.
+    """
+    if not staged:
+        return
+    from app.services import automation_verbs as verbs
+    from app.services.connector_dispatcher import stages_writes_for_approval
+
+    executable = stages_writes_for_approval("automation_thread")
+    for card in staged:
+        tool_name = str(card.get("tool_name") or "")
+        connector_id = str(card.get("connector_id") or "") or \
+            tool_name.split("__", 1)[0]
+        name = verbs.display_name(connector_id) or connector_id or "It"
+        # `summarize_pending_action` falls back to `Run <tool>` for a
+        # connector with no bespoke line, and a raw tool id in a
+        # sentence we author is what `ledger._RAW_TOOL_RE` exists to
+        # catch — it would sanitize this whole turn into an `agent`
+        # bubble with NO BUTTONS in prod, and raise in dev. Drop the
+        # summary rather than the card: the account's name plus the tap
+        # is still a real gate, and "Run slack__send_message" was never
+        # a sentence.
+        summary = " ".join(str(card.get("summary") or "").split())[:200]
+        if ledger._RAW_TOOL_RE.search(summary):
+            summary = ""
+        action_id = str(card.get("action_id") or "")
+        if executable and action_id:
+            payload = {
+                "account_id": connector_id,
+                "connector_id": connector_id,
+                "name": name,
+                "reason_code": "needs_approval",
+                "sentence": (
+                    f"{name} has not done this yet — it is waiting on "
+                    f"you: {summary}" if summary else
+                    f"{name} has not done this yet — it is waiting on you."
+                ),
+                "fix": "approve",
+                "fix_label": "Approve",
+                "pending_action_id": action_id,
+            }
+        else:
+            # No tap to offer. Say so — the alternative is silence about
+            # a call the agent has just told the user is waiting.
+            payload = {
+                "account_id": connector_id,
+                "connector_id": connector_id,
+                "name": name,
+                "reason_code": "cannot_approve_here",
+                "sentence": (
+                    f"{name} did not do this, and it cannot be approved "
+                    f"from here — ask me in the main chat instead."
+                ),
+                "fix": "check",
+                "fix_label": "Open the chat",
+            }
+        try:
+            await ledger.append_turn(
+                db, user_id=automation.user_id, thread=thread,
+                run_id=run_id, kind="needs_you", payload=payload,
+            )
+        except Exception as e:  # noqa: BLE001 — one unrenderable card
+            # must not swallow the others, or the answer.
+            logger.warning("[thread_agent] approval turn skipped: %s", e)
 
 
 def _runner():

@@ -121,3 +121,59 @@ def test_setup_turns_without_accounts_keeps_the_legacy_shape():
                          [{"text": "Read new mail", "ok": True}])
     tools = [d for d in drafts if d.get("kind") == "tool"]
     assert len(tools) == 1 and "account_id" not in tools[0]
+
+
+def test_per_account_verb_only_the_writer_says_posts():
+    """rec1 f007–f011: a posts-to-Slack brief showed Gmail and Outlook
+    sub-labelled "posts" while their own drill-in said read-only, and
+    the ⋯ menu said "reads only" one screen away. Only the account
+    whose step writes wears the write-mode label."""
+    from app.agent.automations.setup_script import setup_turns
+    drafts = setup_turns(
+        "posts", "posts to #all-toup", "tonight",
+        accounts=[
+            {"account_id": "gmail", "writes": False, "steps": []},
+            {"account_id": "outlook", "writes": False, "steps": []},
+            {"account_id": "slack", "writes": True, "steps": []},
+        ],
+    )
+    tools = {d["account_id"]: d for d in drafts if d.get("kind") == "tool"}
+    assert tools["gmail"]["detail"] == "reads only"
+    assert tools["outlook"]["detail"] == "reads only"
+    assert tools["slack"]["detail"] == "posts to #all-toup"
+
+
+def test_per_account_verb_without_the_flag_keeps_the_legacy_stamp():
+    """A caller that cannot say who writes still gets the old shape —
+    honest degradation, not a crash and not a silent reads-only."""
+    from app.agent.automations.setup_script import setup_turns
+    drafts = setup_turns(
+        "drafts_only", "", "tonight",
+        accounts=[{"account_id": "gmail", "steps": []}],
+    )
+    tools = [d for d in drafts if d.get("kind") == "tool"]
+    assert tools[0]["detail"] == "drafts only"
+
+
+def test_writer_connectors_reads_both_spec_shapes():
+    from app.agent.automations.setup_script import writer_connectors
+    v2 = {"steps": [
+        {"id": "mail", "connector_id": "gmail",
+         "tool": "gmail__list_messages"},
+        {"id": "post", "connector_id": "slack",
+         "tool": "slack__send_message", "grant_id": "g-1"},
+    ]}
+    assert writer_connectors(v2) == {"slack"}
+    # An UNGRANTED write step is still a writer — a write is a write by
+    # its TOOL (R36 doctrine), and the verb must not lie mid-setup.
+    v2_ungranted = {"steps": [
+        {"id": "mail", "connector_id": "gmail",
+         "tool": "gmail__list_messages"},
+        {"id": "post", "connector_id": "slack",
+         "tool": "slack__send_message"},
+    ]}
+    assert writer_connectors(v2_ungranted) == {"slack"}
+    v1 = {"action": {"connector_id": "slack",
+                     "tool": "slack__send_message", "grant_id": "g"}}
+    assert writer_connectors(v1) == {"slack"}
+    assert writer_connectors({}) == set()

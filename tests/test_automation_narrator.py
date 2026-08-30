@@ -370,3 +370,61 @@ def test_digest_tool_schema_frees_the_labels_and_pins_the_tones():
     assert "enum" not in group_props["label"]
     assert set(group_props["tone"]["enum"]) == set(narrator.RESULT_TONES)
     assert "digest" in props["vocabulary"]["enum"]
+
+
+# ------------------------------------------------------ determinism (R38)
+
+
+@pytest.mark.asyncio
+async def test_the_narrator_runs_at_temperature_zero(monkeypatch):
+    """rec2: identical inbox data, opposite triage one minute apart —
+    the security notice DO FIRST at 9:47, NO ACTION at 9:48. A triage
+    is a judgement the user acts on; the same facts must produce the
+    same judgement. 0.0, pinned so it cannot regress."""
+    seen = {}
+
+    class _Svc:
+        async def complete_with_json(self, *, messages, model,
+                                     temperature, max_tokens):
+            seen["temperature"] = temperature
+            seen["max_tokens"] = max_tokens
+            return '{"turns": []}'
+
+    monkeypatch.setattr(
+        "app.services.llm_service.get_llm_service", lambda: _Svc())
+    out = await narrator._default_complete(
+        "p", narrator._emit_turns_tool("brief"))
+    assert seen["temperature"] == 0.0
+    assert out == {"turns": []}
+
+
+def test_dispatch_record_serialization_is_stable():
+    """Two builds of the SAME record whose dicts were assembled in
+    different key orders must produce byte-identical prompts — a
+    deterministic model is only deterministic over a stable prompt."""
+    step = {
+        "step_ref": "mail", "connector_name": "Gmail",
+        "account_id": "gmail", "tool_kind": "read",
+        "action": "Read your unread mail", "detail": "2 new threads",
+        "ok": True, "failure_reason": None,
+        "items": [{"id": "i-1", "title": "Security alert", "sub": "",
+                   "msgs": []}],
+        "write": None,
+    }
+    step_scrambled = dict(reversed(list(step.items())))
+    base = {
+        "automation": {"title": "Inbox summary", "mode": "auto",
+                       "description": ""},
+        "run_kind": "run_now", "vocabulary": "brief",
+        "status": "completed", "rules": [], "memory_facts": [],
+    }
+    rec1 = dict(base, steps=[step])
+    rec2 = dict(reversed(list(dict(base, steps=[step_scrambled]).items())))
+    assert narrator.build_prompt(rec1) == narrator.build_prompt(rec2)
+
+
+def test_writing_sentence_speaks_the_vocabulary():
+    assert narrator.writing_sentence("brief") == "Writing your brief"
+    assert narrator.writing_sentence("changes") == "Writing up the changes"
+    assert narrator.writing_sentence("digest") == "Writing your digest"
+    assert narrator.writing_sentence("") == "Writing your brief"

@@ -86,6 +86,8 @@ async def update_automation(automation_id: str, body: SpecBody):
             automation, _ = await _update(
                 db, automation_id=automation_id, user_id=_user_id(),
                 spec=body.spec,
+                # R38: a spec replacement is an EDIT — divider + frame.
+                edited_note=True,
             )
             return {"automation": automation_payload(automation)}
     except AutomationNotFound:
@@ -157,31 +159,39 @@ async def resume(automation_id: str):
 
 @router.post("/{automation_id}/test-run")
 async def test_run(automation_id: str):
-    """DEV ONLY (R31-04).
+    """A rehearsal: the reads run against live data, the writes are
+    rendered and reported, nothing is staged and nothing is sent.
 
-    A test run mints a real `BuildJob`, posts a run notification and
-    fires a `mission_started` push for an automation the user may never
-    have armed. It exists for the harness, and until R31 it was
-    reachable three ways: this route, its proxy twin, and — worst — the
-    `automations__test_run` TOOL, which the skill's own build order made
-    step 7. That is how "Run all of them again" was answered by a
-    staged synthetic fire reporting `TEST RUN STAGED` and a status of
-    `paused`.
-
-    The tool is gone from the model's array. The route stays for
-    `make e2e-automations`, behind the same flag, and 404s in
-    production so it cannot be curl'd into a user's thread.
+    R31-04 recorded why the old implementation was DEV ONLY — it minted
+    a real `BuildJob`, posted a run notification, and its "staged"
+    write was swept and sent by `outbox.flush_loop` like any other. R38
+    replaced the implementation (`service.rehearse`) rather than the
+    gate: there is no outbox row now, so there is nothing a loop can
+    send. The route keeps its dev flag anyway — the harness is what it
+    was built for, and `automations__test_run` is the surface a user
+    reaches — so its blast radius is unchanged while its behaviour got
+    strictly safer.
     """
     _flag_or_404()
     if not getattr(settings, "automations_dev_tools", False):
-        raise HTTPException(status_code=404, detail="Feature not available")
-    from app.agent.automations.service import (
-        AutomationNotFound, test_run as _test,
-    )
+        # NOT `404 Feature not available`. That is the exact body
+        # `_flag_or_404` uses, and `automations_proxy._translate_agent_dark`
+        # turns any 404 carrying it into `503 agent_starting` — so a
+        # rehearsal that is merely switched off reached every remote
+        # caller as "your agent is still booting". Two shut doors, one
+        # sentence, opposite fixes. 403 with a code says which.
+        raise HTTPException(status_code=403, detail={
+            "code": "rehearsal_disabled",
+            "sentence": (
+                "Rehearsals are switched off on this tenant. Nothing was "
+                "run. Validate the spec by saving it as a draft instead."
+            ),
+        })
+    from app.agent.automations.service import AutomationNotFound, rehearse
     try:
         async with async_session_maker() as db:
-            return await _test(db, automation_id=automation_id,
-                               user_id=_user_id())
+            return await rehearse(db, automation_id=automation_id,
+                                  user_id=_user_id())
     except AutomationNotFound:
         raise HTTPException(status_code=404, detail="No such automation")
 
@@ -861,6 +871,62 @@ async def resume_run_route(run_id: str):
         return result
 
 
+async def _run_now_refusal_turn(db, automation, sentence: str) -> bool:
+    """R38 — a run-now refusal is a THREAD TURN, not server silence.
+
+    rec1 f020–f030: "Run it now" answered 409 and wrote nothing, so the
+    app alerted AND posted its own local bubble — the same sentence
+    twice, beside a phantom run card. The refusal now lands ONCE, as an
+    agent turn in the automation's thread (broadcast like any other),
+    and the 409 detail carries `refusal_turn: true` so the client knows
+    the account already exists and posts nothing of its own.
+
+    Deduped against the thread's last agent turn: a second press of the
+    same dead button re-raises the same 409 but does not stack a second
+    identical bubble. Best-effort — a thread that cannot be written
+    still gets its honest 409, just without the flag.
+    """
+    try:
+        from sqlalchemy import select as _select
+        from app.agent.automations import ledger as _ledger
+        from app.db.models import AutomationTurn
+        thread = await _ledger.ensure_thread(
+            db, user_id=automation.user_id, automation_id=automation.id,
+        )
+        last = (await db.execute(
+            _select(AutomationTurn)
+            .where(AutomationTurn.thread_id == thread.id)
+            .where(AutomationTurn.kind == "agent")
+            .order_by(AutomationTurn.seq.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if last is not None:
+            try:
+                if (json.loads(last.payload_json) or {}).get("text") \
+                        == sentence:
+                    return True
+            except (ValueError, TypeError):
+                pass
+        await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=None,
+            kind="agent", payload={"text": sentence},
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 — the 409 stands either way
+        logger.warning("[automations] run-now refusal turn skipped "
+                       "automation=%s: %s", automation.id, e)
+        return False
+
+
+async def _refuse_run_now(db, automation, *, code: str,
+                          sentence: str) -> None:
+    """Append the refusal turn, then raise the 409 with the flag."""
+    detail: dict = {"code": code, "sentence": sentence}
+    if await _run_now_refusal_turn(db, automation, sentence):
+        detail["refusal_turn"] = True
+    raise HTTPException(status_code=409, detail=detail)
+
+
 @router.post("/{automation_id}/run-now")
 async def run_now(automation_id: str):
     """§4.3 — manual fire (kind run_now); honors cadence counters,
@@ -908,11 +974,11 @@ async def run_now(automation_id: str):
                 # Not "already running" — a parked run is waiting for a
                 # DECISION, and firing a second one beside it
                 # double-posts the moment the card is approved.
-                raise HTTPException(status_code=409, detail={
-                    "code": "waiting_on_you",
-                    "sentence": "It is waiting for you to approve a "
-                                "change. Decide that first.",
-                })
+                await _refuse_run_now(
+                    db, automation, code="waiting_on_you",
+                    sentence="It is waiting for you to approve a "
+                             "change. Decide that first.",
+                )
             if v3 == "running":
                 total = int(live.progress_total or 0)
                 step = int(live.progress_step or 0)
@@ -936,13 +1002,19 @@ async def run_now(automation_id: str):
             # button died silently: the app's non-409 path asked the
             # summary what happened, the summary said nothing, and the
             # honest 409 sentence below was never reached.
-            raise HTTPException(status_code=409, detail={
-                "code": "needs_setup",
-                "sentence": (
-                    "It is not finished being set up — finish the "
-                    "questions in its thread and I will run it."
-                ),
-            }) from se
+            # R38: no "in its thread" — the sentence LANDS in the
+            # thread now, and pointing at the room you are standing in
+            # reads absurd (rec1 f020).
+            try:
+                await _refuse_run_now(
+                    db, automation, code="needs_setup",
+                    sentence=(
+                        "It is not finished being set up — finish the "
+                        "questions and I will run it."
+                    ),
+                )
+            except HTTPException as he:
+                raise he from se
         from app.agent.automations.spec_v2 import ValidatedSpecV2
         if not isinstance(vspec, ValidatedSpecV2):
             raise HTTPException(status_code=409, detail={
@@ -968,14 +1040,14 @@ async def run_now(automation_id: str):
             ) and not (st.grant_target or {}).get("id"))
             if needs_pin or not st.grant_id:
                 clause = _verbs._WRITE_CLAUSES.get(st.tool) or "write"
-                raise HTTPException(status_code=409, detail={
-                    "code": "needs_setup",
-                    "sentence": (
+                await _refuse_run_now(
+                    db, automation, code="needs_setup",
+                    sentence=(
                         f"It is not finished being set up — before it "
-                        f"can {clause}, tell me in its thread where "
-                        f"that should go and I will pin it."
+                        f"can {clause}, tell me where that should go "
+                        f"and I will pin it."
                     ),
-                })
+                )
             # R37: a pinned step whose grant the user has not yet
             # approved used to pass this gate and fire — the reads ran
             # and the write met the dispatcher's fail-closed refusal,
@@ -1001,12 +1073,13 @@ async def run_now(automation_id: str):
                     # actionable move is a fresh ask, not a hunt for it.
                     sentence = (
                         f"The permission it needs to {clause} was never "
-                        f"granted — tell me in its thread where that "
-                        f"should go and I will ask again."
+                        f"granted — tell me where that should go and I "
+                        f"will ask again."
                     )
-                raise HTTPException(status_code=409, detail={
-                    "code": "needs_setup", "sentence": sentence,
-                })
+                await _refuse_run_now(
+                    db, automation, code="needs_setup",
+                    sentence=sentence,
+                )
 
     # R36-2: the fire is DETACHED. A run is minutes of reads plus two
     # narration phases; holding the HTTP response open for all of it
@@ -1677,6 +1750,98 @@ async def delete_workflow_account(automation_id: str, account_id: str):
         )
 
 
+# ── R38 §contents — what is inside the account you just tapped ──────
+
+@router.get("/{automation_id}/workflow/accounts/{account_id}/contents")
+async def get_account_contents(automation_id: str, account_id: str):
+    """The node's own material: recent mail, per-channel messages, the
+    tickets due, the open pull requests.
+
+    Always 200 with `ok` — an unreachable agent, a dead credential and
+    an account that genuinely holds nothing are three different answers
+    and the app must be able to tell them apart. An HTTP error would
+    collapse the first two into the app's generic failure banner and
+    lose the sentence that says which.
+    """
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations import contents as _contents
+    from app.agent.automations import registry as _reg
+    from app.agent.automations.workflow import _spec_raw, focus_of
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        raw = _spec_raw(automation)
+        pins = focus_of(raw).get(account_id) or []
+    # Outside the session on purpose: the readers below are N provider
+    # calls at up to 60 s each, and holding a database connection across
+    # them is the same pool-exhaustion mistake `save_permissions`
+    # documents.
+    connection = (await _reg.fetch_connection_state(_user_id())).get(
+        account_id)
+    return await _contents.account_contents(
+        _user_id(), connector_id=account_id, focus=pins,
+        connection=connection,
+    )
+
+
+# ── R38 §focus — where this account starts every run ────────────────
+
+class FocusBody(BaseModel):
+    kind: str = Field(..., max_length=24)
+    id: str = Field(..., min_length=1, max_length=200)
+    label: Optional[str] = Field(default=None, max_length=120)
+
+
+@router.post("/{automation_id}/workflow/accounts/{account_id}/focus")
+async def post_account_focus(automation_id: str, account_id: str,
+                             body: FocusBody):
+    """Pin one place under an account. Writes the EDITED note like any
+    other workflow edit — a pin changes what the automation does."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, add_focus
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await add_focus(
+                db, automation=automation, user_id=_user_id(),
+                account_id=account_id, kind=body.kind,
+                target_id=body.id, label=body.label or "",
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_409(e)
+
+
+@router.delete("/{automation_id}/workflow/accounts/{account_id}/focus")
+async def delete_account_focus(
+    automation_id: str, account_id: str,
+    kind: str = Query(..., max_length=24),
+    id: str = Query(..., min_length=1, max_length=200),
+):
+    """Unpin one place. `kind` + `id` because an id alone is not unique
+    across kinds — a Slack channel id and a thread ts can collide in
+    shape, and removing the wrong one is silent."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, remove_focus
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await remove_focus(
+                db, automation=automation, user_id=_user_id(),
+                account_id=account_id, kind=kind, target_id=id,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_409(e)
+
+
 class AskBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=1000)
 
@@ -1792,15 +1957,23 @@ async def from_template(body: FromTemplateBody):
         # statement — without it the narrator knows nothing but a name.
         spec["description"] = template.get("description")
 
+    # R38 — the build history. The recorder times the REAL segments of
+    # this build; `build_ledger.record` derives every word from the
+    # finished automation. Opened here so `total_ms` covers the whole
+    # creation, not just the part after the spec was persisted.
+    from app.agent.automations import build_ledger as _build
+    rec = _build.BuildRecorder("template")
+
     async with async_session_maker() as db:
         try:
-            automation, vspec = await create_automation(
-                db, user_id=_user_id(), spec=spec,
-                template_slug=template.get("slug"),
-                domain=template.get("category"),
-                template_mode=True,
-                template_vars=declared_vars,
-            )
+            with rec.phase("trigger"):
+                automation, vspec = await create_automation(
+                    db, user_id=_user_id(), spec=spec,
+                    template_slug=template.get("slug"),
+                    domain=template.get("category"),
+                    template_mode=True,
+                    template_vars=declared_vars,
+                )
         except SpecError as e:
             # Never a bare status code on a phone screen: the app shows
             # `sentence` and files `errors` where a developer looks.
@@ -1812,31 +1985,52 @@ async def from_template(body: FromTemplateBody):
             })
         # Arm only when nothing is missing: every member account
         # connected AND no write step without a grant.
-        connections = await _reg.fetch_connection_state(_user_id())
-        from app.agent.automations.workflow import _member_connectors
-        raw = json.loads(automation.spec_json or "{}")
-        members = _member_connectors(raw)
-        all_connected = all(
-            (connections.get(cid) or {}).get("connected")
-            and (connections.get(cid) or {}).get("status") == "active"
-            for cid in members
-        )
-        has_ungranted_write = any(
-            s.get("tool") and not s.get("grant_id")
-            and s.get("grant_target") is not None
-            for s in (raw.get("steps") or [])
-            if isinstance(s, dict)
-        ) or any("{{grant.target.id}}" in json.dumps(s.get("params") or {})
-                 for s in (raw.get("steps") or []) if isinstance(s, dict))
+        with rec.phase("output"):
+            connections = await _reg.fetch_connection_state(_user_id())
+            from app.agent.automations.workflow import _member_connectors
+            raw = json.loads(automation.spec_json or "{}")
+            members = _member_connectors(raw)
+            all_connected = all(
+                (connections.get(cid) or {}).get("connected")
+                and (connections.get(cid) or {}).get("status") == "active"
+                for cid in members
+            )
+            has_ungranted_write = any(
+                s.get("tool") and not s.get("grant_id")
+                and s.get("grant_target") is not None
+                for s in (raw.get("steps") or [])
+                if isinstance(s, dict)
+            ) or any("{{grant.target.id}}" in json.dumps(s.get("params") or {})
+                     for s in (raw.get("steps") or []) if isinstance(s, dict))
         armed = False
-        if all_connected and not has_ungranted_write and not unanswered:
-            try:
-                await arm_automation(
-                    db, automation_id=automation.id, user_id=_user_id(),
-                )
-                armed = True
-            except (CompileError, Exception):  # noqa: BLE001
-                armed = False
+        with rec.phase("agent"):
+            if all_connected and not has_ungranted_write and not unanswered:
+                try:
+                    await arm_automation(
+                        db, automation_id=automation.id, user_id=_user_id(),
+                    )
+                    armed = True
+                except (CompileError, Exception):  # noqa: BLE001
+                    armed = False
+
+        # R38 — one measured segment per account. This is also the ONE
+        # permission resolution of the build: the setup script's
+        # capability check reads it below instead of calling again, so
+        # the history's account phase and the thread's capability turn
+        # can never describe two different permission sets.
+        from app.agent.automations import permissions as _perms
+        resolved_perms: dict = {}
+        for cid in members:
+            with rec.phase(f"account:{cid}"):
+                try:
+                    resolved_perms[cid] = await _perms.resolve(
+                        db, automation=automation, account_id=cid,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "[automations] permission resolve failed for "
+                        "%s: %s", cid, e,
+                    )
 
         # Seed the setup thread (§5.3 — C's script, honest fallback).
         from app.agent.automations import ledger as _ledger
@@ -1881,9 +2075,16 @@ async def from_template(body: FromTemplateBody):
             # lines into one turn stamped `members[0]` opened a
             # six-account brief with "Checked 1 account" and a lone
             # Jira chip.
+            # R38 — rec1 f007–f011: every account's row said "posts"
+            # while Gmail and Outlook were read-only. The verb is per
+            # ACCOUNT: only the one whose step writes wears the
+            # write-mode label.
+            from app.agent.automations.setup_script import (
+                writer_connectors,
+            )
+            _writer_cids = writer_connectors(raw)
             account_scopes: list = []
             try:
-                from app.agent.automations import permissions as _perms
                 from app.agent.automations.setup_script import (
                     scope_lines_from,
                 )
@@ -1893,8 +2094,10 @@ async def from_template(body: FromTemplateBody):
                     # what the row already shows.
                     account_scopes.append({
                         "account_id": cid,
+                        "writes": cid in _writer_cids,
                         "steps": scope_lines_from(
-                            await _perms.resolve(
+                            resolved_perms[cid] if cid in resolved_perms
+                            else await _perms.resolve(
                                 db, automation=automation, account_id=cid,
                             ),
                         ),
@@ -1903,7 +2106,9 @@ async def from_template(body: FromTemplateBody):
                 # thread does not: an empty capability list is worse
                 # than a short one, but neither is worth losing setup.
                 account_scopes = [
-                    {"account_id": cid, "steps": []} for cid in members
+                    {"account_id": cid, "writes": cid in _writer_cids,
+                     "steps": []}
+                    for cid in members
                 ]
             # What it still needs from the user, named, before the
             # capability list — an automation that cannot run without an
@@ -1987,10 +2192,13 @@ async def from_template(body: FromTemplateBody):
         except Exception as e:  # noqa: BLE001
             logger.warning("[automations] setup script skipped: %s", e)
 
+        await _build.record(db, automation=automation, recorder=rec)
+
         from app.agent.automations.service import automation_payload
         payload = automation_payload(automation)
         payload["armed"] = armed
-        return {"automation": payload, "thread_id": thread.id}
+        return {"automation": payload, "thread_id": thread.id,
+                "build_history": _build.read(automation)}
 
 
 class DescribeBody(BaseModel):

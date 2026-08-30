@@ -372,7 +372,16 @@ def test_debt_is_not_growing_silently():
     # automation_threads/automation_turns rows (AGENT_ONLY all three) for
     # the thread-operator proofs; it RUNS in the agent-mode step (a
     # ROUTING entry, not an excuse).
-    CEILING = 88
+    # R38: +3 for test_r38_agent_hands.py, test_r38_agent_step.py and
+    # test_r38_canvas_facts.py — all three drive real AGENT_ONLY rows
+    # (automations / automation_threads / automation_turns /
+    # automation_account_permissions / build_jobs) through the real
+    # writers, and all three RUN in the agent-mode step. ROUTING
+    # entries, not excuses: the platform sweep cannot create those
+    # tables, so listing them is how they reach the runner that can.
+    # The first two landed UNLISTED against this ceiling — the same
+    # mis-invocation R31 documents above, one round later.
+    CEILING = 91
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

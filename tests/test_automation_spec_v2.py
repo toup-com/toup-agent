@@ -385,3 +385,208 @@ def test_every_error_reported_at_once():
     with pytest.raises(SpecError) as ei:
         validate_spec(spec, REGISTRY)
     assert len(codes(ei)) >= 4
+
+
+# ── R38: the agent step ──────────────────────────────────────────────
+#
+# A step whose work is a model call. It has no connector, carries a
+# prompt and an `output_var`, and binds what it worked out to
+# `{{var.<output_var>}}` for later steps and the narration.
+
+
+def agent_spec(**over):
+    """`good_spec` with a thinking step between the read and the write,
+    and the write reading what it produced."""
+    spec = good_spec()
+    spec["steps"] = [
+        spec["steps"][0],
+        {"id": "rank", "kind": "agent",
+         "prompt": "Rank {{steps.issues.text}} by what blocks someone.",
+         "output_var": "ranked"},
+        {**spec["steps"][1],
+         "params": {"channel": "{{grant.target.id}}",
+                    "text": "{{var.ranked}}"}},
+    ]
+    spec.update(over)
+    return spec
+
+
+def test_an_agent_step_validates_and_declares_the_name_it_writes():
+    v = validate_spec(agent_spec(), REGISTRY)
+    assert [s.kind for s in v.steps] == ["tool", "agent", "tool"]
+    step = v.steps[1]
+    assert step.output_var == "ranked"
+    assert step.connector_id == "" and step.tool == ""
+    assert step.mutates is False
+    assert [s.id for s in v.agent_steps] == ["rank"]
+    # `{{var.ranked}}` in the write is declared BY the agent step — no
+    # `variables` entry is needed and none is invented.
+    assert "ranked" not in v.raw.get("variables", {})
+
+
+def test_an_agent_step_defaults_to_fail_not_continue():
+    """Its answer is interpolated into a later template, and a missing
+    value renders as an empty string — a swallowed failure posts a hole
+    rather than omitting a section."""
+    v = validate_spec(agent_spec(), REGISTRY)
+    assert v.steps[1].on_error == "fail"
+    # …and the canonical form omits the default, exactly like a step
+    # that declares nothing anywhere else.
+    assert "on_error" not in v.raw["steps"][1]
+    explicit = agent_spec()
+    explicit["steps"][1]["on_error"] = "skip"
+    assert validate_spec(explicit, REGISTRY).raw["steps"][1]["on_error"] \
+        == "skip"
+
+
+def test_a_spec_with_no_agent_step_canonicalizes_exactly_as_before():
+    """Backwards compatibility, at the byte level: `kind` appears on an
+    agent step and NOWHERE else, so every persisted v2 spec re-validates
+    to the identical dict it did before this round."""
+    v = validate_spec(good_spec(), REGISTRY)
+    assert all("kind" not in s for s in v.raw["steps"])
+    assert v.raw["steps"] == [
+        {"id": "issues", "connector_id": "jira",
+         "tool": "jira__search_issues", "params": {"jql": "{{var.jql}}"},
+         "collect": {"items_path": "issues", "fields": {"key": "key"},
+                     "format": "• {{item.key}}", "limit": 10,
+                     "empty_text": "none"},
+         "on_error": "skip"},
+        {"id": "post", "connector_id": "slack",
+         "tool": "slack__send_message",
+         "params": {"channel": "{{grant.target.id}}",
+                    "text": "{{steps.issues.text}}"},
+         "grant_id": "g-1"},
+    ]
+    assert validate_spec(v.raw, REGISTRY).raw == v.raw
+
+
+def test_agent_step_round_trips():
+    v = validate_spec(agent_spec(), REGISTRY)
+    assert validate_spec(v.raw, REGISTRY).raw == v.raw
+
+
+def test_an_agent_step_needs_a_prompt_and_a_readable_name():
+    spec = agent_spec()
+    spec["steps"][1] = {"id": "rank", "kind": "agent"}
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert {"missing_agent_prompt", "bad_output_var"} <= codes(ei)
+    # Every message is a sentence a person can act on, not a code.
+    for e in ei.value.errors:
+        assert len(e["message"]) > 25 and " " in e["message"]
+
+
+def test_an_agent_step_prompt_is_bounded():
+    from app.agent.automations.spec_v2 import AGENT_PROMPT_MAX_CHARS
+    spec = agent_spec()
+    spec["steps"][1]["prompt"] = "x" * (AGENT_PROMPT_MAX_CHARS + 1)
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "agent_prompt_too_long" in codes(ei)
+
+
+@pytest.mark.parametrize("name", ["Ranked", "1st", "steps", "var", ""])
+def test_output_var_must_be_a_usable_template_name(name):
+    spec = agent_spec()
+    spec["steps"][1]["output_var"] = name
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "bad_output_var" in codes(ei)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("connector_id", "jira"),
+    ("tool", "jira__search_issues"),
+    ("params", {"jql": "x"}),
+    ("collect", {"items_path": "issues", "fields": {"key": "key"}}),
+    ("grant_id", "g-2"),
+    ("grant_target", {"id": "C1"}),
+])
+def test_an_agent_step_calls_nothing(field, value):
+    spec = agent_spec()
+    spec["steps"][1][field] = value
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "agent_step_calls_nothing" in codes(ei)
+
+
+def test_a_tool_step_may_not_carry_agent_fields():
+    spec = good_spec()
+    spec["steps"][0]["prompt"] = "think about it"
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "tool_step_is_not_an_agent_step" in codes(ei)
+
+
+def test_an_unknown_step_kind_is_refused():
+    spec = agent_spec()
+    spec["steps"][1]["kind"] = "oracle"
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "bad_step_kind" in codes(ei)
+
+
+def test_two_agent_steps_may_not_write_the_same_name():
+    spec = agent_spec()
+    spec["steps"].insert(2, {"id": "rank2", "kind": "agent",
+                             "prompt": "again", "output_var": "ranked"})
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "duplicate_output_var" in codes(ei)
+
+
+def test_output_var_may_not_shadow_a_declared_variable():
+    spec = agent_spec(variables={"jql": "x", "ranked": "seed"})
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "output_var_shadows_variable" in codes(ei)
+
+
+def test_agent_steps_are_capped():
+    from app.agent.automations.spec_v2 import MAX_AGENT_STEPS
+    spec = agent_spec()
+    for i in range(MAX_AGENT_STEPS):
+        spec["steps"].insert(2, {"id": f"extra{i}", "kind": "agent",
+                                 "prompt": "x", "output_var": f"v{i}"})
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "too_many_agent_steps" in codes(ei)
+
+
+def test_an_agent_step_may_not_follow_a_write():
+    """Same rule and same reason as a read: a write is staged
+    asynchronously, so nothing after it could see it happen."""
+    spec = agent_spec()
+    spec["steps"] = [spec["steps"][0], spec["steps"][2],
+                     {"id": "late", "kind": "agent", "prompt": "x",
+                      "output_var": "v"}]
+    spec["steps"][1] = {**spec["steps"][1],
+                        "params": {"channel": "{{grant.target.id}}",
+                                   "text": "hi"}}
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "write_before_read" in codes(ei)
+
+
+def test_an_undeclared_variable_in_a_prompt_is_still_undeclared():
+    """The prompt is a template like any params value, so a reference
+    that would silently render as an empty string mid-sentence fails
+    the same way it does everywhere else."""
+    spec = agent_spec()
+    spec["steps"][1]["prompt"] = "Rank it for {{var.nobody}}"
+    with pytest.raises(SpecError) as ei:
+        validate_spec(spec, REGISTRY)
+    assert "unknown_variable" in codes(ei)
+
+
+def test_an_agent_step_is_never_the_automations_acting_connector():
+    """`action_connector_id` answers "which account does this act
+    through" — an agent step has none, and must not answer ''."""
+    spec = agent_spec()
+    spec["steps"] = [spec["steps"][1], spec["steps"][0]]   # agent first
+    spec["steps"][1] = {**spec["steps"][1], "on_error": "skip"}
+    spec["steps"][0] = {**spec["steps"][0], "prompt": "Rank the day."}
+    v = validate_spec(spec, REGISTRY)
+    assert v.steps[0].kind == "agent"
+    assert v.action_connector_id == "jira"

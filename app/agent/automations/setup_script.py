@@ -109,6 +109,26 @@ def scope_lines_from(
     return [line for line in lines if line["text"]]
 
 
+def writer_connectors(raw: dict) -> set:
+    """Connector ids whose step (v2) or action (v1) WRITES, from a raw
+    spec dict. R38 — the per-account verb's ground truth: only these
+    accounts wear the write-mode label on their capability check."""
+    from app.services.automation_verbs import is_write_tool
+    out = {
+        s.get("connector_id")
+        for s in (raw.get("steps") or [])
+        if isinstance(s, dict)
+        and (s.get("grant_id") or is_write_tool(s.get("tool")))
+    }
+    action = raw.get("action") or {}
+    if isinstance(action, dict) and (
+        action.get("grant_id") or is_write_tool(action.get("tool"))
+    ):
+        out.add(action.get("connector_id"))
+    out.discard(None)
+    return out
+
+
 def mode_label(mode: str, *, channel_label: str = "") -> str:
     """The §4.1 `mode_label`."""
     if mode == "posts":
@@ -154,6 +174,15 @@ def setup_turns(
     Jira", which is exactly what the card said. When `accounts` is
     given it wins over `scope_lines`; the legacy single-turn shape
     survives for a caller that has nothing better.
+
+    R38: an entry may carry `"writes": bool` — whether THAT account has
+    a write step. The automation-level mode was stamped as every
+    account's detail, so a posts-to-Slack brief showed Gmail and
+    Outlook sub-labelled "posts" while their own drill-in said Read
+    new mail / ✕ Send anything, and the ⋯ menu said "reads only" one
+    screen away (rec1 f007–f018). With the flag: only the writing
+    account wears the write-mode label; a reads-only account says
+    "reads only". Entries without the flag keep the legacy stamp.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode: {mode!r}")
@@ -173,7 +202,10 @@ def setup_turns(
                 "kind": "tool",
                 "account_id": str(a.get("account_id") or ""),
                 "action": "Checked what I can do",
-                "detail": detail,
+                "detail": (
+                    detail if a.get("writes", True)
+                    else mode_label("reads_only")
+                ),
                 "steps": list(a.get("steps") or []),
             }
             for a in accounts

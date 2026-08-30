@@ -23,8 +23,10 @@ Dispatch record contract (CONTRACTS-R30 §5.1):
       "rules":      [str],                      # "Rules you added", verbatim
       "memory_facts": [{"category": str, "text": str}],   # via memory.recall
       "steps": [
+        # R38: `tool_kind` "agent" is the run's OWN thinking — no
+        # connector, no items, and `detail` is what it worked out.
         {"step_ref": str, "connector_name": str, "account_id": str,
-         "tool_kind": "read"|"write", "action": str, "detail": str,
+         "tool_kind": "read"|"write"|"agent", "action": str, "detail": str,
          # R31-07: `failure_reason` is the string table's
          # `thread_sentence` for this account's reason code
          # (fixtures/automations/reason-strings.json, §4.4) — the
@@ -128,6 +130,28 @@ def vocabulary_for(write_tools) -> str:
     return "changes" if any(
         tool not in TELLING_TOOLS for tool in (write_tools or ())
     ) else "brief"
+
+
+#: R38 — the narration step's live sentence, per vocabulary. The two
+#: narration phases are LLM calls that can take most of a minute, and
+#: until this round nothing on the wire said the run was still working:
+#: the last progress frame was the final READ step, so the founder's
+#: card sat at "step N of N" while the brief was being written. The
+#: engine extends the visible total by ONE step and announces it with
+#: this sentence (executor_v2._narrate_phase1). Keyed by vocabulary so
+#: the automation speaks its own kind of run — same rule as the result
+#: title.
+_WRITING_SENTENCES = {
+    "brief": "Writing your brief",
+    "changes": "Writing up the changes",
+    "digest": "Writing your digest",
+}
+
+
+def writing_sentence(vocabulary: str) -> str:
+    """The narration step's progressive sentence. Total."""
+    return _WRITING_SENTENCES.get(vocabulary or "brief",
+                                  _WRITING_SENTENCES["brief"])
 
 _MAX_WHY_CHARS = 400
 _MAX_TEXT_CHARS = 1200
@@ -465,6 +489,31 @@ that is a guess the user will act on. If you do not know why, say you \
 do not know why and that you will find out."""
 
 
+#: R38 — the run's own thinking, as a step (`spec_v2` kind "agent").
+#:
+#: Without this the model meets a step with no connector, no items and
+#: a `detail` full of prose, and the only shape it has for that is "an
+#: account said this" — which is how a conclusion the run reached about
+#: its own material would be attributed to Gmail.
+_AGENT_STEP_RULES = """\
+One or more steps below are YOUR OWN THINKING, not an account: they \
+carry tool_kind "agent", no items, and a detail that is what you worked \
+out earlier in this same run. Build on it rather than deriving it again \
+— but never present it as something an account told you, never cite it \
+as a source, and never name an account beside it."""
+
+#: Appended when a thinking step FAILED. Deliberately separate from
+#: `_FAILED_SOURCE_RULES`, which orders the model to name the account
+#: every time — a thinking step has no account, and inventing one to
+#: satisfy that instruction is the exact failure that rule exists to
+#: prevent, one layer up.
+_FAILED_THINKING_RULES = """\
+One of your own thinking steps did not finish. Say so plainly, in your \
+own voice, and do not supply what it would have concluded: no account \
+failed, so name none, and offer no fix — there is nothing for the user \
+to reconnect."""
+
+
 def _looks_like_a_sentence(text) -> bool:
     """A supplied reason is quotable only if it IS a sentence.
 
@@ -525,8 +574,15 @@ def build_prompt(record: dict) -> str:
     # the rest are read — and it took the brief's rules with no failure
     # guidance at all. Keyed on the steps, not on the status, so it
     # cannot be missed by a status the table does not know.
-    failed_steps = [s for s in (record.get("steps") or [])
-                    if isinstance(s, dict) and not s.get("ok", True)]
+    #
+    # R38: an `agent` step is not a SOURCE. Its failure gets its own
+    # block below; letting it into this list would hand the model
+    # "name the account every time" about a step that has none.
+    steps_all = [s for s in (record.get("steps") or []) if isinstance(s, dict)]
+    agent_steps = [s for s in steps_all if s.get("tool_kind") == "agent"]
+    failed_steps = [s for s in steps_all
+                    if not s.get("ok", True) and s.get("tool_kind") != "agent"]
+    failed_thinking = [s for s in agent_steps if not s.get("ok", True)]
 
     # R36-7: the automation's own task statement, when it has one. The
     # record used to carry nothing but the name, so every run of every
@@ -545,6 +601,10 @@ def build_prompt(record: dict) -> str:
         _VOICE_RULES,
         shape,
     ]
+    if agent_steps:
+        parts.append(_AGENT_STEP_RULES)
+    if failed_thinking:
+        parts.append(_FAILED_THINKING_RULES)
     if failed_steps:
         parts.append(_FAILED_SOURCE_RULES)
         reasons = [
@@ -580,10 +640,14 @@ def build_prompt(record: dict) -> str:
         parts.append("What you remember about this user (use it to judge, "
                      "never recite it): " + " · ".join(
                          f"[{f.get('category')}] {f.get('text')}" for f in facts[:24]))
+    # R38: sort_keys — the record is assembled from dicts whose
+    # insertion order is an accident of the code path that built them,
+    # and a deterministic model (temperature 0.0) is only deterministic
+    # over a byte-stable prompt.
     parts.append("DISPATCH RECORD:\n" + json.dumps(
         {k: record.get(k) for k in
          ("run_kind", "vocabulary", "status", "steps")},
-        ensure_ascii=False, indent=1))
+        ensure_ascii=False, indent=1, sort_keys=True))
     return "\n\n".join(parts)
 
 
@@ -724,7 +788,13 @@ async def _default_complete(prompt: str, tool: dict) -> dict:
             ),
         }],
         model=model,
-        temperature=0.2,
+        # R38: 0.0, and it stays 0.0 (test_automation_narrator pins it).
+        # At 0.2 the founder got OPPOSITE triage for identical data one
+        # minute apart — the security notice DO FIRST at 9:47, NO ACTION
+        # at 9:48 (rec2). A triage is a judgement the user acts on; the
+        # same facts must produce the same judgement. The composer made
+        # this move already (composer._default_complete).
+        temperature=0.0,
         max_tokens=_NARRATION_MAX_TOKENS,
     )
     raw = response.content if hasattr(response, "content") else response

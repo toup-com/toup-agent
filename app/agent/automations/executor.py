@@ -542,9 +542,13 @@ async def _prepare_and_write(
     event_payload: dict,
     *,
     idem_prefix: str,
-    stage_only: bool = False,
 ) -> str:
-    """prepare (render params) → write (stage to outbox) → record."""
+    """prepare (render params) → write (stage to outbox) → record.
+
+    R38: there is no "stage but do not flush" mode any more. A staged
+    row is not a held row — `outbox.flush_loop` sweeps every one whose
+    undo window has closed — so the mode that promised a rehearsal
+    delivered a send. `rehearse` stages nothing at all instead."""
     raw = json.loads(automation.spec_json)
     grant_target = (raw.get("action") or {}).get("grant_target") or {}
 
@@ -589,11 +593,6 @@ async def _prepare_and_write(
     await db.commit()
     await _advance(db, job_id, "write")
 
-    if stage_only:
-        # test_run stops here: the row exists, the flush loop will send
-        # it after the same undo window a real fire gets.
-        return "staged"
-
     # The flush loop finalizes the job when the row executes; the run
     # stays `running` across the undo window (seconds), inside the cap.
     from .outbox import flush_row_when_due
@@ -601,16 +600,23 @@ async def _prepare_and_write(
     return "run"
 
 
-async def execute_test_run(
+async def rehearse(
     db: AsyncSession, automation: Automation, vspec: ValidatedSpec,
 ) -> dict:
-    """One synthetic fire. Poll modes poll for real (read-only); push/
-    schedule modes build a sample event from the spec's declared
-    fields. The write stages into the real outbox with the real undo
-    window — a test run is a real run with a synthetic trigger."""
+    """The v1 rehearsal: poll for real (read-only), render the write,
+    report it, stage NOTHING. See `executor_v2.rehearse_v2` for why
+    "stage but do not flush" was never a rehearsal.
+
+    A v1 spec is one trigger and one action, so there is no read STEP
+    to report — the read is the poll, and its sample event is what the
+    write is rendered from.
+    """
     sample: dict[str, Any] = {}
     if vspec.trigger_mode == "poll":
-        items = await _poll_once(automation, vspec)
+        try:
+            items = await _poll_once(automation, vspec)
+        except Exception:  # noqa: BLE001 — the sample is best-effort
+            items = []
         if items:
             ev_spec = vspec.event_spec or {}
             fields = dict(ev_spec.get("fields") or {})
@@ -622,28 +628,27 @@ async def execute_test_run(
         fields = dict((vspec.event_spec or {}).get("fields") or {})
         sample = {name: f"<{name}>" for name in fields} or {"sample": "<test>"}
 
-    job = await JobRunner().create_job(
-        job_type="automation_run",
-        spec=TaskSpec(
-            user_id=automation.user_id,
-            channel="automation",
-            source_kind="automation",
-            source_id=automation.id,
-            config_json={"test_run": True},
+    raw = json.loads(automation.spec_json)
+    grant_target = (raw.get("action") or {}).get("grant_target") or {}
+    tool = vspec.action_tool
+    entry = {
+        "step_id": "action",
+        "account_id": vspec.action_connector_id,
+        "what": tool,
+        "target": grant_target.get("label") or grant_target.get("id"),
+        "params": render_params(
+            vspec.action_params_template,
+            event=sample, grant_target=grant_target,
         ),
-        title=f"[test] {automation.name}"[:100],
-        idempotency_key=f"test:{uuid.uuid4()}",
-        status="running",
-        steps_json=_new_steps(vspec),
-        layer=0,
-    )
-    await on_run_created(db, job=job, automation=automation)
-    await _advance(db, job.id, "evaluate")
-    status = await _prepare_and_write(
-        db, automation, vspec, job.id, sample,
-        idem_prefix=f"test:{job.id}", stage_only=True,
-    )
-    return {"job_id": job.id, "status": status, "sample_event": sample}
+        "blocked": None,
+    }
+    if tool in _FORBIDDEN_TOOLS:
+        entry["blocked"] = ("Automations never send mail — this step "
+                            "can only draft.")
+    elif not vspec.grant_id:
+        entry["blocked"] = "No permission has been asked for yet."
+    return {"rehearsal": True, "sample_event": sample,
+            "reads": [], "writes": [entry]}
 
 
 # ── Poll leg ─────────────────────────────────────────────────────────

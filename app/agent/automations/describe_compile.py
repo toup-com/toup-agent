@@ -69,46 +69,53 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
         + f"\n\nTHE USER SAYS: {text[:1000]}"
     )
 
+    # R38 — the build history. `trigger` covers the compile itself:
+    # for a described automation the model's spec IS the decision about
+    # when it runs, so that is honestly what those milliseconds bought.
+    from app.agent.automations import build_ledger as _build
+    rec = _build.BuildRecorder("described")
+
     automation = None
     last_errors = None
-    for attempt in (1, 2):
-        try:
-            payload = await complete(
-                prompt if attempt == 1 else (
-                    prompt + "\n\nYour previous spec was rejected — fix "
-                    "every problem and emit the full reply again:\n"
-                    + json.dumps(last_errors, ensure_ascii=False)[:2000]
+    with rec.phase("trigger"):
+        for attempt in (1, 2):
+            try:
+                payload = await complete(
+                    prompt if attempt == 1 else (
+                        prompt + "\n\nYour previous spec was rejected — fix "
+                        "every problem and emit the full reply again:\n"
+                        + json.dumps(last_errors, ensure_ascii=False)[:2000]
+                    )
                 )
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("[automations] describe LLM failed: %s: %s",
-                           type(e).__name__, str(e)[:200])
-            # R31-22. This used to read "Describe it to me in chat and
-            # I will set it up there." — the sentence that sent a
-            # founder's setup into the main chat, where the agent asked
-            # its questions and no card was ever created. Setting one
-            # up happens in its own thread; when nothing could be
-            # created there is no thread to go to either, so this is an
-            # error the sheet shows, not an invitation somewhere else.
-            raise DescribeError(
-                "compiler_unavailable",
-                "I could not set that up just now. Try again in a moment.",
-            )
-        spec = (payload or {}).get("spec") if isinstance(payload, dict) else None
-        if not isinstance(spec, dict):
-            last_errors = ["reply carried no spec object"]
-            continue
-        try:
-            automation, _ = await create_automation(
-                db, user_id=user_id, spec=spec,
-                domain=(payload.get("domain") if isinstance(payload, dict)
-                        else None),
-                template_mode=True,
-            )
-            break
-        except SpecError as e:
-            last_errors = e.errors
-            continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[automations] describe LLM failed: %s: %s",
+                               type(e).__name__, str(e)[:200])
+                # R31-22. This used to read "Describe it to me in chat and
+                # I will set it up there." — the sentence that sent a
+                # founder's setup into the main chat, where the agent asked
+                # its questions and no card was ever created. Setting one
+                # up happens in its own thread; when nothing could be
+                # created there is no thread to go to either, so this is an
+                # error the sheet shows, not an invitation somewhere else.
+                raise DescribeError(
+                    "compiler_unavailable",
+                    "I could not set that up just now. Try again in a moment.",
+                )
+            spec = (payload or {}).get("spec") if isinstance(payload, dict) else None
+            if not isinstance(spec, dict):
+                last_errors = ["reply carried no spec object"]
+                continue
+            try:
+                automation, _ = await create_automation(
+                    db, user_id=user_id, spec=spec,
+                    domain=(payload.get("domain") if isinstance(payload, dict)
+                            else None),
+                    template_mode=True,
+                )
+                break
+            except SpecError as e:
+                last_errors = e.errors
+                continue
     if automation is None:
         raise DescribeError(
             "cannot_compile",
@@ -116,34 +123,42 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
             "way — name what it should watch, and what it should do.",
         )
 
-    thread = await _ledger.ensure_thread(
-        db, user_id=user_id, automation_id=automation.id,
-    )
-    await _ledger.append_turn(
-        db, user_id=user_id, thread=thread, run_id=None,
-        kind="note", payload={"stamp": "added",
-                              "at": datetime.utcnow().isoformat() + "Z"},
-    )
-    await _ledger.append_turn(
-        db, user_id=user_id, thread=thread, run_id=None,
-        kind="user", payload={"text": text[:1000]},
-    )
-    plan_sentence = _plan_sentence(automation)
-    await _ledger.append_turn(
-        db, user_id=user_id, thread=thread, run_id=None,
-        kind="agent", payload={"text": plan_sentence},
-    )
+    # R38: the `agent` phase of the build history — opening the record
+    # and stating the plan is exactly "wired the agent in".
+    with rec.phase("agent"):
+        thread = await _ledger.ensure_thread(
+            db, user_id=user_id, automation_id=automation.id,
+        )
+        await _ledger.append_turn(
+            db, user_id=user_id, thread=thread, run_id=None,
+            kind="note", payload={"stamp": "added",
+                                  "at": datetime.utcnow().isoformat() + "Z"},
+        )
+        await _ledger.append_turn(
+            db, user_id=user_id, thread=thread, run_id=None,
+            kind="user", payload={"text": text[:1000]},
+        )
+        plan_sentence = _plan_sentence(automation)
+        await _ledger.append_turn(
+            db, user_id=user_id, thread=thread, run_id=None,
+            kind="agent", payload={"text": plan_sentence},
+        )
     try:
         from app.agent.automations.setup_script import setup_turns
         from app.agent.automations.workflow import mode_of, schedule_block
 
         raw = json.loads(automation.spec_json or "{}")
-        mode, label = mode_of(automation, raw)
-        sched = schedule_block(automation, raw)
+        with rec.phase("output"):
+            mode, label = mode_of(automation, raw)
+            sched = schedule_block(automation, raw)
         # R31-22 / §5.3: the capability check said nothing here too.
         # R35: EVERY member, not `automation.connector_id` alone — a
         # described multi-account automation opened with one account's
         # check (or none), same defect as the template path.
+        # R38: per-account verb truth — only the account whose step
+        # writes wears the write-mode label (rec1 f007–f011).
+        from app.agent.automations.setup_script import writer_connectors
+        _writer_cids = writer_connectors(raw)
         account_scopes: list = []
         try:
             from app.agent.automations import permissions as _perms
@@ -153,16 +168,23 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
                 [automation.connector_id] if automation.connector_id else []
             )
             for cid in members:
+                # R38: the account phase of the build history is this
+                # exact resolution — the same call, measured once.
+                with rec.phase(f"account:{cid}"):
+                    resolved = await _perms.resolve(
+                        db, automation=automation, account_id=cid,
+                    )
                 account_scopes.append({
                     "account_id": cid,
-                    "steps": scope_lines_from(await _perms.resolve(
-                        db, automation=automation, account_id=cid,
-                    )),
+                    "writes": cid in _writer_cids,
+                    "steps": scope_lines_from(resolved),
                 })
         except Exception:  # noqa: BLE001 — a short list beats none,
             # and neither is worth losing the thread over.
             account_scopes = (
-                [{"account_id": automation.connector_id, "steps": []}]
+                [{"account_id": automation.connector_id,
+                  "writes": automation.connector_id in _writer_cids,
+                  "steps": []}]
                 if automation.connector_id else []
             )
         for d in setup_turns(mode, label,
@@ -191,8 +213,11 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
     except Exception as e:  # noqa: BLE001 — the thread opens regardless
         logger.warning("[automations] describe setup script skipped: %s", e)
 
+    await _build.record(db, automation=automation, recorder=rec)
+
     return {"automation": automation_payload(automation),
-            "thread_id": thread.id}
+            "thread_id": thread.id,
+            "build_history": _build.read(automation)}
 
 
 def _plan_sentence(automation) -> str:

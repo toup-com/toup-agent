@@ -104,6 +104,11 @@ _PHASE_VERBS: dict[str, tuple[str, str]] = {
     "record": ("Wrapping up", "Done"),
     "compose": ("Composing", "Composed"),
     "deliver": ("Delivering", "Delivered"),
+    # R38 — the `agent` spec step (spec_v2). Not a connector call and
+    # not an engine housekeeping phase: it is the run stopping to work
+    # something out. Branded as the orb, like every other piece of the
+    # agent's own work.
+    "think": ("Thinking it through", "Thought it through"),
 }
 
 _DONE_STATUSES = frozenset({"done", "completed", "success"})
@@ -620,11 +625,40 @@ _V2_TRIGGER_SUB: dict[str, str] = {
     "stub": "when a test item appears",
 }
 
+# Engine phases that produce a THREAD TURN of their own: (done, failed).
+# R38 — an `agent` spec step is recorded like any other step, so its
+# sentence has to come from here rather than from the executor. The
+# served-action set below is DERIVED from this table on purpose: an
+# action `engine_action` can emit that `is_served_action` would refuse
+# is a turn the ledger silently rewrites into a bare agent bubble, and
+# a hand-maintained second list is exactly how that drift happens.
+_V2_ENGINE_PHASE: dict[str, tuple[str, str]] = {
+    "think": ("Thought it through", "Could not think it through"),
+}
+_V2_ENGINE_PHASE_DEFAULT = ("Finished a step", "Could not finish a step")
+
 # Engine-authored (non-connector) actions the thread can carry.
-_V2_ENGINE_ACTIONS = frozenset({
-    "Checked what I can do",   # setup capability check (C §5.3)
-    "Connected again",         # the reconnect catch-up turn (§4.7)
-})
+_V2_ENGINE_ACTIONS = frozenset(
+    {
+        "Checked what I can do",   # setup capability check (C §5.3)
+        "Connected again",         # the reconnect catch-up turn (§4.7)
+    }
+    | {a for pair in _V2_ENGINE_PHASE.values() for a in pair}
+    | set(_V2_ENGINE_PHASE_DEFAULT)
+)
+
+
+def engine_action(phase: str, *, ok: bool = True) -> dict:
+    """`{"action", "detail"}` for one turn of the engine's OWN work.
+
+    No connector, no tool, no target — the counterpart of `turn_action`
+    for a step the agent performs itself. Total: an unknown phase gets
+    the generic pair, never a raw phase name, and every string it can
+    return is in `_V2_ENGINE_ACTIONS` above — including the fallback,
+    because an unserved action is a turn the ledger rewrites away.
+    """
+    done, failed = _V2_ENGINE_PHASE.get(phase, _V2_ENGINE_PHASE_DEFAULT)
+    return {"action": done if ok else failed, "detail": ""}
 
 
 _SLOT_RE = re.compile(r"\{[a-z_][a-z0-9_]*\}")
@@ -800,9 +834,17 @@ def turn_action(
 
 def live_sentence(
     connector_id: Optional[str], tool: Optional[str] = None,
-    count: Optional[int] = None,
+    count: Optional[int] = None, *, phase: Optional[str] = None,
 ) -> str:
-    """Progressive form for the live pill / step sentence. Total."""
+    """Progressive form for the live pill / step sentence. Total.
+
+    `phase` names the engine's OWN work (R38's `agent` spec step is
+    "think") — there is no connector to name, and `live_sentence(None,
+    None)` would answer the bare "working" that says nothing.
+    """
+    if phase:
+        doing, _finished = _PHASE_VERBS.get(phase, ("Working", "Finished"))
+        return _lower_first(doing)
     cid = connector_id or ""
     ce = _c_entry(cid)
     if ce:

@@ -376,35 +376,75 @@ TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
 # reschedule something. Prompts are advisory — tool-list omission is
 # hard.
 #
-# What it deliberately KEEPS is the connector READ surface. Writes are
-# refused one layer down: `automation_thread` IS in
-# `connector_dispatcher._MUTATES_UNATTENDED_DENY_CHANNELS` (b44815f7),
-# because the elevation-confirmation card a mutating call would need
-# has no proven surface in the thread yet, and a confirmation the
-# surface cannot show is a wedge. The earlier position recorded here —
-# attended surface, so writes should meet the main chat's elevation
-# flow ("Post that to Slack", asked inside the automation whose job is
-# posting to Slack, is a reasonable thing to be able to say) — is the
-# direction of travel once the thread can render that card; until then
-# the deny list is the enforcement and this comment matches it.
-AUTOMATION_THREAD_DISABLED_TOOLS: frozenset[str] = frozenset({
-    "create_job",
-    "update_job",
-    "spawn",
-    "start_mission",
-    "save_streaming_credential",
-    "memory_store",
-    "memory_write_file",
-    "memory_edit_file",
-    "memory_delete",
-    "routines__create",
-    "routines__update",
-    "routines__delete",
-    "routines__remind",
-    "triggers__create",
-    "triggers__update",
-    "triggers__delete",
-})
+# What it deliberately KEEPS is the connector READ surface. Connector
+# WRITES are decided one layer down, in `connector_dispatcher`: since
+# R38 a mutating connector call from this channel is STAGED as a
+# pending action and rendered in the thread as a `needs_you` turn with
+# `fix: "approve"` — the elevation surface whose absence was the reason
+# for the older blanket deny (b44815f7). Nothing runs until the user
+# taps; what changed is that there is now a tap to make.
+#
+# R38: the set became a dict so every withholding carries its REASON in
+# the same literal. A tool cannot be added here without one, and
+# `test_r38_agent_hands.py::test_the_withheld_set_is_exactly_this`
+# fails on any add or removal that does not also move the pinned list —
+# so "why is this tool missing from the thread?" is answerable from the
+# code rather than from a commit archaeology.
+AUTOMATION_THREAD_WITHHELD: dict[str, str] = {
+    # Progress cards in a surface that already has a run ledger: the
+    # thread draws its own turns, so a second card is two accounts of
+    # the same work.
+    "create_job": "the thread has its own run ledger; a job card would "
+                  "be a second, disagreeing record of the same work",
+    "update_job": "it can only edit a card this surface never draws",
+    # The answer has to land where the user is looking.
+    "spawn": "hands the work to a child whose result this turn never "
+             "waits for — the answer lands nowhere the user is reading",
+    "start_mission": "moves the work out of the thread the user is "
+                     "sitting in, and reports back somewhere else",
+    "save_streaming_credential": "belt and braces with agent_runner's "
+                                 "VAULT_TOOL_CHANNEL_BLOCK: a thread "
+                                 "turn never has a credential to bank",
+    # The memory writers STAY withheld, and this is the reason of
+    # record (Round 33, item 6): the thread's turns are mostly about a
+    # RUN — which account failed, why a read came back empty — and a
+    # writer on this surface filed those as durable facts about the
+    # USER. "Gmail could not be read" became a fact about the person,
+    # surfaced weeks later in an unrelated chat. Reading memory is
+    # still allowed (`memory_search`, `automations__memory_recall`);
+    # what is withheld is the ability to write a run's transient
+    # failure into the one store that outlives it. Nothing in R38
+    # changes this — the elevation surface is about CONNECTOR writes,
+    # which the user approves one at a time and can see the target of.
+    # A memory write has no target the user could be shown.
+    "memory_store": "a run's transient failure is not a fact about the "
+                    "user, and this surface talks mostly about runs "
+                    "(Round 33, item 6)",
+    "memory_write_file": "same as memory_store: a durable write out of "
+                         "a conversation about one run",
+    "memory_edit_file": "same as memory_store: a durable write out of "
+                        "a conversation about one run",
+    "memory_delete": "destructive, unreviewable, and never what the "
+                     "user meant by a question about an automation",
+    # "Why did this fail?" must not quietly reschedule anything.
+    "routines__create": "a question about a failure must not create "
+                        "recurring work as a side effect",
+    "routines__update": "the same edit, made invisibly, to something "
+                        "the user is not looking at",
+    "routines__delete": "destructive, and out of this thread's scope — "
+                        "this automation is not that routine",
+    "routines__remind": "a reminder created here surfaces somewhere "
+                        "this thread cannot show or take back",
+    "triggers__create": "a question about a failure must not arm a new "
+                        "trigger as a side effect",
+    "triggers__update": "the same edit, made invisibly, to something "
+                        "the user is not looking at",
+    "triggers__delete": "destructive, and out of this thread's scope",
+}
+
+AUTOMATION_THREAD_DISABLED_TOOLS: frozenset[str] = frozenset(
+    AUTOMATION_THREAD_WITHHELD
+)
 
 
 def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:

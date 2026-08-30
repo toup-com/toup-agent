@@ -243,6 +243,18 @@ async def on_terminal(db: AsyncSession, job_id: str) -> None:
             sentence="Done" if v3 in ("completed", "partial") else "Stopped",
             fraction=1.0, status=v3,
         )
+        # R38 — the dedicated terminal frame. Its stamp is the head
+        # note's, from the one function that decides it, so the frame and
+        # the divider cannot tell two stories. `None` is meaningful and is
+        # sent as such: the divider keeps its own note (a stop note, or the
+        # STARTED a superseded run leaves behind for the run that replaced
+        # it), and the client must not invent one.
+        stamp = head_note_stamp(v3, cfg)
+        await ledger.emit_run_finished(
+            automation.user_id, automation_id=automation.id,
+            thread_id=cfg.get("thread_id"), run_id=job.id,
+            status=v3, note_stamp=stamp,
+        )
         await ledger.emit_updated(
             db, automation.user_id, automation_id=automation.id,
         )
@@ -255,21 +267,41 @@ async def on_terminal(db: AsyncSession, job_id: str) -> None:
             pass
 
 
+def head_note_stamp(v3: str, cfg: Optional[dict] = None) -> Optional[str]:
+    """What the run's OPENING note ends up saying, or None if it keeps
+    what it has (stopped and superseded keep their own note; a park keeps
+    STARTED).
+
+    R38. This was two tables: this one, and `ledger.RUN_FINISHED_NOTE_STAMPS`
+    for the terminal frame — and they disagreed on two of six reachable
+    statuses. `skipped` is the common one: `confirm.py` finalizes a rejected
+    or expired confirm card as `outcome="skipped"`, so a user who declined a
+    card watched the divider flip to TRIED from the live frame and revert to
+    RAN on the next refetch — the exact symptom flipping the head note was
+    added to end. One function, both callers, and `None` means "say nothing
+    about the divider" rather than a stamp invented for the frame.
+    """
+    target = {"completed": "ran", "partial": "ran", "failed": "tried",
+              "skipped": "ran"}.get(v3)
+    if target is None:
+        return None
+    # A run that could not read one of its sources did not simply RAN —
+    # and the app's card already says so ("NEEDS YOU"). One status, one
+    # stamp: the thread agrees with the card rather than contradicting
+    # it two screens apart (round 33, item 4).
+    if v3 == "partial" and ((cfg or {}).get("failed_sources") or []):
+        target = "needs_you"
+    return target
+
+
 async def _flip_head_note(
     db: AsyncSession, *, job: BuildJob, automation: Automation, v3: str,
 ) -> None:
     """started → ran (completed/partial) / tried (failed). Stopped and
     superseded keep their stop note; waiting keeps STARTED."""
-    target = {"completed": "ran", "partial": "ran", "failed": "tried",
-              "skipped": "ran"}.get(v3)
+    target = head_note_stamp(v3, ledger._cfg_of(job))
     if target is None:
         return
-    # A run that could not read one of its sources did not simply RAN —
-    # and the app's card already says so ("NEEDS YOU"). One status, one
-    # stamp: the thread agrees with the card rather than contradicting
-    # it two screens apart (round 33, item 4).
-    if v3 == "partial" and (ledger._cfg_of(job).get("failed_sources") or []):
-        target = "needs_you"
     rows = list(
         (await db.execute(
             select(AutomationTurn)
@@ -290,8 +322,14 @@ async def _flip_head_note(
     body["stamp"] = target
     head.payload_json = json.dumps(body, default=str)
     await db.commit()
+    # R38: `automation_id` on the re-broadcast. R31 §4.1 says EVERY
+    # automation frame carries it, and this one did not — the app-level
+    # bridge routes on it, so the terminal stamp flip reached no client
+    # that was not already inside the thread, and the founder's divider
+    # read STARTED through a failed run until a later refetch.
     await ledger._broadcast(automation.user_id, {
         "type": "automation.turn",
+        "automation_id": automation.id,
         "thread_id": head.thread_id,
         "run_id": job.id,
         "turn": ledger._serialize_row(head),
@@ -689,7 +727,17 @@ async def on_parked(db: AsyncSession, *, job_id: str) -> None:
             return
         total = int(job.progress_total or 0)
         step = int(job.progress_step or 0)
-        pct = int(round(100 * step / total)) if total else 0
+        # R38. `progress_step` is the step being STARTED, not the count of
+        # steps finished — that is the convention every frame producer in this
+        # engine already uses (`fraction=(step_no - 1) / total`, twice in
+        # executor_v2). This reader alone treated it as steps-completed, which
+        # was invisible while the read loop always broke at a mutating step
+        # (so `step < total`, and the error was one row of the bar). The
+        # narration step is the first writer in the repo to make
+        # `step == total`, and it turned a run PARKED WAITING ON THE USER into
+        # a card, a push and a Live Activity that all said 100% — the inverse
+        # of the stuck-at-99% this round set out to end. One convention.
+        pct = int(round(100 * max(step - 1, 0) / total)) if total else 0
         # push=False: `_park_run_on_card`'s caller already sends the
         # needs_approval banner on the very next line
         # (outbox.py:190 `_notify_needs_approval`). Pushing here too gave

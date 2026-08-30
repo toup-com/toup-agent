@@ -1197,3 +1197,391 @@ async def test_read_turns_carry_the_real_call(monkeypatch):
         assert t.get("actions"), t
         assert t["actions"][0]["tool"] == "jira__search_issues"
         assert isinstance(t["actions"][0]["ms"], int)
+
+
+# ── R38: the terminal frame + the visible narration step ─────────────
+
+
+def _capture_frames(monkeypatch):
+    """Every ledger broadcast funnels through ws_chat.broadcast_to_user;
+    ledger._broadcast imports it per call, so the module attr is the
+    one chokepoint."""
+    frames = []
+
+    async def _fake(user_id, frame):
+        frames.append(frame)
+
+    import app.api.ws_chat as ws_chat
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _fake)
+    return frames
+
+
+def test_the_frame_and_the_divider_cannot_tell_two_stories():
+    """R38 follow-up. This test used to pin the frame's table against a
+    LITERAL, which is why it stayed green while the table drifted from
+    `_flip_head_note` on two of six reachable statuses.
+
+    `skipped` is the common one — `confirm.py` finalizes a declined or
+    expired confirm card as `outcome="skipped"` — so a user who said no
+    watched the divider flip to TRIED from the live frame and revert to
+    RAN on the next refetch: the exact symptom flipping the head note was
+    added to end. The invariant is AGREEMENT, so that is what is
+    asserted; there is one function now and both callers go through it.
+    """
+    from app.agent.automations.run_v3 import head_note_stamp
+
+    # Every status a terminal can carry, including the ones where the
+    # divider keeps its own note and the frame says so with None.
+    for v3, expected in [
+        ("completed", "ran"),
+        ("partial", "ran"),
+        ("failed", "tried"),
+        ("skipped", "ran"),
+        ("stopped_by_user", None),
+        ("superseded", None),
+        ("waiting_on_user", None),
+    ]:
+        assert head_note_stamp(v3) == expected, v3
+
+    # The one refinement: a partial that really did lose a source needs
+    # you, and the divider says so too.
+    assert head_note_stamp(
+        "partial", {"failed_sources": [{"account_id": "gmail"}]}
+    ) == "needs_you"
+
+
+@pytest.mark.asyncio
+async def test_run_finished_frame_on_the_write_terminal(monkeypatch):
+    """rec2 bug 2: every terminal now broadcasts ONE
+    `automation.run.finished` frame carrying the full address + the
+    note stamp — no client ever again infers the end of a run from
+    `updated.summary.run_in_flight == null`."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    status = await _fire(monkeypatch, uid, a, vspec)
+    assert status == "run"
+    job = await _one_run(a.id)
+    done = [f for f in frames if f["type"] == "automation.run.finished"]
+    assert len(done) == 1, done
+    f = done[0]
+    assert f["automation_id"] == a.id
+    assert f["run_id"] == job.id
+    assert f["thread_id"]
+    assert f["status"] == "completed"
+    assert f["note_stamp"] == "ran"
+    assert f["at"]
+
+
+@pytest.mark.asyncio
+async def test_run_finished_frame_on_the_reads_only_terminal(monkeypatch):
+    """The reads-only terminal (the founder's Inbox summary shape) emits
+    the frame too — and AFTER the narration step announced itself, so a
+    client never sees the run end while still believing it is reading."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec(steps=[{
+        "id": "issues", "connector_id": "jira",
+        "tool": "jira__search_issues", "params": {"jql": "x"},
+        "collect": {"items_path": "issues",
+                    "fields": {"key": "key", "summary": "summary"},
+                    "format": "{{item.key}} {{item.summary}}",
+                    "empty_text": "none"},
+        "on_error": "continue"}])
+    a = await _mk_automation_v2(uid, vspec)
+    status = await _fire(monkeypatch, uid, a, vspec)
+    assert status == "run"
+    job = await _one_run(a.id)
+    types = [f["type"] for f in frames]
+    done_idx = [i for i, f in enumerate(frames)
+                if f["type"] == "automation.run.finished"]
+    assert len(done_idx) == 1, types
+    f = frames[done_idx[0]]
+    assert f["status"] == "completed" and f["note_stamp"] == "ran"
+    assert f["run_id"] == job.id
+    writing_idx = [
+        i for i, fr in enumerate(frames)
+        if fr["type"] == "automation.run.progress"
+        and fr.get("sentence") == "Writing your brief"
+    ]
+    assert writing_idx, "the narration step never announced itself"
+    assert writing_idx[0] < done_idx[0]
+
+
+@pytest.mark.asyncio
+async def test_narration_is_a_visible_step(monkeypatch):
+    """rec2 bug 2a: when the reads are done and narration begins, the
+    run's visible total extends by ONE step ("Writing your brief"), the
+    activity phase flips to `writing`, and the job's progress columns
+    agree — so the terminal frame's totals match what the card shows."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    job = await _one_run(a.id)
+    n = len(vspec.steps)
+    writing = [f for f in frames
+               if f["type"] == "automation.run.progress"
+               and f.get("sentence") == "Writing your brief"]
+    assert len(writing) == 1, "one narration step, not one per phase"
+    assert writing[0]["step"] == n + 1
+    assert writing[0]["total"] == n + 1
+    assert writing[0]["status"] == "running"
+    acts = [f for f in frames if f["type"] == "automation.activity"
+            and f.get("phase") == "writing"]
+    assert len(acts) == 1
+    assert acts[0]["automation_id"] == a.id
+    assert job.progress_step == n + 1
+    assert job.progress_total == n + 1
+
+
+@pytest.mark.asyncio
+async def test_run_finished_frame_when_every_source_fails(monkeypatch):
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec(steps=[{
+        "id": "issues", "connector_id": "jira",
+        "tool": "jira__search_issues", "params": {"jql": "x"},
+        "collect": {"items_path": "issues",
+                    "fields": {"key": "key"},
+                    "format": "{{item.key}}", "empty_text": "none"},
+        "on_error": "continue"}])
+    a = await _mk_automation_v2(uid, vspec)
+    status = await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": {"kind": "error",
+                                "message": "reauth_required"},
+    })
+    assert status == "failed"
+    job = await _one_run(a.id)
+    done = [f for f in frames if f["type"] == "automation.run.finished"]
+    assert len(done) == 1
+    assert done[0]["status"] == "failed"
+    assert done[0]["note_stamp"] == "tried"
+    assert done[0]["run_id"] == job.id
+
+
+@pytest.mark.asyncio
+async def test_run_finished_frame_on_a_user_stop(monkeypatch):
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    from app.agent.automations import run_v3
+
+    async def _slow_read(tool_input):
+        async with async_session_maker() as db:
+            job = (await db.execute(
+                select(BuildJob).where(BuildJob.source_id == a.id)
+                .order_by(BuildJob.created_at.desc()).limit(1)
+            )).scalar_one()
+            await run_v3.request_stop(db, job.id)
+        return _ISSUES
+
+    status = await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": _slow_read,
+        "slack__send_message": _OK,
+    })
+    assert status == "stopped"
+    done = [f for f in frames if f["type"] == "automation.run.finished"]
+    assert len(done) == 1
+    assert done[0]["status"] == "stopped_by_user"
+    # No stamp: a stopped run's divider keeps the stop note the stop
+    # itself wrote. The frame says so with None rather than inventing
+    # one, and the client reads the STATUS to land the card.
+    assert done[0]["note_stamp"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_finished_frame_from_the_stuck_run_sweep(monkeypatch):
+    """The reaper's terminal goes through the same gated finalize, so
+    the frame fires there too — a run that died silently still tells
+    the client it is over."""
+    from datetime import timedelta
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    from app.agent.automations import ledger
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(
+            db, user_id=uid, automation_id=a.id,
+        )
+        job = BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run",
+            prompt="", job_type="automation_run", status="running",
+            source_kind="automation", source_id=a.id,
+            config_json={"thread_id": thread.id, "run_kind": "scheduled"},
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+    async with async_session_maker() as db:
+        row = await db.get(BuildJob, job_id)
+        row.created_at = datetime.utcnow() - timedelta(hours=2)
+        await db.commit()
+    from app.agent.automations.sweep import _sweep_stuck_runs
+    n = await _sweep_stuck_runs()
+    assert n >= 1
+    done = [f for f in frames if f["type"] == "automation.run.finished"
+            and f["run_id"] == job_id]
+    assert len(done) == 1
+    assert done[0]["status"] == "failed"
+    assert done[0]["note_stamp"] == "tried"
+
+
+@pytest.mark.asyncio
+async def test_head_note_rebroadcast_carries_automation_id(monkeypatch):
+    """rec2 bug 1c: the STARTED→RAN flip re-broadcasts the head note,
+    and the frame must carry automation_id (R31 §4.1) — without it the
+    app bridge cannot route the flip and the divider stays STARTED
+    until a refetch, which is exactly what the founder recorded."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    flips = [
+        f for f in frames if f["type"] == "automation.turn"
+        and (f.get("turn") or {}).get("kind") == "note"
+        and (f.get("turn") or {}).get("stamp") == "ran"
+    ]
+    assert flips, "the terminal never re-broadcast the head note"
+    for f in flips:
+        assert f.get("automation_id") == a.id
+
+
+# ── R38: the HTML leak ───────────────────────────────────────────────
+
+
+def test_strip_html_kills_the_founders_leak():
+    """rec2 9:48 briefing: literal <b>…</b> on screen. Tags out,
+    entities unescaped, text kept."""
+    from app.agent.automations.ledger import strip_html
+    assert strip_html("<b>Google Workspace product notifications.</b>") \
+        == "Google Workspace product notifications."
+    assert strip_html("<B>shouty</B>") == "shouty"
+    assert strip_html("a<br/>b") == "a b"
+    assert strip_html('<a href="https://x.y">link</a> text') \
+        == "link text"
+    assert strip_html("Tom &amp; Jerry &lt;3 &quot;cheese&quot; &#39;") \
+        == 'Tom & Jerry <3 "cheese" \''
+    assert strip_html("&lt;b&gt;escaped&lt;/b&gt;") == "escaped"
+
+
+def test_strip_html_never_eats_an_email_address():
+    """The reason this is an allowlist and not <[^>]+>: the founder's
+    drill-in shows "Google <no-reply@accounts.google.com>" and that
+    string must survive byte-for-byte."""
+    from app.agent.automations.ledger import strip_html
+    assert strip_html("Google <no-reply@accounts.google.com>") \
+        == "Google <no-reply@accounts.google.com>"
+    assert strip_html(
+        "The Google Workspace Team <workspace-noreply@google.com>"
+    ) == "The Google Workspace Team <workspace-noreply@google.com>"
+    # Plain text with neither markup nor entities is returned untouched.
+    s = "Security alert — 2 new threads"
+    assert strip_html(s) is s
+
+
+def test_minted_items_and_result_rows_are_sanitized():
+    from app.agent.automations import ledger
+    items = ledger.mint_item_ids([{
+        "title": "<b>Review Google's security alert.</b>",
+        "sub": "Google &lt;no-reply@accounts.google.com&gt;",
+        "msgs": [{"who": "Google", "at": "", "text": "<i>Act now</i>"}],
+    }])
+    assert items[0]["title"] == "Review Google's security alert."
+    assert items[0]["sub"] == "Google <no-reply@accounts.google.com>"
+    assert items[0]["msgs"][0]["text"] == "Act now"
+
+    from app.db.models import BRIEF_TIERS
+    groups = [
+        {"rank": i + 1, "label": lb, "tone": tn, "rows": []}
+        for i, (lb, tn) in enumerate(BRIEF_TIERS)
+    ]
+    groups[-1]["rows"].append({
+        "text": "<b>Google Workspace product notifications.</b>",
+        "sub": "", "tag": "1", "item_refs": []})
+    out = ledger.validate_turn_payload("result", {
+        "title": "Your morning, in order", "vocabulary": "brief",
+        "groups": groups,
+    })
+    assert out["groups"][-1]["rows"][0]["text"] \
+        == "Google Workspace product notifications."
+
+
+@pytest.mark.asyncio
+async def test_the_run_pipeline_serves_no_html(monkeypatch):
+    """End to end: a provider answering with markup produces a thread
+    whose item titles are clean — and the write template's text (what
+    would be posted to Slack) is clean too."""
+    frames = _capture_frames(monkeypatch)
+    del frames
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    html_issues = {"kind": "ok", "content": json.dumps({"issues": [
+        {"key": "TP-1",
+         "summary": "<b>Rate-limit the export endpoint</b>"},
+        {"key": "TP-2", "summary": "Ping Bob &lt;bob@toup.ai&gt;"},
+    ]})}
+    posted = []
+
+    async def _send(tool_input):
+        posted.append(tool_input)
+        return _OK
+
+    await _fire(monkeypatch, uid, a, vspec, responses={
+        "jira__search_issues": html_issues,
+        "slack__send_message": _send,
+    })
+    job = await _one_run(a.id)
+    from app.agent.automations import ledger
+    async with async_session_maker() as db:
+        turns = await ledger.run_turns(db, run_id=job.id)
+    titles = [it["title"] for t in turns if t["kind"] == "tool"
+              for it in (t.get("items") or [])]
+    assert "TP-1 Rate-limit the export endpoint" in titles
+    assert "TP-2 Ping Bob <bob@toup.ai>" in titles
+    assert not any("<b>" in t or "&lt;" in t for t in titles)
+    assert posted, "the write never flushed"
+    assert "<b>" not in posted[0]["text"]
+    assert "Ping Bob <bob@toup.ai>" in posted[0]["text"]
+
+
+def test_progress_step_is_the_step_being_started_everywhere():
+    """R38 follow-up. `progress_step`/`progress_total` carried two
+    incompatible meanings: every frame producer in the engine treats
+    `progress_step` as the step being STARTED and derives
+    `(step - 1) / total`, while `run_v3.on_parked` alone read it as steps
+    COMPLETED and derived `step / total`.
+
+    That off-by-one was invisible while the read loop always broke at a
+    mutating step, so `step < total` and the error was one row of the
+    bar. The narration step is the first writer in the repo to make
+    `step == total` — and it turned a run PARKED WAITING ON THE USER into
+    a card, a push and a Live Activity that all read 100%: the inverse of
+    the stuck-at-99% this round set out to end.
+
+    Executed rather than grepped, because the arithmetic is the bug.
+    """
+    import inspect
+    from app.agent.automations import run_v3
+
+    src = inspect.getsource(run_v3.on_parked)
+    assert "max(step - 1, 0)" in src, (
+        "on_parked went back to reading progress_step as steps-completed"
+    )
+
+    def pct(step: int, total: int) -> int:
+        return int(round(100 * max(step - 1, 0) / total)) if total else 0
+
+    # A run parked at its LAST step is not finished — that is the whole
+    # point of a park.
+    assert pct(4, 4) < 100
+    # …and the ordinary case still reads as the steps actually done.
+    assert pct(3, 5) == 40
+    assert pct(1, 5) == 0
+    assert pct(0, 0) == 0

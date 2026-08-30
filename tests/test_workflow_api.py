@@ -1088,3 +1088,129 @@ async def test_a_removal_that_stops_the_automation_says_so(monkeypatch):
         assert a2.status != "armed"
 
     monkeypatch.setattr(svc, "arm_automation", real_arm)
+
+
+# ── R38: the update path drops its grant wall ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_carries_the_grant_forward():
+    """automations__list deliberately serves NO grant ids, so an edited
+    spec comes back without them — every automations__update hit a wall
+    the model could never climb (founder's edits saved-but-lost). An
+    unchanged write step (same connector_id + tool) inherits the old
+    grant_id and pinned target; the read edit goes through."""
+    from app.agent.automations import service
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    edited = json.loads(json.dumps(vspec.raw))
+    for s in edited["steps"]:
+        s.pop("grant_id", None)
+        s.pop("grant_target", None)
+    edited["steps"][0]["params"]["jql"] = "assignee = me"
+    async with async_session_maker() as db:
+        automation, out = await service.update_automation(
+            db, automation_id=a.id, user_id=uid, spec=edited,
+        )
+    post = next(s for s in out.raw["steps"] if s["id"] == "post")
+    assert post["grant_id"] == "g-1"
+    assert post["grant_target"]["id"] == "C-PIN"
+    # The edit itself landed.
+    issues = next(s for s in out.raw["steps"] if s["id"] == "issues")
+    assert issues["params"]["jql"] == "assignee = me"
+    # Grant verified, so the armed automation re-armed.
+    assert automation.status == "armed"
+
+
+@pytest.mark.asyncio
+async def test_update_is_template_tolerant_and_stamps_edited(monkeypatch):
+    """Grants and variables are enforced at ARM and DISPATCH, not by
+    parse (the R36 doctrine parse_spec_live already follows) — and an
+    agent edit stamps the EDITED divider + broadcasts automation.updated
+    like every other write-back. rec1/rec2: one edit showed a divider,
+    the next did not."""
+    from app.agent.automations import service
+    frames = []
+
+    async def _fake(user_id, frame):
+        frames.append(frame)
+
+    import app.api.ws_chat as ws_chat
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _fake)
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    before = await _edited_notes(a.id)
+    edited = json.loads(json.dumps(vspec.raw))
+    # A dangling variable — a setup state, not an authoring error.
+    edited["steps"][0]["params"]["jql"] = "{{var.never_answered}}"
+    async with async_session_maker() as db:
+        await service.update_automation(
+            db, automation_id=a.id, user_id=uid, spec=edited,
+            edited_note=True,
+        )
+    assert await _edited_notes(a.id) == before + 1
+    updated = [f for f in frames if f["type"] == "automation.updated"
+               and f["automation_id"] == a.id]
+    assert updated and updated[-1].get("workflow_rev")
+
+
+@pytest.mark.asyncio
+async def test_update_without_the_flag_stamps_nothing():
+    """Internal write-backs (workflow, membership, undo) stamp their
+    own EDITED note — the default must not double it."""
+    from app.agent.automations import service
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    before = await _edited_notes(a.id)
+    async with async_session_maker() as db:
+        await service.update_automation(
+            db, automation_id=a.id, user_id=uid,
+            spec=json.loads(json.dumps(vspec.raw)),
+        )
+    assert await _edited_notes(a.id) == before
+
+
+@pytest.mark.asyncio
+async def test_a_new_ungranted_write_parses_but_cannot_arm(monkeypatch):
+    """A genuinely NEW write stays legal at parse (template_mode) and
+    un-armable until granted: it must NOT inherit its sibling's grant,
+    and the re-arm fail-closes through verify_grants_for_arm_v2 — the
+    automation lands in draft, never silently armed."""
+    from app.agent.automations import service
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    edited = json.loads(json.dumps(vspec.raw))
+    edited["steps"].append({
+        "id": "post2", "connector_id": "slack",
+        "tool": "slack__send_message",
+        "params": {"channel": "C9", "text": "second"},
+    })
+
+    async def _grant(user_id, grant_id):
+        if grant_id == "g-1":
+            return {"id": "g-1", "status": "approved",
+                    "connector_id": "slack",
+                    "tool_name": "slack__send_message",
+                    "target": {"kind": "channel", "id": "C-PIN",
+                               "label": "#platform"},
+                    "mode": "auto"}
+        return None
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_grant", _grant,
+    )
+    async with async_session_maker() as db:
+        automation, out = await service.update_automation(
+            db, automation_id=a.id, user_id=uid, spec=edited,
+        )
+    post2 = next(s for s in out.raw["steps"] if s["id"] == "post2")
+    assert not post2.get("grant_id"), \
+        "a new write quietly wore its sibling's permission"
+    post = next(s for s in out.raw["steps"] if s["id"] == "post")
+    assert post["grant_id"] == "g-1"
+    assert automation.status == "draft"

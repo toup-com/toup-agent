@@ -175,6 +175,23 @@ class Automation(Base):
     steps_human_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # R38. How this automation was BUILT — the ordered phases of its
+    # own creation, each with a title, a sub-line, its measured
+    # duration and the lines of what it actually did:
+    # `{"source", "at", "total_ms", "steps": [{id,title,sub,ms,did[]}]}`
+    # (`build_ledger.py` writes it, `workflow_payload` serves it as
+    # `build_history`).
+    #
+    # A column, not a derivation: the build is a HISTORY. Re-deriving
+    # it from the spec at read time would answer with what the
+    # automation is TODAY, so an account removed on Tuesday would
+    # unwrite Monday's "Connected Gmail" and the record would quietly
+    # agree with whatever the last edit said. It is written once, at
+    # creation, and never rewritten.
+    build_history_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+    )
+
     # R31 §4.6. A monotonic revision of the WORKFLOW payload, bumped by
     # every write that changes it. Two jobs, both about the app holding
     # local drafts over a server base:

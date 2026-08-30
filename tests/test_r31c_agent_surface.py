@@ -32,33 +32,48 @@ def _tool_names(skill: AutomationsSkill) -> list[str]:
 
 # ---------------------------------------------------------------- R31-04
 
-def test_run_now_is_reachable_and_the_test_path_is_not():
+def test_run_now_is_reachable():
     names = _tool_names(AutomationsSkill())
     assert "automations__run_now" in names
-    assert "automations__test_run" not in names
 
 
-def test_the_test_path_returns_under_the_dev_flag_only(monkeypatch):
-    monkeypatch.setattr(settings, "automations_dev_fast_lane", True)
-    monkeypatch.setattr(settings, "environment", "development")
+def test_the_rehearsal_is_reachable_now_and_the_gate_still_works(monkeypatch):
+    """A RECORDED REVERSAL (R38).
+
+    R31-04 removed `automations__test_run` from the model's array for
+    two reasons that were both true of the implementation it had: the
+    "staged" write was swept and sent by `outbox.flush_loop` like any
+    other, and the run it opened never closed. R38 replaced that
+    implementation — `service.rehearse` stages no outbox row and opens
+    no run — so the tool is reachable again. The gate itself stays,
+    empty, because it is also the door check in `execute_tool`.
+    """
+    from app.agent.skills.builtins.automations import skill as sk
+
     assert "automations__test_run" in _tool_names(AutomationsSkill())
+    assert sk._DEV_ONLY_TOOLS == frozenset()
 
-    # A stray env var on a production tenant changes nothing — the
-    # dev gate is ANDed with the environment at its use site.
-    monkeypatch.setattr(settings, "environment", "production")
+    # And the mechanism still filters, for the next dev-only tool.
+    monkeypatch.setattr(sk, "_DEV_ONLY_TOOLS",
+                        frozenset({"automations__test_run"}))
+    monkeypatch.setattr(settings, "automations_dev_fast_lane", False)
     assert "automations__test_run" not in _tool_names(AutomationsSkill())
 
 
 @pytest.mark.asyncio
-async def test_the_test_path_is_refused_at_the_door_too(monkeypatch):
+async def test_a_dev_gated_tool_is_refused_at_the_door_too(monkeypatch):
     """Unregistering a tool does not un-teach its name.
 
     A model can emit a name it saw earlier in the conversation or in
     its own history, so the array is not the only gate that has to
     hold. The refusal names the replacement rather than just saying no.
     """
+    from app.agent.skills.builtins.automations import skill as sk
+
     monkeypatch.setattr(settings, "automations_enabled", True)
     monkeypatch.setattr(settings, "automations_dev_fast_lane", False)
+    monkeypatch.setattr(sk, "_DEV_ONLY_TOOLS",
+                        frozenset({"automations__test_run"}))
     out = await AutomationsSkill().execute_tool(
         "automations__test_run", {"automation_id": "a-1"},
         _ctx(),
@@ -180,10 +195,15 @@ def test_the_prompt_routes_every_run_phrasing_to_the_engine():
     for phrasing in ("run it again", "run all of them again", "try again"):
         assert phrasing in prompt, phrasing
     assert "automations__run_now" in prompt
-    # The build order must no longer send the model through the
-    # synthetic path — that instruction is what put "TEST RUN STAGED"
-    # in front of a user.
-    assert "automations__test_run" not in prompt
+    # R38 reversal: the rehearsal IS named in the prompt now, because a
+    # tool called "test run" that the model has never been told about
+    # is exactly what gets reached for when someone says "run it". What
+    # the prompt may not do is leave the two interchangeable — the
+    # build order still routes every run phrasing to `run_now`, and the
+    # rehearsal's paragraph says in as many words that it is not a run.
+    assert "automations__test_run" in prompt
+    assert "NEVER the answer to 'run it'" in prompt
+    assert "sends nothing" in prompt
 
 
 def test_the_prompt_forbids_answering_a_run_request_with_a_status():
@@ -867,27 +887,77 @@ def test_no_automations_tool_returns_a_bare_payload():
     their own DB session, and a mock deep enough to reach the return
     statement would be a second model of the file rather than a test
     of it.
+
+    R38: the probe reads the AST rather than grepping lines. The old
+    regex was `return\\s+.*_as_json\\(` on ONE line, which is neither
+    the invariant nor a proxy for it in both directions — it flagged a
+    compliant single-line `return ToolResult(_as_json(p), display=d)`
+    and would have missed a bare `return (\\n    _as_json(p))`.
     """
+    import ast
     import pathlib
-    import re
 
     path = (pathlib.Path(__file__).resolve().parents[1] / "app" / "agent" /
             "skills" / "builtins" / "automations" / "skill.py")
-    src = path.read_text()
-    offenders = [
-        f"{n}: {line.strip()}"
-        for n, line in enumerate(src.splitlines(), 1)
-        if re.search(r"return\s+.*_as_json\(", line)
-    ]
+    tree = ast.parse(path.read_text())
+
+    def _mentions_as_json(node) -> bool:
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id == "_as_json"
+            for n in ast.walk(node)
+        )
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        if not _mentions_as_json(node.value):
+            continue
+        call = node.value
+        ok = (isinstance(call, ast.Call)
+              and isinstance(call.func, ast.Name)
+              and call.func.id == "ToolResult"
+              and any(kw.arg == "display" for kw in call.keywords))
+        if not ok:
+            offenders.append(f"line {node.lineno}: a payload with no display")
     assert not offenders, offenders
 
     # And every declared display is a sentence, not a payload or a
-    # fragment addressed to the model.
-    for display in re.findall(r'display=(".*?"|f".*?")', src):
-        text = display.strip('f"')
-        assert not text.startswith(("{", "[")), display
-        assert "Say so" not in text, display
-        assert copy_guard.clean(text.replace("{automation.name}", "X")), display
+    # fragment addressed to the model — whether it is written at the
+    # call site or assigned to `display` first.
+    displays: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "display":
+                    displays.extend(_str_parts(kw.value))
+        elif isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "display"
+                   for t in node.targets):
+                displays.extend(_str_parts(node.value))
+    assert len(displays) >= 15, "the probe stopped finding displays"
+    for text in displays:
+        assert not text.startswith(("{", "[")), text
+        assert "Say so" not in text, text
+        assert copy_guard.clean(text.replace("{automation.name}", "X")), text
+
+
+def _str_parts(node) -> list[str]:
+    """Every literal string an expression can evaluate to — a constant,
+    an f-string's literal halves, or the branches of a ternary."""
+    import ast
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, ast.JoinedStr):
+        return ["".join(
+            v.value for v in node.values
+            if isinstance(v, ast.Constant) and isinstance(v.value, str)
+        )]
+    if isinstance(node, ast.IfExp):
+        return _str_parts(node.body) + _str_parts(node.orelse)
+    return []
 
 
 # ------------------------------------------- R31-22 · the setup script

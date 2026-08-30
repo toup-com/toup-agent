@@ -153,6 +153,33 @@ def _member_connectors(raw: dict) -> list[str]:
     return ids
 
 
+def focus_of(raw: dict) -> dict[str, list[dict]]:
+    """The spec's per-account pins, `{connector_id: [{kind,id,label}]}`.
+
+    Total: a spec written before R38 has no `focus` key and answers
+    `{}`, which is the same thing as "nothing pinned" — there is no
+    third state to distinguish, because a pin is a user action and its
+    absence means only that they have not taken it.
+    """
+    focus = raw.get("focus")
+    if not isinstance(focus, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for cid, pins in focus.items():
+        if not isinstance(cid, str) or not isinstance(pins, list):
+            continue
+        rows = [
+            {"kind": str(p.get("kind") or ""),
+             "id": str(p.get("id") or ""),
+             "label": str(p.get("label") or p.get("id") or "")}
+            for p in pins
+            if isinstance(p, dict) and p.get("id") and p.get("kind")
+        ]
+        if rows:
+            out[cid] = rows
+    return out
+
+
 def _write_tools(raw: dict) -> list[tuple[str, str, dict]]:
     """[(connector_id, tool, grant_target)] for the spec's writes.
 
@@ -265,6 +292,18 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
     out = []
     if raw.get("version") == 2:
         for i, s in enumerate(raw.get("steps") or []):
+            if s.get("kind") == "agent":
+                # R38. Derived through the same dictionary as every
+                # other step; the sub is the ask itself, because on this
+                # sheet "Thought it through" alone says nothing about
+                # WHAT it thought through. `turn_action` would answer
+                # "Checked the account" here — a step with no account.
+                out.append({
+                    "n": i + 1,
+                    "text": verbs.engine_action("think")["action"],
+                    "sub": str(s.get("prompt") or "")[:120],
+                })
+                continue
             cid, tool = s.get("connector_id") or "", s.get("tool") or ""
             is_write = bool(s.get("grant_id"))
             act = verbs.turn_action(
@@ -345,6 +384,7 @@ async def workflow_payload(
     members = _member_connectors(raw)
     mode, _mode_label = mode_of(automation, raw)
 
+    pinned = focus_of(raw)
     accounts = []
     for cid in members:
         entry = _account_entry(cid, connections.get(cid) or {})
@@ -355,6 +395,11 @@ async def workflow_payload(
         )
         entry.update(perms)
         entry["last_use"] = await _last_use(db, automation, cid)
+        # R38 — where this account STARTS every run. On the account
+        # entry rather than a sibling map, because the canvas draws one
+        # node per account and a node must not have to join two lists
+        # to know its own pins.
+        entry["focus"] = pinned.get(cid) or []
         accounts.append(entry)
 
     capability = await reg.fetch_registry(user_id)
@@ -365,7 +410,11 @@ async def workflow_payload(
     ]
 
     from app.agent._user_tz_cache import get_cached_user_tz
+    from . import build_ledger
     return {
+        "automation_id": automation.id,
+        "name": automation.name,
+        "workflow_rev": int(getattr(automation, "workflow_rev", 0) or 0),
         "schedule": schedule_block(automation, raw),
         "accounts": accounts,
         "available": available,
@@ -373,6 +422,9 @@ async def workflow_payload(
         "rules": rules_list(automation),
         "output": output_block(automation, raw),
         "counts": counts_block(raw, mode),
+        # R38. `null` when the automation predates the build ledger —
+        # never `[]`, which would claim it was built in no steps.
+        "build_history": build_ledger.read(automation),
         "tz": get_cached_user_tz(user_id),
     }
 
@@ -714,6 +766,7 @@ async def set_steps(
     ]
     if not cleaned:
         raise WorkflowError("empty_steps", "A plan needs at least one step.")
+    before_human = automation.steps_human_json
     automation.steps_human_json = json.dumps(cleaned)
     await db.commit()
     sentence = "Rewrote the steps."
@@ -726,6 +779,16 @@ async def set_steps(
         recompiled = bool(outcome.get("recompiled"))
         sentence = outcome.get("sentence") or sentence
         if outcome.get("code"):
+            # R38: a refusal must leave NOTHING applied — this file's
+            # own contract for a 409 (`commit_workflow`'s docstring).
+            # The wording persists above so a failed recompile can still
+            # say "the wording is saved"; a REFUSAL is the other case,
+            # and leaving the new sentences on screen under a "that
+            # needs your yes" made the sheet show a plan the engine had
+            # not accepted. The agent's edit tool would have reported
+            # `not_changed` over a change it had in fact made.
+            automation.steps_human_json = before_human
+            await db.commit()
             raise WorkflowError(outcome["code"],
                                 outcome.get("sentence") or "Refused.",
                                 outcome.get("extra"))
@@ -846,6 +909,126 @@ async def save_permissions(
     return result
 
 
+# ---------------------------------------------------------- focus pins
+
+async def _write_focus(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    account_id: str, pins: list[dict], sentence: str, note: bool = True,
+) -> dict:
+    """Persist one account's pins through the SAME spec write path
+    every other structural edit uses (`service.update_automation`), so
+    a pin is revalidated, recompiled and re-armed exactly like a
+    schedule change — never poked into `spec_json` behind the
+    validator's back."""
+    from . import service
+    raw = _spec_raw(automation)
+    focus = {k: list(v) for k, v in focus_of(raw).items()}
+    if pins:
+        focus[account_id] = pins
+    else:
+        focus.pop(account_id, None)
+    if focus:
+        raw["focus"] = focus
+    else:
+        raw.pop("focus", None)
+    try:
+        automation, _vspec = await service.update_automation(
+            db, automation_id=automation.id, user_id=user_id, spec=raw,
+        )
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed
+        from .spec import SpecError
+        if isinstance(e, SpecError):
+            raise WorkflowError(
+                "bad_focus", "I could not start it there.",
+                {"errors": e.errors},
+            ) from e
+        raise
+    if note:
+        await _edited_note(db, automation)
+    await db.refresh(automation)
+    return {
+        "focus": focus_of(_spec_raw(automation)).get(account_id) or [],
+        "sentence": sentence,
+        "workflow": await workflow_payload(
+            db, automation=automation, user_id=user_id,
+        ),
+    }
+
+
+async def add_focus(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    account_id: str, kind: str, target_id: str, label: str = "",
+) -> dict:
+    """Pin one place under an account — the automation starts there.
+
+    Membership is the gate HERE rather than in the validator: a pin
+    under an account this automation does not use is a user error with
+    a sentence, not a malformed spec. Re-pinning the same place is a
+    no-op with the same sentence, because a user who taps twice meant
+    it once.
+    """
+    from .spec import FOCUS_KINDS, MAX_FOCUS_PER_ACCOUNT
+    raw = _spec_raw(automation)
+    if account_id not in _member_connectors(raw):
+        raise WorkflowError(
+            "not_member",
+            "This automation does not use that account yet — add it "
+            "first, then pick where it starts.",
+        )
+    if kind not in FOCUS_KINDS:
+        raise WorkflowError(
+            "bad_focus_kind", "I do not know how to start there.")
+    target_id = str(target_id or "").strip()
+    if not target_id:
+        raise WorkflowError("bad_focus_id", "Pick a place first.")
+    name = verbs.display_name(account_id) or account_id
+    pins = list(focus_of(raw).get(account_id) or [])
+    if any(p["kind"] == kind and p["id"] == target_id for p in pins):
+        return {
+            "focus": pins, "workflow": await workflow_payload(
+                db, automation=automation, user_id=user_id,
+            ),
+            "sentence": f"It already starts at "
+                        f"{label or target_id} in {name}.",
+        }
+    if len(pins) >= MAX_FOCUS_PER_ACCOUNT:
+        raise WorkflowError(
+            "too_many_focus",
+            f"It can start in {MAX_FOCUS_PER_ACCOUNT} places in {name} "
+            f"at most. Take one out first.",
+        )
+    shown = str(label or "").strip() or target_id
+    pins.append({"kind": kind, "id": target_id, "label": shown})
+    return await _write_focus(
+        db, automation=automation, user_id=user_id, account_id=account_id,
+        pins=pins, sentence=f"It starts at {shown} in {name} now.",
+    )
+
+
+async def remove_focus(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    account_id: str, kind: str, target_id: str,
+) -> dict:
+    """Unpin one place. A pin that is already gone is a 409, not a
+    silent success — the app would otherwise redraw a row it never
+    removed."""
+    raw = _spec_raw(automation)
+    pins = list(focus_of(raw).get(account_id) or [])
+    target_id = str(target_id or "").strip()
+    kept = [p for p in pins
+            if not (p["kind"] == kind and p["id"] == target_id)]
+    if len(kept) == len(pins):
+        raise WorkflowError("not_found", "It does not start there.")
+    gone = next(p for p in pins
+                if p["kind"] == kind and p["id"] == target_id)
+    name = verbs.display_name(account_id) or account_id
+    return await _write_focus(
+        db, automation=automation, user_id=user_id, account_id=account_id,
+        pins=kept,
+        sentence=f"It no longer starts at {gone['label']} in {name}.",
+    )
+
+
 # ------------------------------------------------------------ composer
 
 _UNDO: dict[str, dict] = {}
@@ -860,6 +1043,93 @@ def _mint_undo(kind: str, revert: dict) -> str:
         for k in [k for k, v in _UNDO.items() if v["at"] < cutoff]:
             _UNDO.pop(k, None)
     return token
+
+
+async def _apply_all(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    intents: list[dict],
+) -> dict:
+    """Apply a list of policy-approved intents. Returns
+    `{"applied": [entry], "refused": [sentence]}`.
+
+    AUDIT-6: every applier commits its own write, so letting a
+    `WorkflowError` out of this loop left the earlier intents COMMITTED,
+    answered the whole call 409, and skipped the `agent` turn the caller
+    writes — a half-applied change with no record of itself in the
+    thread. "Move it to 7:15 and add a rule" was enough to do it. A
+    refusal is a sentence, not an abort: the safe siblings still land
+    and the caller says what did not.
+    """
+    applied: list[dict] = []
+    refused: list[str] = []
+    for intent in intents:
+        try:
+            entry = await _apply_intent(
+                db, automation=automation, user_id=user_id, intent=intent,
+            )
+        except WorkflowError as e:
+            refused.append(e.sentence)
+            continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[workflow] intent %s failed: %s",
+                           intent.get("kind"), e)
+            refused.append("I could not make that one.")
+            continue
+        if entry is not None:
+            applied.append(entry)
+    return {"applied": applied, "refused": refused}
+
+
+async def apply_intents(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    intents: list[dict],
+) -> dict:
+    """The agent's edit tools, and the only door they get.
+
+    The five `automations__edit_*` tools hand STRUCTURED intents of
+    composer.py's documented shape straight to this function — no
+    classifier, because the agent already read the user's sentence.
+    Everything after that is the sheet's own code: `apply_policy`
+    decides what may be applied silently, `_apply_intent` writes it,
+    each write mints the same undo token and stamps the same EDITED
+    note through `_edited_note`, which is also what broadcasts
+    `automation.updated`.
+
+    So a tool can no more widen access than a sentence can: a grant, an
+    account add or a hard rail comes back in `needs`/`answer` exactly as
+    it does for the composer, and the tool tells the model to ask.
+
+    Returns `{"applied", "needs", "answer", "refused", "workflow"}` —
+    never a silent nothing: an intent the writers could not make lands
+    in `refused` carrying the sentence that says why. `workflow` is the
+    payload AFTER the writes, so the caller can say what it looks like
+    now and the model has the ids for its next edit without a second
+    read.
+    """
+    from .composer import _normalize_intent, apply_policy
+
+    wf = await workflow_payload(db, automation=automation, user_id=user_id)
+    outcome = apply_policy(
+        [_normalize_intent(i) for i in intents if isinstance(i, dict)], wf,
+    )
+    landed = await _apply_all(
+        db, automation=automation, user_id=user_id,
+        intents=outcome.get("applied") or [],
+    )
+    after = wf
+    if landed["applied"]:
+        await db.refresh(automation)
+        after = await workflow_payload(
+            db, automation=automation, user_id=user_id,
+        )
+    return {
+        "applied": landed["applied"],
+        "needs": outcome.get("needs") or [],
+        "answer": outcome.get("answer"),
+        "refused": landed["refused"],
+        "workflow": after,
+        "workflow_rev": int(getattr(automation, "workflow_rev", 0) or 0),
+    }
 
 
 async def composer_ask(
@@ -889,33 +1159,14 @@ async def composer_ask(
         wf = await workflow_payload(db, automation=automation,
                                     user_id=user_id)
         outcome = await classify_change(text, wf)
-        intents = outcome.get("applied") or []
         needs = outcome.get("needs") or []
         answer = outcome.get("answer")
-        for intent in intents:
-            # AUDIT-6: every applier commits its own write, so letting a
-            # WorkflowError out of this loop left the earlier intents
-            # COMMITTED, answered the whole call 409, and skipped the
-            # `agent` turn below — a half-applied change with no record
-            # of itself in the thread. "Move it to 7:15 and add a rule"
-            # was enough to do it. A refusal is now a sentence, not an
-            # abort: the safe siblings still land and the agent turn says
-            # what did not.
-            try:
-                entry = await _apply_intent(
-                    db, automation=automation, user_id=user_id,
-                    intent=intent,
-                )
-            except WorkflowError as e:
-                refused.append(e.sentence)
-                continue
-            except Exception as e:  # noqa: BLE001
-                logger.warning("[workflow] intent %s failed: %s",
-                               intent.get("kind"), e)
-                refused.append("I could not make that one.")
-                continue
-            if entry is not None:
-                applied.append(entry)
+        landed = await _apply_all(
+            db, automation=automation, user_id=user_id,
+            intents=outcome.get("applied") or [],
+        )
+        applied = landed["applied"]
+        refused = landed["refused"]
     except ImportError:
         # C's classifier not merged yet — one honest fallback: treat the
         # sentence as a rule (the only always-safe change).
@@ -968,21 +1219,58 @@ async def composer_ask(
 async def _apply_intent(
     db: AsyncSession, *, automation: Automation, user_id: str, intent: dict,
 ) -> Optional[dict]:
+    """Apply ONE policy-approved intent, or raise `WorkflowError` with
+    the sentence that says why not.
+
+    R38: every branch that used to `return None` now raises instead.
+    `None` was a silent no-op — `composer_ask` appended it to nothing
+    and said nothing about it, so "change step 4" on a three-step
+    automation, or "stop Slack posting" for a permission that was
+    already off, came back as a confirmation of the OTHER intents in
+    the same sentence and no word about the one that did nothing. The
+    agent's edit tools would have inherited exactly that: a tool that
+    reports success for a change it did not make. The only surviving
+    `None` is the unreachable tail, which raises too.
+    """
     kind = intent.get("kind")
     if kind == "rule":
-        result = await add_rule(db, automation=automation,
-                                text=intent.get("text") or "")
+        op = str(intent.get("op") or "add").strip().lower()
+        if op == "add":
+            result = await add_rule(db, automation=automation,
+                                    text=intent.get("text") or "")
+            return {"kind": "rule", "sentence": result["sentence"],
+                    "sheet": "rules",
+                    "undo_token": _mint_undo(
+                        "rule", {"rule_id": result["rule"]["id"]})}
+        # remove/edit revert through the WHOLE list rather than a
+        # single id: putting a deleted rule back at its original index
+        # with its original id is what keeps a second undo token (or a
+        # later edit) pointing at the same row.
+        before = [dict(r) for r in rules_list(automation)]
+        rule_id = str(intent.get("rule_id") or "")
+        if op == "remove":
+            result = await delete_rule(db, automation=automation,
+                                       rule_id=rule_id)
+        else:
+            result = await update_rule(db, automation=automation,
+                                       rule_id=rule_id,
+                                       text=intent.get("text") or "")
         return {"kind": "rule", "sentence": result["sentence"],
                 "sheet": "rules",
-                "undo_token": _mint_undo(
-                    "rule", {"rule_id": result["rule"]["id"]})}
+                "undo_token": _mint_undo("rule_set", {"rules": before})}
     if kind == "schedule":
         raw_before = _spec_raw(automation)
         before = _schedule_of(raw_before) or {}
-        result = await set_schedule_preset(
-            db, automation=automation, user_id=user_id,
-            preset_id=intent.get("preset_id") or "",
-        )
+        custom = intent.get("custom")
+        if isinstance(custom, dict) and custom:
+            result = await set_schedule_custom(
+                db, automation=automation, user_id=user_id, custom=custom,
+            )
+        else:
+            result = await set_schedule_preset(
+                db, automation=automation, user_id=user_id,
+                preset_id=intent.get("preset_id") or "",
+            )
         return {"kind": "schedule", "sentence": result["sentence"],
                 "sheet": "schedule",
                 "undo_token": _mint_undo("schedule", {"schedule": before})}
@@ -990,7 +1278,11 @@ async def _apply_intent(
         steps = _steps_human(automation, _spec_raw(automation))
         n = int(intent.get("n") or 0)
         if not (1 <= n <= len(steps)):
-            return None
+            raise WorkflowError(
+                "no_such_step",
+                f"There is no step {n} — this one has "
+                f"{len(steps)} of them." if steps else
+                "This one has no steps yet.")
         before = [dict(s) for s in steps]
         steps[n - 1]["text"] = str(intent.get("text") or "")[:200]
         result = await set_steps(db, automation=automation,
@@ -1013,7 +1305,15 @@ async def _apply_intent(
         )
         before_can = [p["id"] for p in current["can"]]
         if remove_id not in before_can:
-            return None
+            name = verbs.display_name(account_id) or account_id or "It"
+            label = next(
+                (p.get("label") for p in current["cant"]
+                 if p.get("id") == remove_id), None)
+            raise WorkflowError(
+                "not_granted",
+                f"{name} already cannot "
+                f"{label[0].lower()}{label[1:]}." if label else
+                f"{name} does not have that permission to take away.")
         can = [p for p in before_can if p != remove_id]
         cant = [p["id"] for p in current["cant"]
                 if p.get("kind") == "ungranted"] + [remove_id]
@@ -1035,13 +1335,19 @@ async def _apply_intent(
         # wrong while the account stayed wired in. Only REMOVAL applies
         # silently — an add grants new reach and belongs in `needs`.
         if (intent.get("direction") or "remove") != "remove":
-            return None
+            raise WorkflowError(
+                "needs_consent",
+                "Adding an account is the user's call — it is not "
+                "something I apply on my own.")
         account_id = intent.get("account_id") or ""
         raw_before = _spec_raw(automation)
-        if account_id not in _member_connectors(raw_before):
-            return None
         from . import service as _svc
         name = verbs.display_name(account_id) or account_id
+        if account_id not in _member_connectors(raw_before):
+            raise WorkflowError(
+                "not_member",
+                f"{name} is not part of this automation, so there is "
+                f"nothing to take out.")
         was_armed = (automation.status == "armed")
         try:
             await _svc.remove_connector(
@@ -1052,7 +1358,10 @@ async def _apply_intent(
             # Refuse out loud. The spec says why it cannot absorb the
             # removal; silence here reads as "done" to the user.
             if e.code == "not_member":
-                return None
+                raise WorkflowError(
+                    "not_member",
+                    f"{name} is not part of this automation, so there "
+                    f"is nothing to take out.")
             raise WorkflowError(e.code, {
                 "connector_required":
                     f"{name} is doing work this automation depends on, "
@@ -1087,7 +1396,10 @@ async def _apply_intent(
                 "undo_token": _mint_undo(
                     "account",
                     {"account_id": account_id, "spec": raw_before})}
-    return None
+    raise WorkflowError(
+        "unknown_change",
+        "I could not place that change — tell me which part to move "
+        "and I will do it.")
 
 
 async def composer_undo(
@@ -1100,6 +1412,12 @@ async def composer_undo(
     if kind == "rule":
         await delete_rule(db, automation=automation,
                           rule_id=revert["rule_id"])
+    elif kind == "rule_set":
+        # A remove or an edit: the whole list goes back, ids and order
+        # intact, so a rule that was deleted returns as the SAME row a
+        # later token or edit still points at.
+        automation.rules_json = json.dumps(revert.get("rules") or [])
+        await db.commit()
     elif kind == "schedule":
         from . import service
         sched = {k: v for k, v in (revert.get("schedule") or {}).items()

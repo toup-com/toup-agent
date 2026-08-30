@@ -19,6 +19,13 @@ it returns, writes the thread record (`user` turn → `EDITED` note →
               sentence,               # the confirmation the sheet shows
               sheet,                  # which sheet opens
               ...kind-specific fields}
+
+The five kinds are also the agent's five edit tools
+(`automations__edit_rules` and friends): they hand structured intents
+of exactly this shape to `workflow.apply_intents`, which runs THIS
+`apply_policy` and then the same `_apply_intent` writers the sheet
+uses. One policy, one set of writers, one undo — a tool call can no
+more widen access than a sentence can.
     Need   = {kind: consent|confirm, account_id, sentence}
     answer — the one agent line for a question, a rail refusal, or a
              sentence the agent cannot place (posted in the card).
@@ -52,6 +59,12 @@ def confirmation_sentence(intent: dict, workflow: dict) -> str:
     """The §5.5 templates — one sentence per applied change."""
     kind = intent.get("kind")
     if kind == "rule":
+        op = intent.get("op") or "add"
+        if op == "remove":
+            return "Removed the rule."
+        if op == "edit":
+            return (f"Changed the rule — "
+                    f"{_lower_first(str(intent.get('text') or '').rstrip('.'))}.")
         return f"Added a rule — {_lower_first(str(intent.get('text') or '').rstrip('.'))}."
     if kind == "schedule":
         sentence = intent.get("sentence") or ""
@@ -114,16 +127,42 @@ def apply_policy(intents: list[dict], workflow: dict) -> dict:
         if kind not in CHANGE_KINDS:
             continue
         if kind == "rule":
+            # R38: the classifier only ever emits an ADD, and the sheet
+            # deletes and edits through its own routes. The agent's
+            # `automations__edit_rules` needs all three through ONE
+            # policy, so `op` joins the kind. A removal WIDENS what the
+            # agent may do, which is why it is worth naming the
+            # reasoning: it grants no access — no account, no
+            # permission, no new reach — it lifts a line the user drew
+            # and can put back inside the undo window, and the canvas
+            # already removes one on a single tap. Access is what this
+            # policy refuses to widen silently; a rule is not access.
+            op = str(intent.get("op") or "add").strip().lower()
+            if op not in ("add", "remove", "edit"):
+                continue
             text = " ".join(str(intent.get("text") or "").split())
-            if not text:
+            rule_id = str(intent.get("rule_id") or "").strip()
+            if op in ("remove", "edit") and not rule_id:
+                answers.append("Tell me which rule you mean and I will "
+                               "change it.")
+                continue
+            if op in ("add", "edit") and not text:
                 continue
             # A rule is the user's own words — stored verbatim, exempt
             # from the copy guard like any quoted content.
-            applied.append({"kind": "rule", "text": text,
+            applied.append({"kind": "rule", "op": op, "text": text,
+                            "rule_id": rule_id,
                             "sheet": _SHEET_FOR["rule"]})
         elif kind == "schedule":
+            # `custom` is the picker's `{time, days, date?, tz}` shape
+            # (workflow.custom_cron). It has no classifier producer —
+            # the LLM prefers a preset — but the agent's
+            # `automations__edit_schedule` can express a time the four
+            # presets do not carry, and a schedule change is applied
+            # silently either way, so the policy does not change.
             applied.append({k: v for k, v in intent.items()
-                            if k in ("kind", "preset_id", "sentence")}
+                            if k in ("kind", "preset_id", "sentence",
+                                     "custom")}
                            | {"sheet": _SHEET_FOR["schedule"]})
         elif kind == "step":
             applied.append({k: v for k, v in intent.items()

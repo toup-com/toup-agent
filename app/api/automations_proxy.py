@@ -872,6 +872,46 @@ async def proxy_workflow_account_remove(
     )
 
 
+@router.get("/{automation_id}/workflow/accounts/{account_id}/contents")
+async def proxy_account_contents(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """R38 — what is inside the account the user just tapped. The agent
+    side holds its own deadline well inside this forwarder's 30 s, so a
+    slow provider comes back as a named reason rather than a 502."""
+    return await _proxy(
+        request,
+        f"/{automation_id}/workflow/accounts/{account_id}/contents",
+        current_user=current_user, db=db,
+    )
+
+
+@router.post("/{automation_id}/workflow/accounts/{account_id}/focus")
+async def proxy_account_focus_add(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/focus",
+        current_user=current_user, db=db,
+    )
+
+
+@router.delete("/{automation_id}/workflow/accounts/{account_id}/focus")
+async def proxy_account_focus_remove(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/focus",
+        current_user=current_user, db=db,
+    )
+
+
 @router.post("/{automation_id}/workflow/ask")
 async def proxy_workflow_ask(
     automation_id: str, request: Request,

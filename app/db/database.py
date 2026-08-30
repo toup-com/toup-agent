@@ -1119,6 +1119,10 @@ async def init_db():
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS workflow_rev "
         "INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE automations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP",
+        # R38: the build history (`build_ledger.py`). Same self-heal
+        # reasoning as every ALTER above — `workflow_payload` names this
+        # column on the first GET after an upgrade.
+        "ALTER TABLE automations ADD COLUMN IF NOT EXISTS build_history_json TEXT",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS stop_requested_at TIMESTAMP",
         # The write's display form snapshotted at staging (R30 §4.8) —
         # an upgraded tenant's outbox INSERT names this column on the

@@ -633,10 +633,17 @@ async def jira_refresh(refresh_token: str) -> RefreshResult:
 # ─── Response trimming ───────────────────────────────────────────────
 
 
-_SEARCH_FIELDS = "summary,status,assignee,issuetype,priority,updated,created,project"
+# R38: `duedate` joins the default set. An issue's due date is the one
+# field "what is on my plate" is actually sorted by, and JQL could
+# already `ORDER BY duedate` while the row that came back never carried
+# it — so every caller could rank by a date it was not allowed to show.
+_SEARCH_FIELDS = (
+    "summary,status,assignee,issuetype,priority,updated,created,project,"
+    "duedate"
+)
 _ISSUE_FIELDS = (
     "summary,description,status,assignee,reporter,issuetype,priority,"
-    "labels,created,updated,project,resolution,comment"
+    "labels,created,updated,duedate,project,resolution,comment"
 )
 
 
@@ -664,6 +671,7 @@ def _issue_row(issue: dict, site: _CloudSite) -> dict:
         "assignee": _person(f.get("assignee")),
         "project": (f.get("project") or {}).get("key"),
         "updated": f.get("updated"),
+        "duedate": f.get("duedate"),
         "url": f"{site.url}/browse/{key}" if key and site.url else None,
     }
 

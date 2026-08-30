@@ -38,10 +38,14 @@ from app.db.models import (
 )
 from app.agent.job_runner import JobRunner, TaskSpec
 from app.agent import job_steps
-from .spec import render_value, render_with_ctx, resolve_path
+from .spec import (
+    focus_render_ctx as _focus_render_ctx,
+    render_value, render_with_ctx, resolve_path,
+)
 from .spec_v2 import ValidatedSpecV2, ValidatedSource, ValidatedStep
 from .executor import _FORBIDDEN_TOOLS, _finalize_job, _record_health
 from .session import on_run_created
+from . import agent_step as _agent_step
 from . import memory as engine_memory
 from . import registry as reg
 
@@ -82,7 +86,12 @@ def _new_steps_v2(vspec: ValidatedSpecV2) -> str:
     steps = []
     for s in _step_order(vspec):
         st = by_id.get(s)
-        if st is not None:
+        if st is not None and st.kind == "agent":
+            # R38: the agent's own work, branded as the orb — the same
+            # treatment the engine phases get, because that is what it
+            # is. It counts as a step everywhere a step is counted.
+            v = step_verb(None, None, phase="think")
+        elif st is not None:
             v = step_verb(st.tool, st.connector_id)
         else:
             v = step_verb(None, None, phase=s)
@@ -220,6 +229,14 @@ def _collect_result(step: ValidatedStep, content: dict,
     count = len(items)
     limit = int(collect.get("limit") or 10)
     fmt = collect.get("format")
+    # R38 — the ingestion seam. Provider strings arrive carrying HTML
+    # ("<b>Google Workspace product notifications.</b>" reached a
+    # founder's screen, and Gmail snippets ship entities routinely).
+    # Sanitized HERE because `lines` feeds BOTH the ledger's item
+    # titles and, via {{steps.<id>.text}}, the text a write step posts
+    # to Slack or folds into a draft. Known-tag allowlist + entity
+    # unescape; an email's angle brackets survive (ledger.strip_html).
+    from .ledger import strip_html
     lines: list[str] = []
     raw_fields: list[dict] = []
     if fmt:
@@ -229,9 +246,9 @@ def _collect_result(step: ValidatedStep, content: dict,
                 for name, path in (collect.get("fields") or {}).items()
             }
             raw_fields.append(item_fields)
-            lines.append(str(render_value(
+            lines.append(strip_html(str(render_value(
                 fmt, {"item": item_fields, "var": variables or {}},
-            )))
+            ))))
     text = (collect.get("join") or "\n").join(lines)
     if count == 0:
         text = collect.get("empty_text") or ""
@@ -310,10 +327,15 @@ async def _run_steps(
     source: Optional[ValidatedSource],
     *,
     idem_prefix: str,
-    stage_only: bool = False,
     resume: bool = False,
 ) -> str:
     """steps (reads) → stage writes → flush → record + memory.
+
+    There is deliberately no "stage but do not flush" mode. One existed
+    for the test run, and a staged row is not a held row: `flush_loop`
+    sweeps every staged row whose undo window has closed, so the mode
+    that promised a rehearsal delivered a send. `rehearse_v2` stages
+    nothing at all instead.
 
     `resume` (R30 §4.3): the run is a reopened stopped run — reads
     re-execute (the honest answer to a moved dedupe window), already-
@@ -327,9 +349,19 @@ async def _run_steps(
             "connector_id": (source.connector_id or "") if source else "",
             "event": (source.event or "") if source else "",
         },
-        "var": vspec.variables or {},
+        # R38: a COPY. An agent step binds its answer into this dict,
+        # and `vspec.variables` is the validated spec's own — mutating
+        # it would leak one run's answer into the next run parsed from
+        # the same object, and into anything that re-reads the spec.
+        "var": dict(vspec.variables or {}),
         "steps": {},
         "memory": mem_ctx,
+        # R38 — where the user pinned this automation to START, per
+        # account: `{{focus.slack.first.id}}` is the channel they
+        # chose. Flat leaves only (`spec.focus_render_ctx`), because
+        # `render_value` `str()`s anything that is not a leaf and a
+        # Python repr in a connector's params is not a target.
+        "focus": _focus_render_ctx(vspec.focus),
     }
 
     # Mail rail first — checked before any step runs, exactly like v1.
@@ -388,13 +420,20 @@ async def _run_steps(
     partial = False
     failed_sources: list[dict] = []
     read_ok: list[str] = []
+    # R38: what each agent step worked out, for the narration record.
+    # It is deliberately NOT the ledger turn's `detail` — that is
+    # copy-guarded engine prose, and this is model output.
+    agent_outputs: dict[str, str] = {}
     for st in vspec.steps:
         if st.mutates:
             break
         if await _stop_boundary(step_no):
             return "stopped"
         step_no += 1
-        sentence = _verbs.live_sentence(st.connector_id, st.tool)
+        is_agent = st.kind == "agent"
+        sentence = (_verbs.live_sentence(None, None, phase="think")
+                    if is_agent
+                    else _verbs.live_sentence(st.connector_id, st.tool))
         try:
             await _ledger.emit_progress(
                 automation.user_id, run_id=job_id,
@@ -426,14 +465,20 @@ async def _run_steps(
         except Exception as e:  # noqa: BLE001 — progress never fails a run
             logger.debug("[automations] progress stamp skipped: %s", e)
 
-        # §4.5: the same phase change the main chat has always had.
+        # §4.5: the same phase change the main chat has always had. An
+        # agent step is `thinking` — there is no connector to name and
+        # the tool glyph would be a lie about what is happening.
         try:
             await _ledger.emit_activity(
                 automation.user_id, automation_id=automation.id,
                 thread_id=thread.id if thread is not None else None,
-                run_id=job_id, phase="tool",
-                tool={"account_id": st.connector_id or "",
-                      "label": sentence},
+                run_id=job_id,
+                phase="thinking" if is_agent else "tool",
+                tool=None if is_agent else {
+                    "account_id": st.connector_id or "",
+                    "label": sentence,
+                },
+                detail=sentence if is_agent else None,
             )
         except Exception:  # noqa: BLE001 — a frame never fails a run
             pass
@@ -441,14 +486,30 @@ async def _run_steps(
         _t0 = _time.monotonic()
         step_failed_reason = None
         try:
-            ctx["steps"][st.id] = await _execute_read_step(automation, st, ctx)
+            if is_agent:
+                answer = await _agent_step.run_agent_step(
+                    automation=automation, step=st, ctx=ctx,
+                )
+                agent_outputs[st.id] = answer
+                # BOTH namespaces, because both are already how a step's
+                # output is read: `{{var.<output_var>}}` is the name the
+                # step declares, `{{steps.<id>.text}}` is what every
+                # other step exposes and what a spec author will reach
+                # for out of habit.
+                ctx["steps"][st.id] = {"ok": True, "text": answer}
+                ctx["var"][st.output_var] = answer
+            else:
+                ctx["steps"][st.id] = await _execute_read_step(
+                    automation, st, ctx)
         except Exception as e:  # noqa: BLE001 — transport/shape errors
             step_failed_reason = _failure_reason(e)
             if st.on_error == "fail":
                 # Still reachable, and still correct for a step whose
                 # absence makes the rest of the run meaningless. It is
-                # no longer the DEFAULT for a read (spec_v2).
-                await _append_read_turn(
+                # no longer the DEFAULT for a read (spec_v2) — it IS
+                # the default for an agent step, whose answer later
+                # templates interpolate.
+                await _append_step_turn(
                     db, thread=thread, automation=automation, job_id=job_id,
                     step=st, result=None, ms=int((_time.monotonic() - _t0) * 1000),
                     ok=False, reason=step_failed_reason,
@@ -464,13 +525,28 @@ async def _run_steps(
                 return "failed"
             logger.info("[automations] step %s continued past %s on %s",
                         st.id, e, automation.id)
-            ctx["steps"][st.id] = _skipped_result(
-                st, silent=st.on_error != "continue")
+            ctx["steps"][st.id] = (
+                {"ok": False, "failed": True, "text": ""} if is_agent
+                else _skipped_result(st, silent=st.on_error != "continue")
+            )
+            if is_agent:
+                # The name still resolves, to nothing. Leaving it
+                # unbound would make `{{var.x}}` render as the literal
+                # empty string anyway; binding it says so in one place.
+                ctx["var"][st.output_var] = ""
             partial = True
-            if st.on_error == "continue":
+            if st.on_error == "continue" and not is_agent:
                 # `skip` stays SILENT (the Teams provider_down
                 # precedent); `continue` owes the user a named account,
                 # a real reason and a button.
+                #
+                # An AGENT step is excluded on purpose: `failed_sources`
+                # is a list of ACCOUNTS, and every consumer treats it as
+                # one — the needs-you cards, `accounts_failed`, the
+                # reconnect buttons, the per-source resume. A thinking
+                # step has no account to name and no connector to
+                # reconnect; its failure is recorded as its own turn,
+                # in the thread, next to the run that hit it.
                 failed_sources.append({
                     "account_id": st.connector_id or "",
                     "reason_code": _reason_code_of(e, step_failed_reason),
@@ -486,7 +562,7 @@ async def _run_steps(
             if st.connector_id and st.connector_id not in read_ok:
                 read_ok.append(st.connector_id)
         step_result = ctx["steps"].get(st.id) or {}
-        await _append_read_turn(
+        await _append_step_turn(
             db, thread=thread, automation=automation, job_id=job_id,
             step=st, result=step_result,
             ms=int((_time.monotonic() - _t0) * 1000),
@@ -603,9 +679,6 @@ async def _run_steps(
     # EXECUTES (outbox ok branch, keyed by display_json.step_id) — never
     # at staging. A refused write must not wear "Posted to Slack".
 
-    if stage_only:
-        return "staged"
-
     # R30 narration phase 1 (pre-write): the opening line, item whys,
     # think turns, the draft's text. Result + close land in phase 2 so
     # the thread never claims a change before the write executed.
@@ -613,6 +686,7 @@ async def _run_steps(
         db, automation=automation, vspec=vspec, job_id=job_id,
         thread=thread, tool_turn_by_step=tool_turn_by_step,
         partial=partial, failed_sources=failed_sources,
+        agent_outputs=agent_outputs,
     )
 
     from .outbox import flush_row_when_due
@@ -936,16 +1010,44 @@ async def poll_and_run_v2(
             "ran": ran, "failed": failed}
 
 
-# ── Test run ─────────────────────────────────────────────────────────
+# ── Rehearsal ────────────────────────────────────────────────────────
+#
+# R38 — this used to be `execute_test_run_v2`, and it was DEV-only for
+# two reasons that were both true.
+#
+# It was not a rehearsal. `_run_steps(stage_only=True)` returned before
+# narration, but the outbox row it had just committed was `staged` with
+# an `execute_after` in the past six seconds — and `outbox.flush_loop`
+# sweeps EVERY staged row whose window has closed, every 5 s. So a
+# "test" posted to the user's real Slack channel, seconds later, from a
+# background loop, with the caller already gone. And it short-circuited
+# the ledger's phase-2 close, so the run it opened produced no result
+# turn, no notification and a job row that the stuck-run reaper later
+# marked `failed/lost`.
+#
+# The fix is not a flag. A rehearsal STAGES NOTHING: there is no outbox
+# row to sweep, so there is no code path — no loop, no restart, no
+# retry — that can turn one into a send. The reads run for real (that
+# is the whole point of rehearsing against live data, and a read
+# changes nothing), the write params are RENDERED exactly as the run
+# would render them, and they are reported instead of persisted.
+#
+# It also opens no run: a rehearsal changes nothing, so there is
+# nothing for the thread, the home card or a notification to record,
+# and a run row claiming otherwise was half of the old defect.
 
 
-async def execute_test_run_v2(
+async def rehearse_v2(
     db, automation: Automation, vspec: ValidatedSpecV2,
 ) -> dict:
-    """One synthetic fire through the real rails: read steps run for
-    real, writes stop at the staged outbox row and go out after the
-    normal undo window — a test run is a real run with a synthetic
-    trigger."""
+    """Run the reads for real; report what WOULD be written.
+
+    Returns `{"rehearsal": True, "sample_event", "reads", "writes"}`.
+    Each `writes` entry carries the rendered params and, when the
+    engine would refuse the write, a `blocked` reason — a rehearsal
+    that says "it would post to #platform" about a write no grant backs
+    is a rehearsal of something that cannot happen.
+    """
     sample: dict[str, Any] = {}
     source: Optional[ValidatedSource] = None
     for s in vspec.sources:
@@ -970,31 +1072,114 @@ async def execute_test_run_v2(
     if source is None:
         source = vspec.schedule_source()
 
-    job = await JobRunner().create_job(
-        job_type="automation_run",
-        spec=TaskSpec(
-            user_id=automation.user_id,
-            channel="automation",
-            source_kind="automation",
-            source_id=automation.id,
-            config_json={"test_run": True},
-        ),
-        title=f"[test] {automation.name}"[:100],
-        idempotency_key=f"test:{uuid.uuid4()}",
-        status="running",
-        steps_json=_new_steps_v2(vspec),
-        layer=0,
-    )
-    await on_run_created(db, job=job, automation=automation)
-    await _advance_v2(db, job.id, vspec, "evaluate")
-    from . import run_v3 as _rv3_open
-    await _rv3_open.open_run(db, automation=automation, job=job,
-                             kind="run_now", total_steps=len(vspec.steps))
-    status = await _run_steps(
-        db, automation, vspec, job.id, sample, source,
-        idem_prefix=f"test:{job.id}", stage_only=True,
-    )
-    return {"job_id": job.id, "status": status, "sample_event": sample}
+    ctx: dict[str, Any] = {
+        "event": sample,
+        "source": {
+            "id": getattr(source, "id", ""),
+            "connector_id": getattr(source, "connector_id", "") or "",
+            "event": getattr(source, "event", "") or "",
+        },
+        # A copy, for the same reason the run path takes one: an agent
+        # step binds into this dict.
+        "var": dict(vspec.variables or {}),
+        "steps": {},
+        "memory": await engine_memory.read_context(db, automation),
+        # R38. The rehearsal must render the SAME write the run would.
+        # Without this key `{{focus.slack.first.id}}` — the pattern the
+        # authoring guide documents for a pinned sub-node — resolved to ""
+        # (render_value answers "" for a missing path), so a rehearsal of a
+        # pinned automation read the wrong channel and then reported
+        # "it would write" params built from it, under a prompt that says
+        # "say what it WOULD write". An agent step reads it too
+        # (agent_step.build_prompt's `starts_at`).
+        "focus": _focus_render_ctx(vspec.focus),
+    }
+
+    reads: list[dict] = []
+    for st in vspec.steps:
+        if st.mutates:
+            break
+        if st.kind == "agent":
+            # A rehearsal runs the thinking for real, exactly like the
+            # reads: it changes nothing, and the whole point of
+            # rehearsing is to see what the writes below would actually
+            # say — which is this step's answer, interpolated.
+            try:
+                answer = await _agent_step.run_agent_step(
+                    automation=automation, step=st, ctx=ctx,
+                )
+            except Exception as e:  # noqa: BLE001 — report, never hide
+                ctx["steps"][st.id] = {"ok": False, "failed": True,
+                                       "text": ""}
+                ctx["var"][st.output_var] = ""
+                reads.append({
+                    "step_id": st.id, "account_id": None, "kind": "agent",
+                    "ok": False, "on_error": st.on_error,
+                    "error": str(e)[:200],
+                })
+            else:
+                ctx["steps"][st.id] = {"ok": True, "text": answer}
+                ctx["var"][st.output_var] = answer
+                reads.append({
+                    "step_id": st.id, "account_id": None, "kind": "agent",
+                    "ok": True, "output_var": st.output_var,
+                    "text": answer[:1000],
+                })
+            continue
+        try:
+            result = await _execute_read_step(automation, st, ctx)
+        except Exception as e:  # noqa: BLE001 — one broken read is a
+            # fact about the rehearsal, not the end of it. The run
+            # itself applies `on_error`; here the report says which
+            # read failed and the writes downstream show the hole it
+            # left, which is the thing worth seeing before arming.
+            result = _skipped_result(st, silent=st.on_error == "skip")
+            reads.append({
+                "step_id": st.id, "account_id": st.connector_id,
+                "ok": False, "on_error": st.on_error,
+                "error": str(e)[:200],
+            })
+        else:
+            reads.append({
+                "step_id": st.id, "account_id": st.connector_id,
+                "ok": True, "count": result.get("count"),
+                "text": str(result.get("text") or "")[:1000],
+            })
+        ctx["steps"][st.id] = result
+
+    writes: list[dict] = []
+    for st in vspec.write_steps:
+        step_ctx = dict(ctx)
+        step_ctx["grant"] = {"target": st.grant_target or {}}
+        display = _write_display(st)
+        entry = {
+            "step_id": st.id,
+            "account_id": st.connector_id,
+            "what": display.get("what"),
+            "target": display.get("target"),
+            "params": render_with_ctx(st.params_template, step_ctx),
+            "blocked": None,
+        }
+        if st.tool in _FORBIDDEN_TOOLS:
+            # The mail rail. `_run_steps` refuses the whole run here;
+            # the rehearsal reports it against the step that carries it.
+            entry["blocked"] = ("Automations never send mail — this "
+                                "step can only draft.")
+        elif not st.grant_id:
+            entry["blocked"] = "No permission has been asked for yet."
+        elif "{{grant.target." in json.dumps(st.params_template or {}) \
+                and not (st.grant_target or {}).get("id"):
+            entry["blocked"] = "Nothing says where this should go yet."
+        else:
+            grant = await reg.fetch_grant(automation.user_id, st.grant_id)
+            if grant is not None and grant.get("status") != "approved":
+                entry["blocked"] = (
+                    f"The permission it needs is "
+                    f"{grant.get('status') or 'not approved'}.")
+        writes.append(entry)
+
+    return {"rehearsal": True, "sample_event": sample,
+            "reads": reads, "writes": writes}
 
 
 # ── R30: the v3 ledger + narration seams ─────────────────────────────
@@ -1192,6 +1377,74 @@ def _action_record(
     }
 
 
+async def _append_step_turn(
+    db, *, thread, automation: Automation, job_id: str,
+    step: ValidatedStep, result: Optional[dict], ms: int, ok: bool,
+    reason: Optional[str], turn_index: dict,
+) -> None:
+    """One step's mechanical turn, whichever kind of step it is."""
+    if step.kind == "agent":
+        await _append_agent_turn(
+            db, thread=thread, automation=automation, job_id=job_id,
+            step=step, ms=ms, ok=ok, turn_index=turn_index,
+        )
+        return
+    await _append_read_turn(
+        db, thread=thread, automation=automation, job_id=job_id,
+        step=step, result=result, ms=ms, ok=ok, reason=reason,
+        turn_index=turn_index,
+    )
+
+
+async def _append_agent_turn(
+    db, *, thread, automation: Automation, job_id: str,
+    step: ValidatedStep, ms: int, ok: bool, turn_index: dict,
+) -> None:
+    """The mechanical turn for one AGENT step (R38).
+
+    Same `tool` turn as every other step, so the job card counts it and
+    the act page renders it with the rest — a step the user cannot see
+    is a step that cannot be trusted, and the whole reason this kind
+    exists is that a run's judgement should be inspectable.
+
+    Two deliberate choices:
+
+    `tool_kind` is "read" because that field answers exactly one
+    question — did this change something the user owns — and an agent
+    step changes nothing. It is not a claim that a connector was
+    called; `account_id` is empty, which is what every consumer keyed
+    on an account already reads (`ledger._write_episodes`,
+    `automation_verbs.job_card_label`, the home card's touched/failed
+    lists).
+
+    The step's OUTPUT is not here. It is model prose that has passed no
+    copy guard, and the thread's voice belongs to the narrator — which
+    does receive it (`_narrate_phase1`'s record) and may build on it.
+    """
+    if thread is None:
+        return
+    try:
+        from . import ledger as _ledger
+        from app.services import automation_verbs as _verbs
+        act = _verbs.engine_action("think", ok=ok)
+        turn = await _ledger.append_turn(
+            db, user_id=automation.user_id, thread=thread, run_id=job_id,
+            kind="tool",
+            payload={
+                "account_id": "",
+                "tool_kind": "read",
+                "action": act["action"], "detail": act["detail"],
+                "ok": ok, "ms": max(int(ms), 0),
+                "steps": [], "items": [], "actions": [],
+                "write_ids": [], "rest": "",
+            },
+        )
+        turn_index[step.id] = turn
+    except Exception as e:  # noqa: BLE001 — the ledger degrades, the run does not
+        logger.debug("[automations] agent turn skipped step=%s: %s",
+                     step.id, e)
+
+
 async def _append_read_turn(
     db, *, thread, automation: Automation, job_id: str,
     step: ValidatedStep, result: Optional[dict], ms: int, ok: bool,
@@ -1278,11 +1531,15 @@ async def _recall_facts(db, automation: Automation) -> list[dict]:
     try:
         from sqlalchemy import select as _select
         from app.db.models import MemoryFact
+        # R38: `id` as tiebreak — two facts learned in the same second
+        # used to order arbitrarily, so the same run over the same data
+        # could build two different prompts (the narrator is
+        # temperature-0 now; the prompt must be stable too).
         rows = list((await db.execute(
             _select(MemoryFact)
             .where(MemoryFact.user_id == automation.user_id)
             .where(MemoryFact.scope.in_((automation.id, "global")))
-            .order_by(MemoryFact.learned_at.desc())
+            .order_by(MemoryFact.learned_at.desc(), MemoryFact.id)
             .limit(24)
         )).scalars())
         if rows:
@@ -1291,7 +1548,7 @@ async def _recall_facts(db, automation: Automation) -> list[dict]:
         legacy = list((await db.execute(
             _select(AutomationFact)
             .where(AutomationFact.automation_id == automation.id)
-            .order_by(AutomationFact.updated_at.desc())
+            .order_by(AutomationFact.updated_at.desc(), AutomationFact.id)
             .limit(24)
         )).scalars())
         return [{"category": r.category, "text": r.text} for r in legacy]
@@ -1312,6 +1569,7 @@ async def _narrate_phase1(
     db, *, automation: Automation, vspec: ValidatedSpecV2, job_id: str,
     thread, tool_turn_by_step: dict, partial: bool,
     failed_sources: Optional[list] = None,
+    agent_outputs: Optional[dict] = None,
 ) -> Optional[dict]:
     """Run the narrator and persist what may precede the writes: the
     opening agent line + the per-item whys (in-place annotates). The
@@ -1344,9 +1602,70 @@ async def _narrate_phase1(
         if str(narration_hint.get("style") or "") in ("digest", "brief",
                                                       "changes"):
             vocabulary = str(narration_hint["style"])
+
+        # R38 — narration is a VISIBLE step. Both LLM phases together
+        # can take most of a minute, and the last progress frame was the
+        # final read — so the card sat at "step N of N · In progress"
+        # with every step terminal while the brief was being written
+        # (the founder's stuck-99% window, all three runs on 29 August).
+        # The run's visible total extends by ONE step (one, not two:
+        # phase 2 is the same writing, after the flush) and announces
+        # itself in the automation's own narration vocabulary.
+        try:
+            from . import run_v3 as _rv3
+            from .narrator import writing_sentence
+            _n_total = len(vspec.steps) + 1
+            _sentence = writing_sentence(vocabulary)
+            await _ledger.emit_progress(
+                automation.user_id, run_id=job_id,
+                automation_id=automation.id, step=_n_total,
+                total=_n_total, sentence=_sentence,
+                fraction=(_n_total - 1) / _n_total,
+                status="running",
+            )
+            await _rv3.notify_progress(
+                db, automation=automation, job=job, step=_n_total,
+                total=_n_total, sentence=_sentence,
+                fraction=(_n_total - 1) / _n_total,
+            )
+            # The same columns the read loop stamps — the terminal
+            # frame, the park, the home card's fraction and run-now's
+            # 409 sentence all read them back.
+            job.progress_step = _n_total
+            job.progress_total = _n_total
+            await db.flush()
+            await _ledger.emit_activity(
+                automation.user_id, automation_id=automation.id,
+                thread_id=thread.id, run_id=job_id, phase="writing",
+            )
+        except Exception as e:  # noqa: BLE001 — a frame never fails a run
+            logger.debug("[automations] narration step frame skipped: %s", e)
+
         steps_record = []
         from app.services import automation_verbs as _verbs
         for st in vspec.steps:
+            if st.kind == "agent":
+                # R38 — the run's own earlier conclusion, handed back to
+                # the pass that writes the thread. `detail` carries what
+                # it worked out, so the narration can build on it rather
+                # than re-deriving the same judgement from the raw items
+                # (and reaching a different one, at temperature 0, from a
+                # different starting point).
+                turn = tool_turn_by_step.get(st.id) or {}
+                steps_record.append({
+                    "step_ref": st.id,
+                    "connector_name": "",
+                    "account_id": "",
+                    "tool_kind": "agent",
+                    "action": turn.get("action") or "",
+                    "detail": str(
+                        (agent_outputs or {}).get(st.id) or "")[:2000],
+                    "ok": bool(turn.get("ok", True)),
+                    "failure_reason": None,
+                    "items": [],
+                    "write": None,
+                })
+                continue
             if st.mutates:
                 d = _write_display(st)
                 steps_record.append({
@@ -1475,8 +1794,11 @@ async def _apply_annotate(
     row.payload_json = json.dumps(body, default=str)
     await db.commit()
     turn.update(body)
+    # R31 §4.1: every automation frame carries automation_id — the
+    # app-level bridge routes on it (R38: this one was missing it).
     await _ledger._broadcast(automation.user_id, {
         "type": "automation.turn",
+        "automation_id": automation.id,
         "thread_id": row.thread_id,
         "run_id": row.run_id,
         "turn": _ledger._serialize_row(row),
