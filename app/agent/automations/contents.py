@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 
 #: Connectors with a reader. Everything else answers `not_supported`
 #: BY NAME — an unnamed refusal reads as a bug.
-SUPPORTED = ("gmail", "outlook", "slack", "jira", "github")
+SUPPORTED = ("gmail", "outlook", "slack", "jira", "github", "teams",
+             "calendar")
 
 _MAX_GROUPS = 6
 _ITEMS_PER_GROUP = 10
@@ -129,10 +130,11 @@ def _envelope(
 
 
 def _group(key: str, label: str, kind: str, *, items=None,
-           reason: Optional[dict] = None, pinned: bool = False) -> dict:
+           reason: Optional[dict] = None, pinned: bool = False,
+           pin: Optional[dict] = None) -> dict:
     return {"key": key, "label": label, "kind": kind,
             "items": list(items or []), "reason": reason,
-            "pinned": bool(pinned)}
+            "pinned": bool(pinned), "pin": pin}
 
 
 # ── time ─────────────────────────────────────────────────────────────
@@ -202,6 +204,38 @@ def _clip(text: Any, n: int = 160) -> str:
     return s[:n]
 
 
+def _strip_html(text: Any) -> str:
+    """Teams bodies arrive as HTML (`body_content_type: 'html'`); ink on
+    the phone must never carry markup."""
+    import re
+    return re.sub(r"<[^>]+>", " ", str(text or ""))
+
+
+# ── pins ─────────────────────────────────────────────────────────────
+#
+# R39. Every row and group carries `pin`: the focus entry that tapping
+# "+" on it MEANS, in the `FOCUS_KINDS` vocabulary the pin endpoint
+# accepts. The app sends it VERBATIM. Before this the app invented a
+# kind from its icon vocabulary ('slack', 'jira', 'email'→'thread') and
+# every Slack/Jira/GitHub pin was refused `bad_focus_kind` — while a
+# Gmail row pinned a bare message id as a 'thread', which is the
+# "(no sub…" ghost chip on the founder's canvas. `pin: null` means the
+# row is information, not a place — the app draws no "+" on it.
+
+def _pin(kind: str, target_id: Any, label: Any) -> Optional[dict]:
+    tid = str(target_id or "").strip()
+    if not tid:
+        return None
+    return {"kind": kind, "id": tid, "label": _clip(label, 80) or tid}
+
+
+def _from_header(value: Any) -> tuple[str, str]:
+    """RFC 5322 From → (display name, address). Either may be ''."""
+    from email.utils import parseaddr
+    name, addr = parseaddr(str(value or ""))
+    return _clip(name, 80), addr.strip().lower()
+
+
 # ── dispatch ─────────────────────────────────────────────────────────
 
 async def _call(
@@ -245,13 +279,15 @@ def _mail_items(messages: list, connector_id: str) -> list[dict]:
             continue
         if connector_id == "gmail":
             headers = m.get("headers") or {}
-            sender = _clip(headers.get("From"), 80)
+            raw_from = headers.get("From")
             subject = _clip(headers.get("Subject"), 120)
             at = _iso(headers.get("Date"))
         else:
-            sender = _clip(m.get("from"), 80)
+            raw_from = m.get("from")
             subject = _clip(m.get("subject"), 120)
             at = _iso(m.get("received_at"))
+        name, addr = _from_header(raw_from)
+        sender = name or addr or _clip(raw_from, 80)
         snippet = _clip(m.get("snippet") or m.get("preview"), 140)
         sub = f"{sender} — {snippet}" if sender and snippet else (
             sender or snippet)
@@ -261,6 +297,10 @@ def _mail_items(messages: list, connector_id: str) -> list[dict]:
             "title": subject or "(no subject)",
             "sub": sub,
             "at": at,
+            # Pinning a mail means "this SENDER matters" — the reader
+            # turns a person pin into its own from: group. A message id
+            # is not a place anything can start from.
+            "pin": _pin("person", addr, sender),
         })
     return items
 
@@ -287,9 +327,16 @@ async def _read_mail(user_id: str, connector_id: str, focus: list) -> dict:
     if not queries:
         queries = [("recent", "Recent", "", False)]
 
+    # include_body means a DIFFERENT thing per provider: outlook's False
+    # still $selects subject/from/preview, gmail's False strips the list
+    # to bare {id, threadId} — which is how every Gmail row rendered as
+    # "(no subject)" with no sender and no time (R39). Gmail needs True
+    # to get headers + snippet at all; ten parallel fetches sit well
+    # inside _CALL_TIMEOUT_S.
     results = await _gather([
         _call(user_id, connector_id, tool,
-              {"max_results": _ITEMS_PER_GROUP, "include_body": False,
+              {"max_results": _ITEMS_PER_GROUP,
+               "include_body": connector_id == "gmail",
                **({"query": q} if q else {})})
         for _k, _l, q, _p in queries
     ])
@@ -352,10 +399,11 @@ async def _read_slack(user_id: str, connector_id: str, focus: list) -> dict:
     ])
     groups, hard_reason = [], None
     for (cid, label, is_pin), (content, reason) in zip(channels, results):
+        chan_pin = _pin("channel", cid, label)
         if reason is not None:
             hard_reason = hard_reason or reason
             groups.append(_group(cid, label, "channel", reason=reason,
-                                 pinned=is_pin))
+                                 pinned=is_pin, pin=chan_pin))
             continue
         items = []
         for m in (content.get("messages") or [])[:_ITEMS_PER_GROUP]:
@@ -367,9 +415,14 @@ async def _read_slack(user_id: str, connector_id: str, focus: list) -> dict:
                 "title": _clip(m.get("from"), 80) or "(app)",
                 "sub": _clip(m.get("text"), 160),
                 "at": _iso(m.get("ts")),
+                # A Slack message is not a place; its CHANNEL is. This
+                # is also what makes "+ on all-toup" set the start (and,
+                # for the write connector, the destination — see
+                # add_focus) instead of 409ing.
+                "pin": chan_pin,
             })
         groups.append(_group(cid, label, "channel", items=items,
-                             pinned=is_pin))
+                             pinned=is_pin, pin=chan_pin))
     if hard_reason is not None and all(g["reason"] for g in groups):
         return _envelope(connector_id, focus=focus, reason=hard_reason)
     return _envelope(connector_id, focus=focus, groups=groups)
@@ -397,12 +450,17 @@ async def _read_jira(user_id: str, connector_id: str, focus: list) -> dict:
         if not isinstance(i, dict):
             continue
         due = _iso(i.get("duedate"))
+        key = str(i.get("key") or "")
+        # "SCRUM-1" → project "SCRUM": the container the reader can
+        # actually scope a JQL to. A pinned single ticket steers nothing.
+        proj = key.rsplit("-", 1)[0] if "-" in key else ""
         row = {
-            "id": str(i.get("key") or ""),
+            "id": key,
             "kind": "ticket",
             "title": f"{i.get('key')} · {_clip(i.get('summary'), 110)}",
             "sub": _clip(i.get("status") or "", 60),
             "at": due or _iso(i.get("updated")),
+            "pin": _pin("project", proj, proj),
         }
         # The due date is the whole reason this list is ordered the way
         # it is, so it is stated rather than left as a bare timestamp
@@ -461,10 +519,11 @@ async def _read_github(user_id: str, connector_id: str, focus: list) -> dict:
     groups, hard_reason = [], None
     for (owner, repo), (content, reason) in zip(pairs, results):
         key = f"{owner}/{repo}"
+        repo_pin = _pin("repo", key, key)
         if reason is not None:
             hard_reason = hard_reason or reason
             groups.append(_group(key, key, "repo", reason=reason,
-                                 pinned=pinned))
+                                 pinned=pinned, pin=repo_pin))
             continue
         items = [
             {
@@ -474,15 +533,127 @@ async def _read_github(user_id: str, connector_id: str, focus: list) -> dict:
                 "sub": f"#{i.get('number')} · {i.get('user') or ''}".strip(
                     " ·"),
                 "at": None,
+                "pin": repo_pin,
             }
             for i in (content.get("issues") or [])
             if isinstance(i, dict) and i.get("is_pull_request")
         ]
         groups.append(_group(key, key, "repo",
-                             items=items[:_ITEMS_PER_GROUP], pinned=pinned))
+                             items=items[:_ITEMS_PER_GROUP], pinned=pinned,
+                             pin=repo_pin))
     if hard_reason is not None and all(g["reason"] for g in groups):
         return _envelope(connector_id, focus=focus, reason=hard_reason)
     return _envelope(connector_id, focus=focus, groups=groups)
+
+
+async def _read_teams(user_id: str, connector_id: str, focus: list) -> dict:
+    """teams — recent messages per chat, newest chats first.
+
+    R39: Teams was not in SUPPORTED at all, so the ONE connector the
+    Morning work brief actually reads a chat from answered "There is no
+    way to look inside Teams yet." — with an expired credential
+    underneath that the sheet therefore never surfaced either.
+    """
+    pinned = [p for p in focus if p.get("kind") in ("thread", "channel")]
+    chats: list[tuple[str, str, bool]] = [
+        (str(p.get("id")), str(p.get("label") or p.get("id")), True)
+        for p in pinned[:_MAX_GROUPS]
+    ]
+    if not chats:
+        content, reason = await _call(
+            user_id, connector_id, "teams__list_chats",
+            {"max_results": 25},
+        )
+        if reason is not None:
+            return _envelope(connector_id, focus=focus, reason=reason)
+        rows = [c for c in (content.get("chats") or [])
+                if isinstance(c, dict) and c.get("id")]
+
+        def _chat_label(c: dict) -> str:
+            if c.get("topic"):
+                return _clip(c["topic"], 60)
+            names = [m.get("display_name") or m.get("displayName") or ""
+                     for m in (c.get("members") or []) if isinstance(m, dict)]
+            names = [n for n in names if n]
+            return _clip(", ".join(names[:3]), 60) or "Chat"
+
+        chats = [(str(c["id"]), _chat_label(c), False)
+                 for c in rows[:_MAX_GROUPS]]
+        if not chats:
+            return _envelope(connector_id, focus=focus, groups=[])
+
+    results = await _gather([
+        _call(user_id, connector_id, "teams__read_chat_messages",
+              {"chat_id": cid, "max_results": _ITEMS_PER_GROUP})
+        for cid, _label, _p in chats
+    ])
+    groups, hard_reason = [], None
+    for (cid, label, is_pin), (content, reason) in zip(chats, results):
+        chat_pin = _pin("thread", cid, label)
+        if reason is not None:
+            hard_reason = hard_reason or reason
+            groups.append(_group(cid, label, "channel", reason=reason,
+                                 pinned=is_pin, pin=chat_pin))
+            continue
+        items = []
+        for m in (content.get("messages") or [])[:_ITEMS_PER_GROUP]:
+            if not isinstance(m, dict) or m.get("deleted_at"):
+                continue
+            body = m.get("body") or ""
+            if (m.get("body_content_type") or "").lower() == "html":
+                body = _strip_html(body)
+            items.append({
+                "id": str(m.get("id") or ""),
+                "kind": "message",
+                "title": _clip(m.get("sender"), 80) or "(system)",
+                "sub": _clip(body, 160),
+                "at": _iso(m.get("created_at")),
+                "pin": chat_pin,
+            })
+        groups.append(_group(cid, label, "channel", items=items,
+                             pinned=is_pin, pin=chat_pin))
+    if hard_reason is not None and all(g["reason"] for g in groups):
+        return _envelope(connector_id, focus=focus, reason=hard_reason)
+    return _envelope(connector_id, focus=focus, groups=groups)
+
+
+async def _read_calendar(user_id: str, connector_id: str, focus: list) -> dict:
+    """calendar — what is coming up, soonest first. Events are moments,
+    not places, so the rows carry no pin."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    content, reason = await _call(
+        user_id, connector_id, "calendar__list_events",
+        {"max_results": _ITEMS_PER_GROUP,
+         "time_min": now.replace(microsecond=0).isoformat(),
+         "time_max": (now + timedelta(days=7)).replace(
+             microsecond=0).isoformat()},
+    )
+    if reason is not None:
+        return _envelope(connector_id, focus=focus, reason=reason)
+    items = []
+    for ev in (content.get("events") or []):
+        if not isinstance(ev, dict):
+            continue
+        start = ev.get("start") or {}
+        at = _iso(start.get("dateTime") or start.get("date"))
+        bits = []
+        if ev.get("location"):
+            bits.append(_clip(ev["location"], 60))
+        n = ev.get("attendee_count")
+        if isinstance(n, int) and n > 1:
+            bits.append(f"{n} people")
+        items.append({
+            "id": str(ev.get("id") or ""),
+            "kind": "event",
+            "title": _clip(ev.get("summary"), 120) or "(untitled)",
+            "sub": " · ".join(bits),
+            "at": at,
+            "pin": None,
+        })
+    return _envelope(connector_id, focus=focus, groups=[
+        _group("upcoming", "Coming up", "events", items=items),
+    ])
 
 
 _READERS = {
@@ -491,6 +662,8 @@ _READERS = {
     "slack": _read_slack,
     "jira": _read_jira,
     "github": _read_github,
+    "teams": _read_teams,
+    "calendar": _read_calendar,
 }
 
 
@@ -510,13 +683,10 @@ async def account_contents(
     """
     focus = list(focus or [])
     name = verbs.display_name(connector_id) or connector_id
-    reader = _READERS.get(connector_id)
-    if reader is None:
-        return _envelope(connector_id, focus=focus, reason={
-            "code": "not_supported",
-            "sentence": f"There is no way to look inside {name} yet.",
-            "retryable": False,
-        })
+    # Connection state FIRST: an expired credential is the truer answer
+    # than "no way to look inside" for a connector with no reader, and
+    # the one with a Reconnect action on it (R39 — Teams wore its
+    # expiry only as a canvas ring).
     if connection is not None:
         status = str(connection.get("status") or "")
         if not connection.get("connected"):
@@ -534,6 +704,13 @@ async def account_contents(
                 "retryable": False,
                 "consent_url": f"/api/oauth/connect/{connector_id}",
             })
+    reader = _READERS.get(connector_id)
+    if reader is None:
+        return _envelope(connector_id, focus=focus, reason={
+            "code": "not_supported",
+            "sentence": f"There is no way to look inside {name} yet.",
+            "retryable": False,
+        })
     try:
         env = await asyncio.wait_for(
             reader(user_id, connector_id, focus), _TOTAL_TIMEOUT_S,

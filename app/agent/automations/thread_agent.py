@@ -269,10 +269,19 @@ def _setup_lines(automation: Automation) -> list[str]:
             "- Delivers: its brief lands here in this thread (with a card "
             "in the main chat) — it writes to no outside service."
         )
+    # R39: "is it pinned?" is workflow.run_blockers' call, the same
+    # predicate run-now refuses on — this block used to read only the
+    # target label, so the agent could assert a state the gate would
+    # contradict one tap later.
+    try:
+        blocked = {(b.get("connector_id"), b.get("tool"))
+                   for b in workflow.run_blockers(raw)}
+    except Exception:  # noqa: BLE001 — grounding, not a gate
+        blocked = set()
     for _cid, tool, target in writes:
         clause = verbs._WRITE_CLAUSES.get(tool) or "write"
         label = (target or {}).get("label") or (target or {}).get("id")
-        if label:
+        if label and (_cid, tool) not in blocked:
             lines.append(f"- Delivers: it can {clause} — pinned to {label}.")
         else:
             lines.append(

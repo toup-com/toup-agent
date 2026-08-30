@@ -381,7 +381,11 @@ def test_debt_is_not_growing_silently():
     # tables, so listing them is how they reach the runner that can.
     # The first two landed UNLISTED against this ceiling — the same
     # mis-invocation R31 documents above, one round later.
-    CEILING = 91
+    # R39: +1 for test_r39_canvas_pins.py — the round's pin/blocker/
+    # trigger/scope suite drives the same AGENT_ONLY rows through the
+    # same writers as the R38 trio and RUNS in the agent-mode step. A
+    # ROUTING entry, not an excuse.
+    CEILING = 92
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

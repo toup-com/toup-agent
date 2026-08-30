@@ -1033,21 +1033,19 @@ async def run_now(automation_id: str):
         # dispatcher's grant gate wearing a read's clothes, and the
         # thread reported "Could not reach Gmail" about a permission
         # that was simply never asked for. Refuse with the true need.
+        # R39: the predicate is workflow.run_blockers — the ONE shared
+        # with the thread agent's grounding and the setup copy, so no
+        # surface can promise a run this gate refuses.
         from app.services import automation_verbs as _verbs
+        from app.agent.automations import workflow as _wf
+        blockers = _wf.run_blockers(_wf._spec_raw(automation))
+        if blockers:
+            await _refuse_run_now(
+                db, automation, code="needs_setup",
+                sentence=(f"It is not finished being set up — "
+                          f"{blockers[0]['sentence']}."),
+            )
         for st in vspec.write_steps:
-            needs_pin = ("{{grant.target." in json.dumps(
-                st.params_template or {},
-            ) and not (st.grant_target or {}).get("id"))
-            if needs_pin or not st.grant_id:
-                clause = _verbs._WRITE_CLAUSES.get(st.tool) or "write"
-                await _refuse_run_now(
-                    db, automation, code="needs_setup",
-                    sentence=(
-                        f"It is not finished being set up — before it "
-                        f"can {clause}, tell me where that should go "
-                        f"and I will pin it."
-                    ),
-                )
             # R37: a pinned step whose grant the user has not yet
             # approved used to pass this gate and fire — the reads ran
             # and the write met the dispatcher's fail-closed refusal,
@@ -1105,6 +1103,12 @@ def _detach_run_now(automation_id: str, user_id: str, source_id: str,
             _load_owned, AutomationNotFound, parse_spec_live,
         )
         from app.agent.automations.executor_v2 import run_schedule_fire_v2
+        # R39: the route already answered {"fired": true} and the app has
+        # painted its optimistic STARTED — so a death IN HERE, before the
+        # run's own ledger exists, used to be perfect silence (the log
+        # line is the operator's, not the user's). Anything that stops
+        # the fire without a run record now says so in the thread.
+        failure: Optional[str] = None
         try:
             async with async_session_maker() as db:
                 try:
@@ -1119,17 +1123,36 @@ def _detach_run_now(automation_id: str, user_id: str, source_id: str,
                 ) or (vspec.sources[0] if getattr(vspec, "sources", None)
                       else None)
                 if source is None:
-                    return
-                status = await run_schedule_fire_v2(
-                    db, automation, vspec, source,
-                    fire_key=fire_key, run_kind="run_now",
-                )
-                logger.info("[automations] run-now detached finished "
-                            "automation=%s status=%s", automation_id, status)
+                    failure = ("It could not start — its trigger is "
+                               "missing. Open the workflow and check it.")
+                else:
+                    status = await run_schedule_fire_v2(
+                        db, automation, vspec, source,
+                        fire_key=fire_key, run_kind="run_now",
+                    )
+                    logger.info("[automations] run-now detached finished "
+                                "automation=%s status=%s",
+                                automation_id, status)
+                    if status == "drained":
+                        failure = ("It could not start just now — the "
+                                   "platform is mid-update. Try again in "
+                                   "a minute.")
         except Exception:  # noqa: BLE001 — the run's own record is the
-            # user-facing account; this log line is the operator's.
+            # user-facing account once a job exists; this line plus the
+            # turn below cover the window before it does.
             logger.exception("[automations] run-now detached crashed "
                              "automation=%s", automation_id)
+            failure = ("It could not start just now. Nothing ran — "
+                       "try it again.")
+        if failure:
+            try:
+                async with async_session_maker() as db:
+                    automation = await _load_owned(db, automation_id,
+                                                   user_id)
+                    await _run_now_refusal_turn(db, automation, failure)
+            except Exception:  # noqa: BLE001
+                logger.exception("[automations] run-now failure turn "
+                                 "skipped automation=%s", automation_id)
 
     task = _asyncio.create_task(_go())
     _RUN_NOW_TASKS.add(task)
@@ -1533,9 +1556,19 @@ async def post_workflow_commit(automation_id: str, body: CommitBody):
                 **(e.extra or {}),
             })
         except MembershipError as e:
+            # R39: the real reason, not a shrug — "That change was
+            # refused." hid `no_schedule` behind copy that blamed
+            # nobody, while the sheet had just offered a clock for an
+            # event trigger (founder P12).
             raise HTTPException(status_code=409, detail={
                 "code": "refused", "item": e.code,
-                "sentence": "That change was refused.",
+                "sentence": {
+                    "no_schedule": "This one starts on its own trigger "
+                                   "— there is no clock to set.",
+                    "bad_schedule": "That time did not make sense — "
+                                    "pick it again.",
+                    "already_member": "That account is already on it.",
+                }.get(e.code, "That change was refused."),
             })
         if out.get("code") == "stale":
             raise HTTPException(status_code=409, detail=out)
@@ -1793,6 +1826,9 @@ class FocusBody(BaseModel):
     kind: str = Field(..., max_length=24)
     id: str = Field(..., min_length=1, max_length=200)
     label: Optional[str] = Field(default=None, max_length=120)
+    # R39 — the user's instruction for this place; re-posting the same
+    # (kind, id) with a new note updates it.
+    note: Optional[str] = Field(default=None, max_length=280)
 
 
 @router.post("/{automation_id}/workflow/accounts/{account_id}/focus")
@@ -1810,6 +1846,9 @@ async def post_account_focus(automation_id: str, account_id: str,
                 db, automation=automation, user_id=_user_id(),
                 account_id=account_id, kind=body.kind,
                 target_id=body.id, label=body.label or "",
+                # None ≠ "" here: absent means "no note intent", empty
+                # means "clear it" — a bare "+" must never clear.
+                note=body.note,
             )
         except AutomationNotFound:
             raise HTTPException(status_code=404, detail="Not found")
@@ -2156,8 +2195,16 @@ async def from_template(body: FromTemplateBody):
                     logger.warning(
                         "[automations] grant ask skipped: %s", e,
                     )
+            from app.agent.automations.workflow import (
+                _spec_raw as _sr, run_blockers as _rb,
+            )
+            try:
+                _blocked = bool(_rb(_sr(automation)))
+            except Exception:  # noqa: BLE001
+                _blocked = False
             drafts = setup_turns(mode, _label, first_run,
-                                 accounts=account_scopes)
+                                 accounts=account_scopes,
+                                 blocked=_blocked)
             for d in drafts or []:
                 kind = d.get("kind")
                 if kind in ("agent", "think"):
@@ -2197,6 +2244,18 @@ async def from_template(body: FromTemplateBody):
         from app.agent.automations.service import automation_payload
         payload = automation_payload(automation)
         payload["armed"] = armed
+        # R39 (founder P20): creation emitted NO summary frame, and this
+        # response is the spec payload, not the §4.1 row — so the app's
+        # optimistic card kept its empty meta ("" where "First run soon ·
+        # 1 account · asks first" belongs) until the next full summary
+        # load. emit_updated serves the real row the way every other
+        # mutation already does.
+        try:
+            await _ledger.emit_updated(
+                db, _user_id(), automation_id=automation.id,
+            )
+        except Exception as e:  # noqa: BLE001 — the create stands
+            logger.warning("[automations] create emit_updated skipped: %s", e)
         return {"automation": payload, "thread_id": thread.id,
                 "build_history": _build.read(automation)}
 

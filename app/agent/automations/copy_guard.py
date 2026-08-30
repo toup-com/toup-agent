@@ -67,6 +67,11 @@ WHITELIST_EXACT: tuple[str, ...] = (
     "automation · mobile · routine",
     "Edit workflow",
     "Workflow",
+    # R38/R39: the app buttons that OPEN the canvas name their destination
+    # for VoiceOver — accessibilityLabels, never drawn text.
+    "Open the workflow",
+    "Open the workflow for ",
+    "Edit the workflow",
 )
 
 #: UI glyphs that are not emoji.

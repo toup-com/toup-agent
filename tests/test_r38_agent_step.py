@@ -653,6 +653,10 @@ def test_the_canvas_names_the_step_without_inventing_an_account():
     automation = type("A", (), {"steps_human_json": None})()
     steps = workflow._steps_human(automation, raw)
     assert [s["n"] for s in steps] == [1, 2, 3]
-    assert steps[1]["text"] == "Thought it through"
+    # R39: the steps SHEET is the plan ("WHAT IT DOES, IN ORDER"), so the
+    # verb dictionary's past tense is re-tensed at this read boundary —
+    # `verbs.plan_action`. The pin this test exists for is the line below:
+    # the step must not be named after an account it does not have.
+    assert steps[1]["text"] == "Thinks it through"
     assert steps[1]["sub"].startswith("Rank these by what blocks someone")
     assert "account" not in steps[1]["text"].lower()

@@ -144,6 +144,7 @@ def setup_turns(
     scope_lines: list[dict] | None = None,
     *,
     accounts: list[dict] | None = None,
+    blocked: bool = False,
 ) -> list[dict]:
     """TurnDrafts for a fresh setup thread, in order.
 
@@ -191,7 +192,14 @@ def setup_turns(
     label = (first_run_label or "tonight").strip() or "tonight"
     if label[:1].isupper() and not label.startswith("I "):
         label = label[:1].lower() + label[1:]
-    if mode == "drafts_only" and label == "tonight":
+    if blocked:
+        # R39 (founder P6): never promise "First run is soon" about an
+        # automation `workflow.run_blockers` says cannot fire — that
+        # close stood in the same thread as run-now's needs_setup 409.
+        # The blocker itself was already asked for two bubbles up.
+        close = ("It runs the moment that is picked, and every step "
+                 "will be here.")
+    elif mode == "drafts_only" and label == "tonight":
         close = _CANVAS_DRAFTS_CLOSE
     else:
         close = f"First run is {label}. {_CLOSES[mode]}"

@@ -187,9 +187,15 @@ async def compile_describe(db, *, user_id: str, text: str, complete=None) -> dic
                   "steps": []}]
                 if automation.connector_id else []
             )
+        from app.agent.automations.workflow import run_blockers as _rb
+        try:
+            _blocked = bool(_rb(raw))
+        except Exception:  # noqa: BLE001
+            _blocked = False
         for d in setup_turns(mode, label,
                              sched.get("sentence") or "when you arm it",
-                             accounts=account_scopes):
+                             accounts=account_scopes,
+                             blocked=_blocked):
             kind = d.get("kind")
             if kind in ("agent", "think"):
                 await _ledger.append_turn(

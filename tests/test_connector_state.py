@@ -21,7 +21,12 @@ Proves, against real rows:
     with no thread is re-armed but skipped silently from `noted`;
     an automation that never references the connector is untouched;
   - `on_connector_expired` emits the `expired` frame and pauses
-    NOTHING — the run-level failure path owns pausing.
+    NOTHING — the run-level failure path owns pausing;
+  - R39: it does ANNOUNCE — exactly one deduped `needs_you` turn on
+    each armed automation's thread (a Friday-evening expiry used to
+    surface nothing until Monday's run), and a repeat expiry while
+    that card is still the thread's most recent needs_you stacks no
+    duplicate.
 """
 
 import json
@@ -283,3 +288,74 @@ async def test_expired_emits_frame_and_pauses_nothing(monkeypatch):
         row = await db.get(Automation, a.id)
         assert row.status == "armed"
         assert row.paused_reason is None
+
+
+@pytest.mark.asyncio
+async def test_expired_announces_once_on_the_armed_thread(monkeypatch):
+    """R39: `paused_reason="connector_reauth"` has NO writer, so the
+    "run-level failure path" the expiry leg deferred to only speaks when
+    a run fires — a Friday-evening expiry surfaced nothing until Monday
+    8:00. The hook now appends ONE `needs_you` turn per armed automation
+    on that connector, broadcast like any other turn, and a repeat
+    expiry while that card is still the thread's most recent needs_you
+    stacks no duplicate."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    a = await _mk_automation(uid, connector_id="gmail", status="armed")
+    # A paused sibling and an armed stranger both stay silent.
+    a_paused = await _mk_automation(uid, connector_id="gmail",
+                                    status="paused")
+    a_other = await _mk_automation(uid, connector_id="jira", status="armed")
+    threads = {}
+    async with async_session_maker() as db:
+        for row in (a, a_paused, a_other):
+            t = await ledger.ensure_thread(
+                db, user_id=uid, automation_id=row.id)
+            threads[row.id] = t.id
+        await db.commit()
+
+    async with async_session_maker() as db:
+        await connector_state.on_connector_expired(
+            db, user_id=uid, connector_id="gmail", error="reauth_required",
+        )
+
+    async def _turns_of(thread_id):
+        async with async_session_maker() as db:
+            return (await db.execute(
+                select(AutomationTurn)
+                .where(AutomationTurn.thread_id == thread_id)
+                .order_by(AutomationTurn.seq)
+            )).scalars().all()
+
+    turns = await _turns_of(threads[a.id])
+    assert [t.kind for t in turns] == ["needs_you"]
+    body = json.loads(turns[0].payload_json)
+    assert body["account_id"] == "gmail"
+    assert body["connector_id"] == "gmail"
+    assert body["fix"] == "reconnect"          # a credential problem
+    assert body["name"] and body["sentence"]   # named, in words
+    assert turns[0].run_id is None             # no run fired — that is the point
+    for silent in (a_paused.id, a_other.id):
+        assert await _turns_of(threads[silent]) == []
+
+    # Broadcast rode the same wire as every turn, attributed.
+    turn_frames = [f for _, f in frames if f["type"] == "automation.turn"]
+    assert len(turn_frames) == 1
+    assert turn_frames[0]["automation_id"] == a.id
+    assert turn_frames[0]["turn"]["kind"] == "needs_you"
+
+    # A second expiry event while the card is still current: no stack.
+    async with async_session_maker() as db:
+        await connector_state.on_connector_expired(
+            db, user_id=uid, connector_id="gmail", error="reauth_required",
+        )
+    assert len(await _turns_of(threads[a.id])) == 1
+
+    # A TRANSIENT flip announces nothing — the account stays `connected`
+    # and a reconnect card for a vendor's bad minute is the §4.4
+    # inversion.
+    async with async_session_maker() as db:
+        await connector_state.on_connector_expired(
+            db, user_id=uid, connector_id="jira", error="provider_down",
+        )
+    assert await _turns_of(threads[a_other.id]) == []

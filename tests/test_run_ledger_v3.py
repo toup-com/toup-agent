@@ -1078,6 +1078,87 @@ async def test_a_stopped_run_says_whether_anything_was_sent(monkeypatch):
     assert said2 == "Paused at step 6. 2 changes already made.", said2
 
 
+@pytest.mark.asyncio
+async def test_r39_an_armed_automation_with_an_expired_account_needs_you(
+    monkeypatch,
+):
+    """R39 (founder recording): Teams access expired for 8+ hours and
+    the summary row said "On" with a "pause" action throughout, because
+    `_status_of` answered ('active', 'On') for any armed row before
+    expired accounts were considered — `expired_name` was computed and
+    then consumed only under a status an armed row could never reach
+    (needs_attention required a.status == 'error' or a paused_reason,
+    and an expiry writes neither). The row must come out
+    needs_attention, with the reconnect action, and the meta must NAME
+    the account."""
+    from app.agent.automations.summary import summary_payload
+
+    async def _conn(user_id):
+        return {"jira": {"connector_id": "jira", "connected": True,
+                         "status": "reauth_required", "account": "TP"},
+                "slack": {"connector_id": "slack", "connected": True,
+                          "status": "active", "account": "ws"}}
+
+    async def _reg(user_id, force=False):
+        return REGISTRY_V2
+
+    async def _tpl(user_id):
+        return []
+
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_connection_state", _conn)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_registry", _reg)
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_templates", _tpl)
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    assert a.status == "armed"
+    # A completed run on record — the founder's row had months of them,
+    # and `last is None` owns the meta chain's first branch.
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=str(uuid.uuid4()), user_id=uid, title="run", prompt="",
+            job_type="automation_run", status="completed",
+            source_kind="automation", source_id=a.id,
+            completed_at=datetime.utcnow(),
+            config_json={"accounts_touched": ["jira", "slack"]},
+        ))
+        await db.commit()
+
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    row = payload["automations"][0]
+    assert row["status"] == "needs_attention", row
+    assert row["pill"] == "Needs you", row["pill"]
+    # The one blue action is the fix, not "pause".
+    assert row["action"] == "reconnect", row["action"]
+    # The meta names WHICH account — "6 accounts · needs reconnecting"
+    # withheld the one fact the line exists for.
+    assert "Jira needs reconnecting" in row["meta"], row["meta"]
+    # And the description names it too (the existing needs_attention
+    # sentence, now reachable for an armed row).
+    assert row["description"].startswith("Jira needs you."), (
+        row["description"])
+
+    # A healthy armed sibling still reads active · On — the flip is
+    # gated on the expiry, not on being armed.
+    b = await _mk_automation_v2(uid, _v2_spec(name="Healthy brief"))
+    async def _conn_ok(user_id):
+        return {"jira": {"connector_id": "jira", "connected": True,
+                         "status": "active", "account": "TP"},
+                "slack": {"connector_id": "slack", "connected": True,
+                          "status": "active", "account": "ws"}}
+    monkeypatch.setattr(
+        "app.agent.automations.registry.fetch_connection_state", _conn_ok)
+    async with async_session_maker() as db:
+        payload = await summary_payload(db, user_id=uid)
+    healthy = next(r for r in payload["automations"] if r["id"] == b.id)
+    assert healthy["status"] == "active"
+    assert healthy["pill"] == "On"
+
+
 # ── R35: the failed write's card, and Try again re-sending it ──────────
 
 
@@ -1585,3 +1666,110 @@ def test_progress_step_is_the_step_being_started_everywhere():
     assert pct(3, 5) == 40
     assert pct(1, 5) == 0
     assert pct(0, 0) == 0
+
+
+# ── R39: the capability check, corrected where it is served ──────────
+
+
+@pytest.mark.asyncio
+async def test_r39_legacy_capability_turns_are_corrected_at_the_read_boundary():
+    """Capability-check turns persisted before R38 stamped the
+    AUTOMATION-level mode label ("posts") on every account's row —
+    read-only ones included — and R38 fixed only the MINT sites, so a
+    thread's immutable pre-R38 rows kept lying. And every seeded row
+    hardcodes ok:True / ms:0, which the app rendered as "all six green
+    at 0.1s" — a timed health claim nothing ever measured.
+
+    `list_turns` must serve the read-only account "reads only", keep the
+    writer's mode label, and stamp `synthetic: true` on every seeded
+    capability row — while a REAL probed tool turn passes through
+    untouched."""
+    from app.agent.automations import ledger
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())  # jira reads, slack writes
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid,
+                                            automation_id=a.id)
+        # The pre-R38 stamp, verbatim: the automation's own mode label
+        # on BOTH accounts.
+        for cid in ("jira", "slack"):
+            await ledger.append_turn(
+                db, user_id=uid, thread=thread, run_id=None, kind="tool",
+                payload={"account_id": cid, "tool_kind": "read",
+                         "action": "Checked what I can do",
+                         "detail": "posts to #platform",
+                         "ok": True, "ms": 0, "steps": [], "items": []},
+            )
+        # A real, timed read beside them must not be touched.
+        from app.services import automation_verbs as verbs
+        real = verbs.turn_action("jira", "jira__search_issues",
+                                 kind="read", ok=True)
+        await ledger.append_turn(
+            db, user_id=uid, thread=thread, run_id=None, kind="tool",
+            payload={"account_id": "jira", "tool_kind": "read",
+                     "action": real["action"], "detail": "2 issues",
+                     "ok": True, "ms": 840, "steps": [], "items": []},
+        )
+        thread_id = thread.id
+
+    async with async_session_maker() as db:
+        turns, _ = await ledger.list_turns(db, thread_id=thread_id)
+    caps = {t["account_id"]: t for t in turns
+            if t.get("action") == "Checked what I can do"}
+    assert set(caps) == {"jira", "slack"}
+    # The read boundary re-derives the R38 mint rule.
+    assert caps["jira"]["detail"] == "reads only", caps["jira"]
+    assert caps["slack"]["detail"] == "posts to #platform", caps["slack"]
+    # Seeded rows are marked as a LISTING, not a timed probe.
+    assert caps["jira"]["synthetic"] is True
+    assert caps["slack"]["synthetic"] is True
+    # The probed turn keeps its own record — no stamp, no rewrite.
+    probed = next(t for t in turns if t.get("action") == real["action"])
+    assert "synthetic" not in probed
+    assert probed["detail"] == "2 issues"
+    assert probed["ms"] == 840
+
+
+@pytest.mark.asyncio
+async def test_r39_capability_correction_is_shape_tolerant():
+    """A capability row the ctx cannot attribute (no account_id), or a
+    thread whose automation row is GONE, passes through untouched — the
+    correction must never cost a thread its read. The synthetic stamp
+    needs no ctx and survives both."""
+    from app.agent.automations import ledger
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(db, user_id=uid,
+                                            automation_id=a.id)
+        # The pre-R35 single flattened shape: no per-account chip.
+        await ledger.append_turn(
+            db, user_id=uid, thread=thread, run_id=None, kind="tool",
+            payload={"account_id": "", "tool_kind": "read",
+                     "action": "Checked what I can do",
+                     "detail": "posts to #platform",
+                     "ok": True, "ms": 0, "steps": [], "items": []},
+        )
+        thread_id = thread.id
+
+    async with async_session_maker() as db:
+        turns, _ = await ledger.list_turns(db, thread_id=thread_id)
+    cap = next(t for t in turns
+               if t.get("action") == "Checked what I can do")
+    assert cap["detail"] == "posts to #platform"   # unattributable: kept
+    assert cap["synthetic"] is True
+
+    # A spec the ctx cannot parse: the ctx answers None and the stored
+    # detail is served verbatim rather than the read failing.
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.spec_json = "{not json"
+        await db.commit()
+    async with async_session_maker() as db:
+        turns, _ = await ledger.list_turns(db, thread_id=thread_id)
+    cap = next(t for t in turns
+               if t.get("action") == "Checked what I can do")
+    assert cap["detail"] == "posts to #platform"
+    assert cap["synthetic"] is True

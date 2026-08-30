@@ -289,7 +289,12 @@ async def arm_automation(
             for s in steps:
                 g = grants.get(s.get("id"))
                 if g is not None:
-                    s["grant_target"] = g.get("target") or {}
+                    # R39: keep the step's own pinned target when the
+                    # platform's grant echo omits `target` — overwriting
+                    # with {} un-pinned a destination the user had just
+                    # set, one re-arm later.
+                    s["grant_target"] = (g.get("target")
+                                         or s.get("grant_target") or {})
             raw["steps"] = steps
             automation.spec_json = json.dumps(raw, sort_keys=True)
     else:

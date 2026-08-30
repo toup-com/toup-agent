@@ -47,17 +47,22 @@ class WorkflowError(Exception):
 # ------------------------------------------------------------- presets
 
 # The four canvas presets (§4.4) — ids are wire-stable.
+#
+# R39: the subs describe the CRON, not a use case. "Finishes before your
+# first meeting" / "Right before standup" were the Morning brief's own
+# copy, served to every automation — a repo digest's schedule sheet was
+# selling commute times (founder P13).
 SCHEDULE_PRESETS = (
     {"id": "weekdays-8", "cron_local": "0 8 * * 1-5",
      "sentence": "Weekdays at 8:00",
-     "sub": "Finishes before your first meeting"},
+     "sub": "Monday to Friday"},
     {"id": "weekdays-730", "cron_local": "30 7 * * 1-5",
      "sentence": "Weekdays at 7:30",
-     "sub": "Ready earlier, before the commute"},
+     "sub": "Monday to Friday, earlier"},
     {"id": "daily-8", "cron_local": "0 8 * * *",
      "sentence": "Every morning at 8:00", "sub": "Weekends included"},
     {"id": "weekdays-9", "cron_local": "0 9 * * 1-5",
-     "sentence": "Weekdays at 9:00", "sub": "Right before standup"},
+     "sentence": "Weekdays at 9:00", "sub": "Monday to Friday"},
 )
 
 
@@ -85,6 +90,55 @@ def _current_sentence(raw: dict) -> str:
     if len(parts) == 2 and ":" in parts[1] and " at " not in s:
         s = f"{parts[0]} at {parts[1]}"
     return s
+
+
+def _event_source_of(raw: dict) -> Optional[dict]:
+    """The first push/poll source carrying an event key, v1 or v2."""
+    if raw.get("version") == 2:
+        for s in (raw.get("trigger") or {}).get("sources") or []:
+            if isinstance(s, dict) and s.get("mode") in ("push", "poll") \
+                    and s.get("event"):
+                return s
+        return None
+    trig = raw.get("trigger") or {}
+    if trig.get("mode") in ("push", "poll") and trig.get("event"):
+        return trig
+    return None
+
+
+def trigger_block(raw: dict) -> dict:
+    """R39 — the trigger's OWN vocabulary (founder P12).
+
+    The payload used to carry only `schedule`, so an event automation
+    ("New event → Slack", trigger poll/event_created) rendered as "On
+    its own schedule", its sheet offered four cron presets, and saving
+    one silently REPAINTED the event automation as a daily schedule.
+    The canvas must speak each automation's own trigger; the app
+    branches on `kind` and never shows cron UI for an event.
+    """
+    ev = _event_source_of(raw)
+    if ev is not None:
+        key = str(ev.get("event") or "")
+        conn = ev.get("connector_id")
+        clause = verbs._EVENT_CLAUSES.get(key) or "when something new lands"
+        tag = verbs.event_tag(key) or "on new activity"
+        name = verbs.display_name(conn) or ""
+        return {
+            "kind": "event",
+            "label": tag[0].upper() + tag[1:],
+            "sub": f"watches {name}" if name else "watches for it",
+            "event": {
+                "key": key,
+                "connector_id": conn,
+                "sentence": clause[0].upper() + clause[1:],
+            },
+        }
+    if _schedule_of(raw):
+        sentence = _current_sentence(raw)
+        return {"kind": "schedule", "label": _label_of(sentence),
+                "sub": "", "event": None}
+    return {"kind": "manual", "label": "On request",
+            "sub": "runs when you ask", "event": None}
 
 
 def schedule_block(automation: Automation, raw: dict) -> dict:
@@ -153,13 +207,56 @@ def _member_connectors(raw: dict) -> list[str]:
     return ids
 
 
+def run_blockers(raw: dict) -> list[dict]:
+    """Why this spec cannot fire yet — the SPEC-side truth, in one place.
+
+    R39: run-now's gate, the thread agent's grounding and the setup
+    copy each hand-maintained their own version of "can it run?", and
+    they drifted: the thread promised "First run is soon. The post will
+    be waiting for your edit" about an automation whose write step
+    run-now refused every single time (founder P6 — three surfaces,
+    two answers). Every surface that speaks about runnability reads
+    THIS. The route adds its async grant-STATUS refinement on top;
+    everything here is decidable from the spec alone.
+    """
+    out: list[dict] = []
+    if raw.get("version") != 2:
+        return out
+    for st in raw.get("steps") or []:
+        if st.get("kind") == "agent":
+            continue
+        tool = str(st.get("tool") or "")
+        if not (st.get("grant_id") or verbs.is_write_tool(tool)):
+            continue
+        params = st.get("params_template") or st.get("params") or {}
+        needs_pin = ("{{grant.target." in json.dumps(params)
+                     and not (st.get("grant_target") or {}).get("id"))
+        if needs_pin or not st.get("grant_id"):
+            clause = verbs._WRITE_CLAUSES.get(tool) or "write"
+            out.append({
+                "code": "needs_destination",
+                "connector_id": st.get("connector_id"),
+                "tool": tool,
+                "sentence": (f"before it can {clause}, tell me where "
+                             f"that should go and I will pin it"),
+            })
+    return out
+
+
 def focus_of(raw: dict) -> dict[str, list[dict]]:
-    """The spec's per-account pins, `{connector_id: [{kind,id,label}]}`.
+    """The spec's per-account pins,
+    `{connector_id: [{kind,id,label[,note]}]}`.
 
     Total: a spec written before R38 has no `focus` key and answers
     `{}`, which is the same thing as "nothing pinned" — there is no
     third state to distinguish, because a pin is a user action and its
     absence means only that they have not taken it.
+
+    R39: `note` rides through. This normalizer used to rebuild pins as
+    exactly {kind,id,label}, and BOTH writers rebuild the persisted list
+    through it — so the user's instruction survived only until the next
+    pin or unpin anywhere on the automation, and the payload never
+    served it back for the sheet to edit.
     """
     focus = raw.get("focus")
     if not isinstance(focus, dict):
@@ -168,13 +265,16 @@ def focus_of(raw: dict) -> dict[str, list[dict]]:
     for cid, pins in focus.items():
         if not isinstance(cid, str) or not isinstance(pins, list):
             continue
-        rows = [
-            {"kind": str(p.get("kind") or ""),
-             "id": str(p.get("id") or ""),
-             "label": str(p.get("label") or p.get("id") or "")}
-            for p in pins
-            if isinstance(p, dict) and p.get("id") and p.get("kind")
-        ]
+        rows = []
+        for p in pins:
+            if not (isinstance(p, dict) and p.get("id") and p.get("kind")):
+                continue
+            row = {"kind": str(p.get("kind") or ""),
+                   "id": str(p.get("id") or ""),
+                   "label": str(p.get("label") or p.get("id") or "")}
+            if p.get("note"):
+                row["note"] = str(p["note"])
+            rows.append(row)
         if rows:
             out[cid] = rows
     return out
@@ -232,10 +332,19 @@ def output_block(automation: Automation, raw: dict) -> dict:
         "posts": "only where you allowed it",
         "asks_first": "after you say yes",
     }[mode]
-    lines: list[dict] = [{
-        "title": "A brief on your phone",
-        "body": "Ranked by what breaks if you ignore it.",
-    }]
+    # R39: the brief row only for automations that actually DELIVER a
+    # brief here. It was unconditional, so "New event → Slack" — whose
+    # only output is a Slack post — opened "Where it lands" selling "A
+    # brief on your phone — Ranked by what breaks if you ignore it",
+    # the Morning brief's own copy (founder P13). Every sheet speaks
+    # its automation's own spec.
+    lines: list[dict] = []
+    if mode in ("reads_only", "drafts_only"):
+        lines.append({
+            "title": "A brief on your phone",
+            "body": "It lands in this thread; nothing is sent on your "
+                    "behalf.",
+        })
     node_label, node_sub = "Brief to you", "on your phone"
     first_write_action = None
     for cid, tool, target in writes:
@@ -284,6 +393,11 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
         stored = json.loads(automation.steps_human_json or "[]")
     except (ValueError, TypeError):
         stored = []
+    # Stored rows are the USER's own words (`set_steps` is the only
+    # writer) — served verbatim, never re-tensed. The plan-tense pass
+    # below applies only to the DERIVED branches, whose strings come
+    # from the verb dictionary's past tense (founder P18: "Checked your
+    # calendar" on an automation that has never run).
     if stored:
         return [
             {"n": i + 1, "text": s.get("text") or "", "sub": s.get("sub") or ""}
@@ -349,7 +463,8 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
                 "n": len(out) + 1, "text": act["action"],
                 "sub": act["detail"] or verbs.display_name(cid) or "",
             })
-    return out
+    # Re-tense the whole plan in one place (see the stored branch above).
+    return [{**s, "text": verbs.plan_action(s["text"])} for s in out]
 
 
 def rules_list(automation: Automation) -> list[dict]:
@@ -416,6 +531,10 @@ async def workflow_payload(
         "name": automation.name,
         "workflow_rev": int(getattr(automation, "workflow_rev", 0) or 0),
         "schedule": schedule_block(automation, raw),
+        # R39: the trigger's own vocabulary. `schedule` above stays for
+        # older clients; new ones branch on trigger.kind and only show
+        # cron UI for kind == "schedule".
+        "trigger": trigger_block(raw),
         "accounts": accounts,
         "available": available,
         "steps": _steps_human(automation, raw),
@@ -958,6 +1077,7 @@ async def _write_focus(
 async def add_focus(
     db: AsyncSession, *, automation: Automation, user_id: str,
     account_id: str, kind: str, target_id: str, label: str = "",
+    note: Optional[str] = None,
 ) -> dict:
     """Pin one place under an account — the automation starts there.
 
@@ -982,8 +1102,34 @@ async def add_focus(
     if not target_id:
         raise WorkflowError("bad_focus_id", "Pick a place first.")
     name = verbs.display_name(account_id) or account_id
+    from .spec import FOCUS_NOTE_MAX
+    # None = no note intent (a bare "+" tap must never clear anything);
+    # "" = an explicit clear from the instruction sheet.
+    if note is not None:
+        note = str(note).strip()[:FOCUS_NOTE_MAX]
     pins = list(focus_of(raw).get(account_id) or [])
-    if any(p["kind"] == kind and p["id"] == target_id for p in pins):
+    existing = next((p for p in pins
+                     if p["kind"] == kind and p["id"] == target_id), None)
+    if existing is not None:
+        # R39: re-pinning the same place with a NOTE is how the app
+        # writes/edits the per-pin instruction — that is an update,
+        # not a double tap.
+        if note is not None and note != (existing.get("note") or ""):
+            updated = [dict(p) for p in pins]
+            for p in updated:
+                if p["kind"] == kind and p["id"] == target_id:
+                    if note:
+                        p["note"] = note
+                    else:
+                        p.pop("note", None)
+            shown = existing.get("label") or target_id
+            return await _write_focus(
+                db, automation=automation, user_id=user_id,
+                account_id=account_id, pins=updated,
+                sentence=(f"Noted — I will treat {shown} that way."
+                          if note else
+                          f"Cleared — {shown} is a plain pin again."),
+            )
         return {
             "focus": pins, "workflow": await workflow_payload(
                 db, automation=automation, user_id=user_id,
@@ -998,11 +1144,179 @@ async def add_focus(
             f"at most. Take one out first.",
         )
     shown = str(label or "").strip() or target_id
-    pins.append({"kind": kind, "id": target_id, "label": shown})
-    return await _write_focus(
+    new_pin: dict = {"kind": kind, "id": target_id, "label": shown}
+    if note:  # None and "" both mean: a new pin starts plain
+        new_pin["note"] = note
+    pins.append(new_pin)
+    out = await _write_focus(
         db, automation=automation, user_id=user_id, account_id=account_id,
         pins=pins, sentence=f"It starts at {shown} in {name} now.",
     )
+    # R39: a channel/chat pinned under the connector that still owes a
+    # WRITE DESTINATION sets that too — the founder followed "pick
+    # all-toup and I'll set it there" by tapping "+" on all-toup, and a
+    # bare focus left the run refusing about the very thing he had just
+    # picked. `only_if_unpinned`: "+" never redirects an approved
+    # destination. A failed grant does not poison the focus pin; the
+    # sentence carries what happened either way.
+    if kind in ("channel", "thread"):
+        try:
+            dest = await pin_write_destination(
+                db, automation=automation, user_id=user_id,
+                connector_id=account_id,
+                target={"kind": kind, "id": target_id, "label": shown},
+                only_if_unpinned=True,
+            )
+        except Exception as e:  # noqa: BLE001 — the pin stood; the
+            # destination half can be asked for again.
+            logger.warning("[automations] focus destination bridge "
+                           "failed automation=%s: %s", automation.id, e)
+            dest = None
+        if dest is not None:
+            out = dict(out)
+            out["sentence"] = (f"It starts at {shown} in {name} now. "
+                               f"{dest['sentence']}")
+            out["destination"] = dest
+            await db.refresh(automation)
+            out["workflow"] = await workflow_payload(
+                db, automation=automation, user_id=user_id,
+            )
+    return out
+
+
+async def pin_write_destination(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    connector_id: str, target: dict, only_if_unpinned: bool = False,
+) -> Optional[dict]:
+    """Point the connector's write step at `target` and ask for the
+    grant — the WHOLE flow: grant request, step pin, grant card in the
+    main chat, needs_you ask in the thread.
+
+    R39: this is one function because it has two callers with one
+    contract — the agent's `automations__set_destination` tool and
+    `add_focus` (the canvas "+" on a channel). The founder followed the
+    agent's own instruction ("pick all-toup and I'll set it there") by
+    tapping "+" on all-toup, and got `bad_focus_kind`: the canvas pin
+    wrote a FOCUS, and a focus is not a destination. Now a channel
+    pinned under the connector that still owes a destination sets both.
+
+    `only_if_unpinned` is the canvas caller's safety: a "+" must never
+    silently REDIRECT an already-approved destination (the agent tool
+    may — an explicit ask is a redirect).
+
+    Returns None when there is nothing to do (no write step on this
+    connector, or pinned already and `only_if_unpinned`). Returns
+    `{"ok": False, "sentence": …}` when the grant could not be prepared
+    — the caller decides whether that poisons its own operation.
+    """
+    from app.services.automation_verbs import (
+        _WRITE_CLAUSES, display_name, is_write_tool,
+    )
+    raw = _spec_raw(automation)
+    if raw.get("version") != 2:
+        return None
+    steps = [s for s in raw.get("steps") or []
+             if s.get("connector_id") == connector_id
+             and (s.get("grant_id") or is_write_tool(s.get("tool")))]
+    if not steps:
+        return None
+    unpinned = [s for s in steps
+                if not (s.get("grant_target") or {}).get("id")]
+    if only_if_unpinned and not unpinned:
+        return None
+    tool = str((unpinned or steps)[0].get("tool") or "")
+    label = str(target.get("label") or target.get("id") or "")
+    clause = _WRITE_CLAUSES.get(tool) or "write"
+    grant = await reg.create_grant_request(
+        user_id,
+        connector_id=connector_id,
+        tool_name=tool,
+        target=target,
+        cadence=None,
+        mode=raw.get("mode") or "auto",
+        summary=f"{automation.name}: {clause} in {label}",
+        preview=None,
+        automation_id=automation.id,
+    )
+    if grant is None:
+        return {"ok": False, "sentence": (
+            "The permission ask could not be prepared just now — "
+            "nothing about the destination changed.")}
+    from .service import pin_destination
+    from .spec import SpecError
+    try:
+        await pin_destination(
+            db, automation_id=automation.id, user_id=user_id,
+            connector_id=connector_id, tool=tool, grant=grant,
+            target=target,
+        )
+    except SpecError as e:
+        return {"ok": False, "sentence": (
+            "; ".join(str(x.get("message") or "") for x in e.errors)
+            or "The destination could not be pinned.")}
+
+    name = display_name(connector_id) or connector_id
+    payload = {
+        "id": grant["id"],
+        "automation_id": grant.get("automation_id") or automation.id,
+        "connector_id": grant["connector_id"],
+        "action": grant["tool_name"],
+        "action_label": grant["tool_name"].split("__", 1)[-1]
+        .replace("_", " "),
+        "target": grant.get("target") or {},
+        "cadence": grant.get("cadence") or {},
+        "mode": grant.get("mode"),
+        "summary": grant.get("summary"),
+        "preview": None,
+        "status": grant.get("status"),
+        "created_at": grant.get("created_at"),
+        "expires_at": grant.get("expires_at"),
+        "decided_at": None,
+        "decided_via": None,
+    }
+    try:
+        from . import cards
+        await cards.write_card_message(
+            db,
+            user_id=user_id,
+            content=f"Permission needed: {grant.get('summary')}",
+            metadata_key=cards.GRANT_CARD_KEY,
+            payload=payload,
+            title="Permission request",
+        )
+        await cards.broadcast_card(user_id, cards.GRANT_CARD_KEY, payload)
+    except Exception as e:  # noqa: BLE001 — the thread turn below still
+        # carries the ask; a missing card is a missing duplicate.
+        logger.warning("[automations] grant card skipped: %s", e)
+    try:
+        thread = await ledger.ensure_thread(
+            db, user_id=user_id, automation_id=automation.id,
+        )
+        await ledger.append_turn(
+            db, user_id=user_id, thread=thread, run_id=None,
+            kind="needs_you",
+            payload={
+                "account_id": connector_id,
+                "connector_id": connector_id,
+                "name": name,
+                "reason_code": "grant_missing",
+                "sentence": (f"It needs your permission to "
+                             f"{clause} in {label}."),
+                "fix": "grant",
+                "fix_label": "Allow it",
+                "grant_request_id": grant["id"],
+            },
+        )
+    except Exception as e:  # noqa: BLE001 — the main-chat card stands;
+        # the thread just lost its copy of the ask.
+        logger.warning("[automations] thread grant ask skipped: %s", e)
+    return {
+        "ok": True,
+        "grant_id": grant["id"],
+        "tool": tool,
+        "sentence": (f"I asked for your permission to {clause} in "
+                     f"{label} — approve it and it runs on its own."),
+    }
 
 
 async def remove_focus(

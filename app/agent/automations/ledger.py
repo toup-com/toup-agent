@@ -39,6 +39,7 @@ from app.db.models import (
 )
 from app.db.models.automation_ledger import AUTOMATION_FIXES
 from app.services import automation_verbs as verbs
+from app.services.automation_verb_entries import CAPABILITY_CHECK_ACTION
 
 logger = logging.getLogger(__name__)
 
@@ -493,11 +494,82 @@ def _sanitize_fallback(kind: str, payload: dict) -> dict:
 
 # ------------------------------------------------------------ turn writes
 
-def _serialize_row(row: AutomationTurn) -> dict:
+# ── R39: the capability check, corrected where it is SERVED ──────────
+# Setup's "Checked what I can do" turns are SEEDED, never probed: every
+# mint site hardcodes ok:True, ms:0. Two lies survived in rows persisted
+# before R38 fixed the mint sites — the automation-level mode label
+# ("posts") stamped on read-only accounts, and the ok/ms pair rendering
+# as "all six green at 0.1s", a health claim nothing measured. The
+# founder's thread holds those rows immutably, so the truth must also
+# live at the read boundary, not only at mint.
+
+def _is_capability_check(kind: str, body: dict) -> bool:
+    """A seeded capability turn: the mint sites' own action string, with
+    no measured time on it (an unparseable ms is not a measurement)."""
+    if kind != "tool" or body.get("action") != CAPABILITY_CHECK_ACTION:
+        return False
+    try:
+        return int(body.get("ms") or 0) == 0
+    except (TypeError, ValueError):
+        return True
+
+
+async def _capability_ctx(
+    db: AsyncSession, thread_id: str,
+) -> Optional[dict]:
+    """The spec facts a stored capability check is corrected against:
+    which member connectors WRITE, and the automation's current mode
+    label. None — rows pass through untouched — whenever the automation
+    or its spec cannot answer; the correction must never cost a thread
+    its read."""
+    try:
+        thread = await db.get(AutomationThread, thread_id)
+        automation = (
+            await db.get(Automation, thread.automation_id)
+            if thread is not None else None
+        )
+        if automation is None:
+            return None
+        from .setup_script import mode_label, writer_connectors
+        from .workflow import mode_of
+        raw = json.loads(automation.spec_json or "{}")
+        # mode_of's label IS the mint-time detail: `setup_turns` derives
+        # its `detail` as mode_label(mode, channel) over the channel it
+        # parses back out of this same label (`_channel_only`).
+        _mode, label = mode_of(automation, raw)
+        return {
+            "writers": writer_connectors(raw),
+            "mode_detail": label,
+            "reads_detail": mode_label("reads_only"),
+        }
+    except Exception as e:  # noqa: BLE001 — see docstring
+        logger.debug("[ledger] capability ctx skipped: %s", e)
+        return None
+
+
+def _serialize_row(
+    row: AutomationTurn, *, capability_ctx: Optional[dict] = None,
+) -> dict:
     try:
         body = json.loads(row.payload_json)
     except (ValueError, TypeError):
         body = {}
+    if _is_capability_check(row.kind, body):
+        # `synthetic` tells the app this is a capability LISTING, not a
+        # timed probe — render no clock and no green health claim over
+        # the seeded ok:True/ms:0 pair.
+        body["synthetic"] = True
+        if capability_ctx and body.get("account_id"):
+            # The R38 mint rule, re-derived at read time for rows minted
+            # before it: only an account whose step writes wears the
+            # write-mode label; everyone else reads only. Shape-tolerant
+            # on purpose — a row with no account_id (or served with no
+            # ctx) keeps whatever it stored.
+            body["detail"] = (
+                capability_ctx["mode_detail"]
+                if body["account_id"] in capability_ctx["writers"]
+                else capability_ctx["reads_detail"]
+            )
     return {
         "id": row.id,
         "kind": row.kind,
@@ -820,7 +892,18 @@ async def list_turns(
     has_more = len(rows) > limit
     rows = rows[:limit]
     rows.reverse()
-    return [_serialize_row(r) for r in rows], has_more
+    # R39: the ctx costs two row reads + a spec parse and most pages
+    # hold no capability turn, so it is fetched only when one is on the
+    # page. The quoted-substring probe is the repo's own idiom
+    # (connector_state._references_connector) — it can only match the
+    # stored action string. `run_turns` needs none of this: capability
+    # turns are minted with run_id=None, so they never ride it.
+    _needle = f'"{CAPABILITY_CHECK_ACTION}"'
+    ctx = (
+        await _capability_ctx(db, thread_id)
+        if any(_needle in (r.payload_json or "") for r in rows) else None
+    )
+    return [_serialize_row(r, capability_ctx=ctx) for r in rows], has_more
 
 
 async def run_turns(db: AsyncSession, *, run_id: str) -> list[dict]:

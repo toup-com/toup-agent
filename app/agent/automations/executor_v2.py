@@ -286,6 +286,75 @@ def _skipped_result(step: ValidatedStep, *, silent: bool = True) -> dict:
     }
 
 
+def _apply_focus_scope(
+    connector_id: str, tool: str, params: dict, pins: list,
+) -> dict:
+    """Make the user's pins steer the read (R39, founder P10).
+
+    Until now an accepted pin reached a run only as a `{{focus.*}}`
+    render root that no compiled step ever referenced — the canvas
+    said "it starts at #all-toup" and the run read the whole account
+    anyway. This narrows a read step's params by the pins on its own
+    connector, the same vocabulary `contents.py` reads by:
+
+      - query languages COMPOSE (gmail/outlook person+label terms,
+        jira project scope) — the spec's own filter still applies;
+      - single-target reads FILL an empty target and OVERRIDE a set
+        one (slack channel, teams chat, github repo) — the pin is the
+        user's later word than the compiled spec.
+
+    Pure and total: no pins, unknown tool, or malformed params → the
+    params come back untouched.
+    """
+    if not pins or not isinstance(params, dict):
+        return params
+    out = dict(params)
+    by_kind: dict[str, list] = {}
+    for p in pins:
+        if isinstance(p, dict) and p.get("id"):
+            by_kind.setdefault(str(p.get("kind") or ""), []).append(p)
+    try:
+        if tool == "gmail__list_messages":
+            terms = [f"from:{p['id']}" for p in by_kind.get("person", [])]
+            terms += [f"label:{p['id']}" for p in by_kind.get("label", [])
+                      + by_kind.get("folder", [])]
+            if terms:
+                scoped = terms[0] if len(terms) == 1 \
+                    else "(" + " OR ".join(terms) + ")"
+                q = str(out.get("query") or "").strip()
+                out["query"] = f"{q} {scoped}".strip()
+        elif tool == "outlook__list_messages":
+            froms = [f"from:{p['id']}" for p in by_kind.get("person", [])]
+            if froms:
+                scoped = " OR ".join(froms)
+                q = str(out.get("query") or "").strip()
+                out["query"] = f"({q}) AND ({scoped})" if q else scoped
+        elif tool == "slack__read_messages":
+            chans = by_kind.get("channel", []) + by_kind.get("thread", [])
+            if chans:
+                out["channel"] = str(chans[0]["id"])
+        elif tool == "teams__read_chat_messages":
+            chats = by_kind.get("thread", []) + by_kind.get("channel", [])
+            if chats:
+                out["chat_id"] = str(chats[0]["id"])
+        elif tool == "jira__search_issues":
+            projects = [str(p["id"]) for p in by_kind.get("project", [])]
+            if projects:
+                keys = ", ".join(f'"{k}"' for k in projects)
+                jql = str(out.get("jql") or "").strip()
+                out["jql"] = (f"project in ({keys}) AND ({jql})"
+                              if jql else f"project in ({keys})")
+        elif tool == "github__list_issues":
+            repos = [str(p["id"]) for p in by_kind.get("repo", [])
+                     if "/" in str(p.get("id") or "")]
+            if repos:
+                owner, repo = repos[0].split("/", 1)
+                out["owner"], out["repo"] = owner, repo
+    except Exception:  # noqa: BLE001 — a pin must never break a read
+        return params
+    return out
+
+
 async def _execute_read_step(
     automation: Automation,
     step: ValidatedStep,
@@ -294,6 +363,10 @@ async def _execute_read_step(
     """One inline read via the platform RPC. Raises RuntimeError on a
     non-ok result — the caller applies on_error."""
     params = render_with_ctx(step.params_template, ctx)
+    params = _apply_focus_scope(
+        step.connector_id, step.tool, params,
+        (ctx.get("_focus_pins") or {}).get(step.connector_id) or [],
+    )
     result = await reg.dispatch_via_platform(
         automation.user_id,
         connector_id=step.connector_id,
@@ -362,6 +435,9 @@ async def _run_steps(
         # `render_value` `str()`s anything that is not a leaf and a
         # Python repr in a connector's params is not a target.
         "focus": _focus_render_ctx(vspec.focus),
+        # R39 — the raw pins for `_apply_focus_scope`. Underscored: not
+        # a render root, never reachable from a `{{…}}` template.
+        "_focus_pins": dict(vspec.focus or {}),
     }
 
     # Mail rail first — checked before any step runs, exactly like v1.

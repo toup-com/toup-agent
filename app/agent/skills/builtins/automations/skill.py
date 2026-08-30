@@ -1427,7 +1427,7 @@ class AutomationsSkill(Skill):
         the user is looking is the founder's item 7.
         """
         from app.agent.automations.service import (
-            AutomationNotFound, pin_destination, set_destination_chat,
+            AutomationNotFound, set_destination_chat,
         )
         from app.agent.automations.spec import SpecError
         from app.db.database import async_session_maker
@@ -1468,129 +1468,35 @@ class AutomationsSkill(Skill):
             return ("ERROR: a connector destination needs connector_id "
                     "and a target from automations__list_targets.")
 
-        # The grant request first — if the platform refuses (bad
-        # target, missing OAuth scope), nothing has been half-pinned.
-        from app.agent.automations import registry as reg
+        # R39: the whole flow (grant first — nothing half-pinned on a
+        # refusal — then the step pin, the grant card and the thread
+        # ask) lives in workflow.pin_write_destination, shared with the
+        # canvas "+" so the agent's instruction and the user's tap do
+        # the same thing.
         from app.agent.automations.service import _load_owned
+        from app.agent.automations.workflow import pin_write_destination
         async with async_session_maker() as db:
             try:
                 automation = await _load_owned(db, automation_id, uid)
             except AutomationNotFound:
                 return "ERROR: No such automation."
-            raw_spec = json.loads(automation.spec_json or "{}")
-        from app.services.automation_verbs import (
-            _WRITE_CLAUSES, is_write_tool,
-        )
-        tool = next(
-            (s.get("tool") for s in raw_spec.get("steps") or []
-             if s.get("connector_id") == connector_id
-             and (s.get("grant_id") or is_write_tool(s.get("tool")))),
-            None,
-        )
-        if not tool:
+            dest = await pin_write_destination(
+                db, automation=automation, user_id=uid,
+                connector_id=connector_id, target=target,
+            )
+        if dest is None:
             return (f"ERROR: this automation has no {connector_id} "
                     f"write to point anywhere.")
-        grant = await reg.create_grant_request(
-            uid,
-            connector_id=connector_id,
-            tool_name=tool,
-            target=target,
-            cadence=None,
-            mode=raw_spec.get("mode") or "auto",
-            summary=f"{automation.name}: "
-                    f"{_WRITE_CLAUSES.get(tool) or 'write'} in "
-                    f"{target.get('label') or target.get('id')}",
-            preview=None,
-            automation_id=automation_id,
-        )
-        if grant is None:
-            return ("ERROR: The permission request could not be "
-                    "prepared (invalid target, a missing OAuth scope, "
-                    "or the platform is unreachable). Nothing changed.")
-
-        try:
-            async with async_session_maker() as db:
-                await pin_destination(
-                    db, automation_id=automation_id, user_id=uid,
-                    connector_id=connector_id, tool=tool, grant=grant,
-                    target=target,
-                )
-        except SpecError as e:
+        if not dest.get("ok"):
             return ToolResult(
-                "COULD NOT PIN IT:\n" + _as_json(e.errors),
+                "COULD NOT PIN IT:\n" + str(dest.get("sentence") or ""),
                 display="Could not pin the destination",
             )
-
-        # The ask, where the user is looking: the grant card in the
-        # main chat (the surface that can decide it) AND a needs_you
-        # turn in this thread (the surface the conversation is in).
-        clause = _WRITE_CLAUSES.get(tool) or "write"
         label = target.get("label") or target.get("id")
-        payload = {
-            "id": grant["id"],
-            "automation_id": grant.get("automation_id") or automation_id,
-            "connector_id": grant["connector_id"],
-            "action": grant["tool_name"],
-            "action_label": grant["tool_name"].split("__", 1)[-1]
-            .replace("_", " "),
-            "target": grant.get("target") or {},
-            "cadence": grant.get("cadence") or {},
-            "mode": grant.get("mode"),
-            "summary": grant.get("summary"),
-            "preview": None,
-            "status": grant.get("status"),
-            "created_at": grant.get("created_at"),
-            "expires_at": grant.get("expires_at"),
-            "decided_at": None,
-            "decided_via": None,
-        }
-        try:
-            from app.agent.automations import cards
-            async with async_session_maker() as db:
-                await cards.write_card_message(
-                    db,
-                    user_id=uid,
-                    content=f"Permission needed: {grant.get('summary')}",
-                    metadata_key=cards.GRANT_CARD_KEY,
-                    payload=payload,
-                    title="Permission request",
-                )
-            await cards.broadcast_card(uid, cards.GRANT_CARD_KEY, payload)
-        except Exception as e:  # noqa: BLE001 — the thread turn below
-            # still carries the ask; a missing card is a missing
-            # duplicate, not a missing ask.
-            logger.warning("[automations] grant card skipped: %s", e)
-        from app.services.automation_verbs import display_name
-        name = display_name(connector_id) or connector_id.title()
-        try:
-            from app.agent.automations import ledger as _ledger
-            async with async_session_maker() as db:
-                thread = await _ledger.ensure_thread(
-                    db, user_id=uid, automation_id=automation_id,
-                )
-                await _ledger.append_turn(
-                    db, user_id=uid, thread=thread, run_id=None,
-                    kind="needs_you",
-                    payload={
-                        "account_id": connector_id,
-                        "connector_id": connector_id,
-                        "name": name,
-                        "reason_code": "grant_missing",
-                        "sentence": (f"It needs your permission to "
-                                     f"{clause} in {label}."),
-                        "fix": "grant",
-                        "fix_label": "Allow it",
-                        "grant_request_id": grant["id"],
-                    },
-                )
-        except Exception as e:  # noqa: BLE001 — the main-chat card
-            # stands; the thread just lost its copy of the ask.
-            logger.warning("[automations] thread grant ask skipped: %s", e)
-
         return ToolResult(
             f"PINNED to {label}, waiting on the user's permission "
-            f"(grant_id={grant['id']}, expires in 1 hour). The ask is "
-            f"in this thread and in their chat. It arms itself when "
+            f"(grant_id={dest['grant_id']}, expires in 1 hour). The ask "
+            f"is in this thread and in their chat. It arms itself when "
             f"they approve — end your turn telling them that in one "
             f"line.",
             display="Pinned — waiting on you",

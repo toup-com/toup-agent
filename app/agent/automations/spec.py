@@ -147,8 +147,12 @@ FOCUS_KINDS = frozenset({
 MAX_FOCUS_PER_ACCOUNT = 10
 FOCUS_ID_MAX = 200
 FOCUS_LABEL_MAX = 120
+#: R39 — a pin can carry the user's own instruction for that place
+#: ("boss — anything from her outranks the rest"). It rides the pin
+#: into the agent step's context and the run's grounding.
+FOCUS_NOTE_MAX = 280
 
-_FOCUS_KEYS = {"kind", "id", "label"}
+_FOCUS_KEYS = {"kind", "id", "label", "note"}
 
 
 def validate_focus(spec: dict, errors: list) -> dict:
@@ -214,7 +218,16 @@ def validate_focus(spec: dict, errors: list) -> dict:
                 # Not an error: the same place pinned twice is one pin.
                 continue
             seen.add((kind, pid))
-            kept.append({"kind": kind, "id": pid, "label": label})
+            note = pin.get("note")
+            if note is not None and not isinstance(note, str):
+                _err(errors, "bad_focus_note", f"{pfld}.note",
+                     "note must be a string")
+                note = ""
+            note = (note or "").strip()[:FOCUS_NOTE_MAX]
+            entry = {"kind": kind, "id": pid, "label": label}
+            if note:
+                entry["note"] = note
+            kept.append(entry)
         if kept:
             out[cid] = kept
     return out
@@ -240,6 +253,11 @@ def focus_render_ctx(focus: dict) -> dict:
             "ids": ",".join(str(p.get("id") or "") for p in pins),
             "labels": ", ".join(str(p.get("label") or p.get("id") or "")
                                 for p in pins),
+            # R39: the user's own per-pin instructions, one joined leaf
+            # ("boss@x: anything from her outranks the rest; …").
+            "notes": "; ".join(
+                f"{p.get('label') or p.get('id')}: {p['note']}"
+                for p in pins if p.get("note")),
             "count": len(pins),
             "first": {
                 "kind": str(first.get("kind") or ""),

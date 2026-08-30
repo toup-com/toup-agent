@@ -661,6 +661,33 @@ def engine_action(phase: str, *, ok: bool = True) -> dict:
     return {"action": done if ok else failed, "detail": ""}
 
 
+# R39 — the PLAN tense (founder P18). The verb dictionary speaks in the
+# past because it narrates turns that happened; the canvas Steps sheet
+# describes what an automation WILL do, and "Checked your calendar"
+# above "WHAT IT DOES, IN ORDER" on a never-run automation reads as a
+# record that doesn't exist. Keyed on the leading verb rather than a
+# parallel table: a second table drifts, and an unknown verb passes
+# through in the past — legible, where a bad transform is garbage.
+_PLAN_TENSE = {
+    "Added": "Adds", "Checked": "Checks", "Commented": "Comments",
+    "Connected": "Connects", "Created": "Creates", "Drafted": "Drafts",
+    "Filed": "Files", "Finished": "Finishes", "Held": "Holds",
+    "Looked": "Looks", "Made": "Makes", "Posted": "Posts",
+    "Pulled": "Pulls", "Read": "Reads", "Searched": "Searches",
+    "Sent": "Sends", "Thought": "Thinks", "Told": "Tells",
+    "Updated": "Updates", "Wrote": "Writes",
+}
+
+
+def plan_action(action: str) -> str:
+    """"Checked your calendar" → "Checks your calendar"."""
+    head, _, rest = str(action or "").partition(" ")
+    now = _PLAN_TENSE.get(head)
+    if not now:
+        return action
+    return f"{now} {rest}" if rest else now
+
+
 _SLOT_RE = re.compile(r"\{[a-z_][a-z0-9_]*\}")
 
 

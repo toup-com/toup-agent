@@ -146,9 +146,24 @@ async def _next_run_at(
     return min(times) if times else None
 
 
-def _status_of(a: Automation, missing_account: bool) -> tuple[str, str]:
+def _status_of(
+    a: Automation, missing_account: bool, expired_account: bool,
+) -> tuple[str, str]:
     """(status, pill) per §4.1."""
     if a.status == "armed":
+        # R39. An armed row answered "On" before expiry was considered,
+        # and `expired_name` was consumed only under a status this very
+        # branch made unreachable — needs_attention required
+        # a.status == 'error' or a paused reason, and an expiry writes
+        # neither (on_connector_expired pauses nothing by design). So
+        # Teams sat dead for 8+ hours behind an "On" pill and a "pause"
+        # action. Run state cannot outrank this here because it never
+        # ranked here at all: running/waiting ride the RUN's v3 status
+        # (`run_in_flight`, `running_count`), which this row status is
+        # deliberately orthogonal to — a needs_attention row with a live
+        # run already renders both today.
+        if expired_account:
+            return "needs_attention", "Needs you"
         return "active", "On"
     if a.status == "error" or a.paused_reason in (
         "connector_reauth", "grant_revoked", "auto_failures",
@@ -282,7 +297,8 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
                 entry["state"] = "expired"
             accounts.append(entry)
 
-        status, pill = _status_of(a, missing_account)
+        status, pill = _status_of(a, missing_account,
+                                  expired_name is not None)
         mode, mode_label = workflow.mode_of(a, raw)
         last = await _latest_run(db, a.id)
         v3 = ledger.run_v3_status(last) if last is not None else None
@@ -335,12 +351,29 @@ async def summary_payload(db: AsyncSession, *, user_id: str) -> dict:
         touched = len(ledger._cfg_of(last).get("accounts_touched") or []) \
             if last is not None else 0
         if last is None:
-            when = _when_label(await _next_run_at(db, a.id), tz)
-            meta = f"First run {when} · {_acct_count(len(members))}"
-            if mode_label:
-                meta += f" · {mode_label}"
+            # R39: never promise a first run the gate would refuse —
+            # "First run soon" stood in the same thread as run-now's
+            # needs_setup 409 (founder P6). One predicate, shared with
+            # the route and the thread agent: workflow.run_blockers.
+            from . import workflow as _wf
+            try:
+                blocked = bool(_wf.run_blockers(_wf._spec_raw(a)))
+            except Exception:  # noqa: BLE001
+                blocked = False
+            if blocked:
+                meta = (f"Needs a destination first · "
+                        f"{_acct_count(len(members))}")
+            else:
+                when = _when_label(await _next_run_at(db, a.id), tz)
+                meta = f"First run {when} · {_acct_count(len(members))}"
+                if mode_label:
+                    meta += f" · {mode_label}"
         elif status == "needs_attention" and expired_name:
-            meta = f"{_acct_count(len(members))} · needs reconnecting"
+            # R39: NAME the account. "6 accounts · needs reconnecting"
+            # is §4.3(7)'s class with a count on it — the one fact the
+            # line exists for (WHICH account) was the one it withheld.
+            meta = (f"{expired_name} needs reconnecting · "
+                    f"{_acct_count(len(members))}")
         elif v3 == "waiting_on_user":
             meta = f"Waiting for you since {_clock(last.created_at, tz)}"
         elif v3 == "failed":

@@ -18,7 +18,10 @@ this module:
     (`stamp: reconnected`) appended to its thread;
   - on an expiry, emits the `expired` frame and pauses NOTHING — the
     run-level failure path owns pausing, and flipping automations here
-    would double-report the same outage.
+    would double-report the same outage. It does ANNOUNCE (R39): one
+    deduped `needs_you` turn on each armed automation's thread, because
+    a Friday-evening expiry otherwise surfaced nothing until Monday's
+    scheduled run.
 
 Constraints this module lives under:
   - Frames carry NO `channel` key (the app's frame filter drops
@@ -35,6 +38,7 @@ Constraints this module lives under:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -323,8 +327,14 @@ async def on_connector_expired(
     identity state itself. Flipping automations here would mark
     automations that might never have fired during the outage.
 
-    `db` is accepted for signature parity with the connected leg (and
-    for the day this hook grows an honest read); it is not written.
+    R39: pausing nothing must not mean SAYING nothing. The "run-level
+    failure path" this docstring deferred to only speaks when a run
+    fires, so a Friday-evening expiry surfaced no thread turn, no ⋯
+    menu change and no sheet change until Monday 8:00 — the canvas ring
+    was the whole account for 8+ hours. This hook now also APPENDS one
+    `needs_you` turn (the same §4.4 card a failed run mints) to each
+    armed automation's thread, deduped so a flapping vault cannot stack
+    copies. The run stays the enforcement; this is the announcement.
     """
     # R31 §4.4: the hook's `error` reaches the frame now. It was
     # accepted at the route boundary and never read, so a revoked
@@ -348,6 +358,85 @@ async def on_connector_expired(
         user_id, connector_id=connector_id, state=state,
         reconnected_at=None, reason_code=code, fix=fix,
     )
+
+    # ── R39: the announcement (frame first, module convention) ────────
+    # Only a credential problem earns the card: a transient reason keeps
+    # `state == "connected"` / `fix == "retry"`, and announcing a
+    # reconnect for a vendor's bad minute is the §4.4 inversion again.
+    if fix != "reconnect":
+        return
+    try:
+        automations = (
+            await db.execute(
+                select(Automation).where(Automation.user_id == user_id)
+            )
+        ).scalars().all()
+    except Exception as e:  # noqa: BLE001 — announcement is best-effort
+        logger.warning(
+            "[connector_state] expiry automation scan failed for user=%s: %s",
+            user_id[:8], e,
+        )
+        return
+    from app.agent.automations import ledger
+    for automation in automations:
+        # Armed rows only: a paused or draft automation is not promising
+        # the user anything a dead token silently breaks.
+        if (automation.status or "") != "armed":
+            continue
+        if not _references_connector(automation, connector_id):
+            continue
+        # Own try/except per automation (module constraint).
+        try:
+            thread = await ledger.thread_for(db, automation.id)
+            if thread is None:
+                # Pre-v3 rows — same silent skip as the RECONNECTED note.
+                continue
+            if await _needs_you_already_current(db, thread.id, connector_id):
+                continue
+            await ledger.append_turn(
+                db, user_id=user_id, thread=thread, run_id=None,
+                kind="needs_you",
+                payload=account_health.needs_you_payload(
+                    account_id=connector_id,
+                    connector_id=connector_id,
+                    name=account_health.display_of(connector_id),
+                    reason_code=code,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — one automation's card
+            # never blocks a sibling's
+            logger.warning(
+                "[connector_state] expiry needs_you turn skipped for %s: %s",
+                automation.id, e,
+            )
+
+
+async def _needs_you_already_current(
+    db: AsyncSession, thread_id: str, connector_id: str,
+) -> bool:
+    """Is the thread's most recent `needs_you` turn already this
+    connector's? Same discipline as `_run_now_refusal_turn`
+    (api/automations.py): dedupe against the LAST turn of the kind, so
+    a repeat expiry event while the card is still the standing account
+    stacks nothing, while a fresh expiry after other needs_you traffic
+    may speak again."""
+    from app.db.models import AutomationTurn
+    row = (
+        await db.execute(
+            select(AutomationTurn)
+            .where(AutomationTurn.thread_id == thread_id)
+            .where(AutomationTurn.kind == "needs_you")
+            .order_by(AutomationTurn.seq.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if row is None:
+        return False
+    try:
+        prev = json.loads(row.payload_json) or {}
+    except (ValueError, TypeError):
+        return False
+    return (prev.get("connector_id") or prev.get("account_id")) == connector_id
 
 
 # ─── WIRING (coordinator) ────────────────────────────────────────────

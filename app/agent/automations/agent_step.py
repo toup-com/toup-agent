@@ -115,7 +115,8 @@ def build_prompt(automation_name: str, step, ctx: dict) -> str:
     # is a fact the model has to read and cannot use, and this prompt's
     # whole discipline is that its bytes are bounded and stable.
     focus = {
-        str(cid): str((entry or {}).get("labels") or "")
+        str(cid): (str((entry or {}).get("labels") or "")
+                   + (f" — {entry['notes']}" if entry.get("notes") else ""))
         for cid, entry in (ctx.get("focus") or {}).items()
         if isinstance(entry, dict) and entry.get("labels")
     }
