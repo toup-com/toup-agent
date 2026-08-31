@@ -654,6 +654,52 @@ async def _active_devices(db, user_id: str) -> List[LiveActivityDevice]:
     return list(result.scalars().all())
 
 
+# ── The foreground gate ──────────────────────────────────────────────────
+# A Live Activity is the agent reaching the user OUTSIDE the app. Pushing one
+# at a device whose owner is looking at the app is the founder's report of
+# 2026-08-31: "when a user asks a question and stays in the app waiting for the
+# answer, the notification card and the Dynamic Island activate" — and then sit
+# there for their dismiss window once the user does leave.
+#
+# The app reports both edges of its presence (POST .../presence, a TTL on the
+# device row). This is the one place that consults it.
+#
+# EXEMPT, and it is not a softening of the rule but the rule applied to a
+# different kind of object: a `reminder:` countdown is not a report of
+# something that happened, it is the PENDING ALERT ITSELF. Its card has to be
+# armed at the moment the reminder is created — which is, by definition, while
+# the user is in the app talking to their agent — and the platform cannot come
+# back and arm it later. Everything else can wait until the user leaves,
+# because everything else is a message ABOUT something that already happened.
+#
+# What a suppressed row COSTS, recorded rather than discovered later: the LA
+# lane is this app's only OS surface, so a card declined here is never
+# retried — `_START_EVENT_KINDS` rows terminate quietly on a non-error skip
+# (notification_dispatcher, the `_START_EVENT_KINDS` branch). That is the
+# intended trade for every family this gate covers, because each of them
+# already lands IN the app the user is looking at: a chat turn is the answer
+# in the thread, a job is its card in the run surface, and an operator
+# announcement "already lands as its own chat card written by the fan-out"
+# (the dispatcher's own words). A reminder is the one that does not, which is
+# exactly why it is exempt.
+_PRESENCE_EXEMPT_PREFIXES = ("reminder:",)
+
+
+def _device_is_foreground(device: LiveActivityDevice, now: datetime) -> bool:
+    until = getattr(device, "foreground_until", None)
+    return until is not None and until > now
+
+
+def _suppressed_by_presence(
+    device: LiveActivityDevice, mission_id: str, now: datetime,
+) -> bool:
+    """Would starting `mission_id`'s card on `device` put a card on screen
+    while its owner is already looking at the app?"""
+    if mission_id.startswith(_PRESENCE_EXEMPT_PREFIXES):
+        return False
+    return _device_is_foreground(device, now)
+
+
 async def _revoke_device(db, device: LiveActivityDevice, now: datetime, reason: str) -> None:
     if device.revoked_at is None:
         device.revoked_at = now
@@ -1192,6 +1238,12 @@ async def handle_notification_row(
                 # it also lands as a chat card the user keeps.
                 per_device[device.id] = {"status": "skipped", "reason": "yields_to_reminder"}
                 continue
+            if _suppressed_by_presence(device, mission_id, now):
+                # The user is IN the app. The thread, the Activity list and
+                # the Admin inbox are all better surfaces than a card in the
+                # island describing what is already on their screen.
+                per_device[device.id] = {"status": "skipped", "reason": "app_in_foreground"}
+                continue
             result = await _send_start(db, device, row, mission_id, now, silent=start_silent)
             per_device[device.id] = result
             delivered = delivered or result["status"] == "ok"
@@ -1287,6 +1339,17 @@ async def handle_notification_row(
                         "status": "skipped", "reason": "alarm_owned",
                     }
                     continue
+            if _suppressed_by_presence(device, mission_id, now):
+                # THE ONE THE FOUNDER SAW. "Answer ready" is a
+                # mission_completed row, mission_completed is in
+                # _START_IF_MISSING_KINDS, and no card exists for a turn the
+                # user never left — so every answer to a question asked and
+                # waited for in the app push-STARTED a loud card, which then
+                # sat in the island for its 5-minute dismiss window. The
+                # answer still reaches them: it is already in the thread they
+                # are looking at, and the push notification is unaffected.
+                per_device[device.id] = {"status": "skipped", "reason": "app_in_foreground"}
+                continue
             result = await _send_start(
                 db, device, row, mission_id, now, silent=not restart_loud,
             )

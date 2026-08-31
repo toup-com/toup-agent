@@ -24,8 +24,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -426,6 +426,149 @@ async def report_activity_token(
         body.mission_id, device.id, body.source or "unspecified",
     )
     return {"ok": True, "updated": 0, "adopted": True}
+
+
+class LiveActivityPresence(BaseModel):
+    """Is this device SHOWING THE APP right now?
+
+    ``token`` (the device's push-to-start token) scopes the report to
+    one device. Without it the report lands on the user's most recently
+    seen device, which is the single-phone reality and the same
+    heuristic adoption uses; with two devices it matters, because a
+    phone in the user's hand must not silence a card on their iPad —
+    the iPad IS out of app."""
+
+    foreground: bool
+    token: Optional[str] = Field(default=None, min_length=32, max_length=200)
+
+
+# How long one `foreground: true` report is believed. Refreshed on every
+# foreground transition, so the only way to reach the end of it is for the
+# app to have gone away without being able to say so (suspended, crashed,
+# force-quit). Expiry fails OPEN — cards allowed — which is the direction
+# that can only ever cost a card the user did not need, never a reminder
+# that never arrived.
+PRESENCE_TTL = timedelta(minutes=5)
+
+
+@router.post("/presence")
+async def report_presence(
+    body: LiveActivityPresence,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The client-side half of the foreground gate.
+
+    A Live Activity is the agent reaching OUT of the app, and the app is
+    the only actor that can say whether it is on screen. Until this
+    existed the platform pushed an out-of-app card at a phone whose owner
+    was watching the answer stream into the thread — the card that
+    appears "while still in the app", and then lingers for its dismiss
+    window after they leave.
+
+    Both edges are reported: `false` on the way out, so the gate lifts
+    the moment the user leaves rather than after the TTL lapses."""
+    user_id = current_user.id
+    now = datetime.utcnow()
+    q = select(LiveActivityDevice).where(
+        LiveActivityDevice.user_id == user_id,
+        LiveActivityDevice.revoked_at.is_(None),
+    )
+    if body.token:
+        q = q.where(
+            LiveActivityDevice.push_to_start_token == body.token.strip().lower()
+        )
+    else:
+        q = q.order_by(LiveActivityDevice.last_seen_at.desc())
+    device = (await db.execute(q)).scalars().first()
+    if device is None:
+        return {"ok": True, "updated": 0}
+    device.foreground_until = (now + PRESENCE_TTL) if body.foreground else None
+    device.last_seen_at = now
+    await db.commit()
+    return {"ok": True, "updated": 1,
+            "foreground_until": device.foreground_until.isoformat()
+            if device.foreground_until else None}
+
+
+class LiveActivitiesCleared(BaseModel):
+    """The device ended these missions' cards locally.
+
+    ``token`` scopes the report to the reporting DEVICE, and it matters:
+    a card is a per-device object, so one phone's sweep must not end the
+    row of a card that is still on screen on the user's iPad."""
+
+    mission_ids: List[str] = Field(..., min_length=1, max_length=32)
+    token: Optional[str] = Field(default=None, min_length=32, max_length=200)
+
+
+@router.post("/cleared")
+async def report_cleared(
+    body: LiveActivitiesCleared,
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """The app ended these cards itself — a foreground sweep, or a launch
+    sweep after a force-quit — and the platform still has them STARTED.
+
+    That is not cosmetic bookkeeping. A started row holds the device's
+    one-activity slot (``_preempt_device``, the partial unique index) and
+    it is what makes the start-if-missing lane DECLINE to render the
+    mission's next alert: the lane only restarts a card it believes is
+    gone. So a reminder whose countdown card a force-quit swept would
+    reach its fire with the platform still convinced a card was on
+    screen, and push an update into an activity that no longer exists.
+
+    Deliberately NOT the tap ack. ``/ack`` and ``/seen`` also SUPPRESS
+    the mission's pending completed/failed rows, which is right for "the
+    user read it" and exactly wrong here — nobody has seen anything; a
+    card was removed from a screen. This ends rows and stops there.
+
+    DB-only: there is no card left to push an end to."""
+    user_id = current_user.id
+    now = datetime.utcnow()
+    missions = [m.strip()[:64] for m in body.mission_ids if m and m.strip()]
+    if not missions:
+        return {"ok": True, "ended": 0}
+    q = select(LiveActivity).where(
+        LiveActivity.user_id == user_id,
+        LiveActivity.mission_id.in_(missions),
+        LiveActivity.status == LA_STARTED,
+    )
+    if body.token:
+        # Device-scoped: a card is a per-device object. Without this, one
+        # phone's foreground sweep ends the row of a card still on screen on
+        # the user's other device — and the platform then stops updating it.
+        device = (
+            await db.execute(
+                select(LiveActivityDevice).where(
+                    LiveActivityDevice.user_id == user_id,
+                    LiveActivityDevice.push_to_start_token
+                    == body.token.strip().lower(),
+                )
+            )
+        ).scalars().first()
+        if device is None:
+            return {"ok": True, "ended": 0, "reason": "unknown_device"}
+        q = q.where(LiveActivity.device_id == device.id)
+    rows = (await db.execute(q)).scalars().all()
+    for la in rows:
+        la.status = LA_ENDED
+        la.ended_at = now
+        la.updated_at = now
+        # `alarm_owned_at` is deliberately LEFT ALONE. The ack clears it
+        # because a post-fire tap consumes the ownership cycle; nothing is
+        # consumed here — an AlarmKit alarm that owns this reminder's fire is
+        # still armed, and clearing the flag would let the platform's loud
+        # restart ring on top of it (the double-alert this device reported
+        # ownership to prevent).
+    await db.commit()
+    if rows:
+        logger.info(
+            "live-activity cleared: %d row(s) for %d mission(s) (user %s)",
+            len(rows), len(missions), user_id[:8],
+        )
+    return {"ok": True, "ended": len(rows)}
 
 
 @router.get("/active-missions")

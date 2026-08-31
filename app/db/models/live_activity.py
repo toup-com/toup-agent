@@ -98,6 +98,24 @@ class LiveActivityDevice(Base):
     # Diagnosable from ladebug in one query; nullable = older builds.
     alarm_auth: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     alarms_armed: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # ── Presence ──────────────────────────────────────────────────
+    # Until when this device is believed to be SHOWING THE APP. A Live
+    # Activity is the agent reaching the user out of app; pushing one at
+    # a phone whose owner is watching the answer arrive in the thread is
+    # the card appearing "while still in the app" — and it then lingers
+    # for its dismiss window after they leave.
+    #
+    # The app is the only actor that knows, so it reports both edges
+    # (POST .../presence). A TTL, not a boolean, because the "I left"
+    # report is the one that can be lost — an app suspended or killed
+    # sends nothing, and a stuck `true` would silence every card on the
+    # device forever. Expiry therefore fails OPEN, which is the safe
+    # direction: at worst a card the user did not need, never a reminder
+    # that never arrived. Nullable = never reported (older builds), which
+    # also reads as "not foreground".
+    foreground_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False,
     )

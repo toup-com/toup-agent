@@ -2731,3 +2731,281 @@ async def test_preempt_never_ends_a_voice_card(monkeypatch, client, auth_headers
         )).scalars().one()
         assert voice.status == LA_STARTED
     assert sent == []   # and no end push went anywhere near it
+
+
+# ── The foreground gate (2026-08-31) ──────────────────────────────
+# "When a user asks a question and stays in the app waiting for the
+# answer, the notification card and the Dynamic Island activate" — and
+# then linger once they leave. The answer row is `mission_completed`,
+# `mission_completed` is in `_START_IF_MISSING_KINDS`, and a turn the
+# user never left has no card to update — so every answer to a question
+# asked IN the app push-STARTED one.
+
+
+async def _register_and_mark(client, auth_headers, token: str, foreground: bool):
+    await client.post(
+        "/api/devices/live-activity",
+        json={"token": token, "environment": "development",
+              "install_id": f"install-{token[:6]}"},
+        headers=auth_headers,
+    )
+    resp = await client.post(
+        "/api/devices/live-activity/presence",
+        json={"foreground": foreground, "token": token},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _answer_row(user_id: str, mission: str) -> NotificationQueue:
+    """The 'Answer ready' row ws_chat emits for every completed turn."""
+    return NotificationQueue(
+        id=str(uuid.uuid4()), user_id=user_id, source="agent",
+        event_kind="mission_completed", title="Answer ready", priority="high",
+        idempotency_key=f"{mission}:completed", status=NQ_QUEUED,
+        created_at=datetime.utcnow(),
+        data_json={"mission_id": mission, "route": "chat",
+                   "kind": "chat_turn", "progress": 100},
+    )
+
+
+@pytest.mark.asyncio
+async def test_answer_card_is_not_started_while_the_app_is_foreground(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    body = await _register_and_mark(client, auth_headers, "fa" * 32, True)
+    assert body["foreground_until"] is not None
+
+    mission = "chatturn:fg0001"
+    async with async_session_maker() as db:
+        row = _answer_row(test_user_id, mission)
+        db.add(row)
+        await db.commit()
+        result = await las.handle_notification_row(db, row, datetime.utcnow())
+
+    assert sent == [], "a card was push-started at a phone whose owner is in the app"
+    verdicts = [v.get("reason") for v in (result.get("devices") or {}).values()]
+    assert verdicts == ["app_in_foreground"], result
+
+
+@pytest.mark.asyncio
+async def test_answer_card_IS_started_once_the_user_has_left(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """The gate must lift on the way out, not merely expire — the app
+    reports `foreground: false` on the background transition."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await _register_and_mark(client, auth_headers, "fb" * 32, True)
+    body = await _register_and_mark(client, auth_headers, "fb" * 32, False)
+    assert body["foreground_until"] is None
+
+    mission = "chatturn:fg0002"
+    async with async_session_maker() as db:
+        row = _answer_row(test_user_id, mission)
+        db.add(row)
+        await db.commit()
+        await las.handle_notification_row(db, row, datetime.utcnow())
+
+    # A terminal row starts the card and then falls through to the normal
+    # update/end loop on it, so the count is not the interesting number —
+    # the START is.
+    assert sent, "the out-of-app answer card no longer starts"
+    assert sent[0]["payload"]["aps"]["event"] == "start"
+
+
+@pytest.mark.asyncio
+async def test_presence_expiry_fails_OPEN(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """A stuck `true` must never silence a device forever: the app that
+    went away without saying so (suspended, crashed, force-quit) sends
+    nothing, so the TTL is what lifts the gate. Failing open can only
+    cost a card the user did not need; failing closed loses a reminder."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await _register_and_mark(client, auth_headers, "fc" * 32, True)
+    async with async_session_maker() as db:
+        dev = (await db.execute(
+            select(LiveActivityDevice).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        dev.foreground_until = datetime.utcnow() - timedelta(seconds=1)
+        await db.commit()
+
+    mission = "chatturn:fg0003"
+    async with async_session_maker() as db:
+        row = _answer_row(test_user_id, mission)
+        db.add(row)
+        await db.commit()
+        await las.handle_notification_row(db, row, datetime.utcnow())
+
+    assert sent and sent[0]["payload"]["aps"]["event"] == "start", \
+        "an expired presence claim still suppressed the card"
+
+
+@pytest.mark.asyncio
+async def test_reminder_countdown_is_exempt_from_the_foreground_gate(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """A countdown is not a report of something that happened — it IS the
+    pending alert, and it has to be armed at the moment the user creates
+    it, which is by definition while they are in the app talking to their
+    agent. The platform cannot come back and arm it later."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await _register_and_mark(client, auth_headers, "fd" * 32, True)
+
+    mission = "reminder:fg0004"
+    async with async_session_maker() as db:
+        row = NotificationQueue(
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_started", title="⏰ Standup", priority="default",
+            idempotency_key=f"{mission}:started", status=NQ_QUEUED,
+            created_at=datetime.utcnow(),
+            data_json={"mission_id": mission, "route": "chat",
+                       "kind": "reminder", "silent": True,
+                       "timer_end_ms": int(
+                           (datetime.utcnow() + timedelta(minutes=30)).timestamp() * 1000)},
+        )
+        db.add(row)
+        await db.commit()
+        await las.handle_notification_row(db, row, datetime.utcnow())
+
+    assert sent and sent[0]["payload"]["aps"]["event"] == "start", \
+        "the countdown card was suppressed — the reminder has no surface"
+
+
+# ── The cleared receipt ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cleared_ends_rows_without_suppressing_pending_alerts(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """The device swept a card locally (a foreground return, or a launch
+    after a force-quit). The row must END — a started row holds the
+    device's one-activity slot and makes start-if-missing decline the
+    mission's NEXT alert — but nothing may be SUPPRESSED: nobody has seen
+    anything, a card was removed from a screen."""
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    await _register_and_mark(client, auth_headers, "ce" * 32, False)
+
+    mission = "reminder:cleared01"
+    async with async_session_maker() as db:
+        device_id = (await db.execute(
+            select(LiveActivityDevice.id).where(
+                LiveActivityDevice.user_id == test_user_id)
+        )).scalars().first()
+        db.add(LiveActivity(
+            id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+            device_id=device_id, status=LA_STARTED, started_at=datetime.utcnow(),
+        ))
+        db.add(NotificationQueue(
+            id=str(uuid.uuid4()), user_id=test_user_id, source="agent",
+            event_kind="mission_completed", title="⏰ Standup", priority="high",
+            idempotency_key="cleared-fire", status=NQ_QUEUED,
+            created_at=datetime.utcnow(),
+            data_json={"mission_id": mission},
+        ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/cleared",
+        json={"mission_ids": [mission]},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ended"] == 1
+
+    async with async_session_maker() as db:
+        la = (await db.execute(
+            select(LiveActivity).where(LiveActivity.mission_id == mission)
+        )).scalars().one()
+        assert la.status == LA_ENDED
+        fire = (await db.execute(
+            select(NotificationQueue).where(
+                NotificationQueue.idempotency_key == "cleared-fire")
+        )).scalars().one()
+        # THE POINT: the fire still fires.
+        assert fire.status == NQ_QUEUED, "clearing a card suppressed the alert it was for"
+    assert sent == [], "the cleared receipt pushed to a card that no longer exists"
+
+
+@pytest.mark.asyncio
+async def test_cleared_is_device_scoped_and_spares_alarm_ownership(
+    client, auth_headers, test_user_id, monkeypatch,
+):
+    """Two corrections from review, both of which end an alert wrongly:
+
+    (a) a card is a PER-DEVICE object, so one phone's foreground sweep must
+        not end the row of a card still on screen on the user's other device;
+    (b) `alarm_owned_at` must survive. The ack clears it because a post-fire
+        tap consumes the ownership cycle; nothing is consumed here — an
+        AlarmKit alarm that owns this reminder's fire is still armed, and
+        clearing the flag lets the platform's loud restart ring on top of it.
+    """
+    from app.db import async_session_maker
+
+    sent: list = []
+    _patch_apns(monkeypatch, sent)
+    phone, ipad = "d1" * 32, "d2" * 32
+    for tok, install in ((phone, "install-phone"), (ipad, "install-ipad")):
+        await client.post(
+            "/api/devices/live-activity",
+            json={"token": tok, "environment": "development", "install_id": install},
+            headers=auth_headers,
+        )
+
+    mission = "reminder:twodev01"
+    async with async_session_maker() as db:
+        devs = {
+            d.push_to_start_token: d.id
+            for d in (await db.execute(
+                select(LiveActivityDevice).where(
+                    LiveActivityDevice.user_id == test_user_id)
+            )).scalars().all()
+        }
+        assert len(devs) == 2, devs
+        for tok in (phone, ipad):
+            db.add(LiveActivity(
+                id=str(uuid.uuid4()), user_id=test_user_id, mission_id=mission,
+                device_id=devs[tok], status=LA_STARTED,
+                started_at=datetime.utcnow(),
+                alarm_owned_at=datetime.utcnow(),
+            ))
+        await db.commit()
+
+    resp = await client.post(
+        "/api/devices/live-activity/cleared",
+        json={"mission_ids": [mission], "token": phone},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ended"] == 1, "the report was not scoped to the reporting device"
+
+    async with async_session_maker() as db:
+        rows = {
+            la.device_id: la for la in (await db.execute(
+                select(LiveActivity).where(LiveActivity.mission_id == mission)
+            )).scalars().all()
+        }
+        assert rows[devs[phone]].status == LA_ENDED
+        assert rows[devs[ipad]].status == LA_STARTED, \
+            "one device's sweep ended the OTHER device's live card"
+        assert rows[devs[phone]].alarm_owned_at is not None, \
+            "clearing a card un-muted the AlarmKit double-alert guard"

@@ -2928,14 +2928,25 @@ async def resolve_voice_language(user_id: str) -> Optional[str]:
 
 
 # ── Which realtime session currently OWNS a user's voice presence ────────
-# user_id → session nonce, single-worker in-process (the deployment is
-# deliberately one worker; same rule as the warm-reopen context cache above).
-# A silent app reconnect opens the NEW session before (or moments after) the
-# OLD one's finally runs, and without this the old teardown's Live Activity
-# end killed the island card of the call the user was still on (review
-# finding, 2026-08-16). The finally only ends the card if it is still the
-# owner after a short grace — a clean client 'stop' skips the grace, because
-# an ended call has no successor coming.
+# user_id → session nonce, in-process. A silent app reconnect opens the NEW
+# session before (or moments after) the OLD one's finally runs, and without
+# this the old teardown's Live Activity end killed the island card of the call
+# the user was still on (review finding, 2026-08-16). The finally only ends the
+# card if it is still the owner after a short grace — a clean client 'stop'
+# skips the grace, because an ended call has no successor coming.
+#
+# ⚠️ THIS DICT IS PER-PROCESS AND THE DEPLOYMENT IS NOT. An earlier comment
+# here asserted "the deployment is deliberately one worker"; railway.json says
+# `numReplicas: 2`. One uvicorn worker per CONTAINER, two containers — so a
+# reconnect that lands on the other replica leaves this replica's dying socket
+# still holding the nonce, and six seconds later it ends the card of a call
+# that is very much still live.
+#
+# The app is the backstop and it is the right one: it is the only party that
+# knows whether a call is live, and `voiceActivity.ios.ts::noteVoiceActivityEnded`
+# restores a card ended under a live call (once). A shared-store owner check
+# here would be the cleaner fix and is the tracked follow-up; it needs a
+# cross-replica store this service does not currently have.
 _voice_session_owner: dict = {}
 _VOICE_LA_END_GRACE_S = 6.0
 _deferred_la_tasks: set = set()
