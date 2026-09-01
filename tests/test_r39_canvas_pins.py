@@ -15,16 +15,18 @@
                           commute (founder P13).
   4. NOTES ON PINS      — a pin can carry the user's own instruction,
                           and re-pinning with a new note is an edit.
-  5. THE PIN STEERS THE — `_apply_focus_scope` narrows the read; before
-     RUN                  this a pin reached a run only as a render
-                          root no compiled step referenced (founder
-                          P10).
+  5. THE PIN STEERS THE — `_apply_focus_scope` fills a read's EMPTY
+     RUN                  target from a pin. R42 REVERSED the rest of
+                          it: pins rank, they never filter (founder
+                          P6), so a broad query is left alone and the
+                          pins reach the ranking step instead.
   6. PLAN TENSE         — the Steps sheet describes what an automation
                           WILL do; "Checked your calendar" on a
                           never-run automation reads as a record that
                           does not exist (founder P18).
 """
 
+import datetime as _dt
 import json
 import uuid
 from types import SimpleNamespace
@@ -124,42 +126,53 @@ async def test_a_gmail_read_asks_for_bodies_because_bare_ids_have_no_subject(
 
 
 @pytest.mark.asyncio
-async def test_a_gmail_row_pins_its_sender_never_its_message_id(monkeypatch):
-    """Pinning a mail means "this SENDER matters"; a message id is not a
-    place anything can start from — pinning one as a 'thread' is the
-    "(no sub…" ghost chip."""
+async def test_a_gmail_row_pins_its_conversation_and_the_group_its_sender(
+    monkeypatch,
+):
+    """R42: a row pins the mail it IS. Carrying the sender on every row
+    made one tap tick every other mail from Sara — the group a person
+    pin makes is where a whole correspondent is pinned."""
     from app.agent.automations import contents
     from app.agent.automations.spec import FOCUS_KINDS
 
     async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
                         **kw):
-        return _ok({"messages": [{
-            "id": "m1",
-            "headers": {"From": "Sara Chen <SARA@X.com>",
-                        "Subject": "Re: launch",
-                        "Date": "Fri, 29 Aug 2026 09:14:00 +0000"},
-            "snippet": "ok",
-        }]})
+        return _ok({"messages": [
+            {"id": "m1", "threadId": "t1",
+             "headers": {"From": "Sara Chen <SARA@X.com>",
+                         "Subject": "Re: launch",
+                         "Date": "Fri, 29 Aug 2026 09:14:00 +0000"},
+             "snippet": "ok"},
+            {"id": "m2", "threadId": "t2",
+             "headers": {"From": "Sara Chen <SARA@X.com>",
+                         "Subject": "Budget"}},
+        ]})
     monkeypatch.setattr(
         "app.agent.automations.registry.dispatch_via_platform", _dispatch,
     )
     env = await contents.account_contents(
         "u", connector_id="gmail", connection=_LIVE,
+        focus=[{"kind": "person", "id": "sara@x.com", "label": "Sara Chen"}],
     )
-    pin = env["groups"][0]["items"][0]["pin"]
-    assert pin == {"kind": "person", "id": "sara@x.com",
-                   "label": "Sara Chen"}
-    assert pin["kind"] in FOCUS_KINDS
+    sender = env["groups"][0]
+    assert sender["pinned"] and sender["pin"] == {
+        "kind": "person", "id": "sara@x.com", "label": "Sara Chen"}
+    pins = [i["pin"] for i in sender["items"]]
+    assert pins == [{"kind": "thread", "id": "t1", "label": "Re: launch"},
+                    {"kind": "thread", "id": "t2", "label": "Budget"}]
+    assert all(p["kind"] in FOCUS_KINDS for p in pins)
 
 
 @pytest.mark.asyncio
-async def test_a_mail_with_no_sender_carries_no_pin(monkeypatch):
+async def test_a_mail_with_no_id_carries_no_pin(monkeypatch):
+    """A row that cannot say WHICH mail it is must claim no check — it
+    would lose it on the next read."""
     from app.agent.automations import contents
 
     async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
                         **kw):
         return _ok({"messages": [{
-            "id": "m1", "headers": {"Subject": "System notice"},
+            "headers": {"Subject": "System notice"},
         }]})
     monkeypatch.setattr(
         "app.agent.automations.registry.dispatch_via_platform", _dispatch,
@@ -171,11 +184,39 @@ async def test_a_mail_with_no_sender_carries_no_pin(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_outlook_row_pins_the_sender_and_keeps_the_cheap_read(
+async def test_a_person_pin_orders_the_mailbox_it_never_scopes_it(
+    monkeypatch,
+):
+    """R42, founder P6: the pinned query used to REPLACE the recent one,
+    so the first pin a user made was the last mail they could ever pick
+    in here."""
+    from app.agent.automations import contents
+    seen = []
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        **kw):
+        seen.append(tool_input.get("query") or "")
+        return _ok({"messages": [{"id": "m1", "threadId": "t1",
+                                  "headers": {"Subject": "S"}}]})
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _dispatch,
+    )
+    env = await contents.account_contents(
+        "u", connector_id="gmail", connection=_LIVE,
+        focus=[{"kind": "person", "id": "sara@x.com", "label": "Sara"}],
+    )
+    assert sorted(seen) == ["", "from:sara@x.com"]
+    assert [(g["key"], g["pinned"]) for g in env["groups"]] == [
+        ("from:sara@x.com", True), ("recent", False)]
+
+
+@pytest.mark.asyncio
+async def test_an_outlook_row_pins_the_message_and_keeps_the_cheap_read(
     monkeypatch,
 ):
     """outlook's include_body=False still $selects subject/from/preview
-    — only gmail needs the expensive form."""
+    — only gmail needs the expensive form. That $select carries no
+    conversation id, so an Outlook row pins the message it is."""
     from app.agent.automations import contents
     seen = []
 
@@ -194,16 +235,18 @@ async def test_an_outlook_row_pins_the_sender_and_keeps_the_cheap_read(
     )
     assert seen[0]["include_body"] is False
     pin = env["groups"][0]["items"][0]["pin"]
-    assert pin == {"kind": "person", "id": "omid@x.com", "label": "Omid"}
+    assert pin == {"kind": "thread", "id": "m1", "label": "Budget"}
 
 
 @pytest.mark.asyncio
-async def test_a_slack_row_pins_its_channel_and_so_does_its_group(
+async def test_a_slack_row_pins_its_own_thread_and_the_group_the_channel(
     monkeypatch,
 ):
-    """A Slack message is not a place; its CHANNEL is — the app used to
-    invent kind 'slack' from its icon vocabulary and every pin was
-    refused bad_focus_kind."""
+    """R42, founder P4: every row carried its CHANNEL, and the app reads
+    "is this row pinned?" off that id — so one tap on one #all-toup
+    message drew a checkmark on all ten while the badge said 1. A reply
+    and its parent are one conversation and one pin; two separate
+    messages are two."""
     from app.agent.automations import contents
 
     async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
@@ -214,6 +257,10 @@ async def test_a_slack_row_pins_its_channel_and_so_does_its_group(
             ]})
         return _ok({"messages": [
             {"ts": "1756400000.0", "from": "Sara", "text": "shipping"},
+            {"ts": "1756400100.0", "from": "Omid", "text": "blockers?",
+             "reply_count": 2, "thread_ts": "1756400100.0"},
+            {"ts": "1756400200.0", "from": "Ali", "text": "none",
+             "in_thread_of": "1756400100.0"},
         ]})
     monkeypatch.setattr(
         "app.agent.automations.registry.dispatch_via_platform", _dispatch,
@@ -221,16 +268,56 @@ async def test_a_slack_row_pins_its_channel_and_so_does_its_group(
     env = await contents.account_contents(
         "u", connector_id="slack", connection=_LIVE,
     )
-    want = {"kind": "channel", "id": "C1", "label": "#eng"}
-    assert env["groups"][0]["pin"] == want
-    assert env["groups"][0]["items"][0]["pin"] == want
+    assert env["groups"][0]["pin"] == {"kind": "channel", "id": "C1",
+                                       "label": "#eng"}
+    ids = [i["pin"]["id"] for i in env["groups"][0]["items"]]
+    assert ids == ["C1#1756400000.0", "C1#1756400100.0", "C1#1756400100.0"]
+    assert env["groups"][0]["items"][0]["pin"]["label"] == "Sara: shipping"
 
 
 @pytest.mark.asyncio
-async def test_a_jira_row_pins_the_project_its_key_names(monkeypatch):
-    """"SCRUM-1" → project "SCRUM": the container a JQL can actually be
-    scoped to. A pinned single ticket steers nothing — and a key with no
-    dash names no project, so it carries no pin at all."""
+async def test_a_slack_pin_orders_the_channels_it_never_hides_them(
+    monkeypatch,
+):
+    """R42, founder P6: `slack__list_channels` was skipped outright when
+    any pin existed, so the sheet showed that one channel and nothing
+    else could ever be picked. And a pinned channel the listing does not
+    confirm is still read — the user pinned it."""
+    from app.agent.automations import contents
+    seen = []
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        **kw):
+        seen.append(tool_name)
+        if tool_name == "slack__list_channels":
+            return _ok({"channels": [
+                {"id": "C1", "name": "eng", "is_member": True},
+                {"id": "C2", "name": "all-toup", "is_member": True},
+            ]})
+        return _ok({"messages": [
+            {"ts": "1756400000.0", "from": "Sara", "text": "shipping"},
+        ]})
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _dispatch,
+    )
+    env = await contents.account_contents(
+        "u", connector_id="slack", connection=_LIVE,
+        focus=[{"kind": "thread", "id": "C2#1756400000.0",
+                "label": "Sara: shipping"}],
+    )
+    assert "slack__list_channels" in seen
+    assert [(g["key"], g["label"], g["pinned"]) for g in env["groups"]] == [
+        ("C2", "#all-toup", True), ("C1", "#eng", False)]
+
+
+@pytest.mark.asyncio
+async def test_a_jira_row_pins_its_ticket_and_its_group_the_project(
+    monkeypatch,
+):
+    """"SCRUM-1" → project "SCRUM": the container a read can be aimed
+    at, and now the GROUP the ticket sits in. A key with no dash names
+    no project, so that group is a plain bucket with no pin of its own.
+    """
     from app.agent.automations import contents
 
     async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
@@ -245,15 +332,50 @@ async def test_a_jira_row_pins_the_project_its_key_names(monkeypatch):
     env = await contents.account_contents(
         "u", connector_id="jira", connection=_LIVE,
     )
-    items = env["groups"][0]["items"]
-    by_id = {i["id"]: i for i in items}
-    assert by_id["ENG-12"]["pin"] == {"kind": "project", "id": "ENG",
-                                      "label": "ENG"}
-    assert by_id["ODD"]["pin"] is None
+    groups = {g["key"]: g for g in env["groups"]}
+    assert groups["ENG"]["pin"] == {"kind": "project", "id": "ENG",
+                                    "label": "ENG"}
+    assert groups["ENG"]["items"][0]["pin"] == {
+        "kind": "ticket", "id": "ENG-12", "label": "ENG-12"}
+    assert groups["other"]["pin"] is None
+    assert groups["other"]["items"][0]["pin"] == {
+        "kind": "ticket", "id": "ODD", "label": "ODD"}
 
 
 @pytest.mark.asyncio
-async def test_a_github_row_and_its_group_pin_the_repo(monkeypatch):
+async def test_a_jira_pin_leads_the_groups_it_never_enters_the_jql(
+    monkeypatch,
+):
+    """R42, founder P6: the pin used to prefix the JQL with
+    `project in (…)`, so every other project vanished from the sheet the
+    moment one was pinned — and the ORDER BY has to stay at the very
+    end, which a scope built by string prefixing is one edit away from
+    breaking."""
+    from app.agent.automations import contents
+    seen = []
+
+    async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
+                        **kw):
+        seen.append(tool_input["jql"])
+        return _ok({"issues": [
+            {"key": "ENG-12", "summary": "Ship", "project": "ENG"},
+            {"key": "OPS-4", "summary": "Rotate", "project": "OPS"},
+        ]})
+    monkeypatch.setattr(
+        "app.agent.automations.registry.dispatch_via_platform", _dispatch,
+    )
+    env = await contents.account_contents(
+        "u", connector_id="jira", connection=_LIVE,
+        focus=[{"kind": "project", "id": "OPS", "label": "OPS"}],
+    )
+    assert "project in" not in seen[0]
+    assert seen[0].endswith("ORDER BY duedate ASC, updated DESC")
+    assert [(g["key"], g["pinned"]) for g in env["groups"]] == [
+        ("OPS", True), ("ENG", False)]
+
+
+@pytest.mark.asyncio
+async def test_a_github_row_pins_its_pr_and_its_group_the_repo(monkeypatch):
     from app.agent.automations import contents
 
     async def _dispatch(user_id, *, connector_id, tool_name, tool_input,
@@ -270,13 +392,16 @@ async def test_a_github_row_and_its_group_pin_the_repo(monkeypatch):
     env = await contents.account_contents(
         "u", connector_id="github", connection=_LIVE,
     )
-    want = {"kind": "repo", "id": "toup/platform", "label": "toup/platform"}
-    assert env["groups"][0]["pin"] == want
-    assert env["groups"][0]["items"][0]["pin"] == want
+    assert env["groups"][0]["pin"] == {
+        "kind": "repo", "id": "toup/platform", "label": "toup/platform"}
+    # R42: the row is the pull request, and "owner/repo#7" is both its
+    # own name and the repo it hangs off.
+    assert env["groups"][0]["items"][0]["pin"] == {
+        "kind": "ticket", "id": "toup/platform#7", "label": "#7 A PR"}
 
 
 @pytest.mark.asyncio
-async def test_teams_is_readable_now_and_its_rows_pin_the_chat(monkeypatch):
+async def test_teams_is_readable_now_and_its_rows_pin_themselves(monkeypatch):
     """Teams was not in SUPPORTED at all, so the one connector the
     Morning work brief reads a chat from answered "no way to look
     inside" — with an expired credential underneath that the sheet
@@ -306,8 +431,12 @@ async def test_teams_is_readable_now_and_its_rows_pin_the_chat(monkeypatch):
     )
     item = env["groups"][0]["items"][0]
     assert item["sub"] == "Hello world"
-    assert item["pin"] == {"kind": "thread", "id": "chat1",
-                           "label": "Quarterly"}
+    assert env["groups"][0]["pin"] == {"kind": "thread", "id": "chat1",
+                                       "label": "Quarterly"}
+    # A Graph chat message has no thread of its own, so the row IS the
+    # message — and pinning one must not tick the whole chat (R42).
+    assert item["pin"] == {"kind": "thread", "id": "chat1#m1",
+                           "label": "Sara: Hello world"}
 
 
 @pytest.mark.asyncio
@@ -762,8 +891,8 @@ async def test_a_pin_never_redirects_an_approved_destination(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_project_pin_asks_for_no_destination(monkeypatch):
-    """Only a channel/thread pin can BE a write destination; a project
-    scopes a read and nothing else."""
+    """Only a pin that NAMES A PLACE can be a write destination; a
+    project scopes a read and nothing else."""
     from app.agent.automations.workflow import add_focus
 
     calls = []
@@ -781,6 +910,39 @@ async def test_a_project_pin_asks_for_no_destination(monkeypatch):
         )
     assert "destination" not in out
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_message_thread_pin_does_not_redirect_the_write(monkeypatch):
+    """R42: `thread` names two things and only one of them is a place.
+
+    `contents._read_teams` pins a Teams CHAT as kind `thread`, and that
+    chat IS where `teams__send_chat_message` posts — it must keep
+    bridging. Everywhere else a `thread` is a MESSAGE thread, a preview
+    ROW: bridging it would point the automation's POST at whatever the
+    user last pinned to READ, and `only_if_unpinned` cannot catch that
+    — an unpinned destination has nothing to refuse with.
+    """
+    from app.agent.automations.workflow import _names_a_destination, add_focus
+
+    calls = []
+    monkeypatch.setattr(
+        "app.agent.automations.registry.create_grant_request",
+        _grant_stub(calls),
+    )
+    uid = await _mk_user()
+    a = await _mk(uid, _raw(granted=False))   # the slack write is still owed
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        out = await add_focus(
+            db, automation=row, user_id=uid, account_id="slack",
+            kind="thread", target_id="1724968000.001", label="Re: launch",
+        )
+    assert "destination" not in out
+    assert calls == []
+    assert not _names_a_destination("slack", "thread")
+    assert _names_a_destination("teams", "thread")
+    assert _names_a_destination("slack", "channel")
 
 
 @pytest.mark.asyncio
@@ -831,113 +993,156 @@ async def test_no_write_step_means_no_destination_to_pin():
 
 # ──────────────────────────────────────── 5. the pin steers the run
 
-def test_gmail_pins_compose_into_the_query_with_or():
+def test_a_broad_query_is_left_exactly_as_the_spec_wrote_it():
+    """R42, founder P6 — pins RANK, they never FILTER.
+
+    R39 composed them into the provider call: a person pin became
+    `from:boss@x.com` on the Gmail query, a project pin wrapped the
+    step's own JQL in `project in (…) AND (…)`. Material the user did
+    not pin was then never FETCHED, so no ranking step could see it and
+    nothing downstream could put the pinned item first — which is the
+    whole thing a pin is for. The Jira composition was also invalid
+    JQL: every shipped template's JQL ends in ORDER BY, which JQL
+    forbids inside parentheses, so the read 400'd, `on_error: continue`
+    swallowed it, and the brief blamed a healthy board.
+    """
     from app.agent.automations.executor_v2 import _apply_focus_scope
 
-    out = _apply_focus_scope(
-        "gmail", "gmail__list_messages", {"query": "is:unread"},
+    gmail = {"query": "is:unread"}
+    assert _apply_focus_scope(
+        "gmail", "gmail__list_messages", dict(gmail),
         [{"kind": "person", "id": "boss@x.com"},
          {"kind": "label", "id": "urgent"}],
-    )
-    assert out["query"] == "is:unread (from:boss@x.com OR label:urgent)"
+    ) == gmail
 
-    # One pin needs no parentheses, and the spec's own filter stays.
-    solo = _apply_focus_scope(
-        "gmail", "gmail__list_messages", {"query": "is:unread"},
+    outlook = {"query": "isRead:false"}
+    assert _apply_focus_scope(
+        "outlook", "outlook__list_messages", dict(outlook),
         [{"kind": "person", "id": "boss@x.com"}],
-    )
-    assert solo["query"] == "is:unread from:boss@x.com"
+    ) == outlook
+
+    jql = {"jql": "assignee = currentUser() AND statusCategory != Done "
+                  "ORDER BY updated DESC"}
+    assert _apply_focus_scope(
+        "jira", "jira__search_issues", dict(jql),
+        [{"kind": "project", "id": "ENG"}, {"kind": "project", "id": "OPS"}],
+    ) == jql
 
 
-def test_outlook_person_pins_narrow_by_and():
+def test_a_pin_fills_an_empty_target_and_never_overrides_a_set_one():
+    """The one honest case: a tool that REQUIRES a target it does not
+    have. Filling a hole is not filtering; replacing what the spec said
+    is (R39 did, and a second pin was silently dropped)."""
     from app.agent.automations.executor_v2 import _apply_focus_scope
 
-    out = _apply_focus_scope(
-        "outlook", "outlook__list_messages", {"query": "isRead:false"},
-        [{"kind": "person", "id": "boss@x.com"}],
+    filled = _apply_focus_scope(
+        "slack", "slack__read_messages", {"channel": "", "limit": 10},
+        [{"kind": "channel", "id": "C-PIN"},
+         {"kind": "channel", "id": "C-TWO"}],
     )
-    assert out["query"] == "(isRead:false) AND (from:boss@x.com)"
+    assert filled["channel"] == "C-PIN" and filled["limit"] == 10
 
-    bare = _apply_focus_scope(
-        "outlook", "outlook__list_messages", {},
-        [{"kind": "person", "id": "boss@x.com"}],
-    )
-    assert bare["query"] == "from:boss@x.com"
-
-
-def test_slack_and_teams_pins_override_the_single_target():
-    """The pin is the user's later word than the compiled spec — it
-    fills an empty target and overrides a set one."""
-    from app.agent.automations.executor_v2 import _apply_focus_scope
-
-    slack = _apply_focus_scope(
-        "slack", "slack__read_messages", {"channel": "C-OLD", "limit": 10},
+    kept = {"channel": "C-OLD", "limit": 10}
+    assert _apply_focus_scope(
+        "slack", "slack__read_messages", dict(kept),
         [{"kind": "channel", "id": "C-PIN"}],
-    )
-    assert slack["channel"] == "C-PIN" and slack["limit"] == 10
+    ) == kept
 
     teams = _apply_focus_scope(
-        "teams", "teams__read_chat_messages", {"chat_id": "old"},
+        "teams", "teams__read_chat_messages", {},
         [{"kind": "thread", "id": "chat9"}],
     )
     assert teams["chat_id"] == "chat9"
+    assert _apply_focus_scope(
+        "teams", "teams__read_chat_messages", {"chat_id": "old"},
+        [{"kind": "thread", "id": "chat9"}],
+    ) == {"chat_id": "old"}
 
 
-def test_jira_project_pins_prefix_the_jql():
+def test_a_github_repo_pin_fills_only_a_repository_the_spec_left_empty():
     from app.agent.automations.executor_v2 import _apply_focus_scope
 
     out = _apply_focus_scope(
-        "jira", "jira__search_issues",
-        {"jql": "assignee = currentUser()"},
-        [{"kind": "project", "id": "ENG"}, {"kind": "project", "id": "OPS"}],
-    )
-    assert out["jql"] == ('project in ("ENG", "OPS") AND '
-                          '(assignee = currentUser())')
-
-    bare = _apply_focus_scope(
-        "jira", "jira__search_issues", {"jql": ""},
-        [{"kind": "project", "id": "ENG"}],
-    )
-    assert bare["jql"] == 'project in ("ENG")'
-
-
-def test_a_github_repo_pin_overrides_owner_and_repo():
-    from app.agent.automations.executor_v2 import _apply_focus_scope
-
-    out = _apply_focus_scope(
-        "github", "github__list_issues",
-        {"owner": "someone", "repo": "else", "state": "open"},
+        "github", "github__list_issues", {"state": "open"},
         [{"kind": "repo", "id": "toup/platform"}],
     )
-    assert (out["owner"], out["repo"]) == ("toup", "platform")
+    assert (out["owner"], out["repo"], out["state"]) == (
+        "toup", "platform", "open")
+
+    named = {"owner": "someone", "repo": "else", "state": "open"}
+    assert _apply_focus_scope(
+        "github", "github__list_issues", dict(named),
+        [{"kind": "repo", "id": "toup/platform"}],
+    ) == named
 
     # A repo pin that names no owner half steers nothing.
-    odd = _apply_focus_scope(
-        "github", "github__list_issues", {"owner": "a", "repo": "b"},
+    assert _apply_focus_scope(
+        "github", "github__list_issues", {},
         [{"kind": "repo", "id": "just-a-name"}],
-    )
-    assert (odd["owner"], odd["repo"]) == ("a", "b")
+    ) == {}
 
 
 def test_no_pins_unknown_tools_and_malformed_pins_change_nothing():
     """Pure and total — a pin must never break a read."""
     from app.agent.automations.executor_v2 import _apply_focus_scope
 
-    params = {"query": "is:unread"}
-    assert _apply_focus_scope("gmail", "gmail__list_messages",
+    params = {"channel": ""}
+    assert _apply_focus_scope("slack", "slack__read_messages",
                               params, []) is params
     assert _apply_focus_scope(
-        "gmail", "gmail__get_message", dict(params),
-        [{"kind": "person", "id": "x@y.z"}],
+        "slack", "slack__read_channels", dict(params),
+        [{"kind": "channel", "id": "C1"}],
     ) == params
     assert _apply_focus_scope(
-        "gmail", "gmail__list_messages", dict(params),
-        ["not-a-dict", {"kind": "person"}, {"no": "id"}],
+        "slack", "slack__read_messages", dict(params),
+        ["not-a-dict", {"kind": "channel"}, {"no": "id"}],
     ) == params
     assert _apply_focus_scope(
         "slack", "slack__read_messages", "not-a-dict",
         [{"kind": "channel", "id": "C1"}],
     ) == "not-a-dict"
+
+
+def test_a_calendar_read_gets_the_clock_the_spec_cannot_have():
+    """R42 B1 — `calendar__list_events` windows only when asked and
+    orders ASCENDING, and no shipped template passed a window, so every
+    "your day's calendar" posted the oldest events in the account.
+    `window_days` is spec vocabulary three templates already carry; it
+    is popped here so the provider never sees a key its schema does not
+    declare."""
+    from datetime import datetime, timezone
+    from app.agent.automations.executor_v2 import _apply_time_window
+
+    clock = {"now": datetime(2026, 8, 31, 7, 30, 15, 123456,
+                             tzinfo=timezone.utc)}
+    out = _apply_time_window(
+        "calendar__list_events",
+        {"window_days": 7, "max_results": 25}, clock,
+    )
+    assert out == {"max_results": 25,
+                   "time_min": "2026-08-31T07:30:15+00:00",
+                   "time_max": "2026-09-07T07:30:15+00:00"}
+
+    # Default horizon is one day, and a bound the spec set is kept.
+    assert _apply_time_window(
+        "calendar__list_events", {"max_results": 10}, clock,
+    )["time_max"] == "2026-09-01T07:30:15+00:00"
+    pinned = _apply_time_window(
+        "calendar__list_events",
+        {"time_min": "2020-01-01T00:00:00+00:00",
+         "time_max": "2020-01-02T00:00:00+00:00"}, clock,
+    )
+    assert pinned["time_min"].startswith("2020-01-01")
+    assert pinned["time_max"].startswith("2020-01-02")
+
+    # No clock (a ctx without `_clock`) windows nothing, and no tool
+    # ever receives `window_days`.
+    assert _apply_time_window(
+        "calendar__list_events", {"window_days": 3}, {},
+    ) == {}
+    assert _apply_time_window(
+        "slack__read_messages", {"channel": "C1", "window_days": 5}, clock,
+    ) == {"channel": "C1"}
 
 
 @pytest.mark.asyncio
@@ -962,7 +1167,8 @@ async def test_the_executor_applies_the_scope_at_the_read_seam(monkeypatch):
     )
     ctx = {"event": {}, "var": {}, "steps": {}, "focus": {},
            "_focus_pins": {"slack": [{"kind": "channel", "id": "C-PIN",
-                                      "label": "#platform"}]}}
+                                      "label": "#platform"}]},
+           "_clock": {"now": _dt.datetime.now(_dt.timezone.utc)}}
     out = await _execute_read_step(
         SimpleNamespace(user_id="u", id="a1"), step, ctx,
     )

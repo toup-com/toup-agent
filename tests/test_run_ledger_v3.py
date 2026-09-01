@@ -1391,14 +1391,25 @@ async def test_run_finished_frame_on_the_reads_only_terminal(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_narration_is_a_visible_step(monkeypatch):
+async def test_narration_is_a_visible_step_on_a_reads_only_run(monkeypatch):
     """rec2 bug 2a: when the reads are done and narration begins, the
     run's visible total extends by ONE step ("Writing your brief"), the
     activity phase flips to `writing`, and the job's progress columns
-    agree — so the terminal frame's totals match what the card shows."""
+    agree — so the terminal frame's totals match what the card shows.
+
+    R42: on a READS-ONLY run, which is the run this is still true of.
+    A run with a write step terminalizes in the outbox flush that now
+    precedes narration — see the sibling test below."""
     frames = _capture_frames(monkeypatch)
     uid = await _mk_user()
-    vspec = _v2_spec()
+    vspec = _v2_spec(steps=[{
+        "id": "issues", "connector_id": "jira",
+        "tool": "jira__search_issues", "params": {"jql": "x"},
+        "collect": {"items_path": "issues",
+                    "fields": {"key": "key", "summary": "summary"},
+                    "format": "{{item.key}} {{item.summary}}",
+                    "empty_text": "none"},
+        "on_error": "skip"}])
     a = await _mk_automation_v2(uid, vspec)
     await _fire(monkeypatch, uid, a, vspec)
     job = await _one_run(a.id)
@@ -1416,6 +1427,56 @@ async def test_narration_is_a_visible_step(monkeypatch):
     assert acts[0]["automation_id"] == a.id
     assert job.progress_step == n + 1
     assert job.progress_total == n + 1
+
+
+@pytest.mark.asyncio
+async def test_a_written_run_does_not_announce_a_step_after_its_terminal(
+        monkeypatch):
+    """R42: the write and the run's terminal now land BEFORE narration,
+    so the narration step must not announce itself as `running` on a job
+    that has already reported Done at fraction 1.0 — the card would walk
+    backwards. The thread is still being written, so the `writing`
+    activity phase stays."""
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    job = await _one_run(a.id)
+    assert job.status == "completed"
+    writing = [f for f in frames
+               if f["type"] == "automation.run.progress"
+               and f.get("sentence") == "Writing your brief"]
+    assert writing == []
+    acts = [f for f in frames if f["type"] == "automation.activity"
+            and f.get("phase") == "writing"]
+    assert len(acts) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_write_turn_lands_before_the_runs_terminal(monkeypatch):
+    """R42 (P14-4): the send's own record precedes the terminal frame.
+
+    The client latches a run card's content the instant `run_in_flight`
+    goes null, and `automation.run.finished` is what nulls it — so the
+    `tool_kind: write` turn that names WHAT was posted and WHERE has to
+    be on the wire first, or the landed card can never show it. The
+    failure branch has always ordered it this way; the success branch
+    finalized first and appended the turn afterwards.
+    """
+    frames = _capture_frames(monkeypatch)
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    await _fire(monkeypatch, uid, a, vspec)
+    kinds = [
+        "write" if (f["type"] == "automation.turn"
+                    and f["turn"].get("tool_kind") == "write") else f["type"]
+        for f in frames
+    ]
+    assert "write" in kinds, "the write turn was never broadcast"
+    assert "automation.run.finished" in kinds
+    assert kinds.index("write") < kinds.index("automation.run.finished")
 
 
 @pytest.mark.asyncio

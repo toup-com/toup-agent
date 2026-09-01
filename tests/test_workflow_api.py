@@ -10,6 +10,7 @@ with undo, and the EDITED thread record on every write.
 
 import json
 import uuid
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -366,7 +367,66 @@ async def test_rules_crud_and_injection_boundary():
         assert facts == []
         await delete_rule(db, automation=a2, rule_id=rid)
         assert rules_list(a2) == []
-    assert await _edited_notes(a.id) == 3
+    # R42 (P9): three writes inside the same minute are ONE divider.
+    # This asserted 3 while the founder's thread showed the reason it
+    # should not: stacked EDITED rows, identical and back to back with
+    # nothing between them. The stamp still moves — the collapse is a
+    # rewrite in place, not a dropped edit.
+    assert await _edited_notes(a.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_edit_rewrites_the_divider_instead_of_stacking_one():
+    """R42 (P9): one edit, one divider.
+
+    A repeat inside the window REWRITES the standing note — same turn
+    id, same seq, a moved stamp — so the `automation.turn` frame
+    repaints the row the user is looking at. An edit that is no longer
+    on top of a fresh one still appends: the collapse hides duplicates,
+    never history.
+    """
+    from app.agent.automations import ledger
+    from app.agent.automations.workflow import add_rule
+
+    uid = await _mk_user()
+    a = await _mk_automation_v2(uid, _v2_spec())
+
+    async def _notes():
+        async with async_session_maker() as db:
+            thread = await ledger.thread_for(db, a.id)
+            rows = (await db.execute(
+                select(AutomationTurn)
+                .where(AutomationTurn.thread_id == thread.id)
+                .where(AutomationTurn.kind == "note")
+                .order_by(AutomationTurn.seq)
+            )).scalars().all()
+            return [(r.id, r.seq, json.loads(r.payload_json)) for r in rows]
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        await add_rule(db, automation=row, text="Never post on a weekend.")
+    first = await _notes()
+    assert len(first) == 1
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        await add_rule(db, automation=row, text="Leave finance alone.")
+    second = await _notes()
+    assert len(second) == 1
+    assert (second[0][0], second[0][1]) == (first[0][0], first[0][1])
+    assert second[0][2]["at"] > first[0][2]["at"]
+
+    # Age the standing note past the window; the next edit gets its own.
+    async with async_session_maker() as db:
+        turn = await db.get(AutomationTurn, second[0][0])
+        body = json.loads(turn.payload_json)
+        body["at"] = (datetime.utcnow()
+                      - timedelta(minutes=5)).isoformat() + "Z"
+        turn.payload_json = json.dumps(body)
+        await db.commit()
+        row = await db.get(Automation, a.id)
+        await add_rule(db, automation=row, text="Ask before mailing anyone.")
+    assert len(await _notes()) == 2
 
 
 @pytest.mark.asyncio

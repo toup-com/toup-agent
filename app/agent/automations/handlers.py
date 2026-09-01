@@ -110,7 +110,16 @@ class AutomationPollHandler:
                 status="partial" if stats["ran"] else "failed",
                 outcome="partial" if stats["ran"] else "failure",
                 error_class="run_failed",
-                error_detail=f"{stats['failed']} of {stats['fresh']} runs failed",
+                # What this tick actually ATTEMPTED. `fresh` is the intake
+                # alone, and since R42 a tick also drains events an earlier
+                # tick deferred over the rate budget — so a tick that saw
+                # nothing new and ran two carried-over events reported
+                # "1 of 0 runs failed".
+                error_detail=(
+                    f"{stats['failed']} of "
+                    f"{stats.get('fresh', 0) + stats.get('carried_in', 0)} "
+                    f"runs failed"
+                ),
                 metrics=stats,
             )
         return RoutineResult(

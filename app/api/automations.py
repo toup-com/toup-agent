@@ -137,6 +137,19 @@ async def _lifecycle(automation_id: str, verb: str) -> dict:
             return {"automation": automation_payload(automation)}
     except AutomationNotFound:
         raise HTTPException(status_code=404, detail="No such automation")
+    except service.MissingSettings as e:
+        # Ordered BEFORE CompileError — it is one, and this refusal
+        # owes the user a question rather than a code. A 409 alone
+        # would leave the app to invent a sentence for a state only the
+        # spec knows, so the question lands in the thread, which is
+        # where it is answered.
+        async with async_session_maker() as db:
+            automation = await _owned_automation_or_404(db, automation_id)
+            asked = await _ask_in_thread(db, automation, str(e))
+        raise HTTPException(status_code=409, detail={
+            "code": e.code, "message": str(e), "sentence": str(e),
+            "missing": e.missing, "refusal_turn": asked,
+        })
     except CompileError as e:
         raise HTTPException(status_code=409,
                             detail={"code": e.code, "message": str(e)})
@@ -224,6 +237,56 @@ async def _owned_automation_or_404(db, automation_id: str) -> "Automation":
     return a
 
 
+#: A thread page is at most 200 turns and a run writes once or twice,
+#: so this bound is never reached in practice — it is here so a single
+#: pathological run can never make the thread response unbounded.
+_THREAD_WRITES_CAP = 500
+
+
+async def _writes_for_turns(
+    db, automation_id: str, turns: list[dict],
+) -> list[dict]:
+    """The write ledger for the runs this page's turns belong to.
+
+    The app resolves each tool turn's `write_ids` against this list to
+    say what a run actually sent (`jobSheetSubtitle`). Served empty,
+    every group took the "Nothing was sent or changed" branch — under a
+    title that read "Posted in #all-toup", about the same run, in the
+    same sheet. Scoped to the page rather than to the thread: a
+    year-old automation's whole write history is neither wanted here
+    nor cheap.
+
+    Field list and ordering are the §4.8 run projection's, so a client
+    reading `writes` from a run and from a thread reads one shape.
+    """
+    from app.db.models import AutomationWrite
+
+    run_ids = sorted({
+        str(t.get("run_id")) for t in turns if t.get("run_id")
+    })
+    if not run_ids:
+        return []
+    rows = list((await db.execute(
+        select(AutomationWrite)
+        .where(AutomationWrite.automation_id == automation_id)
+        .where(AutomationWrite.run_id.in_(run_ids))
+        # Newest first for the CAP (the page's newest turns are the ones
+        # a sheet is opened from), re-sorted below to the ascending
+        # order the projection serves.
+        .order_by(AutomationWrite.created_at.desc())
+        .limit(_THREAD_WRITES_CAP)
+    )).scalars())
+    rows.reverse()
+    return [
+        {
+            "id": w.id, "account_id": w.account_id, "what": w.what,
+            "target": w.target, "audience": w.audience,
+            "reversible": w.reversible, "undo_ref": w.undo_ref,
+        }
+        for w in rows
+    ]
+
+
 @router.get("/{automation_id}/thread")
 async def automation_thread(
     automation_id: str,
@@ -299,6 +362,7 @@ async def automation_thread(
             ]),
             "thread_id": thread.id,
             "turns": turns,
+            "writes": await _writes_for_turns(db, automation_id, turns),
             "has_more": has_more,
             "tz": get_cached_user_tz(_user_id()),
         }
@@ -738,23 +802,38 @@ async def grant_decided_hook(body: GrantHook):
                         .where(Automation.deleted_at.is_(None))
                     )).scalar_one_or_none()
                     if a is not None and a.status != "armed":
-                        await arm_automation(
-                            db, automation_id=automation_id,
-                            user_id=_user_id(),
+                        from app.agent.automations.service import (
+                            MissingSettings,
                         )
-                        thread = await _ledger.ensure_thread(
-                            db, user_id=_user_id(),
-                            automation_id=automation_id,
-                        )
-                        await _ledger.append_turn(
-                            db, user_id=_user_id(), thread=thread,
-                            run_id=None, kind="agent",
-                            payload={"text": (
-                                "You approved it — the permission is in "
-                                "place and this automation is armed. Say "
-                                "run it to watch the first one."
-                            )},
-                        )
+                        try:
+                            await arm_automation(
+                                db, automation_id=automation_id,
+                                user_id=_user_id(),
+                            )
+                        except MissingSettings as ms:
+                            # R42 (founder 16): approving the permission
+                            # card armed the automation whatever else was
+                            # still unanswered, and this was the arm that
+                            # reproduced it — the setup questions were
+                            # never asked again, so every weekday the run
+                            # read GitHub with an empty owner. The grant
+                            # is real and stays; what is missing is named.
+                            await _ask_in_thread(db, a, str(ms))
+                        else:
+                            thread = await _ledger.ensure_thread(
+                                db, user_id=_user_id(),
+                                automation_id=automation_id,
+                            )
+                            await _ledger.append_turn(
+                                db, user_id=_user_id(), thread=thread,
+                                run_id=None, kind="agent",
+                                payload={"text": (
+                                    "You approved it — the permission is "
+                                    "in place and this automation is "
+                                    "armed. Say run it to watch the "
+                                    "first one."
+                                )},
+                            )
             except Exception as e:  # noqa: BLE001 — approval stands;
                 # the next thread turn can still arm by hand.
                 logger.info(
@@ -871,15 +950,23 @@ async def resume_run_route(run_id: str):
         return result
 
 
-async def _run_now_refusal_turn(db, automation, sentence: str) -> bool:
-    """R38 — a run-now refusal is a THREAD TURN, not server silence.
+async def _ask_in_thread(db, automation, sentence: str) -> bool:
+    """Say ONE sentence to the user, as an agent turn in the
+    automation's own thread. Returns whether it landed.
 
+    R38 — a run-now refusal is a THREAD TURN, not server silence.
     rec1 f020–f030: "Run it now" answered 409 and wrote nothing, so the
     app alerted AND posted its own local bubble — the same sentence
     twice, beside a phantom run card. The refusal now lands ONCE, as an
     agent turn in the automation's thread (broadcast like any other),
     and the 409 detail carries `refusal_turn: true` so the client knows
     the account already exists and posts nothing of its own.
+
+    R42 gave it a second caller: an arm refused for an unanswered
+    setup question asks for the answer here, because the thread is
+    where the question is answered — the user replies and the thread
+    agent writes the value back through `automations__update`. That is
+    the whole mechanism; there is no second one.
 
     Deduped against the thread's last agent turn: a second press of the
     same dead button re-raises the same 409 but does not stack a second
@@ -912,8 +999,8 @@ async def _run_now_refusal_turn(db, automation, sentence: str) -> bool:
             kind="agent", payload={"text": sentence},
         )
         return True
-    except Exception as e:  # noqa: BLE001 — the 409 stands either way
-        logger.warning("[automations] run-now refusal turn skipped "
+    except Exception as e:  # noqa: BLE001 — the caller's answer stands
+        logger.warning("[automations] thread turn skipped "
                        "automation=%s: %s", automation.id, e)
         return False
 
@@ -922,7 +1009,7 @@ async def _refuse_run_now(db, automation, *, code: str,
                           sentence: str) -> None:
     """Append the refusal turn, then raise the 409 with the flag."""
     detail: dict = {"code": code, "sentence": sentence}
-    if await _run_now_refusal_turn(db, automation, sentence):
+    if await _ask_in_thread(db, automation, sentence):
         detail["refusal_turn"] = True
     raise HTTPException(status_code=409, detail=detail)
 
@@ -993,9 +1080,20 @@ async def run_now(automation_id: str):
                     "sentence": f"It is running now — step "
                                 f"{max(step, 1)} of {max(total, 1)}.",
                 })
+        from app.agent.automations.service import MissingSettings
         from app.agent.automations.spec import SpecError as _SpecError
         try:
             vspec = await parse_spec_live(automation)
+        except MissingSettings as ms:
+            # A run cannot be honest about a setting it does not have:
+            # `render_value` would put "" where the owner, the repo or
+            # the chat id belongs, the provider would refuse, and the
+            # thread would blame the account. Name the setting instead
+            # — the same sentence the setup thread opened with, in the
+            # place it is answered.
+            await _refuse_run_now(
+                db, automation, code="needs_setup", sentence=str(ms),
+            )
         except _SpecError as se:
             # A spec that no longer parses is a SETUP state, not a
             # server error. Answering 500 here is how the founder's Run
@@ -1149,7 +1247,7 @@ def _detach_run_now(automation_id: str, user_id: str, source_id: str,
                 async with async_session_maker() as db:
                     automation = await _load_owned(db, automation_id,
                                                    user_id)
-                    await _run_now_refusal_turn(db, automation, failure)
+                    await _ask_in_thread(db, automation, failure)
             except Exception:  # noqa: BLE001
                 logger.exception("[automations] run-now failure turn "
                                  "skipped automation=%s", automation_id)
@@ -1881,6 +1979,61 @@ async def delete_account_focus(
             raise _workflow_409(e)
 
 
+# ── R42 §5.2 / §5.3 — narrow it, and tell me the moment ─────────────
+
+class FiltersBody(BaseModel):
+    """The whole set the chips drew, not a toggle — two quick taps
+    cannot interleave into a state neither of them meant."""
+    filters: list[str] = Field(default_factory=list, max_length=8)
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/filters")
+async def put_account_filters(automation_id: str, account_id: str,
+                              body: FiltersBody):
+    """The account's read filters. Same EDITED note as every other
+    workflow edit: a filter changes what the automation reads."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, set_filters
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await set_filters(
+                db, automation=automation, user_id=_user_id(),
+                connector_id=account_id, filters=body.filters,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_409(e)
+
+
+class TriggersBody(BaseModel):
+    triggers: list[str] = Field(default_factory=list, max_length=4)
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/triggers")
+async def put_account_triggers(automation_id: str, account_id: str,
+                               body: TriggersBody):
+    """The account's instant triggers — real `trigger.sources` lanes,
+    so this goes through the spec validator and the compiler like any
+    other trigger change."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, set_triggers
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await set_triggers(
+                db, automation=automation, user_id=_user_id(),
+                connector_id=account_id, triggers=body.triggers,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_409(e)
+
+
 class AskBody(BaseModel):
     text: str = Field(..., min_length=1, max_length=1000)
 
@@ -2154,15 +2307,18 @@ async def from_template(body: FromTemplateBody):
             # answer must say which answer, in the thread where the
             # conversation is (round 33, item 8).
             if unanswered:
-                names = ", ".join(unanswered[:-1]) + (
-                    f" and {unanswered[-1]}" if len(unanswered) > 1
-                    else unanswered[0]
-                ) if len(unanswered) > 1 else unanswered[0]
+                # R42: one grammar for this question, shared with the
+                # arm and fire refusals — the sentence a user meets at
+                # creation and the one they meet three days later when
+                # the same answer is still missing must be the same
+                # sentence, or the second reads as a new problem.
+                from app.agent.automations.service import (
+                    missing_settings_sentence,
+                )
                 await _ledger.append_turn(
                     db, user_id=_user_id(), thread=thread, run_id=None,
-                    kind="agent", payload={"text": (
-                        f"Before this can run I need {names}. Tell me here "
-                        f"and I will set it up."
+                    kind="agent", payload={"text": missing_settings_sentence(
+                        [{"label": label} for label in unanswered],
                     )},
                 )
             # R36-2a: the promised grant conversation, actually seeded.

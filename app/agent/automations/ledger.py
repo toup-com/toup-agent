@@ -974,41 +974,6 @@ def checkpoint_of(job: BuildJob) -> Optional[dict]:
     return {"step_index": int(idx)} if idx is not None else None
 
 
-async def run_v3_payload(
-    db: AsyncSession, *, job: BuildJob, include_turns: bool = True,
-) -> dict:
-    cfg = _cfg_of(job)
-    writes = list(
-        (await db.execute(
-            select(AutomationWrite)
-            .where(AutomationWrite.run_id == job.id)
-            .order_by(AutomationWrite.created_at.asc())
-        )).scalars()
-    )
-    turns = await run_turns(db, run_id=job.id) if include_turns else []
-    return {
-        "id": job.id,
-        "automation_id": job.source_id,
-        "thread_id": cfg.get("thread_id"),
-        "kind": run_kind_of(job),
-        "started_at": job.created_at.isoformat() + "Z" if job.created_at else None,
-        "finished_at": job.completed_at.isoformat() + "Z" if job.completed_at else None,
-        "status": run_v3_status(job),
-        "checkpoint": checkpoint_of(job),
-        "accounts_touched": list(cfg.get("accounts_touched") or []),
-        "accounts_failed": list(cfg.get("accounts_failed") or []),
-        "writes": [
-            {
-                "id": w.id, "account_id": w.account_id, "what": w.what,
-                "target": w.target, "audience": w.audience,
-                "reversible": w.reversible, "undo_ref": w.undo_ref,
-            }
-            for w in writes
-        ],
-        "turns": turns,
-    }
-
-
 # ------------------------------------------- the completeness invariant
 
 def _expected_vocabulary(automation, job) -> Optional[str]:

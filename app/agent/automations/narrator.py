@@ -21,6 +21,11 @@ Dispatch record contract (CONTRACTS-R30 §5.1):
       "vocabulary": "brief"|"changes",
       "status":     "completed"|"partial"|"failed",
       "rules":      [str],                      # "Rules you added", verbatim
+      # R42: the user's per-account pins, `spec.focus_render_ctx`'s
+      # shape — where this automation starts. They RANK the result;
+      # they never filter it, which is why they are prompt material
+      # and not a step param.
+      "focus":      {connector_id: {"ids","labels","notes","count","first"}},
       "memory_facts": [{"category": str, "text": str}],   # via memory.recall
       "steps": [
         # R38: `tool_kind` "agent" is the run's OWN thinking — no
@@ -553,6 +558,35 @@ once, not a source that would round the answer out. If an account was \
 not read, say so in its own paragraph rather than leaving it out — a \
 silent omission reads as "nothing there"."""
 
+#: How many pinned accounts reach the prompt. `validate_focus` already
+#: bounds the pins per account and the length of every label; this bounds
+#: the number of accounts, so the block cannot grow with the size of the
+#: automation.
+_MAX_STANDING_ORDER_ACCOUNTS = 8
+
+
+def _standing_orders(focus: Any) -> str:
+    """The pins, as one line — `spec.focus_render_ctx`'s shape in, prose
+    out. Empty string when nothing is pinned.
+
+    Sorted by account, because the render context is built from a dict
+    whose order is an accident of the spec, and this prompt is only
+    deterministic over stable bytes. Same rendering as
+    `agent_step.build_prompt`'s `starts_at`, so the ranking step and the
+    narration are told about the pins in one voice rather than two.
+    """
+    rows = []
+    for cid, entry in sorted((focus or {}).items())[
+            :_MAX_STANDING_ORDER_ACCOUNTS]:
+        if not isinstance(entry, dict):
+            continue
+        labels = str(entry.get("labels") or "").strip()
+        if not labels:
+            continue
+        notes = str(entry.get("notes") or "").strip()
+        rows.append(f"{cid}: {labels}" + (f" — {notes}" if notes else ""))
+    return " · ".join(rows)
+
 
 def build_prompt(record: dict) -> str:
     vocabulary = record.get("vocabulary") or "brief"
@@ -635,6 +669,13 @@ def build_prompt(record: dict) -> str:
     if rules:
         parts.append("Rules you added (obey them; they outrank everything "
                      "below): " + " · ".join(rules))
+    starts = _standing_orders(record.get("focus"))
+    if starts:
+        parts.append(
+            "Where it starts (the user pinned these, with their own "
+            "instructions). They RANK, never filter: a pinned name "
+            "outranks the others inside its section, and nothing is "
+            "dropped for being unpinned. " + starts)
     facts = record.get("memory_facts") or []
     if facts:
         parts.append("What you remember about this user (use it to judge, "

@@ -237,6 +237,95 @@ async def test_outbox_claim_single_winner_and_undo():
 
 
 @pytest.mark.asyncio
+async def test_a_lost_terminal_is_swept_and_a_failed_one_is_retried():
+    """R42 (P14-5): a send that LANDED cannot be left with an open run.
+
+    `_execute_claimed` commits the row `executed` before it finalizes,
+    so the staged query never claims it again and the stale sweep only
+    looks at `executing`: an exception between the two — a session left
+    in a failed transaction by a best-effort helper, or the 30s
+    `statement_timeout` landing on the finalize itself — used to leave
+    the run open until the 360s stuck-run reaper called a real Slack
+    post "lost". `_finalize_run_safe` retries on a clean session;
+    `_lost_terminals` is the backstop for the process that died between
+    the two, and it must pick up only the runs nobody else can close.
+    """
+    from app.db.models import BuildJob
+    from app.agent.automations import outbox as ob
+
+    uid = await _mk_user()
+    a = await _mk_automation(uid, _poll_spec())
+    old = datetime.utcnow() - timedelta(seconds=ob._LOST_TERMINAL_AFTER_S + 5)
+
+    async def _run(status: str) -> str:
+        jid = f"j-{uuid.uuid4()}"
+        async with async_session_maker() as db:
+            db.add(BuildJob(
+                id=jid, user_id=uid, title="Run", prompt="(automation)",
+                job_type="automation_run", status=status,
+                source_kind="automation", source_id=a.id,
+            ))
+            await db.commit()
+        return jid
+
+    async def _row(job_id: str, *, status: str, executed_at, result="{}"):
+        async with async_session_maker() as db:
+            row = AutomationOutbox(
+                user_id=uid, automation_id=a.id, job_id=job_id,
+                connector_id="slack", tool_name="slack__send_message",
+                payload_json="{}", grant_id="g-1",
+                idempotency_key=f"t:{uuid.uuid4()}",
+                execute_after=old, status=status, executed_at=executed_at,
+                result_json=result,
+            )
+            db.add(row)
+            await db.commit()
+            return row.id
+
+    lost = await _run("running")
+    lost_id = await _row(lost, status="executed", executed_at=old)
+    # Everything that must NOT be swept.
+    fresh = await _run("running")
+    await _row(fresh, status="executed", executed_at=datetime.utcnow())
+    sibling = await _run("running")
+    await _row(sibling, status="executed", executed_at=old)
+    await _row(sibling, status="staged", executed_at=None)
+    parked = await _run("waiting_on_user")
+    await _row(parked, status="executed", executed_at=old)
+    confirm = await _run("running")
+    await _row(confirm, status="executed", executed_at=old,
+               result='{"kind": "confirmation_required"}')
+
+    async with async_session_maker() as db:
+        assert [r.id for r in await ob._lost_terminals(db)] == [lost_id]
+
+    # And the retry: a finalize that fails once still closes the run.
+    calls = []
+    real = ob._finalize_run
+
+    async def _flaky(db, row, **kw):
+        calls.append(row.id)
+        if len(calls) == 1:
+            raise RuntimeError("current transaction is aborted")
+        await real(db, row, **kw)
+
+    ob._finalize_run = _flaky
+    try:
+        async with async_session_maker() as db:
+            row = await db.get(AutomationOutbox, lost_id)
+            await ob._finalize_run_safe(db, row, status="completed",
+                                        outcome="sent")
+    finally:
+        ob._finalize_run = real
+    assert len(calls) == 2
+    async with async_session_maker() as db:
+        job = await db.get(BuildJob, lost)
+        assert job.status == "completed" and job.outcome == "sent"
+    async with async_session_maker() as db:
+        assert await ob._lost_terminals(db) == []
+
+
+@pytest.mark.asyncio
 async def test_auto_pause_after_three_failures_posts_one_notice():
     uid = await _mk_user()
     a = await _mk_automation(uid, _poll_spec())
@@ -1401,3 +1490,162 @@ async def test_a_poll_with_nothing_fresh_is_not_a_run(monkeypatch):
         assert row.last_run_at is None, (
             f"a poll with nothing fresh stamped a run at {row.last_run_at}")
         assert row.last_status != "success", row.last_status
+
+
+@pytest.mark.asyncio
+async def test_v2_first_poll_baselines_then_the_rate_budget_caps_the_burst(
+        monkeypatch):
+    """R42 B5: an event automation could fire one run per observed item
+    on its first tick.
+
+    The dedupe table is empty on that tick, so every item a provider
+    hands back is "new" — and poll windows are up to 50 items (calendar
+    50, jira 50, github 50). `poll_and_run_v2` then looped `for event in
+    fresh` with no cap, while the manifests' `automation.rate_budget`
+    (11 connectors) was enforced nowhere and `skipped_rate` had no
+    writer.
+
+    The overflow is DEFERRED, not dropped (R42 review). Stamping it
+    `skipped_rate` was a one-way exit: nothing drains a non-`run` event,
+    and the dedupe gate makes `ingest_items_v2` skip that item on every
+    later poll, so the two events the budget could not afford were the
+    engine's last sight of them — indistinguishable, to the user, from
+    an automation that never fired. They keep their `new` status and the
+    next tick spends its allowance on them first.
+    """
+    from app.agent.automations import executor_v2
+    from app.agent.automations import registry as reg
+
+    uid = await _mk_user()
+    vspec = _v2_spec()
+    a = await _mk_automation_v2(uid, vspec)
+    source = vspec.source_by_id("tickets")
+
+    observed: list[list[dict]] = [
+        [{"key": f"ENG-{i}", "summary": "old"} for i in range(1, 4)],
+        [{"key": f"ENG-{i}", "summary": "new"} for i in range(4, 7)],
+        [],
+    ]
+
+    async def _items(automation, src):
+        return observed.pop(0)
+    monkeypatch.setattr(executor_v2, "_poll_once_v2", _items)
+
+    ran: list[str] = []
+
+    async def _run(db, automation, vspec_, src, event):
+        ran.append(event.dedupe_key)
+        event.status = "run"
+        await db.commit()
+        return "run"
+    monkeypatch.setattr(executor_v2, "run_event_v2", _run)
+
+    budget = {"per_hour": 1, "per_day": 100}
+
+    async def _registry(user_id, force=False):
+        return {"jira": {"connector_id": "jira", "rate_budget": budget}}
+    monkeypatch.setattr(reg, "fetch_registry", _registry)
+
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        first = await executor_v2.poll_and_run_v2(db, row, vspec, source)
+        assert ran == [], "the first poll of a source must run nothing"
+        second = await executor_v2.poll_and_run_v2(db, row, vspec, source)
+
+    assert first == {"observed": 3, "fresh": 0, "ran": 0, "failed": 0,
+                     "baselined": 3, "carried_in": 0, "deferred_rate": 0}
+
+    # Second tick: three genuinely new items against a budget of one.
+    assert second["observed"] == 3 and second["fresh"] == 3
+    assert second["ran"] == 1 and second["deferred_rate"] == 2
+    assert ran == ["tickets:ENG-4"]
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationEvent)
+            .where(AutomationEvent.automation_id == a.id)
+        )).scalars().all()
+    by_status: dict[str, list[str]] = {}
+    for r in rows:
+        by_status.setdefault(r.status, []).append(r.dedupe_key)
+    assert sorted(by_status["discarded"]) == [
+        "tickets:ENG-1", "tickets:ENG-2", "tickets:ENG-3"]
+    assert by_status["run"] == ["tickets:ENG-4"]
+    # Waiting, not judged: the two the budget could not afford are still
+    # the engine's to run.
+    assert sorted(by_status["new"]) == [
+        "tickets:ENG-5", "tickets:ENG-6"]
+    assert "skipped_rate" not in by_status
+
+    # Third tick observes NOTHING new, and drains the carry-over out of
+    # the widened budget — the poll that proves `skipped_rate` was a
+    # drop and this is a deferral.
+    budget = {"per_hour": 3, "per_day": 100}
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        third = await executor_v2.poll_and_run_v2(db, row, vspec, source)
+
+    assert third["observed"] == 0 and third["fresh"] == 0
+    assert third["carried_in"] == 2 and third["deferred_rate"] == 0
+    assert third["ran"] == 2
+    assert sorted(ran) == [
+        "tickets:ENG-4", "tickets:ENG-5", "tickets:ENG-6"]
+
+    async with async_session_maker() as db:
+        rows = (await db.execute(
+            select(AutomationEvent)
+            .where(AutomationEvent.automation_id == a.id)
+        )).scalars().all()
+    assert sorted(r.dedupe_key for r in rows if r.status == "run") == [
+        "tickets:ENG-4", "tickets:ENG-5", "tickets:ENG-6"]
+
+
+@pytest.mark.asyncio
+async def test_arm_refuses_while_a_setup_question_is_unanswered():
+    """R42 (founder 16). `from-template` refused to arm an automation
+    whose questions were unanswered; every LATER arm — the route, the
+    skill, the grant-approval hook — checked grants and nothing else.
+    So approving the write permission armed it, `render_value` resolved
+    the dangling `{{var.jql}}` to "", and every weekday after that the
+    read went out empty and a healthy account was blamed for refusing
+    it. The check lives in `arm_automation` so all four inherit it.
+    """
+    from app.agent.automations import service as svc
+
+    uid = await _mk_user()
+    raw = _v2_spec().raw
+    raw["steps"][0]["params"] = {"jql": "{{var.jql}}"}
+    # How a template draft is persisted: the reference is DECLARED (the
+    # setup thread is going to ask for it) but has no value yet.
+    vspec = validate_spec(raw, REGISTRY_V2, template_mode=True,
+                          template_vars={"jql"})
+    a = await _mk_automation_v2(uid, vspec)
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        row.status = "draft"
+        await db.commit()
+
+    async with async_session_maker() as db:
+        with pytest.raises(svc.MissingSettings) as ei:
+            await svc.arm_automation(db, automation_id=a.id, user_id=uid)
+    # Ahead of the grant verify, which is what the founder's approval
+    # ran straight past — and the sentence names the setting, because
+    # the card it replaces named nothing.
+    assert ei.value.code == "needs_answer"
+    assert [m["name"] for m in ei.value.missing] == ["jql"]
+    assert "jql" in str(ei.value)
+    async with async_session_maker() as db:
+        assert (await db.get(Automation, a.id)).status == "draft"
+
+    # Answered, the gate is silent and arm gets on with the grant it
+    # always checked — a different refusal, which is the point.
+    async with async_session_maker() as db:
+        row = await db.get(Automation, a.id)
+        answered = json.loads(row.spec_json)
+        answered["variables"] = {"jql": "assignee = currentUser()"}
+        row.spec_json = json.dumps(answered)
+        await db.commit()
+    async with async_session_maker() as db:
+        with pytest.raises(compiler.CompileError) as ei2:
+            await svc.arm_automation(db, automation_id=a.id, user_id=uid)
+    assert ei2.value.code != "needs_answer"

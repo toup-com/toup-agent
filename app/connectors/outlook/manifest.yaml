@@ -43,13 +43,20 @@ health:
 tools:
   - name: outlook__list_messages
     description: |
-      List recent Outlook messages, optionally filtered by Graph's $search syntax (e.g. "from:alice@contoso.com"). Returns full headers + body for every message in ONE call by default. Only set `include_body: false` for rare bulk-enumeration. For "Nth email" requests, set `max_results` to N and pick the Nth from the response — ONE tool call, not list-then-get.
+      List recent Outlook messages, newest first. Narrow by `query` (Graph's KQL search, e.g. "from:alice@contoso.com") and/or `is_read`. Returns full headers + body for every message in ONE call by default. Only set `include_body: false` for rare bulk-enumeration. For "Nth email" requests, set `max_results` to N and pick the Nth from the response — ONE tool call, not list-then-get.
     input_schema:
       type: object
       properties:
         query:
           type: string
-          description: Microsoft Graph $search filter. Empty string = inbox.
+          description: |
+            Microsoft Graph KQL search over the mailbox — free text, or one of the property restrictions message search supports: from:, to:, subject:, body:, hasAttachments:, received: (e.g. "from:alice@contoso.com", "subject:invoice"). This is NOT an OData $filter: "isRead eq false" here is searched as that literal phrase and matches nothing — use `is_read` for read/unread, which Graph cannot express in a search at all. Omit for the whole mailbox.
+        is_read:
+          type: boolean
+          description: false = unread only, true = read only; omit for both.
+        since:
+          type: string
+          description: 'Only messages received at or after this instant (ISO 8601, e.g. "2026-08-30T00:00:00Z"). Use for "since yesterday" / "today''s mail".'
         max_results:
           type: integer
           minimum: 1

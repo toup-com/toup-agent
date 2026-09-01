@@ -6,8 +6,9 @@ the spec (steps, sources, mode), `permissions.py` (the per-automation
 account permissions), the platform connection state (account states),
 `rules_json` (the user's standing rules), and the verb dictionary
 (every human string). Writes are per sheet, never one big PUT; every
-workflow write appends an `EDITED` note turn to the automation's
-thread so the thread stays the full record.
+workflow write stamps an `EDITED` note turn on the automation's
+thread so the thread stays the full record (writes inside one minute
+share the one note — see `_edited_note`).
 
 The composer is a real conversation with the agent: C's classifier
 (`composer.classify_change`) names the intents; THIS module applies
@@ -25,9 +26,10 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Automation
+from app.db.models import Automation, AutomationTurn
 from app.services import automation_verbs as verbs
 from . import ledger, permissions
 from . import registry as reg
@@ -115,7 +117,18 @@ def trigger_block(raw: dict) -> dict:
     one silently REPAINTED the event automation as a daily schedule.
     The canvas must speak each automation's own trigger; the app
     branches on `kind` and never shows cron UI for an event.
+
+    R42: the SCHEDULE wins when a spec has both. §5.3 lets a user add
+    an instant lane to a scheduled automation, and reading the event
+    first would have repainted a daily brief as an event automation and
+    hidden its cron UI the moment they tapped one row — P12's own
+    defect, in the other direction. No shipped template carries both;
+    an event-only spec has no schedule, so it is unaffected.
     """
+    if _schedule_of(raw):
+        sentence = _current_sentence(raw)
+        return {"kind": "schedule", "label": _label_of(sentence),
+                "sub": "", "event": None}
     ev = _event_source_of(raw)
     if ev is not None:
         key = str(ev.get("event") or "")
@@ -133,10 +146,6 @@ def trigger_block(raw: dict) -> dict:
                 "sentence": clause[0].upper() + clause[1:],
             },
         }
-    if _schedule_of(raw):
-        sentence = _current_sentence(raw)
-        return {"kind": "schedule", "label": _label_of(sentence),
-                "sub": "", "event": None}
     return {"kind": "manual", "label": "On request",
             "sub": "runs when you ask", "event": None}
 
@@ -419,7 +428,13 @@ def _steps_human(automation: Automation, raw: dict) -> list[dict]:
                 })
                 continue
             cid, tool = s.get("connector_id") or "", s.get("tool") or ""
-            is_write = bool(s.get("grant_id"))
+            # R42 (B6): the same predicate `_write_tools` above spells
+            # out — a write is a write by its TOOL. Keyed on grant
+            # presence, this sheet described every UNGRANTED template
+            # write as a read: an unpinned Morning brief said "Checks
+            # Slack" about the step whose whole job is to POST there,
+            # and it was true for all fifteen v2 templates.
+            is_write = bool(s.get("grant_id")) or verbs.is_write_tool(tool)
             act = verbs.turn_action(
                 cid, tool, kind="write" if is_write else "read", ok=True,
             )
@@ -496,10 +511,12 @@ async def workflow_payload(
 ) -> dict:
     raw = _spec_raw(automation)
     connections = await reg.fetch_connection_state(user_id)
+    capability = await reg.fetch_registry(user_id)
     members = _member_connectors(raw)
     mode, _mode_label = mode_of(automation, raw)
 
     pinned = focus_of(raw)
+    stored_filters = filters_of(raw)
     accounts = []
     for cid in members:
         entry = _account_entry(cid, connections.get(cid) or {})
@@ -515,9 +532,24 @@ async def workflow_payload(
         # node per account and a node must not have to join two lists
         # to know its own pins.
         entry["focus"] = pinned.get(cid) or []
+        # R42 §5.2 / §5.3 — what this account is narrowed by, and what
+        # it can announce the moment it happens. Beside `focus` for the
+        # same reason: the canvas draws one node per account, and a
+        # node must not have to join two lists to know its own state.
+        # All four are served as `[]` when empty, and NEVER omitted: the app
+        # distinguishes an empty list from an absent key, because §5.3 renders
+        # a SENTENCE for the empty case ("nothing it can tell you the moment it
+        # happens") and that is a claim only this payload can support. Dropping
+        # a key here would make the app state it against no evidence.
+        # Empty filters draw no §5.2 section at all; empty triggers draw §5.3
+        # with the sentence — a picker asserts nothing by being absent, prose
+        # does.
+        entry["filters"] = stored_filters.get(cid) or []
+        entry["filters_available"] = available_filters(raw, cid)
+        entry["triggers"] = triggers_of(raw, cid)
+        entry["triggers_available"] = available_triggers(raw, capability, cid)
         accounts.append(entry)
 
-    capability = await reg.fetch_registry(user_id)
     available = [
         _account_entry(cid, connections.get(cid) or {})
         for cid in sorted(set(capability) | set(connections))
@@ -607,10 +639,39 @@ async def bump_rev(db: AsyncSession, automation: Automation) -> int:
         return int(getattr(automation, "workflow_rev", 0) or 0)
 
 
+# R42 (P9): one edit gets one divider. A rolling window rather than a
+# clock minute, so two writes two seconds apart do not become two
+# dividers because one of them fell the other side of :00.
+_EDITED_COLLAPSE_S = 60.0
+
+
+def _edited_stamp_at(row: Optional[AutomationTurn]) -> Optional[datetime]:
+    """When an `edited` note says it happened, or None if `row` is not
+    one. The payload's own `at` is the answer the client renders —
+    `ledger._serialize_row` spreads the body OVER the row's
+    `created_at` — so a collapse decision has to read the same field it
+    is about to rewrite."""
+    if row is None or row.kind != "note":
+        return None
+    try:
+        body = json.loads(row.payload_json or "{}") or {}
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict) or body.get("stamp") != "edited":
+        return None
+    raw = str(body.get("at") or "")
+    if raw:
+        try:
+            return datetime.fromisoformat(raw.rstrip("Z"))
+        except ValueError:
+            pass
+    return row.created_at
+
+
 async def _edited_note(
     db: AsyncSession, automation: Automation,
 ) -> Optional[str]:
-    """Every workflow write appends the EDITED note (§4.4) and
+    """Every workflow write stamps the EDITED note (§4.4) and
     broadcasts `automation.updated` (§4.6).
 
     One seam for both, because they are one fact: the workflow changed.
@@ -620,18 +681,43 @@ async def _edited_note(
     `5 accounts`, because those two surfaces read a summary nobody had
     told. Every writer in this module already calls this function, so
     putting the broadcast here means a new writer cannot forget it.
+
+    R42 (P9): it APPENDS only when the thread does not already end in a
+    fresh EDITED note. One user action is routinely several workflow
+    writes — a pin, then the grant approval that follows it — and the
+    founder's thread carried three stacked dividers, two of them
+    identical and back to back with nothing between them. A repeat
+    rewrites the standing note in place; `ledger.replace_turn` keeps the
+    turn's id and seq, so the `automation.turn` frame repaints that row
+    instead of the client gaining a second one.
     """
     try:
         thread = await ledger.ensure_thread(
             db, user_id=automation.user_id, automation_id=automation.id,
         )
-        turn = await ledger.append_turn(
-            db, user_id=automation.user_id, thread=thread, run_id=None,
-            kind="note",
-            payload={"stamp": "edited",
-                     "at": datetime.utcnow().isoformat() + "Z"},
-        )
-        turn_id = turn["id"]
+        now = datetime.utcnow()
+        payload = {"stamp": "edited", "at": now.isoformat() + "Z"}
+        last = (await db.execute(
+            select(AutomationTurn)
+            .where(AutomationTurn.thread_id == thread.id)
+            .order_by(AutomationTurn.seq.desc())
+            .limit(1)
+        )).scalars().first()
+        prev = _edited_stamp_at(last)
+        if prev is not None and 0 <= (now - prev).total_seconds() \
+                <= _EDITED_COLLAPSE_S:
+            turn = await ledger.replace_turn(
+                db, user_id=automation.user_id, thread=thread,
+                turn_id=last.id, kind="note", payload=payload,
+            )
+        else:
+            turn = await ledger.append_turn(
+                db, user_id=automation.user_id, thread=thread, run_id=None,
+                kind="note", payload=payload,
+            )
+        # `replace_turn` answers None when the turn it was given is
+        # already gone — a race with a delete, not an error.
+        turn_id = turn["id"] if turn else None
     except Exception as e:  # noqa: BLE001
         logger.warning("[workflow] EDITED note skipped: %s", e)
         turn_id = None
@@ -1030,16 +1116,38 @@ async def save_permissions(
 
 # ---------------------------------------------------------- focus pins
 
+async def _persist_spec(
+    db: AsyncSession, *, automation: Automation, user_id: str, raw: dict,
+    code: str, refusal: str, note: bool = True,
+) -> Automation:
+    """Persist an edited spec through the SAME write path every other
+    structural edit uses (`service.update_automation`), so an edit is
+    revalidated, recompiled and re-armed exactly like a schedule
+    change — never poked into `spec_json` behind the validator's back.
+
+    One note per write, stamped here, so a caller cannot forget it and
+    two callers cannot stamp two dividers for one edit.
+    """
+    from . import service
+    try:
+        automation, _vspec = await service.update_automation(
+            db, automation_id=automation.id, user_id=user_id, spec=raw,
+        )
+    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed
+        from .spec import SpecError
+        if isinstance(e, SpecError):
+            raise WorkflowError(code, refusal, {"errors": e.errors}) from e
+        raise
+    if note:
+        await _edited_note(db, automation)
+    await db.refresh(automation)
+    return automation
+
+
 async def _write_focus(
     db: AsyncSession, *, automation: Automation, user_id: str,
     account_id: str, pins: list[dict], sentence: str, note: bool = True,
 ) -> dict:
-    """Persist one account's pins through the SAME spec write path
-    every other structural edit uses (`service.update_automation`), so
-    a pin is revalidated, recompiled and re-armed exactly like a
-    schedule change — never poked into `spec_json` behind the
-    validator's back."""
-    from . import service
     raw = _spec_raw(automation)
     focus = {k: list(v) for k, v in focus_of(raw).items()}
     if pins:
@@ -1050,21 +1158,10 @@ async def _write_focus(
         raw["focus"] = focus
     else:
         raw.pop("focus", None)
-    try:
-        automation, _vspec = await service.update_automation(
-            db, automation_id=automation.id, user_id=user_id, spec=raw,
-        )
-    except Exception as e:  # noqa: BLE001 — surfaced, never swallowed
-        from .spec import SpecError
-        if isinstance(e, SpecError):
-            raise WorkflowError(
-                "bad_focus", "I could not start it there.",
-                {"errors": e.errors},
-            ) from e
-        raise
-    if note:
-        await _edited_note(db, automation)
-    await db.refresh(automation)
+    automation = await _persist_spec(
+        db, automation=automation, user_id=user_id, raw=raw,
+        code="bad_focus", refusal="I could not start it there.", note=note,
+    )
     return {
         "focus": focus_of(_spec_raw(automation)).get(account_id) or [],
         "sentence": sentence,
@@ -1159,7 +1256,7 @@ async def add_focus(
     # picked. `only_if_unpinned`: "+" never redirects an approved
     # destination. A failed grant does not poison the focus pin; the
     # sentence carries what happened either way.
-    if kind in ("channel", "thread"):
+    if _pin_names_a_destination(account_id, new_pin):
         try:
             dest = await pin_write_destination(
                 db, automation=automation, user_id=user_id,
@@ -1182,6 +1279,439 @@ async def add_focus(
                 db, automation=automation, user_id=user_id,
             )
     return out
+
+
+# ── R42 §5.2 — the account's read filters ────────────────────────────
+
+def filters_of(raw: dict) -> dict[str, list[str]]:
+    """The spec's per-account filter ids, `{connector_id: [id]}`.
+
+    Total, like `focus_of`: a spec written before R42 has no `filters`
+    key and answers `{}` — "nothing narrowed", which is the same thing
+    and has no third state.
+    """
+    filters = raw.get("filters")
+    if not isinstance(filters, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for cid, ids in filters.items():
+        if not isinstance(cid, str) or not isinstance(ids, list):
+            continue
+        kept = [str(i) for i in ids if isinstance(i, str) and i]
+        if kept:
+            out[cid] = kept
+    return out
+
+
+def _account_read_tools(raw: dict, connector_id: str) -> set:
+    """The read tools this automation actually runs on that account."""
+    if raw.get("version") != 2:
+        return set()
+    return {
+        str(st.get("tool") or "")
+        for st in raw.get("steps") or []
+        if isinstance(st, dict)
+        and st.get("connector_id") == connector_id
+        and st.get("kind") != "agent"
+        and not verbs.is_write_tool(st.get("tool"))
+    }
+
+
+def available_filters(raw: dict, connector_id: str) -> list[dict]:
+    """`[{id, label}]` — the chips this account can honestly offer.
+
+    Two gates, and the second is the one that matters: the connector
+    has to be able to EXPRESS the filter (`spec.CONNECTOR_FILTERS`),
+    and this automation has to run a step the filter composes into. An
+    account here only to draft mail narrows nothing, so it offers
+    nothing — the app then draws no section at all, which is the
+    correct rendering and the whole reason the list is optional.
+
+    A filter already ON is always offered, whatever the steps say now:
+    a step edited after the fact must never leave a stored filter the
+    user cannot see or take off.
+    """
+    from .spec import filter_options
+    tools = _account_read_tools(raw, connector_id)
+    on = set(filters_of(raw).get(connector_id) or [])
+    return [
+        {"id": f["id"], "label": f["label"]}
+        for f in filter_options(connector_id)
+        if f["id"] in on or (tools & set(f.get("tools") or ()))
+    ]
+
+
+async def set_filters(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    connector_id: str, filters: list,
+) -> dict:
+    """Replace one account's read filters (design §5.2).
+
+    A whole set rather than a toggle, because that is what the chips
+    are: the app sends the state it drew, so two quick taps cannot
+    interleave into a set neither of them meant.
+
+    Membership is the gate here for the same reason it is in
+    `add_focus` — a filter under an account this automation does not
+    use is a user error with a sentence, not a malformed spec.
+    """
+    from .spec import filter_ids, filter_options
+    raw = _spec_raw(automation)
+    name = verbs.display_name(connector_id) or connector_id
+    # v2 only, like `set_triggers`: the v1 executor reads neither `focus`
+    # nor `filters`, so a filter stored on a v1 spec is consumed by nothing
+    # and can never be un-lit by anything but a second write. It is
+    # unreachable from the app today only because `available_filters`
+    # answers [] for v1 — an accident, not a guard.
+    if raw.get("version") != 2:
+        raise WorkflowError(
+            "not_supported",
+            f"This automation is too old to narrow {name}. Ask me to "
+            f"rebuild it and I will set it up the new way.",
+        )
+    if connector_id not in _member_connectors(raw):
+        raise WorkflowError(
+            "not_member",
+            f"This automation does not use {name} yet — add it first, "
+            f"then narrow it.",
+        )
+    known = filter_ids(connector_id)
+    wanted = set()
+    for fid in (filters or []):
+        if not isinstance(fid, str) or fid not in known:
+            raise WorkflowError(
+                "unknown_filter",
+                f"{name} cannot narrow a read that way.",
+            )
+        wanted.add(fid)
+    kept = [f["id"] for f in filter_options(connector_id) if f["id"] in wanted]
+
+    stored = {k: list(v) for k, v in filters_of(raw).items()}
+    if kept:
+        stored[connector_id] = kept
+    else:
+        stored.pop(connector_id, None)
+    if stored:
+        raw["filters"] = stored
+    else:
+        raw.pop("filters", None)
+
+    labels = [f["label"] for f in filter_options(connector_id)
+              if f["id"] in wanted]
+    sentence = (f"In {name} it now reads {verbs.join_list(labels)}."
+                if labels else f"It reads all of {name} again.")
+    automation = await _persist_spec(
+        db, automation=automation, user_id=user_id, raw=raw,
+        code="bad_filters", refusal="I could not narrow it that way.",
+    )
+    return {
+        "filters": filters_of(_spec_raw(automation)).get(connector_id) or [],
+        "sentence": sentence,
+        "workflow": await workflow_payload(
+            db, automation=automation, user_id=user_id,
+        ),
+    }
+
+
+# ── R42 §5.3 — the account's instant triggers ────────────────────────
+#
+# A trigger is a `trigger.sources[]` entry, so turning one on adds a
+# firing lane to the automation rather than changing a setting beside
+# it. Two consequences the writer below owes the user:
+#
+#   - the SCHEDULE is a source too, and it survives untouched. An
+#     automation can hold a schedule and an event lane at once (the
+#     compiler already builds one primitive per source), and R42 §5.3
+#     is exactly that shape: "it all waits for the run, except these".
+#   - an automation with only events and no schedule is legal, so the
+#     last event cannot be taken off one: `trigger.sources` may not go
+#     empty, and the refusal says what to do instead.
+
+# Event param → (what to ask the user for, the pin kinds that can fill
+# it). Some events are only meaningful about a PLACE the user picked —
+# github wants a repository, teams a chat — and the manifest says so in
+# `params_required`. The pin is where that place already lives.
+_EVENT_PARAM_PINS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "owner": ("repository", ("repo",)),
+    "repo": ("repository", ("repo",)),
+    "chat_id": ("chat", ("thread", "channel")),
+    # Forward declarations, deliberately: no manifest asks for either today
+    # (Slack declares no events at all, and Jira's `issue_created` requires
+    # no params), so `_event_params_from_pins` never looks them up. They are
+    # here so the mapping is written down once when those events land, not
+    # because they were verified against a manifest.
+    "channel": ("channel", ("channel",)),
+    "project_key": ("project", ("project",)),
+}
+
+
+def _event_params_from_pins(
+    event_spec: dict, pins: list[dict],
+) -> tuple[dict, list[str]]:
+    """`(params, missing)` for an event that names a place.
+
+    `owner`/`repo` are one pin ("owner/repo") answering two params —
+    the same shape `_apply_focus_scope` reads for github.
+    """
+    params: dict = {}
+    missing: list[str] = []
+    by_kind: dict[str, list] = {}
+    for p in pins or []:
+        if isinstance(p, dict) and p.get("id"):
+            by_kind.setdefault(str(p.get("kind") or ""), []).append(p)
+    for field in (event_spec.get("params_required") or []):
+        what, kinds = _EVENT_PARAM_PINS.get(str(field), ("place", ()))
+        value = ""
+        for kind in kinds:
+            for pin in by_kind.get(kind, []):
+                pid = str(pin.get("id") or "")
+                if field in ("owner", "repo"):
+                    if "/" not in pid:
+                        continue
+                    owner, repo = pid.split("/", 1)
+                    value = owner if field == "owner" else repo
+                else:
+                    value = pid
+                if value:
+                    break
+            if value:
+                break
+        if value:
+            params[str(field)] = value
+        elif what not in missing:
+            missing.append(what)
+    return params, missing
+
+
+def triggers_of(raw: dict, connector_id: str) -> list[str]:
+    """The event keys this account currently fires on."""
+    out: list[str] = []
+    for s in (raw.get("trigger") or {}).get("sources") or []:
+        if not isinstance(s, dict):
+            continue
+        if s.get("connector_id") == connector_id and s.get("event"):
+            key = str(s["event"])
+            if key not in out:
+                out.append(key)
+    return out
+
+
+def available_triggers(
+    raw: dict, capability: dict, connector_id: str,
+) -> list[dict]:
+    """`[{id, label}]` — every EVENT the connector's manifest declares.
+
+    Nothing is invented: the design lists 31 instant triggers and the
+    platform declares eight across seven connectors, Slack none at all.
+    An empty list is the honest answer and the app says so in words.
+
+    Version-gated like `available_filters`, because `set_triggers` refuses
+    a v1 spec: without this a v1 automation drew tappable rows whose every
+    tap 409'd and rolled back, which is the picker-that-writes-nowhere the
+    round exists to remove. A trigger already ON is still listed, so a
+    stored one can always be turned off.
+    """
+    from .spec import event_label
+    on = set(triggers_of(raw, connector_id))
+    if raw.get("version") != 2 and not on:
+        return []
+    entry = capability.get(connector_id) or {}
+    out = []
+    for ev in entry.get("events") or []:
+        key = str((ev or {}).get("key") or "")
+        if not key:
+            continue
+        out.append({
+            "id": key,
+            "label": event_label(connector_id, key, ev.get("description") or ""),
+        })
+    return out
+
+
+def _new_source_id(taken: set, connector_id: str, event_key: str) -> str:
+    """A source id inside `spec_v2._ID_RE` that collides with nothing —
+    not another source, not a STEP (the v2 validator shares one id
+    space between them)."""
+    import re as _re
+    base = _re.sub(r"[^a-z0-9_]", "_",
+                   f"{connector_id}_{event_key}".lower())[:24].strip("_")
+    if not base or not base[0].isalpha():
+        base = f"s{base}"[:24]
+    cand, n = base, 2
+    while cand in taken:
+        cand = f"{base[:22]}_{n}"
+        n += 1
+    return cand
+
+
+async def set_triggers(
+    db: AsyncSession, *, automation: Automation, user_id: str,
+    connector_id: str, triggers: list,
+) -> dict:
+    """Replace the event lanes this account fires on (design §5.3).
+
+    Gated on the live manifest, so this can only ever turn on an event
+    the connector actually declares — the registry is the same one
+    `validate_spec_v2` re-checks against on the way through
+    `_persist_spec`, and an unreachable registry refuses rather than
+    guessing (fail closed: `fetch_registry` answers {} when the
+    platform is down, and {} must not read as "nothing is allowed"
+    written into a spec).
+    """
+    from .spec_v2 import MAX_SOURCES
+    raw = _spec_raw(automation)
+    name = verbs.display_name(connector_id) or connector_id
+    if connector_id not in _member_connectors(raw):
+        raise WorkflowError(
+            "not_member",
+            f"This automation does not use {name} yet — add it first.",
+        )
+    if raw.get("version") != 2:
+        raise WorkflowError(
+            "not_supported",
+            "This automation is on the older engine, so it cannot watch "
+            "for anything between runs yet.",
+        )
+    capability = await reg.fetch_registry(user_id)
+    if not capability:
+        raise WorkflowError(
+            "registry_unavailable",
+            "I could not check what your accounts can announce. Try that "
+            "again in a moment.",
+        )
+    events = {str(e.get("key")): e
+              for e in (capability.get(connector_id) or {}).get("events") or []
+              if e.get("key")}
+    wanted: list[str] = []
+    for tid in (triggers or []):
+        if not isinstance(tid, str) or tid not in events:
+            raise WorkflowError(
+                "unknown_trigger",
+                f"{name} cannot tell you the moment that happens.",
+            )
+        if tid not in wanted:
+            wanted.append(tid)
+
+    sources = [s for s in (raw.get("trigger") or {}).get("sources") or []
+               if isinstance(s, dict)]
+    kept = [s for s in sources
+            if not (s.get("connector_id") == connector_id and s.get("event"))]
+    mine = {str(s.get("event")): s for s in sources
+            if s.get("connector_id") == connector_id and s.get("event")}
+    if not wanted and not kept:
+        raise WorkflowError(
+            "last_trigger",
+            "Then nothing would ever start it. Give it a schedule first "
+            "and I will take this off.",
+        )
+    cap = capability.get(connector_id) or {}
+    mode = "push" if cap.get("push") else "poll"
+    pins = focus_of(raw).get(connector_id) or []
+    taken = {str(s.get("id") or "") for s in kept}
+    taken |= {str(st.get("id") or "") for st in raw.get("steps") or []
+              if isinstance(st, dict)}
+    added: list[dict] = []
+    for key in wanted:
+        if key in mine:
+            # Untouched, id and all: re-minting it would tear down and
+            # rebuild a live primitive for a no-op.
+            added.append(mine[key])
+            taken.add(str(mine[key].get("id") or ""))
+            continue
+        ev = events[key]
+        params, missing = _event_params_from_pins(ev, pins)
+        if missing:
+            raise WorkflowError(
+                "needs_pin",
+                f"Pick the {verbs.join_list(missing)} in {name} first — "
+                f"tap + on the one I should watch.",
+            )
+        sid = _new_source_id(taken, connector_id, key)
+        taken.add(sid)
+        added.append({
+            "id": sid,
+            "mode": mode,
+            "connector_id": connector_id,
+            "event": key,
+            **({"params": params} if params else {}),
+            # The manifest's own dedupe field. `poll_interval_s` is left
+            # out on purpose: the validator fills the connector's floor,
+            # which is the only interval a user who tapped a row asked
+            # for.
+            "dedupe_key": f"event.{ev.get('dedupe_field') or 'id'}",
+        })
+    if len(kept) + len(added) > MAX_SOURCES:
+        raise WorkflowError(
+            "too_many_sources",
+            f"It can watch {MAX_SOURCES} things at once at most. Take one "
+            f"off first.",
+        )
+    raw.setdefault("trigger", {})["sources"] = kept + added
+
+    labels = {t["id"]: t["label"]
+              for t in available_triggers(raw, capability, connector_id)}
+    on = [labels.get(k) or k for k in wanted]
+    sentence = (f"I will tell you the moment {verbs.join_list(on).lower()}."
+                if on else
+                f"Nothing in {name} interrupts you now — it waits for the "
+                f"run.")
+    automation = await _persist_spec(
+        db, automation=automation, user_id=user_id, raw=raw,
+        code="bad_triggers", refusal="I could not set that up.",
+    )
+    return {
+        "triggers": triggers_of(_spec_raw(automation), connector_id),
+        "sentence": sentence,
+        "workflow": await workflow_payload(
+            db, automation=automation, user_id=user_id,
+        ),
+    }
+
+
+# R42: `thread` names two different things, and only one of them is a
+# place an automation can POST to. `contents._read_teams` pins a Teams
+# CHAT as kind `thread`, and that chat IS the destination of
+# `teams__send_chat_message` (`executor_v2` resolves `chat_id` from the
+# `thread`/`channel` pins) — so it has to keep bridging. Everywhere
+# else a `thread` is a MESSAGE thread: a preview ROW, pinned to say
+# "start from this conversation". Bridging that would quietly redirect
+# where the automation posts every time someone pinned something to
+# READ. On Teams the message ROWS carry this kind too, which the kind
+# alone cannot see — `_pin_names_a_destination` is the other half.
+_DESTINATION_KINDS = frozenset({"channel"})
+_CHAT_AS_THREAD_CONNECTORS = frozenset({"teams"})
+
+
+def _names_a_destination(connector_id: str, kind: str) -> bool:
+    """Could a pin of this KIND, on this connector, be a place to post?"""
+    return (kind in _DESTINATION_KINDS
+            or (kind == "thread"
+                and connector_id in _CHAT_AS_THREAD_CONNECTORS))
+
+
+def _pin_names_a_destination(connector_id: str, pin: dict) -> bool:
+    """The pin names a place this automation could POST to.
+
+    Two halves, and neither answers it alone. The KIND half above is
+    what keeps a Jira project, a GitHub repo and a mail thread out:
+    they are containers, but not ones anything writes INTO — the write
+    there targets a ticket, an issue, a draft. The CONTAINER half is
+    what R42's own reader made necessary: `contents._read_teams` pins
+    the CHAT as kind `thread` — that chat really is the destination of
+    `teams__send_chat_message` — and now pins every MESSAGE ROW in it
+    as kind `thread` too, with a `<chat>#<message>` id the app posts
+    verbatim. So the ordinary read-pin gesture on a Teams message asked
+    to make that message the automation's write destination, and
+    `only_if_unpinned` cannot catch it: an unpinned destination has
+    nothing to refuse with. `contents.container_of` already knows the
+    row format per connector, so ask it — a pin whose container is
+    ITSELF is the whole place; a row inside one is not.
+    """
+    from . import contents
+    if not _names_a_destination(connector_id, str(pin.get("kind") or "")):
+        return False
+    got = contents.container_of(connector_id, pin)
+    return got is not None and got[0] == str(pin.get("id") or "").strip()
 
 
 async def pin_write_destination(

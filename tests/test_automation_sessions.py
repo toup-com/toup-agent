@@ -241,6 +241,61 @@ async def test_thread_endpoint_mints_serializes_and_404s(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_thread_serves_the_write_ledger_for_the_runs_on_the_page(
+    monkeypatch,
+):
+    """R42 (P14-2). The app resolves a turn's `write_ids` against
+    `run.writes` to say what a run sent; the route served no `writes`
+    key at all, so the job sheet's subtitle took its "Nothing was sent
+    or changed" branch under a title reading "Posted in #all-toup".
+    Scoped to the runs whose turns are on the page — another
+    automation's ledger is not this thread's business.
+    """
+    from app.agent.automations import ledger
+    from app.db.models import AutomationWrite
+
+    uid = await _mk_user()
+    aid = await _mk_automation(uid, "Poster")
+    other = await _mk_automation(uid, "Someone else")
+    monkeypatch.setattr(settings, "automations_enabled", True)
+    monkeypatch.setattr(settings, "user_id", uid)
+    from app.api.automations import automation_thread
+
+    run_id = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        thread = await ledger.ensure_thread(
+            db, user_id=uid, automation_id=aid,
+        )
+        await ledger.append_turn(
+            db, user_id=uid, thread=thread, run_id=run_id,
+            kind="agent", payload={"text": "Posted it."},
+        )
+        db.add(AutomationWrite(
+            user_id=uid, automation_id=aid, run_id=run_id,
+            account_id="slack:acme", what="Posted a message",
+            target="#all-toup", audience="others",
+            reversible=True, undo_ref="ob-1",
+        ))
+        db.add(AutomationWrite(
+            user_id=uid, automation_id=other, run_id=str(uuid.uuid4()),
+            account_id="slack:acme", what="Posted somewhere else",
+            target="#other", audience="others",
+            reversible=False, undo_ref=None,
+        ))
+        await db.commit()
+
+    out = await automation_thread(aid, limit=100)
+    assert [w["target"] for w in out["writes"]] == ["#all-toup"]
+    assert out["writes"][0] == {
+        "id": out["writes"][0]["id"], "account_id": "slack:acme",
+        "what": "Posted a message", "target": "#all-toup",
+        "audience": "others", "reversible": True, "undo_ref": "ob-1",
+    }
+    # A thread with no run turns asks for nothing.
+    assert (await automation_thread(other, limit=100))["writes"] == []
+
+
+@pytest.mark.asyncio
 async def test_memory_endpoint_serves_v2_sheet_never_the_state_row(monkeypatch):
     """R30 §4.5 rewrites the R28 pin: this route serves the §3.10
     five-category sheet; the engine-state row (raw ISO + counters,

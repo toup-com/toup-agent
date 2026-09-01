@@ -26,8 +26,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -39,10 +40,13 @@ from app.db.models import (
 from app.agent.job_runner import JobRunner, TaskSpec
 from app.agent import job_steps
 from .spec import (
+    filter_options as _filter_options,
+    filter_tools as _filter_tools,
     focus_render_ctx as _focus_render_ctx,
     render_value, render_with_ctx, resolve_path,
 )
 from .spec_v2 import ValidatedSpecV2, ValidatedSource, ValidatedStep
+from .contents import container_of
 from .executor import _FORBIDDEN_TOOLS, _finalize_job, _record_health
 from .session import on_run_created
 from . import agent_step as _agent_step
@@ -139,11 +143,28 @@ async def ingest_items_v2(
     automation: Automation,
     source: ValidatedSource,
     items: list[dict],
+    *,
+    baseline: bool = False,
 ) -> list[AutomationEvent]:
     """Insert-or-skip each observed item, dedupe-keyed as
     "<source_id>:<value>" so two sources can never collide in the
     per-automation UNIQUE gate. Payloads are trimmed to the declared
-    event fields plus `_source`."""
+    event fields plus `_source`.
+
+    `baseline` is the first tick of a source that has never observed
+    anything (R42, B5): the rows are recorded as `discarded` — seen,
+    deliberately not run — and NOTHING comes back as fresh. Without it
+    the dedupe table is empty on the first poll, so every item a
+    provider hands back is "new" and a 50-item window mints 50 runs at
+    once. The status is written at INSERT, never as a second UPDATE: a
+    row that lands as `new` and dies before the flip is a run this
+    engine still owes.
+
+    The caller decides, because only the caller knows the leg: a poll
+    window is history (the last 25-50 items the provider holds), while
+    a pushed event arrived because it just happened, and baselining
+    THAT drops real mail on the day the automation is armed.
+    """
     ev_spec = source.event_spec or {}
     fields: dict[str, str] = dict(ev_spec.get("fields") or {})
     dedupe_field = source.dedupe_key_field or ev_spec.get("dedupe_field") or "id"
@@ -165,16 +186,50 @@ async def ingest_items_v2(
             user_id=automation.user_id,
             dedupe_key=f"{source.id}:{key}"[:255],
             payload_json=json.dumps(payload, default=str)[:8000],
+            status="discarded" if baseline else "new",
         )
         try:
             async with db.begin_nested():
                 db.add(event)
                 await db.flush()
-            fresh.append(event)
+            if not baseline:
+                fresh.append(event)
         except IntegrityError:
             pass
     await db.commit()
     return fresh
+
+
+def _like_prefix(value: str) -> str:
+    """Escape a literal for a LIKE prefix match (backslash escape)."""
+    return (value.replace("\\", "\\\\")
+            .replace("%", "\\%").replace("_", "\\_"))
+
+
+async def _source_has_history(db, automation_id: str, source_id: str) -> bool:
+    """Has this source ever ingested an item?
+
+    The honest "has it polled before" marker, and it is the dedupe
+    namespace itself — the same "<source_id>:<value>" gate the intake
+    claims — so it needs no column and no second store, it is per
+    SOURCE (a second lane armed later baselines on its own first tick),
+    and it survives a restart the way the runs it guards do.
+
+    One hole, and it is the cheap side of the trade: a first poll that
+    observes NOTHING leaves the source unbaselined, so the next
+    non-empty poll baselines items that were genuinely new. That costs
+    one batch, recorded as `discarded` rows an audit can read. Getting
+    it wrong the other way costs 50 runs in one tick.
+    """
+    from sqlalchemy import select as _select
+    row = await db.execute(
+        _select(AutomationEvent.id)
+        .where(AutomationEvent.automation_id == automation_id)
+        .where(AutomationEvent.dedupe_key.like(
+            f"{_like_prefix(source_id)}:%", escape="\\"))
+        .limit(1)
+    )
+    return row.scalar() is not None
 
 
 def _passes_filter_v2(source: ValidatedSource, payload: dict,
@@ -286,72 +341,402 @@ def _skipped_result(step: ValidatedStep, *, silent: bool = True) -> dict:
     }
 
 
+# tool → (the param that names its target, the pin kinds that can fill
+# it, in order of preference). A read in this table CANNOT run without a
+# target, so an empty one is a hole a pin may fill — never a narrowing.
+_PIN_TARGET_PARAM: dict[str, tuple[str, tuple[str, ...]]] = {
+    "slack__read_messages": ("channel", ("channel", "thread")),
+    "teams__read_chat_messages": ("chat_id", ("thread", "channel")),
+}
+
+# github__list_issues takes its target as two params, so it is filled
+# separately — the kinds, in preference order, are here beside the rest.
+_PIN_TARGET_GITHUB_KINDS: tuple[str, ...] = ("repo", "ticket")
+
+
 def _apply_focus_scope(
     connector_id: str, tool: str, params: dict, pins: list,
 ) -> dict:
-    """Make the user's pins steer the read (R39, founder P10).
+    """Fill a read's EMPTY target from a pin. Pins rank; they never
+    filter (R42, founder P6 — stated twice).
 
-    Until now an accepted pin reached a run only as a `{{focus.*}}`
-    render root that no compiled step ever referenced — the canvas
-    said "it starts at #all-toup" and the run read the whole account
-    anyway. This narrows a read step's params by the pins on its own
-    connector, the same vocabulary `contents.py` reads by:
+    R39 read the pins as a scope and narrowed the provider call itself:
+    a pinned person became `from:dana@x.com` on the Gmail query, a
+    pinned project became `project in ("ENG") AND (<the step's own
+    jql>)`, and a pinned Slack channel OVERRODE the channel the step
+    already named. Three separate wrongs, one mistake. Material the
+    user did not pin was never FETCHED, so no ranking step could see
+    it and nothing downstream could put the pinned item first — which
+    is the whole thing a pin is for. A second pin was silently dropped
+    (only `[0]` was used). And every shipped Jira template's JQL ends
+    in `ORDER BY`, which JQL forbids inside parentheses, so the
+    composed clause 400'd, `on_error: continue` swallowed it, and the
+    brief blamed a healthy board.
 
-      - query languages COMPOSE (gmail/outlook person+label terms,
-        jira project scope) — the spec's own filter still applies;
-      - single-target reads FILL an empty target and OVERRIDE a set
-        one (slack channel, teams chat, github repo) — the pin is the
-        user's later word than the compiled spec.
+    So the only case left is the honest one: a tool that REQUIRES a
+    target it does not have. A query language that is already broad
+    (gmail/outlook `query`, jira `jql`) is left exactly as the spec
+    wrote it; the pins reach the RANKING step instead, through
+    `focus_render_ctx` — `agent_step.build_prompt` renders them as
+    `starts_at` (labels + the user's notes) and the narrator's record
+    carries them under `focus`.
 
-    Pure and total: no pins, unknown tool, or malformed params → the
-    params come back untouched.
+    A step that genuinely wants a scoped read can already say so in the
+    spec: `{{focus.<connector_id>.first.id}}` renders the pinned target
+    into any param. That is authored intent, which a pin is not.
+
+    Pure and total: no pins, unknown tool, a target the spec already
+    set, a pin that names no place, or malformed params → the params
+    come back untouched.
+
+    A pin id is NOT a target id. R42 gave a preview ROW its own pin,
+    whose id is `<container id>#<row id>` and whose kind is the one a
+    CONTAINER pin also uses (a Slack message in a channel and a Teams
+    message in a chat are both `thread`) — so a run aimed at the
+    channel id `C0ALL#1712345.678`, which exists nowhere, and a GitHub
+    ticket pin `acme/api#42` would have split into owner `acme` and
+    repo `api#42`. `contents.container_of` is the one place that format
+    is taken apart, and every fill below goes through it.
     """
-    if not pins or not isinstance(params, dict):
+    if not pins or not isinstance(pins, list) or not isinstance(params, dict):
         return params
-    out = dict(params)
     by_kind: dict[str, list] = {}
     for p in pins:
         if isinstance(p, dict) and p.get("id"):
             by_kind.setdefault(str(p.get("kind") or ""), []).append(p)
-    try:
-        if tool == "gmail__list_messages":
-            terms = [f"from:{p['id']}" for p in by_kind.get("person", [])]
-            terms += [f"label:{p['id']}" for p in by_kind.get("label", [])
-                      + by_kind.get("folder", [])]
-            if terms:
-                scoped = terms[0] if len(terms) == 1 \
-                    else "(" + " OR ".join(terms) + ")"
-                q = str(out.get("query") or "").strip()
-                out["query"] = f"{q} {scoped}".strip()
-        elif tool == "outlook__list_messages":
-            froms = [f"from:{p['id']}" for p in by_kind.get("person", [])]
-            if froms:
-                scoped = " OR ".join(froms)
-                q = str(out.get("query") or "").strip()
-                out["query"] = f"({q}) AND ({scoped})" if q else scoped
-        elif tool == "slack__read_messages":
-            chans = by_kind.get("channel", []) + by_kind.get("thread", [])
-            if chans:
-                out["channel"] = str(chans[0]["id"])
-        elif tool == "teams__read_chat_messages":
-            chats = by_kind.get("thread", []) + by_kind.get("channel", [])
-            if chats:
-                out["chat_id"] = str(chats[0]["id"])
-        elif tool == "jira__search_issues":
-            projects = [str(p["id"]) for p in by_kind.get("project", [])]
-            if projects:
-                keys = ", ".join(f'"{k}"' for k in projects)
-                jql = str(out.get("jql") or "").strip()
-                out["jql"] = (f"project in ({keys}) AND ({jql})"
-                              if jql else f"project in ({keys})")
-        elif tool == "github__list_issues":
-            repos = [str(p["id"]) for p in by_kind.get("repo", [])
-                     if "/" in str(p.get("id") or "")]
-            if repos:
-                owner, repo = repos[0].split("/", 1)
-                out["owner"], out["repo"] = owner, repo
-    except Exception:  # noqa: BLE001 — a pin must never break a read
+
+    def _targets(kinds: tuple[str, ...]):
+        """The container id of each pin of those kinds, in preference
+        order. A pin whose container cannot be resolved is skipped —
+        never guessed at."""
+        for kind in kinds:
+            for p in by_kind.get(kind, []):
+                got = container_of(connector_id, p)
+                if got is None or not got[0]:
+                    continue
+                yield got[0]
+
+    if tool == "github__list_issues":
+        # Two params, one pin: a repo pin is "owner/repo", a ticket pin
+        # sits INSIDE one, and either half already set means the spec
+        # named the repository.
+        if params.get("owner") or params.get("repo"):
+            return params
+        for target in _targets(_PIN_TARGET_GITHUB_KINDS):
+            if "/" in target:
+                out = dict(params)
+                out["owner"], out["repo"] = target.split("/", 1)
+                return out
         return params
+
+    entry = _PIN_TARGET_PARAM.get(tool)
+    if entry is None:
+        return params
+    field, kinds = entry
+    if params.get(field):
+        return params
+    for target in _targets(kinds):
+        out = dict(params)
+        out[field] = target
+        return out
+    return params
+
+
+# ── Per-account read filters (R42, design §5.2) ──────────────────────
+#
+# The mirror image of `_apply_focus_scope` above, and the distinction
+# is the whole point: a PIN ranks, so it must never stop material being
+# fetched; a FILTER is the user explicitly asking for less, so it DOES
+# compose into the provider call. `spec.CONNECTOR_FILTERS` owns which
+# filters exist and which tools each one composes into — this file owns
+# only HOW.
+#
+# Two composition rules, and they differ because the substrates differ:
+#
+#   query languages (gmail's `query`, jira's `jql`, slack search's
+#   `query`) AND their terms, so a filter APPENDS and the step's own
+#   query still applies — see `_already_narrowed` for the one case it
+#   does not repeat itself.
+#
+#   PARAMS (outlook `is_read`/`since`, slack `oldest`) are set. A bound
+#   only ever moves later — a filter may not widen a read the spec
+#   already narrowed — while read state REPLACES, because it is a
+#   partition rather than a bound: leaving `is_read: true` under a lit
+#   "Unread only" is the chip that lies.
+#
+# Pure and total, like every other params pass here: unknown connector,
+# unknown tool, malformed params, or a filter that needs a clock the
+# run did not supply → the params come back untouched.
+
+
+def _split_jql_order_by(jql: str) -> tuple[str, str]:
+    """`("<where>", "ORDER BY …")` — the trailing sort, kept trailing.
+
+    JQL forbids `ORDER BY` inside parentheses, so a composed clause
+    must go into the WHERE half and the sort must stay at the very end
+    (R42's B2 finding, where a wrapped query 400'd and `on_error:
+    continue` blamed a healthy board). The scan skips quoted regions so
+    an issue searched for the words "order by" is not mistaken for the
+    sort.
+    """
+    text = str(jql or "")
+    low = text.lower()
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif low.startswith("order by", i) and (i == 0 or not text[i - 1].isalnum()):
+            return text[:i].strip(), text[i:].strip()
+        i += 1
+    return text.strip(), ""
+
+
+def _already_narrowed(text: str, term: str) -> bool:
+    """Is `term` already ANDed into `text`?
+
+    A query with no `OR` in it is a plain conjunction, so a term that
+    appears is already narrowing and repeating it would be noise. The
+    moment an `OR` appears, the same term may sit inside a group where
+    it narrows NOTHING — the shipped Jira brief's
+    "… OR priority in (Highest, High) OR …" is exactly that — and no
+    substring test can tell the two apart. So it is appended there: a
+    redundant AND is idempotent, while a skipped one is a lit chip over
+    a read that ignores it.
+    """
+    low = str(text or "").lower()
+    if re.search(r"\bor\b", low) is not None:
+        return False
+    return re.search(rf"(?<![\w:@.-]){re.escape(term.lower())}(?![\w.@-])",
+                     low) is not None
+
+
+def _and_jql(jql: str, clauses: list) -> str:
+    """AND every clause into the WHERE half, in ONE pass.
+
+    One pass rather than one call per clause: re-splitting for each
+    would wrap the query again each time, and four filters produced
+    four nested layers of parentheses around a query a person has to
+    be able to read in the ledger.
+    """
+    where, order = _split_jql_order_by(jql)
+    extra = [c for c in clauses if not _already_narrowed(where, c)]
+    if not extra:
+        return str(jql)
+    joined = " AND ".join(extra)
+    where = f"({where}) AND {joined}" if where else joined
+    return f"{where} {order}".strip() if order else where
+
+
+def _and_terms(query: str, term: str) -> str:
+    """Append one search term so it narrows the WHOLE query.
+
+    Parenthesised, for the same reason `_and_jql` wraps a WHERE clause: in
+    Gmail's grammar (and Slack's) `OR` binds looser than the implicit AND
+    between adjacent terms, so a bare append attaches to the LAST branch
+    only. The shipped "Newsletter roundup" reads
+    `category:promotions OR category:updates newer_than:7d`, and appending
+    `-category:promotions` to that left the first branch returning every
+    promotion — the chip lit, the mail still there.
+    """
+    q = str(query or "").strip()
+    if not q:
+        return term
+    if _already_narrowed(q, term):
+        return q
+    # Only where it changes the meaning: adjacent terms are already ANDed, so
+    # wrapping every append would stack `((a) b) c` for nothing.
+    return f"({q}) {term}" if _HAS_OR.search(q) else f"{q} {term}"
+
+
+#: A top-level `OR` is the only thing that makes an appended term bind
+#: narrower than the whole query; word-bounded so `ORDER`, `WORD` and an
+#: address containing "or" are not mistaken for it.
+_HAS_OR = re.compile(r"\bOR\b")
+
+_GMAIL_TERMS = {
+    "me": "to:me",
+    "unread": "is:unread",
+    # Gmail's own tab, which is where every bulk mailing this filter
+    # means already lands. There is no "newsletter" predicate.
+    "no_promos": "-category:promotions",
+    "day": "newer_than:1d",
+}
+
+_JQL_CLAUSES = {
+    "priority": "priority in (Highest, High)",
+    "open": "statusCategory != Done",
+    "due_week": "duedate <= endOfWeek()",
+    "day": "updated >= -1d",
+}
+
+
+def _apply_read_filters(
+    connector_id: str, tool: str, params: dict, filters: list,
+    clock: dict,
+) -> dict:
+    if not filters or not isinstance(params, dict):
+        return params
+    # Table order, never the caller's: the same filter set has to
+    # compose the same query byte for byte, or one automation's read
+    # reads differently on the run after a re-tap.
+    on = {f for f in filters if isinstance(f, str)}
+    wanted = [f["id"] for f in _filter_options(connector_id)
+              if f["id"] in on and tool in _filter_tools(connector_id, f["id"])]
+    if not wanted:
+        return params
+    now = clock.get("now") if isinstance(clock, dict) else None
+    if not isinstance(now, datetime):
+        now = None
+    out = dict(params)
+
+    if connector_id == "gmail":
+        for fid in wanted:
+            term = _GMAIL_TERMS.get(fid)
+            if not term:
+                continue
+            # A filter is per ACCOUNT and composes into every read step on
+            # it, and one shipped template deliberately runs two Gmail
+            # windows: the Morning brief's `mail` is `newer_than:1d` and its
+            # `waiting` is `older_than:1d newer_than:7d` — the separate
+            # window IS the age. ANDing `newer_than:1d` onto the second
+            # makes a query that can never match, which `empty_text` then
+            # states as the fact "Nothing waiting on you." A step that
+            # already carries its own lower age bound keeps it.
+            if fid == "day" and "older_than:" in str(out.get("query") or ""):
+                continue
+            out["query"] = _and_terms(out.get("query"), term)
+        return out
+
+    if connector_id == "jira":
+        clauses = [c for c in (_JQL_CLAUSES.get(f) for f in wanted) if c]
+        if clauses:
+            out["jql"] = _and_jql(out.get("jql"), clauses)
+        return out
+
+    if connector_id == "outlook":
+        for fid in wanted:
+            if fid == "unread":
+                out["is_read"] = False
+            elif fid == "day" and now is not None:
+                out["since"] = _later_iso(
+                    out.get("since"),
+                    (now - timedelta(days=1)).replace(
+                        microsecond=0).isoformat(),
+                )
+        return out
+
+    if connector_id == "slack":
+        for fid in wanted:
+            if fid != "day" or now is None:
+                continue
+            since = now - timedelta(days=1)
+            if tool == "slack__read_messages":
+                # Seconds, the unit conversations.history takes.
+                out["oldest"] = _later_ts(out.get("oldest"),
+                                          f"{since.timestamp():.0f}")
+            elif "after:" not in str(out.get("query") or "").lower():
+                # Slack search takes ONE `after:`; a second is not an extra
+                # AND, so this is the one place a present term is left
+                # alone. `after:` is EXCLUSIVE of the day it names, so the
+                # day BEFORE the window's start is what makes the search a
+                # superset of the 24 hours `oldest` gives the other tool —
+                # one chip, one meaning, whichever Slack read it lands on.
+                out["query"] = _and_terms(
+                    out.get("query"),
+                    f"after:{(since - timedelta(days=1)).date().isoformat()}")
+        return out
+
+    return out
+
+
+def _later_iso(current: Any, candidate: str) -> str:
+    """The later of two ISO bounds — a filter narrows, never widens.
+
+    A bound the spec wrote that this cannot parse is left exactly as it
+    is: authored intent outranks a filter that has no way to compare
+    itself against it.
+    """
+    cur = str(current or "").strip()
+    if not cur:
+        return candidate
+    try:
+        return candidate if (datetime.fromisoformat(cur)
+                             < datetime.fromisoformat(candidate)) else cur
+    except (TypeError, ValueError):
+        return cur
+
+
+def _later_ts(current: Any, candidate: str) -> str:
+    """Same rule, in the unix seconds Slack speaks."""
+    try:
+        return candidate if float(current) < float(candidate) else str(current)
+    except (TypeError, ValueError):
+        return candidate
+
+
+# tool → (lower-bound param, upper-bound param). A provider that orders
+# ASCENDING and windows only when asked answers an unwindowed read with
+# the OLDEST rows it holds.
+_TIME_WINDOW_PARAMS: dict[str, tuple[str, str]] = {
+    "calendar__list_events": ("time_min", "time_max"),
+}
+_DEFAULT_WINDOW_DAYS = 1
+_MAX_WINDOW_DAYS = 366
+
+
+def _window_days(raw: Any) -> int:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_WINDOW_DAYS
+    return min(max(n, 1), _MAX_WINDOW_DAYS)
+
+
+def _apply_time_window(tool: str, params: dict, clock: dict) -> dict:
+    """Give a time-ordered read the window the spec cannot compute
+    (R42, B1).
+
+    `calendar__list_events` sets `timeMin`/`timeMax` only when the
+    caller passes them and orders by start time ASCENDING, and no
+    shipped template passes them — so "your day's calendar" posted the
+    oldest events in the account's history, every morning. A spec
+    cannot fix that from its own text: there is no `{{now}}` render
+    root, and deliberately so (a render root is a string the model
+    composes; a clock is a fact of the run). The DISPATCHER supplies
+    it, from `ctx["_clock"]`.
+
+    A step names its own horizon with `window_days` — SPEC vocabulary,
+    popped for every tool so a provider is never handed a key its
+    schema does not declare. Default one day: on a daily automation,
+    "what is coming up" means today.
+
+    Each bound is filled INDEPENDENTLY and only when empty, so a spec
+    that pins one end keeps it and gains the other, and a spec that
+    pinned both is untouched. Pure and total: unknown tool, malformed
+    params or a clockless ctx → nothing but `window_days` is removed.
+    """
+    if not isinstance(params, dict):
+        return params
+    out = dict(params)
+    days = _window_days(out.pop("window_days", None))
+    fields = _TIME_WINDOW_PARAMS.get(tool)
+    now = clock.get("now") if isinstance(clock, dict) else None
+    if fields is None or not isinstance(now, datetime):
+        return out
+    lo, hi = fields
+    if not out.get(lo):
+        out[lo] = now.replace(microsecond=0).isoformat()
+    if not out.get(hi):
+        out[hi] = (now + timedelta(days=days)).replace(
+            microsecond=0).isoformat()
     return out
 
 
@@ -367,6 +752,17 @@ async def _execute_read_step(
         step.connector_id, step.tool, params,
         (ctx.get("_focus_pins") or {}).get(step.connector_id) or [],
     )
+    # Then the user's own narrowing, which is what a filter is and a
+    # pin is not (§5.2). After the pins so a filter composes into the
+    # target the pin just filled.
+    params = _apply_read_filters(
+        step.connector_id, step.tool, params,
+        (ctx.get("_filters") or {}).get(step.connector_id) or [],
+        ctx.get("_clock") or {},
+    )
+    # After both, never before: a pin or a filter that could re-widen
+    # the window would put the run back where B1 found it.
+    params = _apply_time_window(step.tool, params, ctx.get("_clock") or {})
     result = await reg.dispatch_via_platform(
         automation.user_id,
         connector_id=step.connector_id,
@@ -438,6 +834,17 @@ async def _run_steps(
         # R39 — the raw pins for `_apply_focus_scope`. Underscored: not
         # a render root, never reachable from a `{{…}}` template.
         "_focus_pins": dict(vspec.focus or {}),
+        # R42 — the per-account read filters, for `_apply_read_filters`.
+        # Underscored for the same reason; there is deliberately no
+        # `{{filters.…}}` root, because a filter narrows the CALL and
+        # has nothing to say inside a template.
+        "_filters": dict(vspec.filters or {}),
+        # R42 — the run's clock, for `_apply_time_window`. Underscored
+        # for exactly the reason the pins are: `render_value` must
+        # never reach it. tz-aware because it leaves this process as an
+        # ISO string in a provider's params (the DB columns beside it
+        # stay naive UTC, as everywhere else in this engine).
+        "_clock": {"now": datetime.now(timezone.utc)},
     }
 
     # Mail rail first — checked before any step runs, exactly like v1.
@@ -755,26 +1162,89 @@ async def _run_steps(
     # EXECUTES (outbox ok branch, keyed by display_json.step_id) — never
     # at staging. A refused write must not wear "Posted to Slack".
 
-    # R30 narration phase 1 (pre-write): the opening line, item whys,
-    # think turns, the draft's text. Result + close land in phase 2 so
-    # the thread never claims a change before the write executed.
-    narration = await _narrate_phase1(
-        db, automation=automation, vspec=vspec, job_id=job_id,
-        thread=thread, tool_turn_by_step=tool_turn_by_step,
-        partial=partial, failed_sources=failed_sources,
-        agent_outputs=agent_outputs,
-    )
+    # R42 — the WRITE goes first, and the run's terminal with it.
+    #
+    # Narration used to sit here, ahead of the flush, so that the
+    # thread's opening line could precede the write turn. That promise
+    # was never kept: the undo window is 6 s and `flush_loop` sweeps
+    # every 5 s, so a narration taking anything like an LLM's time was
+    # overtaken by the background loop, which sent the write, then
+    # blocked on `_mark_write_step`'s UPDATE of `build_jobs` behind the
+    # progress stamp this session had flushed and not committed. At a
+    # 30 s `statement_timeout` that UPDATE is CANCELLED — so the post
+    # had landed, `_finalize_job` never ran, and the card sat at 99%
+    # "Working now" until the 360 s stuck-run reaper called it failed.
+    #
+    # Flushing here fixes both halves. The write no longer waits on
+    # prose, and the send + terminal happen on THIS session, where a
+    # lock cannot be contended, instead of racing a background loop
+    # that had become the de-facto decider of the ordering.
+    if rows:
+        # …and the LEDGER CLOSE is what waits for the prose now.
+        #
+        # `close_ledger` reads "the run is terminal and has no result
+        # turn" as "narration failed outright" and appends a mechanical
+        # one ("N items read — I could not rank them this time"). That
+        # test was true only while narration preceded the terminal. With
+        # the flush first it fires on every healthy write run, and the
+        # narrator's real result lands behind the fabricated one — two
+        # results in one thread. The rest of the close judges the
+        # narrated record too: the missing-item reconciliation, the
+        # vocabulary tripwire and the result-row episodes all read turns
+        # that do not exist yet.
+        #
+        # So the flag defers the whole close rather than one branch of
+        # it, `run_v3.on_terminal` honours it, and `_close_ledger_after_
+        # narration` below both closes the ledger and clears the flag.
+        # Stamped WITH a time, because the flag is a claim on someone
+        # else's work and a claim needs an expiry. The `finally` below
+        # releases it on any exception, but not on the class this whole
+        # reordering exists because of — a pod eviction between the stamp
+        # and the release, which would leave every future terminal for
+        # this run (including the stuck-run reaper's) skipping its close
+        # forever. `on_terminal` honours the claim only while it is fresh.
+        await merge_job_config(
+            db, job_id,
+            narration_pending=True,
+            narration_pending_at=datetime.utcnow().isoformat() + "Z",
+        )
 
     from .outbox import flush_row_when_due
     statuses = []
-    for row in rows:
-        statuses.append(await flush_row_when_due(db, row.id))
+    try:
+        for row in rows:
+            statuses.append(await flush_row_when_due(db, row.id))
 
-    await _narrate_phase2(
-        db, automation=automation, job_id=job_id, thread=thread,
-        narration=narration,
-        writes_ok=not any(s == "failed" for s in statuses),
-    )
+        # Phase 1 is still the opening line + the item whys, and phase 2
+        # still holds the result until the writes are known: a run whose
+        # write FAILED must not be narrated as one that landed.
+        narration = await _narrate_phase1(
+            db, automation=automation, vspec=vspec, job_id=job_id,
+            thread=thread, tool_turn_by_step=tool_turn_by_step,
+            partial=partial, failed_sources=failed_sources,
+            agent_outputs=agent_outputs,
+            # A run with an outbox row does not own its own terminal:
+            # the outbox does, in the flush above or in a later retry.
+            # Either way this pass must not announce a step on its
+            # behalf.
+            terminal_landed=bool(rows),
+        )
+
+        await _narrate_phase2(
+            db, automation=automation, job_id=job_id, thread=thread,
+            narration=narration,
+            writes_ok=not any(s == "failed" for s in statuses),
+        )
+    finally:
+        # In a `finally` because the flag is a CLAIM: while it is set
+        # `on_terminal` declines to close, so an exception escaping the
+        # inline flush (nothing here is the blanket handler `flush_loop`
+        # gives the background path) would leave the run's ledger to be
+        # skipped by whichever sweep terminalizes it, forever.
+        if rows:
+            await _close_ledger_after_narration(
+                db, automation=automation, job_id=job_id,
+            )
 
     outcome = "sent"
     if any(s == "failed" for s in statuses):
@@ -1062,20 +1532,177 @@ async def _poll_once_v2(
     return items if isinstance(items, list) else []
 
 
+# The two windows a manifest may declare. Order is immaterial — the
+# most restrictive of them decides.
+_RATE_WINDOWS: tuple[tuple[str, timedelta], ...] = (
+    ("per_hour", timedelta(hours=1)),
+    ("per_day", timedelta(days=1)),
+)
+
+
+async def _rate_budget(automation: Automation, connector_id: str) -> dict:
+    """The connector's declared `automation.rate_budget`, or {}.
+
+    Fails OPEN: `fetch_registry` answers {} when the platform is
+    unreachable, and a poll that cannot read the budget must still run
+    the user's automation. The cap is a fan-out guard, not a rail — the
+    rails (mail, grants, the outbox) all fail closed platform-side.
+    """
+    if not connector_id:
+        return {}
+    entry = (await reg.fetch_registry(automation.user_id)).get(connector_id)
+    budget = (entry or {}).get("rate_budget")
+    return budget if isinstance(budget, dict) else {}
+
+
+async def _rate_allowance(
+    db, automation: Automation, budget: dict,
+) -> Optional[int]:
+    """How many more runs this automation may start now, or None when
+    nothing caps it (R42, B5).
+
+    Every connector manifest has declared `automation.rate_budget`
+    since R26 — `AutomationCapability`'s own field comment says "the
+    rate budget the executor enforces" — and nothing ever enforced it,
+    while `AUTOMATION_EVENT_STATUSES` has carried `skipped_rate` with
+    no writer. A poll window is up to 50 items, so one tick could mint
+    50 runs.
+
+    The window is counted off `automation_events` rather than kept in
+    memory. `triggers/rate_limiter.py` is the working sliding window
+    for the OLD triggers engine and its shape is the one copied here —
+    a count of fires inside each window, most restrictive wins — but it
+    is a per-container token bucket, and importing it would couple two
+    engines this repo keeps apart and would still lose the count on a
+    restart that the runs it guards survive. The event rows ARE the
+    ledger; counting them is one indexed query per tick
+    (`ix_automation_events_auto_received`).
+
+    `received_at` is the intake stamp, which on the poll leg is the
+    same tick the run starts on — the only leg this gate sits on.
+    """
+    limits: list[tuple[int, timedelta]] = []
+    for key, span in _RATE_WINDOWS:
+        try:
+            n = int(budget.get(key))
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            limits.append((n, span))
+    if not limits:
+        return None
+    from sqlalchemy import func as _func, select as _select
+    now = datetime.utcnow()
+    allowance: Optional[int] = None
+    for n, span in limits:
+        used = int((await db.execute(
+            _select(_func.count(AutomationEvent.id))
+            .where(AutomationEvent.automation_id == automation.id)
+            .where(AutomationEvent.status == "run")
+            .where(AutomationEvent.received_at >= now - span)
+        )).scalar() or 0)
+        left = max(n - used, 0)
+        allowance = left if allowance is None else min(allowance, left)
+    return allowance
+
+
+# How many carried-over events one tick may pick up, whatever the
+# budget allows. The same order of magnitude as a poll window: a tick
+# that starts fifty runs is the fan-out this gate exists to stop, and a
+# backlog longer than that is drained a tick at a time.
+_PENDING_DRAIN_MAX = 50
+
+
+async def _pending_events(
+    db, automation_id: str, source_id: str,
+) -> list[AutomationEvent]:
+    """This source's fresh events that no tick has run yet, oldest
+    first.
+
+    An event the rate budget could not afford is DEFERRED, not dropped:
+    it keeps its `new` status and the next tick spends its allowance on
+    it before anything the provider has just handed back. Nothing else
+    drains a `new` row — the dedupe gate makes `ingest_items_v2` skip
+    that item on every later poll — so stamping it `skipped_rate` here
+    was the last time the engine would ever see it, and the user could
+    not tell that from an automation that had simply not fired.
+
+    The same query picks up an event a deploy drain refused (`run_event_v2`
+    returns "drained" and leaves the row `new`), which had exactly the
+    same one-way exit.
+    """
+    from sqlalchemy import select as _select
+    rows = (await db.execute(
+        _select(AutomationEvent)
+        .where(AutomationEvent.automation_id == automation_id)
+        .where(AutomationEvent.status == "new")
+        .where(AutomationEvent.dedupe_key.like(
+            f"{_like_prefix(source_id)}:%", escape="\\"))
+        .order_by(AutomationEvent.received_at.asc())
+        .limit(_PENDING_DRAIN_MAX)
+    )).scalars().all()
+    return list(rows)
+
+
 async def poll_and_run_v2(
     db, automation: Automation, vspec: ValidatedSpecV2,
     source: ValidatedSource,
 ) -> dict:
     items = await _poll_once_v2(automation, source)
-    fresh = await ingest_items_v2(db, automation, source, items)
+    # B5, first half: the first poll of a source records what it saw
+    # and runs nothing. Before this, the dedupe table was empty on that
+    # tick, so every item in a 25-50 item window was "new" — arming a
+    # calendar automation fired one run per event already on the
+    # calendar.
+    baselined = not await _source_has_history(db, automation.id, source.id)
+    # Read BEFORE the intake, or this tick's own fresh rows come back in
+    # it and every event is queued twice.
+    pending = await _pending_events(db, automation.id, source.id)
+    fresh = await ingest_items_v2(db, automation, source, items,
+                                  baseline=baselined)
+    if baselined and items:
+        logger.info(
+            "[automations] first poll baselined automation=%s source=%s "
+            "observed=%d — recorded as seen, nothing ran",
+            automation.id, source.id, len(items),
+        )
+
+    # B5, second half: the declared budget, enforced. One log line per
+    # tick — a line per skipped event is the same fan-out in the log.
+    allowance = await _rate_allowance(
+        db, automation,
+        await _rate_budget(automation, source.connector_id or ""),
+    )
     ran = 0
     failed = 0
-    for event in fresh:
+    started = 0
+    deferred = 0
+    # The carry-over spends the budget first: an event the last tick
+    # could not afford is older than anything this poll returned, and
+    # letting fresh items overtake it is how a backlog starves.
+    for event in pending + fresh:
+        if allowance is not None and started >= allowance:
+            # Left `new` on purpose — see `_pending_events`. Not
+            # `skipped_rate`, which reads as a verdict and is a one-way
+            # exit; this event has not been judged, only postponed.
+            deferred += 1
+            continue
         status = await run_event_v2(db, automation, vspec, source, event)
+        # A filtered or drained event minted no job, so it spends
+        # nothing: the budget counts RUNS.
+        if status not in ("skipped_filter", "drained"):
+            started += 1
         if status == "failed":
             failed += 1
         elif status == "run":
             ran += 1
+    if deferred:
+        logger.info(
+            "[automations] rate budget spent automation=%s connector=%s "
+            "allowance=%d deferred=%d — the next tick runs them",
+            automation.id, source.connector_id or "", allowance, deferred,
+        )
+
     if failed == 0:
         # See `_record_health`: a poll with nothing fresh is connector
         # health, not a run. Stamping it as a run made the health object
@@ -1083,7 +1710,9 @@ async def poll_and_run_v2(
         await _record_health(db, automation.id, ok=True, error=None,
                              ran=ran > 0)
     return {"observed": len(items), "fresh": len(fresh),
-            "ran": ran, "failed": failed}
+            "ran": ran, "failed": failed,
+            "baselined": len(items) if baselined else 0,
+            "carried_in": len(pending), "deferred_rate": deferred}
 
 
 # ── Rehearsal ────────────────────────────────────────────────────────
@@ -1169,6 +1798,13 @@ async def rehearse_v2(
         # "say what it WOULD write". An agent step reads it too
         # (agent_step.build_prompt's `starts_at`).
         "focus": _focus_render_ctx(vspec.focus),
+        # R42. The same run-only roots `_run_steps` builds, for the
+        # same reason: a rehearsal that reads a different window, a
+        # different pinned channel or an unfiltered inbox is a
+        # rehearsal of a different run.
+        "_focus_pins": dict(vspec.focus or {}),
+        "_filters": dict(vspec.filters or {}),
+        "_clock": {"now": datetime.now(timezone.utc)},
     }
 
     reads: list[dict] = []
@@ -1646,11 +2282,16 @@ async def _narrate_phase1(
     thread, tool_turn_by_step: dict, partial: bool,
     failed_sources: Optional[list] = None,
     agent_outputs: Optional[dict] = None,
+    terminal_landed: bool = False,
 ) -> Optional[dict]:
-    """Run the narrator and persist what may precede the writes: the
-    opening agent line + the per-item whys (in-place annotates). The
-    result/thinks/draft/close land in phase 2, after the writes, so
-    the thread never claims a change before it happened."""
+    """Run the narrator and persist the opening agent line + the
+    per-item whys (in-place annotates). The result/thinks/draft/close
+    land in phase 2, gated on the writes, so a run whose write failed
+    is never narrated as one that landed.
+
+    `terminal_landed` says the run's terminal transition has already
+    happened (the outbox owns it for any run with a write step) — see
+    the progress block below."""
     if thread is None:
         return None
     _reason_by_step = {
@@ -1687,35 +2328,74 @@ async def _narrate_phase1(
         # The run's visible total extends by ONE step (one, not two:
         # phase 2 is the same writing, after the flush) and announces
         # itself in the automation's own narration vocabulary.
+        #
+        # R42 — the FRAME is what a landed terminal suppresses, never
+        # the columns. A `running` progress frame for a job that has
+        # already reported `Done` walks its own card backwards, so a run
+        # with a write step (which terminalizes in the outbox flush
+        # above) is announced to nobody. But `progress_step` /
+        # `progress_total` are the run's durable record, read back by
+        # the terminal frame, the park, the home card's fraction and
+        # run-now's 409 sentence — and a finished run that stops one
+        # short of its own total draws a card that never fills.
         try:
             from . import run_v3 as _rv3
             from .narrator import writing_sentence
             _n_total = len(vspec.steps) + 1
-            _sentence = writing_sentence(vocabulary)
-            await _ledger.emit_progress(
-                automation.user_id, run_id=job_id,
-                automation_id=automation.id, step=_n_total,
-                total=_n_total, sentence=_sentence,
-                fraction=(_n_total - 1) / _n_total,
-                status="running",
-            )
-            await _rv3.notify_progress(
-                db, automation=automation, job=job, step=_n_total,
-                total=_n_total, sentence=_sentence,
-                fraction=(_n_total - 1) / _n_total,
-            )
-            # The same columns the read loop stamps — the terminal
-            # frame, the park, the home card's fraction and run-now's
-            # 409 sentence all read them back.
+            if not terminal_landed:
+                _sentence = writing_sentence(vocabulary)
+                await _ledger.emit_progress(
+                    automation.user_id, run_id=job_id,
+                    automation_id=automation.id, step=_n_total,
+                    total=_n_total, sentence=_sentence,
+                    fraction=(_n_total - 1) / _n_total,
+                    status="running",
+                )
+                await _rv3.notify_progress(
+                    db, automation=automation, job=job, step=_n_total,
+                    total=_n_total, sentence=_sentence,
+                    fraction=(_n_total - 1) / _n_total,
+                )
+            # COMMITTED, not flushed. These columns are a published
+            # fact, not part of the narration; left open, the UPDATE
+            # holds the `build_jobs` tuple lock across two 8000-token
+            # completions, and the outbox's own `_mark_write_step`
+            # UPDATE on that row blocks behind it until the 30 s
+            # `statement_timeout` cancels it — a run that posted and
+            # could never be finalized.
             job.progress_step = _n_total
             job.progress_total = _n_total
-            await db.flush()
+            await db.commit()
+            # The thread IS being written either way, terminal or not,
+            # and the `done` phase lands at the end of the run.
             await _ledger.emit_activity(
                 automation.user_id, automation_id=automation.id,
                 thread_id=thread.id, run_id=job_id, phase="writing",
             )
         except Exception as e:  # noqa: BLE001 — a frame never fails a run
             logger.debug("[automations] narration step frame skipped: %s", e)
+            # The narration continues on THIS session — `_recall_facts`,
+            # `narrate_run`, `_apply_annotate` and `append_turn` all run
+            # below — so a failed commit must not leave it to inherit a
+            # transaction that can no longer be used.
+            #
+            # And a rollback alone is not enough: it EXPIRES every instance
+            # the session holds, so the very next read of `automation.user_id`
+            # or `thread.id` raises MissingGreenlet in async SQLAlchemy. The
+            # rollback swaps a poisoned transaction for expired objects unless
+            # what the rest of this pass reads is reloaded — the same rule
+            # `outbox._reopen(db, row)` follows.
+            try:
+                await db.rollback()
+                job = await db.get(BuildJob, job_id)
+                automation = await db.get(Automation, automation.id) or automation
+                if thread is not None:
+                    thread = await db.get(type(thread), thread.id) or thread
+                if job is None:
+                    return None
+            except Exception:  # noqa: BLE001 — the session is unusable; the
+                # run's own terminal and the outbox are on other sessions.
+                return None
 
         steps_record = []
         from app.services import automation_verbs as _verbs
@@ -1803,6 +2483,14 @@ async def _narrate_phase1(
             "status": "partial" if partial else "completed",
             "rules": _rules_of(automation),
             "memory_facts": await _recall_facts(db, automation),
+            # R42 — the pins, and the user's notes on them, reach the
+            # pass that RANKS. `_apply_focus_scope` used to narrow the
+            # provider call instead, which is the one thing a pin must
+            # never do; the ranking step is where "put Dana first"
+            # belongs, and this record was the only surface that could
+            # not see it. Same shape `agent_step` already reads:
+            # {connector_id: {ids, labels, notes, count, first{...}}}.
+            "focus": _focus_render_ctx(vspec.focus),
             "steps": steps_record,
         }
         from .narrator import narrate_run
@@ -1941,6 +2629,59 @@ async def _narrate_phase2(
                 )
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] narration phase 2 skipped: %s", e)
+
+
+async def _close_ledger_after_narration(
+    db, *, automation: Automation, job_id: str,
+) -> None:
+    """Close the v3 ledger the run's terminal deliberately left open,
+    and release the claim that made it wait.
+
+    ORDER, and it is the whole function: the job's status is read while
+    `narration_pending` is still set, so a terminal that landed at any
+    point since the flush — ours, or the background loop's, mid-
+    narration — is one `on_terminal` declined to close and this run
+    still owes. The flag is cleared LAST, and unconditionally: a run
+    whose write is still staged (an undo took the claim, the send went
+    to backoff) has no terminal yet, and a flag left set would make the
+    terminal that eventually lands skip its close forever.
+
+    That leaves exactly one closer in every case, and the run that
+    closes is the one that has already narrated. Best-effort by the same
+    contract `close_ledger` itself carries: the run is terminal and
+    nothing here may un-finalize it.
+    """
+    from . import ledger as _ledger
+    try:
+        job = await db.get(BuildJob, job_id)
+        # From the DATABASE, not the identity map. `db.get` answers from the
+        # session's own cache, and the terminal we are deciding about is
+        # written by ANOTHER session — the outbox's. A retryable write returns
+        # `staged` with no terminal and `flush_loop` retries ~10s later, i.e.
+        # while these two LLM calls are running: without the refresh this
+        # reads a stale `running`, declines, and clears the flag — and
+        # `on_terminal` had already declined because the flag was set. Nobody
+        # closes the ledger and nothing ever comes back for it.
+        if job is not None:
+            await db.refresh(job)
+        if job is not None and job.status not in (
+                "queued", "running", "waiting_on_user"):
+            await _ledger.close_ledger(
+                db, user_id=automation.user_id, job=job,
+                automation=automation,
+            )
+    except Exception as e:  # noqa: BLE001 — a close never fails a run
+        logger.warning("[automations] deferred ledger close skipped "
+                       "job=%s: %s", job_id[:8], e)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await merge_job_config(db, job_id, narration_pending=False)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[automations] narration claim not released "
+                       "job=%s: %s", job_id[:8], e)
 
 
 # ── §4.2a — per-source resume ────────────────────────────────────────

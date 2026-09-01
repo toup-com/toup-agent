@@ -9,8 +9,13 @@ Pure-function tests: no DB, no network. The registry snapshot mirrors
 
 import pytest
 
-from app.agent.automations.spec import SpecError, validate_spec
-from app.agent.automations.spec_v2 import ValidatedSpecV2
+from app.agent.automations.spec import (
+    SpecError, validate_spec,
+    unanswered_variables as spec_unanswered,
+)
+from app.agent.automations.spec_v2 import (
+    ValidatedSpecV2, unanswered_variables,
+)
 
 
 REGISTRY = {
@@ -590,3 +595,41 @@ def test_an_agent_step_is_never_the_automations_acting_connector():
     v = validate_spec(spec, REGISTRY)
     assert v.steps[0].kind == "agent"
     assert v.action_connector_id == "jira"
+
+
+# ── unanswered settings (R42) ────────────────────────────────────────
+#
+# `validate_spec(template_mode=True, template_vars=None)` deliberately
+# waives the undeclared-variable rule so a mid-setup draft can still be
+# read and edited. `unanswered_variables` is what the arm gate and the
+# fire path ask instead, and it must agree with what `render_value`
+# would actually produce.
+
+def test_a_referenced_variable_with_no_value_is_unanswered():
+    """The founder's chain, from the top: `{{var.github_owner}}` with
+    nothing behind it renders as "" and reaches GitHub as an empty
+    owner. It is named here so nothing downstream has to guess."""
+    spec = good_spec(variables={})
+    spec["trigger"]["sources"] = [{
+        "id": "gh", "mode": "poll", "connector_id": "github",
+        "event": "issue_opened",
+        "params": {"owner": "{{var.github_owner}}", "repo": "x"},
+        "poll_interval_s": 600, "dedupe_key": "event.number",
+    }]
+    assert unanswered_variables(spec) == ["github_owner", "jql"]
+    # Reference order, deduped, and an EMPTY string is not an answer.
+    spec["variables"] = {"jql": "  ", "github_owner": "toup-com"}
+    assert unanswered_variables(spec) == ["jql"]
+
+
+def test_an_agent_steps_own_output_is_never_unanswered():
+    """`{{var.ranked}}` is written DURING the run by the step that
+    declares it, so a spec whose only reference is one is complete —
+    this is the shipped Morning work brief's exact shape."""
+    assert unanswered_variables(agent_spec()) == []
+
+
+def test_a_v1_spec_has_no_settings_to_leave_unanswered():
+    """Variables are a v2 grammar; the dispatch must not read a v1
+    spec's `action` as if it had them."""
+    assert spec_unanswered({"trigger": {}, "action": {}}) == []

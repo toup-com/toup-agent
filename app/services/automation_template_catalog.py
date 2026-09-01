@@ -52,15 +52,77 @@ def _v(name: str, label: str, description: str, *, required: bool = True,
     return out
 
 
-# ── The flagship: Morning Work Brief (6 connectors) ──────────────────
+# ── The flagship: Morning Work Brief ─────────────────────────────────
+#
+# R42. Until this round the brief was five connector reads stitched by a
+# STRING TEMPLATE — "*Jira ({{steps.issues.count}})*\n{{steps.issues.text}}"
+# — and it published its own failures as facts. A read that fell over
+# left `count` at 0 and `text` at "Could not read GitHub.", so the post
+# said "GitHub (0)" directly above the sentence saying it never read
+# GitHub; a step that never ran at all had no `steps.<id>` node, and
+# `render_value` resolves a missing path to "", so an earlier post read
+# "Teams ()" and "Outlook unread ()". The run also spoke twice in two
+# vocabularies: the thread's result card ranked five groups under "Your
+# morning, in order" while Slack got the raw connector dump.
+#
+# So the post interpolates ONE value now — an agent step's answer — and
+# the count/text placeholders are gone with the arithmetic that produced
+# them. The agent step's five headings are `narrator.BRIEF_GROUPS`
+# word-for-word — the separators are ASCII hyphens here because this text
+# is Slack copy, `-` beside `*bold*` — which is what makes the Slack post
+# and the thread's result card one ranking of one run rather than two.
+#
+# What was dropped and why:
+#   github  — its owner/repo variables are unanswerable at setup, and an
+#             unanswered variable made the read fail and blame a healthy
+#             account every weekday.
+#   teams   — needs a chat id nobody can name at setup, and has no unread
+#             filter.
+#   outlook — Gmail already carries the mail; a second inbox bought a
+#             second failure mode.
+# Calendar JOINS: a morning brief without your meetings is not one, and
+# it is the only step in the run that yields a real date.
+#
+# The template declares NO variables. Every param is a literal, so there
+# is nothing for the setup thread to ask and nothing to leave unanswered;
+# `needs_destination` (which Slack channel) is the only blocker, and the
+# product already asks that well.
+
+#: The ranking step's ask. Bounded by `spec_v2.AGENT_PROMPT_MAX_CHARS`;
+#: rendered by `agent_step.build_prompt` against the same bounded view of
+#: the steps that is printed beneath it, so `starts_at` below is the pins.
+#:
+#: It deliberately does NOT tell the model which address is the reader's.
+#: The obvious rule — a row where you appear only in cc is not yours —
+#: needs their own email, and nothing in a run knows it: `ctx["var"]` is
+#: the spec's declared variables, and the only way to fill one is to ask
+#: at setup, which is the unanswered-variable defect this template exists
+#: to be rid of. The connector account label (`fetch_connection_state`'s
+#: `account`) is the right source and reaching it is an executor change,
+#: not a catalog one. A `{{var.my_email}}` here would render as "" and
+#: leave the sentence saying "with  absent from to".
+_MORNING_BRIEF_RANK = """\
+Rank this morning's work for the reader. Order by what breaks if it is ignored, never by which app it came from.
+The steps are the facts: cal is calendar entries; mail arrived in the last day; waiting is mail to you, unread, 1-7 days old; rooms is Slack naming you, newest first, no times; board is your live Jira. You have no clock: never write "today" or "yesterday", never work out a date, use only a date a line gives you.
+Sections, headings exact, in this order, each omitted when it has nothing:
+*DO FIRST - BLOCKS OTHERS* - at most 2: someone is stopped until this moves.
+*ANSWER TODAY* - at most 3: a question to you, or work due on or before the earliest date cal gives.
+*THIS WEEK* - at most 3: dated later, or owed and undated.
+*NO ACTION - FOR AWARENESS* - at most 2: worth knowing, needs nothing.
+*IGNORED - NOTHING NEEDED YOU* - one line: named categories with counts (cc only, automated, newsletters, chatter).
+One item may appear in one section only. If no section has anything, write one line: "Nothing needed you this morning."
+STANDING ORDERS: the material's starts_at names the people, channels and projects the reader pinned, with their own instructions. These RANK, never filter: a pinned name outranks others inside its section.
+For a step whose ok is false, add a final line: "Missing: name it, I could not read it." Never report a step you could not read as a zero.
+Never write a number you did not copy; the ignored counts you get by counting lines. Never write a double brace. Under 900 characters."""
 
 _MORNING_WORK_BRIEF = {
     "version": 2,
     "name": "Morning work brief",
     "description": (
-        "Every weekday morning, pull your open Jira issues, the repo's "
-        "open GitHub issues, your main Teams chat, and unread Gmail + "
-        "Outlook — and post one sectioned brief to a Slack channel."
+        "Every weekday morning, read what is next on your calendar, what "
+        "landed overnight, what has been waiting on you, who named you in "
+        "Slack and what is live on your Jira board — then post one ranked "
+        "brief to a Slack channel."
     ),
     "mode": "auto",
     "variables": {},
@@ -71,76 +133,101 @@ _MORNING_WORK_BRIEF = {
         ],
     },
     "steps": [
-        {"id": "issues", "connector_id": "jira",
-         "tool": "jira__search_issues",
-         "params": {"jql": "{{var.jira_jql}}", "max_results": 10},
-         "collect": {"items_path": "issues",
-                     "fields": {"key": "key", "summary": "summary",
-                                "status": "status"},
-                     "format": "• {{item.key}} [{{item.status}}] {{item.summary}}",
-                     "limit": 8, "empty_text": "No open issues."},
-         "on_error": "continue"},
-        {"id": "repo", "connector_id": "github",
-         "tool": "github__list_issues",
-         "params": {"owner": "{{var.github_owner}}",
-                    "repo": "{{var.github_repo}}",
-                    "state": "open", "per_page": 10},
-         "collect": {"items_path": "issues",
-                     "fields": {"number": "number", "title": "title"},
-                     "format": "• #{{item.number}} {{item.title}}",
-                     "limit": 8, "empty_text": "No open repo issues."},
-         "on_error": "continue"},
-        {"id": "chat", "connector_id": "teams",
-         "tool": "teams__read_chat_messages",
-         "params": {"chat_id": "{{var.teams_chat_id}}", "max_results": 10},
-         "collect": {"items_path": "messages",
-                     "fields": {"sender": "sender", "body": "body"},
-                     "format": "• {{item.sender}}: {{item.body}}",
-                     "limit": 5, "empty_text": "No new Teams messages."},
+        # The anchor: the only real date in the run, and what "due today"
+        # is measured against — the ranking step has no clock.
+        {"id": "cal", "connector_id": "calendar",
+         "tool": "calendar__list_events",
+         "params": {"window_days": 1, "max_results": 10},
+         "collect": {"items_path": "events",
+                     "fields": {"title": "summary",
+                                "at": "start.dateTime",
+                                "day": "start.date"},
+                     # Google answers `dateTime` for a timed event and
+                     # `date` for an all-day one, never both — the
+                     # concatenation is what stops an all-day deadline
+                     # rendering as a line with no date on it.
+                     "format": "- {{item.at}}{{item.day}} {{item.title}}",
+                     "limit": 10,
+                     "empty_text": "Nothing on the calendar."},
          "on_error": "continue"},
         {"id": "mail", "connector_id": "gmail",
          "tool": "gmail__list_messages",
-         "params": {"query": "is:unread newer_than:1d", "max_results": 10},
+         "params": {"query": "in:inbox newer_than:1d", "max_results": 10},
          "collect": {"items_path": "messages",
-                     "fields": {"subject": "headers.Subject",
-                                "from": "headers.From"},
-                     "format": "• {{item.from}} — {{item.subject}}",
-                     "limit": 8, "empty_text": "Gmail inbox is clear."},
+                     "fields": {"from": "headers.From",
+                                "to": "headers.To",
+                                "cc": "headers.Cc",
+                                "date": "headers.Date",
+                                "subject": "headers.Subject",
+                                "snippet": "snippet"},
+                     "format": "- {{item.date}} · from {{item.from}} · "
+                               "to {{item.to}} · cc {{item.cc}} · "
+                               "{{item.subject}} — {{item.snippet}}",
+                     "limit": 10,
+                     "empty_text": "No new mail."},
          "on_error": "continue"},
-        {"id": "outlook", "connector_id": "outlook",
-         "tool": "outlook__list_messages",
-         "params": {"query": "isRead eq false", "max_results": 10},
+        # A SEPARATE window rather than an age computed from `mail`:
+        # membership of this step is the age, and the ranking step is
+        # forbidden to do date arithmetic.
+        {"id": "waiting", "connector_id": "gmail",
+         "tool": "gmail__list_messages",
+         "params": {"query": "to:me is:unread older_than:1d newer_than:7d",
+                    "max_results": 10},
          "collect": {"items_path": "messages",
-                     "fields": {"subject": "subject", "from": "from"},
-                     "format": "• {{item.from}} — {{item.subject}}",
-                     "limit": 8, "empty_text": "Outlook inbox is clear."},
+                     "fields": {"from": "headers.From",
+                                "subject": "headers.Subject"},
+                     "format": "- from {{item.from}} — {{item.subject}}",
+                     "limit": 10,
+                     "empty_text": "Nothing waiting on you."},
          "on_error": "continue"},
-        {"id": "post", "connector_id": "slack", "tool": "slack__send_message",
-         "params": {
-             "channel": "{{grant.target.id}}",
-             "text": ("*Morning work brief*\n\n"
-                      "*Jira ({{steps.issues.count}})*\n{{steps.issues.text}}\n\n"
-                      "*GitHub ({{steps.repo.count}})*\n{{steps.repo.text}}\n\n"
-                      "*Teams ({{steps.chat.count}})*\n{{steps.chat.text}}\n\n"
-                      "*Gmail unread ({{steps.mail.count}})*\n{{steps.mail.text}}\n\n"
-                      "*Outlook unread ({{steps.outlook.count}})*\n"
-                      "{{steps.outlook.text}}"),
-         }},
+        # Search on the USER token sees DMs and every channel at once, so
+        # there is no channel id to interview the user for.
+        {"id": "rooms", "connector_id": "slack",
+         "tool": "slack__search_messages",
+         "params": {"query": "to:me", "sort": "timestamp", "count": 15},
+         "collect": {"items_path": "matches",
+                     "fields": {"from": "from",
+                                "where": "channel_name",
+                                "text": "text"},
+                     "format": "- {{item.from}} in {{item.where}}: "
+                               "{{item.text}}",
+                     "limit": 15,
+                     "empty_text": "Nobody named you."},
+         "on_error": "continue"},
+        # Dated, hot, or moved overnight — the rubric is evaluated
+        # server-side, so the ranking step never has to date anything.
+        {"id": "board", "connector_id": "jira",
+         "tool": "jira__search_issues",
+         "params": {"jql": "assignee = currentUser() AND statusCategory "
+                           "!= Done AND (duedate <= 7d OR priority in "
+                           "(Highest, High) OR updated >= -1d) ORDER BY "
+                           "duedate ASC, priority DESC, updated DESC",
+                    "max_results": 15},
+         "collect": {"items_path": "issues",
+                     "fields": {"key": "key", "summary": "summary",
+                                "status": "status",
+                                "priority": "priority",
+                                "due": "duedate"},
+                     "format": "- {{item.key}} [{{item.status}}] "
+                               "[{{item.priority}}] {{item.due}} "
+                               "{{item.summary}}",
+                     "limit": 15,
+                     "empty_text": "Nothing live on the board."},
+         "on_error": "continue"},
+        # Keeps the agent step's default on_error (`fail`): its answer is
+        # the whole post, and a swallowed failure binds "" and publishes a
+        # bare title.
+        {"id": "rank", "kind": "agent",
+         "prompt": _MORNING_BRIEF_RANK,
+         "output_var": "brief"},
+        {"id": "post", "connector_id": "slack",
+         "tool": "slack__send_message",
+         "params": {"channel": "{{grant.target.id}}",
+                    "text": "*Morning brief*\n\n{{var.brief}}"}},
     ],
 }
 
-_MORNING_WORK_BRIEF_VARS = [
-    _v("jira_jql", "Jira filter",
-       "JQL for the issues section.",
-       default="assignee = currentUser() AND statusCategory != Done "
-               "ORDER BY updated DESC"),
-    _v("github_owner", "GitHub owner", "Repo owner/org for the GitHub "
-       "section.", example="toup-com"),
-    _v("github_repo", "GitHub repo", "Repository name.",
-       example="toup-platform"),
-    _v("teams_chat_id", "Teams chat", "The Teams chat to summarize "
-       "(pick via automations__list_targets or the chat's id)."),
-]
+_MORNING_WORK_BRIEF_VARS: list[dict] = []
 
 
 # ── Catalog ──────────────────────────────────────────────────────────
@@ -153,12 +240,13 @@ CATALOG: list[dict] = [
     {
         "slug": "morning-work-brief",
         "name": "Morning work brief",
-        "description": "One Slack post each weekday morning: Jira, "
-                       "GitHub, Teams, Gmail and Outlook in one brief.",
+        "description": "One Slack post each weekday morning: your "
+                       "calendar, your mail, who named you in Slack and "
+                       "your Jira board, ranked by what breaks if you "
+                       "ignore it.",
         "icon": "slack",
         "category": "work",
-        "connectors": ["jira", "github", "teams", "gmail", "outlook",
-                       "slack"],
+        "connectors": ["calendar", "gmail", "slack", "jira"],
         "variables": _MORNING_WORK_BRIEF_VARS,
         "spec": _MORNING_WORK_BRIEF,
         "sort_order": 0,
@@ -505,8 +593,7 @@ CATALOG: list[dict] = [
                  "on_error": "continue"},
                 {"id": "outlook", "connector_id": "outlook",
                  "tool": "outlook__list_messages",
-                 "params": {"query": "isRead eq false",
-                            "max_results": 10},
+                 "params": {"is_read": False, "max_results": 10},
                  "collect": {"items_path": "messages",
                              "fields": {"subject": "subject",
                                         "from": "from"},
@@ -757,7 +844,7 @@ CATALOG: list[dict] = [
             "steps": [
                 {"id": "events", "connector_id": "calendar",
                  "tool": "calendar__list_events",
-                 "params": {"max_results": 15},
+                 "params": {"window_days": 1, "max_results": 15},
                  "collect": {"items_path": "events",
                              "fields": {"title": "summary",
                                         "when": "start.dateTime"},
@@ -825,7 +912,7 @@ CATALOG: list[dict] = [
             "steps": [
                 {"id": "events", "connector_id": "calendar",
                  "tool": "calendar__list_events",
-                 "params": {"max_results": 25},
+                 "params": {"window_days": 7, "max_results": 25},
                  "collect": {"items_path": "events",
                              "fields": {"title": "summary",
                                         "when": "start.dateTime"},

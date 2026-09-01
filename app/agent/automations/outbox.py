@@ -6,9 +6,10 @@ same idiom as connector_pending_actions), and goes to the provider via
 the platform's grant-gated dispatch RPC. Retryable failures back off
 (10/30/90s, the routines ladder) and hard-fail after 3 attempts.
 
-Two entry points:
+Two entry points, and BOTH send on a session the outbox owns:
   - `flush_row_when_due(db, id)` — inline from the run, sub-second
-    after the window closes (the happy path).
+    after the window closes (the happy path). `db` is the run's
+    session and is used only to re-read what the send changed.
   - `flush_loop()` — the background guarantee: sweeps rows the inline
     path lost to a restart, and retries backoffs. Started by
     agent_main only when `settings.automations_enabled` is true.
@@ -27,6 +28,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import select, update as sa_update
+from sqlalchemy.orm import aliased
+from sqlalchemy.orm.util import identity_key
 
 from app.db.database import async_session_maker
 from app.db.models import Automation, AutomationOutbox, BuildJob
@@ -39,6 +42,13 @@ _RETRY_DELAYS_S = (10, 30, 90)
 _MAX_ATTEMPTS = 3
 _LOOP_INTERVAL_S = 5.0
 _BOOT_DELAY_S = 20.0
+# How long an `executed` row may sit under a still-running job before
+# the loop treats its terminal as LOST. Comfortably past the 30s
+# `statement_timeout` (db/database.py), so a finalize merely blocked on
+# a slow statement is not called missing — and still six times faster
+# than the 360s stuck-run reaper, which is the only thing that used to
+# close such a run and closed it as "lost" over a post that landed.
+_LOST_TERMINAL_AFTER_S = 60
 
 
 async def _claim(db, outbox_id: str) -> bool:
@@ -57,17 +67,89 @@ async def _claim(db, outbox_id: str) -> bool:
 
 async def flush_row_when_due(db, outbox_id: str) -> Optional[str]:
     """Inline flush: sleep out the remainder of the undo window, then
-    claim and send. Returns the terminal outbox status, or None when
-    the claim was lost."""
-    row = await db.get(AutomationOutbox, outbox_id)
-    if row is None:
-        return None
-    delay = (row.execute_after - datetime.utcnow()).total_seconds()
+    claim and send — on the outbox's OWN session, never the caller's.
+    Returns the terminal outbox status, or None when the claim was lost.
+
+    R42 made this call inline from the run (`executor_v2._run_steps`),
+    so `db` here is the RUN's session and the run goes on using its
+    `automation`, `job` and `thread` instances after we return. The send
+    contains best-effort helpers that must roll back on a failed
+    statement (`_reopen`), and a ROLLBACK expires every instance the
+    session holds whatever `expire_on_commit` says — so a repair inside
+    the outbox would turn the run's next `job.status` into lazy IO an
+    async session cannot perform, i.e. a `MissingGreenlet` raised out of
+    the run, caused by the write's own error handling. A separate
+    session makes that structurally impossible instead of leaving it to
+    review. `_claim` is a guarded UPDATE, so exactly-once is the
+    database's guarantee and does not care whose session asks.
+
+    Two obligations come with the split. The caller MUST have COMMITTED
+    before calling — all three call sites commit in the same breath as
+    they stage — and that is two requirements in one. A row still
+    pending in the caller's transaction is invisible to every other
+    session, so we would flush nothing at all; and P14 was this send's
+    UPDATE of `build_jobs` blocking behind a progress stamp the run had
+    flushed and not committed, until the 30s `statement_timeout`
+    cancelled it with the post already landed. What fixed P14 is the
+    ORDER — the write goes before the narration, so the run's session is
+    idle here — not the session being shared, so it survives the split.
+    Do not move a flush ahead of a commit.
+
+    And the send changes rows the caller has already loaded, so
+    `_resync_caller` re-reads them: SQLAlchemy would otherwise keep
+    answering the run's `db.get(BuildJob, …)` from its identity map with
+    the pre-send copy, and the resume path reads exactly that row's
+    `status` to decide whether the write it just repaired may flip the
+    run back to `sent`.
+    """
+    async with async_session_maker() as own:
+        row = await own.get(AutomationOutbox, outbox_id)
+        if row is None:
+            logger.warning("[automations] outbox %s not visible to the "
+                           "flush — was it staged without a commit?",
+                           outbox_id)
+            return None
+        delay = (row.execute_after - datetime.utcnow()).total_seconds()
+        job_id = row.job_id
+    # The window is seconds and a session that has run a statement holds
+    # a pooled connection until it ends — so the sleep happens between
+    # two short sessions, not inside one.
     if delay > 0:
         await asyncio.sleep(delay)
-    if not await _claim(db, outbox_id):
-        return None
-    return await _execute_claimed(db, outbox_id)
+    status: Optional[str] = None
+    async with async_session_maker() as own:
+        if await _claim(own, outbox_id):
+            status = await _execute_claimed(own, outbox_id)
+    await _resync_caller(db, outbox_id, job_id)
+    return status
+
+
+async def _resync_caller(db, outbox_id: str, job_id: Optional[str]) -> None:
+    """Re-read, on the CALLER's session, the two rows the flush just
+    changed on another one.
+
+    Only rows the caller already holds: `async_session_maker` sets
+    `expire_on_commit=False`, so its identity map answers from the copy
+    it loaded before the send, and a plain `db.get` would hand back that
+    stale row rather than notice. A row the caller never loaded needs
+    nothing — reading it here would only be a SELECT for no one.
+    """
+    for model, pk in ((AutomationOutbox, outbox_id), (BuildJob, job_id)):
+        if not pk:
+            continue
+        inst = db.identity_map.get(identity_key(model, pk))
+        if inst is None:
+            continue
+        try:
+            await db.refresh(inst)
+        except Exception as e:  # noqa: BLE001 — the write already went
+            # out and the run is already terminal; raising here would
+            # unwind a landed send. We do NOT roll back: expiring the
+            # run's instances is the exact failure this split exists to
+            # prevent, and the caller's own handler owns its session.
+            logger.warning("[automations] post-flush reload of %s %s "
+                           "failed — the run may read a stale row: %s",
+                           model.__name__, pk, e)
 
 
 async def _execute_claimed(db, outbox_id: str) -> str:
@@ -169,7 +251,27 @@ async def _execute_claimed(db, outbox_id: str) -> str:
             db.add(write_row)
         await db.commit()
         await _mark_write_step(db, row, ok=True)
-        await _finalize_run(db, row, status="completed", outcome="sent")
+        # R42 (P14-4): the send's own record comes BEFORE the terminal —
+        # the order the failure branch below has always used. The client
+        # latches a run card's content the instant `run_in_flight` goes
+        # null, and the terminal is what nulls it (`_finalize_job` →
+        # `run_v3.on_terminal` → `ledger.emit_run_finished`), so a turn
+        # appended after it lands on a card that can no longer show it:
+        # the landed card never said what it posted or where.
+        await _append_write_turn(db, row, write_row, ms=_ms)
+        if row.tool_name in _DRAFT_TOOLS:
+            # The proactive-draft surface (R29): a session card that
+            # names the draft and tells the "nothing was sent" truth.
+            from .draft_card import write_draft_card
+            await write_draft_card(db, row, result)
+            # It rolls back its own failure, and a rollback expires every
+            # instance the session holds — so the terminal below would
+            # read `row` through lazy IO an async session cannot do.
+            # `get` is free when nothing expired it.
+            fresh = await db.get(AutomationOutbox, outbox_id)
+            if fresh is not None:
+                row = fresh
+        await _finalize_run_safe(db, row, status="completed", outcome="sent")
         # R31-43: a write that landed is not a clean run if a source was
         # lost getting there. `steps_partial` is the same flag the
         # aggregate finalizer reads to report `partial`; reading it here
@@ -180,12 +282,6 @@ async def _execute_claimed(db, outbox_id: str) -> str:
                           .get("steps_partial"))
         await _record_health(db, row.automation_id, ok=True, error=None,
                              clean=_clean)
-        await _append_write_turn(db, row, write_row, ms=_ms)
-        if row.tool_name in _DRAFT_TOOLS:
-            # The proactive-draft surface (R29): a session card that
-            # names the draft and tells the "nothing was sent" truth.
-            from .draft_card import write_draft_card
-            await write_draft_card(db, row, result)
         return row.status
 
     if kind == "confirmation_required":
@@ -233,7 +329,7 @@ async def _execute_claimed(db, outbox_id: str) -> str:
         db, row, ms=_ms,
         reason_kind=str(kind or ""), message=str(result.get("message") or ""),
     )
-    await _finalize_run(
+    await _finalize_run_safe(
         db, row, status="failed", outcome="write_failed",
         error_class="tool_error",
         user_message=(str(result.get("message") or "The write failed."))[:300],
@@ -300,9 +396,99 @@ async def flush_loop() -> None:
                     )
                     await _record_health(db, row.automation_id, ok=False,
                                          error=row.last_error)
+                for row in await _lost_terminals(db):
+                    # R42 (P14-5): the send LANDED and its terminal did
+                    # not. The row is committed `executed`, so the staged
+                    # query never claims it again and the stale sweep
+                    # above only looks at `executing` — nothing closed
+                    # the run until the 360s stuck-run reaper called a
+                    # real Slack post "lost". `_finalize_run_safe` is the
+                    # in-process repair; this is the one for the process
+                    # that died between the send and the terminal.
+                    logger.warning(
+                        "[automations] outbox %s executed but run %s was "
+                        "never finalized — closing it now",
+                        row.id, row.job_id,
+                    )
+                    await _finalize_run_safe(db, row, status="completed",
+                                             outcome="sent")
         except Exception as e:  # noqa: BLE001 — loop must survive anything
             logger.warning("[automations] flush loop error: %s", e)
         await asyncio.sleep(_LOOP_INTERVAL_S)
+
+
+async def _lost_terminals(db) -> list[AutomationOutbox]:
+    """Executed rows whose run nobody ever closed.
+
+    Three conditions, and each one is load-bearing. The job is still
+    `running` — a confirm-mode park (`waiting_on_user`) is owned by the
+    pending-action resolution, and a run already terminal needs nothing.
+    No sibling is still `staged`/`executing` — a multi-write run legally
+    holds an executed row for the length of another row's undo window
+    and retry ladder, and warning about that every loop is noise, not a
+    signal. And the row is past `_LOST_TERMINAL_AFTER_S`, so a finalize
+    merely blocked on a slow statement finishes on its own first.
+    """
+    sib = aliased(AutomationOutbox)
+    rows = (await db.execute(
+        select(AutomationOutbox)
+        .join(BuildJob, BuildJob.id == AutomationOutbox.job_id)
+        .where(AutomationOutbox.status == "executed")
+        .where(AutomationOutbox.executed_at <= datetime.utcnow() - timedelta(
+            seconds=_LOST_TERMINAL_AFTER_S))
+        .where(BuildJob.status == "running")
+        .where(~select(sib.id)
+               .where(sib.job_id == AutomationOutbox.job_id)
+               .where(sib.status.in_(("staged", "executing")))
+               .exists())
+        .limit(20)
+    )).scalars().all()
+    # A confirm-mode row is `executed` too — it means "the dispatcher
+    # staged the approval card", not "sent". Announcing `sent` for one
+    # would tell the user about a send that has not happened; if its
+    # park failed, the confirm sweep and the reaper still own it.
+    return [r for r in rows if _result_kind(r) != "confirmation_required"]
+
+
+def _result_kind(row: AutomationOutbox) -> str:
+    try:
+        return str((json.loads(row.result_json or "{}") or {}).get("kind")
+                   or "")
+    except (ValueError, TypeError, AttributeError):
+        return ""
+
+
+async def _reopen(db, row: Optional[AutomationOutbox] = None) -> None:
+    """Undo a best-effort helper's failed statement, and hand the caller
+    back a row it can still read.
+
+    Two halves, and the second is not optional. A helper that swallows a
+    DB error must not leave the session in a failed transaction: the
+    next statement — the terminal — then raises `InFailedSQLTransaction`
+    out of a path whose row is already committed `executed`, and nothing
+    ever closes the run (`statement_timeout` is 30s, db/database.py, so
+    this is reachable from any slow statement, not only from a bug).
+    But a ROLLBACK expires every instance the session holds, whatever
+    `expire_on_commit` says — and this whole module reads its row across
+    commits because `async_session_maker` sets that False. Without the
+    reload the caller's next `row.user_id` is lazy IO an async session
+    cannot perform, and the repair for the swallowed error becomes a
+    `MissingGreenlet` standing where it used to be.
+    """
+    try:
+        await db.rollback()
+    except Exception as e:  # noqa: BLE001 — the session is being abandoned
+        logger.debug("[automations] rollback after a best-effort DB "
+                     "failure did not take: %s", e)
+        return
+    if row is None:
+        return
+    try:
+        await db.refresh(row)
+    except Exception as e:  # noqa: BLE001 — the caller's own handler owns
+        # what happens next; an unreadable row raises there, not here.
+        logger.debug("[automations] outbox row reload after rollback "
+                     "failed: %s", e)
 
 
 # ── Run-ledger + health plumbing (thin wrappers over executor's) ─────
@@ -359,6 +545,59 @@ async def _finalize_run(db, row: AutomationOutbox, *, status: str,
                        .get("steps_partial"))
         await _finalize_job(db, row.job_id, status="completed",
                             outcome="partial" if partial else "sent")
+
+
+async def _finalize_run_safe(db, row: AutomationOutbox, *, status: str,
+                             outcome: str,
+                             error_class: Optional[str] = None,
+                             user_message: Optional[str] = None) -> None:
+    """`_finalize_run`, on a session a best-effort helper may have
+    poisoned (R42, P14-5).
+
+    By the time this is called the outbox row is committed terminal, so
+    the staged-row query will never claim it again: an exception here
+    unwinds out of `_execute_claimed`, is caught by `flush_loop`'s
+    blanket handler, and leaves a write that ALREADY WENT OUT attached
+    to a run no surface ever closes. One rollback re-opens the session
+    and the retry costs milliseconds — `_finalize_job`'s guarded UPDATE
+    only moves a non-terminal row, so a second attempt is free even when
+    the first got further than it looked.
+
+    The arguments are spelled out rather than forwarded as `**kwargs`
+    for the same reason `_record_health` below spells its own out: a
+    wrapper that silently drops what its caller passed is how a fix
+    lands in the source and never reaches the behaviour.
+    """
+    # Read before the first attempt: a failure in there can expire `row`,
+    # and the log line that reports it must not be the thing that raises.
+    outbox_id, job_id = row.id, row.job_id
+    try:
+        await _finalize_run(db, row, status=status, outcome=outcome,
+                            error_class=error_class,
+                            user_message=user_message)
+        return
+    except Exception as e:  # noqa: BLE001 — retried on a clean session
+        logger.warning("[automations] finalize failed outbox=%s run=%s — "
+                       "retrying on a clean session: %s",
+                       outbox_id, job_id, e)
+    await _reopen(db, row)
+    try:
+        await _finalize_run(db, row, status=status, outcome=outcome,
+                            error_class=error_class,
+                            user_message=user_message)
+    except Exception as e:  # noqa: BLE001 — `_lost_terminals` is the
+        # backstop: it re-finalizes an executed row whose job is still
+        # running, one loop interval later.
+        logger.error("[automations] finalize retry failed outbox=%s run=%s "
+                     "— leaving it to the lost-terminal sweep: %s",
+                     outbox_id, job_id, e)
+        # WITH the row: `_execute_claimed` reads it on the very next
+        # line either way (`row.job_id` for the health flag, or
+        # `row.automation_id`/`row.last_error` for the failure record),
+        # and a rollback with nothing reloaded is the lazy-IO trap
+        # `_reopen` exists to close, left open on the one path that
+        # reaches it.
+        await _reopen(db, row)
 
 
 async def _record_health(db, automation_id: str, *, ok: bool,
@@ -468,6 +707,7 @@ async def _park_run_on_card(db, row: AutomationOutbox,
                 )
         except Exception as e:  # noqa: BLE001
             logger.debug("[automations] waiting turn skipped: %s", e)
+            await _reopen(db, row)
 
 
 async def _notify_needs_approval(row: AutomationOutbox,
@@ -599,6 +839,7 @@ async def _append_write_turn(db, row: AutomationOutbox, write_row,
                 )
     except Exception as e:  # noqa: BLE001
         logger.debug("[automations] write turn skipped: %s", e)
+        await _reopen(db, row)
 
 
 async def _append_failed_write_turn(
@@ -687,6 +928,7 @@ async def _append_failed_write_turn(
         )
     except Exception as e:  # noqa: BLE001 — display beside a durable row
         logger.warning("[automations] failed-write turn skipped: %s", e)
+        await _reopen(db, row)
 
 
 async def _mark_write_step(db, row: AutomationOutbox, *, ok: bool) -> None:
@@ -721,3 +963,4 @@ async def _mark_write_step(db, row: AutomationOutbox, *, ok: bool) -> None:
             await db.commit()
     except Exception as e:  # noqa: BLE001 — a label flip never blocks a send
         logger.debug("[automations] write-step mark skipped: %s", e)
+        await _reopen(db, row)

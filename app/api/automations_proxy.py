@@ -973,6 +973,30 @@ async def proxy_account_focus_remove(
     )
 
 
+@router.put("/{automation_id}/workflow/accounts/{account_id}/filters")
+async def proxy_account_filters(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/filters",
+        current_user=current_user, db=db,
+    )
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/triggers")
+async def proxy_account_triggers(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/triggers",
+        current_user=current_user, db=db,
+    )
+
+
 @router.post("/{automation_id}/workflow/ask")
 async def proxy_workflow_ask(
     automation_id: str, request: Request,

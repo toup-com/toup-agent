@@ -96,6 +96,37 @@ async def _edited_notes(automation_id: str) -> int:
                    if json.loads(r.payload_json).get("stamp") == "edited")
 
 
+async def _edited_note_rows(automation_id: str) -> list[tuple[str, str]]:
+    """Every EDITED divider on the thread as `(turn id, stamp)`, oldest
+    first. The id says whether a divider was rewritten in place or a
+    second one appeared; the stamp says whether it moved."""
+    from app.agent.automations import ledger
+    async with async_session_maker() as db:
+        thread = await ledger.thread_for(db, automation_id)
+        if thread is None:
+            return []
+        rows = (await db.execute(
+            __import__("sqlalchemy").select(AutomationTurn)
+            .where(AutomationTurn.thread_id == thread.id)
+            .where(AutomationTurn.kind == "note")
+            .order_by(AutomationTurn.seq)
+        )).scalars().all()
+        out = []
+        for r in rows:
+            body = json.loads(r.payload_json)
+            if body.get("stamp") == "edited":
+                out.append((r.id, str(body.get("at") or "")))
+        return out
+
+
+async def _workflow_rev(automation_id: str) -> int:
+    """`bump_rev` runs inside `_edited_note` and nowhere else, so this
+    counts the seam even when the divider it wrote was a rewrite."""
+    async with async_session_maker() as db:
+        row = await db.get(Automation, automation_id)
+        return int(row.workflow_rev or 0)
+
+
 async def _call(tool: str, args: dict, uid: str):
     from app.agent.skills.builtins.automations.skill import AutomationsSkill
     return await AutomationsSkill().execute_tool(tool, args, _ctx(uid))
@@ -522,18 +553,36 @@ async def test_every_applied_edit_stamps_the_edited_note_once():
     """`_edited_note` is ONE seam for two facts — the EDITED turn and
     the `automation.updated` broadcast. An agent edit that skipped it
     is the R38 defect one layer down: the founder's first edit drew a
-    divider in the thread and the second did not."""
+    divider in the thread and the second did not.
+
+    R42 (P9) changed what proves it, not what is proved. An EDITED note
+    carries no content — `{stamp, at, writes_count: 0}` — so two of
+    them back to back tell the reader nothing the one tells him, and
+    consecutive edits now REWRITE the standing divider instead of
+    stacking an identical row under it. Counting rows would therefore
+    pass whether the second edit reached the seam or not, which is the
+    one thing this test exists to catch. So it counts what the seam
+    itself moves: `workflow_rev` (bumped nowhere else in the app) and
+    the divider's own stamp.
+    """
     uid = await _mk_user()
     a = await _mk_automation_v2(uid, _v2_spec())
     assert await _edited_notes(a.id) == 0
 
     await _call("automations__edit_rules",
                 {"automation_id": a.id, "add": ["Only unread."]}, uid)
-    assert await _edited_notes(a.id) == 1
+    first = await _edited_note_rows(a.id)
+    assert len(first) == 1
+    assert await _workflow_rev(a.id) == 1
 
     await _call("automations__edit_schedule",
                 {"automation_id": a.id, "preset_id": "daily-8"}, uid)
-    assert await _edited_notes(a.id) == 2
+    second = await _edited_note_rows(a.id)
+    # One divider, and it MOVED: the second edit went through the seam.
+    assert len(second) == 1
+    assert second[0][0] == first[0][0]
+    assert second[0][1] > first[0][1]
+    assert await _workflow_rev(a.id) == 2
 
 
 @pytest.mark.asyncio

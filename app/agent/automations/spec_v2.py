@@ -38,7 +38,7 @@ from app.db.models.automation import AUTOMATION_TRIGGER_MODES
 
 from .spec import (
     SpecError, _err, effective_every_floor, effective_poll_floor,
-    validate_focus,
+    validate_filters, validate_focus,
 )
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,23}$")
@@ -71,7 +71,7 @@ MAX_AGENT_STEPS = 2
 AGENT_PROMPT_MAX_CHARS = 2000
 
 _TOP_KEYS = {"version", "name", "description", "mode", "variables",
-             "trigger", "steps", "narration", "focus"}
+             "trigger", "steps", "narration", "focus", "filters"}
 _SOURCE_KEYS = {"id", "mode", "connector_id", "event", "params",
                 "poll_interval_s", "schedule", "filter", "dedupe_key"}
 # `grant_target` is SYSTEM-written per write step (arm snapshots the
@@ -195,6 +195,13 @@ class ValidatedSpecV2:
         and there is exactly one place the pins live.
         """
         f = self.raw.get("focus")
+        return f if isinstance(f, dict) else {}
+
+    @property
+    def filters(self) -> dict:
+        """R42 — the per-account read filters, `{connector_id: [id]}`.
+        Off `raw` for the same reason `focus` is."""
+        f = self.raw.get("filters")
         return f if isinstance(f, dict) else {}
 
     @property
@@ -637,6 +644,35 @@ def _iter_var_refs(spec: dict):
                                  f"steps[{i}].collect.empty_text")
 
 
+def unanswered_variables(spec: dict) -> list[str]:
+    """Referenced `{{var.<name>}}` names with nothing to render, in
+    reference order, deduped.
+
+    `render_value` resolves a miss to the EMPTY STRING, so this is the
+    only place the difference between "answered" and "will silently
+    render as nothing" is decidable — a spec that reaches a provider
+    with `owner=""` is refused on this list, not on a 400 from GitHub.
+    An agent step's `output_var` is written during the run, so a
+    reference to one is answered by construction.
+    """
+    values = spec.get("variables")
+    values = values if isinstance(values, dict) else {}
+    produced = {
+        str(st.get("output_var"))
+        for st in (spec.get("steps") or [])
+        if isinstance(st, dict) and st.get("kind") == "agent"
+        and st.get("output_var")
+    }
+    out: list[str] = []
+    for _where, name in _iter_var_refs(spec):
+        if name in produced or name in out:
+            continue
+        if str(values.get(name) or "").strip():
+            continue
+        out.append(name)
+    return out
+
+
 def _canonical_step(st: ValidatedStep) -> dict:
     """The persisted form of one step.
 
@@ -866,6 +902,7 @@ def validate_spec_v2(
                      f"{{{{var.{var_name}}}}} is not declared in variables")
 
     focus = validate_focus(spec, errors)
+    filters = validate_filters(spec, errors)
 
     if errors:
         raise SpecError(errors)
@@ -876,6 +913,7 @@ def validate_spec_v2(
         "description": spec.get("description") or None,
         "mode": mode,
         **({"focus": focus} if focus else {}),
+        **({"filters": filters} if filters else {}),
         **({"narration": narration} if narration else {}),
         **({"variables": variables} if variables else {}),
         "trigger": {

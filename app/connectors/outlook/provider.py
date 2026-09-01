@@ -5,6 +5,10 @@ through the shared `_microsoft_base` helpers; only the API endpoint
 shape differs from other Microsoft 365 surfaces (Calendar, Teams,
 OneDrive) which will reuse the same base.
 
+Read-endpoint quirk (the one that bit us): Graph's message
+collection speaks two query languages and refuses to mix them —
+see `_list_messages_params`.
+
 Send-mail endpoint quirks:
   - POST /me/sendMail returns 202 Accepted with an empty body. We
     surface that as a {"sent": true} payload so the agent doesn't
@@ -18,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any, ClassVar, Optional
 
 from app.connectors._microsoft_base import (
@@ -72,6 +77,142 @@ def _split_recipient_csv(value: Optional[str]) -> list[dict]:
     return out
 
 
+# The manifest's own max_results ceiling. Also the ceiling on the
+# over-fetch below, so a read/unread scan can never ask Graph for a
+# page the tool doesn't already ship (bodies ride along in $select,
+# and the docs warn that big pages of them hit the 504 gateway).
+_MAX_TOP = 50
+
+# How much extra to pull when read/unread has to be applied to a
+# search page client-side (see _list_messages_params).
+_READ_SCAN_HEADROOM = 4
+
+# An open lower bound: every message in a mailbox is at or after it,
+# so it changes no result. It exists only to put receivedDateTime in
+# $filter — which is what makes ordering by it legal. See
+# _list_messages_params. A caller-supplied `since` replaces it.
+_FILTER_EPOCH = "1900-01-01T00:00:00Z"
+
+
+def _graph_datetime(value: Any) -> Optional[str]:
+    """`since` → the UTC literal Graph's $filter accepts, or None.
+
+    Graph wants an ISO-8601 instant and rejects a bare date, so a
+    caller that says "2026-08-30" means midnight and gets it. A value
+    this cannot read is dropped rather than guessed: a malformed bound
+    would 400 the whole read, and the read without it is the honest
+    superset.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(microsecond=0).isoformat() + "Z"
+
+
+def _clamp_top(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        top = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(top, _MAX_TOP))
+
+
+def _list_messages_params(tool_input: dict) -> tuple[dict, Optional[bool], int]:
+    """Build the Graph query for outlook__list_messages.
+
+    Graph's message collection speaks two query languages and refuses
+    to mix them, so this is not a matter of appending parameters:
+
+      - `$search` is KQL free text (from:, subject:, body:,
+        hasAttachments:, received:). Graph owns the ordering of a
+        search and rejects `$filter` or `$orderby` alongside it with a
+        400 — so a search sends neither.
+      - `$filter` is OData, and combining it with `$orderby` is legal
+        only in the shape "List messages" documents: every property in
+        `$orderby` must also appear in `$filter`, in the same order,
+        ahead of any property that is not in `$orderby`. Otherwise
+        Graph answers `InefficientFilter` ("The restriction or sort
+        order is too complex for this operation"). `isRead eq false`
+        alone with `$orderby=receivedDateTime desc` breaks rule one,
+        which is why the filter leads with the open `_FILTER_EPOCH`
+        bound on receivedDateTime.
+
+    Dropping `$orderby` instead is not equivalent: Graph then infers
+    its own sort for the filtered set, and `$top` is applied to THAT
+    page — so an inbox read could return the oldest unread mail,
+    which no caller of this tool wants.
+
+    `since` is a received-from bound (R42 §5.2's "Last 24 hours"): a
+    real `$filter` lower bound on its own path, and the KQL
+    `received>=` restriction on the search path.
+
+    Returns the params, the read state Graph could NOT be asked to
+    apply (None whenever it is filtering server-side), and the number
+    of rows the caller should return.
+    """
+    include_body = bool(tool_input.get("include_body", True))
+    top = _clamp_top(tool_input.get("max_results"), 25)
+    query = (tool_input.get("query") or "").strip()
+    is_read = tool_input.get("is_read")
+    if is_read is not None:
+        is_read = bool(is_read)
+    since = _graph_datetime(tool_input.get("since"))
+
+    params: dict = {
+        "$top": top,
+        # When include_body=true we ask Graph for the full body in the
+        # same list call — saves the per-message GET round-trip
+        # entirely (Graph's /messages endpoint supports body inline,
+        # unlike Gmail). When false, only headers + preview to keep
+        # the LLM's token budget low. isRead is unconditional: it is
+        # both a returned field and the key the search path filters on.
+        "$select": (
+            "id,subject,from,toRecipients,receivedDateTime,"
+            "bodyPreview,isRead,hasAttachments"
+            + (",body" if include_body else "")
+        ),
+    }
+
+    if query:
+        # Graph wants the whole KQL expression inside ONE pair of
+        # double quotes and documents no way to escape another pair
+        # inside it, so a phrase the model quoted ("subject:\"year
+        # end\"") is a 400 rather than a narrower search. Dropping the
+        # inner quotes keeps the terms and the request.
+        if since:
+            # Graph will not filter a search either, and KQL is the one
+            # language left: `received>=` is a documented message
+            # search restriction, date-granular.
+            query = f"{query} received>={since[:10]}"
+        params["$search"] = '"{}"'.format(query.replace('"', ""))
+        if is_read is None:
+            return params, None, top
+        # Graph will not filter a search, so read/unread is applied to
+        # the page here. Over-fetch first, or a page of read matches
+        # answers "no unread mail" while unread ones sit one row below.
+        params["$top"] = min(top * _READ_SCAN_HEADROOM, _MAX_TOP)
+        return params, is_read, top
+
+    if is_read is not None or since:
+        # receivedDateTime leads whether or not it is the bound the
+        # caller asked for — rule one of the filter+orderby contract
+        # above, which is why the open epoch exists.
+        params["$filter"] = f"receivedDateTime ge {since or _FILTER_EPOCH}"
+        if is_read is not None:
+            params["$filter"] += (
+                f" and isRead eq {'true' if is_read else 'false'}")
+    params["$orderby"] = "receivedDateTime desc"
+    return params, None, top
+
+
 class OutlookProvider(BaseConnectorProvider):
     manifest_id: ClassVar[str] = "outlook"
 
@@ -94,24 +235,7 @@ class OutlookProvider(BaseConnectorProvider):
                 # also auto-injects when the LLM omits the field; this
                 # default covers tests + non-dispatcher call paths.
                 include_body = bool(tool_input.get("include_body", True))
-                params: dict = {
-                    "$top": int(tool_input.get("max_results", 25)),
-                    # When include_body=true we ask Graph for the full
-                    # body in the same list call — saves the
-                    # per-message GET round-trip entirely (Graph's
-                    # /messages endpoint supports body inline, unlike
-                    # Gmail). When false, only headers + preview to
-                    # keep the LLM's token budget low.
-                    "$select": (
-                        "id,subject,from,toRecipients,receivedDateTime,"
-                        "bodyPreview,isRead,hasAttachments"
-                        + (",body" if include_body else "")
-                    ),
-                    "$orderby": "receivedDateTime desc",
-                }
-                if tool_input.get("query"):
-                    # Graph's $search header-style: e.g. "from:alice".
-                    params["$search"] = f'"{tool_input["query"]}"'
+                params, scan_is_read, limit = _list_messages_params(tool_input)
                 result = await microsoft_graph_request(
                     "GET",
                     f"{GRAPH_API}/me/messages",
@@ -124,6 +248,9 @@ class OutlookProvider(BaseConnectorProvider):
                 # don't blow the LLM's token budget on Graph metadata.
                 msgs = []
                 for m in (result.get("value") or []):
+                    if (scan_is_read is not None
+                            and bool(m.get("isRead")) != scan_is_read):
+                        continue
                     row: dict[str, Any] = {
                         "id": m.get("id"),
                         "subject": m.get("subject", ""),
@@ -139,6 +266,8 @@ class OutlookProvider(BaseConnectorProvider):
                         row["body_content_type"] = body_obj.get("contentType")
                         row["body"] = (body_obj.get("content") or "")[:50_000]
                     msgs.append(row)
+                    if len(msgs) >= limit:
+                        break
                 return ConnectorOk(content=json.dumps({"messages": msgs}))
 
             if tool_name == "outlook__get_message":

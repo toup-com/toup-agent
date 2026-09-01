@@ -106,7 +106,7 @@ def _err(errors: list, code: str, fld: str, message: str) -> None:
 
 
 _TOP_KEYS = {"name", "description", "trigger", "action", "dedupe_key", "mode",
-             "version", "focus"}
+             "version", "focus", "filters"}
 _TRIGGER_KEYS = {
     "mode", "connector_id", "event", "params", "poll_interval_s",
     "schedule", "filter",
@@ -268,6 +268,193 @@ def focus_render_ctx(focus: dict) -> dict:
     return out
 
 
+# ── Per-account read filters (R42, design §5.2) ──────────────────────
+#
+# `filters` is the user asking for LESS, per account:
+#
+#   filters: {"gmail": ["unread", "me"]}
+#
+# It is the deliberate opposite of `focus` above. A pin RANKS — it says
+# "look here first" and must never stop other material from being
+# fetched (R42, founder P6, and `executor_v2._apply_focus_scope` says
+# so at length). A filter NARROWS: the user tapped "Unread only", so an
+# unread-only read is the answer they asked for. That is why filters
+# compose into the provider query and pins do not.
+#
+# THE ONE TABLE. Three readers need the same answer and a second copy
+# is how this drifts: `validate_filters` below (which ids are legal),
+# `workflow.available_filters` (the chips the app draws) and
+# `executor_v2._apply_read_filters` (how each one composes, and which
+# tools it composes INTO — read from `tools` here, never restated).
+#
+# A filter this connector cannot really express is NOT in the table. A
+# chip that changes nothing is exactly the defect this round removes
+# elsewhere, so under-offering is the correct error:
+#
+#   github  `github__list_issues` forwards only `state` and `per_page`
+#           to the API (provider.py) — and `state` already defaults to
+#           "open", so the one expressible narrowing is the one that is
+#           already applied. `sort` is a `github__list_repos` param; on
+#           an issue list it would be dropped in silence. No filters.
+#   slack   `slack__read_messages` takes `oldest` (a unix ts the
+#           provider forwards to conversations.history) and
+#           `slack__search_messages` takes Slack's own `after:`
+#           modifier, so a time window is real. Unread, "to me" and
+#           newsletters have no Slack expression at all.
+#   outlook Graph's KQL search has no "to me" (Gmail's `to:me` has no
+#           counterpart — we do not know the mailbox's own address
+#           here) and no promotions category. Read state and a
+#           received-since bound are real, and are separate PARAMS
+#           rather than query text: see `_list_messages_params`.
+#   calendar/notion/teams/drive  nothing this vocabulary can narrow
+#           that the step's own params do not already own (the calendar
+#           horizon is `window_days`, applied by `_apply_time_window`).
+CONNECTOR_FILTERS: dict[str, tuple[dict, ...]] = {
+    "gmail": (
+        {"id": "me", "label": "Addressed to me",
+         "tools": ("gmail__list_messages", "gmail__search_threads")},
+        {"id": "unread", "label": "Unread only",
+         "tools": ("gmail__list_messages", "gmail__search_threads")},
+        {"id": "no_promos", "label": "Skip newsletters",
+         "tools": ("gmail__list_messages", "gmail__search_threads")},
+        {"id": "day", "label": "Last 24 hours",
+         "tools": ("gmail__list_messages", "gmail__search_threads")},
+    ),
+    "outlook": (
+        {"id": "unread", "label": "Unread only",
+         "tools": ("outlook__list_messages",)},
+        {"id": "day", "label": "Last 24 hours",
+         "tools": ("outlook__list_messages",)},
+    ),
+    "jira": (
+        {"id": "priority", "label": "P1 and P2 only",
+         "tools": ("jira__search_issues",)},
+        {"id": "open", "label": "Still open",
+         "tools": ("jira__search_issues",)},
+        {"id": "due_week", "label": "Due this week",
+         "tools": ("jira__search_issues",)},
+        {"id": "day", "label": "Touched in the last 24 hours",
+         "tools": ("jira__search_issues",)},
+    ),
+    # Date-granular in search, exact in a channel read — one label that
+    # is true of both.
+    "slack": (
+        {"id": "day", "label": "Since yesterday",
+         "tools": ("slack__read_messages", "slack__search_messages")},
+    ),
+}
+
+MAX_FILTERS_PER_ACCOUNT = 8
+
+
+def filter_options(connector_id: str) -> tuple[dict, ...]:
+    """Every filter this connector can express, in chip order."""
+    return CONNECTOR_FILTERS.get(str(connector_id or ""), ())
+
+
+def filter_ids(connector_id: str) -> frozenset:
+    return frozenset(f["id"] for f in filter_options(connector_id))
+
+
+def filter_tools(connector_id: str, filter_id: str) -> tuple[str, ...]:
+    """The tools this filter composes into — the table's own answer to
+    "can this step express it", so the executor never restates it."""
+    for f in filter_options(connector_id):
+        if f["id"] == filter_id:
+            return tuple(f.get("tools") or ())
+    return ()
+
+
+def validate_filters(spec: dict, errors: list) -> dict:
+    """`spec["filters"]` → the canonical `{connector_id: [id]}` map.
+
+    Shape AND membership, unlike `validate_focus`: a filter id is drawn
+    from a closed table, so an unknown one is a malformed spec rather
+    than a user error about their own account. Order is the TABLE's,
+    not the caller's — the chips render in one order everywhere, and
+    two specs that narrow identically serialize identically.
+    """
+    filters = spec.get("filters")
+    if filters is None:
+        return {}
+    if not isinstance(filters, dict):
+        _err(errors, "bad_filters", "filters",
+             "filters must map a connector id to a list of filter ids")
+        return {}
+    out: dict[str, list[str]] = {}
+    for cid, ids in filters.items():
+        fld = f"filters.{cid}"
+        if not isinstance(cid, str) or not cid.strip():
+            _err(errors, "bad_filters", "filters",
+                 "filters keys must be connector ids")
+            continue
+        if not isinstance(ids, list):
+            _err(errors, "bad_filters", fld,
+                 "each account's filters is a list of ids")
+            continue
+        if len(ids) > MAX_FILTERS_PER_ACCOUNT:
+            _err(errors, "too_many_filters", fld,
+                 f"at most {MAX_FILTERS_PER_ACCOUNT} filters per account")
+            ids = ids[:MAX_FILTERS_PER_ACCOUNT]
+        known = filter_ids(cid)
+        wanted = set()
+        for i, fid in enumerate(ids):
+            if not isinstance(fid, str) or fid not in known:
+                _err(errors, "unknown_filter", f"{fld}[{i}]",
+                     f"{fid!r} is not a filter {cid} can express "
+                     f"(known: {sorted(known)})")
+                continue
+            wanted.add(fid)
+        kept = [f["id"] for f in filter_options(cid) if f["id"] in wanted]
+        if kept:
+            out[cid] = kept
+    return out
+
+
+# ── Instant triggers (R42, design §5.3) ──────────────────────────────
+#
+# The label table for `trigger.sources[]` events, beside the filter
+# table because they are the same kind of thing: the connector declares
+# the capability, this file names it in the product's voice. The
+# manifest's own `description` is written for the MODEL ("A new issue
+# appears in a project you pick"); these are written for the person
+# tapping the row.
+#
+# Nothing here invents an event. A key with no entry falls back to its
+# manifest description, so a connector that declares a new event shows
+# up honestly — worded for the model — rather than not at all.
+EVENT_LABELS: dict[str, str] = {
+    "calendar.event_created": "A new event lands on my calendar",
+    "drive.file_added": "A file shows up in my Drive",
+    "github.issue_opened": "An issue is opened in that repo",
+    "gmail.email_received": "An email arrives in my inbox",
+    "jira.issue_created": "A ticket is created in that project",
+    "notion.page_added": "A page shows up in my workspace",
+    "outlook.email_received": "An email arrives in my Outlook inbox",
+    "teams.chat_message_received": "A message arrives in that chat",
+}
+
+
+def event_label(connector_id: str, event_key: str, fallback: str = "") -> str:
+    return (EVENT_LABELS.get(f"{connector_id}.{event_key}")
+            or (fallback or "").strip()
+            or str(event_key or ""))
+
+
+def unanswered_variables(spec: Any) -> list[str]:
+    """The spec's `{{var.<name>}}` references that have no answer yet.
+
+    Version dispatch, like `validate_spec`: variables are a v2 grammar,
+    so a v1 spec has none and answers `[]`. Derived from what the spec
+    REFERENCES rather than from the template's declared list, so an
+    automation the agent edited after adoption is covered too.
+    """
+    if not isinstance(spec, dict) or spec.get("version") != 2:
+        return []
+    from .spec_v2 import unanswered_variables as _v2_unanswered
+    return _v2_unanswered(spec)
+
+
 def validate_spec(
     spec: Any,
     registry: dict[str, dict],
@@ -283,9 +470,13 @@ def validate_spec(
 
     Dispatch (Round 28): a spec with `version: 2` returns a
     `ValidatedSpecV2` from spec_v2.py; anything else takes the v1 path
-    below, unchanged. `template_mode` (catalog lint only — nothing on
-    the create/run path sets it) waives grant references and treats
-    `template_vars` as declared.
+    below, unchanged. `template_mode` waives grant references — the
+    create, edit and fire paths all set it, because a grant is
+    enforced at ARM and at DISPATCH, never by a parse — and treats
+    `template_vars` as declared. `template_mode` with NO
+    `template_vars` additionally waives the undeclared-variable
+    rule, which is why an unanswered setting is caught by
+    `unanswered_variables` at arm and fire instead of here.
     """
     errors: list[dict] = []
 
@@ -479,6 +670,7 @@ def validate_spec(
         # dispatcher (unknown tool ⇒ tool_error, fail closed).
 
     focus = validate_focus(spec, errors)
+    filters = validate_filters(spec, errors)
 
     if errors:
         raise SpecError(errors)
@@ -487,6 +679,7 @@ def validate_spec(
         "name": name,
         "description": spec.get("description") or None,
         **({"focus": focus} if focus else {}),
+        **({"filters": filters} if filters else {}),
         "trigger": {
             "mode": t_mode,
             **({"connector_id": t_connector} if t_connector else {}),

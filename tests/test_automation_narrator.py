@@ -273,6 +273,24 @@ def test_the_prompt_carries_rules_memory_and_the_record():
     assert "DO FIRST · BLOCKS OTHERS" in prompt
 
 
+def test_the_pins_reach_the_ranking_as_standing_orders():
+    """R42 — a pin RANKS. It reached the agent step and the canvas, and
+    the one pass that decides the order could not see it."""
+    record = dict(RECORD, focus={
+        "slack": {"labels": "#all-toup", "notes": "#all-toup: Ali first",
+                  "ids": "C0ALL", "count": 1, "first": {}},
+        "gmail": {"labels": "Dana", "notes": "", "ids": "dana@x.com",
+                  "count": 1, "first": {}},
+    })
+    prompt = narrator.build_prompt(record)
+    assert "Where it starts" in prompt
+    assert "RANK, never filter" in prompt
+    # Sorted, so the same pins always build the same bytes.
+    assert "gmail: Dana · slack: #all-toup — #all-toup: Ali first" in prompt
+    # Nothing pinned says nothing at all.
+    assert "Where it starts" not in narrator.build_prompt(RECORD)
+
+
 def test_the_failed_prompt_swaps_the_shape_rules():
     record = record_from(B2, "brief", "failed")
     prompt = narrator.build_prompt(record)

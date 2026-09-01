@@ -385,7 +385,17 @@ def test_debt_is_not_growing_silently():
     # trigger/scope suite drives the same AGENT_ONLY rows through the
     # same writers as the R38 trio and RUNS in the agent-mode step. A
     # ROUTING entry, not an excuse.
-    CEILING = 92
+    # R42 (+3): test_r42_connector_popup.py, test_r42_pin_bridge_and_dividers.py
+    # and test_r42_run_close.py all drive the automations engine on real rows,
+    # and `automations`/`automation_threads`/`_turns` are AGENT_ONLY — there is
+    # no platform-mode table for them to run against. ROUTING entries, not
+    # excuses: all three RUN, in the agent-mode step. run_close was left out of
+    # this list once to hold the ceiling at +2, which is backwards — the entry
+    # is what puts a file in the lane where its tables exist, so omitting it
+    # dropped the file into the platform sweep and it failed there with
+    # "no such table: automations", taking the agent-mode step (skipped on the
+    # sweep's failure, so the other two never ran) down with it.
+    CEILING = 95
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

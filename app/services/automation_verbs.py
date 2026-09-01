@@ -281,6 +281,18 @@ def event_tag(event_key: Optional[str]) -> Optional[str]:
     return _EVENT_TAGS.get(event_key, "on new activity")
 
 
+def join_list(items) -> str:
+    """`["a", "b", "c"]` → `"a, b and c"` — the app's own `joinList`,
+    so a sentence the server writes and one the app writes read the
+    same way."""
+    kept = [str(i) for i in (items or []) if str(i or "").strip()]
+    if not kept:
+        return ""
+    if len(kept) == 1:
+        return kept[0]
+    return f"{', '.join(kept[:-1])} and {kept[-1]}"
+
+
 # write tool → what the automation does for the user.
 _WRITE_CLAUSES = {
     "slack__send_message": "post to Slack",

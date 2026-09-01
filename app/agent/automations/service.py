@@ -22,13 +22,94 @@ from app.db.models import (
     Automation, AutomationBinding, AutomationEvent, BuildJob,
 )
 from . import compiler, registry as reg
-from .spec import SpecError, ValidatedSpec, validate_spec
+from .spec import (
+    SpecError, ValidatedSpec, unanswered_variables, validate_spec,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class AutomationNotFound(LookupError):
     pass
+
+
+class MissingSettings(compiler.CompileError):
+    """A lifecycle or fire refusal for a spec whose setup questions are
+    still unanswered.
+
+    A `CompileError` subclass on purpose: the automation is well formed
+    and simply not ready, which is exactly what that type means here —
+    and both arm call sites (the HTTP `_lifecycle` and the skill's)
+    already render one as `{code, message}` for the user, so the
+    refusal reaches a person rather than a 500. `missing` carries the
+    variables by name and label so a caller can ask for them.
+    """
+
+    def __init__(self, missing: list[dict]):
+        self.missing = list(missing)
+        super().__init__("needs_answer", missing_settings_sentence(missing))
+
+
+def missing_settings_sentence(missing: list[dict]) -> str:
+    """The ONE sentence every surface shows for an unanswered setting.
+
+    Deliberately the grammar `from-template` already opens a setup
+    thread with: it is the same question, asked later, and the thread
+    is where it is answered (the user replies, the thread agent writes
+    the value back through `automations__update`). It names the
+    setting, because the failure it replaces named nothing — an empty
+    `owner` reached GitHub, came back "owner/repo required", and the
+    user was shown "I could not read GitHub, and it did not tell me
+    why" over a button that probed a healthy account.
+    """
+    from .account_health import join_names
+
+    names = join_names([
+        str(m.get("label") or m.get("name") or "") for m in missing
+    ])
+    return (f"Before this can run I need {names}. Tell me here and I "
+            f"will set it up.")
+
+
+async def missing_settings(
+    automation: Automation, raw: Optional[dict] = None,
+) -> list[dict]:
+    """`[{"name", "label"}]` for every setup question this spec still
+    needs answered — empty when it is ready to fire.
+
+    The labels come from the catalog card the automation was adopted
+    from, which is where they were authored; the fetch is skipped
+    entirely when nothing is missing, and a blip degrades to the
+    variable's own name rather than failing the refusal that needs it.
+    """
+    if raw is None:
+        try:
+            raw = json.loads(automation.spec_json or "{}")
+        except (ValueError, TypeError):
+            raw = {}
+    names = unanswered_variables(raw)
+    if not names:
+        return []
+    labels: dict[str, str] = {}
+    slug = getattr(automation, "template_slug", None)
+    if slug:
+        try:
+            for tpl in await reg.fetch_templates(automation.user_id):
+                if slug not in (tpl.get("slug"), tpl.get("id")):
+                    continue
+                for v in tpl.get("variables") or []:
+                    if v.get("name") and v.get("label"):
+                        labels[str(v["name"])] = str(v["label"])
+                break
+        except Exception as e:  # noqa: BLE001 — the name is a fallback
+            logger.warning(
+                "[automations] variable labels unreadable for %s: %s",
+                automation.id, e,
+            )
+    return [
+        {"name": n, "label": labels.get(n) or n.replace("_", " ")}
+        for n in names
+    ]
 
 
 async def _load_owned(
@@ -227,16 +308,11 @@ async def update_automation(
     # undeclared-variable rule, and BOTH waivers are deliberate: a spec
     # mid-setup legitimately carries a variable whose question the user
     # has not answered yet, which is the state run-now used to answer 500
-    # about (R37, the founder's dead Run button). `parse_spec_live` — and
-    # therefore ARM — waives it the same way.
-    #
-    # Known gap, recorded rather than closed here: nothing downstream
-    # enforces it either. `render_value` resolves a missing path to "", so
-    # an automation armed with a dangling `{{var.summary}}` fires and posts
-    # " today" instead of refusing. Tightening THIS call would reject the
-    # mid-setup state the doctrine exists to allow; the fix belongs at
-    # dispatch, where the difference between "not answered yet" and "will
-    # never be answered" is actually knowable.
+    # about (R37, the founder's dead Run button). An EDIT must be able to
+    # persist that state; what may not happen is firing it, and that is
+    # now refused where it is decidable — `arm_automation` and
+    # `parse_spec_live` both raise `MissingSettings` rather than letting
+    # `render_value` resolve the dangling `{{var.x}}` to "".
     vspec = validate_spec(spec, capability, template_mode=True)
 
     was_armed = automation.status == "armed"
@@ -272,10 +348,25 @@ async def update_automation(
 async def arm_automation(
     db: AsyncSession, *, automation_id: str, user_id: str,
 ) -> Automation:
-    """draft/paused → armed. Verifies the grant against the platform
-    (fail closed), snapshots the pinned target into the spec for
-    template rendering, enables the primitives, provisions push."""
+    """draft/paused → armed. Refuses while a setup question is
+    unanswered, verifies the grant against the platform (fail closed),
+    snapshots the pinned target into the spec for template rendering,
+    enables the primitives, provisions push.
+
+    The settings check lives HERE rather than in each caller because
+    arming is the moment a draft becomes something that fires on its
+    own: `POST /{id}/arm`, the skill's `automations__arm`, the
+    grant-approval hook and this module's own re-arm after an edit all
+    inherit it. `from-template` refuses the same state at creation, but
+    it was the only one that did — approving the write permission card
+    armed an automation whose questions had never been answered, and
+    every weekday after that it read GitHub with an empty owner and
+    blamed a healthy account for the refusal.
+    """
     automation = await _load_owned(db, automation_id, user_id)
+    missing = await missing_settings(automation)
+    if missing:
+        raise MissingSettings(missing)
     vspec = await parse_spec_live(automation)
 
     from .spec_v2 import ValidatedSpecV2
@@ -998,9 +1089,23 @@ async def parse_spec_live(automation: Automation) -> ValidatedSpec:
     `event_spec` carries the real source_tool / items_path / fields.
     Falls back to the offline shape when the registry is empty — the
     poll then observes nothing and the health loop records the miss
-    rather than inventing capabilities."""
-    capability = await reg.fetch_registry(automation.user_id)
+    rather than inventing capabilities.
+
+    Refuses outright while a setup question is unanswered. The parse
+    below runs in `template_mode`, which waives the
+    undeclared-variable rule so a mid-setup draft can still be read —
+    and downstream `render_value` turns the dangling `{{var.x}}` into
+    an empty string, so the run reached GitHub with `owner=""` and
+    Teams with `chat_id=""` and then reported healthy accounts as
+    unreadable. There is nothing honest a run can do with a missing
+    answer, so it does not start: `MissingSettings` carries the
+    sentence the thread shows instead.
+    """
     raw = json.loads(automation.spec_json)
+    missing = await missing_settings(automation, raw)
+    if missing:
+        raise MissingSettings(missing)
+    capability = await reg.fetch_registry(automation.user_id)
     if capability:
         try:
             # template_mode (R36-5): grants are enforced at DISPATCH

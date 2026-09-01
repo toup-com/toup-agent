@@ -208,6 +208,34 @@ async def handle_stop(
 
 # -------------------------------------------------------------- terminal
 
+#: How long a narration claim is honoured. Two LLM completions with a
+#: retry apiece, plus slack — past it the run's close belongs to whoever
+#: terminalizes it, because the process that made the claim is gone.
+_NARRATION_CLAIM_S = 300.0
+
+
+def _narration_still_owed(cfg: dict) -> bool:
+    """Is `_close_ledger_after_narration` still coming for this run?
+
+    The flag alone would be a claim with no expiry: a pod eviction
+    between the stamp and its release leaves it committed True forever,
+    and every later terminal — the retry's, the stuck-run reaper's —
+    would decline to close a ledger nobody is going to close. An
+    unparseable or missing stamp reads as EXPIRED, so the failure mode
+    is a close that happens twice (guarded, idempotent) rather than one
+    that never happens.
+    """
+    if not cfg.get("narration_pending"):
+        return False
+    stamp = str(cfg.get("narration_pending_at") or "")
+    try:
+        at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    now = datetime.now(at.tzinfo) if at.tzinfo else datetime.utcnow()
+    return (now - at).total_seconds() < _NARRATION_CLAIM_S
+
+
 async def on_terminal(db: AsyncSession, job_id: str) -> None:
     """Post-terminal v3 closing — called from `_finalize_job` AFTER its
     guarded UPDATE won (rowcount == 1). Best-effort throughout; a v3
@@ -232,9 +260,21 @@ async def on_terminal(db: AsyncSession, job_id: str) -> None:
         await _flip_head_note(db, job=job, automation=automation, v3=v3)
         if v3 == "skipped":
             await _append_skip_note(db, job=job, automation=automation)
-        await ledger.close_ledger(
-            db, user_id=automation.user_id, job=job, automation=automation,
-        )
+        # R42 — a v2 run with a write step terminalizes in the outbox
+        # flush, BEFORE the narrator has written anything, and most of
+        # the close judges the narrated record: the missing-item
+        # reconciliation, the vocabulary tripwire, the result-row
+        # episodes, and the mechanical result turn that stands in for a
+        # narration that never came. Closing here fabricated that
+        # stand-in on every healthy run and the narrator's real result
+        # landed behind it. `executor_v2._run_steps` sets the flag
+        # before the flush, clears it after, and closes the ledger
+        # itself once phase 2 has landed.
+        if not _narration_still_owed(cfg):
+            await ledger.close_ledger(
+                db, user_id=automation.user_id, job=job,
+                automation=automation,
+            )
         await _notify_terminal(db, automation=automation, job=job, v3=v3)
         total = int(job.progress_total or 0)
         await ledger.emit_progress(

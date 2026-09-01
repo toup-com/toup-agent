@@ -294,9 +294,11 @@ async def test_jira_contents_name_the_due_date(monkeypatch):
         "u", connector_id="jira",
         connection={"connected": True, "status": "active"},
     )
-    groups = {g["key"]: g for g in env["groups"]}
-    assert "due 2026-09-01" in groups["dated"]["items"][0]["sub"]
-    assert groups["undated"]["items"][0]["id"] == "ENG-2"
+    # R42: the groups are the PROJECTS now — the due date is named on
+    # the row that has one, which is where it was always read from.
+    items = {g["key"]: g for g in env["groups"]}["ENG"]["items"]
+    assert "due 2026-09-01" in items[0]["sub"]
+    assert items[1]["id"] == "ENG-2" and "due" not in items[1]["sub"]
 
 
 @pytest.mark.asyncio
@@ -469,8 +471,10 @@ async def test_the_contents_route_uses_this_automations_pins(monkeypatch):
         "app.agent.automations.registry.dispatch_via_platform", _dispatch,
     )
     env = await get_account_contents(a.id, "slack")
-    assert "slack__list_channels" not in seen, (
-        "a pinned channel is the answer — do not list the workspace")
+    # R42: the workspace is listed even so — a pin LEADS this list, it
+    # never shortens it, or the first pin is the last channel the user
+    # can ever pick in here (founder P6).
+    assert "slack__list_channels" in seen
     assert env["groups"][0]["key"] == "C-PIN"
     assert env["groups"][0]["pinned"] is True
     assert env["focus"][0]["label"] == "#platform"
