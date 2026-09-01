@@ -193,6 +193,37 @@ def _spec_raw(automation: Automation) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+#: The sentence the payload carries when this automation's spec is on
+#: the v1 engine, and `None` when it is not.
+#:
+#: R43 repair (finding 22). Three of the canvas's writers are v2-only —
+#: `set_sources`, `set_delivery` and `set_ping` all refuse a v1 spec
+#: with 409 `not_supported` — while every READ beside them is served
+#: unconditionally: `_member_connectors` handles the v1 shape,
+#: `_sources_available` is a live enumeration independent of the spec,
+#: and `delivery_block` is composed from a default when the spec holds
+#: no `delivery`. So the app had nothing to gate on, gated on PRESENCE,
+#: and lit a tick and a ping picker that answer 409 at use time. R42's
+#: two sections self-disabled here because `available_filters` and
+#: `available_triggers` read the v2 step shape and returned `[]`;
+#: R43's two do not, so the signal has to be explicit.
+#:
+#: ONE key rather than a per-writer flag: the three refusals share a
+#: single condition (`raw["version"] != 2`), and three keys the app has
+#: to AND together is three chances to gate the wrong control.
+_V1_EDITS_LOCKED = (
+    "This automation is on the older engine, so what it opens and where "
+    "it lands cannot be changed here yet. Ask me to rebuild it and I will "
+    "set it up the new way."
+)
+
+
+def edits_locked(raw: dict) -> Optional[str]:
+    """Why the canvas's R43 writers are refused on this automation, in
+    words — or `None` when they are not."""
+    return None if raw.get("version") == 2 else _V1_EDITS_LOCKED
+
+
 def _member_connectors(raw: dict) -> list[str]:
     ids: list[str] = []
     if raw.get("version") == 2:
@@ -467,14 +498,176 @@ def linked_channels() -> dict[str, bool]:
     }
 
 
+#: One deadline over every live identity read `delivery_grants` needs.
+#: The payload is on the path of every canvas open AND every workflow
+#: write's re-read, and two of the five connector channels prove their
+#: owner with a PROVIDER call (`deliver._live_account`). Over budget the
+#: identity is `""`, which `_check_addressed_to_the_user` treats as an
+#: unprovable owner and REFUSES — the same way it fails everywhere else
+#: in this flow. A channel wrongly withheld says so in words and the
+#: next load corrects it; a channel wrongly offered is a brief that
+#: never arrives.
+_GRANT_BUDGET_S = 4.0
+
+
+async def delivery_grants(
+    automation: Optional[Automation], user_id: str, connections: dict,
+) -> dict[str, tuple[bool, Optional[str]]]:
+    """`{channel_id: (writable, reason)}` for the connector-backed
+    channels — the half of "available" that OAuth cannot answer.
+
+    A delivery is not a connection. `deliver._deliver_one` requires, for
+    every one of these five, an APPROVED grant on THIS automation whose
+    tool is the channel's writer and whose pinned target passes
+    `_check_addressed_to_the_user`; `permissions.write_grant_ids`
+    derives its candidates from the spec's own write STEPS, so a
+    read-only automation has none for any connector and a posting one
+    has a grant pinned at the place it posts to. Offering the channel on
+    connection state alone therefore lit six controls that refuse on
+    every run, forever — and the user learns it from a refusal turn the
+    morning after (§0.2, and the reason field exists to carry the words).
+
+    The SAME two predicates the delivery path runs, called here rather
+    than restated: the grant walk mirrors `deliver._grant_for` and the
+    target test IS `deliver._check_addressed_to_the_user`. A second
+    implementation of "can this be written" is how the picker and the
+    writer disagree again.
+
+    Only connected accounts are answered. A missing or expired one
+    already has a truer sentence from `_channel_state`, and asking the
+    platform for grants on an account the user has to reconnect first
+    would put the second-best reason on the row.
+    """
+    from .deliver import (
+        DeliveryRefused, UNVERIFIABLE_CHANNELS, _CONNECTOR_CHANNELS,
+        _check_addressed_to_the_user, _account_for,
+    )
+    from . import permissions
+
+    out: dict[str, tuple[bool, Optional[str]]] = {}
+    if automation is None:
+        return out
+
+    # 1. The candidate grants, per channel. Free — `write_grant_ids`
+    #    reads the spec this automation is already holding.
+    wanted: dict[str, list[str]] = {}
+    for cid, spec in _CONNECTOR_CHANNELS.items():
+        # A channel `_channel_state` already refuses outright buys
+        # nothing here, and this runs on every canvas open: no grant it
+        # could find would make it writable.
+        if cid in UNVERIFIABLE_CHANNELS:
+            continue
+        conn = spec["connector_id"]
+        state = _account_entry(conn, connections.get(conn) or {})["state"]
+        if state != "connected":
+            continue
+        wanted[cid] = list(permissions.write_grant_ids(automation, conn))
+
+    gids = sorted({g for ids in wanted.values() for g in ids if g})
+    grants: dict[str, dict] = {}
+    if gids:
+        fetched = await asyncio.gather(
+            *(reg.fetch_grant(user_id, g) for g in gids),
+            return_exceptions=True,
+        )
+        for g, got in zip(gids, fetched):
+            if isinstance(got, dict):
+                grants[g] = got
+
+    # 2. The identities the target test measures against — one read per
+    #    CONNECTOR, and only for a connector that has something to test.
+    def _candidates(channel_id: str) -> list[dict]:
+        spec = _CONNECTOR_CHANNELS[channel_id]
+        rows = []
+        for g in wanted.get(channel_id) or []:
+            grant = grants.get(g) or {}
+            if grant.get("status") != "approved":
+                continue
+            if grant.get("tool_name") != spec["tool"]:
+                continue
+            target = grant.get("target") or {}
+            if not isinstance(target, dict) or not target.get("id"):
+                continue
+            rows.append(target)
+        return rows
+
+    need = sorted({_CONNECTOR_CHANNELS[c]["connector_id"]
+                   for c in wanted if _candidates(c)})
+    accounts: dict[str, str] = {}
+    if need:
+        try:
+            resolved = await asyncio.wait_for(
+                asyncio.gather(*(_account_for(user_id, c) for c in need),
+                               return_exceptions=True),
+                _GRANT_BUDGET_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[workflow] delivery identities over budget for "
+                           "%d connectors", len(need))
+            resolved = ["" for _ in need]
+        for conn, got in zip(need, resolved):
+            accounts[conn] = got if isinstance(got, str) else ""
+
+    # 3. The same test the delivery itself runs.
+    for cid in wanted:
+        spec = _CONNECTOR_CHANNELS[cid]
+        conn = spec["connector_id"]
+        name = verbs.display_name(conn) or conn
+        targets = _candidates(cid)
+        if not targets:
+            out[cid] = (False, f"{name} has not been allowed to write a "
+                               f"brief for you yet — ask me to set it up "
+                               f"and I will request permission.")
+            continue
+        reason = None
+        for target in targets:
+            try:
+                _check_addressed_to_the_user(
+                    cid, conn, str(target.get("id") or ""),
+                    accounts.get(conn) or "")
+            except DeliveryRefused as e:
+                label = str(target.get("label") or target.get("id") or "")
+                if label and e.reason_code == "not_the_user":
+                    # The founder's case, and the one the picker was
+                    # most wrong about: a Slack grant pinned to a
+                    # channel can never address him.
+                    reason = f"{name} can write to {label}, not to you."
+                else:
+                    reason = (e.sentence
+                              or f"{name} cannot reach you yet") + "."
+                continue
+            out[cid] = (True, None)
+            break
+        else:
+            out[cid] = (False, reason)
+    return out
+
+
 def _channel_state(
     entry: dict, connections: dict, linked: dict,
+    writable: Optional[dict] = None,
 ) -> tuple[bool, bool, Optional[str]]:
     """`(available, linked, reason)` for one catalogue channel.
 
     `reason` is a sentence, never a code: §0.2 says an option the
     platform cannot honour is not offered AND the UI says why in words,
     and the app has no vocabulary of its own for this.
+
+    `writable` is `delivery_grants`' verdict — the permission half,
+    which OAuth cannot answer and which the delivery path requires.
+    Consulted only after the connection is good, because "sign in
+    again" is the truer sentence when both are missing. `None` means
+    "no automation to have grants on" (the catalogue's own shape, which
+    is all `delivery_block(None, …)` describes); every caller that HAS
+    an automation computes it.
+
+    `deliver.UNVERIFIABLE_CHANNELS` outranks BOTH, and outranks the
+    connection state too: a channel this platform cannot prove reaches
+    the user alone is refused by the writer no matter what the user
+    connects or grants next, so "Notion is not connected" would send
+    them to connect an account for a control that can never light. The
+    permanent reason is the honest one, and it is served here rather
+    than restated — the writer raises the same sentence.
     """
     needs_link = entry.get("needs_link")
     if needs_link:
@@ -485,16 +678,25 @@ def _channel_state(
     conn_id = entry.get("connector_id")
     if not conn_id:
         return True, True, None
+    from .deliver import UNVERIFIABLE_CHANNELS
+    if entry["id"] in UNVERIFIABLE_CHANNELS:
+        return False, True, UNVERIFIABLE_CHANNELS[entry["id"]] + "."
     name = verbs.display_name(conn_id) or conn_id
     state = _account_entry(conn_id, connections.get(conn_id) or {})["state"]
-    if state == "connected":
-        return True, True, None
     if state == "expired":
         return False, True, f"{name} needs signing in again."
-    return False, True, f"{name} is not connected."
+    if state != "connected":
+        return False, True, f"{name} is not connected."
+    verdict = (writable or {}).get(entry["id"])
+    if verdict is not None and not verdict[0]:
+        return False, True, (verdict[1]
+                             or f"{name} cannot reach you yet.")
+    return True, True, None
 
 
-def channels_available(connections: dict) -> list[dict]:
+def channels_available(
+    connections: dict, writable: Optional[dict] = None,
+) -> list[dict]:
     """All nine channels, always, in catalogue order (§2.1).
 
     Never filtered down to the usable ones: the delivery sheet shows
@@ -506,7 +708,7 @@ def channels_available(connections: dict) -> list[dict]:
     out = []
     for entry in catalog.CHANNELS:
         available, is_linked, reason = _channel_state(
-            entry, connections, linked)
+            entry, connections, linked, writable)
         out.append({
             "id": entry["id"], "name": entry["name"], "meta": entry["meta"],
             "land": entry["land"], "connector_id": entry["connector_id"],
@@ -518,6 +720,7 @@ def channels_available(connections: dict) -> list[dict]:
 
 def delivery_block(
     automation: Optional[Automation], raw: dict, connections: dict,
+    writable: Optional[dict] = None,
 ) -> dict:
     """The whole §2.1 block: the picks, the catalogue, and the canvas
     labels composed from both.
@@ -533,7 +736,7 @@ def delivery_block(
         "channels": channels,
         "format": fmt,
         "cadence": picked["cadence"],
-        "channels_available": channels_available(connections),
+        "channels_available": channels_available(connections, writable),
         "formats": [dict(f) for f in catalog.FORMATS],
         # Not in the contract's example block, and additive on purpose:
         # §1.4 froze three cadence labels, and serving them beside the
@@ -586,6 +789,14 @@ def ping_of(raw: dict, connector_id: str) -> dict:
     return {"channel": None, "format": None}
 
 
+def _sources_max(connector_id: str) -> int:
+    """`executor_v2`'s answer, never a second copy of it: the picker,
+    the writer and the run must agree about how many places one account
+    can be opened at."""
+    from .executor_v2 import source_scope_max
+    return source_scope_max(connector_id)
+
+
 def scope_line(state: str, picked: list, available: list) -> str:
     """The canvas chip's second line (§2.2, §8's copy rules).
 
@@ -633,11 +844,28 @@ def invalidate_sources_cache() -> None:
 async def _sources_available(
     user_id: str, connector_id: str, state: str,
     pins: Optional[list] = None,
-) -> list[dict]:
+) -> tuple[list[dict], Optional[str]]:
+    """`(sources, reason)` — the account's real objects, and why the
+    list is empty when the emptiness is a FAILURE rather than a fact.
+
+    An empty list is served for four different things: a connector that
+    genuinely holds nothing separate, a dead credential, this
+    enumeration raising, and the deadline over all the accounts. The app
+    cannot tell them apart, and it may not render any of them as a claim
+    about what the connector holds ("Gmail has nothing separate inside
+    it", under a Reconnect button, was that claim — finding 1).
+
+    `None` for a SUCCESS, genuine emptiness included. Also `None` for a
+    credential that is not connected: the app already knows that from
+    `state`, and its own reason table separates expired from revoked
+    from scope_missing from org_approval_needed — four sentences this
+    module would flatten into one. The reason exists for the two the app
+    has no other way to see.
+    """
     if state != "connected":
         # A dead credential enumerates nothing, and `scope` says
         # "access expired" over the top of the list anyway.
-        return []
+        return [], None
     # The pins ride in the key, not just in the call: `account_sources`
     # orders the pinned containers first, so a cache hit taken before a
     # pin would keep serving the pre-pin order.
@@ -646,7 +874,8 @@ async def _sources_available(
     now = time.monotonic()
     hit = _SOURCES_CACHE.get(key)
     if hit is not None and now - hit[0] < _SOURCES_TTL_S:
-        return hit[1]
+        return hit[1], None
+    name = verbs.display_name(connector_id) or connector_id
     try:
         from .contents import account_sources
     except ImportError:
@@ -654,14 +883,18 @@ async def _sources_available(
         # Until it lands the key is served EMPTY rather than omitted —
         # the R42 rule (absent ≠ empty) — so the app can ship first and
         # tell "no backend" from "no sources".
-        return []
+        return [], f"I cannot list what is inside {name} yet."
     try:
         rows = await account_sources(user_id, connector_id,
                                      focus=list(pins or []))
     except Exception as e:  # noqa: BLE001 — a provider never fails the payload
         logger.warning("[workflow] sources for %s unavailable: %s: %s",
                        connector_id, type(e).__name__, str(e)[:200])
-        return list(hit[1]) if hit is not None else []
+        # A stale list is better than none and is not a failure to
+        # report — the app draws it, and the picks still match it.
+        if hit is not None:
+            return list(hit[1]), None
+        return [], f"{name} did not say what is inside it just now."
     out = []
     for r in rows or []:
         if not (isinstance(r, dict) and r.get("id")):
@@ -681,13 +914,19 @@ async def _sources_available(
     if len(_SOURCES_CACHE) > _SOURCES_CACHE_MAX:
         _SOURCES_CACHE.clear()
     _SOURCES_CACHE[key] = (now, out)
-    return out
+    return out, None
 
 
 async def _sources_for_accounts(
     user_id: str, wanted: list[tuple[str, str, list]],
-) -> dict[str, list[dict]]:
-    """`{connector_id: [source]}` for every account, under one deadline."""
+) -> dict[str, tuple[list[dict], Optional[str]]]:
+    """`{connector_id: (sources, reason)}` for every account, under one
+    deadline.
+
+    The deadline is the failure the app is least able to see: it empties
+    EVERY account at once, including ones that answered, so without a
+    reason the sheet would tell a healthy connector it holds nothing.
+    """
     if not wanted:
         return {}
 
@@ -703,11 +942,20 @@ async def _sources_for_accounts(
     except asyncio.TimeoutError:
         logger.warning("[workflow] source enumeration over budget for %d "
                        "accounts", len(wanted))
-        return {}
-    out: dict[str, list[dict]] = {}
+        return {cid: ([], f"I ran out of time asking "
+                          f"{verbs.display_name(cid) or cid} what is in it.")
+                for cid, _state, _pins in wanted}
+    out: dict[str, tuple[list[dict], Optional[str]]] = {}
     for p in pairs:
         if isinstance(p, tuple) and len(p) == 2:
             out[p[0]] = p[1]
+    # `return_exceptions=True` turns a raise into a value, and a cid
+    # that is simply MISSING from this map would reach the app as an
+    # empty list with nothing said about it — the one shape §0.1 exists
+    # to forbid.
+    for cid, _state, _pins in wanted:
+        out.setdefault(cid, ([], f"{verbs.display_name(cid) or cid} did not "
+                                 f"say what is inside it just now."))
     return out
 
 
@@ -919,9 +1167,22 @@ async def workflow_payload(
         # go. Served the same way as `filters`: always present, `[]`
         # when empty, never omitted.
         picked_sources = stored_sources.get(cid) or []
-        avail_sources = live_sources.get(cid) or []
+        avail_sources, sources_reason = live_sources.get(cid) or ([], None)
         entry["sources"] = picked_sources
         entry["sources_available"] = avail_sources
+        # Why that list is empty, when the emptiness is a FAILURE — the
+        # third state §0.1's absent-≠-empty rule does not reach. `null`
+        # on success (a genuine empty included) and on an account whose
+        # credential is not connected, which the app reads off `state`
+        # with a richer table than this module could compose.
+        entry["sources_reason"] = sources_reason
+        # How many of those places a RUN can really open — the writer's
+        # own cap, served so the picker cannot offer a set the run
+        # would refuse. 0 means this account's read cannot be aimed at
+        # one place at all, and the sheet must say so rather than draw
+        # a picker: gmail and jira narrow by query and take a set,
+        # every other read takes ONE place per call.
+        entry["sources_max"] = _sources_max(cid)
         entry["scope"] = scope_line(
             entry["state"], picked_sources, avail_sources)
         entry["ping"] = ping_of(raw, cid)
@@ -932,6 +1193,9 @@ async def workflow_payload(
         for cid in sorted(set(capability) | set(connections))
         if cid not in members and cid != "stub"
     ]
+
+    delivery_writable = await delivery_grants(
+        automation, user_id, connections)
 
     from app.agent._user_tz_cache import get_cached_user_tz
     from . import build_ledger
@@ -951,7 +1215,20 @@ async def workflow_payload(
         "output": output_block(automation, raw),
         # R43 §2.1. `output` above is untouched and stays for older
         # clients; `delivery` is the user's choice of where it lands.
-        "delivery": delivery_block(automation, raw, connections),
+        # The permission half of "available" (`delivery_grants`) is
+        # resolved with the payload, not by the app: a channel whose
+        # write cannot be honoured today is drawn as unavailable with
+        # the reason in words.
+        "delivery": delivery_block(automation, raw, connections,
+                                   delivery_writable),
+        # R43 §0.2 (finding 22). The R43 writers are v2-only and every
+        # read beside them is not, so without this the app gates on the
+        # PRESENCE of a block it is always served — and lights source
+        # ticks and a ping picker that answer 409 `not_supported`. A
+        # sentence rather than a version number: the app has no
+        # vocabulary for engine versions and would have to invent the
+        # words, which is the half §0.2 cares about.
+        "edits_locked": edits_locked(raw),
         "counts": counts_block(raw, mode, accounts),
         # R38. `null` when the automation predates the build ledger —
         # never `[]`, which would claim it was built in no steps.
@@ -2151,9 +2428,11 @@ async def set_delivery(
         if not isinstance(channels, list):
             raise WorkflowError("unknown_channel",
                                 "I do not know that place to send it.")
+        connections = await reg.fetch_connection_state(user_id)
         rows = {r["id"]: r
                 for r in channels_available(
-                    await reg.fetch_connection_state(user_id))}
+                    connections,
+                    await delivery_grants(automation, user_id, connections))}
         wanted: list[str] = []
         for cid in channels:
             row = rows.get(cid) if isinstance(cid, str) else None
@@ -2261,7 +2540,7 @@ async def set_sources(
     gives: the app sends the state it drew, so two quick taps cannot
     interleave into a set neither of them meant.
     """
-    from .spec_v2 import MAX_ACCOUNT_SOURCES
+    from .executor_v2 import source_scope_max, source_scope_supports
     raw = _spec_raw(automation)
     name = verbs.display_name(connector_id) or connector_id
     # v2 only, like `set_filters` and `set_triggers`: the v1 executor
@@ -2288,17 +2567,39 @@ async def set_sources(
         sid = sid.strip()
         if sid not in wanted:
             wanted.append(sid)
-    if len(wanted) > MAX_ACCOUNT_SOURCES:
+    # What the RUN can really honour, asked of the one table that
+    # answers it (`executor_v2._SOURCE_SCOPE`). R43 stored a pick no
+    # run ever read; a pick the run cannot express is the same defect
+    # one layer down, so it is refused here rather than saved and
+    # quietly ignored. Under-offering is the correct error.
+    cap = source_scope_max(connector_id)
+    if wanted and not cap:
+        raise WorkflowError(
+            "not_scopable",
+            f"It reads all of {name} — there is no way yet to point that "
+            f"read at one place inside it.",
+        )
+    for sid in wanted:
+        if not source_scope_supports(connector_id, sid):
+            raise WorkflowError(
+                "unknown_source",
+                f"It cannot aim its read at that part of {name} yet.",
+                {"source": sid},
+            )
+    if len(wanted) > cap:
         raise WorkflowError(
             "too_many_sources_picked",
-            f"It can open {MAX_ACCOUNT_SOURCES} places in {name} at once "
-            f"at most. Take one off first.",
+            f"It can open one place in {name} at a time — that is all its "
+            f"read takes. Take the others off first."
+            if cap == 1 else
+            f"It can open {cap} places in {name} at once at most. Take one "
+            f"off first.",
         )
 
     connections = await reg.fetch_connection_state(user_id)
     state = _account_entry(
         connector_id, connections.get(connector_id) or {})["state"]
-    available = await _sources_available(
+    available, _reason = await _sources_available(
         user_id, connector_id, state, focus_of(raw).get(connector_id) or [])
     # Membership against the LIVE enumeration, but ONLY when there is
     # one. A provider having a bad minute answers [], and validating
@@ -2327,9 +2628,13 @@ async def set_sources(
 
     shorts = {r["id"]: r["short"] for r in available}
     labels = [shorts.get(sid) or sid for sid in wanted]
+    # An EMPTY pick is the state every automation has ever been in, so
+    # it cannot mean "skip this account" — it means the read is not
+    # narrowed, which is what it already was. The old sentence promised
+    # a destructive behaviour the engine has never had.
     sentence = (f"In {name} it now opens {verbs.join_list(labels)}."
                 if labels else
-                f"Nothing picked — I will skip {name} on the next run.")
+                f"Nothing picked — it reads all of {name}, as before.")
     automation = await _persist_spec(
         db, automation=automation, user_id=user_id, raw=raw,
         code="bad_sources", refusal="I could not open those.",
@@ -2378,9 +2683,11 @@ async def set_ping(
             raise WorkflowError("unknown_channel",
                                 "I do not know that place to send it.",
                                 {"channel": channel})
+        connections = await reg.fetch_connection_state(user_id)
         rows = {r["id"]: r
                 for r in channels_available(
-                    await reg.fetch_connection_state(user_id))}
+                    connections,
+                    await delivery_grants(automation, user_id, connections))}
         row = rows[channel]
         if not row["available"]:
             raise WorkflowError(

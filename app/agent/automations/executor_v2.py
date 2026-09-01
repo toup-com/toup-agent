@@ -455,6 +455,247 @@ def _apply_focus_scope(
     return params
 
 
+# ── What each account may OPEN (R43 §2.2) ────────────────────────────
+#
+# The third and last params pass, and the one that was missing: R43
+# shipped a picker ("what it may open here"), a writer (`workflow.
+# set_sources`), a validator (`spec_v2.validate_account_sources`) and a
+# canvas chip that all agreed about a set of ids NOTHING then read. The
+# sheet said "Nothing picked — I will skip Gmail on the next run" and
+# the next run read Gmail exactly as before. This is the consumer.
+#
+# It is NOT `_apply_focus_scope`, and the distinction is the same one
+# that separates a pin from a filter. A pin RANKS — it may never stop
+# material being fetched, so it only ever fills a target the spec left
+# empty. A picked source is the user answering "which places", which is
+# a narrowing they asked for out loud, so it composes into the call and
+# OVERRIDES a target a pin filled.
+#
+# Two shapes, because two kinds of read exist and only one of them can
+# express a SET:
+#
+#   query languages (gmail's `query`, jira's `jql`) take an OR-group
+#   ANDed into whatever the step already asked for, so any number of
+#   picks is exact.
+#
+#   a target param (slack's `channel`, teams' `chat_id`, outlook's
+#   `folder`, calendar's `calendar_id`, github's `owner`/`repo`) names
+#   ONE place per call, so N picks are N calls, merged at the step's
+#   own `collect.items_path`. Capped at `_SOURCE_FANOUT_MAX`, and the
+#   writer refuses a pick past that cap (`source_scope_max`) — a set
+#   the run cannot read is the picker that writes nowhere again, one
+#   layer down.
+#
+# A connector absent from the table cannot narrow by place at all, and
+# `workflow.set_sources` refuses a pick for it rather than storing one.
+# Under-offering is the correct error here, exactly as it is for
+# `spec.CONNECTOR_FILTERS`: notion's read is `notion__search`, whose
+# `query` is free text and cannot be aimed at a page id; drive, docs,
+# sheets and linkedin have no read this vocabulary reaches.
+
+#: How many places one account's read may be fanned out to in a run.
+#: Four, the same bound the per-account route cap uses: it is the
+#: number of extra provider calls a single step may cost, and it is
+#: also the cap the WRITER enforces, so "picked" and "read" cannot
+#: differ.
+_SOURCE_FANOUT_MAX = 4
+
+#: Gmail's own operators for the three system labels the enumeration
+#: ships (`contents._GMAIL_LABELS`, which names them by their API ids).
+#: `label:INBOX` is NOT one of them — `label:` takes a label NAME, and a
+#: term that matches nothing would empty the brief in silence.
+_GMAIL_SYSTEM_TERMS = {
+    "inbox": "in:inbox",
+    "important": "is:important",
+    "starred": "is:starred",
+}
+
+
+def _gmail_source_term(source_id: str) -> str:
+    """One picked Gmail source → the query term that selects it, or `""`
+    when nothing does.
+
+    Two id shapes reach here and both are real: the live enumeration's
+    system-label ids (`INBOX`), and the contract's `label:<name>` form
+    for a user label — which is already a Gmail term, quoted here
+    because a label name may carry spaces.
+    """
+    sid = str(source_id or "").strip()
+    if not sid:
+        return ""
+    plain = _GMAIL_SYSTEM_TERMS.get(sid.lower())
+    if plain:
+        return plain
+    if sid.lower().startswith("label:"):
+        name = sid.split(":", 1)[1].strip()
+        # A quote inside a label name has no escape in Gmail's grammar,
+        # so such a label is simply not scopable rather than guessed at.
+        if name and '"' not in name:
+            return f'label:"{name}"'
+    return ""
+
+#: A Jira project key, and nothing that could close the quote it is
+#: about to be wrapped in.
+_JIRA_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+
+_SOURCE_SCOPE: dict[str, dict] = {
+    "gmail": {"kind": "query_or", "term": _gmail_source_term,
+              "tools": {"gmail__list_messages": "query",
+                        "gmail__search_threads": "query"}},
+    "jira": {"kind": "jql_in", "field": "project",
+             "tools": {"jira__search_issues": "jql"}},
+    "slack": {"kind": "target",
+              "tools": {"slack__read_messages": ("channel",)}},
+    "teams": {"kind": "target",
+              "tools": {"teams__read_chat_messages": ("chat_id",)}},
+    "outlook": {"kind": "target",
+                "tools": {"outlook__list_messages": ("folder",)}},
+    "calendar": {"kind": "target",
+                 "tools": {"calendar__list_events": ("calendar_id",)}},
+    # Two params, one id: a repo source is "owner/repo", which is what
+    # `_apply_focus_scope` already splits a repo PIN into.
+    "github": {"kind": "target",
+               "tools": {"github__list_issues": ("owner", "repo")}},
+}
+
+
+def source_scope_kind(connector_id: str) -> str:
+    """How this connector's reads narrow to a picked place, or `""` for
+    "they cannot". Public because the WRITER has to ask the same
+    question the run answers, and a second copy of this table is how
+    the two drift."""
+    entry = _SOURCE_SCOPE.get(str(connector_id or ""))
+    return str(entry["kind"]) if entry else ""
+
+
+def source_scope_max(connector_id: str) -> int:
+    """How many places this account's read can really open. 0 when the
+    connector has no scopable read at all."""
+    kind = source_scope_kind(connector_id)
+    if not kind:
+        return 0
+    if kind == "target":
+        return _SOURCE_FANOUT_MAX
+    from .spec_v2 import MAX_ACCOUNT_SOURCES
+    return MAX_ACCOUNT_SOURCES
+
+
+def source_scope_supports(connector_id: str, source_id: str) -> bool:
+    """Can a run really aim a read at THIS id?
+
+    Per-id rather than per-connector because Gmail's answer is per-id:
+    the three system labels compile to real operators and a label id
+    compiles to nothing.
+    """
+    entry = _SOURCE_SCOPE.get(str(connector_id or ""))
+    sid = str(source_id or "").strip()
+    if entry is None or not sid:
+        return False
+    kind = entry["kind"]
+    if kind == "query_or":
+        return bool(entry["term"](sid))
+    if kind == "jql_in":
+        return _JIRA_KEY_RE.match(sid) is not None
+    # A target is whatever the provider calls a place; github's is the
+    # only one with a shape, because it is two params.
+    if str(connector_id) == "github":
+        return "/" in sid and all(p.strip() for p in sid.split("/", 1))
+    return True
+
+
+def _fill_target(params: dict, fields: tuple, source_id: str):
+    """One params dict aimed at one place, or None when the id does not
+    name one this tool can take."""
+    out = dict(params)
+    if len(fields) == 1:
+        out[fields[0]] = source_id
+        return out
+    if len(fields) == 2 and "/" in source_id:
+        owner, repo = source_id.split("/", 1)
+        if owner.strip() and repo.strip():
+            out[fields[0]], out[fields[1]] = owner.strip(), repo.strip()
+            return out
+    return None
+
+
+def _apply_source_scope(
+    connector_id: str, tool: str, params: dict, sources: list,
+) -> list[dict]:
+    """The picked places, compiled into the calls this step will make.
+
+    Returns a LIST because a target-shaped read needs one call per
+    place. Pure and total, like the two passes above it: no picks, a
+    connector or a tool the table does not reach, malformed params, or
+    ids that name nothing this tool can take → `[params]`, untouched.
+    """
+    if not isinstance(params, dict) or not isinstance(sources, list):
+        return [params]
+    entry = _SOURCE_SCOPE.get(str(connector_id or ""))
+    if entry is None:
+        return [params]
+    picked = [s.strip() for s in sources
+              if isinstance(s, str) and s.strip()
+              and source_scope_supports(connector_id, s)]
+    if not picked:
+        return [params]
+    field = (entry.get("tools") or {}).get(tool)
+    if not field:
+        return [params]
+
+    kind = entry["kind"]
+    if kind == "query_or":
+        terms = [entry["term"](sid) for sid in picked]
+        # Parenthesised only when there is a choice inside it: a single
+        # term needs no group, and `_and_terms` already knows how to AND
+        # one onto a query that has its own `OR`.
+        group = terms[0] if len(terms) == 1 else f"({' OR '.join(terms)})"
+        out = dict(params)
+        out[field] = _and_terms(out.get(field), group)
+        return [out]
+
+    if kind == "jql_in":
+        vals = ", ".join(f'"{sid}"' for sid in picked)
+        out = dict(params)
+        out[field] = _and_jql(out.get(field),
+                              [f'{entry["field"]} in ({vals})'])
+        return [out]
+
+    sets = [p for p in (_fill_target(params, field, sid)
+                        for sid in picked[:_SOURCE_FANOUT_MAX])
+            if p is not None]
+    return sets or [params]
+
+
+def _merge_read_contents(contents: list, items_path: str) -> dict:
+    """Fold one account's fanned-out reads back into one result.
+
+    Only the step's own `collect.items_path` is merged; every other key
+    comes from the first call. A provider's `next_cursor` or
+    `result_size` describes ONE of the calls and there is no honest way
+    to add them up, while `items_path` is the only thing
+    `_collect_result` and `_apply_read_drops` read.
+    """
+    kept = [c for c in contents if isinstance(c, dict)]
+    if not kept:
+        return {}
+    parts = [p for p in str(items_path or "").split(".") if p]
+    if len(kept) == 1 or not parts:
+        return kept[0]
+    items: list = []
+    for c in kept:
+        got = resolve_path(c, items_path)
+        if isinstance(got, list):
+            items.extend(got)
+    merged = dict(kept[0])
+    cur = merged
+    for p in parts[:-1]:
+        nxt = cur.get(p)
+        cur[p] = dict(nxt) if isinstance(nxt, dict) else {}
+        cur = cur[p]
+    cur[parts[-1]] = items
+    return merged
+
+
 # ── Per-account read filters (R42, design §5.2) ──────────────────────
 #
 # The mirror image of `_apply_focus_scope` above, and the distinction
@@ -931,24 +1172,40 @@ async def _execute_read_step(
     # After both, never before: a pin or a filter that could re-widen
     # the window would put the run back where B1 found it.
     params = _apply_time_window(step.tool, params, ctx.get("_clock") or {})
-    result = await reg.dispatch_via_platform(
-        automation.user_id,
-        connector_id=step.connector_id,
-        tool_name=step.tool,
-        tool_input=params,
-        automation_id=automation.id,
+    # LAST, so the place the user picked is the place this call is
+    # aimed at — a filter narrows what comes back from it and may not
+    # move it, and a pin only ever fills a target nobody chose (§2.2).
+    param_sets = _apply_source_scope(
+        step.connector_id, step.tool, params,
+        (ctx.get("_account_sources") or {}).get(step.connector_id) or [],
     )
-    if result.get("kind") != "ok":
-        raise RuntimeError(
-            f"step {step.id!r} failed: {result.get('kind')}: "
-            f"{str(result.get('message') or '')[:200]}"
-        )
-    try:
-        content = json.loads(result.get("content") or "{}")
-    except (ValueError, TypeError):
-        content = {}
-    if not isinstance(content, dict):
-        content = {}
+    results = await asyncio.gather(*(
+        reg.dispatch_via_platform(
+            automation.user_id,
+            connector_id=step.connector_id,
+            tool_name=step.tool,
+            tool_input=p,
+            automation_id=automation.id,
+        ) for p in param_sets
+    ))
+    contents = []
+    for result in results:
+        # One dead place fails the step, exactly as one dead account
+        # always has: `on_error` then names the account and the run
+        # says so. A partial read served as a whole one is the brief
+        # that quietly did not arrive.
+        if result.get("kind") != "ok":
+            raise RuntimeError(
+                f"step {step.id!r} failed: {result.get('kind')}: "
+                f"{str(result.get('message') or '')[:200]}"
+            )
+        try:
+            got = json.loads(result.get("content") or "{}")
+        except (ValueError, TypeError):
+            got = {}
+        contents.append(got if isinstance(got, dict) else {})
+    content = _merge_read_contents(
+        contents, (step.collect or {}).get("items_path") or "")
     # The `drop` half of the filter vocabulary, on the way back: the
     # narrowings no provider query can express. Before `_collect_result`
     # so the step's COUNT is the count of what survived — a filtered
@@ -1017,6 +1274,11 @@ async def _run_steps(
         # `{{filters.…}}` root, because a filter narrows the CALL and
         # has nothing to say inside a template.
         "_filters": dict(vspec.filters or {}),
+        # R43 §2.2 — the places inside each account the user said it
+        # may open, for `_apply_source_scope`. Underscored for the same
+        # reason as the two above: it narrows the CALL, so it has
+        # nothing to say inside a `{{…}}` template.
+        "_account_sources": dict(vspec.account_sources or {}),
         # R42 — the run's clock, for `_apply_time_window`. Underscored
         # for exactly the reason the pins are: `render_value` must
         # never reach it. tz-aware because it leaves this process as an
@@ -2000,6 +2262,7 @@ async def rehearse_v2(
         # rehearsal of a different run.
         "_focus_pins": dict(vspec.focus or {}),
         "_filters": dict(vspec.filters or {}),
+        "_account_sources": dict(vspec.account_sources or {}),
         "_clock": {"now": datetime.now(timezone.utc)},
     }
 
@@ -2715,7 +2978,8 @@ async def _narrate_phase1(
         # nothing to open. Dropping it hands the run to
         # `close_ledger`'s completeness net, which owes the thread one
         # result turn and writes the honest mechanical one instead.
-        unservable = set(outcome.get("unservable") or ())
+        unservable = _recheck_unservable(
+            drafts, record, set(outcome.get("unservable") or ()))
         if outcome.get("problems"):
             logger.log(
                 logging.WARNING if unservable else logging.INFO,
@@ -2746,6 +3010,30 @@ async def _narrate_phase1(
     except Exception as e:  # noqa: BLE001 — narration must not kill the run
         logger.warning("[automations] narration phase 1 skipped: %s", e)
         return None
+
+
+def _recheck_unservable(drafts: list, record: dict, reported: set) -> set:
+    """Which result drafts really cannot be served, judged on the drafts
+    in hand rather than on how the narrator stopped.
+
+    R43 repair (finding 15). `narrate_run` reports EVERY result
+    unservable when its RETRY throws — a ReadTimeout against the model
+    is the ordinary case — but the drafts it hands back are then
+    attempt ONE's, which it validated on the previous pass and which
+    `unservable_results` may well have KEPT: its own rule is that a
+    result with some good rows survives, because a bad `tag` on one
+    line is not a reason to replace a real ranking with "I could not
+    rank them". So a complete five-tier brief was thrown away and the
+    mechanical fallback served over it, and nothing else in the round
+    could tell "the retry never happened" from "the retry rejected it".
+
+    Idempotent on every other path: the same two pure functions over
+    the same drafts and the same record already produced the number.
+    """
+    if not drafts or not reported:
+        return set(reported)
+    from .narrator import unservable_results, validate_drafts
+    return unservable_results(drafts, validate_drafts(drafts, record))
 
 
 async def _apply_annotate(

@@ -12,6 +12,23 @@ them saying no:
      of every write is checked against the connected account's own
      identity before the row is staged. §1.3.
 
+     That check is a POSITIVE proof and it is total:
+     `_check_addressed_to_the_user` has a branch for every id in
+     `_CONNECTOR_CHANNELS` and ends in a raise, so a tenth channel
+     refuses until somebody writes its proof. It used to fall off the
+     end with a bare `return`, which meant `teams_chat`, `notion_page`
+     and `calendar_hold` were checked for nothing but a non-empty
+     target — a grant pinned to a group chat or a team page is a
+     perfectly legal grant for a write STEP, and those three would have
+     delivered the user's whole ranked brief into it. §6.4's
+     reassurance line was true for two connectors out of five.
+
+     Where a provider exposes no way to prove it (`notion_page`), the
+     channel is named in `UNVERIFIABLE_CHANNELS` and REFUSED rather
+     than passed. §0.2: an option that cannot be honoured is not
+     offered, and the words that say why live beside the id so the
+     delivery picker can print them.
+
   2. **Every write goes through the outbox.** Same staging, same undo
      window, same grant gate, same `automation_writes` row and the same
      failed-write turn as a write STEP. A delivery is not a special kind
@@ -108,6 +125,31 @@ _CONNECTOR_CHANNELS: dict[str, dict] = {
                       "param": "calendar_id", "body_param": "description"},
 }
 
+#: Channels this module cannot PROVE reach the user and nobody else,
+#: and the words that say why. Read by `workflow._channel_state`, which
+#: serves them as `available: false` + `reason` so the delivery sheet
+#: never lights a control that refuses at use time (§0.2).
+#:
+#: `notion_page` is the whole list. Notion's public API exposes no
+#: sharing state at all: a page object carries `parent`, `created_by`
+#: and `last_edited_by`, and nothing anywhere says who else can read
+#: it. A page shared with a teamspace and a page nobody else has ever
+#: seen are byte-identical from here, so "this brief reaches you alone"
+#: is a claim this module would be guessing at — and the thing it would
+#: leak is the user's mail subjects, who is waiting on them, and their
+#: board. Guessing is not one of rule 1's options.
+#:
+#: The channel keeps its row in `_CONNECTOR_CHANNELS` on purpose: the
+#: writer, the append tool and the dated heading are correct and stay
+#: tested, so the day Notion ships a permissions read this is one
+#: deletion away from working.
+UNVERIFIABLE_CHANNELS: dict[str, str] = {
+    "notion_page": (
+        "Notion cannot say who else can read a page, so it will not put "
+        "your brief on one"
+    ),
+}
+
 #: A Slack conversation id that is a DM. `D…` is a direct message and
 #: `U…`/`W…` is a person (posting to which OPENS their DM) — and for a
 #: user token that person is the token's own owner, checked below.
@@ -122,6 +164,18 @@ CALENDAR_HOLD_MINUTES = 15
 #: A refusal this file raised → the verb-dictionary row that describes
 #: it honestly. Anything not here is a write that did not happen.
 _REFUSAL_VERBS = {"grant_missing": "scope_missing"}
+
+#: WhatsApp / Telegram failure reasons → the sentence that reaches the
+#: thread. `channel_dispatcher` answers in tokens (`no_recipient`,
+#: `no_adapter`) or an exception class name; none of those is something
+#: to put in front of a person, and the ledger's grammar would drop the
+#: turn rather than serve one. Anything unlisted falls back to the
+#: channel's own name, which is at least true.
+_OWN_CHANNEL_SENTENCES = {
+    "no_recipient": "It does not have a number to send yours to yet — "
+                    "link the channel again",
+    "no_adapter": "That channel is not connected on this agent",
+}
 
 
 class DeliveryRefused(Exception):
@@ -244,6 +298,13 @@ async def _live_account(user_id: str, connector_id: str) -> str:
     either is renamed this degrades to "could not tell which mailbox is
     yours" — the same sentence the empty column produces today — rather
     than to an exception on the delivery path.
+
+    Calendar answers with the id of the token owner's PRIMARY calendar,
+    which is the calendar analogue of a mailbox address: Google names
+    it after the account, and every other calendar the token can write
+    to (`…@group.calendar.google.com`, a colleague who shared theirs) is
+    somebody else's room. R43 — before this, `calendar_hold` had no
+    identity to be measured against and no branch to measure it in.
     """
     try:
         if connector_id == "slack":
@@ -254,6 +315,15 @@ async def _live_account(user_id: str, connector_id: str) -> str:
             from app.connectors.outlook import provider as _outlook
             token = await _outlook._resolve_token(user_id)
             return str(await _outlook._mailbox_address(user_id, token) or "")
+        if connector_id == "calendar":
+            from app.connectors._google_base import google_request
+            from app.connectors.calendar import provider as _cal
+            token = await _cal._resolve_token(user_id)
+            entry = await google_request(
+                "GET", f"{_cal.CAL_API_BASE}/users/me/calendarList/primary",
+                access_token=token, scope_hint="calendar.readonly",
+            )
+            return str((entry or {}).get("id") or "")
     except Exception as e:  # noqa: BLE001 — an unproven owner declines
         logger.warning("[automations] %s identity unresolved: %s: %s",
                        connector_id, type(e).__name__, str(e)[:200])
@@ -275,8 +345,69 @@ async def _account_for(user_id: str, connector_id: str) -> str:
     return await _live_account(user_id, connector_id)
 
 
+async def _owned_chats(user_id: str) -> set[str]:
+    """The Teams chats this connection can PROVE hold nobody but its
+    owner — the user's chat with themselves, and only that.
+
+    Teams has no `/me` for this connector (it holds `Chat.Read` and
+    `ChatMessage.Send`; `User.Read` would need every existing
+    connection re-consented), so "which member is me" is a DEDUCTION,
+    and the teams provider already ships it as a closed one:
+    `_identify_self` returns an id only when the member sets of the
+    caller's chats intersect to exactly one person, and None with a
+    reason otherwise. This reuses it rather than re-deriving it, for
+    the same reason `_live_account` reaches into slack and outlook: the
+    provider owns what its own ids mean.
+
+    A chat is the user's own iff its member set is exactly `{self}`.
+    A `oneOnOne` with a colleague is NOT — it reaches the user, and it
+    reaches the colleague, which is the half rule 1 is about.
+
+    Empty is a real answer and the caller treats it as a refusal, never
+    as a pass. Nothing here may raise: an unprovable chat declines; it
+    does not fail the run.
+    """
+    try:
+        from app.connectors.teams import provider as _teams
+        token = await _teams._resolve_token(user_id)
+        page = await _teams._graph(
+            "GET", f"{_teams.GRAPH_API}/me/chats",
+            access_token=token, user_id=user_id, scope_hint="Chat.Read",
+            params={"$top": 50, "$expand": "members"},
+        )
+        chats = [c for c in ((page or {}).get("value") or [])
+                 if isinstance(c, dict)]
+        self_id, why = _teams._identify_self(chats)
+        if not self_id:
+            logger.info("[automations] teams self unresolved: %s", why)
+            return set()
+        return {str(c.get("id") or "") for c in chats
+                if _teams._member_ids(c) == {self_id} and c.get("id")}
+    except Exception as e:  # noqa: BLE001 — an unproven owner declines
+        logger.warning("[automations] teams chats unresolved: %s: %s",
+                       type(e).__name__, str(e)[:200])
+    return set()
+
+
+async def _owned_targets(user_id: str, channel_id: str) -> set[str]:
+    """Targets `_check_addressed_to_the_user` will accept for a channel
+    whose proof is a LOOKUP rather than a comparison.
+
+    Gmail, Outlook, Slack and Calendar each prove ownership by matching
+    the target against one identity (`_account_for`). Teams cannot: a
+    chat id is not an identity, and the only chat that reaches the user
+    alone has to be found. Empty for every other channel, and empty is
+    a refusal there too — the caller never treats "no set" as "any
+    target".
+    """
+    if channel_id == "teams_chat":
+        return await _owned_chats(user_id)
+    return set()
+
+
 def _check_addressed_to_the_user(
     channel_id: str, connector_id: str, target: str, account: str,
+    owned: Optional[set[str]] = None,
 ) -> None:
     """§1.3, enforced rather than asserted.
 
@@ -288,14 +419,28 @@ def _check_addressed_to_the_user(
     promise (§6.4's reassurance line) is that this list is not that.
 
     `account` is what the caller could PROVE about the connection
-    (`_account_for`), never what it assumed. An empty one is therefore a
-    refusal and not a pass: this check fails closed in both directions.
+    (`_account_for`), never what it assumed. `owned` is the same thing
+    for a channel whose proof is a lookup (`_owned_targets`). An empty
+    one of either is therefore a refusal and not a pass: this check
+    fails closed in both directions.
+
+    TOTAL, and that is the point. Every branch below either returns or
+    raises, and the function ENDS in a raise — so an id with no branch
+    refuses instead of falling through. The bare `return` that used to
+    sit at the end is the whole of finding 16: it made `teams_chat`,
+    `notion_page` and `calendar_hold` pass any grant target at all.
     """
     t = str(target or "").strip()
     if not t:
         raise DeliveryRefused(
             "no_target", "the permission pins no target",
             sentence="The permission it has pins no destination")
+    if channel_id in UNVERIFIABLE_CHANNELS:
+        raise DeliveryRefused(
+            "unverifiable_channel",
+            f"{connector_id} exposes no way to prove {t} is the user's alone",
+            sentence=UNVERIFIABLE_CHANNELS[channel_id],
+        )
     if channel_id in ("gmail_draft", "outlook_mail"):
         if not account:
             raise DeliveryRefused(
@@ -345,6 +490,58 @@ def _check_addressed_to_the_user(
                                "yours"),
             )
         return
+    if channel_id == "teams_chat":
+        # The user's chat with THEMSELVES, proven by membership, or
+        # nothing. A `oneOnOne` with a colleague reaches the user AND
+        # the colleague; a group chat reaches everyone in it; and a
+        # grant pinned to either is a legal grant for a write STEP, so
+        # the grant cannot be the proof. `owned` is `_owned_chats`'
+        # closed answer (see there) and an empty one is a refusal.
+        if t in (owned or set()):
+            return
+        raise DeliveryRefused(
+            "not_the_user",
+            "that Teams chat is not the one you have with yourself"
+            if owned else "this Teams account did not say which chat is "
+                          "yours alone",
+            sentence=("A Teams delivery goes to your own chat, never to one "
+                      "with other people in it" if owned else
+                      "It could not tell which Teams chat is yours alone"),
+        )
+    if channel_id == "calendar_hold":
+        # A hold with no attendees still SITS somewhere, and everyone
+        # who can read that calendar reads the brief in it. So the
+        # calendar has to be the user's own, which is the same test
+        # `gmail_draft` makes against a mailbox — Google names the
+        # primary calendar after the account, and `primary` is the
+        # literal alias for it.
+        #
+        # Everything else this token can write to is somebody else's
+        # room: a `…@group.calendar.google.com` shared with the team, a
+        # colleague who gave them write access.
+        if t.lower() == "primary":
+            return
+        if not account:
+            raise DeliveryRefused(
+                "unknown_account",
+                "calendar did not report which calendar is the user's own",
+                sentence="It could not tell which calendar is yours",
+            )
+        if t.lower() != str(account).lower():
+            raise DeliveryRefused(
+                "not_the_user",
+                "a delivery hold sits on your own calendar, not a shared one",
+                sentence="A hold goes on your own calendar, never on a "
+                         "shared one",
+            )
+        return
+    # No branch means no proof. A tenth channel refuses here until
+    # somebody writes one, rather than shipping unchecked.
+    raise DeliveryRefused(
+        "unverifiable_channel",
+        f"no ownership check is written for {channel_id}",
+        sentence="It cannot yet prove a brief sent there reaches only you",
+    )
 
 
 def _subject(automation, brief: Brief, now: datetime) -> str:
@@ -441,6 +638,20 @@ async def deliver_brief(
         logger.warning("[automations] brief PDF unavailable: %s", e)
         for cid in plan["channels"]:
             out[cid] = {"status": "failed", "reason": "format_unavailable"}
+            if cid == "app":
+                # The thread already has the brief; only the FILE is
+                # missing, and saying "your brief did not reach this
+                # chat" under it would be the false half of rule 3.
+                continue
+            await _append_refused_turn(
+                db, automation=automation, job_id=job_id, thread=thread,
+                channel_id=cid,
+                refusal=DeliveryRefused(
+                    "format_unavailable", str(e)[:200],
+                    sentence="The one-page PDF could not be made, and it "
+                             "will not send a different file under that "
+                             "name"),
+            )
         await _record(db, automation=automation, job_id=job_id, thread=thread,
                       results=out, plan=plan)
         return out
@@ -465,6 +676,17 @@ async def deliver_brief(
             logger.warning("[automations] delivery to %s failed: %s: %s",
                            cid, type(e).__name__, str(e)[:200])
             out[cid] = {"status": "failed", "reason": "unknown_error"}
+            # Rule 3 again. Nothing after `flush_row_when_due` can
+            # raise, so an exception reaching here means the outbox
+            # never staged this channel and never appended its own
+            # turn — this is the only record the user can get.
+            await _append_refused_turn(
+                db, automation=automation, job_id=job_id, thread=thread,
+                channel_id=cid,
+                refusal=DeliveryRefused(
+                    "unknown_error", f"{type(e).__name__}: {str(e)[:200]}",
+                    sentence="Something went wrong sending it there"),
+            )
 
     await _record(db, automation=automation, job_id=job_id, thread=thread,
                   results=out, plan=plan)
@@ -506,9 +728,10 @@ async def _deliver_one(
     grant = await _grant_for(
         automation.user_id, automation, spec["connector_id"], spec["tool"])
     account = await _account_for(automation.user_id, spec["connector_id"])
+    owned = await _owned_targets(automation.user_id, channel_id)
     target = str(grant["target"].get("id") or "")
     _check_addressed_to_the_user(
-        channel_id, spec["connector_id"], target, account)
+        channel_id, spec["connector_id"], target, account, owned)
 
     payload = _payload_for(channel_id, target=target, brief=brief,
                            automation=automation, now=now)
@@ -588,9 +811,24 @@ async def _deliver_own_channel(
     status = entry.get("status")
     if status == "delivered":
         return {"status": "delivered", "reason": None}
-    return {"status": "failed",
-            "reason": str(entry.get("reason")
-                          or entry.get("error_class") or "no_adapter")}
+    # RAISES, and that is finding 17. These two channels used to
+    # `return` a failed dict, and `deliver_brief`'s loop only appends
+    # the thread turn on `DeliveryRefused` — so a dropped WhatsApp
+    # session left the run's thread saying nothing at all and the brief
+    # silently stopped arriving. Rule 3 does not have an exception for
+    # the channels that skip the outbox: the outbox is what makes the
+    # OTHER failures visible (`outbox._append_failed_write_turn`), and
+    # a channel that has no outbox row needs this file to do it.
+    reason = str(entry.get("reason") or entry.get("error_class")
+                 or "no_adapter")
+    name = (catalog.channel(channel_id) or {}).get("name") or channel_id
+    raise DeliveryRefused(
+        reason,
+        f"{channel_id} delivery {status or 'failed'}: "
+        f"{entry.get('error_detail') or reason}",
+        sentence=_OWN_CHANNEL_SENTENCES.get(
+            reason, f"{name} did not take it this time"),
+    )
 
 
 # ── the record ───────────────────────────────────────────────────────
@@ -618,6 +856,13 @@ async def _append_refused_turn(
         name = catalog.channel(channel_id) or {}
         code = _ah.classify(refusal.reason_code, refusal.detail)
         state, fix = _ah.state_for_reason(code)
+        # WhatsApp and Telegram are the agent's OWN channels: there is
+        # no connected account behind them, so every string the health
+        # table composes ("I could not read {Connector}") would be
+        # about a connector that does not exist. They take the plain
+        # fallback below, which names the channel and stops there.
+        if not cid:
+            state, fix = "connected", None
         # The dictionary is the only source of `action`/`detail`
         # (CONTRACTS-R30 §1), and its DEFAULT pair is "Could not
         # connect / it did not answer" — which is a claim about the
@@ -630,7 +875,7 @@ async def _append_refused_turn(
         line = _ah.sentence_for(
             account_state=state, reason_code=code, connector_id=cid,
             name=_ah.display_of(cid),
-        )
+        ) if cid else ""
         if not line:
             # A refusal this file raised (`not_the_user`, `no_target_param`)
             # is not an account-health state, so the table has no sentence
@@ -639,6 +884,7 @@ async def _append_refused_turn(
             # offers a fix that cannot work, so BOTH are dropped together.
             line = f"Your brief did not reach {name.get('name') or channel_id}."
             fix = None
+        steps_land = name.get("land") or "to you"
         await _ledger.append_turn(
             db, user_id=automation.user_id, thread=thread, run_id=job_id,
             kind="tool",
@@ -647,8 +893,8 @@ async def _append_refused_turn(
                 "action": act["action"], "detail": act["detail"],
                 "ok": False, "ms": 0,
                 "steps": [
-                    {"text": f"Asked to send your brief "
-                             f"{name.get('land') or 'to you'}", "ok": True},
+                    {"text": f"Asked to send your brief {steps_land}",
+                     "ok": True},
                     # `sentence`, never `detail`: see DeliveryRefused.
                     {"text": (refusal.sentence or act["detail"]
                               or "It could not be sent"),

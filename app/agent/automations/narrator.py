@@ -855,12 +855,17 @@ async def narrate_run(record: dict, *, complete=None) -> dict:
                            type(e).__name__, str(e)[:200])
             return {"turns": drafts, "problems": [f"llm: {type(e).__name__}"],
                     "attempts": attempts,
-                    # The drafts are the PREVIOUS attempt's, already
-                    # rejected; nothing here has been re-validated, so
-                    # every result in them is unservable.
-                    "unservable": sorted(
-                        i for i, d in enumerate(drafts)
-                        if isinstance(d, dict) and d.get("kind") == "result")}
+                    # R43 repair (finding 15). The drafts are the
+                    # PREVIOUS attempt's — which WAS validated, on the
+                    # iteration that decided to retry, and whose verdict
+                    # is the `unservable` already in hand. Recomputing it
+                    # here as "every result" contradicted this module's
+                    # own rule: a result with some good rows is KEPT,
+                    # because a bad `tag` on one line is not a reason to
+                    # replace a real ranking with "I could not rank
+                    # them". A ReadTimeout on attempt 2 is the ordinary
+                    # case, and it threw a complete five-tier brief away.
+                    "unservable": sorted(unservable)}
         drafts = payload.get("turns") if isinstance(payload, dict) else None
         drafts = drafts if isinstance(drafts, list) else []
         problems = validate_drafts(drafts, record)

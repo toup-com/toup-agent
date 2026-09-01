@@ -665,6 +665,17 @@ def _delivery_env(monkeypatch, *, grants: dict, accounts: dict, calls: list):
     monkeypatch.setattr(
         "app.agent.automations.registry.dispatch_via_platform", _dispatch)
 
+    # R43 repair (finding 16). Teams' ownership proof is a live
+    # `/me/chats` enumeration and this fixture holds no token, so the
+    # set is supplied the way every other identity here is. It is
+    # deliberately NOT the whole grant target space: `_SELF_CHAT` alone
+    # is owned, which is what makes the group-chat refusal in
+    # test_r43_repair_deliver.py a real fence rather than a tautology.
+    async def _owned(user_id, channel_id):
+        return {_SELF_CHAT} if channel_id == "teams_chat" else set()
+    monkeypatch.setattr(
+        "app.agent.automations.deliver._owned_targets", _owned)
+
 
 async def _automation_with_write(uid, connector_id, tool, grant_id):
     vspec = validate_spec({
@@ -699,25 +710,31 @@ async def _automation_with_write(uid, connector_id, tool, grant_id):
     return a, vspec
 
 
+#: The user's chat with THEMSELVES — the only Teams chat a delivery may
+#: reach (finding 16). `19:chat` was the toy id here before there was an
+#: ownership check, and no honest rule can accept it.
+_SELF_CHAT = "19:11111111_11111111@unq.gbl.spaces"
+
 _DELIVERY_CASES = [
     ("slack_dm", "slack", "slack__send_message",
      {"kind": "thread", "id": "D0FOUNDER", "label": "you"}, "U0ME",
      "channel", "text"),
     ("teams_chat", "teams", "teams__send_chat_message",
-     {"kind": "thread", "id": "19:chat", "label": "your chat"}, "me@acme.com",
-     "chat_id", "message"),
+     {"kind": "thread", "id": _SELF_CHAT, "label": "your chat"},
+     "me@acme.com", "chat_id", "message"),
     ("gmail_draft", "gmail", "gmail__create_draft",
      {"kind": "person", "id": "me@acme.com", "label": "you"}, "me@acme.com",
      "to", "body"),
     ("outlook_mail", "outlook", "outlook__create_draft",
      {"kind": "person", "id": "me@acme.com", "label": "you"}, "me@acme.com",
      "to", "body"),
-    # R43 — `notion__append_blocks`, not `notion__create_page`. §1.2
-    # promises "appended under today's date"; a create makes a CHILD
-    # page, so the pinned page never gains a line.
-    ("notion_page", "notion", "notion__append_blocks",
-     {"kind": "doc", "id": "page-1", "label": "Journal"}, "me@acme.com",
-     "page_id", "content"),
+    # `notion_page` is NOT here, and its absence is the point: R43
+    # repair (finding 16) refuses the channel outright, because Notion's
+    # API exposes no sharing state and a teamspace page is
+    # byte-identical from here to a private one. The refusal has its own
+    # fence below, and the row's writer/append tool/dated heading stay
+    # tested in test_r43_repair_deliver.py — the day Notion ships a
+    # permissions read this entry comes back.
     # R43 — the calendar manifest declares `calendar_id` as this write's
     # pinned target now, so a hold is grantable and this channel joins
     # the others instead of refusing every time it is picked.
@@ -781,6 +798,61 @@ async def test_each_channel_stages_the_right_outbox_row(
             .where(AutomationOutbox.tool_name == tool)
         )).scalars())
     assert len(rows) == 1 and rows[0].status == "executed"
+
+
+@pytest.mark.asyncio
+async def test_a_notion_page_stages_no_outbox_row_at_all(monkeypatch):
+    """The fence the deleted `notion_page` case leaves behind.
+
+    R43 repair (finding 16): Notion exposes no sharing state, so this
+    module cannot prove a page reaches the user alone and refuses the
+    channel rather than guessing. Rule 2 still holds — it is just that
+    the row is never built, and the run says why in the thread instead.
+    """
+    uid = await _mk_user()
+    a, vspec = await _automation_with_write(
+        uid, "notion", "notion__append_blocks", "g-d")
+    calls: list = []
+    target = {"kind": "doc", "id": "page-1", "label": "Journal"}
+    _delivery_env(
+        monkeypatch,
+        grants={"g-d": {"status": "approved",
+                        "tool_name": "notion__append_blocks",
+                        "target": target}},
+        accounts={"notion": "me@acme.com"}, calls=calls)
+    await _fire(monkeypatch, uid, a, vspec,
+                responses={"jira__search_issues": _EMPTY})
+    _delivery_env(
+        monkeypatch,
+        grants={"g-d": {"status": "approved",
+                        "tool_name": "notion__append_blocks",
+                        "target": target}},
+        accounts={"notion": "me@acme.com"}, calls=calls)
+
+    job = await _one_run(a.id)
+    async with async_session_maker() as db:
+        auto = await db.get(Automation, a.id)
+        thread = await ledger.thread_for(db, a.id)
+        result = [t for t in await ledger.run_turns(db, run_id=job.id)
+                  if t["kind"] == "result"][-1]
+        out = await deliver.deliver_brief(
+            db, automation=auto, job_id=job.id, thread=thread,
+            groups=result["groups"], title=result["title"],
+            delivery={"channels": ["app", "notion_page"], "format": "ranked",
+                      "cadence": "run"},
+            idem_prefix=f"t:{uuid.uuid4()}",
+        )
+    assert out["notion_page"]["status"] == "failed"
+    assert out["notion_page"]["reason"] == "unverifiable_channel"
+    assert not [c for c in calls if c["tool"] == "notion__append_blocks"]
+
+    async with async_session_maker() as db:
+        rows = list((await db.execute(
+            select(AutomationOutbox)
+            .where(AutomationOutbox.job_id == job.id)
+            .where(AutomationOutbox.tool_name == "notion__append_blocks")
+        )).scalars())
+    assert rows == []
 
 
 @pytest.mark.asyncio

@@ -225,8 +225,16 @@ def test_availability_names_the_reason_for_every_case(unlinked):
     assert rows["gmail_draft"]["available"] is False
     assert rows["gmail_draft"]["reason"] == "Gmail needs signing in again."
     # missing account
+    assert rows["teams_chat"]["available"] is False
+    assert rows["teams_chat"]["reason"] == "Teams is not connected."
+    # R43 repair (finding 16): a channel this platform cannot PROVE
+    # reaches the user alone is refused for good, so it says the
+    # permanent reason and not "Notion is not connected" — connecting
+    # Notion would not light it, and sending the user to do that is the
+    # picker that writes nowhere with an extra step in front of it.
     assert rows["notion_page"]["available"] is False
-    assert rows["notion_page"]["reason"] == "Notion is not connected."
+    assert rows["notion_page"]["reason"].startswith(
+        "Notion cannot say who else can read a page")
     # unlinked channel: the reason quotes the catalogue's own ask
     assert rows["whatsapp"]["available"] is False
     assert rows["whatsapp"]["linked"] is False
@@ -444,13 +452,18 @@ async def test_set_delivery_is_partial_and_round_trips(unlinked):
     a = await _mk_automation(uid, _spec())
     async with async_session_maker() as db:
         row = await db.get(Automation, a.id)
+        # `app` and not `slack_dm`: R43 repair (finding 14). A
+        # connector-backed channel needs an APPROVED write grant on
+        # THIS automation, pinned at the user — this spec has no write
+        # step, so Slack DM is now correctly refused, and
+        # `test_repair_*` in test_r43_repair_platform.py covers that.
         out = await wf.set_delivery(
             db, automation=row, user_id=uid,
-            channels=["slack_dm", "app"], format_id="pdf")
-    assert out["delivery"]["channels"] == ["app", "slack_dm"]
+            channels=["app"], format_id="pdf")
+    assert out["delivery"]["channels"] == ["app"]
     assert out["delivery"]["format"] == "pdf"
     assert out["delivery"]["cadence"] == "run"
-    assert "Slack DM" in out["sentence"] and "one-page PDF" in out["sentence"]
+    assert "This app" in out["sentence"] and "one-page PDF" in out["sentence"]
     assert out["workflow"]["workflow_rev"] >= 1
 
     # A second write that names only the cadence must not rewrite the
@@ -459,7 +472,7 @@ async def test_set_delivery_is_partial_and_round_trips(unlinked):
         row = await db.get(Automation, a.id)
         out2 = await wf.set_delivery(
             db, automation=row, user_id=uid, cadence="instant")
-    assert out2["delivery"]["channels"] == ["app", "slack_dm"]
+    assert out2["delivery"]["channels"] == ["app"]
     assert out2["delivery"]["format"] == "pdf"
     assert out2["delivery"]["cadence"] == "instant"
 
@@ -576,14 +589,17 @@ async def test_sources_round_trip_and_a_stale_pick_is_refused(monkeypatch):
                                  connector_id="gmail", sources=["label:gone"])
     assert e.value.code == "unknown_source"
 
-    # Clearing it says what happens next, in words.
+    # Clearing it says what happens next, in words — and what happens
+    # is the state every automation has always been in. R43 repair
+    # (finding 2): "I will skip Gmail" promised a destructive behaviour
+    # the engine has never had, about every account, on day one.
     async with async_session_maker() as db:
         row = await db.get(Automation, a.id)
         out2 = await wf.set_sources(db, automation=row, user_id=uid,
                                     connector_id="gmail", sources=[])
     assert out2["sources"] == []
-    assert out2["sentence"] == "Nothing picked — I will skip Gmail on the " \
-                               "next run."
+    assert out2["sentence"] == ("Nothing picked — it reads all of Gmail, "
+                                "as before.")
 
 
 @pytest.mark.asyncio

@@ -395,7 +395,15 @@ def test_debt_is_not_growing_silently():
     # dropped the file into the platform sweep and it failed there with
     # "no such table: automations", taking the agent-mode step (skipped on the
     # sweep's failure, so the other two never ran) down with it.
-    CEILING = 95
+    # R43 (+3): test_r43_workflow_payload.py, test_r43_brief_and_delivery.py
+    # and test_r43_repair_platform.py drive the delivery model and the brief
+    # over real `automations`/`automation_threads`/`_turns`/`_outbox` rows,
+    # which are AGENT_ONLY. ROUTING entries, all three RUN in the agent-mode
+    # step. The first two were added without moving this number and turned
+    # main red the moment R43 merged; the third shipped WITHOUT its entry and
+    # failed in the platform sweep with "no such table: automations" — the
+    # exact failure the R42 note above was written to prevent.
+    CEILING = 98
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

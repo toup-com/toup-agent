@@ -227,13 +227,19 @@ def test_describe_creates_and_seeds_the_thread(monkeypatch):
     assert turns[0][1]["stamp"] == "added"
     assert turns[1][1]["text"] == "every Friday, summarise my week"
     assert "Nothing runs until you say so." in turns[2][1]["text"]
-    # The §5.3 script follows: agent, tool, think, agent.
-    assert kinds[3:] == ["agent", "tool", "think", "agent"]
+    # The §5.3 script, as R43 §8 reshaped it: agent, tool, one line per
+    # BAND (not per account — six connectors used to open with six
+    # near-identical "Connected X" bubbles), think, close, and the
+    # closing shape sentence. One Gmail account is one band, MAIL.
+    assert kinds[3:] == ["agent", "tool", "agent", "think", "agent",
+                         "agent"]
     tool_payload = dict(turns[4][1])
     assert tool_payload["action"] == "Checked what I can do"
+    assert turns[5][1]["text"].startswith("Connected Gmail — ")
     # A's positional call semantics land the schedule sentence in the
     # close, lowered to read as one sentence.
-    assert "First run is every Friday at 17:00." in turns[6][1]["text"]
+    assert "First run is every Friday at 17:00." in turns[7][1]["text"]
+    assert turns[8][1]["text"].startswith("That is the shape of it.")
 
 
 def test_describe_retries_spec_errors_then_refuses(monkeypatch):
