@@ -876,12 +876,115 @@ def _connector_membership(raw: dict, connector_id: str) -> dict:
     }
 
 
+def _is_write_step(step: dict, capability: dict) -> bool:
+    """Whether a step MUTATES — the same question `_validate_step` asks
+    of the registry, not the grant proxy the rest of this module uses.
+
+    A from-template draft legitimately carries an ungranted write
+    (R36-5), so "the first step with a `grant_id`" answers `len(steps)`
+    for one and a read inserted there lands BEHIND the write. That is
+    `write_before_read`: a `SpecError` the membership routes do not
+    catch, i.e. a 500 for adding an account to a draft.
+    """
+    if step.get("grant_id") or step.get("grant_target"):
+        return True
+    cap = capability.get(step.get("connector_id")) or {}
+    return step.get("tool") in (cap.get("scopes_write_by_action") or {})
+
+
+def _step_id(taken: set, connector_id: str) -> str:
+    """A step id inside `spec_v2._ID_RE` that collides with nothing —
+    not another step, not a SOURCE (the v2 validator shares one id space
+    between them), not a renderer root."""
+    import re as _re
+    from .spec_v2 import RESERVED_IDS
+    base = _re.sub(r"[^a-z0-9_]", "_", connector_id.lower())[:24].strip("_")
+    if not base or not base[0].isalpha():
+        base = f"a{base}"[:24]
+    cand, n = base, 2
+    while cand in taken or cand in RESERVED_IDS:
+        cand = f"{base[:22]}_{n}"
+        n += 1
+    return cand
+
+
+def _default_read_step(
+    connector_id: str, cap: dict, taken: set,
+) -> Optional[dict]:
+    """One read step for a connector the automation's template has
+    nothing for, derived from that connector's own manifest.
+
+    R43. 099 dropped GitHub, Teams and Outlook out of the installed
+    Morning work brief, and the catalog's template no longer names them
+    — so `add_connector`'s only source of a read step had nothing for
+    exactly the three accounts the user is now being invited to put
+    back. A picker that writes nowhere is forbidden, so the manifest
+    answers instead of the template.
+
+    THE DERIVATION, in one sentence: the primary read is the
+    `source_tool` of the FIRST event the connector declares — the
+    manifest's own answer to "what does watching this account call" —
+    with that event's `poll_args` as the params and its `items_path` /
+    `fields` as the collect shape. The registry entry is the only view
+    of a manifest the agent has (`registry.fetch_registry`), and an
+    event carries all four.
+
+    `params_required` is deliberately left EMPTY. Those name a PLACE —
+    a repository, a chat — that only the user can choose, and
+    `executor_v2._apply_focus_scope` fills exactly those from a pin.
+    Until one is pinned the read fails and the run names the account
+    (`on_error: continue`), which is the honest state: the account is
+    on the automation and has not been told where to look. Inventing a
+    default would read the wrong repository and say nothing about it.
+
+    None when the connector declares no readable event — the caller
+    refuses rather than writing a step that calls nothing.
+    """
+    from .spec_v2 import COLLECT_LIMIT_DEFAULT
+    writes = cap.get("scopes_write_by_action") or {}
+    name = str(cap.get("name") or connector_id)
+    for ev in cap.get("events") or []:
+        tool = str((ev or {}).get("source_tool") or "")
+        if not tool.startswith(f"{connector_id}__") or tool in writes:
+            continue
+        items_path = str(ev.get("items_path") or "")
+        # An event's fields exist to IDENTIFY a row (dedupe); a collect
+        # line is read by a person and then by the ranking step, and a
+        # raw message id in it is noise both of them have to step over.
+        fields = {k: v for k, v in (ev.get("fields") or {}).items()
+                  if isinstance(k, str) and isinstance(v, str)
+                  and k != "id" and not k.endswith("_id")}
+        if not items_path or not fields:
+            continue
+        return {
+            "id": _step_id(taken, connector_id),
+            "connector_id": connector_id,
+            "tool": tool,
+            "params": dict(ev.get("poll_args") or {}),
+            "collect": {
+                "items_path": items_path,
+                "fields": fields,
+                "format": "- " + " · ".join(
+                    "{{item.%s}}" % f for f in fields
+                ),
+                "limit": COLLECT_LIMIT_DEFAULT,
+                "empty_text": f"Nothing from {name}.",
+            },
+            # CONTRACTS-R31 §4.2a: one unreachable account must not end
+            # the run, and the user is owed the account's name.
+            "on_error": "continue",
+        }
+    return None
+
+
 async def add_connector(
     db: AsyncSession, *, automation_id: str, user_id: str, connector_id: str,
 ) -> tuple[Automation, ValidatedSpec]:
-    """Re-add a connector's READ presence from the automation's
-    template skeleton (CONTRACTS-R29.md §3.2): its read step(s) and
-    poll/push source(s), inserted ahead of the writes. Writes never
+    """Re-add a connector's READ presence: its read step(s) and
+    poll/push source(s) from the automation's template skeleton
+    (CONTRACTS-R29.md §3.2), or — when the template has nothing for it
+    — one default read step derived from the connector's own manifest
+    (`_default_read_step`). Inserted ahead of the writes. Writes never
     ride this path — a write needs its own grant conversation."""
     automation = await _load_owned(db, automation_id, user_id)
     raw = _spec_dict(automation)
@@ -892,29 +995,54 @@ async def add_connector(
         )
     if any(_connector_membership(raw, connector_id).values()):
         raise MembershipError("already_member", "connector already present")
-    if not automation.template_slug:
-        raise MembershipError(
-            "no_template_step", "this automation has no template to add from",
+    capability = await reg.fetch_registry(user_id)
+    donor: dict = {"read_steps": [], "sources": []}
+    if automation.template_slug:
+        template = next(
+            (t for t in await reg.fetch_templates(user_id)
+             if t.get("slug") == automation.template_slug),
+            None,
         )
-    template = next(
-        (t for t in await reg.fetch_templates(user_id)
-         if t.get("slug") == automation.template_slug),
-        None,
-    )
-    tspec = (template or {}).get("spec") or {}
-    donor = _connector_membership(tspec, connector_id)
-    if not donor["read_steps"] and not donor["sources"]:
-        raise MembershipError(
-            "no_template_step",
-            "the template has nothing for this connector",
-        )
+        donor = _connector_membership((template or {}).get("spec") or {},
+                                      connector_id)
     steps = [s for s in (raw.get("steps") or []) if isinstance(s, dict)]
     first_write = next(
-        (i for i, s in enumerate(steps) if s.get("grant_id")), len(steps),
+        (i for i, s in enumerate(steps) if _is_write_step(s, capability)),
+        len(steps),
     )
     existing_ids = {s.get("id") for s in steps}
     new_steps = [dict(s) for s in donor["read_steps"]
                  if s.get("id") not in existing_ids]
+    if not new_steps and not donor["sources"]:
+        cap = capability.get(connector_id)
+        if not cap:
+            # An unreachable platform answers {} — refusing here is what
+            # stops "nothing is automatable right now" being written
+            # into a spec as "this connector has no read".
+            raise MembershipError(
+                "no_template_step",
+                "I could not read what this account offers just now.",
+            )
+        taken = existing_ids | {
+            s.get("id") for s in ((raw.get("trigger") or {}).get("sources")
+                                  or []) if isinstance(s, dict)
+        }
+        step = _default_read_step(connector_id, cap, taken)
+        if step is None:
+            raise MembershipError(
+                "no_template_step",
+                "there is nothing this automation can read there",
+            )
+        new_steps = [step]
+    from .spec_v2 import MAX_STEPS
+    if len(steps) + len(new_steps) > MAX_STEPS:
+        # Refuse in the caller's vocabulary. The validator would refuse
+        # too, as a `SpecError` the membership routes do not catch — a
+        # 500 for a full automation.
+        raise MembershipError(
+            "too_many_steps",
+            "this automation already does as much as one can",
+        )
     raw["steps"] = steps[:first_write] + new_steps + steps[first_write:]
     if donor["sources"]:
         trig = dict(raw.get("trigger") or {})

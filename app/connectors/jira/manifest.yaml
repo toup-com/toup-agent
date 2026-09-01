@@ -250,3 +250,59 @@ automation:
         status: status
         project: project
         url: url
+    # R43 §7. JQL is the one place in this connector set where the
+    # round's events are expressible as written, because the query
+    # language reaches every field the labels name. The 1-day windows
+    # overlap for the same reason `issue_created`'s does.
+    #
+    # §7's fourth Jira event, "a due date moves", is NOT here: JQL's
+    # CHANGED operator covers status, assignee, priority, reporter,
+    # resolution and fixVersion only, so there is no query that watches
+    # a due date, and a poll on `duedate` alone would need a dedupe key
+    # that is a DATE — shared by every ticket due that day.
+    - key: issue_assigned
+      description: A ticket is assigned to you and is not finished.
+      source_tool: jira__search_issues
+      poll_args:
+        jql: 'assignee = currentUser() AND statusCategory != Done ORDER BY updated DESC'
+        max_results: 50
+      items_path: issues
+      dedupe_field: key
+      fields:
+        key: key
+        summary: summary
+        status: status
+        project: project
+        url: url
+    - key: issue_reopened
+      description: A ticket you reported moves back out of Done.
+      source_tool: jira__search_issues
+      poll_args:
+        jql: 'reporter = currentUser() AND status CHANGED FROM "Done" AFTER "-1d" ORDER BY updated DESC'
+        max_results: 50
+      items_path: issues
+      # The key, not the issue: a ticket can be reopened more than once
+      # and the dedupe space is per-automation and permanent, so keying
+      # on `key` would fire once in the automation's life. Jira's
+      # `updated` is millisecond-precision.
+      dedupe_field: updated
+      fields:
+        key: key
+        summary: summary
+        status: status
+        updated: updated
+        url: url
+    - key: p1_raised
+      description: A ticket is raised at Highest or High priority.
+      source_tool: jira__search_issues
+      poll_args:
+        jql: 'priority in (Highest, High) AND created >= "-1d" ORDER BY created DESC'
+        max_results: 50
+      items_path: issues
+      dedupe_field: key
+      fields:
+        key: key
+        summary: summary
+        priority: priority
+        project: project
+        url: url

@@ -167,6 +167,18 @@ tools:
         oldest:
           type: string
           description: Unix timestamp (seconds, may be fractional). Only messages at or after this point. Use for "since yesterday".
+        since_last_read:
+          type: boolean
+          default: false
+          description: Start from where the user last read this conversation. Ignored when `oldest` is given or when reading a thread. Costs one extra call, and quietly does nothing if Slack will not report read state for this conversation.
+        mentions_only:
+          type: boolean
+          default: false
+          description: Keep only messages that name the user with a real <@user> mention. Fails with an explanation if the connection cannot say who the user is — it never widens to the whole channel instead.
+        threads_only:
+          type: boolean
+          default: false
+          description: Keep only threads the user has replied in, judged from Slack's reply_users, which lists at most five people. Ignored when reading one thread.
         cursor:
           type: string
           description: Pagination cursor from a previous call's next_cursor.
@@ -272,22 +284,275 @@ tools:
       default: allow
       deny: []
 
-# ── Automation capability (Round 26) ──────────────────────────────
-# Slack is action-only in v1: no push path (Slack Events API needs an
-# app-level subscription we don't provision) and polling channel
-# history for triggers is a privacy hazard at rest. Writes are
-# grant-gated to ONE pinned channel.
+  - name: slack__conversation_info
+    description: |
+      Everything Slack knows about ONE conversation: its name or the person on the other end, its topic, whether it is archived, and — for a conversation this account is a member of — the read state: `last_read`, `unread_count` and `unread_count_display`. Read state is the one thing `slack__list_channels` cannot give you, which is why "52 messages overnight" needs this call. Check `unread_supported` before believing a zero: Slack declines to report read state for some conversations, and absent is not the same as nothing unread.
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Channel id (C…/G…/D…), or "#general", or "@sara".
+        include_num_members:
+          type: boolean
+          default: false
+      required: [channel]
+    mutates: false
+    elevation: false
+    output_redaction: ["latest"]
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__list_dms
+    description: |
+      The user's direct-message conversations, most unread first, each with who it is with, the newest message in it, and how many are unread. Use it for "who has written to me", for "did Sara reply", and to find the conversation with a particular person without paging every channel. The row whose `is_self` is true is the user's own saved-messages DM — the only conversation a message can be delivered to without involving another person. Each conversation costs one or two extra API calls, so `limit` is a real budget, not a display cap.
+    input_schema:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 25
+          default: 15
+          description: How many conversations to open and describe.
+        with_unread:
+          type: boolean
+          default: true
+          description: Fetch read state per conversation. Costs one extra call each.
+        types:
+          type: string
+          default: im,mpim
+          description: 'im (1:1), mpim (group DM), or both.'
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["dms"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__list_mentions
+    description: |
+      Messages anywhere in the workspace that name the connected user — "@you" — newest first. This is the "what is waiting on me" read: it needs no channel, because it resolves the user's own handle at call time and searches on it. Messages that merely contain the name as text are dropped unless `strict` is false, and the user's own messages are never returned.
+    input_schema:
+      type: object
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 30
+        query:
+          type: string
+          description: 'Extra Slack search modifiers to narrow it, e.g. ''in:#eng after:2026-08-30''.'
+        strict:
+          type: boolean
+          default: true
+          description: Keep only real <@user> mentions. False also keeps plain-text name matches.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["mentions"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__list_threads
+    description: |
+      Threads the user is in, and when each one last moved. With `channel`, the threads under that conversation. Without one, the threads the user has REPLIED in anywhere — found from their own messages, so it needs no channel and no pin. Each row carries the parent message, the reply count and `latest_reply`, the timestamp of the newest reply. Read a thread's contents with slack__read_messages and the `thread_ts` returned here.
+    input_schema:
+      type: object
+      properties:
+        channel:
+          type: string
+          description: Optional. Channel id, "#general" or "@sara". Omit for every thread the user has replied in.
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 25
+          default: 10
+        only_mine:
+          type: boolean
+          default: true
+          description: Keep only threads the user has replied in. With `channel`, this is judged from Slack's reply_users, which lists at most five people.
+        scan:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+          description: With `channel`, how many recent messages to scan for threads.
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: ["threads"]
+    pii: high
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: slack__whoami
+    description: |
+      Who this Slack connection belongs to — the user's own Slack id, handle, workspace name and workspace id. Use it to tell the user's own messages from everyone else's, to build a `from:` or mention query, and to confirm which workspace is connected. Needs no scope.
+    input_schema:
+      type: object
+      properties: {}
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+# ── Automation capability (Round 26; polling added R43) ────────────
+# Still no push path: Slack's Events API needs an app-level
+# subscription we don't provision.
+#
+# Polling was refused in R26 as "a privacy hazard at rest", and R43
+# reverses that deliberately. The hazard was a poll over the whole
+# workspace; this one reads ONE conversation the user pinned, with the
+# same user token they already granted history scopes to, and stores
+# only the dedupe key plus the declared fields. The alternative was a
+# Slack column of instant triggers that could never fire.
+#
+# R43 W3-A adds the four §7 rows. The earlier note here said they had
+# nothing to bind to, and that was true of the tool surface as it stood:
+# `conversations.history` reads a single conversation, so "I am
+# @mentioned" needed the user's own handle (nothing answered
+# `auth.test`), "a DM arrives" needed a DM listing, and "a thread I am
+# in moves" needed a `thread_ts` the pin vocabulary cannot supply.
+# `slack__list_mentions`, `slack__list_dms` and `slack__list_threads`
+# are exactly those three surfaces, each resolving the owner's identity
+# at CALL time rather than asking an automation author to hard-code it.
+#
+# No new scope: all three read under `search:read`, `im:read`/
+# `im:history` and the `channels:*`/`groups:*` pairs this connector has
+# always requested. `auth.test` needs no scope at all.
+#
+# `channel_message` stays, and stays first: it is the only row that
+# means "the place I pinned", and `oncall_message` below is a
+# deliberately literal special case of it.
+#
+# Writes stay grant-gated to ONE pinned channel.
 automation:
   push: false
-  poll: false
+  poll: true
   floor_s: 300
   rate_budget:
     per_hour: 30
     per_day: 200
   scopes_read:
     - channels:read
+    - channels:history
+    - groups:read
+    - groups:history
+    - im:read
+    - im:history
+    - mpim:read
+    - mpim:history
+    - users:read
+    # `slack__list_mentions` and the account-wide half of
+    # `slack__list_threads` are both `search.messages` calls.
+    - search:read
   scopes_write_by_action:
     slack__send_message: ["chat:write"]
   target_param_by_action:
     slack__send_message: channel
-  events: []
+  events:
+    - key: channel_message
+      description: >-
+        A message arrives in one Slack conversation you pick — a
+        channel, a group or a DM. `channel` comes from the canvas pin.
+      source_tool: slack__read_messages
+      poll_args:
+        limit: 30
+      params_required: [channel]
+      items_path: messages
+      # `ts` is unique inside a conversation, and a source lane polls
+      # exactly one conversation, so it cannot collide with another
+      # channel's message.
+      dedupe_field: ts
+      fields:
+        ts: ts
+        from: from
+        text: text
+    - key: mentioned
+      description: Someone names you in any conversation you can see.
+      source_tool: slack__list_mentions
+      poll_args:
+        limit: 30
+        strict: true
+      items_path: mentions
+      # The permalink, not `ts`: a Slack timestamp is unique inside ONE
+      # conversation and this window spans the whole workspace, so two
+      # channels can hand back the same key.
+      dedupe_field: permalink
+      # The dedupe key is COLLECTED, not just computed: an event whose
+      # payload cannot say what it deduped on is unauditable.
+      fields:
+        permalink: permalink
+        ts: ts
+        from: from
+        channel: channel_name
+        text: text
+        url: permalink
+    - key: dm_arrived
+      description: A new message arrives in one of your direct messages.
+      source_tool: slack__list_dms
+      poll_args:
+        limit: 15
+        # The trigger only needs "did the newest message change", and
+        # read state costs a second call per conversation.
+        with_unread: false
+      items_path: dms
+      # One item per CONVERSATION, keyed on its newest message — so a
+      # burst of six replies from one person while the poller sleeps is
+      # one event, not six. A DM with no messages yet answers null here
+      # and the engine skips it.
+      dedupe_field: latest_ts
+      fields:
+        latest_ts: latest_ts
+        channel: channel
+        from: user_name
+        text: latest_text
+        ts: latest_ts
+    - key: thread_moved
+      description: A thread you have replied in gets a new reply.
+      source_tool: slack__list_threads
+      poll_args:
+        limit: 10
+        only_mine: true
+      items_path: threads
+      # `latest_reply` moves on every new reply; `thread_ts` would fire
+      # once in the automation's life, which is the opposite of "moves".
+      dedupe_field: latest_reply
+      fields:
+        latest_reply: latest_reply
+        channel: channel
+        thread: thread_ts
+        from: parent_from
+        text: parent_text
+        replies: reply_count
+    - key: oncall_message
+      description: A message arrives in the channel named #oncall.
+      source_tool: slack__read_messages
+      # Literal, and needs no pin — that is the whole difference from
+      # `channel_message`, and it is the reason the row can say "#oncall"
+      # rather than "the channel you picked". A workspace whose on-call
+      # channel is named anything else (#oncall-handover, #on-call) has
+      # no channel called `oncall`, the read says so in words, and
+      # `channel_message` with a pin is the row for it.
+      poll_args:
+        channel: "#oncall"
+        limit: 30
+      items_path: messages
+      dedupe_field: ts
+      fields:
+        ts: ts
+        from: from
+        text: text

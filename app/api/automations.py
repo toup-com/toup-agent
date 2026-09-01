@@ -1526,6 +1526,25 @@ def _workflow_409(e) -> HTTPException:
     })
 
 
+# R43 §3: a name the catalogue does not hold is a MALFORMED request
+# (400) — the app hard-codes those nine strings, so it can only send an
+# unknown one by being out of date. A name the catalogue does hold but
+# this account cannot use is a 409 about state, and the app draws that
+# row with its reason instead of retrying. Collapsing the two into one
+# status hid which of the two had happened.
+_BAD_REQUEST_CODES = frozenset({
+    "unknown_channel", "unknown_format", "unknown_cadence", "unknown_source",
+})
+
+
+def _workflow_error(e) -> HTTPException:
+    if e.code in _BAD_REQUEST_CODES:
+        return HTTPException(status_code=400, detail={
+            "code": e.code, "sentence": e.sentence, **(e.extra or {}),
+        })
+    return _workflow_409(e)
+
+
 class CustomSchedule(BaseModel):
     """§4.7's `Custom…` row — what the time wheel and the weekday chips
     send. `days` is ISO (1 = Monday, 7 = Sunday); `date` makes it a
@@ -1898,7 +1917,9 @@ async def get_account_contents(automation_id: str, account_id: str):
     from app.agent.automations.service import _load_owned, AutomationNotFound
     from app.agent.automations import contents as _contents
     from app.agent.automations import registry as _reg
-    from app.agent.automations.workflow import _spec_raw, focus_of
+    from app.agent.automations.workflow import (
+        _spec_raw, account_sources_of, focus_of,
+    )
     async with async_session_maker() as db:
         try:
             automation = await _load_owned(db, automation_id, _user_id())
@@ -1906,6 +1927,11 @@ async def get_account_contents(automation_id: str, account_id: str):
             raise HTTPException(status_code=404, detail="Not found")
         raw = _spec_raw(automation)
         pins = focus_of(raw).get(account_id) or []
+        # R43 §5.1 — which places are PICKED, so each group can say
+        # whether its checkbox is on. Without it every group serves
+        # `selected: false` and the popup's ticks are all empty however
+        # many sources the user has chosen.
+        picked = account_sources_of(raw).get(account_id)
     # Outside the session on purpose: the readers below are N provider
     # calls at up to 60 s each, and holding a database connection across
     # them is the same pool-exhaustion mistake `save_permissions`
@@ -1914,7 +1940,7 @@ async def get_account_contents(automation_id: str, account_id: str):
         account_id)
     return await _contents.account_contents(
         _user_id(), connector_id=account_id, focus=pins,
-        connection=connection,
+        connection=connection, sources=picked,
     )
 
 
@@ -2032,6 +2058,129 @@ async def put_account_triggers(automation_id: str, account_id: str,
             raise HTTPException(status_code=404, detail="Not found")
         except WorkflowError as e:
             raise _workflow_409(e)
+
+
+# ── R43 §3 — delivery, the link, an account's sources, its ping ──────
+
+class DeliveryBody(BaseModel):
+    """Partial: only the keys the sheet sent are written. `channels` is
+    the whole set the rows drew, never a toggle — same reason
+    `FiltersBody` is."""
+    channels: Optional[list[str]] = Field(default=None, max_length=9)
+    format: Optional[str] = Field(default=None, max_length=32)
+    cadence: Optional[str] = Field(default=None, max_length=32)
+
+
+@router.put("/{automation_id}/workflow/delivery")
+async def put_workflow_delivery(automation_id: str, body: DeliveryBody):
+    """Where the brief reaches you. Refuses an unavailable channel
+    (409) rather than storing a delivery that silently never
+    happens."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import (
+        UNSET, WorkflowError, set_delivery,
+    )
+    sent = body.model_fields_set
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await set_delivery(
+                db, automation=automation, user_id=_user_id(),
+                # An absent key and an explicit null are different
+                # requests — "leave the channels alone" versus "send it
+                # nowhere" — and pydantic cannot tell them apart in the
+                # value, so the field set is what decides.
+                channels=body.channels if "channels" in sent else UNSET,
+                format_id=body.format if "format" in sent else UNSET,
+                cadence=body.cadence if "cadence" in sent else UNSET,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_error(e)
+
+
+class LinkBody(BaseModel):
+    channel: str = Field(..., min_length=1, max_length=32)
+
+
+@router.post("/{automation_id}/workflow/delivery/link")
+async def post_workflow_delivery_link(automation_id: str, body: LinkBody):
+    """Start linking WhatsApp or Telegram. It never SELECTS the
+    channel — the app calls PUT /delivery once the link took, so a link
+    that did not complete cannot leave a delivery pointing nowhere."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, link_channel
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await link_channel(
+                db, automation=automation, user_id=_user_id(),
+                channel=body.channel,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_error(e)
+
+
+class SourcesBody(BaseModel):
+    """The whole set the checkbox rows drew. The cap matches
+    `spec_v2.MAX_ACCOUNT_SOURCES`; the writer quotes the number back."""
+    sources: list[str] = Field(default_factory=list, max_length=10)
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/sources")
+async def put_account_sources(automation_id: str, account_id: str,
+                              body: SourcesBody):
+    """Which objects inside the account the agent may open. Same EDITED
+    note as every other workflow edit: this changes what it reads."""
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import WorkflowError, set_sources
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await set_sources(
+                db, automation=automation, user_id=_user_id(),
+                connector_id=account_id, sources=body.sources,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_error(e)
+
+
+class PingBody(BaseModel):
+    """§8 — this connector's instant pings. An explicit null CLEARS the
+    override (the automation's delivery is used again); an absent key
+    leaves that half alone."""
+    channel: Optional[str] = Field(default=None, max_length=32)
+    format: Optional[str] = Field(default=None, max_length=32)
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/ping")
+async def put_account_ping(automation_id: str, account_id: str,
+                           body: PingBody):
+    _flag_or_404()
+    from app.agent.automations.service import _load_owned, AutomationNotFound
+    from app.agent.automations.workflow import UNSET, WorkflowError, set_ping
+    sent = body.model_fields_set
+    async with async_session_maker() as db:
+        try:
+            automation = await _load_owned(db, automation_id, _user_id())
+            return await set_ping(
+                db, automation=automation, user_id=_user_id(),
+                connector_id=account_id,
+                channel=body.channel if "channel" in sent else UNSET,
+                format_id=body.format if "format" in sent else UNSET,
+            )
+        except AutomationNotFound:
+            raise HTTPException(status_code=404, detail="Not found")
+        except WorkflowError as e:
+            raise _workflow_error(e)
 
 
 class AskBody(BaseModel):

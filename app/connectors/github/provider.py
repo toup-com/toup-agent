@@ -88,6 +88,138 @@ def _org_from_restriction(body: str) -> str:
     return org if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", org) else ""
 
 
+_REPO_URL_RE = re.compile(r"/repos/([^/]+/[^/]+)/?$")
+
+#: GitHub's check-run conclusions that a human reads as "red". `failure`
+#: alone is not the set: a check that timed out or that demands manual
+#: approval blocks a merge exactly as hard, and a build_red trigger that
+#: ignored them would be silent on the two failures people escalate
+#: fastest. `neutral`/`skipped`/`cancelled`/`stale` are deliberately NOT
+#: here — none of them means the build broke.
+_FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "action_required"})
+
+_CHECK_CONCLUSIONS = (
+    "failing", "failure", "timed_out", "action_required",
+    "success", "neutral", "cancelled", "skipped", "stale",
+)
+
+
+def _repo_full_name(item: dict) -> str:
+    """`repository_url` → "owner/repo".
+
+    `search/issues` items carry no repository object, only the API URL
+    of one, so every caller that wants to say WHERE a pull request is
+    would otherwise parse this by hand.
+    """
+    m = _REPO_URL_RE.search(str(item.get("repository_url") or ""))
+    return m.group(1) if m else ""
+
+
+def _search_item(i: dict) -> dict:
+    """One `search/issues` hit, trimmed.
+
+    `comments_key` is derived, not GitHub's: it is `<id>:<comments>`,
+    which changes exactly when the comment count changes. It exists
+    because the `pr_commented` event has to dedupe on "a comment
+    arrived" and GitHub's search index exposes the COUNT and nothing
+    else — keying on `id` would fire once in the automation's life and
+    keying on `updated_at` would fire on a label change. The known miss
+    is a comment deleted and another posted between two polls: same
+    count, same key, no event.
+    """
+    comments = i.get("comments")
+    ident = i.get("id")
+    pull = i.get("pull_request") if isinstance(i.get("pull_request"), dict) else None
+    row: dict = {
+        # The GLOBAL issue id, not the per-repo `number`: a dedupe space
+        # spanning repositories cannot key on a number two repos share.
+        "id": ident,
+        "number": i.get("number"),
+        "title": i.get("title"),
+        "state": i.get("state"),
+        "repository": _repo_full_name(i),
+        "user": (i.get("user") or {}).get("login"),
+        "html_url": i.get("html_url"),
+        "is_pull_request": pull is not None,
+        "draft": i.get("draft"),
+        "comments": comments,
+        "comments_key": (
+            f"{ident}:{comments}" if ident is not None and comments is not None
+            else None
+        ),
+        "created_at": i.get("created_at"),
+        "updated_at": i.get("updated_at"),
+        "labels": [
+            str(l.get("name")) for l in (i.get("labels") or [])
+            if isinstance(l, dict) and l.get("name")
+        ][:10],
+    }
+    if pull is not None and pull.get("merged_at"):
+        row["merged_at"] = pull.get("merged_at")
+    return row
+
+
+_GH_DATE_RE = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})?)?\Z")
+
+
+def _with_updated_since(q: str, raw) -> str:
+    """`q` narrowed to what changed since `raw`, or `q` unchanged.
+
+    A PARAM rather than a query term because a chip cannot carry a
+    clock: R43 §6's "Changed since yesterday" compiles as a
+    `time_window` into `updated_since`, the executor writes an ISO
+    timestamp there, and turning that into GitHub's `updated:>=` is this
+    file's job — which is what keeps the compile vocabulary at five
+    kinds instead of six.
+
+    Fails OPEN on an unparseable bound (the read is wider, never empty)
+    and leaves a query that already names `updated:` alone, so a step
+    with its own window keeps it.
+    """
+    text = str(raw or "").strip()
+    if not text or not _GH_DATE_RE.match(text):
+        return q
+    if "updated:" in q.lower():
+        return q
+    return f"{q} updated:>={text}".strip()
+
+
+def _check_row(r: dict) -> dict:
+    return {
+        "id": r.get("id"),
+        "name": r.get("name"),
+        "status": r.get("status"),
+        "conclusion": r.get("conclusion"),
+        "head_sha": r.get("head_sha"),
+        "html_url": r.get("html_url"),
+        "started_at": r.get("started_at"),
+        "completed_at": r.get("completed_at"),
+        "app": (r.get("app") or {}).get("name"),
+    }
+
+
+def _check_rollup(rows: list[dict]) -> str:
+    """One word for the whole ref, computed over EVERY run — never over
+    the filtered subset, or a `conclusion=failing` read would always
+    report the ref as failing even when it holds one stale red among
+    twenty greens."""
+    if not rows:
+        return "none"
+    if any(str(r.get("conclusion") or "") in _FAILING_CONCLUSIONS for r in rows):
+        return "failure"
+    if any(str(r.get("status") or "") != "completed" for r in rows):
+        return "pending"
+    return "success"
+
+
+def _clamp(raw, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _handle_response(resp: httpx.Response, *, scope_hint: str = "") -> dict:
     if 200 <= resp.status_code < 300:
         if resp.headers.get("content-type", "").startswith("application/json"):
@@ -256,6 +388,13 @@ class GitHubProvider(BaseConnectorProvider):
                         "description": r.get("description"),
                         "html_url": r.get("html_url"),
                         "default_branch": r.get("default_branch"),
+                        # GitHub's own meaning: issues AND pull requests
+                        # together. Callers that phrase it as "N PRs"
+                        # are wrong about this number, not about the
+                        # field — the automations source list says
+                        # "open" for exactly that reason.
+                        "open_issues_count": r.get("open_issues_count"),
+                        "pushed_at": r.get("pushed_at"),
                     }
                     for r in (result if isinstance(result, list) else [])
                 ]
@@ -302,6 +441,12 @@ class GitHubProvider(BaseConnectorProvider):
                         "user": (i.get("user") or {}).get("login"),
                         "html_url": i.get("html_url"),
                         "is_pull_request": "pull_request" in i,
+                        # Present on pull requests only, and absent (not
+                        # False) on plain issues — which is what lets a
+                        # caller tell "this PR is ready for a human"
+                        # from "this row is not a PR at all".
+                        "draft": i.get("draft"),
+                        "updated_at": i.get("updated_at"),
                     }
                     for i in (result if isinstance(result, list) else [])
                 ]
@@ -322,6 +467,107 @@ class GitHubProvider(BaseConnectorProvider):
                 return ConnectorOk(content=json.dumps({
                     "id": result.get("id"),
                     "html_url": result.get("html_url"),
+                }))
+
+            if tool_name == "github__search_issues":
+                q = str(tool_input.get("q") or "").strip()
+                if not q:
+                    return ConnectorToolError(message="q required", retryable=False)
+                q = _with_updated_since(q, tool_input.get("updated_since"))
+                params = {
+                    "q": q,
+                    "per_page": _clamp(tool_input.get("per_page"), 30, 1, 100),
+                    # GitHub's new issue-search engine. Sent explicitly
+                    # rather than left to the default so the qualifiers
+                    # the automation events depend on — `review:approved`,
+                    # `review-requested:@me`, `status:failure` — are always
+                    # evaluated by the engine that documents them.
+                    "advanced_search": "true",
+                }
+                sort = str(tool_input.get("sort") or "").strip()
+                if sort in ("comments", "created", "updated", "reactions"):
+                    params["sort"] = sort
+                    params["order"] = (
+                        "asc" if str(tool_input.get("order") or "") == "asc"
+                        else "desc"
+                    )
+                result = await _gh_request(
+                    "GET", "/search/issues",
+                    access_token=access_token, params=params, scope_hint="repo",
+                )
+                return ConnectorOk(content=json.dumps({
+                    "total_count": result.get("total_count"),
+                    # GitHub caps the search index at 1000 results and
+                    # says so here; a caller reading `total_count` as a
+                    # promise it can page to all of them is wrong.
+                    "incomplete_results": result.get("incomplete_results"),
+                    "items": [
+                        _search_item(i) for i in (result.get("items") or [])
+                        if isinstance(i, dict)
+                    ],
+                }))
+
+            if tool_name == "github__list_check_runs":
+                owner = tool_input.get("owner")
+                repo = tool_input.get("repo")
+                if not (owner and repo):
+                    return ConnectorToolError(message="owner/repo required", retryable=False)
+                ref = str(tool_input.get("ref") or "").strip()
+                if not ref:
+                    # The pin vocabulary reaches a repository and stops —
+                    # there is no `ref` focus kind — so a repo-only caller
+                    # has to mean the branch the repo itself calls default.
+                    meta = await _gh_request(
+                        "GET", f"/repos/{owner}/{repo}",
+                        access_token=access_token, scope_hint="repo",
+                    )
+                    ref = str(meta.get("default_branch") or "").strip()
+                    if not ref:
+                        return ConnectorToolError(
+                            message=(
+                                f"{owner}/{repo} reports no default branch, so there "
+                                f"is no commit to read checks from. Pass `ref`."
+                            ),
+                            retryable=False,
+                        )
+                params = {
+                    "per_page": _clamp(tool_input.get("per_page"), 30, 1, 100),
+                    # One row per check NAME, the newest run of each.
+                    # Without this a re-run repository answers with every
+                    # historical attempt and a red that was fixed an hour
+                    # ago still reads as red.
+                    "filter": "latest",
+                }
+                status = str(tool_input.get("status") or "").strip()
+                if status in ("queued", "in_progress", "completed"):
+                    params["status"] = status
+                result = await _gh_request(
+                    "GET", f"/repos/{owner}/{repo}/commits/{ref}/check-runs",
+                    access_token=access_token, params=params, scope_hint="repo",
+                )
+                rows = [
+                    _check_row(r) for r in (result.get("check_runs") or [])
+                    if isinstance(r, dict)
+                ]
+                rollup = _check_rollup(rows)
+                want = str(tool_input.get("conclusion") or "").strip().lower()
+                if want == "failing":
+                    rows = [
+                        r for r in rows
+                        if str(r.get("conclusion") or "") in _FAILING_CONCLUSIONS
+                    ]
+                elif want:
+                    rows = [
+                        r for r in rows
+                        if str(r.get("conclusion") or "").lower() == want
+                    ]
+                return ConnectorOk(content=json.dumps({
+                    "owner": owner,
+                    "repo": repo,
+                    "ref": ref,
+                    "conclusion": rollup,
+                    "total_count": result.get("total_count"),
+                    "check_runs": rows,
                 }))
 
             if tool_name == "github__search_code":

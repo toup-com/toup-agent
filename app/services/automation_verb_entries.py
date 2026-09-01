@@ -93,6 +93,11 @@ ENTRIES: dict[str, dict] = {
                 "detail": "{count} thread(s) matched",
                 "progressive": "searching your mail",
             },
+            "gmail__list_labels": {
+                "action": "Checked your Gmail labels",
+                "detail": "{count} label(s)",
+                "progressive": "checking your Gmail labels",
+            },
             "*": {
                 "action": "Checked Gmail",
                 "detail": "{count} item(s)",
@@ -127,6 +132,11 @@ ENTRIES: dict[str, dict] = {
                 "action": "Read one thread",
                 "detail": "the one that needed it",
                 "progressive": "reading a thread",
+            },
+            "outlook__list_folders": {
+                "action": "Checked your Outlook folders",
+                "detail": "{count} folder(s)",
+                "progressive": "checking your Outlook folders",
             },
             "*": {
                 "action": "Checked Outlook",
@@ -167,6 +177,31 @@ ENTRIES: dict[str, dict] = {
                 "action": "Looked at your channels",
                 "detail": "{count} channel(s)",
                 "progressive": "looking at your channels",
+            },
+            "slack__list_mentions": {
+                "action": "Checked who named you",
+                "detail": "{count} mention(s)",
+                "progressive": "checking who named you",
+            },
+            "slack__list_dms": {
+                "action": "Checked your DMs",
+                "detail": "{count} direct message(s)",
+                "progressive": "checking your DMs",
+            },
+            "slack__list_threads": {
+                "action": "Checked your threads",
+                "detail": "{count} thread(s)",
+                "progressive": "checking your threads",
+            },
+            "slack__conversation_info": {
+                "action": "Checked one conversation",
+                "detail": "",
+                "progressive": "checking the conversation",
+            },
+            "slack__whoami": {
+                "action": "Checked your Slack account",
+                "detail": "",
+                "progressive": "checking your Slack account",
             },
             "*": {
                 "action": "Checked Slack",
@@ -248,6 +283,16 @@ ENTRIES: dict[str, dict] = {
                 "detail": "{count} open pull request(s)",
                 "progressive": "reading your repositories",
             },
+            "github__search_issues": {
+                "action": "Searched GitHub",
+                "detail": "{count} pull request(s)",
+                "progressive": "searching GitHub",
+            },
+            "github__list_check_runs": {
+                "action": "Checked the build",
+                "detail": "{count} check(s)",
+                "progressive": "checking the build",
+            },
             "*": {
                 "action": "Checked GitHub",
                 "detail": "{count} item(s)",
@@ -312,6 +357,11 @@ ENTRIES: dict[str, dict] = {
                 "detail": "{count} page(s) changed",
                 "progressive": "reading your pages",
             },
+            "notion__query_database": {
+                "action": "Checked your pages",
+                "detail": "{count} row(s)",
+                "progressive": "checking your pages",
+            },
             "*": {
                 "action": "Checked Notion",
                 "detail": "{count} page(s)",
@@ -328,6 +378,14 @@ ENTRIES: dict[str, dict] = {
                 "progressive": "writing the page",
                 "job_label": "added a page",
                 "clause": "add a Notion page",
+            },
+            "notion__append_blocks": {
+                "action": "Added to your page",
+                "action_others": "Added to {target}",
+                "detail": "appended to the end, nothing overwritten",
+                "progressive": "adding to your page",
+                "job_label": "added to your page",
+                "clause": "add to your Notion page",
             },
         },
         "trigger_sub": "when a page changes",

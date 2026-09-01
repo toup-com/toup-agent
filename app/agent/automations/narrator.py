@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from . import copy_guard
@@ -268,6 +269,69 @@ def validate_drafts(drafts: list[dict], record: dict) -> list[str]:
         problems.append("a failed run carries no result turn")
 
     return problems
+
+
+#: R43 §9. `validate_drafts` prefixes every problem with the turn it is
+#: about, and until now nobody read that back — `_narrate_phase1` logged
+#: the list at INFO and persisted the drafts anyway, so a result whose
+#: every row was rejected was still served as the user's brief. These
+#: two patterns turn the log line into a decision.
+_TURN_REF_RE = re.compile(r"^turn\[(\d+)\](?:\.groups\[(\d+)\]\.rows\[(\d+)\])?")
+
+#: Problems `validate_drafts` raises about the result WITHOUT naming a
+#: turn. "unaccounted items" is deliberately not here: the ledger's own
+#: reconciliation appends the missing ids as a count row, which is a
+#: better answer than throwing a good ranking away.
+_RESULT_SCOPED_PROBLEMS = (
+    "expected exactly one result turn",
+    "a failed run carries no result turn",
+)
+
+
+def unservable_results(drafts: list[dict], problems: list[str]) -> set:
+    """Indices of `result` drafts that must not be served as a brief.
+
+    A result is dropped when it cannot be read as one: a structural
+    violation (wrong vocabulary, wrong title, tiers that are not the
+    vocabulary's), no rows at all, or every row it does have rejected.
+    A result with SOME good rows is kept — a bad `tag` on one line is
+    not a reason to replace a real ranking with "I could not rank them".
+
+    Dropping is not silence. `close_ledger`'s completeness net owes the
+    thread exactly one result turn, and the honest mechanical one it
+    appends says what happened; the five empty headings this replaces
+    said nothing at all.
+    """
+    out: set = set()
+    if not isinstance(drafts, list):
+        return out
+    result_ix = [i for i, d in enumerate(drafts)
+                 if isinstance(d, dict) and d.get("kind") == "result"]
+    if not result_ix:
+        return out
+    unindexed = [p for p in (problems or [])
+                 if any(p.startswith(x) for x in _RESULT_SCOPED_PROBLEMS)]
+    if unindexed:
+        return set(result_ix)
+    for i in result_ix:
+        structural = False
+        flagged: set = set()
+        for p in problems or []:
+            m = _TURN_REF_RE.match(str(p))
+            if m is None or int(m.group(1)) != i:
+                continue
+            if m.group(2) is None:
+                structural = True
+            else:
+                flagged.add((int(m.group(2)), int(m.group(3))))
+        rows_total = sum(
+            len(g.get("rows") or [])
+            for g in (drafts[i].get("groups") or [])
+            if isinstance(g, dict)
+        )
+        if structural or rows_total == 0 or len(flagged) >= rows_total:
+            out.add(i)
+    return out
 
 
 def _validate_result(
@@ -781,6 +845,7 @@ async def narrate_run(record: dict, *, complete=None) -> dict:
     prompt = build_prompt(record)
     drafts: list[dict] = []
     problems: list[str] = ["not attempted"]
+    unservable: set = set()
     attempts = 0
     for attempts in (1, 2):
         try:
@@ -789,10 +854,20 @@ async def narrate_run(record: dict, *, complete=None) -> dict:
             logger.warning("[automations] narrator LLM call failed: %s: %s",
                            type(e).__name__, str(e)[:200])
             return {"turns": drafts, "problems": [f"llm: {type(e).__name__}"],
-                    "attempts": attempts}
+                    "attempts": attempts,
+                    # The drafts are the PREVIOUS attempt's, already
+                    # rejected; nothing here has been re-validated, so
+                    # every result in them is unservable.
+                    "unservable": sorted(
+                        i for i, d in enumerate(drafts)
+                        if isinstance(d, dict) and d.get("kind") == "result")}
         drafts = payload.get("turns") if isinstance(payload, dict) else None
         drafts = drafts if isinstance(drafts, list) else []
         problems = validate_drafts(drafts, record)
+        # Recomputed on EVERY attempt, before the break: a retry that
+        # comes back clean must not inherit the first attempt's verdict
+        # on a result it has since replaced.
+        unservable = unservable_results(drafts, problems) if problems else set()
         if not problems:
             break
         prompt = (
@@ -801,7 +876,8 @@ async def narrate_run(record: dict, *, complete=None) -> dict:
               "and emit the full turn list again:\n- "
             + "\n- ".join(problems[:40])
         )
-    return {"turns": drafts, "problems": problems, "attempts": attempts}
+    return {"turns": drafts, "problems": problems, "attempts": attempts,
+            "unservable": sorted(unservable)}
 
 
 async def _default_complete(prompt: str, tool: dict) -> dict:

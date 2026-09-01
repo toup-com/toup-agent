@@ -90,7 +90,9 @@ async def test_the_build_ledger_records_measured_phases_and_survives():
     assert payload is not None
     assert payload["source"] == "template"
     ids = [s["id"] for s in payload["steps"]]
-    assert ids == ["trigger", "agent", "output", "account:jira"], ids
+    # R43: the account phases are TIMED per account and TOLD per BAND
+    # (design §8), so one Jira account becomes the WORK band's one step.
+    assert ids == ["trigger", "agent", "output", "band:work"], ids
     for step in payload["steps"]:
         assert step["title"] and isinstance(step["title"], str)
         assert isinstance(step["sub"], str)
@@ -200,7 +202,7 @@ async def test_from_template_writes_the_history_it_returns(monkeypatch):
     assert history and history["source"] == "template"
     ids = [s["id"] for s in history["steps"]]
     assert ids[:3] == ["trigger", "agent", "output"], ids
-    assert "account:jira" in ids and "account:slack" in ids, ids
+    assert "band:work" in ids and "band:chat" in ids, ids
 
     async with async_session_maker() as db:
         row = await db.get(Automation, out["automation"]["id"])
@@ -409,10 +411,14 @@ async def test_an_expired_connection_never_makes_the_call(monkeypatch):
 async def test_a_connector_with_no_reader_says_so_by_name():
     from app.agent.automations import contents
 
-    env = await contents.account_contents("u", connector_id="notion")
+    # R43 gave Notion a reader (it is in the design's PLANS band), so the
+    # example moved to one that still has none. The behaviour under test is
+    # the SENTENCE naming the connector — an unnamed "not supported" reads
+    # as the whole popup being broken.
+    env = await contents.account_contents("u", connector_id="drive")
     assert env["ok"] is False
     assert env["reason"]["code"] == "not_supported"
-    assert "Notion" in env["reason"]["sentence"]
+    assert "Drive" in env["reason"]["sentence"]
 
 
 @pytest.mark.asyncio

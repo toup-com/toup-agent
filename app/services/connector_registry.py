@@ -172,6 +172,13 @@ class AutomationEventSpec(BaseModel):
     fields: dict[str, str] = Field(default_factory=dict)
     # Dot-path to the list of items inside the tool's JSON result.
     items_path: Optional[str] = None
+    #: R43 §7 — the narrowing this event IS, evaluated against the push
+    #: item by `filter_evaluator.matches_filter` (`from_contains`,
+    #: `subject_contains`, `labels`, `exclude_categories`). Gmail's four
+    #: events all ride the ONE `users.watch` feed, so without this each
+    #: compiles to a Trigger row that fires on every message and four
+    #: events turned on means four runs per incoming mail.
+    default_filter: dict = Field(default_factory=dict)
 
 
 class AutomationCapability(BaseModel):
@@ -343,6 +350,7 @@ class ConnectorRegistry:
                         "description": ev.description,
                         "source_tool": ev.source_tool,
                         "poll_args": dict(ev.poll_args),
+                        "default_filter": dict(ev.default_filter),
                         "params_required": list(ev.params_required),
                         "items_path": ev.items_path,
                         "dedupe_field": ev.dedupe_field,

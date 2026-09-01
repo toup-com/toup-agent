@@ -63,6 +63,28 @@ _TOOL_VERBS: dict[str, tuple[str, str, Optional[str]]] = {
     "outlook__list_messages": ("Checking Outlook", "Checked Outlook",
                                "Read {count} Outlook emails"),
     "outlook__get_message": ("Reading an email", "Read the email", None),
+    "gmail__list_labels": ("Checking your Gmail labels",
+                           "Checked your Gmail labels",
+                           "Found {count} labels"),
+    "outlook__list_folders": ("Checking your Outlook folders",
+                              "Checked your Outlook folders",
+                              "Found {count} folders"),
+    "github__search_issues": ("Searching GitHub", "Searched GitHub",
+                              "Found {count} pull requests"),
+    "github__list_check_runs": ("Checking the build", "Checked the build",
+                                "Read {count} checks"),
+    "slack__list_mentions": ("Checking who named you",
+                             "Checked who named you",
+                             "Found {count} mentions"),
+    "slack__list_dms": ("Checking your DMs", "Checked your DMs",
+                        "Read {count} direct messages"),
+    "slack__list_threads": ("Checking your threads", "Checked your threads",
+                            "Found {count} threads"),
+    "slack__conversation_info": ("Checking Slack", "Checked Slack", None),
+    "slack__whoami": ("Checking your Slack account",
+                      "Checked your Slack account", None),
+    "notion__query_database": ("Checking Notion", "Checked Notion",
+                               "Read {count} Notion rows"),
     "jira__search_issues": ("Checking Jira", "Checked Jira",
                             "Read {count} Jira issues"),
     "github__list_issues": ("Checking GitHub", "Checked GitHub",
@@ -76,6 +98,8 @@ _TOOL_VERBS: dict[str, tuple[str, str, Optional[str]]] = {
     "calendar__list_events": ("Checking your calendar",
                               "Checked your calendar",
                               "Found {count} events"),
+    "slack__read_messages": ("Checking Slack", "Checked Slack",
+                             "Read {count} Slack messages"),
     "stub__list_items": ("Checking the test feed", "Checked the test feed",
                          "Read {count} test items"),
     # writes
@@ -93,6 +117,10 @@ _TOOL_VERBS: dict[str, tuple[str, str, Optional[str]]] = {
     "notion__create_page": ("Creating a Notion page",
                             "Created a Notion page", None),
     "docs__append_text": ("Updating the doc", "Updated the doc", None),
+    "notion__append_blocks": ("Adding to your Notion page",
+                              "Added to your Notion page", None),
+    "calendar__create_event": ("Holding time on your calendar",
+                               "Held time on your calendar", None),
     "stub__post": ("Posting to the test channel",
                    "Posted to the test channel", None),
 }
@@ -303,6 +331,8 @@ _WRITE_CLAUSES = {
     "jira__create_issue": "create a Jira issue",
     "github__create_comment": "comment on GitHub",
     "notion__create_page": "add a Notion page",
+    "notion__append_blocks": "add to your Notion page",
+    "calendar__create_event": "put a hold on your calendar",
     "docs__append_text": "update your doc",
     "stub__post": "post to the test channel",
 }
@@ -312,7 +342,7 @@ def is_write_tool(tool: Optional[str]) -> bool:
     """True when `tool` is a declared write action (R36-5).
 
     The manifests' `scopes_write_by_action` keys and this table are the
-    same ten tools, and this one is importable without the registry —
+    same set of tools, and this one is importable without the registry —
     which is what the raw-spec derivations (`workflow._write_tools`,
     `service._permissive_registry_v2`) need: an UNGRANTED template
     write step carries no grant_id and no grant_target key, so grant
@@ -605,6 +635,14 @@ _V2_WRITE: dict[str, dict[str, str]] = {
     "docs__append_text": {
         "action": "Added to the doc", "action_others": "Added to {target}",
         "detail": "appended, nothing removed",
+    },
+    "notion__append_blocks": {
+        "action": "Added to your page", "action_others": "Added to {target}",
+        "detail": "appended to the end, nothing overwritten",
+    },
+    "calendar__create_event": {
+        "action": "Held time for you", "action_others": "Held time on {target}",
+        "detail": "a hold on your calendar, nobody invited",
     },
     "stub__post": {
         "action": "Posted to the test channel",

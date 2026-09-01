@@ -113,8 +113,10 @@ def test_specific_round28_shape_pins(entries):
         "https://graph.microsoft.com/Mail.ReadWrite"]
     assert entries["outlook"]["target_param_by_action"][
         "outlook__create_draft"] == "to"
+    # R43 declared the design's §3 events per connector; Outlook gained
+    # "A meeting request arrives".
     assert [e["key"] for e in entries["outlook"]["events"]] == [
-        "email_received"]
+        "email_received", "meeting_request"]
     # Teams: chat polling requires the chat id.
     teams_ev = entries["teams"]["events"][0]
     assert teams_ev["params_required"] == ["chat_id"]

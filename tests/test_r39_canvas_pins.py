@@ -205,7 +205,11 @@ async def test_a_person_pin_orders_the_mailbox_it_never_scopes_it(
         "u", connector_id="gmail", connection=_LIVE,
         focus=[{"kind": "person", "id": "sara@x.com", "label": "Sara"}],
     )
-    assert sorted(seen) == ["", "from:sara@x.com"]
+    # R43 added the unread probe that answers §4's `hot` for Gmail — the
+    # list call carries no labelIds, so "is this unread" needs its own
+    # id-only read. The pin's own query and the plain recent read are what
+    # this test is about, and both are still exactly one call each.
+    assert sorted(seen) == ["", "from:sara@x.com", "is:unread in:inbox"]
     assert [(g["key"], g["pinned"]) for g in env["groups"]] == [
         ("from:sara@x.com", True), ("recent", False)]
 
@@ -488,12 +492,15 @@ async def test_a_dead_credential_outranks_a_missing_reader(monkeypatch):
     assert missing["reason"]["code"] == "not_connected"
     assert missing["reason"]["consent_url"].endswith("/notion")
 
-    # With a live connection the old answer survives, by name.
+    # With a live connection the old answer survives, by name. R43 gave
+    # Notion a reader, so the connector with none moved to Drive — what is
+    # under test is that a dead credential outranks a missing reader, not
+    # which connector happens to lack one.
     unsupported = await contents.account_contents(
-        "u", connector_id="notion", connection=_LIVE,
+        "u", connector_id="drive", connection=_LIVE,
     )
     assert unsupported["reason"]["code"] == "not_supported"
-    assert "Notion" in unsupported["reason"]["sentence"]
+    assert "Drive" in unsupported["reason"]["sentence"]
 
 
 # ─────────────────────────────────────── 2. one runnability predicate

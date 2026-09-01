@@ -42,6 +42,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from typing import Any, ClassVar, Optional
 
 import httpx
@@ -84,6 +85,13 @@ _MAX_SEARCH_COUNT = 100
 # fifty different people would otherwise turn one read into fifty API
 # calls. Beyond the cap ids are left as ids, which reads badly but never
 # rate-limits the user out of their own workspace.
+#: How many DM conversations `slack__list_dms` will probe for their
+#: latest message and unread state. Each one is 1-2 extra calls, so
+#: this is the number that keeps a single sheet-open inside
+#: `conversations.history`'s Tier-3 budget rather than a display cap.
+_MAX_DM_PROBE = 25
+#: Same shape for threads: one `conversations.replies` per thread.
+_MAX_THREAD_PROBE = 25
 _MAX_USER_LOOKUPS = 25
 _USER_LOOKUP_CONCURRENCY = 5
 
@@ -352,6 +360,92 @@ class _UserCache:
 
 _USERS = _UserCache()
 
+#: token fingerprint → (stamped, identity). `auth.test` needs no scope
+#: and its answer cannot change for the life of a token, so this is one
+#: call per credential per process rather than one per read.
+#:
+#: The whole body is cached, not just the id: R43 needs the HANDLE too
+#: (Slack search's `from:` / mention modifiers speak handles, not ids)
+#: and re-calling `auth.test` for the second field of the same answer
+#: would be a second round-trip for nothing.
+_SELF_IDS: dict[str, tuple[float, dict]] = {}
+
+_EMPTY_IDENTITY: dict = {"user_id": "", "handle": "", "team": "", "team_id": "",
+                         "url": ""}
+
+
+async def _self_identity(access_token: str) -> dict:
+    """`{user_id, handle, team, team_id, url}` for the connected human.
+
+    Needed because a message that NAMES you is the only "this is for
+    you" signal a user token gets from the Web API: `conversations.list`
+    and `conversations.history` both carry unread state for nobody.
+    Failures answer the empty identity rather than raising — an
+    unresolved self id costs a highlight, and must never cost the read.
+    Callers that CANNOT proceed without it (mentions, my-threads) check
+    for the empty string and say so.
+    """
+    fp = _fingerprint(access_token)
+    hit = _SELF_IDS.get(fp)
+    if hit is not None and time.monotonic() - hit[0] <= _USER_CACHE_TTL_S:
+        return hit[1]
+    try:
+        body = await _call("auth.test", access_token=access_token)
+    except _SlackError:
+        return dict(_EMPTY_IDENTITY)
+    ident = {
+        "user_id": str(body.get("user_id") or ""),
+        "handle": str(body.get("user") or ""),
+        "team": str(body.get("team") or ""),
+        "team_id": str(body.get("team_id") or ""),
+        "url": str(body.get("url") or ""),
+    }
+    _SELF_IDS[fp] = (time.monotonic(), ident)
+    return ident
+
+
+async def _self_user_id(access_token: str) -> str:
+    return (await _self_identity(access_token)).get("user_id") or ""
+
+
+async def self_identity_for_user(user_id: str) -> dict:
+    """The connected human's own Slack identity, resolved from the vault.
+
+    Public because delivery needs it and delivery does not hold a token:
+    `slack_dm` has to prove that the `U…` it is about to message is the
+    OWNER of this connection and not some colleague, and
+    `ConnectorIdentity.provider_account_id` is empty for Slack (oauth.py
+    reads `tokens["account"]`/`["login"]`, while Slack's
+    `token_lift_key: authed_user` puts the id under `id` — see this
+    package's report). Same process-lifetime cache as every other read,
+    so asking on each delivery costs one call per token per hour.
+
+    Answers the empty identity rather than raising: a delivery that
+    cannot prove the target is the owner must decline, not crash.
+    """
+    try:
+        token = await _resolve_token(user_id)
+    except _SlackError:
+        return dict(_EMPTY_IDENTITY)
+    return await _self_identity(token)
+
+
+async def _last_read(channel: str, *, access_token: str) -> str:
+    """The caller's own read cursor on one conversation, or "".
+
+    Fails OPEN — an unreadable cursor widens the read rather than
+    emptying it. Slack declines read state for conversations the token
+    is not a member of, and a "Since my last read" chip that silently
+    returned nothing would look exactly like a quiet channel.
+    """
+    try:
+        data = await _call("conversations.info", access_token=access_token,
+                           params={"channel": channel})
+    except _SlackError:
+        return ""
+    ch = data.get("channel")
+    return str(ch.get("last_read") or "") if isinstance(ch, dict) else ""
+
 
 def _display_name(member: dict) -> str:
     """Slack stores a name in four places and populates a different one
@@ -616,22 +710,47 @@ def _channel_row(c: dict, names: dict[str, str]) -> dict:
     return row
 
 
-def _message_row(m: dict, names: dict[str, str]) -> dict:
+def _message_row(m: dict, names: dict[str, str],
+                 self_id: str = "") -> dict:
     uid = str(m.get("user") or "")
+    raw = str(m.get("text") or "")
     row: dict[str, Any] = {
         "ts": m.get("ts"),
         # A message from an app or a workflow has `bot_id` and no `user`;
         # `username` is then the only name available.
         "from": names.get(uid) or m.get("username") or uid or "(app)",
-        "text": _render_text(str(m.get("text") or ""), names),
+        "text": _render_text(raw, names),
     }
+    if self_id:
+        # Read from the RAW text, before `_render_text` rewrites
+        # `<@U04J1F2>` into a display name — after that rewrite the id
+        # is gone and there is nothing left to match on. `@here`/
+        # `@channel` are deliberately not mentions of a person.
+        row["mentions_me"] = f"<@{self_id}>" in raw
+    if m.get("bot_id"):
+        # An app, a workflow or an integration posted this. Slack gives
+        # a bot post a `bot_id` and usually no `user`, so this is the
+        # only reliable "not a person" signal on a message — `subtype`
+        # answers a different question (channel_join, file_share…) and
+        # is absent on a plain bot message. R43's "Skip bots" chip
+        # drops on this field; without it the chip could only guess.
+        row["bot_id"] = m.get("bot_id")
     if m.get("thread_ts") and m.get("thread_ts") != m.get("ts"):
         row["in_thread_of"] = m.get("thread_ts")
+    if m.get("thread_ts"):
+        # ALWAYS the thread this message belongs to — the parent's ts on
+        # a reply, its own on a parent. `in_thread_of` above says the
+        # same thing for replies only and stays for the callers already
+        # reading it; "Threads I am in" needs one field that is present
+        # on both halves of a thread.
+        row["thread_ts"] = m.get("thread_ts")
     if m.get("reply_count"):
         # The channel view shows only the parent, so without this the
         # agent cannot tell that a one-line message has 40 replies under it.
         row["reply_count"] = m.get("reply_count")
         row["thread_ts"] = m.get("ts")
+        if m.get("latest_reply"):
+            row["latest_reply"] = m.get("latest_reply")
     files = m.get("files")
     if isinstance(files, list) and files:
         row["files"] = [
@@ -641,6 +760,30 @@ def _message_row(m: dict, names: dict[str, str]) -> dict:
     if m.get("subtype"):
         row["subtype"] = m.get("subtype")
     return row
+
+
+def _permalink_thread(permalink: Optional[str]) -> str:
+    """The `thread_ts` a Slack permalink carries, or "".
+
+    This is the whole reason "threads you replied in" is affordable.
+    `search.messages` answers `from:@me` in ONE call but its match
+    objects carry no `thread_ts` — and a permalink to a threaded reply
+    does:
+
+        https://acme.slack.com/archives/C01/p1756400100000100
+            ?thread_ts=1756400000.000100&cid=C01
+
+    So the search names the threads and one `conversations.replies` per
+    thread fills them in, instead of reading every channel.
+    """
+    if not permalink:
+        return ""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(str(permalink)).query)
+    except ValueError:
+        return ""
+    got = (q.get("thread_ts") or [""])[0].strip()
+    return got if re.fullmatch(r"\d+\.\d+", got) else ""
 
 
 def _speaker_ids(messages: list[dict]) -> list[str]:
@@ -760,6 +903,16 @@ class SlackProvider(BaseConnectorProvider):
                 return await self._send_message(tool_input, access_token)
             if tool_name == "slack__list_users":
                 return await self._list_users(tool_input, access_token)
+            if tool_name == "slack__conversation_info":
+                return await self._conversation_info(tool_input, access_token)
+            if tool_name == "slack__list_dms":
+                return await self._list_dms(tool_input, access_token)
+            if tool_name == "slack__list_mentions":
+                return await self._list_mentions(tool_input, access_token)
+            if tool_name == "slack__list_threads":
+                return await self._list_threads(tool_input, access_token)
+            if tool_name == "slack__whoami":
+                return await self._whoami(tool_input, access_token)
             return ConnectorToolError(
                 message=f"unknown slack tool {tool_name!r}", retryable=False,
             )
@@ -807,11 +960,25 @@ class SlackProvider(BaseConnectorProvider):
             str(ti.get("channel") or ""), access_token=token, for_write=False,
         )
         thread_ts = (ti.get("thread_ts") or "").strip()
+        self_id = await _self_user_id(token)
+        applied: list[str] = []
+
+        oldest = (ti.get("oldest") or "").strip()
+        if not oldest and ti.get("since_last_read") and not thread_ts:
+            # R43 §6 "Since my last read". A separate call because Slack
+            # puts read state on `conversations.info` and nowhere else —
+            # `conversations.history` has no notion of who is asking.
+            # An explicit `oldest` always wins: a bound the spec already
+            # set is narrower than "everything since I last looked".
+            oldest = await _last_read(channel, access_token=token)
+            if oldest:
+                applied.append("since_last_read")
+
         params = {
             "channel": channel,
             "limit": _clamp(ti.get("limit", 30), 30, 1, _MAX_PAGE),
             "cursor": (ti.get("cursor") or "").strip(),
-            "oldest": (ti.get("oldest") or "").strip(),
+            "oldest": oldest,
         }
         if thread_ts:
             params["ts"] = thread_ts
@@ -821,11 +988,61 @@ class SlackProvider(BaseConnectorProvider):
 
         raw = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         names = await _resolve_users(_speaker_ids(raw), access_token=token)
+        rows = [_message_row(m, names, self_id) for m in raw]
+
+        # The two narrowings Slack's API cannot express and a `drop`
+        # cannot either: both need to know WHO is asking, and only this
+        # file can answer that. They REFUSE rather than widen when the
+        # identity is unknown — handing back the whole channel under
+        # "Mentions me" is the chip that lies.
+        if ti.get("mentions_only"):
+            if not self_id:
+                return ConnectorToolError(
+                    message=(
+                        "Cannot narrow to messages that name you: Slack did not "
+                        "say who this connection belongs to. Reconnect Slack."
+                    ),
+                    retryable=False,
+                )
+            rows = [r for r in rows if r.get("mentions_me")]
+            applied.append("mentions_only")
+
+        if ti.get("threads_only") and not thread_ts:
+            if not self_id:
+                return ConnectorToolError(
+                    message=(
+                        "Cannot narrow to threads you are in: Slack did not say "
+                        "who this connection belongs to. Reconnect Slack."
+                    ),
+                    retryable=False,
+                )
+            # `reply_users` rides on the PARENT, which is the only row a
+            # channel history carries for a thread — Slack keeps replies
+            # out of `conversations.history` entirely. It is capped at
+            # five, so this can miss a very busy thread; it never invents
+            # one.
+            mine = {
+                str(m.get("ts") or "")
+                for m in raw
+                if isinstance(m.get("reply_users"), list)
+                and self_id in m["reply_users"]
+            }
+            rows = [
+                r for r in rows
+                if str(r.get("ts") or "") in mine
+                or str(r.get("thread_ts") or "") in mine
+            ]
+            applied.append("threads_only")
 
         return ConnectorOk(content=json.dumps({
             "channel": channel,
             "thread_ts": thread_ts or None,
-            "messages": [_message_row(m, names) for m in raw],
+            "messages": rows,
+            "oldest": oldest or None,
+            # What the tool actually did, so a run ledger can say it and
+            # a lit chip that changed nothing is visible rather than
+            # assumed.
+            "applied": applied,
             "has_more": bool(data.get("has_more")),
             "next_cursor": (data.get("response_metadata") or {}).get("next_cursor") or None,
         }, ensure_ascii=False))
@@ -937,6 +1154,353 @@ class SlackProvider(BaseConnectorProvider):
         return ConnectorOk(content=json.dumps({
             "users": users,
             "next_cursor": (data.get("response_metadata") or {}).get("next_cursor") or None,
+        }, ensure_ascii=False))
+
+    # ── R43 tools ──
+
+    async def _whoami(self, ti: dict, token: str) -> ConnectorResult:
+        ident = await _self_identity(token)
+        if not ident.get("user_id"):
+            return ConnectorToolError(
+                message=(
+                    "Slack did not say who this connection belongs to. The token "
+                    "may have been revoked — reconnect Slack and try again."
+                ),
+                retryable=True,
+            )
+        return ConnectorOk(content=json.dumps(ident, ensure_ascii=False))
+
+    async def _conversation_info(self, ti: dict, token: str) -> ConnectorResult:
+        channel = await _resolve_channel(
+            str(ti.get("channel") or ""), access_token=token, for_write=False,
+        )
+        params: dict[str, Any] = {"channel": channel}
+        if ti.get("include_num_members"):
+            params["include_num_members"] = "true"
+        data = await _call("conversations.info", access_token=token, params=params)
+        c = data.get("channel")
+        if not isinstance(c, dict):
+            return ConnectorToolError(
+                message=f"Slack returned no conversation for {channel!r}.",
+                retryable=True,
+            )
+        names = await _resolve_users(
+            [str(c.get("user") or "")] if c.get("is_im") else [],
+            access_token=token,
+        )
+        row = _channel_row(c, names)
+        row["archived"] = bool(c.get("is_archived"))
+        # Read state. Slack hands these to a USER token for a
+        # conversation that token is a member of, and to nobody else —
+        # so `unread_supported` is not decoration: without it a caller
+        # cannot tell "you have read everything" from "Slack declined to
+        # say", and the first reading of the second is how a source row
+        # comes to claim 0 unread on a channel with fifty.
+        has_read_state = "last_read" in c
+        row["unread_supported"] = has_read_state
+        if has_read_state:
+            row["last_read"] = c.get("last_read")
+        for key in ("unread_count", "unread_count_display"):
+            if key in c:
+                row[key] = c.get(key)
+        latest = c.get("latest")
+        if isinstance(latest, dict):
+            speakers = await _resolve_users(
+                _speaker_ids([latest]), access_token=token,
+            )
+            row["latest"] = _message_row(
+                latest, speakers, await _self_user_id(token),
+            )
+        return ConnectorOk(content=json.dumps(row, ensure_ascii=False))
+
+    async def _list_dms(self, ti: dict, token: str) -> ConnectorResult:
+        """Direct messages, newest first, with who and how many unread.
+
+        Three callers, one shape: the "Direct messages" source row needs
+        a real count, the `dm_arrived` trigger needs a per-conversation
+        latest timestamp to dedupe on, and Slack-DM delivery needs to
+        find the conversation whose counterpart IS the connected user
+        (`is_self`) — Slack's own saved-messages DM.
+        """
+        limit = _clamp(ti.get("limit", 15), 15, 1, _MAX_DM_PROBE)
+        with_unread = bool(ti.get("with_unread", True))
+        data = await _call(
+            "conversations.list", access_token=token,
+            params={
+                "types": (ti.get("types") or "im,mpim"),
+                "exclude_archived": "true",
+                "limit": _MAX_PAGE,
+            },
+        )
+        raw = [c for c in (data.get("channels") or []) if isinstance(c, dict)]
+        names = await _resolve_users(
+            [str(c.get("user")) for c in raw if c.get("user")], access_token=token,
+        )
+        self_id = await _self_user_id(token)
+        probed = raw[:limit]
+
+        sem = asyncio.Semaphore(_USER_LOOKUP_CONCURRENCY)
+
+        async def one(c: dict) -> dict:
+            cid = str(c.get("id") or "")
+            uid = str(c.get("user") or "")
+            row: dict[str, Any] = {
+                "channel": cid,
+                "is_group": bool(c.get("is_mpim")),
+                "user_id": uid or None,
+                "user_name": names.get(uid, uid) or None,
+                # The one row Slack-DM delivery may write to without
+                # messaging another human.
+                "is_self": bool(uid and self_id and uid == self_id),
+                "latest_ts": None,
+                "latest_from": None,
+                "latest_text": None,
+                "unread_supported": False,
+            }
+            async with sem:
+                try:
+                    hist = await _call(
+                        "conversations.history", access_token=token,
+                        params={"channel": cid, "limit": 1},
+                    )
+                except _SlackError:
+                    hist = {}
+                msgs = [m for m in (hist.get("messages") or []) if isinstance(m, dict)]
+                if msgs:
+                    speakers = await _resolve_users(
+                        _speaker_ids(msgs[:1]), access_token=token,
+                    )
+                    shaped = _message_row(msgs[0], speakers, self_id)
+                    row["latest_ts"] = shaped.get("ts")
+                    row["latest_from"] = shaped.get("from")
+                    row["latest_text"] = shaped.get("text")
+                    if shaped.get("bot_id"):
+                        row["latest_bot_id"] = shaped["bot_id"]
+                if with_unread:
+                    try:
+                        info = await _call(
+                            "conversations.info", access_token=token,
+                            params={"channel": cid},
+                        )
+                    except _SlackError:
+                        info = {}
+                    ch = info.get("channel") if isinstance(info, dict) else None
+                    if isinstance(ch, dict) and "last_read" in ch:
+                        row["unread_supported"] = True
+                        row["last_read"] = ch.get("last_read")
+                        row["unread_count"] = ch.get("unread_count")
+                        row["unread_count_display"] = ch.get("unread_count_display")
+            return row
+
+        rows = list(await asyncio.gather(*(one(c) for c in probed)))
+        rows.sort(
+            key=lambda r: (
+                -int(r.get("unread_count_display") or 0),
+                -float(r.get("latest_ts") or 0),
+            ),
+        )
+        unread_total = sum(
+            int(r.get("unread_count_display") or 0) for r in rows
+        )
+        return ConnectorOk(content=json.dumps({
+            "dms": rows,
+            # `total` is every DM conversation Slack listed; `dms` is the
+            # bounded slice actually probed. Reporting only the slice
+            # would make "you have 40 DMs" read as 25.
+            "total": len(raw),
+            "probed": len(rows),
+            "unread_total": unread_total if with_unread else None,
+            "unread_supported": any(r.get("unread_supported") for r in rows),
+        }, ensure_ascii=False))
+
+    async def _list_mentions(self, ti: dict, token: str) -> ConnectorResult:
+        """Messages that name the connected user, newest first.
+
+        Its own tool rather than an argument to `slack__search_messages`
+        because the query is not knowable when an automation is written:
+        it is the token owner's handle, resolved at call time from
+        `auth.test`.
+        """
+        ident = await _self_identity(token)
+        handle = ident.get("handle") or ""
+        self_id = ident.get("user_id") or ""
+        if not handle:
+            return ConnectorToolError(
+                message=(
+                    "Slack did not say who this connection belongs to, so there "
+                    "is no handle to search mentions of. Reconnect Slack."
+                ),
+                retryable=True,
+            )
+        query = f"@{handle}"
+        extra = str(ti.get("query") or "").strip()
+        if extra:
+            query = f"{query} {extra}"
+        data = await _call(
+            "search.messages", access_token=token,
+            params={
+                "query": query,
+                "sort": "timestamp",
+                "sort_dir": "desc",
+                "count": _clamp(ti.get("limit", 30), 30, 1, _MAX_SEARCH_COUNT),
+                "page": 1,
+            },
+        )
+        block = data.get("messages") or {}
+        raw = [m for m in (block.get("matches") or []) if isinstance(m, dict)]
+        names = await _resolve_users(_speaker_ids(raw), access_token=token)
+
+        strict = bool(ti.get("strict", True))
+        out = []
+        for m in raw:
+            uid = str(m.get("user") or "")
+            text = str(m.get("text") or "")
+            # Slack's index matches the HANDLE, which also hits someone
+            # typing the name as plain text. The real mention is the
+            # `<@U…>` run, read before `_render_text` rewrites it away.
+            named = bool(self_id) and f"<@{self_id}>" in text
+            if strict and not named:
+                continue
+            # A message where the owner named themselves is not someone
+            # asking them for something.
+            if uid and self_id and uid == self_id:
+                continue
+            ch = m.get("channel") or {}
+            out.append({
+                "ts": m.get("ts"),
+                "from": names.get(uid) or m.get("username") or uid or "(app)",
+                "from_id": uid or None,
+                "channel_id": ch.get("id"),
+                "channel_name": ch.get("name") or (
+                    "(direct message)" if ch.get("is_im") else None),
+                "text": _render_text(text, names),
+                "mentions_me": named,
+                # The dedupe key. A `ts` is unique only INSIDE one
+                # conversation and this window spans the workspace.
+                "permalink": m.get("permalink"),
+            })
+        return ConnectorOk(content=json.dumps({
+            "handle": handle,
+            "total": block.get("total"),
+            "mentions": out,
+        }, ensure_ascii=False))
+
+    async def _list_threads(self, ti: dict, token: str) -> ConnectorResult:
+        """Threads the connected user is in, and when each last moved.
+
+        Two routes, because the two questions have different shapes.
+        With `channel`: the threads under one conversation. Without: the
+        threads the user has REPLIED in anywhere, found by searching
+        their own messages and reading each hit's permalink for the
+        `thread_ts` the search result itself does not carry.
+        """
+        limit = _clamp(ti.get("limit", 10), 10, 1, _MAX_THREAD_PROBE)
+        only_mine = bool(ti.get("only_mine", True))
+        self_id = await _self_user_id(token)
+        pairs: list[tuple[str, Optional[str], str]] = []  # (channel, name, ts)
+        replied: set[tuple[str, str]] = set()
+
+        channel_raw = str(ti.get("channel") or "").strip()
+        if channel_raw:
+            cid = await _resolve_channel(
+                channel_raw, access_token=token, for_write=False,
+            )
+            data = await _call(
+                "conversations.history", access_token=token,
+                params={"channel": cid,
+                        "limit": _clamp(ti.get("scan", 50), 50, 1, _MAX_PAGE)},
+            )
+            for m in (data.get("messages") or []):
+                if not isinstance(m, dict) or not m.get("reply_count"):
+                    continue
+                ts = str(m.get("ts") or "")
+                if not ts:
+                    continue
+                pairs.append((cid, None, ts))
+                # `reply_users` is Slack's own list of who is in the
+                # thread. It is capped at five, so it can miss a busy
+                # thread — which is why `only_mine` reads it as evidence
+                # FOR inclusion and the search route below, where every
+                # hit is the user's own message, needs no evidence.
+                users = m.get("reply_users")
+                if isinstance(users, list) and self_id and self_id in users:
+                    replied.add((cid, ts))
+        else:
+            ident = await _self_identity(token)
+            handle = ident.get("handle") or ""
+            if not handle:
+                return ConnectorToolError(
+                    message=(
+                        "Slack did not say who this connection belongs to, so "
+                        "\"threads I am in\" has no owner to look for. Reconnect Slack."
+                    ),
+                    retryable=True,
+                )
+            data = await _call(
+                "search.messages", access_token=token,
+                params={"query": f"from:@{handle}", "sort": "timestamp",
+                        "sort_dir": "desc", "count": _MAX_SEARCH_COUNT, "page": 1},
+            )
+            block = data.get("messages") or {}
+            for m in (block.get("matches") or []):
+                if not isinstance(m, dict):
+                    continue
+                ts = _permalink_thread(m.get("permalink"))
+                ch = m.get("channel") or {}
+                cid = str(ch.get("id") or "")
+                if not (ts and cid):
+                    continue
+                pairs.append((cid, ch.get("name"), ts))
+                replied.add((cid, ts))
+
+        seen: set[tuple[str, str]] = set()
+        wanted: list[tuple[str, Optional[str], str]] = []
+        for cid, name, ts in pairs:
+            if (cid, ts) in seen:
+                continue
+            if only_mine and (cid, ts) not in replied:
+                continue
+            seen.add((cid, ts))
+            wanted.append((cid, name, ts))
+            if len(wanted) >= limit:
+                break
+
+        sem = asyncio.Semaphore(_USER_LOOKUP_CONCURRENCY)
+
+        async def one(cid: str, name: Optional[str], ts: str) -> Optional[dict]:
+            async with sem:
+                try:
+                    data = await _call(
+                        "conversations.replies", access_token=token,
+                        params={"channel": cid, "ts": ts, "limit": 1},
+                    )
+                except _SlackError:
+                    return None
+            msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+            if not msgs:
+                return None
+            parent = msgs[0]
+            names = await _resolve_users(
+                _speaker_ids([parent]), access_token=token,
+            )
+            shaped = _message_row(parent, names, self_id)
+            return {
+                "channel": cid,
+                "channel_name": name,
+                "thread_ts": ts,
+                "parent_from": shaped.get("from"),
+                "parent_text": shaped.get("text"),
+                "reply_count": parent.get("reply_count") or 0,
+                # The dedupe key for "a thread I am in moves": the ts of
+                # the newest reply, which changes on every new one.
+                "latest_reply": parent.get("latest_reply"),
+                "i_replied": (cid, ts) in replied,
+            }
+
+        got = await asyncio.gather(*(one(c, n, t) for c, n, t in wanted))
+        return ConnectorOk(content=json.dumps({
+            "threads": [g for g in got if g],
+            "scope": channel_raw or "everywhere you have replied",
         }, ensure_ascii=False))
 
     # ── Lifecycle ──

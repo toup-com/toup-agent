@@ -997,6 +997,57 @@ async def proxy_account_triggers(
     )
 
 
+# ── R43 §3 — delivery, the link, an account's sources, its ping ──────
+#
+# The phone only ever hits the proxy, so a route that exists agent-side
+# alone is invisible to the app — which is how R42's writers were found
+# to be half-shipped. Every one of the four is mirrored verbatim; the
+# agent owns the vocabulary and the refusals.
+
+@router.put("/{automation_id}/workflow/delivery")
+async def proxy_workflow_delivery(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/delivery",
+                        current_user=current_user, db=db)
+
+
+@router.post("/{automation_id}/workflow/delivery/link")
+async def proxy_workflow_delivery_link(
+    automation_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(request, f"/{automation_id}/workflow/delivery/link",
+                        current_user=current_user, db=db)
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/sources")
+async def proxy_account_sources(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/sources",
+        current_user=current_user, db=db,
+    )
+
+
+@router.put("/{automation_id}/workflow/accounts/{account_id}/ping")
+async def proxy_account_ping(
+    automation_id: str, account_id: str, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _proxy(
+        request, f"/{automation_id}/workflow/accounts/{account_id}/ping",
+        current_user=current_user, db=db,
+    )
+
+
 @router.post("/{automation_id}/workflow/ask")
 async def proxy_workflow_ask(
     automation_id: str, request: Request,

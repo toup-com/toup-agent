@@ -58,7 +58,7 @@ health:
 tools:
   - name: notion__search
     description: |
-      Search the connected Notion workspace for pages and databases by title. Only content the user has explicitly shared with this connection is visible — an empty result usually means "not shared yet", not "does not exist". Returns ids, titles and URLs; use notion__get_page_content to read a page's body.
+      Search the connected Notion workspace for pages and databases by title. Only content the user has explicitly shared with this connection is visible — an empty result usually means "not shared yet", not "does not exist". Returns ids, titles and URLs; use notion__get_page_content to read a page's body. Each result also carries state ("active", "archived" or "in_trash") and change_key ("<page id>@<last edited time>"), which changes only when the page does. Search cannot narrow by person or by time — use notion__query_database for either.
     input_schema:
       type: object
       properties:
@@ -135,7 +135,7 @@ tools:
 
   - name: notion__query_database
     description: |
-      Query a Notion database and return its rows with properties flattened to plain values. Accepts either a database id/URL or a data source id. `filter` and `sorts` take Notion's own query syntax, e.g. filter {"property":"Status","status":{"equals":"Done"}} and sorts [{"property":"Due","direction":"ascending"}]. Omit both to list everything.
+      Query a Notion database and return its rows with properties flattened to plain values. Accepts either a database id/URL or a data source id. `filter` and `sorts` take Notion's own query syntax, e.g. filter {"property":"Status","status":{"equals":"Done"}} and sorts [{"property":"Due","direction":"ascending"}]. Omit both to list everything. `edited_since` and `assigned_to_me` are composed onto whatever `filter` you pass, never instead of it. Every row carries state, change_key, deadline_key ("<page id>@<its date>", so it moves only when the date moves) and people (the person ids named on it).
     input_schema:
       type: object
       properties:
@@ -158,6 +158,13 @@ tools:
           minimum: 1
           maximum: 100
           default: 25
+        edited_since:
+          type: string
+          description: ISO timestamp — only rows edited on or after it. Sorts newest-edited first unless you pass your own sorts.
+        assigned_to_me:
+          type: boolean
+          description: Only rows naming you in a person column (any of them). Fails with an explanation if the connection cannot say who you are or the table has no person column — it never widens to the whole table instead.
+          default: false
         start_cursor:
           type: string
           description: Pagination cursor from a previous call's next_cursor.
@@ -166,6 +173,31 @@ tools:
     elevation: false
     output_redaction: ["results"]
     pii: medium
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: notion__append_blocks
+    description: |
+      Append content to the END of an existing Notion page. Use this to add to a page that already exists — a running log, a daily brief, a notes page — rather than notion__create_page, which makes a NEW child page every time. Nothing already on the page is edited or removed; the append only ever adds to the bottom, so the user can edit or delete what was added. `heading` writes one heading above the appended text, which is how "under today's date" is done: pass the date as the heading.
+    input_schema:
+      type: object
+      properties:
+        page_id:
+          type: string
+          description: Page to append to (id or Notion URL). This is the parameter an automation grant is pinned to.
+        heading:
+          type: string
+          description: Optional heading written immediately above the appended text — e.g. today's date.
+        content:
+          type: string
+          description: Text to append. Each line becomes its own paragraph.
+      required: [page_id]
+    mutates: true
+    elevation: true
+    output_redaction: ["heading", "content"]
+    pii: medium
+    rate_limit: "10/min"
     channel_policy:
       default: allow
       deny: []
@@ -204,13 +236,32 @@ tools:
       default: allow
       deny: []
 
-# ── Automation capability (Round 28) ──────────────────────────────
-# Notion has no webhooks for public integrations — poll only, via
-# search. Notion search sorts by last_edited_time and the event dedupe
-# gate fires once per page id, so the event is honestly "first time a
-# page is seen", not "page updated". Notion OAuth has no granular
-# scopes (empty lists are the truth); the grant is still the write
-# gate, pinned to one parent page.
+# ── Automation capability (Round 28, extended R43) ────────────────
+# Notion has no webhooks for public integrations — poll only. Notion
+# OAuth has no granular scopes (empty lists are the truth); the grant
+# is still the write gate, pinned to one page or one parent page.
+#
+# R43 added a second write and two events, and NO scope moved, because
+# there are none to move: what an append may do is decided by the
+# integration's "insert content" capability and by which pages the user
+# shared with the connection, both of them outside this file.
+#
+# The two events R28 could not declare are declared now, and the reason
+# each was blocked is gone rather than argued around:
+#
+#   `page_changed` was blocked because dedupe on `last_edited_time`
+#   alone collapses two pages edited in the same minute into one event.
+#   The key is `change_key` — "<page id>@<last edited>" — which is
+#   unique per page per minute. It polls `notion__query_database` with
+#   `assigned_to_me`, so the row it announces really is one tagged to
+#   the user rather than any page in the workspace; that is why it
+#   requires a database to be pinned.
+#
+#   `deadline_moved` was blocked because "an edit" and "a deadline
+#   moved" were the same signal. `deadline_key` is
+#   "<page id>@<the row's date>", so it changes when the DATE changes
+#   and not when the body does, and a row carrying no date answers None
+#   and never fires.
 automation:
   push: false
   poll: true
@@ -221,8 +272,10 @@ automation:
   scopes_read: []
   scopes_write_by_action:
     notion__create_page: []
+    notion__append_blocks: []
   target_param_by_action:
     notion__create_page: parent_page_id
+    notion__append_blocks: page_id
   events:
     - key: page_added
       description: >-
@@ -239,3 +292,33 @@ automation:
         title: title
         url: url
         last_edited_time: last_edited_time
+    - key: page_changed
+      description: A row tagged to you, in a database you pick, is edited.
+      source_tool: notion__query_database
+      poll_args:
+        page_size: 25
+        assigned_to_me: true
+      params_required: [database_id]
+      items_path: results
+      dedupe_field: change_key
+      fields:
+        id: id
+        title: title
+        url: url
+        change_key: change_key
+        last_edited_time: last_edited_time
+    - key: deadline_moved
+      description: >-
+        A date on a row in a database you pick moves. Rows with no date
+        property never fire.
+      source_tool: notion__query_database
+      poll_args:
+        page_size: 25
+      params_required: [database_id]
+      items_path: results
+      dedupe_field: deadline_key
+      fields:
+        id: id
+        title: title
+        url: url
+        deadline_key: deadline_key

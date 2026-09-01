@@ -40,6 +40,7 @@ from app.db.models import (
 from app.agent.job_runner import JobRunner, TaskSpec
 from app.agent import job_steps
 from .spec import (
+    filter_compile as _filter_compile,
     filter_options as _filter_options,
     filter_tools as _filter_tools,
     focus_render_ctx as _focus_render_ctx,
@@ -52,6 +53,7 @@ from .session import on_run_created
 from . import agent_step as _agent_step
 from . import memory as engine_memory
 from . import registry as reg
+from app.connectors.textclean import unescape_once
 
 logger = logging.getLogger(__name__)
 
@@ -296,9 +298,20 @@ def _collect_result(step: ValidatedStep, content: dict,
     raw_fields: list[dict] = []
     if fmt:
         for item in items[:limit]:
+            # ONE decode, at ingestion (R43). These raw values are the OTHER
+            # derivation of the same provider text: the rendered line below
+            # becomes the item's `title`, and these become its `head`/`lede`
+            # through `ledger.item_slots`. The line was unescaped here and the
+            # fields were not, so `mint_item_ids` had to unescape a second
+            # time to reach them — which decoded the line TWICE and turned a
+            # sender's literal `&amp;` into `&`. Cleaning both here is what
+            # lets every layer downstream strip tags only.
             item_fields = {
-                name: resolve_path(item, path)
-                for name, path in (collect.get("fields") or {}).items()
+                name: (unescape_once(v) if isinstance(v, str) else v)
+                for name, v in (
+                    (name, resolve_path(item, path))
+                    for name, path in (collect.get("fields") or {}).items()
+                )
             }
             raw_fields.append(item_fields)
             lines.append(strip_html(str(render_value(
@@ -561,27 +574,24 @@ def _and_terms(query: str, term: str) -> str:
 #: address containing "or" are not mistaken for it.
 _HAS_OR = re.compile(r"\bOR\b")
 
-_GMAIL_TERMS = {
-    "me": "to:me",
-    "unread": "is:unread",
-    # Gmail's own tab, which is where every bulk mailing this filter
-    # means already lands. There is no "newsletter" predicate.
-    "no_promos": "-category:promotions",
-    "day": "newer_than:1d",
-}
-
-_JQL_CLAUSES = {
-    "priority": "priority in (Highest, High)",
-    "open": "statusCategory != Done",
-    "due_week": "duedate <= endOfWeek()",
-    "day": "updated >= -1d",
-}
-
-
 def _apply_read_filters(
     connector_id: str, tool: str, params: dict, filters: list,
     clock: dict,
 ) -> dict:
+    """The user's picked filters, compiled into ONE provider call.
+
+    R43 §6: the table declares WHAT each chip does (`spec.CONNECTOR_
+    FILTERS[…]["compile"]`, a closed five-kind vocabulary) and this
+    owns HOW. It used to own both — a per-connector `if` ladder with its
+    own copy of Gmail's terms and Jira's clauses — so a chip could be
+    added to the table, drawn in the popup, saved on the account, and
+    change nothing about the read. Reading the compile list here is what
+    makes "offered" and "narrows" the same fact.
+
+    Pure and total: unknown connector, unknown tool, malformed params,
+    or a filter that needs a clock the run did not supply → the params
+    come back untouched.
+    """
     if not filters or not isinstance(params, dict):
         return params
     # Table order, never the caller's: the same filter set has to
@@ -596,65 +606,216 @@ def _apply_read_filters(
     if not isinstance(now, datetime):
         now = None
     out = dict(params)
+    jql_clauses: list[str] = []
 
-    if connector_id == "gmail":
-        for fid in wanted:
-            term = _GMAIL_TERMS.get(fid)
-            if not term:
+    for fid in wanted:
+        for m in _filter_compile(connector_id, fid, tool):
+            kind = m.get("kind")
+            if kind == "query_term":
+                field = str(m.get("param") or "query")
+                term = str(m.get("value") or "")
+                if not term:
+                    continue
+                # A filter is per ACCOUNT and composes into every read
+                # step on it, and one shipped template deliberately runs
+                # two Gmail windows: the Morning brief's `mail` is
+                # `newer_than:1d` and its `waiting` is `older_than:1d
+                # newer_than:7d` — the separate window IS the age. ANDing
+                # `newer_than:1d` onto the second makes a query that can
+                # never match, which `empty_text` then states as the fact
+                # "Nothing waiting on you." A step that already carries
+                # its own lower age bound keeps it.
+                if (term.startswith("newer_than:")
+                        and "older_than:" in str(out.get(field) or "")):
+                    continue
+                out[field] = _and_terms(out.get(field), term)
+            elif kind == "jql_and":
+                clause = str(m.get("value") or "")
+                if clause:
+                    jql_clauses.append(clause)
+            elif kind == "param":
+                name = str(m.get("name") or "")
+                if name:
+                    # SET, not merged: read state is a partition rather
+                    # than a bound, and leaving `is_read: true` under a
+                    # lit "Unread only" is the chip that lies.
+                    out[name] = m.get("value")
+            elif kind == "time_window":
+                _apply_time_filter(out, m, now)
+            elif kind == "drop":
+                # The one kind that runs AFTER the call — no provider
+                # query expresses it. `_apply_read_drops` owns it.
                 continue
-            # A filter is per ACCOUNT and composes into every read step on
-            # it, and one shipped template deliberately runs two Gmail
-            # windows: the Morning brief's `mail` is `newer_than:1d` and its
-            # `waiting` is `older_than:1d newer_than:7d` — the separate
-            # window IS the age. ANDing `newer_than:1d` onto the second
-            # makes a query that can never match, which `empty_text` then
-            # states as the fact "Nothing waiting on you." A step that
-            # already carries its own lower age bound keeps it.
-            if fid == "day" and "older_than:" in str(out.get("query") or ""):
-                continue
-            out["query"] = _and_terms(out.get("query"), term)
-        return out
 
-    if connector_id == "jira":
-        clauses = [c for c in (_JQL_CLAUSES.get(f) for f in wanted) if c]
-        if clauses:
-            out["jql"] = _and_jql(out.get("jql"), clauses)
-        return out
-
-    if connector_id == "outlook":
-        for fid in wanted:
-            if fid == "unread":
-                out["is_read"] = False
-            elif fid == "day" and now is not None:
-                out["since"] = _later_iso(
-                    out.get("since"),
-                    (now - timedelta(days=1)).replace(
-                        microsecond=0).isoformat(),
-                )
-        return out
-
-    if connector_id == "slack":
-        for fid in wanted:
-            if fid != "day" or now is None:
-                continue
-            since = now - timedelta(days=1)
-            if tool == "slack__read_messages":
-                # Seconds, the unit conversations.history takes.
-                out["oldest"] = _later_ts(out.get("oldest"),
-                                          f"{since.timestamp():.0f}")
-            elif "after:" not in str(out.get("query") or "").lower():
-                # Slack search takes ONE `after:`; a second is not an extra
-                # AND, so this is the one place a present term is left
-                # alone. `after:` is EXCLUSIVE of the day it names, so the
-                # day BEFORE the window's start is what makes the search a
-                # superset of the 24 hours `oldest` gives the other tool —
-                # one chip, one meaning, whichever Slack read it lands on.
-                out["query"] = _and_terms(
-                    out.get("query"),
-                    f"after:{(since - timedelta(days=1)).date().isoformat()}")
-        return out
-
+    if jql_clauses:
+        # ONE pass: re-splitting per clause would wrap the query again
+        # each time, and four filters produced four nested layers of
+        # parentheses around a query a person has to be able to read.
+        out["jql"] = _and_jql(out.get("jql"), jql_clauses)
     return out
+
+
+def _apply_time_filter(out: dict, m: dict, now: Optional[datetime]) -> None:
+    """One `time_window` mutation, in place.
+
+    A bound only ever moves INWARD — a filter narrows a read, it may
+    never widen one the spec already narrowed — so "back" takes the
+    LATER of the two lower bounds and "ahead" additionally takes the
+    EARLIER of the two upper ones.
+    """
+    if now is None:
+        return
+    hours = m.get("hours")
+    try:
+        hours = int(hours)
+    except (TypeError, ValueError):
+        return
+    field = str(m.get("param") or "")
+    if not field:
+        return
+    unit = str(m.get("unit") or "iso")
+    if str(m.get("direction") or "back") == "ahead":
+        lo = now.replace(microsecond=0)
+        hi = (now + timedelta(hours=hours)).replace(microsecond=0)
+        out[field] = _later_iso(out.get(field), lo.isoformat())
+        max_field = str(m.get("max_param") or "")
+        if max_field:
+            out[max_field] = _earlier_iso(out.get(max_field), hi.isoformat())
+        return
+    since = now - timedelta(hours=hours)
+    if unit == "unix":
+        # Seconds, the unit conversations.history takes.
+        out[field] = _later_ts(out.get(field), f"{since.timestamp():.0f}")
+    elif unit == "slack_after":
+        # Slack search takes ONE `after:`; a second is not an extra AND,
+        # so this is the one place a present term is left alone.
+        # `after:` is EXCLUSIVE of the day it names, so the day BEFORE
+        # the window's start is what makes the search a superset of the
+        # hours `oldest` gives the other tool — one chip, one meaning,
+        # whichever Slack read it lands on.
+        if "after:" in str(out.get(field) or "").lower():
+            return
+        out[field] = _and_terms(
+            out.get(field),
+            f"after:{(since - timedelta(days=1)).date().isoformat()}")
+    else:
+        out[field] = _later_iso(
+            out.get(field), since.replace(microsecond=0).isoformat())
+
+
+def _drop_field(item: Any, field: str) -> Any:
+    """One field off a raw provider row. `resolve_path` so a `drop` can
+    name a nested one (`from.emailAddress.address`) without this file
+    knowing any provider's shape."""
+    if not isinstance(item, (dict, list)):
+        return None
+    return resolve_path(item, field) if "." in field else (
+        item.get(field) if isinstance(item, dict) else None)
+
+
+def _drops_item(item: Any, m: dict, now: Optional[datetime]) -> bool:
+    """Does this `drop` mutation remove this row?
+
+    Fails SAFE in every unreadable case: a row whose field cannot be
+    read, a bound that will not parse, a `when` this file does not know
+    — the row STAYS. A filter that silently deleted material it could
+    not judge would be the same lie as a chip that narrows nothing,
+    pointed the other way.
+    """
+    when = str(m.get("when") or "")
+    value = _drop_field(item, str(m.get("field") or ""))
+    if when == "present":
+        return value not in (None, "", [], {})
+    if when == "absent":
+        return value in (None, "", [], {})
+    if when == "contains":
+        text = str(value or "").lower()
+        if not text:
+            return False
+        return any(str(v).lower() in text
+                   for v in (m.get("values") or ()) if v)
+    if when == "older_than":
+        if now is None:
+            return False
+        try:
+            hours = int(m.get("hours"))
+            at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=now.tzinfo)
+        return at < now - timedelta(hours=hours)
+    return False
+
+
+def _apply_read_drops(
+    connector_id: str, tool: str, content: dict, filters: list,
+    collect: Optional[dict], clock: dict,
+) -> dict:
+    """The `drop` half of the compile vocabulary — the narrowings no
+    provider query can express (R43 §6).
+
+    Outlook has no KQL predicate for automated mail: `NOT from:noreply`
+    inside a `$search` narrows only that one literal address. So "Skip
+    automated mail" removes the rows AFTER the call, which is honest
+    about what it is — the count the step reports is the count the user
+    is shown, because it is the same list.
+
+    Pure and total: no drop filters, no collect, or an items path that
+    is not a list → the content comes back unchanged, never emptied.
+    """
+    if not isinstance(content, dict) or not filters:
+        return content
+    on = {f for f in filters if isinstance(f, str)}
+    mutations = [
+        m
+        for f in _filter_options(connector_id) if f["id"] in on
+        and tool in _filter_tools(connector_id, f["id"])
+        for m in _filter_compile(connector_id, f["id"], tool)
+        if m.get("kind") == "drop"
+    ]
+    if not mutations:
+        return content
+    path = str((collect or {}).get("items_path") or "")
+    if not path:
+        return content
+    items = resolve_path(content, path)
+    if not isinstance(items, list):
+        return content
+    now = clock.get("now") if isinstance(clock, dict) else None
+    if not isinstance(now, datetime):
+        now = None
+    kept = [it for it in items
+            if not any(_drops_item(it, m, now) for m in mutations)]
+    if len(kept) == len(items):
+        return content
+    out = dict(content)
+    # One level only: every shipped `items_path` is a top-level key and
+    # rebuilding an arbitrary nesting would be a second path language.
+    if "." in path:
+        return content
+    out[path] = kept
+    return out
+
+
+def _cmp_iso(a: str, b: str) -> Optional[bool]:
+    """`a < b`, or None when either will not parse.
+
+    Naive and AWARE are compared as though both were UTC. The run clock
+    is tz-aware (`_run_steps`' `_clock`) and a spec's own bound is a
+    string an author typed, so mixing the two is the ordinary case —
+    and `datetime.__lt__` raises TypeError across it. That exception
+    landed in the `except` below, which returns the spec's bound: the
+    lit "Last 24 hours" chip narrowed nothing at all whenever the step
+    already carried a naive `since`.
+    """
+    try:
+        x, y = datetime.fromisoformat(a), datetime.fromisoformat(b)
+    except (TypeError, ValueError):
+        return None
+    if (x.tzinfo is None) != (y.tzinfo is None):
+        x, y = x.replace(tzinfo=None), y.replace(tzinfo=None)
+    return x < y
 
 
 def _later_iso(current: Any, candidate: str) -> str:
@@ -667,11 +828,18 @@ def _later_iso(current: Any, candidate: str) -> str:
     cur = str(current or "").strip()
     if not cur:
         return candidate
-    try:
-        return candidate if (datetime.fromisoformat(cur)
-                             < datetime.fromisoformat(candidate)) else cur
-    except (TypeError, ValueError):
-        return cur
+    less = _cmp_iso(cur, candidate)
+    return candidate if less else cur
+
+
+def _earlier_iso(current: Any, candidate: str) -> str:
+    """The earlier of two ISO upper bounds — the "ahead" half of the
+    same rule `_later_iso` enforces for a lower one."""
+    cur = str(current or "").strip()
+    if not cur:
+        return candidate
+    less = _cmp_iso(candidate, cur)
+    return candidate if less else cur
 
 
 def _later_ts(current: Any, candidate: str) -> str:
@@ -781,6 +949,16 @@ async def _execute_read_step(
         content = {}
     if not isinstance(content, dict):
         content = {}
+    # The `drop` half of the filter vocabulary, on the way back: the
+    # narrowings no provider query can express. Before `_collect_result`
+    # so the step's COUNT is the count of what survived — a filtered
+    # read that still reported the provider's total would put a number
+    # in the brief that nothing in it accounts for.
+    content = _apply_read_drops(
+        step.connector_id, step.tool, content,
+        (ctx.get("_filters") or {}).get(step.connector_id) or [],
+        step.collect, ctx.get("_clock") or {},
+    )
     return _collect_result(step, content, ctx.get("var") or {})
 
 
@@ -1276,6 +1454,24 @@ async def _run_steps(
         )
         await _record_health(db, automation.id, ok=True, error=None,
                              ran=True, clean=not partial)
+
+    # R43 §1.2 — and only now. Delivery fans the BRIEF out, so it has to
+    # come after the result turn exists AND after the ledger close that
+    # may still be repairing it (the mechanical fallback, the missing-
+    # item row, the "nothing came back" row). Delivering from inside
+    # narration would post whatever the narrator happened to emit, which
+    # is exactly the half of the run the completeness net exists for.
+    #
+    # It is also after the terminal, deliberately: a delivery row is an
+    # outbox row like any other, and `outbox._finalize_run` aggregates
+    # siblings — so a Slack DM that failed would otherwise flip a run
+    # that had already told the user it was done. `_finalize_job`'s
+    # guarded UPDATE makes the aggregate a no-op on a terminal row.
+    if outcome != "failed":
+        await _deliver_run_brief(
+            db, automation=automation, vspec=vspec, job_id=job_id,
+            thread=thread, source=source, idem_prefix=idem_prefix,
+        )
 
     counts = {
         sid: res.get("count")
@@ -2168,6 +2364,7 @@ async def _append_read_turn(
         return
     try:
         from . import ledger as _ledger
+        from .ledger import item_slots as _ledger_item_slots
         from app.services import automation_verbs as _verbs
         if ok:
             extra = {}
@@ -2176,10 +2373,26 @@ async def _append_read_turn(
                 step.connector_id, step.tool, kind="read", ok=True,
                 count=count if isinstance(count, int) else None,
             )
-            items = [
-                {"title": str(line)[:200], "sub": "", "why": ""}
-                for line in ((result or {}).get("lines") or [])
-            ]
+            # R43 §9 — the display slots beside the ranked line. The
+            # line stays the item's `title` (the narrator ranks on it,
+            # and the mechanical fallback prints it); `head`/`lede` and
+            # who/at/where/hot are what the brief's card opens into, and
+            # they come from the step's OWN collect fields, which the
+            # rendered line already flattened past recovery.
+            _raw = (result or {}).get("raw_fields") or []
+            items = []
+            for _i, line in enumerate((result or {}).get("lines") or []):
+                slots = _ledger_item_slots(
+                    _raw[_i] if _i < len(_raw) else None,
+                    source=step.connector_id or "",
+                )
+                head, lede = slots.pop("_title", ""), slots.pop("_sub", "")
+                items.append({
+                    "title": str(line)[:200], "sub": "", "why": "",
+                    **{k: v for k, v in slots.items() if v},
+                    **({"head": head} if head else {}),
+                    **({"lede": lede} if lede else {}),
+                })
             steps_lines = []
         else:
             act = _verbs.failure_action(step.connector_id, reason)
@@ -2496,15 +2709,28 @@ async def _narrate_phase1(
         from .narrator import narrate_run
         outcome = await narrate_run(record)
         drafts = outcome.get("turns") or []
+        # R43 §9 — the verdict, not just the log line. A result whose
+        # every row was rejected used to be persisted anyway and served
+        # as the user's brief: five headings, "0 items" under each,
+        # nothing to open. Dropping it hands the run to
+        # `close_ledger`'s completeness net, which owes the thread one
+        # result turn and writes the honest mechanical one instead.
+        unservable = set(outcome.get("unservable") or ())
         if outcome.get("problems"):
-            logger.info("[automations] narration problems on %s: %s",
-                        job_id[:8], outcome["problems"][:5])
+            logger.log(
+                logging.WARNING if unservable else logging.INFO,
+                "[automations] narration problems on %s (dropping %d "
+                "result draft(s)): %s",
+                job_id[:8], len(unservable), outcome["problems"][:5],
+            )
         held: list[dict] = []
         # A resumed run already has its opening line — never repeat it.
         existing = await _ledger.run_turns(db, run_id=job_id)
         opened = any(t["kind"] == "agent" for t in existing)
-        for d in drafts:
+        for n, d in enumerate(drafts):
             kind = d.get("kind")
+            if kind == "result" and n in unservable:
+                continue
             if kind == "annotate":
                 await _apply_annotate(db, automation, tool_turn_by_step, d)
             elif kind == "agent" and not opened:
@@ -2582,6 +2808,15 @@ async def _narrate_phase2(
         from . import ledger as _ledger
         existing = await _ledger.run_turns(db, run_id=job_id)
         has_draft = any(t["kind"] == "draft" for t in existing)
+        # R43 §9 — the items the ranked rows point at ride the result
+        # turn itself, so the BROADCAST carries them too. Attaching them
+        # only in `close_ledger` would leave the live card counting rows
+        # until the thread was re-read.
+        tool_turns = [t for t in existing if t["kind"] == "tool"]
+        item_ix = _ledger.item_index(tool_turns)
+        reason = _ledger.empty_reason(_ledger._failed_account_names(
+            [t for t in tool_turns
+             if t.get("tool_kind") == "read" and t.get("account_id")]))
         for d in narration.get("held") or []:
             kind = d.get("kind")
             if kind == "result":
@@ -2594,7 +2829,8 @@ async def _narrate_phase2(
                         "title": d.get("title") or "",
                         "vocabulary": d.get("vocabulary")
                         or narration.get("vocabulary") or "brief",
-                        "groups": d.get("groups") or [],
+                        "groups": _ledger.attach_items(
+                            d.get("groups") or [], item_ix, reason=reason),
                     },
                 )
             elif kind == "think":
@@ -2629,6 +2865,47 @@ async def _narrate_phase2(
                 )
     except Exception as e:  # noqa: BLE001
         logger.warning("[automations] narration phase 2 skipped: %s", e)
+
+
+async def _deliver_run_brief(
+    db, *, automation: Automation, vspec: ValidatedSpecV2, job_id: str,
+    thread, source: Optional[ValidatedSource], idem_prefix: str,
+) -> None:
+    """Hand the run's finished brief to `deliver`.
+
+    Best-effort by contract: the run is terminal, its thread already
+    carries the brief, and nothing about fanning it out may unwind that.
+    A run with no result turn delivers nothing — there is no brief, and
+    posting the run's raw steps to Slack under the automation's name is
+    the disagreement between the post and the card this round removes.
+    """
+    if thread is None:
+        return
+    try:
+        from . import deliver as _deliver
+        from . import ledger as _ledger
+        job = await db.get(BuildJob, job_id)
+        if job is None or _ledger.run_kind_of(job) not in ("scheduled",
+                                                           "run_now"):
+            return
+        results = [t for t in await _ledger.run_turns(db, run_id=job_id)
+                   if t["kind"] == "result"]
+        if not results:
+            return
+        await _deliver.deliver_brief(
+            db, automation=automation, job_id=job_id, thread=thread,
+            groups=results[-1].get("groups") or [],
+            title=results[-1].get("title") or "",
+            delivery=vspec.delivery, source=source,
+            idem_prefix=idem_prefix,
+        )
+    except Exception as e:  # noqa: BLE001 — delivery never fails a run
+        logger.warning("[automations] delivery skipped job=%s: %s",
+                       job_id[:8], e)
+        try:
+            await db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _close_ledger_after_narration(

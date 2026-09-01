@@ -26,16 +26,26 @@ health:
 
 tools:
   - name: calendar__list_events
-    description: List upcoming events on the primary calendar within a time window.
+    description: |
+      List upcoming events within a time window. Defaults to the primary calendar. Every event carries role ("organizer" when you own it, "attendee", or "" when neither can be established), my_response (your own responseStatus: accepted, declined, tentative, needsAction, or "" when you are not an attendee), and agenda ("description", "attachment", "description+attachment", or "" when there is nothing to read before it — the shape only, never the text). organized_by_me / without_agenda / awaiting_my_response narrow the page that came back, since the Calendar API has no predicate for any of them.
     input_schema:
       type: object
       properties:
+        calendar_id:
+          type: string
+          description: Calendar to read. Defaults to "primary". Other calendars are readable only if you already know their id — listing them needs a scope this connector does not request.
+          default: primary
         time_min:
           type: string
           description: ISO timestamp (lower bound, inclusive).
         time_max:
           type: string
           description: ISO timestamp (upper bound, exclusive).
+        within_hours:
+          type: integer
+          minimum: 1
+          maximum: 2160
+          description: Window from now, in hours — "the next 24 hours" is 24. Fills only the bounds you left open; an explicit time_min or time_max wins.
         max_results:
           type: integer
           minimum: 1
@@ -44,20 +54,43 @@ tools:
         query:
           type: string
           description: Free-text search across event fields.
+        organized_by_me:
+          type: boolean
+          description: Only meetings you own (role "organizer"). A meeting whose owner cannot be established is kept.
+          default: false
+        without_agenda:
+          type: boolean
+          description: Only meetings with no description and no attachment.
+          default: false
+        awaiting_my_response:
+          type: boolean
+          description: Only invitations from other people that you have not answered yet.
+          default: false
       required: []
     mutates: false
     elevation: false
-    output_redaction: ["description", "attendees"]
+    # `_redact` strips TOP-LEVEL keys only. The old list named
+    # `description` and `attendees`, which are fields INSIDE each event
+    # row — so it stripped nothing and every event title and location
+    # went to the audit row. Naming the list is what actually keeps them
+    # out; the row carries no description text at all now (see
+    # `provider._agenda`).
+    output_redaction: ["events"]
     pii: medium
     channel_policy:
       default: allow
       deny: []
 
   - name: calendar__create_event
-    description: Create a new event on the primary calendar. Times accept ISO timestamps with timezone.
+    description: |
+      Create a new event. Defaults to the primary calendar. Times accept ISO timestamps with timezone. Attendees are invited and mailed; an event with no attendees notifies nobody, which is what a private hold on your own calendar is.
     input_schema:
       type: object
       properties:
+        calendar_id:
+          type: string
+          description: Calendar to write to. Defaults to "primary". This is the parameter an automation grant is pinned to, so an automation must pass it explicitly.
+          default: primary
         summary:
           type: string
         start:
@@ -111,10 +144,14 @@ tools:
       deny: []
 
   - name: calendar__delete_event
-    description: Delete an event by id from the primary calendar.
+    description: Delete an event by id. Defaults to the primary calendar — pass the same calendar_id the event was created on.
     input_schema:
       type: object
       properties:
+        calendar_id:
+          type: string
+          description: Calendar the event lives on. Defaults to "primary".
+          default: primary
         event_id:
           type: string
       required: [event_id]
@@ -127,10 +164,32 @@ tools:
       default: allow
       deny: []
 
-# ── Automation capability (Round 26) ──────────────────────────────
-# Observe-only in v1: create_event has no pinnable target (everything
-# lands on the primary calendar), and a grant that cannot pin a
-# target cannot exist — so no write actions are declared.
+# ── Automation capability (Round 26, reopened R43) ────────────────
+# R26 declared this connector observe-only, on the reasoning that
+# `create_event` "has no pinnable target (everything lands on the
+# primary calendar), and a grant that cannot pin a target cannot
+# exist". That was true of the tool as it stood and it made §1.2's
+# `calendar_hold` — a 15-minute block with no attendees, so the user
+# has somewhere to read their own brief — refuse before it could be
+# staged: with no `scopes_write_by_action` entry the rail validated a
+# WRITE as a READ, took no grant, and the runtime backstop in
+# `connector_dispatcher` then refused it for declaring no pinned
+# target.
+#
+# The fix is the target, not the exception. `calendar_id` is now a real
+# parameter on create/list/delete, so a grant pins the calendar the
+# same way a Slack grant pins a channel, `primary` included — and an
+# automation must pass it explicitly, because the dispatcher compares
+# `tool_input[calendar_id]` against the pinned id and a schema default
+# is not an argument.
+#
+# NO NEW SCOPE. `calendar.events` is already in `oauth.scopes` and
+# already reads "Create, edit, and delete events on your calendars" —
+# the write was granted at consent all along; only the rail refused it.
+# `scopes_read` still names `calendar.readonly`, which no user holds
+# (see the provider's health-probe note) — left as-is rather than
+# quietly widened, since changing it changes what the grant sheet says
+# a read costs.
 automation:
   push: false
   poll: true
@@ -140,8 +199,10 @@ automation:
     per_day: 100
   scopes_read:
     - https://www.googleapis.com/auth/calendar.readonly
-  scopes_write_by_action: {}
-  target_param_by_action: {}
+  scopes_write_by_action:
+    calendar__create_event: ["https://www.googleapis.com/auth/calendar.events"]
+  target_param_by_action:
+    calendar__create_event: calendar_id
   events:
     - key: event_created
       description: A new event appears on your primary calendar.
@@ -153,3 +214,57 @@ automation:
       fields:
         id: id
         title: summary
+    # R43 §7's three. All three were blocked on the same two things and
+    # both are gone: `poll_args` are static, so the window had to become
+    # something the PROVIDER resolves against its own clock
+    # (`within_hours`) rather than a timestamp nobody can write here;
+    # and the row had to start carrying who owns the meeting, whether it
+    # has an agenda, and what the user answered.
+    - key: meeting_soon
+      description: A meeting lands within the next 24 hours.
+      source_tool: calendar__list_events
+      poll_args:
+        within_hours: 24
+        max_results: 50
+      items_path: events
+      dedupe_field: id
+      fields:
+        id: id
+        title: summary
+        start: start
+        role: role
+    - key: no_agenda
+      description: >-
+        A meeting you own, in the coming week, still has nothing to
+        read before it. Dedupes on the meeting, so it says this once —
+        adding an agenda afterwards stops it matching but cannot
+        un-fire what already fired.
+      source_tool: calendar__list_events
+      poll_args:
+        within_hours: 168
+        organized_by_me: true
+        without_agenda: true
+        max_results: 50
+      items_path: events
+      dedupe_field: id
+      fields:
+        id: id
+        title: summary
+        start: start
+    - key: invitation_arrived
+      description: >-
+        Someone else's meeting invitation is waiting for your answer.
+        Matches on your own responseStatus being needsAction, so it
+        stops the moment you reply.
+      source_tool: calendar__list_events
+      poll_args:
+        within_hours: 720
+        awaiting_my_response: true
+        max_results: 50
+      items_path: events
+      dedupe_field: id
+      fields:
+        id: id
+        title: summary
+        start: start
+        organizer: organizer_email

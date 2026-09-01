@@ -115,6 +115,72 @@ tools:
       default: allow
       deny: []
 
+  - name: github__search_issues
+    description: |
+      Search issues and pull requests across every repository this account can see, using GitHub's own search syntax. This is the only way to ask a question that spans repositories: `is:open is:pr review-requested:@me` (waiting on your review), `is:open is:pr author:@me` (your open pull requests), `is:open is:pr author:@me review:approved` (approved and ready to merge), `-is:draft` (skip drafts), `status:failure` (a check is red), `updated:>=2026-08-30` (changed since a date). Returns the total number of matches as well as the page, so it also answers "how many".
+    input_schema:
+      type: object
+      properties:
+        q:
+          type: string
+          description: 'GitHub issue-search query, e.g. ''is:open is:pr review-requested:@me -is:draft''.'
+        updated_since:
+          type: string
+          description: 'ISO timestamp or date — only items updated on or after it. Appended to the query as `updated:>=`; a query that already names `updated:` is left alone.'
+        per_page:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 30
+        sort:
+          type: string
+          enum: [comments, created, updated, reactions]
+          description: Omit for best-match order.
+        order:
+          type: string
+          enum: [asc, desc]
+          default: desc
+      required: [q]
+    mutates: false
+    elevation: false
+    output_redaction: ["items"]
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
+  - name: github__list_check_runs
+    description: |
+      List the check runs (CI results) on a commit — by default the tip of the repository's default branch. Use it to answer "is the build red", "what broke", and "which check". `conclusion: failing` narrows to the runs a human reads as red: failure, timed_out and action_required. The `conclusion` field on the envelope is the whole ref in one word — failure, pending, success or none — computed over every run, not over the filtered subset.
+    input_schema:
+      type: object
+      properties:
+        owner: { type: string }
+        repo: { type: string }
+        ref:
+          type: string
+          description: Branch, tag or commit SHA. Defaults to the repository's default branch.
+        conclusion:
+          type: string
+          enum: [failing, failure, timed_out, action_required, success, neutral, cancelled, skipped, stale]
+          description: Keep only runs with this conclusion. `failing` means failure, timed_out or action_required.
+        status:
+          type: string
+          enum: [queued, in_progress, completed]
+        per_page:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 30
+      required: [owner, repo]
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
   - name: github__search_code
     description: Search code across all accessible repos using GitHub's code search.
     input_schema:
@@ -171,4 +237,95 @@ automation:
       fields:
         number: number
         title: title
+        url: html_url
+    # R43 §7's four. Each was unbindable until this round because every
+    # one is about a PULL REQUEST or a CHECK RUN and this connector had
+    # neither surface: `github__list_issues` excludes PRs outright.
+    # `github__search_issues` and `github__list_check_runs` are those
+    # surfaces, and each event below is one real query.
+    #
+    # None of them needs a new scope: `/search/issues` and
+    # `/repos/*/commits/*/check-runs` both read under `repo`, which this
+    # connector has always requested.
+    - key: review_requested
+      description: A pull request is waiting on your review.
+      source_tool: github__search_issues
+      # Account-wide on purpose — the ask is "what is waiting on ME",
+      # which is not a property of any one repository, so unlike
+      # `issue_opened` this event needs no pin.
+      poll_args:
+        q: "is:open is:pr review-requested:@me"
+        per_page: 50
+      items_path: items
+      # The global issue id, never `number`: this window spans
+      # repositories and two of them share numbers freely.
+      dedupe_field: id
+      # The dedupe key is COLLECTED, not just computed: an event whose
+      # payload cannot say what it deduped on is unauditable.
+      fields:
+        id: id
+        number: number
+        title: title
+        repository: repository
+        author: user
+        url: html_url
+    - key: pr_commented
+      description: One of your open pull requests gets a new comment.
+      source_tool: github__search_issues
+      poll_args:
+        q: "is:open is:pr author:@me comments:>0"
+        sort: updated
+        per_page: 50
+      items_path: items
+      # `<id>:<comments>` — see `_search_item`. The search index carries
+      # the comment COUNT and nothing about the comments themselves, so
+      # this is the only key that fires once per new comment; `id` would
+      # fire once per pull request ever and `updated_at` would fire on a
+      # label change.
+      dedupe_field: comments_key
+      fields:
+        comments_key: comments_key
+        number: number
+        title: title
+        repository: repository
+        comments: comments
+        url: html_url
+    - key: pr_approved
+      description: One of your open pull requests is approved.
+      source_tool: github__search_issues
+      poll_args:
+        q: "is:open is:pr author:@me review:approved"
+        per_page: 50
+      items_path: items
+      # `id` is right here and wrong for `pr_commented`: a pull request
+      # is approved once, and re-announcing the same approval every five
+      # minutes for as long as it sits unmerged is the failure mode.
+      dedupe_field: id
+      fields:
+        id: id
+        number: number
+        title: title
+        repository: repository
+        url: html_url
+    - key: build_red
+      description: A check fails on the repository you pick.
+      source_tool: github__list_check_runs
+      poll_args:
+        conclusion: failing
+        per_page: 50
+      # The only one of the four that is pinned, because check runs hang
+      # off a COMMIT: there is no account-wide "my builds" index. `ref`
+      # is not required — the tool falls back to the repository's own
+      # default branch, which is the branch "a build goes red" means.
+      params_required: [owner, repo]
+      items_path: check_runs
+      # A check run id is minted per run, so a re-run that fails again
+      # is a new event and a red that was fixed and broke again fires
+      # twice — which is what the label promises.
+      dedupe_field: id
+      fields:
+        id: id
+        name: name
+        conclusion: conclusion
+        commit: head_sha
         url: html_url

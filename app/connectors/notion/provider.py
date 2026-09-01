@@ -475,6 +475,171 @@ def _flatten_properties(props: Any) -> tuple[dict, list[str]]:
     return flat, truncated
 
 
+def _state(obj: dict) -> str:
+    """"archived" | "in_trash" | "active".
+
+    A WORD rather than the two booleans Notion sends, because a `false`
+    boolean and an unset field are the same value to every narrowing
+    that reads a row, and "not archived" has to be distinguishable from
+    "we could not tell".
+    """
+    if obj.get("in_trash"):
+        return "in_trash"
+    if obj.get("archived"):
+        return "archived"
+    return "active"
+
+
+def _change_key(obj: dict) -> Optional[str]:
+    """`"<page id>@<last edited>"`, or None.
+
+    The manifest's own recorded objection to a page-CHANGED event was
+    that `last_edited_time` is rounded to the minute, so two pages
+    edited in the same minute would collapse into one. They collapse
+    only if the page id is left out of the key — with it in, the key is
+    unique per (page, minute) and an edit a minute after the last one
+    is a new event while a re-poll of the same edit is not. None when
+    either half is missing, which the event pipeline skips outright
+    rather than deduping every such row onto one empty key.
+    """
+    pid = str(obj.get("id") or "").strip()
+    at = str(obj.get("last_edited_time") or "").strip()
+    return f"{pid}@{at}" if pid and at else None
+
+
+async def _self_user_id(access_token: str) -> tuple[Optional[str], str]:
+    """The Notion user id of the person who authorized this connection.
+
+    `GET /v1/users/me` returns the BOT that owns the token, and for a
+    user-authorized public integration `bot.owner.user` is the person.
+    Notion documents that a connection without user-information
+    capabilities still gets a partial user object there — `object` and
+    `id` — which is exactly and only what a people filter needs, so
+    this asks for no capability the workspace has not already given.
+
+    Returns `(id, reason)`. There are no OAuth scopes to widen here
+    (see the manifest header), so a failure to resolve is reported, not
+    retried against a bigger grant.
+    """
+    me = await _notion_request("GET", "/users/me", access_token=access_token)
+    owner = (me.get("bot") or {}).get("owner") or {}
+    user = owner.get("user") if isinstance(owner.get("user"), dict) else {}
+    uid = str((user or {}).get("id") or "").strip()
+    if uid:
+        return uid.replace("-", "").casefold(), ""
+    kind = str(owner.get("type") or "unknown")
+    return None, (
+        f"this Notion connection is owned by the {kind}, not by a person, "
+        f"so there is no \"me\" for it to match against"
+    )
+
+
+async def _people_property_names(
+    data_source_id: str, *, access_token: str,
+) -> list[str]:
+    """The people-typed columns on a data source, in schema order.
+
+    Notion's people filter is per COLUMN — there is no "any person
+    property" predicate — so narrowing to one person means ORing over
+    every people column the table actually has.
+    """
+    ds = await _notion_request(
+        "GET", f"/data_sources/{data_source_id}", access_token=access_token,
+    )
+    props = ds.get("properties")
+    if not isinstance(props, dict):
+        return []
+    return [name for name, spec in props.items()
+            if isinstance(spec, dict) and spec.get("type") == "people"]
+
+
+def _and_filter(existing: Any, extra: list) -> Any:
+    """AND `extra` onto a caller-supplied Notion filter.
+
+    Notion's grammar has no implicit conjunction, so a composed filter
+    is an explicit `{"and": [...]}` — and an existing `{"and": [...]}`
+    is extended rather than nested, so four narrowings stay one level
+    deep and the ledger stays readable.
+    """
+    clauses = list(extra)
+    if isinstance(existing, dict) and existing:
+        inner = existing.get("and")
+        if isinstance(inner, list):
+            clauses = list(inner) + clauses
+        else:
+            clauses = [existing] + clauses
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"and": clauses}
+
+
+def _first_date(props: Any) -> str:
+    """The first DATE-typed property on a row, as `start|end`, or "".
+
+    Read off the raw property rather than the flattened one, for the
+    same reason `_raw_people` is: `_flatten_property` renders a date
+    as a dict and renders several NON-date types as ISO strings
+    (`created_time`, a date formula, a rollup), so a scan of the
+    flattened row for something date-shaped would happily key a
+    "deadline" off the row's own creation stamp — which never moves.
+
+    Both ends are in the key: moving only the end of a range is a
+    deadline moving.
+    """
+    if not isinstance(props, dict):
+        return ""
+    for prop in props.values():
+        if not isinstance(prop, dict) or prop.get("type") != "date":
+            continue
+        val = prop.get("date") or {}
+        start = str(val.get("start") or "")
+        finish = str(val.get("end") or "")
+        if start or finish:
+            return f"{start}|{finish}"
+    return ""
+
+
+def _deadline_key(obj: dict) -> Optional[str]:
+    """The page id and its date, or None when the row carries none.
+
+    This is what makes "a deadline moves" a real event rather than "a
+    page changed": the key moves only when the DATE moves, so an edit
+    to the body re-polls to the same key and fires nothing. A row with
+    no date property answers None, which the event pipeline skips
+    outright — otherwise every dateless row in the table would collide
+    on one empty key and the first of them would fire for all.
+    """
+    pid = str(obj.get("id") or "").strip()
+    when = _first_date(obj.get("properties"))
+    return f"{pid}@{when}" if pid and when else None
+
+
+def _raw_people(props: Any) -> list[str]:
+    """Every person id named on the row's people-shaped properties.
+
+    Read off the RAW property rather than the flattened one:
+    `_flatten_property` renders a `people` value as display NAMES, and
+    a display name cannot be compared against a user id. Ids are
+    dash-stripped and lower-cased, which is how Notion's two spellings
+    of the same uuid are made comparable.
+    """
+    out: set = set()
+    if not isinstance(props, dict):
+        return []
+    for prop in props.values():
+        if not isinstance(prop, dict):
+            continue
+        if prop.get("type") == "people":
+            for person in (prop.get("people") or []):
+                if isinstance(person, dict) and person.get("id"):
+                    out.add(str(person["id"]).replace("-", "").casefold())
+        elif prop.get("type") in ("created_by", "last_edited_by"):
+            who = prop.get(prop["type"])
+            if isinstance(who, dict) and who.get("id"):
+                out.add(str(who["id"]).replace("-", "").casefold())
+    return sorted(out)
+
+
 def _page_summary(obj: dict) -> dict:
     """Compact shape shared by search results and database rows."""
     flat, truncated = _flatten_properties(obj.get("properties"))
@@ -484,6 +649,10 @@ def _page_summary(obj: dict) -> dict:
         "title": _title_of(obj),
         "url": obj.get("url"),
         "last_edited_time": obj.get("last_edited_time"),
+        "state": _state(obj),
+        "change_key": _change_key(obj),
+        "deadline_key": _deadline_key(obj),
+        "people": _raw_people(obj.get("properties")),
         "properties": flat,
     }
     if truncated:
@@ -821,6 +990,8 @@ class NotionProvider(BaseConnectorProvider):
                 return await self._get_page_content(tool_input, access_token)
             if tool_name == "notion__query_database":
                 return await self._query_database(tool_input, access_token)
+            if tool_name == "notion__append_blocks":
+                return await self._append_blocks(tool_input, access_token)
             if tool_name == "notion__create_page":
                 return await self._create_page(tool_input, access_token)
             return ConnectorToolError(
@@ -871,6 +1042,13 @@ class NotionProvider(BaseConnectorProvider):
                 "title": _title_of(obj),
                 "url": obj.get("url"),
                 "last_edited_time": obj.get("last_edited_time"),
+                # Search returns no `properties`, so a search row can
+                # carry the two facts that are on the OBJECT — its state
+                # and its edit stamp — and not the person one. That is
+                # why "Tagged to me" composes into notion__query_database
+                # and not into this tool.
+                "state": _state(obj),
+                "change_key": _change_key(obj),
             }
             if obj.get("object") == "data_source":
                 # Hand back the containing database id too: users refer
@@ -954,10 +1132,60 @@ class NotionProvider(BaseConnectorProvider):
         body: dict[str, Any] = {
             "page_size": _clamp_page_size(tool_input.get("page_size", 25)),
         }
-        if isinstance(tool_input.get("filter"), dict) and tool_input["filter"]:
-            body["filter"] = tool_input["filter"]
+        composed: list = []
+        applied: list = []
+
+        edited_since = str(tool_input.get("edited_since") or "").strip()
+        if edited_since:
+            composed.append({
+                "timestamp": "last_edited_time",
+                "last_edited_time": {"on_or_after": edited_since},
+            })
+            applied.append("edited_since")
+
+        if tool_input.get("assigned_to_me"):
+            uid, why = await _self_user_id(access_token)
+            if not uid:
+                # Refused, never widened. The caller asked for one
+                # person's rows; handing back the whole table under that
+                # request is the narrowing that lies, and it is the one
+                # failure mode a "Tagged to me" chip must not have.
+                return ConnectorToolError(
+                    message=(
+                        f"Cannot narrow to rows tagged to you: {why}."
+                    ),
+                    retryable=False,
+                )
+            columns = await _people_property_names(
+                data_source_id, access_token=access_token,
+            )
+            if not columns:
+                return ConnectorToolError(
+                    message=(
+                        "Cannot narrow to rows tagged to you: this table "
+                        "has no person column to match against."
+                    ),
+                    retryable=False,
+                )
+            # Per COLUMN — Notion has no "any people property" predicate
+            # — so one clause per person column, ORed.
+            clauses = [{"property": name, "people": {"contains": uid}}
+                       for name in columns]
+            composed.append(clauses[0] if len(clauses) == 1
+                            else {"or": clauses})
+            applied.append("assigned_to_me")
+
+        merged = _and_filter(tool_input.get("filter"), composed)
+        if merged:
+            body["filter"] = merged
         if isinstance(tool_input.get("sorts"), list) and tool_input["sorts"]:
             body["sorts"] = tool_input["sorts"]
+        elif edited_since:
+            # A time-windowed read that comes back in table order shows
+            # the oldest edits first, which is the wrong end of "what
+            # changed since yesterday".
+            body["sorts"] = [{"timestamp": "last_edited_time",
+                              "direction": "descending"}]
         if tool_input.get("start_cursor"):
             body["start_cursor"] = tool_input["start_cursor"]
 
@@ -976,6 +1204,10 @@ class NotionProvider(BaseConnectorProvider):
             "has_more": bool(data.get("has_more")),
             "next_cursor": data.get("next_cursor"),
         }
+        if applied:
+            # What the query actually asked for, so a lit chip and an
+            # empty table are not the same sentence in the ledger.
+            payload["narrowed_by"] = applied
         # Notion caps a single query at 10k rows and says so here rather
         # than by omitting `has_more`.
         status = data.get("request_status") or {}
@@ -1049,6 +1281,71 @@ class NotionProvider(BaseConnectorProvider):
             payload["note"] = (
                 f"Only the first {_MAX_BLOCKS_PER_REQUEST} paragraphs were written; "
                 f"Notion accepts at most that many blocks per request."
+            )
+        return ConnectorOk(content=json.dumps(payload))
+
+    async def _append_blocks(
+        self, tool_input: dict, access_token: str,
+    ) -> ConnectorResult:
+        """Append to an EXISTING page — the write §1.2's `notion_page`
+        delivery has always described and `notion__create_page` could
+        not do.
+
+        "Appended under today's date" is one page that grows, not a new
+        child page every morning; `create_page` under a page parent
+        makes a child, so a daily brief left the user with thirty pages
+        named after thirty days. Notion's own primitive for this is
+        `PATCH /v1/blocks/{id}/children`, which only ever adds to the
+        end — there is no path through this tool that edits or removes
+        anything already on the page, which is what makes it an
+        undoable, user-editable write rather than an overwrite.
+        """
+        page_id = _normalize_id(tool_input.get("page_id"))
+        if not page_id:
+            return ConnectorToolError(message="page_id required",
+                                      retryable=False)
+        content = str(tool_input.get("content") or "")
+        heading = str(tool_input.get("heading") or "").strip()
+        if not content.strip() and not heading:
+            return ConnectorToolError(
+                message="content (or heading) required", retryable=False,
+            )
+
+        children: list = []
+        if heading:
+            children.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{
+                    "type": "text",
+                    "text": {"content": heading[:_MAX_RICH_TEXT_CHARS]},
+                }]},
+            })
+        truncated = False
+        if content.strip():
+            blocks, truncated = _paragraph_blocks(content)
+            # The heading is one of the 100 `children` Notion accepts,
+            # so the body has to give one back rather than push the
+            # request one block over the ceiling and 400.
+            room = _MAX_BLOCKS_PER_REQUEST - len(children)
+            if len(blocks) > room:
+                blocks, truncated = blocks[:room], True
+            children.extend(blocks)
+
+        result = await _notion_request(
+            "PATCH", f"/blocks/{page_id}/children",
+            access_token=access_token, json_body={"children": children},
+        )
+        payload: dict[str, Any] = {
+            "page_id": page_id,
+            "appended": True,
+            "blocks_written": len(result.get("results") or children),
+        }
+        if truncated:
+            payload["content_truncated"] = True
+            payload["note"] = (
+                f"Only the first {_MAX_BLOCKS_PER_REQUEST} blocks were "
+                f"appended; Notion accepts at most that many per request."
             )
         return ConnectorOk(content=json.dumps(payload))
 

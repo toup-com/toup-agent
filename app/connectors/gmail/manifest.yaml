@@ -1,8 +1,10 @@
 # T3b — Gmail connector manifest.
 #
-# Tool surface kept tight: list, get, send, search. No labels/drafts
-# in v1 — the agent can express those as natural-language asks and
-# we'll add them when we see real demand.
+# Tool surface: list, get, send, draft, search, labels. `list_labels`
+# arrived in R43 — the workflow picker offers "one source per user
+# label" and could enumerate nothing but INBOX / IMPORTANT / STARRED
+# without it. It rides `gmail.readonly`, which already covers labels
+# (see scope_descriptions); no new consent.
 #
 # Channel policy: send_message is mutating (default-deny on voice and
 # Telegram via the dispatcher's _MUTATES_DEFAULT_DENY_CHANNELS).
@@ -82,6 +84,31 @@ tools:
       default: allow
       deny: []
 
+  - name: gmail__list_labels
+    description: |
+      List the labels in this Gmail account — the three system ones (INBOX, IMPORTANT, STARRED, plus Gmail's category tabs) and every label the user made themselves, each with how many messages it holds and how many are unread. Use this to answer "which labels do I have" or to turn a label NAME the user said into the label id `gmail__list_messages` takes as `label:<id>`.
+    input_schema:
+      type: object
+      properties:
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: How many labels to return, system ones first then the user's own by name. Default 50.
+          default: 50
+        include_counts:
+          type: boolean
+          description: Defaults to true — adds messages_total and messages_unread to every row. Set false to skip one extra read per label when only the names are wanted.
+          default: true
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
   - name: gmail__send_message
     description: Compose and send a Gmail message. Subject and body are required.
     input_schema:
@@ -109,7 +136,7 @@ tools:
       deny: []
 
   - name: gmail__create_draft
-    description: Create a Gmail DRAFT (never sends). The draft appears in the user's Drafts folder for them to review and send themselves. This is the only mail write automations may perform.
+    description: Create a Gmail DRAFT (never sends). The draft appears in the user's Drafts folder for them to review and send themselves. This is the only mail write automations may perform. Can carry files via `attachments` — that is how a one-page PDF, a CSV or a markdown file reaches the user as a FILE rather than as text pasted into the body.
     input_schema:
       type: object
       properties:
@@ -124,10 +151,27 @@ tools:
           type: string
         bcc:
           type: string
+        attachments:
+          type: array
+          maxItems: 3
+          description: Files to attach. At most 3, and at most 3 MB decoded in total (Microsoft Graph's inline-attachment ceiling, which the Outlook draft tool shares so a delivery cannot succeed on one mail channel and refuse on the other). A malformed entry refuses the whole draft rather than writing one silently missing its file.
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+                description: Name the file arrives under, e.g. "brief.pdf".
+              content_type:
+                type: string
+                description: MIME type, e.g. "application/pdf". Defaults to application/octet-stream.
+              content_base64:
+                type: string
+                description: The file's bytes, base64-encoded (standard alphabet, padded).
+            required: [filename, content_base64]
       required: [to, subject, body]
     mutates: true
     elevation: false
-    output_redaction: ["body", "cc", "bcc"]
+    output_redaction: ["body", "cc", "bcc", "attachments"]
     pii: high
     rate_limit: "20/min"
     channel_policy:
@@ -182,3 +226,42 @@ automation:
         subject: subject
         from: from
         snippet: snippet
+    # R43 §7 names three more Gmail events — "someone in my VIPs
+    # writes", "an invoice lands", "a thread I pinned gets a reply" —
+    # and marks all four `push`. Two of them are declarable and one is
+    # not, and NEITHER is declared here yet, on purpose:
+    #
+    #   All four ride the ONE `users.watch` feed, so each compiles to
+    #   its own `Trigger(kind="email_received")` row on the same push.
+    #   Declared as they stand, every row fires on every message: four
+    #   events turned on would mean four runs per incoming mail, each
+    #   claiming a different reason. The narrowing has to be the
+    #   TRIGGER's own `filter_json` — which `compiler._compile_bindings_v2`
+    #   already copies from `source.filter_rules`, and which
+    #   `filter_evaluator.matches_filter` already evaluates
+    #   (`from_contains`, `subject_contains`, `labels`,
+    #   `exclude_categories`). Both halves of that path exist.
+    #
+    #   The missing half is the DECLARATION: `AutomationEventSpec` is
+    #   `extra="forbid"` with no filter key, `automation_registry()`
+    #   ships none, and `workflow.set_triggers` writes no `filter` when
+    #   it mints a lane. There is no manifest key that supplies it —
+    #   that is a statement about this codebase, not a guess. The exact
+    #   three-line addition is in R43's NEEDS; the moment it lands,
+    #   `vip_wrote` (from_contains, from the user's own person pins) and
+    #   `invoice_landed` (subject_contains) are declarable here as push
+    #   events that fire on the mail they name and nothing else.
+    #
+    #   `pinned_thread_reply` is NOT declarable even then: the filter
+    #   vocabulary has no thread predicate and the Pub/Sub push item
+    #   carries no thread id, so a row for it could only ever mean
+    #   `email_received` under a different name.
+    #
+    # Declaring them `push: false` and polling instead was the other
+    # option and is rejected: §7's frozen table says all four are push,
+    # the per-event opt-out `workflow.event_mode` reads
+    # (`ev["push"] is False`) is itself unreachable — the registry never
+    # serialises a per-event `push` — and turning Gmail into a poll
+    # connector would demand a `source_tool` on `email_received`, i.e.
+    # giving up the one real push path this platform has to narrow two
+    # events it can narrow properly instead.

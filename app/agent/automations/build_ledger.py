@@ -257,6 +257,84 @@ def output_lines(automation: Automation, raw: dict) -> tuple[str, list[str]]:
     return sub, did
 
 
+#: The design's four bands (spec §8: "Setup narration is one step per
+#: GROUP, not per account"). This mirrors `src/automations/canvas/bands.ts`
+#: in the app, deliberately: the app owns how the panel is DRAWN, and this
+#: owns how the build is TOLD — and the build history is persisted once, at
+#: creation, so it cannot be re-grouped later by a client that disagrees.
+#: Move one and move the other.
+_BANDS: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    ("MAIL", ("gmail", "outlook"), "your mail"),
+    ("CHAT", ("slack", "teams"), "your channels"),
+    ("WORK", ("jira", "github"), "your tickets and reviews"),
+    ("PLANS", ("notion", "calendar"), "your plans"),
+    ("CODE", ("claude", "codex"), "the repository you point it at"),
+)
+
+
+def band_of(connector_id: str) -> str:
+    for key, members, _phrase in _BANDS:
+        if connector_id in members:
+            return key
+    return "MORE"
+
+
+def _join(names: list[str]) -> str:
+    """"a", "a and b", "a, b and c" — the design's own list voice."""
+    kept = [n for n in names if n]
+    if not kept:
+        return ""
+    if len(kept) == 1:
+        return kept[0]
+    return f"{', '.join(kept[:-1])} and {kept[-1]}"
+
+
+def band_lines(
+    band_key: str, connector_ids: list[str], per_account: dict,
+) -> tuple[str, str, list[str]]:
+    """(title, sub, did) for one BAND — "Connected Gmail and Outlook".
+
+    `per_account` is `{connector_id: (title, sub, did)}` from
+    `account_lines`; the band keeps every account's own `did` lines
+    underneath, so nothing the per-account pass established is lost —
+    the change is which grain the STEP is at, not how much it says.
+    """
+    names = [verbs.display_name(cid) or cid for cid in connector_ids]
+    title = f"Connected {_join(names)}"
+    subs = {per_account[cid][1] for cid in connector_ids if cid in per_account}
+    # One sub only when every account in the band got the same access;
+    # a band where one is read-only and one can draft must not claim
+    # either for both.
+    sub = subs.pop() if len(subs) == 1 else "read only, scoped to you"
+    did: list[str] = []
+    for cid in connector_ids:
+        did.extend(per_account.get(cid, ("", "", []))[2])
+    return title, sub, did
+
+
+def closing_sentence(
+    band_order: list[tuple[str, list[str]]], format_noun: str,
+) -> str:
+    """The sentence that ends the setup narration (spec §8).
+
+    `band_order` is `[(band_key, [connector_id, …]), …]` in the panel's
+    own order; `format_noun` is the delivery format's noun ("a ranked
+    list"), so what the narration promises and what the delivery node
+    says are one value.
+    """
+    phrases = []
+    for key, cids in band_order:
+        phrase = next((p for k, _m, p in _BANDS if k == key), "your other accounts")
+        names = _join([verbs.display_name(c) or c for c in cids])
+        phrases.append(f"{phrase} ({names})" if names else phrase)
+    read = _join(phrases)
+    return (
+        f"That is the shape of it. I read {read}, keep what is addressed to "
+        f"you, and bring it back as {format_noun} in this chat. They are "
+        f"grouped on the canvas — tap any account to see what is in there."
+    )
+
+
 def account_lines(
     connector_id: str, perms: dict, raw: dict,
 ) -> tuple[str, str, list[str]]:
@@ -326,13 +404,38 @@ async def record(
     try:
         from . import permissions as _perms
         steps: list[dict] = []
+        # The account phases are TIMED per account and TOLD per band
+        # (spec §8): "Connected Gmail and Outlook — read only, scoped to
+        # you". The band's own step carries the sum of its accounts'
+        # measured time, so the durations still add up to `total_ms`.
+        per_account: dict[str, tuple[str, str, list[str]]] = {}
+        band_members: dict[str, list[str]] = {}
+        band_ms: dict[str, int] = {}
+        band_first: dict[str, int] = {}
+        for i, (phase_id, ms) in enumerate(recorder.timings()):
+            if not phase_id.startswith("account:"):
+                continue
+            cid = phase_id.split(":", 1)[1]
+            resolved = await _perms.resolve(
+                db, automation=automation, account_id=cid,
+            )
+            per_account[cid] = account_lines(cid, resolved, raw)
+            key = band_of(cid)
+            band_members.setdefault(key, []).append(cid)
+            band_ms[key] = band_ms.get(key, 0) + max(0, int(ms))
+            band_first.setdefault(key, i)
+        emitted_bands: set[str] = set()
+
         for phase_id, ms in recorder.timings():
             if phase_id.startswith("account:"):
                 cid = phase_id.split(":", 1)[1]
-                resolved = await _perms.resolve(
-                    db, automation=automation, account_id=cid,
-                )
-                title, sub, did = account_lines(cid, resolved, raw)
+                key = band_of(cid)
+                if key in emitted_bands:
+                    continue
+                emitted_bands.add(key)
+                phase_id = f"band:{key.lower()}"
+                ms = band_ms.get(key, 0)
+                title, sub, did = band_lines(key, band_members[key], per_account)
             elif phase_id == "trigger":
                 title = _PHASE_TITLES["trigger"]
                 sub, did = trigger_lines(automation, raw)

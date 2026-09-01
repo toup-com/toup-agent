@@ -1635,8 +1635,15 @@ def test_minted_items_and_result_rows_are_sanitized():
         "msgs": [{"who": "Google", "at": "", "text": "<i>Act now</i>"}],
     }])
     assert items[0]["title"] == "Review Google's security alert."
-    assert items[0]["sub"] == "Google <no-reply@accounts.google.com>"
     assert items[0]["msgs"][0]["text"] == "Act now"
+    # R43 — ONE decode, at ingestion. `_collect_result` unescapes the raw
+    # collect fields beside the line it renders from them, so every later
+    # layer strips TAGS only: unescaping again here decoded the SAME line
+    # twice and turned a sender's literal `&amp;` into `&`. This item is
+    # handed straight to the minter with no ingestion behind it, so its
+    # pre-escaped address stays escaped; a real read arrives decoded, which
+    # `test_the_run_pipeline_serves_no_html` below proves end to end.
+    assert items[0]["sub"] == "Google &lt;no-reply@accounts.google.com&gt;"
 
     from app.db.models import BRIEF_TIERS
     groups = [

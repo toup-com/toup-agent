@@ -40,6 +40,7 @@ from app.db.models import (
 from app.db.models.automation_ledger import AUTOMATION_FIXES
 from app.services import automation_verbs as verbs
 from app.services.automation_verb_entries import CAPABILITY_CHECK_ACTION
+from app.connectors.textclean import unescape_once
 
 logger = logging.getLogger(__name__)
 
@@ -188,20 +189,104 @@ _HTML_TAG_RE = re.compile(
 _WS_RUN_RE = re.compile(r"[ \t]{2,}")
 
 
-def strip_html(s: Any) -> str:
+def strip_html(s: Any, *, unescape: bool = True) -> str:
     """Unescape HTML entities and strip known HTML tags. Total — never
     raises, never touches a string with no markup in it, and never
-    strips an email address's angle brackets."""
+    strips an email address's angle brackets.
+
+    `unescape=False` for every caller downstream of the first. Unescaping
+    is NOT idempotent — `&amp;amp;` → `&amp;` → `&` — and one provider
+    string passed through here three times: once when the collect line was
+    rendered, again when the item was minted, and again when the narrator's
+    row was validated. A sender who writes a literal `&amp;` had it
+    silently turned into `&`, and `&amp;#8212;` became an em dash nobody
+    wrote. Entities are decoded at INGESTION (`executor_v2`'s collect line
+    and `contents`' own seam); the later layers only strip tags."""
     if not isinstance(s, str) or not s:
         return s if isinstance(s, str) else ""
-    if "<" not in s and "&" not in s:
+    if "<" not in s and ("&" not in s or not unescape):
         return s
-    import html as _html
-    out = _html.unescape(s)
+    out = unescape_once(s) if unescape else s
     out, n = _HTML_TAG_RE.subn(" ", out)
     if n:
         out = _WS_RUN_RE.sub(" ", out).strip()
     return out
+
+
+#: R43 §9 — the slots a brief item shows, beyond the ranked line.
+#:
+#: The producer is `executor_v2._append_read_turn`, which has only the
+#: step's own `collect.fields` to work from: field NAMES are the
+#: template author's, and the eight shipped templates already agree on
+#: a small vocabulary (`from`, `subject`, `summary`, `snippet`, `text`,
+#: `where`, `channel_name`, `due`). Mapping by name is what lets an
+#: item say who it is from without every template being rewritten, and
+#: an unmapped field simply does not fill a slot — it is still in the
+#: rendered line, which stays the item's `title` fallback.
+_ITEM_SLOT_ALIASES: dict[str, tuple[str, ...]] = {
+    "who": ("who", "from", "sender", "author", "assignee", "organiser",
+            "organizer", "reporter", "actor"),
+    "title": ("title", "subject", "summary", "headline", "name"),
+    "sub": ("sub", "snippet", "text", "body", "preview", "excerpt",
+            "description"),
+    "at": ("at", "date", "when", "time", "due", "duedate", "start",
+           "updated", "day"),
+    "where": ("where", "channel", "channel_name", "repo", "project",
+              "board", "folder", "label", "space", "calendar", "list"),
+}
+
+#: A field whose truthy value means "this one is live" — the blue dot
+#: (§4). Deliberately a short closed list: a slot that guesses at
+#: urgency from arbitrary text is a slot that marks the wrong row.
+_ITEM_HOT_FIELDS = ("hot", "unread", "failing", "overdue", "blocked",
+                    "is_unread", "red")
+_ITEM_HOT_PRIORITIES = ("highest", "high", "p1", "p2", "urgent",
+                        "blocker", "critical")
+
+#: §9 — what a tier says instead of "0 items" when nothing landed in it
+#: and every account answered. The failed-account form is the string
+#: table's (`account_health.names_sentence`), which is the sentence the
+#: reconnect card and `_append_honest_line` already use.
+EMPTY_NOTHING_MATCHED = "Nothing matched"
+
+
+def item_slots(fields: Any, *, source: str = "") -> dict:
+    """The §9 display slots for ONE read item, from its collect fields.
+
+    Total and pure: a missing, malformed or unrecognised field set
+    yields empty slots rather than a guess. `hot` is the only derived
+    value and it derives from two closed lists — a row wearing the blue
+    dot is a claim, and the wrong claim is worse than none.
+    """
+    out = {"who": "", "at": "", "where": "", "hot": False,
+           "source": str(source or "")}
+    slot_title = slot_sub = ""
+    if not isinstance(fields, dict):
+        return {**out, "_title": "", "_sub": ""}
+    lower = {str(k).lower(): v for k, v in fields.items()}
+    for slot, names in _ITEM_SLOT_ALIASES.items():
+        for name in names:
+            val = lower.get(name)
+            if val is None or val == "":
+                continue
+            text = strip_html(str(val).strip(), unescape=False)[:200]
+            if not text:
+                continue
+            if slot == "title":
+                slot_title = text
+            elif slot == "sub":
+                slot_sub = text
+            else:
+                out[slot] = text
+            break
+    for name in _ITEM_HOT_FIELDS:
+        if lower.get(name):
+            out["hot"] = True
+            break
+    prio = str(lower.get("priority") or "").strip().lower()
+    if prio in _ITEM_HOT_PRIORITIES:
+        out["hot"] = True
+    return {**out, "_title": slot_title, "_sub": slot_sub}
 
 
 def mint_item_ids(items: list[dict]) -> list[dict]:
@@ -210,6 +295,13 @@ def mint_item_ids(items: list[dict]) -> list[dict]:
     R38: item title/sub and msg text are HTML-sanitized at mint — this
     is the one seam every quoted vendor string passes on its way into a
     persisted turn, whichever producer minted it.
+
+    R43: the §9 display slots ride along. `title` stays the RENDERED
+    COLLECT LINE it has always been — that string is what the narrator
+    ranks on and what `close_ledger`'s mechanical fallback prints, and
+    replacing it would change the ranking pass's input as a side effect
+    of a display change. The slots are additive; `brief_item` below is
+    where the two are reconciled into what a card shows.
     """
     out = []
     for it in items or []:
@@ -220,17 +312,148 @@ def mint_item_ids(items: list[dict]) -> list[dict]:
             msgs.append({
                 "who": m.get("who", ""),
                 "at": m.get("at", ""),
-                "text": strip_html(m.get("text", "")),
+                "text": strip_html(m.get("text", ""), unescape=False),
                 "why": m.get("why", ""),
             })
         it["msgs"] = msgs
-        out.append({
+        row = {
             "id": it["id"],
-            "title": strip_html(it.get("title", "")),
-            "sub": strip_html(it.get("sub", "")),
+            "title": strip_html(it.get("title", ""), unescape=False),
+            "sub": strip_html(it.get("sub", ""), unescape=False),
             "why": it.get("why", ""),
             "msgs": it["msgs"],
-        })
+        }
+        for slot in ("who", "at", "where", "source"):
+            val = str(it.get(slot) or "").strip()
+            if val:
+                row[slot] = strip_html(val, unescape=False)[:200]
+        if it.get("hot"):
+            row["hot"] = True
+        # The field-derived pair, kept apart from the line so a card can
+        # show "Anyone own the retry flag?" where the line reads
+        # "- Dana in #platform: Anyone own the retry flag?".
+        for key in ("head", "lede"):
+            val = str(it.get(key) or "").strip()
+            if val:
+                row[key] = strip_html(val, unescape=False)[:400]
+        out.append(row)
+    return out
+
+
+def brief_item(it: dict) -> dict:
+    """One persisted read item → the §9 brief item the card opens.
+
+    A PROJECTION: every field here is already on the tool turn. The
+    title prefers the field-derived head over the rendered line, since
+    the line carries the sender and the timestamp the other slots show
+    on their own — a card that repeats them in its title has nothing
+    left to show as a title.
+    """
+    it = it if isinstance(it, dict) else {}
+    return {
+        "id": str(it.get("id") or ""),
+        "who": str(it.get("who") or ""),
+        "title": str(it.get("head") or it.get("title") or ""),
+        "sub": str(it.get("lede") or it.get("sub") or ""),
+        "why": str(it.get("why") or ""),
+        "at": str(it.get("at") or ""),
+        "source": str(it.get("source") or ""),
+        "where": str(it.get("where") or ""),
+        "hot": bool(it.get("hot")),
+    }
+
+
+def item_index(turns: list[dict]) -> dict:
+    """`{item_id: brief_item}` over a run's tool turns, in read order."""
+    out: dict[str, dict] = {}
+    for t in turns or []:
+        if t.get("kind") not in (None, "tool"):
+            continue
+        for it in t.get("items") or []:
+            row = brief_item(it)
+            if row["id"]:
+                out.setdefault(row["id"], row)
+    return out
+
+
+def empty_reason(failed_names: list[str]) -> str:
+    """Why a tier is empty, in words (§9).
+
+    A failed account outranks "nothing matched", and by a long way: an
+    empty tier under a Gmail that never answered is not a quiet morning,
+    it is a brief the user cannot trust. The sentence is the string
+    table's own `missing_from_this`, which is what the honest line and
+    the reconnect card already say — this file authors none of it.
+    """
+    from . import account_health as _ah
+    names = [n for n in (failed_names or []) if n]
+    if names:
+        return (_ah.names_sentence(names, prefix="missing_from_this")
+                or _ah.names_sentence(names, prefix="could_not_reach")
+                or EMPTY_NOTHING_MATCHED)
+    return EMPTY_NOTHING_MATCHED
+
+
+def attach_items(groups: list, index: dict, *, reason: str) -> list:
+    """Fill every group's `items` and `empty_reason` (§9).
+
+    The count a card shows is `items.length`, so this is what makes the
+    number a count of THINGS READ rather than of ranked sentences. Order
+    follows the rows: a tier's items read in the order the ranking put
+    them, and an id referenced twice appears once.
+    """
+    out = []
+    for g in groups or []:
+        g = dict(g)
+        seen: set[str] = set()
+        items: list[dict] = []
+        for r in g.get("rows") or []:
+            for ref in r.get("item_refs") or []:
+                ref = str(ref)
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                found = index.get(ref)
+                if found is not None:
+                    items.append(found)
+        g["items"] = items
+        # A tier with rows but no resolvable items is not "empty" — it
+        # said something, and stamping a reason on it would contradict
+        # the sentence sitting right above.
+        g["empty_reason"] = None if (items or g.get("rows")) else reason
+        out.append(g)
+    return out
+
+
+def _result_group_extras(g: dict) -> dict:
+    """The §9 additions on ONE result group, validated by SHAPE only.
+
+    `items` is a projection of items this module already minted and
+    sanitized on the tool turn, so re-screening them would be the third
+    unescape R43 §10 exists to delete. What is checked is that the
+    payload cannot carry anything the app will not understand: bounded
+    strings, a real boolean, no extra keys.
+    """
+    out: dict = {}
+    items = g.get("items")
+    if isinstance(items, list):
+        out["items"] = [
+            {
+                "id": str(it.get("id") or "")[:64],
+                "who": str(it.get("who") or "")[:200],
+                "title": str(it.get("title") or "")[:400],
+                "sub": str(it.get("sub") or "")[:400],
+                "why": str(it.get("why") or "")[:400],
+                "at": str(it.get("at") or "")[:64],
+                "source": str(it.get("source") or "")[:64],
+                "where": str(it.get("where") or "")[:200],
+                "hot": bool(it.get("hot")),
+            }
+            for it in items if isinstance(it, dict)
+        ]
+    reason = g.get("empty_reason")
+    if reason is not None:
+        out["empty_reason"] = str(reason)[:200] or None
     return out
 
 
@@ -370,7 +593,8 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
                         "item_refs": list(r.get("item_refs") or []),
                     })
                 out_groups.append(
-                    {"rank": i, "label": label, "tone": tone, "rows": rows}
+                    {"rank": i, "label": label, "tone": tone, "rows": rows,
+                     **_result_group_extras(g)}
                 )
             return {
                 "title": _plain(p.get("title"), "result.title"),
@@ -393,14 +617,15 @@ def validate_turn_payload(kind: str, payload: dict) -> dict:
                     # titles, and "<b>…</b>" reached the founder's
                     # briefing through exactly this field.
                     "text": strip_html(
-                        _plain(r.get("text"), "result.row.text")),
+                        _plain(r.get("text"), "result.row.text"), unescape=False),
                     "sub": strip_html(
-                        strip_markdown_markers(r.get("sub") or "")[0]),
+                        strip_markdown_markers(r.get("sub") or "")[0], unescape=False),
                     "tag": r.get("tag") or "",
                     "item_refs": list(r.get("item_refs") or []),
                 })
             out_groups.append(
-                {"rank": i, "label": label, "tone": tone, "rows": rows}
+                {"rank": i, "label": label, "tone": tone, "rows": rows,
+                 **_result_group_extras(g)}
             )
         return {
             "title": _plain(p.get("title"), "result.title"),
@@ -1017,6 +1242,42 @@ def _digest_title_of(automation) -> str:
     return str(getattr(automation, "name", "") or "What this run found")
 
 
+def _failed_account_names(read_turns: list[dict]) -> list[str]:
+    """The display names of the accounts whose READ failed, in read
+    order and deduped — the accounts §9's `empty_reason` names."""
+    from app.services import automation_verbs as _verbs
+    names: list[str] = []
+    for t in read_turns or []:
+        acc = t.get("account_id") or ""
+        if not acc or t.get("ok", True):
+            continue
+        name = _verbs.display_name(acc) or acc
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def _nothing_row(failed_names: list[str]) -> dict:
+    """The one row a result with nothing in it carries (§9).
+
+    It has no `item_refs` because there is nothing to refer to, which is
+    the whole point — this row exists so that "the run found nothing"
+    and "the run's ranking was lost" stop looking identical from the
+    outside. Both were five empty headings.
+    """
+    if failed_names:
+        return {
+            "text": empty_reason(failed_names),
+            "sub": "Nothing else came back, so there is nothing to rank.",
+            "tag": "0", "item_refs": [],
+        }
+    return {
+        "text": "Nothing came back from the accounts I read.",
+        "sub": "The run finished and there was nothing to rank.",
+        "tag": "0", "item_refs": [],
+    }
+
+
 async def close_ledger(
     db: AsyncSession, *, user_id: str, job: BuildJob, automation: Automation,
 ) -> None:
@@ -1053,11 +1314,22 @@ async def close_ledger(
             read_ok.append(acc)
 
     result_rows = [t for t in turns if t["kind"] == "result"]
+    # R43 §9. This asked whether the run produced ITEMS, so the one run
+    # that most needs the net — the run that read and found nothing —
+    # was the one run it was inert on, and five headings reading
+    # "0 items" shipped unchallenged: no mechanical fallback when the
+    # narration died, no reconciliation, nothing saying what happened.
+    # The question is whether the run READ, which is a fact about the
+    # steps rather than about their yield. An agent step is a `read`
+    # turn with no account (`_append_agent_turn`) and is not one.
+    read_turns = [t for t in tool_turns
+                  if t["tool_kind"] == "read" and t.get("account_id")]
     invariant_applies = (
         v3 in ("completed", "partial")
         and run_kind_of(job) in ("scheduled", "run_now")
-        and any(t["tool_kind"] == "read" and t.get("items") for t in tool_turns)
+        and bool(read_turns)
     )
+    failed_names = _failed_account_names(read_turns)
     if invariant_applies and not result_rows:
         # Narration failed outright — the run still owes ONE result turn
         # (§4.2: every completed read-ful run emits exactly one). The
@@ -1075,12 +1347,14 @@ async def close_ledger(
                        for it in (t.get("items") or [])]
             n = len(all_ids)
             vocab = _expected_vocabulary(automation, job) or "brief"
-            count_row = {
-                "text": (f"{n} item(s) read — I could not rank them this "
-                         "time").replace("(s)", "" if n == 1 else "s"),
-                "sub": "Everything the run read is here, unranked.",
-                "tag": str(n), "item_refs": all_ids,
-            }
+            count_row = (
+                _nothing_row(failed_names) if n == 0 else {
+                    "text": (f"{n} item(s) read — I could not rank them this "
+                             "time").replace("(s)", "" if n == 1 else "s"),
+                    "sub": "Everything the run read is here, unranked.",
+                    "tag": str(n), "item_refs": all_ids,
+                }
+            )
             if vocab == "digest":
                 # R36-7: a digest automation's mechanical fallback keeps
                 # its own title — never "Your morning, in order".
@@ -1099,8 +1373,10 @@ async def close_ledger(
             appended = await append_turn(
                 db, user_id=user_id, thread=thread, run_id=job.id,
                 kind="result",
-                payload={"title": title,
-                         "vocabulary": vocab, "groups": groups},
+                payload={"title": title, "vocabulary": vocab,
+                         "groups": attach_items(
+                             groups, item_index(tool_turns),
+                             reason=empty_reason(failed_names))},
             )
             result_rows = [appended]
             turns = await run_turns(db, run_id=job.id)
@@ -1114,6 +1390,7 @@ async def close_ledger(
             for r in g.get("rows") or []:
                 referenced.update(r.get("item_refs") or [])
         missing = sorted(item_ids - referenced)
+        turn_row = await db.get(AutomationTurn, result["id"])
         if missing:
             logger.warning(
                 "automation.ledger.unaccounted run=%s automation=%s count=%d",
@@ -1123,7 +1400,6 @@ async def close_ledger(
                 f"{len(missing)} more item(s) the ranking missed"
                 if len(missing) != 1 else "1 more item the ranking missed"
             )
-            turn_row = await db.get(AutomationTurn, result["id"])
             if turn_row is not None:
                 body = json.loads(turn_row.payload_json)
                 body["groups"][-1]["rows"].append({
@@ -1133,6 +1409,27 @@ async def close_ledger(
                     "item_refs": missing,
                 })
                 turn_row.payload_json = json.dumps(body, default=str)
+        # R43 §9 — and now the same turn says what it holds. Two things
+        # land here and both are the same defect from opposite ends: a
+        # tier gets the ITEMS its rows point at (so the count the card
+        # shows is a count of things read, not of ranked sentences), and
+        # a result with no rows at ALL gets one row saying so. Five
+        # silent headings is not a brief; it is the absence of one,
+        # rendered as though it were the answer.
+        if turn_row is not None:
+            body = json.loads(turn_row.payload_json)
+            if not any(g.get("rows") for g in body.get("groups") or []):
+                logger.warning(
+                    "automation.ledger.empty_result run=%s automation=%s "
+                    "failed=%s", job.id, automation.id, failed_names,
+                )
+                (body["groups"] or [{}])[-1].setdefault("rows", []).append(
+                    _nothing_row(failed_names))
+            body["groups"] = attach_items(
+                body.get("groups") or [], item_index(tool_turns),
+                reason=empty_reason(failed_names),
+            )
+            turn_row.payload_json = json.dumps(body, default=str)
 
     # R31-37: the result turn's VOCABULARY must match what the run
     # actually did, and it is asserted here because here is where the

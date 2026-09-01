@@ -15,6 +15,8 @@ The canvas's `go ahead` user turn is a demo close and is not seeded.
 
 from __future__ import annotations
 
+from app.services import automation_verbs as verbs
+
 #: §4.1 mode → the label the wire serves ("posts" is completed with the
 #: real target by the caller).
 MODES = ("drafts_only", "reads_only", "posts", "asks_first")
@@ -145,6 +147,7 @@ def setup_turns(
     *,
     accounts: list[dict] | None = None,
     blocked: bool = False,
+    format_noun: str = "a ranked list",
 ) -> list[dict]:
     """TurnDrafts for a fresh setup thread, in order.
 
@@ -229,6 +232,67 @@ def setup_turns(
     return [
         {"kind": "agent", "text": opening},
         *checks,
+        *_band_turns(accounts),
         {"kind": "think", "text": _THINKS[mode]},
         {"kind": "agent", "text": close},
+        *_shape_turn(accounts, format_noun),
     ]
+
+
+def _band_turns(accounts: list[dict] | None) -> list[dict]:
+    """One line per BAND, never per account (spec §8).
+
+    The narration used to be one line per connector, so a six-account
+    automation opened with six near-identical "Connected X" bubbles
+    before it said anything about itself. The band is the grain a person
+    reads at: mail, channels, tickets, plans.
+    """
+    from .build_ledger import band_of, _BANDS, _join
+    if not accounts:
+        return []
+    members: dict[str, list[str]] = {}
+    writes: dict[str, bool] = {}
+    for a in accounts:
+        cid = str(a.get("account_id") or "")
+        if not cid:
+            continue
+        key = band_of(cid)
+        members.setdefault(key, []).append(cid)
+        writes[key] = writes.get(key, False) or bool(a.get("writes"))
+    order = [k for k, _m, _p in _BANDS] + ["MORE"]
+    out: list[dict] = []
+    for key in order:
+        cids = members.get(key)
+        if not cids:
+            continue
+        names = _join([verbs.display_name(c) or c for c in cids])
+        # A band where any member can write must not claim read-only for
+        # the whole band; the per-account sheet is where the detail lives.
+        sub = ("read and write where you allowed it, scoped to you"
+               if writes.get(key) else "read only, scoped to you")
+        out.append({"kind": "agent", "text": f"Connected {names} — {sub}"})
+    return out
+
+
+def _shape_turn(
+    accounts: list[dict] | None, format_noun: str,
+) -> list[dict]:
+    """The sentence that closes the setup (spec §8).
+
+    Skipped when there is nothing to name: a shape sentence about no
+    accounts is a sentence about nothing.
+    """
+    from .build_ledger import band_of, closing_sentence, _BANDS
+    if not accounts:
+        return []
+    members: dict[str, list[str]] = {}
+    for a in accounts:
+        cid = str(a.get("account_id") or "")
+        if cid:
+            members.setdefault(band_of(cid), []).append(cid)
+    order = [k for k, _m, _p in _BANDS] + ["MORE"]
+    band_order = [(k, members[k]) for k in order if members.get(k)]
+    if not band_order:
+        return []
+    return [{"kind": "agent",
+             "text": closing_sentence(band_order, format_noun)}]

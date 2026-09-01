@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 from app.db.models.automation import AUTOMATION_TRIGGER_MODES
 
+from . import catalog
 from .spec import (
     SpecError, _err, effective_every_floor, effective_poll_floor,
     validate_filters, validate_focus,
@@ -52,8 +53,16 @@ RESERVED_IDS = frozenset({
     "event", "source", "var", "steps", "grant", "memory", "item", "focus",
 })
 
-MAX_SOURCES = 4
-MAX_STEPS = 8
+# R43 §7: one schedule plus up to eleven event lanes. The canvas can
+# now turn on an instant trigger per account across eight connectors,
+# and at four a user wiring their third account hit a refusal that read
+# as a bug. `workflow.set_triggers` quotes this number back at them, so
+# raising it here is the whole change.
+MAX_SOURCES = 12
+# Twelve reads (eight accounts, some of them twice) plus a write and an
+# agent step; at eight, an automation could not read every account it
+# had been given.
+MAX_STEPS = 12
 MAX_WRITE_STEPS = 3
 COLLECT_LIMIT_DEFAULT = 10
 COLLECT_LIMIT_MAX = 25
@@ -71,9 +80,17 @@ MAX_AGENT_STEPS = 2
 AGENT_PROMPT_MAX_CHARS = 2000
 
 _TOP_KEYS = {"version", "name", "description", "mode", "variables",
-             "trigger", "steps", "narration", "focus", "filters"}
+             "trigger", "steps", "narration", "focus", "filters",
+             # R43: where the brief goes (§2.1) and which objects inside
+             # each account the agent may open (§2.2).
+             "delivery", "sources"}
 _SOURCE_KEYS = {"id", "mode", "connector_id", "event", "params",
-                "poll_interval_s", "schedule", "filter", "dedupe_key"}
+                "poll_interval_s", "schedule", "filter", "dedupe_key",
+                # R43 §8 — this connector's pings override the
+                # automation's delivery. Set on EVERY source of the
+                # connector, so they read the same wherever they are
+                # found.
+                "ping_channel", "ping_format"}
 # `grant_target` is SYSTEM-written per write step (arm snapshots the
 # approved grant's pinned target) — accepted on re-validation, never
 # authored.
@@ -105,6 +122,10 @@ class ValidatedSource:
     filter_rules: dict
     dedupe_key_field: Optional[str]
     event_spec: Optional[dict]
+    # R43 §8. Defaults keep every construction site and every stored
+    # spec unchanged; None means "use the automation's delivery".
+    ping_channel: Optional[str] = None
+    ping_format: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +226,29 @@ class ValidatedSpecV2:
         return f if isinstance(f, dict) else {}
 
     @property
+    def delivery(self) -> dict:
+        """R43 §2.1 — where the brief goes, `{channels, format,
+        cadence}`. Partial: the payload builder fills what is missing
+        from `catalog.DEFAULT_DELIVERY`, so an automation written before
+        this round reads as the default rather than as nowhere."""
+        d = self.raw.get("delivery")
+        return d if isinstance(d, dict) else {}
+
+    @property
+    def account_sources(self) -> dict:
+        """R43 §2.2 — the objects inside each account the agent may
+        open, `{connector_id: [id]}`.
+
+        NOT `sources`: that name is already this class's tuple of
+        firing lanes, and the two are unrelated. The spec key is
+        `sources` because that is the word the design and the app use
+        for what is inside an account; the accessor is renamed rather
+        than the key, so the wire stays the contract's.
+        """
+        s = self.raw.get("sources")
+        return s if isinstance(s, dict) else {}
+
+    @property
     def write_steps(self) -> tuple:
         return tuple(st for st in self.steps if st.mutates)
 
@@ -223,6 +267,132 @@ class ValidatedSpecV2:
             if s.mode == "schedule":
                 return s
         return None
+
+
+# ── Delivery and per-account sources (R43 §2.1 / §2.2) ───────────────
+#
+# Both are the same kind of thing as `filters`: a user choice that
+# belongs IN the spec because more than one reader needs the same
+# answer — the workflow payload the canvas draws, the run that has to
+# send the brief somewhere, and the thread agent that has to be able to
+# say where it went. Both validate membership against a CLOSED
+# catalogue (`catalog.py`), which is what makes an unknown id a
+# malformed spec rather than a fact about the user's account.
+#
+# `sources` is the exception, and it is validated like `focus`: shape
+# only. The ids are the account's own objects (a Gmail label, a Slack
+# channel), enumerated live, so this file cannot know them and a stale
+# pick must stay inert rather than make the spec unparseable at run
+# time.
+
+MAX_ACCOUNT_SOURCES = 10
+SOURCE_ID_MAX = 200
+
+
+def validate_delivery(spec: dict, errors: list) -> dict:
+    """`spec["delivery"]` → the canonical `{channels, format, cadence}`.
+
+    Partial by design: a spec that names only a format keeps the
+    defaults for the rest, because `PUT /delivery` is a partial write
+    and re-validating what it produced must not invent the two keys it
+    did not touch.
+    """
+    delivery = spec.get("delivery")
+    if delivery is None:
+        return {}
+    if not isinstance(delivery, dict):
+        _err(errors, "bad_delivery", "delivery",
+             "delivery must be an object")
+        return {}
+    unknown = set(delivery) - {"channels", "format", "cadence"}
+    if unknown:
+        _err(errors, "unknown_field", "delivery",
+             f"unknown delivery fields {sorted(unknown)}")
+    out: dict = {}
+
+    channels = delivery.get("channels")
+    if channels is not None:
+        if not isinstance(channels, list):
+            _err(errors, "bad_delivery", "delivery.channels",
+                 "delivery.channels must be a list of channel ids")
+        else:
+            wanted: set = set()
+            for i, cid in enumerate(channels):
+                if not isinstance(cid, str) or not catalog.is_channel(cid):
+                    _err(errors, "unknown_channel", f"delivery.channels[{i}]",
+                         f"{cid!r} is not a delivery channel "
+                         f"(known: {sorted(catalog.CHANNEL_IDS)})")
+                    continue
+                wanted.add(cid)
+            # Catalogue order, never the caller's, for the reason
+            # `validate_filters` canonicalises its list: two deliveries
+            # that reach the same person the same way must serialize
+            # identically.
+            out["channels"] = catalog.order_channels(wanted)
+
+    fmt = delivery.get("format")
+    if fmt is not None:
+        if not isinstance(fmt, str) or not catalog.is_format(fmt):
+            _err(errors, "unknown_format", "delivery.format",
+                 f"{fmt!r} is not a format "
+                 f"(known: {sorted(catalog.FORMAT_IDS)})")
+        else:
+            out["format"] = fmt
+
+    cad = delivery.get("cadence")
+    if cad is not None:
+        if not isinstance(cad, str) or not catalog.is_cadence(cad):
+            _err(errors, "unknown_cadence", "delivery.cadence",
+                 f"{cad!r} is not a cadence "
+                 f"(known: {sorted(catalog.CADENCE_IDS)})")
+        else:
+            out["cadence"] = cad
+
+    return out
+
+
+def validate_account_sources(spec: dict, errors: list) -> dict:
+    """`spec["sources"]` → the canonical `{connector_id: [id]}` map.
+
+    Order is the CALLER's here, unlike `filters`: these ids come from a
+    live enumeration in the account's own order, and there is no table
+    to sort them against.
+    """
+    sources = spec.get("sources")
+    if sources is None:
+        return {}
+    if not isinstance(sources, dict):
+        _err(errors, "bad_sources", "sources",
+             "sources must map a connector id to a list of source ids")
+        return {}
+    out: dict[str, list[str]] = {}
+    for cid, ids in sources.items():
+        fld = f"sources.{cid}"
+        if not isinstance(cid, str) or not cid.strip():
+            _err(errors, "bad_sources", "sources",
+                 "sources keys must be connector ids")
+            continue
+        if not isinstance(ids, list):
+            _err(errors, "bad_sources", fld,
+                 "each account's sources is a list of ids")
+            continue
+        if len(ids) > MAX_ACCOUNT_SOURCES:
+            _err(errors, "too_many_sources_picked", fld,
+                 f"at most {MAX_ACCOUNT_SOURCES} sources per account")
+            ids = ids[:MAX_ACCOUNT_SOURCES]
+        kept: list[str] = []
+        for i, sid in enumerate(ids):
+            if not isinstance(sid, str) or not (1 <= len(sid.strip())
+                                                <= SOURCE_ID_MAX):
+                _err(errors, "bad_source_pick", f"{fld}[{i}]",
+                     f"a source id must be 1-{SOURCE_ID_MAX} characters")
+                continue
+            sid = sid.strip()
+            if sid not in kept:
+                kept.append(sid)
+        if kept:
+            out[cid] = kept
+    return out
 
 
 def _validate_source(
@@ -352,6 +522,17 @@ def _validate_source(
                 _err(errors, "bad_schedule", f"{fld}.schedule.every_s",
                      f"every_s must be an integer >= {floor}")
 
+    ping_channel = _validated_ping(
+        src.get("ping_channel"), f"{fld}.ping_channel",
+        catalog.is_channel, "unknown_channel", "delivery channel",
+        catalog.CHANNEL_IDS, errors,
+    )
+    ping_format = _validated_ping(
+        src.get("ping_format"), f"{fld}.ping_format",
+        catalog.is_format, "unknown_format", "format",
+        catalog.FORMAT_IDS, errors,
+    )
+
     return ValidatedSource(
         id=sid,
         mode=mode,
@@ -363,7 +544,28 @@ def _validate_source(
         filter_rules=filter_rules,
         dedupe_key_field=dedupe_field,
         event_spec=event_spec,
+        ping_channel=ping_channel,
+        ping_format=ping_format,
     )
+
+
+def _validated_ping(
+    raw: Any, fld: str, known, code: str, what: str, ids, errors: list,
+) -> Optional[str]:
+    """One per-connector override, or None.
+
+    Explicit null is how the app CLEARS an override, so it has to be
+    indistinguishable from an absent key by the time it reaches the
+    dataclass — otherwise re-validating a cleared spec would resurrect
+    the value the user just took off.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not known(raw):
+        _err(errors, code, fld,
+             f"{raw!r} is not a {what} (known: {sorted(ids)})")
+        return None
+    return raw
 
 
 def _validate_collect(
@@ -903,6 +1105,8 @@ def validate_spec_v2(
 
     focus = validate_focus(spec, errors)
     filters = validate_filters(spec, errors)
+    delivery = validate_delivery(spec, errors)
+    account_sources = validate_account_sources(spec, errors)
 
     if errors:
         raise SpecError(errors)
@@ -914,6 +1118,8 @@ def validate_spec_v2(
         "mode": mode,
         **({"focus": focus} if focus else {}),
         **({"filters": filters} if filters else {}),
+        **({"delivery": delivery} if delivery else {}),
+        **({"sources": account_sources} if account_sources else {}),
         **({"narration": narration} if narration else {}),
         **({"variables": variables} if variables else {}),
         "trigger": {
@@ -930,6 +1136,10 @@ def validate_spec_v2(
                     **({"filter": s.filter_rules} if s.filter_rules else {}),
                     **({"dedupe_key": f"event.{s.dedupe_key_field}"}
                        if s.dedupe_key_field else {}),
+                    **({"ping_channel": s.ping_channel}
+                       if s.ping_channel else {}),
+                    **({"ping_format": s.ping_format}
+                       if s.ping_format else {}),
                 }
                 for s in sources
             ],

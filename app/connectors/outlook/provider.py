@@ -21,10 +21,14 @@ Send-mail endpoint quirks:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import time
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Any, ClassVar, Optional
 
+from app.connectors.textclean import clean_provider_text
 from app.connectors._microsoft_base import (
     _MicrosoftConnectorError,
     microsoft_graph_request,
@@ -125,7 +129,98 @@ def _clamp_top(value: Any, default: int) -> int:
     return max(1, min(top, _MAX_TOP))
 
 
-def _list_messages_params(tool_input: dict) -> tuple[dict, Optional[bool], int]:
+#: Attachment caps. The 3 MB is MICROSOFT'S: a `fileAttachment` posted
+#: inline on a message create is capped there, and anything larger needs
+#: an upload session this connector does not open. The Gmail draft tool
+#: takes the same pair verbatim, because a delivery that succeeds on one
+#: mail channel and refuses on the other is a channel picker that lies.
+MAX_ATTACHMENTS = 3
+MAX_ATTACHMENT_BYTES = 3 * 1024 * 1024
+
+
+def _safe_filename(value: Any) -> str:
+    """A filename with nothing in it that could break out of the JSON
+    field or read as a location. Graph takes `name` as a plain string,
+    so this is narrower than it needs to be on purpose — the two mail
+    providers agree on what a delivery filename may contain."""
+    text = str(value or "").strip()
+    for bad in ("\r", "\n", '"', "\\", "/"):
+        text = text.replace(bad, "")
+    return text.strip()[:128] or "attachment"
+
+
+def _graph_attachments(raw: Any) -> tuple[list[dict], str]:
+    """`([fileAttachment, ...], error)` — exactly one is empty.
+
+    Same wire shape as the Gmail draft tool takes
+    (`[{"filename", "content_type"?, "content_base64"}]`), because
+    `deliver.py` hands ONE `Brief.document` to whichever mail channel
+    the user picked and must not have to know which.
+
+    A refusal is a MESSAGE. A draft that quietly arrives without the PDF
+    the user chose would make "One-page PDF" the name of something that
+    is not there.
+    """
+    if raw in (None, "", []):
+        return [], ""
+    if not isinstance(raw, list):
+        return [], "attachments must be a list"
+    if len(raw) > MAX_ATTACHMENTS:
+        return [], f"at most {MAX_ATTACHMENTS} attachments"
+    out: list[dict] = []
+    total = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            return [], "each attachment must be an object"
+        b64 = item.get("content_base64")
+        if not isinstance(b64, str) or not b64.strip():
+            return [], "each attachment needs content_base64"
+        try:
+            blob = base64.b64decode(b64, validate=True)
+        except Exception:
+            return [], "content_base64 is not valid base64"
+        total += len(blob)
+        if total > MAX_ATTACHMENT_BYTES:
+            return [], (f"attachments exceed "
+                        f"{MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB")
+        out.append({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": _safe_filename(item.get("filename")),
+            "contentType": (str(item.get("content_type") or "").strip()
+                            or "application/octet-stream"),
+            # Re-encoded from the DECODED bytes, not passed through:
+            # Graph rejects a urlsafe alphabet and unpadded input, and
+            # the caller's string has already been proved decodable.
+            "contentBytes": base64.b64encode(blob).decode("ascii"),
+        })
+    return out, ""
+
+
+def _messages_url(tool_input: dict) -> str:
+    """The message collection this read runs against.
+
+    A folder pin used to buy NOTHING: `query` is a KQL `$search`, which
+    cannot name a folder, so "Vendors" and "Inbox" produced the same
+    account-wide read. Graph scopes by COLLECTION instead —
+    `/me/mailFolders/{id}/messages` — and every `$filter`/`$search`/
+    `$orderby` rule below applies to it unchanged.
+
+    `folder` accepts either a real folder id or one of Graph's
+    well-known names (`inbox`, `archive`, `sentitems`, `drafts`,
+    `deleteditems`, `junkemail`), which are addressable in the same
+    position. It is percent-encoded because a Graph folder id is
+    base64url with `=` padding and would otherwise change meaning in a
+    path segment.
+    """
+    folder = str(tool_input.get("folder") or "").strip()
+    if not folder:
+        return f"{GRAPH_API}/me/messages"
+    return f"{GRAPH_API}/me/mailFolders/{quote(folder, safe='')}/messages"
+
+
+def _list_messages_params(
+    tool_input: dict, me_address: str = "",
+) -> tuple[dict, Optional[bool], int]:
     """Build the Graph query for outlook__list_messages.
 
     Graph's message collection speaks two query languages and refuses
@@ -161,6 +256,17 @@ def _list_messages_params(tool_input: dict) -> tuple[dict, Optional[bool], int]:
     include_body = bool(tool_input.get("include_body", True))
     top = _clamp_top(tool_input.get("max_results"), 25)
     query = (tool_input.get("query") or "").strip()
+    # R43 §6's `me` chip ("Addressed to me"). KQL's `to:` restriction,
+    # not an OData `toRecipients/any(...)` lambda: the lambda would have
+    # to sit in a `$filter` beside `$orderby`, which is the exact shape
+    # Graph answers `InefficientFilter` to for a collection property,
+    # while `to:` is a documented message-search restriction that
+    # composes with everything the search path already does (`received>=`
+    # for `since`, the client-side read scan for `is_read`). The caller
+    # resolves the address; an unresolvable mailbox narrows nothing
+    # rather than searching for the literal word "me".
+    if tool_input.get("to_me") and me_address:
+        query = f"to:{me_address} {query}".strip()
     is_read = tool_input.get("is_read")
     if is_read is not None:
         is_read = bool(is_read)
@@ -213,6 +319,50 @@ def _list_messages_params(tool_input: dict) -> tuple[dict, Optional[bool], int]:
     return params, None, top
 
 
+#: The mailbox's own address, per user, for the lifetime of a process.
+#: `ConnectorIdentity.provider_account_id` is NULL for Outlook — the
+#: Microsoft token response carries neither `account` nor `login`, and
+#: nothing back-fills it the way `oauth._gmail_post_connect` does for
+#: Gmail — so "addressed to me" has to ask Graph. `GET /me` is the same
+#: call `health_probe` already makes on `User.Read`, which this
+#: connector has always requested, so the chip costs no new consent.
+#: An hour is well inside how often a mailbox address changes (never)
+#: and short enough that a reconnected account is not stale for a day.
+_MAILBOX_TTL_S = 3600.0
+_MAILBOX_CACHE: dict[str, tuple[float, str]] = {}
+
+
+async def _mailbox_address(user_id: str, access_token: str) -> str:
+    """This mailbox's primary address, or `""`.
+
+    Empty is a real answer and the caller must treat it as one: the
+    `to_me` narrowing is DROPPED rather than guessed, because searching
+    for the literal word "me" would return an arbitrary slice of the
+    mailbox under a lit "Addressed to me" chip — the picker that writes
+    nowhere, wearing a result.
+    """
+    key = str(user_id or "")
+    hit = _MAILBOX_CACHE.get(key)
+    now = time.monotonic()
+    if hit and now - hit[0] < _MAILBOX_TTL_S:
+        return hit[1]
+    try:
+        me = await microsoft_graph_request(
+            "GET",
+            f"{GRAPH_API}/me",
+            access_token=access_token,
+            params={"$select": "mail,userPrincipalName"},
+            connector_id="outlook",
+            scope_hint="User.Read",
+        )
+    except _MicrosoftConnectorError:
+        return ""
+    addr = str(me.get("mail") or me.get("userPrincipalName") or "").strip()
+    if key:
+        _MAILBOX_CACHE[key] = (now, addr)
+    return addr
+
+
 class OutlookProvider(BaseConnectorProvider):
     manifest_id: ClassVar[str] = "outlook"
 
@@ -235,10 +385,15 @@ class OutlookProvider(BaseConnectorProvider):
                 # also auto-injects when the LLM omits the field; this
                 # default covers tests + non-dispatcher call paths.
                 include_body = bool(tool_input.get("include_body", True))
-                params, scan_is_read, limit = _list_messages_params(tool_input)
+                me_address = (
+                    await _mailbox_address(ctx.user_id, access_token)
+                    if tool_input.get("to_me") else ""
+                )
+                params, scan_is_read, limit = _list_messages_params(
+                    tool_input, me_address)
                 result = await microsoft_graph_request(
                     "GET",
-                    f"{GRAPH_API}/me/messages",
+                    _messages_url(tool_input),
                     access_token=access_token,
                     params=params,
                     connector_id="outlook",
@@ -253,11 +408,11 @@ class OutlookProvider(BaseConnectorProvider):
                         continue
                     row: dict[str, Any] = {
                         "id": m.get("id"),
-                        "subject": m.get("subject", ""),
+                        "subject": clean_provider_text(m.get("subject")),
                         "from": (
                             (m.get("from") or {}).get("emailAddress", {}).get("address")
                         ),
-                        "preview": m.get("bodyPreview", "")[:300],
+                        "preview": clean_provider_text(m.get("bodyPreview"))[:300],
                         "received_at": m.get("receivedDateTime"),
                         "is_read": m.get("isRead"),
                     }
@@ -269,6 +424,46 @@ class OutlookProvider(BaseConnectorProvider):
                     if len(msgs) >= limit:
                         break
                 return ConnectorOk(content=json.dumps({"messages": msgs}))
+
+            if tool_name == "outlook__list_folders":
+                top = _clamp_top(tool_input.get("max_results"), 25)
+                listing, well_known = await asyncio.gather(
+                    microsoft_graph_request(
+                        "GET",
+                        f"{GRAPH_API}/me/mailFolders",
+                        access_token=access_token,
+                        params={"$top": top, "$select": _FOLDER_SELECT},
+                        connector_id="outlook",
+                        scope_hint="Mail.Read",
+                    ),
+                    _well_known_folder_ids(access_token),
+                )
+                folders = []
+                for f in (listing.get("value") or []):
+                    if not isinstance(f, dict) or not f.get("id"):
+                        continue
+                    folders.append({
+                        "id": f.get("id"),
+                        "name": clean_provider_text(f.get("displayName")),
+                        "unread_count": f.get("unreadItemCount"),
+                        "total_count": f.get("totalItemCount"),
+                        "child_count": f.get("childFolderCount"),
+                        # Which of Outlook's OWN folders this is, by id
+                        # rather than by display name: `displayName` is
+                        # localised, so "Inbox" is "Boîte de réception"
+                        # on a French mailbox and a caller matching the
+                        # English string would list the inbox twice and
+                        # find its own well-known row nowhere.
+                        # `wellKnownName` is a beta-only field, so the
+                        # v1.0 way to know is to ask for the folder by
+                        # the well-known name and compare ids.
+                        "well_known": well_known.get(str(f.get("id"))),
+                    })
+                # The three §5 names first, in the design's order, then
+                # the user's own folders as Graph listed them.
+                order = {"inbox": 0, "archive": 1, "sentitems": 2}
+                folders.sort(key=lambda f: order.get(f["well_known"], 9))
+                return ConnectorOk(content=json.dumps({"folders": folders}))
 
             if tool_name == "outlook__get_message":
                 mid = tool_input.get("message_id")
@@ -286,7 +481,7 @@ class OutlookProvider(BaseConnectorProvider):
                 body_obj = msg.get("body") or {}
                 return ConnectorOk(content=json.dumps({
                     "id": msg.get("id"),
-                    "subject": msg.get("subject", ""),
+                    "subject": clean_provider_text(msg.get("subject")),
                     "from": (
                         (msg.get("from") or {}).get("emailAddress", {}).get("address")
                     ),
@@ -352,6 +547,13 @@ class OutlookProvider(BaseConnectorProvider):
                         message="to, subject, and body are required",
                         retryable=False,
                     )
+                # R43 — a malformed attachment refuses the draft rather
+                # than writing one silently missing its file: "One-page
+                # PDF" naming something that is not there is the same
+                # class of lie as a chip that narrows nothing.
+                files, bad = _graph_attachments(tool_input.get("attachments"))
+                if bad:
+                    return ConnectorToolError(message=bad, retryable=False)
                 message = {
                     "subject": subject,
                     "body": {
@@ -360,6 +562,15 @@ class OutlookProvider(BaseConnectorProvider):
                     },
                     "toRecipients": _split_recipient_csv(to),
                 }
+                # R43 §1.2 — the `outlook_mail` channel's own words are
+                # "mail to yourself, marked read". Graph takes `isRead`
+                # on a message create, so the claim can be true; sent
+                # only when the caller asked, so an ordinary agent draft
+                # keeps whatever Graph's default is.
+                if tool_input.get("is_read") is not None:
+                    message["isRead"] = bool(tool_input.get("is_read"))
+                if files:
+                    message["attachments"] = files
                 cc = _split_recipient_csv(tool_input.get("cc"))
                 if cc:
                     message["ccRecipients"] = cc
@@ -386,6 +597,8 @@ class OutlookProvider(BaseConnectorProvider):
                     "web_link": result.get("webLink"),
                     "to": to,
                     "subject": subject,
+                    "is_read": result.get("isRead"),
+                    "attachments": [f["name"] for f in files],
                 }))
 
             return ConnectorToolError(
@@ -427,3 +640,37 @@ class OutlookProvider(BaseConnectorProvider):
             return HealthResult(ok=False, detail=repr(e.result))
         except Exception as e:
             return HealthResult(ok=False, detail=f"{type(e).__name__}: {e}")
+
+
+#: The folders §5 names, addressable by these literal segments in every
+#: locale (`/me/mailFolders/inbox`), which is what makes them the stable
+#: handle a picker can store.
+WELL_KNOWN_FOLDERS = ("inbox", "archive", "sentitems")
+
+_FOLDER_SELECT = ("id,displayName,unreadItemCount,totalItemCount,"
+                  "childFolderCount")
+
+
+async def _well_known_folder_ids(access_token: str) -> dict[str, str]:
+    """`{folder_id: "inbox"|"archive"|"sentitems"}`.
+
+    Three cheap GETs, run beside the listing rather than after it. A
+    mailbox with no Archive answers for the other two — a missing
+    well-known folder is a real shape (older Exchange), not a failure.
+    """
+    async def _one(name: str) -> tuple[str, str]:
+        try:
+            f = await microsoft_graph_request(
+                "GET",
+                f"{GRAPH_API}/me/mailFolders/{name}",
+                access_token=access_token,
+                params={"$select": "id"},
+                connector_id="outlook",
+                scope_hint="Mail.Read",
+            )
+        except _MicrosoftConnectorError:
+            return "", name
+        return str(f.get("id") or ""), name
+
+    pairs = await asyncio.gather(*(_one(n) for n in WELL_KNOWN_FOLDERS))
+    return {fid: name for fid, name in pairs if fid}

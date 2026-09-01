@@ -32,6 +32,13 @@
 # scopes=entry.manifest.oauth.scopes)`), so nothing here reaches Entra.
 # If that ever changes, this entry must move out of the manifest first.
 #
+# R43 asked again, for `teams__read_channel_messages` (a per-team-channel
+# source in the workflow picker). The answer is unchanged and the reason
+# is unchanged: the tool is one HTTP GET away and the scope behind it is
+# not grantable by the people who would use it. It stays undeclared —
+# a tool that 403s for most of the fleet, and whose mere REQUEST would
+# stop everyone else connecting at all, is worse than no tool.
+#
 # Channel tools therefore stop at names + web links. Posting to a channel
 # (ChannelMessage.Send) IS user-consentable and was still left out: a
 # message to a whole team is a different blast radius from a message in a
@@ -117,7 +124,7 @@ tools:
 
   - name: teams__list_chats
     description: |
-      List your recent Teams chats (1:1, group, and meeting chats), most recently active first, with their participants. Use this to find the chat_id for teams__read_chat_messages or teams__send_chat_message. One-on-one chats have no topic — identify them by their members.
+      List your recent Teams chats (1:1, group, and meeting chats), most recently active first, with their participants. Use this to find the chat_id for teams__read_chat_messages or teams__send_chat_message. One-on-one chats have no topic — identify them by their members. Each chat carries is_self_chat: true only for the user's chat with themselves, which is the one chat a message can be sent to without anyone else reading it. The member marked is_self is the signed-in user; when self_identified is false nobody is marked and self_note says why.
     input_schema:
       type: object
       properties:
@@ -132,7 +139,9 @@ tools:
     elevation: false
     # `_redact` strips TOP-LEVEL keys only, so naming the list itself is
     # what keeps participant names and emails out of the audit row.
-    output_redaction: ["chats"]
+    # `self_user_id` is the caller's own directory id and is named for
+    # the same reason — it identifies a person on its own.
+    output_redaction: ["chats", "self_user_id"]
     pii: medium
     channel_policy:
       default: allow
@@ -140,7 +149,7 @@ tools:
 
   - name: teams__read_chat_messages
     description: |
-      Read the most recent messages in one Teams chat, newest first. Pass a chat_id from teams__list_chats. Message bodies may be HTML — body_content_type says which. System messages (someone joined, chat renamed) come back with sender null.
+      Read the most recent messages in one Teams chat, newest first. Pass a chat_id from teams__list_chats. Message bodies may be HTML — body_content_type says which. System messages (someone joined, chat renamed) come back with sender null and author_type "". Every message carries author_type ("user", "application" for a bot, "device") and its mentions.
     input_schema:
       type: object
       properties:
@@ -153,6 +162,14 @@ tools:
           maximum: 50
           description: Number of messages to return. Graph caps this at 50.
           default: 25
+        mentions_only:
+          type: boolean
+          description: Return only messages that @-mention you. Graph has no mentions predicate on this endpoint, so the narrowing runs over the page fetched — count is what you are handed. Costs one extra call to work out which member is you, and fails with an explanation rather than widening if it cannot.
+          default: false
+        since_last_read:
+          type: boolean
+          description: Return only messages modified since you last read this chat. Uses the chat's own viewpoint; a chat you have never opened has none, and the response then says since_last_read_applied false rather than pretending nothing is new.
+          default: false
       required: [chat_id]
     mutates: false
     elevation: false
@@ -216,6 +233,25 @@ automation:
       source_tool: teams__read_chat_messages
       poll_args:
         max_results: 25
+      params_required: [chat_id]
+      items_path: messages
+      dedupe_field: id
+      fields:
+        id: id
+        sender: sender
+        body: body
+        created_at: created_at
+    # R43 §7's second Teams event. Same tool, same pinned chat, one
+    # more poll arg — the row now carries `mentions`, and `mentions_only`
+    # resolves who "me" is from the chat list (see
+    # `provider._identify_self`) rather than from a `User.Read` scope
+    # every existing connection would have to be re-consented to gain.
+    - key: mentioned
+      description: A message in a Teams chat you pick @-mentions you.
+      source_tool: teams__read_chat_messages
+      poll_args:
+        max_results: 25
+        mentions_only: true
       params_required: [chat_id]
       items_path: messages
       dedupe_field: id

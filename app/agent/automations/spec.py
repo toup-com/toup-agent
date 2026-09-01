@@ -289,58 +289,294 @@ def focus_render_ctx(focus: dict) -> dict:
 #
 # A filter this connector cannot really express is NOT in the table. A
 # chip that changes nothing is exactly the defect this round removes
-# elsewhere, so under-offering is the correct error:
+# elsewhere, so under-offering is the correct error. R43 §6 asks for a
+# fuller seed list than the tool surface can honour, and these are the
+# chips it names that are NOT here, each for a reason that is a fact
+# about the provider rather than a gap in this file:
 #
-#   github  `github__list_issues` forwards only `state` and `per_page`
-#           to the API (provider.py) — and `state` already defaults to
-#           "open", so the one expressible narrowing is the one that is
-#           already applied. `sort` is a `github__list_repos` param; on
-#           an issue list it would be dropped in silence. No filters.
-#   slack   `slack__read_messages` takes `oldest` (a unix ts the
-#           provider forwards to conversations.history) and
-#           `slack__search_messages` takes Slack's own `after:`
-#           modifier, so a time window is real. Unread, "to me" and
-#           newsletters have no Slack expression at all.
-#   outlook Graph's KQL search has no "to me" (Gmail's `to:me` has no
-#           counterpart — we do not know the mailbox's own address
-#           here) and no promotions category. Read state and a
-#           received-since bound are real, and are separate PARAMS
-#           rather than query text: see `_list_messages_params`.
-#   calendar/notion/teams/drive  nothing this vocabulary can narrow
-#           that the step's own params do not already own (the calendar
-#           horizon is `window_days`, applied by `_apply_time_window`).
+#   github  every chip §6 names — failing checks, drafts, changed-since
+#           — needs a pull request or a check run, and this connector
+#           has neither tool. `github__list_issues` forwards only
+#           `state` and `per_page`, excludes PRs outright, and `state`
+#           already defaults to "open". No filters.
+#   slack   "Mentions me" and "Threads I am in" need the user's own
+#           handle, which no Slack tool here answers (`auth.test` is not
+#           exposed). "Since my last read" needs `conversations.info`'s
+#           `last_read`, also unexposed. "Skip bots" needs `bot_id`,
+#           which `_message_row` does not carry. The time window is
+#           real, and it is the one chip.
+#   outlook "Addressed to me" would need the mailbox's own address to
+#           write Graph's `to:`; nothing here knows it. Newsletters have
+#           no Graph counterpart to Gmail's category tabs, so §6's
+#           "Skip automated mail" is a `drop` on the sender instead.
+#   teams   `teams__read_chat_messages` takes a chat id and a count and
+#           nothing else; mentions, bots and read state are all
+#           unreachable from it.
+#   notion  `notion__search` sorts by last-edited but cannot filter on
+#           it, and returns no person or archived flag to drop on. A
+#           person filter is `notion__query_database` territory, which
+#           needs a database the user has not been asked for.
+#   calendar §6's "Meetings I own", "No agenda yet" and "Skip declined"
+#           all need fields the provider's event row does not return
+#           (organiser, description, responseStatus). The horizon is
+#           real and is the one chip.
+#   drive   nothing this vocabulary can narrow that the step's own
+#           params do not already own.
+
+#: The closed vocabulary of `compile` mutations (R43 §6). A filter
+#: declares WHAT it does to the read; `executor_v2` owns HOW. Five
+#: kinds, each with one shape:
+#:
+#:   query_term   {"param", "value"}   append one term to a provider
+#:                                     search string, ANDed with the
+#:                                     step's own query.
+#:   jql_and      {"value"}            AND one clause into the WHERE
+#:                                     half of `jql`, sort left trailing.
+#:   param        {"name", "value"}    set one request param outright.
+#:   time_window  {"direction", "hours", "param", "unit", "max_param"?}
+#:                                     a bound computed from the run
+#:                                     clock. direction "back" writes
+#:                                     now-hours into `param`; "ahead"
+#:                                     writes now into `param` and
+#:                                     now+hours into `max_param`. unit
+#:                                     is the encoding the provider
+#:                                     takes: "iso", "unix", or
+#:                                     "slack_after" (Slack search's own
+#:                                     `after:<date>` term, appended to
+#:                                     the query named by `param`).
+#:   drop         {"field", "when", "values"?, "hours"?}
+#:                                     remove RETURNED items — the one
+#:                                     kind that runs after the call,
+#:                                     for narrowings no provider query
+#:                                     can express. `when` is "present",
+#:                                     "absent", "contains" (any of
+#:                                     `values`, case-insensitive) or
+#:                                     "older_than" (`hours`).
+#:
+#: A filter's `compile` is a LIST, because one chip can be two
+#: mutations (Gmail's newsletters are two categories) and because the
+#: same chip can compile differently per tool — an entry may carry its
+#: own `tools` to say which of the filter's tools it applies to, and
+#: omitting it means all of them.
+#:
+#: Two kinds the contract names are deliberately absent. `graph_filter`
+#: has no user: `outlook__list_messages` speaks `$search` and typed
+#: params, and forwards no OData `$filter` a caller could compose into.
+#: `sort` still has no user, and R43 chose not to add one: GitHub
+#: search cannot order by check status at all (its `sort` accepts
+#: created/updated/comments/reactions), so "Failing checks first"
+#: compiles as a `query_term` that SELECTS the red ones. A `sort`
+#: kind would have had exactly one caller and no provider able to
+#: honour it.
+FILTER_COMPILE_KINDS = frozenset({
+    "query_term", "jql_and", "param", "time_window", "drop",
+})
+
 CONNECTOR_FILTERS: dict[str, tuple[dict, ...]] = {
     "gmail": (
         {"id": "me", "label": "Addressed to me",
-         "tools": ("gmail__list_messages", "gmail__search_threads")},
+         "tools": ("gmail__list_messages", "gmail__search_threads"),
+         "compile": ({"kind": "query_term", "param": "query",
+                      "value": "to:me"},)},
         {"id": "unread", "label": "Unread only",
-         "tools": ("gmail__list_messages", "gmail__search_threads")},
+         "tools": ("gmail__list_messages", "gmail__search_threads"),
+         "compile": ({"kind": "query_term", "param": "query",
+                      "value": "is:unread"},)},
+        # Gmail's own tabs, which is where every bulk mailing this chip
+        # means already lands. There is no "newsletter" predicate.
         {"id": "no_promos", "label": "Skip newsletters",
-         "tools": ("gmail__list_messages", "gmail__search_threads")},
+         "tools": ("gmail__list_messages", "gmail__search_threads"),
+         "compile": ({"kind": "query_term", "param": "query",
+                      "value": "-category:promotions"},
+                     {"kind": "query_term", "param": "query",
+                      "value": "-category:updates"})},
         {"id": "day", "label": "Last 24 hours",
-         "tools": ("gmail__list_messages", "gmail__search_threads")},
+         "tools": ("gmail__list_messages", "gmail__search_threads"),
+         "compile": ({"kind": "query_term", "param": "query",
+                      "value": "newer_than:1d"},)},
     ),
     "outlook": (
+        # R43 §6. A typed param rather than a `graph_filter`: the tool
+        # resolves the mailbox's own address (Outlook stores none) and
+        # puts it in the KQL search, which is the one place Graph will
+        # take a recipient restriction beside everything else this read
+        # already does.
+        {"id": "me", "label": "Addressed to me",
+         "tools": ("outlook__list_messages",),
+         "compile": ({"kind": "param", "name": "to_me", "value": True},)},
         {"id": "unread", "label": "Unread only",
-         "tools": ("outlook__list_messages",)},
+         "tools": ("outlook__list_messages",),
+         "compile": ({"kind": "param", "name": "is_read", "value": False},)},
+        # A `drop` rather than a query term: Graph's KQL has no
+        # automated-mail predicate, and `NOT from:noreply` inside a
+        # `$search` narrows only the one literal address. The senders
+        # below are what automated mail actually uses.
+        {"id": "no_auto", "label": "Skip automated mail",
+         "tools": ("outlook__list_messages",),
+         "compile": ({"kind": "drop", "field": "from", "when": "contains",
+                      "values": ("noreply", "no-reply", "donotreply",
+                                 "do-not-reply", "mailer-daemon")},)},
         {"id": "day", "label": "Last 24 hours",
-         "tools": ("outlook__list_messages",)},
+         "tools": ("outlook__list_messages",),
+         "compile": ({"kind": "time_window", "direction": "back",
+                      "hours": 24, "param": "since", "unit": "iso"},)},
+    ),
+    # Date-granular in search, exact in a channel read — one label that
+    # is true of both, and two compile entries because the two tools
+    # take the bound in different units.
+    "slack": (
+        {"id": "day", "label": "Since yesterday",
+         "tools": ("slack__read_messages", "slack__search_messages"),
+         "compile": ({"kind": "time_window", "direction": "back",
+                      "hours": 24, "param": "oldest", "unit": "unix",
+                      "tools": ("slack__read_messages",)},
+                     {"kind": "time_window", "direction": "back",
+                      "hours": 24, "param": "query", "unit": "slack_after",
+                      "tools": ("slack__search_messages",)})},
+        # R43 §6. Three of the four are provider params rather than
+        # query terms because each needs to know WHO is asking, and the
+        # compile vocabulary has no clock and no identity — only the
+        # provider can resolve `auth.test`. `slack__list_mentions` and
+        # `slack__list_threads` are deliberately NOT in `tools`: a step
+        # that already runs those IS the narrowing, and a chip over it
+        # would change nothing.
+        {"id": "mentions", "label": "Mentions me",
+         "tools": ("slack__read_messages",),
+         "compile": ({"kind": "param", "name": "mentions_only",
+                      "value": True},)},
+        {"id": "mine", "label": "Threads I am in",
+         "tools": ("slack__read_messages",),
+         "compile": ({"kind": "param", "name": "threads_only",
+                      "value": True},)},
+        # A `drop`, and the right kind for it: Slack's API has no bot
+        # predicate, and `bot_id` is the only reliable not-a-person
+        # signal on a message — `subtype` answers a different question
+        # and is absent on a plain bot post.
+        {"id": "no_bots", "label": "Skip bots",
+         "tools": ("slack__read_messages",),
+         "compile": ({"kind": "drop", "field": "bot_id",
+                      "when": "present"},)},
+        # Read state lives on `conversations.info` and nowhere else, so
+        # the provider pays one extra call. An explicit `oldest` — the
+        # `day` chip above, or the step's own — always wins: a bound
+        # only ever moves inward.
+        {"id": "since_read", "label": "Since my last read",
+         "tools": ("slack__read_messages",),
+         "compile": ({"kind": "param", "name": "since_last_read",
+                      "value": True},)},
+    ),
+    "teams": (
+        {"id": "mentions", "label": "Mentions me",
+         "tools": ("teams__read_chat_messages",),
+         "compile": ({"kind": "param", "name": "mentions_only",
+                      "value": True},)},
+        # A `drop`, not a query term: Graph exposes no author-kind
+        # predicate on /chats/{id}/messages. A system message ("Dana
+        # joined the chat") has author_type "" and is not a bot.
+        {"id": "no_bots", "label": "Skip bots",
+         "tools": ("teams__read_chat_messages",),
+         "compile": ({"kind": "drop", "field": "author_type",
+                      "when": "contains",
+                      "values": ("application", "device")},)},
+        {"id": "since_read", "label": "Since my last read",
+         "tools": ("teams__read_chat_messages",),
+         "compile": ({"kind": "param", "name": "since_last_read",
+                      "value": True},)},
+    ),
+    # R43 §6. All three compose into `github__search_issues` — the only
+    # GitHub tool that speaks a query — so a step that lists one repo's
+    # issues still offers nothing, which is the R42 gate working.
+    "github": (
+        # NOT an ordering. GitHub search's `sort` accepts created /
+        # updated / comments / reactions and nothing about checks, so
+        # this SELECTS the pull requests whose checks are red rather
+        # than putting them first. The spec's label is kept verbatim;
+        # "Failing checks only" is the honest wording if copy may move.
+        {"id": "failing", "label": "Failing checks first",
+         "tools": ("github__search_issues",),
+         "compile": ({"kind": "query_term", "param": "q",
+                      "value": "status:failure"},)},
+        {"id": "no_drafts", "label": "Skip drafts",
+         "tools": ("github__search_issues",),
+         "compile": ({"kind": "query_term", "param": "q",
+                      "value": "-is:draft"},)},
+        # A PARAM, not a query term: a chip carries no clock. The
+        # provider turns the ISO written here into GitHub's own
+        # `updated:>=`, which is what keeps the compile vocabulary at
+        # five kinds instead of six.
+        {"id": "day", "label": "Changed since yesterday",
+         "tools": ("github__search_issues",),
+         "compile": ({"kind": "time_window", "direction": "back",
+                      "hours": 24, "param": "updated_since",
+                      "unit": "iso"},)},
+    ),
+    # `day` compiles differently per tool — Notion's search cannot
+    # narrow on time at all, a data-source query can — the same
+    # two-entry shape Slack's `day` uses. `mine` names ONLY
+    # `notion__query_database`, because Notion's search has no person
+    # predicate and returns no `properties` to post-filter on; the R42
+    # `available_filters` gate then hides the chip unless the automation
+    # runs such a step.
+    "notion": (
+        {"id": "day", "label": "Changed since yesterday",
+         "tools": ("notion__search", "notion__query_database"),
+         "compile": ({"kind": "drop", "field": "last_edited_time",
+                      "when": "older_than", "hours": 24,
+                      "tools": ("notion__search",)},
+                     {"kind": "time_window", "direction": "back", "hours": 24,
+                      "param": "edited_since", "unit": "iso",
+                      "tools": ("notion__query_database",)})},
+        {"id": "mine", "label": "Tagged to me",
+         "tools": ("notion__query_database",),
+         "compile": ({"kind": "param", "name": "assigned_to_me",
+                      "value": True},)},
+        {"id": "no_archived", "label": "Skip archived",
+         "tools": ("notion__search", "notion__query_database"),
+         "compile": ({"kind": "drop", "field": "state", "when": "contains",
+                      "values": ("archived", "in_trash")},)},
     ),
     "jira": (
         {"id": "priority", "label": "P1 and P2 only",
-         "tools": ("jira__search_issues",)},
-        {"id": "open", "label": "Still open",
-         "tools": ("jira__search_issues",)},
+         "tools": ("jira__search_issues",),
+         "compile": ({"kind": "jql_and",
+                      "value": "priority in (Highest, High)"},)},
+        {"id": "open", "label": "Skip closed",
+         "tools": ("jira__search_issues",),
+         "compile": ({"kind": "jql_and",
+                      "value": "statusCategory != Done"},)},
         {"id": "due_week", "label": "Due this week",
-         "tools": ("jira__search_issues",)},
-        {"id": "day", "label": "Touched in the last 24 hours",
-         "tools": ("jira__search_issues",)},
+         "tools": ("jira__search_issues",),
+         "compile": ({"kind": "jql_and",
+                      "value": "duedate <= endOfWeek()"},)},
+        {"id": "day", "label": "Changed since yesterday",
+         "tools": ("jira__search_issues",),
+         "compile": ({"kind": "jql_and", "value": "updated >= -1d"},)},
     ),
-    # Date-granular in search, exact in a channel read — one label that
-    # is true of both.
-    "slack": (
-        {"id": "day", "label": "Since yesterday",
-         "tools": ("slack__read_messages", "slack__search_messages")},
+    "calendar": (
+        # The only calendar narrowing this vocabulary can express, and
+        # it is a real one: `calendar__list_events` orders ASCENDING and
+        # windows only when asked, so an unwindowed read answers with
+        # the OLDEST events in the account (R42, B1).
+        {"id": "next24", "label": "Next 24 hours",
+         "tools": ("calendar__list_events",),
+         "compile": ({"kind": "time_window", "direction": "ahead",
+                      "hours": 24, "param": "time_min",
+                      "max_param": "time_max", "unit": "iso"},)},
+        {"id": "mine", "label": "Meetings I own",
+         "tools": ("calendar__list_events",),
+         "compile": ({"kind": "param", "name": "organized_by_me",
+                      "value": True},)},
+        {"id": "no_agenda", "label": "No agenda yet",
+         "tools": ("calendar__list_events",),
+         "compile": ({"kind": "param", "name": "without_agenda",
+                      "value": True},)},
+        # A `drop`: the Calendar API has no responseStatus predicate.
+        # An event the user is not an attendee of answers "" and STAYS —
+        # not being invited is not being declined.
+        {"id": "no_declined", "label": "Skip declined",
+         "tools": ("calendar__list_events",),
+         "compile": ({"kind": "drop", "field": "my_response",
+                      "when": "contains", "values": ("declined",)},)},
     ),
 }
 
@@ -362,6 +598,28 @@ def filter_tools(connector_id: str, filter_id: str) -> tuple[str, ...]:
     for f in filter_options(connector_id):
         if f["id"] == filter_id:
             return tuple(f.get("tools") or ())
+    return ()
+
+
+def filter_compile(
+    connector_id: str, filter_id: str, tool: str = "",
+) -> tuple[dict, ...]:
+    """The mutations this filter makes to a read, for `tool`.
+
+    The applier asks the table rather than carrying its own per-
+    connector branches, so a chip that is offered and a chip that
+    narrows are the same fact. An entry may pin itself to a subset of
+    the filter's tools (Slack's one time window is a unix `oldest` on a
+    channel read and an `after:` term in a search); an entry with no
+    `tools` applies to every tool the filter declares.
+    """
+    for f in filter_options(connector_id):
+        if f["id"] != filter_id:
+            continue
+        return tuple(
+            m for m in (f.get("compile") or ())
+            if not tool or not m.get("tools") or tool in m["tools"]
+        )
     return ()
 
 
@@ -423,15 +681,49 @@ def validate_filters(spec: dict, errors: list) -> dict:
 # Nothing here invents an event. A key with no entry falls back to its
 # manifest description, so a connector that declares a new event shows
 # up honestly — worded for the model — rather than not at all.
+#
+# R43 §7 fixes the wording for every event the round names. Entries for
+# events no manifest declares are kept here on purpose: the picker is
+# built from the REGISTRY, so a label with no event is inert, and the
+# alternative — deleting it — loses the agreed wording the day the
+# provider gains the tool that makes the event real.
 EVENT_LABELS: dict[str, str] = {
     "calendar.event_created": "A new event lands on my calendar",
+    "calendar.invitation_arrived": "An invitation arrives",
+    "calendar.meeting_soon": "A meeting lands in the next 24 hours",
+    "calendar.no_agenda": "A meeting I own has no agenda",
     "drive.file_added": "A file shows up in my Drive",
+    "github.build_red": "A build goes red",
     "github.issue_opened": "An issue is opened in that repo",
-    "gmail.email_received": "An email arrives in my inbox",
+    "github.pr_approved": "My pull request is approved",
+    "github.pr_commented": "My pull request gets a comment",
+    "github.review_requested": "A review is requested from me",
+    "gmail.email_received": "Mail addressed to me arrives",
+    "gmail.invoice_landed": "An invoice lands",
+    "gmail.pinned_thread_reply": "A thread I pinned gets a reply",
+    "gmail.vip_wrote": "Someone in my VIPs writes",
+    "jira.due_moved": "A due date moves",
+    "jira.issue_assigned": "A ticket is assigned to me",
     "jira.issue_created": "A ticket is created in that project",
+    "jira.issue_reopened": "My ticket is reopened",
+    "jira.p1_raised": "A P1 is raised",
+    "notion.deadline_moved": "A deadline moves",
     "notion.page_added": "A page shows up in my workspace",
-    "outlook.email_received": "An email arrives in my Outlook inbox",
-    "teams.chat_message_received": "A message arrives in that chat",
+    "notion.page_changed": "A page tagged to me changes",
+    "outlook.email_received": "Mail addressed to me arrives",
+    "outlook.meeting_request": "A meeting request arrives",
+    "outlook.vendor_moved": "A vendor thread moves",
+    # The one Slack event a user token can honestly poll, and it is
+    # deliberately not one of §7's four ids: `conversations.history`
+    # reads ONE conversation, so the row has to name the place the pin
+    # names rather than promise "#oncall" or "any DM".
+    "slack.channel_message": "A message lands in a channel I picked",
+    "slack.dm_arrived": "A DM arrives",
+    "slack.mentioned": "I am @mentioned",
+    "slack.oncall_message": "#oncall gets a message",
+    "slack.thread_moved": "A thread I am in moves",
+    "teams.chat_message_received": "A chat arrives",
+    "teams.mentioned": "I am @mentioned",
 }
 
 

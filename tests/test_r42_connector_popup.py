@@ -331,16 +331,36 @@ async def test_a_stored_filter_stays_offerable_even_if_the_step_moves():
 # ── §5.3 the manifest is the whole inventory ────────────────────────
 
 def test_triggers_available_is_the_manifest_and_nothing_else():
+    # Gmail is still ONE row. R43 §7 names four, and the other three
+    # stay undeclared until the manifest carries the `default_filter`
+    # that narrows them — all four ride the same `users.watch` push, so
+    # declaring them unnarrowed would mean four runs per incoming mail.
     assert [t["id"] for t in wf.available_triggers({"version": 2}, REGISTRY, "gmail")] == [
         "email_received"]
-    assert wf.available_triggers({"version": 2}, REGISTRY, "slack") == []
+    # Slack was the empty one this test was written to pin. R43 gave it
+    # five: `channel_message` still names a pinned place, and four more
+    # that resolve the owner's identity at call time.
+    assert [t["id"] for t in wf.available_triggers({"version": 2}, REGISTRY, "slack")] == [
+        "channel_message", "mentioned", "dm_arrived", "thread_moved",
+        "oncall_message"]
     labels = {t["id"]: t["label"]
               for t in wf.available_triggers({"version": 2}, REGISTRY, "jira")}
-    assert labels == {"issue_created": "A ticket is created in that project"}
-    # Eight events across the shipped manifests — the design lists 31,
-    # and the payload never invents the difference.
+    assert labels == {
+        "issue_created": "A ticket is created in that project",
+        "issue_assigned": "A ticket is assigned to me",
+        "issue_reopened": "My ticket is reopened",
+        "p1_raised": "A P1 is raised",
+    }
+    # A connector with no `automation.events` block is still the honest
+    # empty answer, and the app says so in words.
+    assert wf.available_triggers({"version": 2}, REGISTRY, "docs") == []
+    # 27 events across the shipped manifests — the design lists 31, and
+    # the payload never invents the difference. The four it does not
+    # name are recorded, each with its reason, in `test_r43_catalog`'s
+    # `_R43_EVENTS`; this number is the count of what a user can
+    # actually tap.
     total = sum(len(wf.available_triggers({"version": 2}, REGISTRY, c)) for c in REGISTRY)
-    assert total == 8
+    assert total == 27
 
 
 @pytest.mark.asyncio
@@ -352,8 +372,11 @@ async def test_an_instant_lane_joins_the_schedule_it_does_not_replace_it():
                                     connector_id="gmail",
                                     triggers=["email_received"])
     assert out["triggers"] == ["email_received"]
+    # R43 §7 fixed this row's wording. The sentence is composed from
+    # `EVENT_LABELS`, not from the manifest description, so the label
+    # the picker draws and the sentence the write returns cannot drift.
     assert out["sentence"] == (
-        "I will tell you the moment an email arrives in my inbox.")
+        "I will tell you the moment mail addressed to me arrives.")
     async with async_session_maker() as db:
         raw = json.loads((await db.get(Automation, a.id)).spec_json)
     modes = {s["mode"] for s in raw["trigger"]["sources"]}

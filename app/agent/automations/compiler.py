@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     Automation, AutomationBinding, Routine, Trigger,
 )
-from .spec import ValidatedSpec
+from .spec import ValidatedSpec, effective_poll_floor
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,39 @@ async def compile_bindings(
     return bindings
 
 
+#: The one connector whose push path exists (`TRIGGER_KINDS` holds
+#: `email_received` and nothing else — Gmail Pub/Sub). R43 raises the
+#: instant-event count from eight to twenty-seven across eight
+#: connectors, and `mode` is a manifest boolean, so a manifest that
+#: declares push on a connector with no subscription pipeline would
+#: compile a Gmail trigger row that nothing can ever fire: an event the
+#: user turned ON, that silently never happens. `_push_pipeline` is the
+#: gate; anything else falls back to the poll lane, which is late but
+#: real.
+_PUSH_PIPELINE_CONNECTORS = frozenset({"gmail"})
+
+
+def _push_pipeline(source) -> bool:
+    return (source.connector_id or "") in _PUSH_PIPELINE_CONNECTORS
+
+
+def _ping_config(source) -> dict:
+    """R43 §8 — the lane's per-connector delivery override, carried on
+    the PRIMITIVE as well as in the spec.
+
+    The run resolves it from `ValidatedSource`, which is the truth; this
+    copy is for the fire path's own logging and for anyone reading a
+    routine row to answer "where does this one land" without parsing a
+    spec. Absent keys mean "use the automation's delivery", so a lane
+    with no override adds nothing."""
+    return {
+        **({"ping_channel": source.ping_channel} if source.ping_channel
+           else {}),
+        **({"ping_format": source.ping_format} if source.ping_format
+           else {}),
+    }
+
+
 async def _compile_bindings_v2(
     db: AsyncSession,
     automation: Automation,
@@ -171,7 +204,14 @@ async def _compile_bindings_v2(
 
     bindings: list[AutomationBinding] = []
     for source in vspec.sources:
-        if source.mode == "push":
+        subscribes = source.mode == "push" and _push_pipeline(source)
+        if source.mode == "push" and not subscribes:
+            logger.warning(
+                "[automations] %s declares push for %s but has no "
+                "subscription pipeline — compiling source %s as a poll",
+                source.connector_id, source.event, source.id,
+            )
+        if subscribes:
             trigger = Trigger(
                 user_id=automation.user_id,
                 kind="email_received",
@@ -183,6 +223,7 @@ async def _compile_bindings_v2(
                     "automation_id": automation.id,
                     "source_id": source.id,
                     **({"params": source.params} if source.params else {}),
+                    **_ping_config(source),
                 },
             )
             db.add(trigger)
@@ -197,8 +238,8 @@ async def _compile_bindings_v2(
             )
         else:
             kind = (
-                ROUTINE_KIND_POLL if source.mode == "poll"
-                else ROUTINE_KIND_SCHEDULE
+                ROUTINE_KIND_SCHEDULE if source.mode == "schedule"
+                else ROUTINE_KIND_POLL
             )
             routine = Routine(
                 user_id=automation.user_id,
@@ -206,11 +247,16 @@ async def _compile_bindings_v2(
                 enabled=False,
                 name=f"[automation] {vspec.name}"[:100],
                 config_json={"automation_id": automation.id,
-                             "source_id": source.id},
+                             "source_id": source.id,
+                             **_ping_config(source)},
             )
-            if source.mode == "poll":
+            if source.mode != "schedule":
                 routine.schedule_kind = "every"
-                routine.schedule_interval_seconds = source.poll_interval_s
+                # A degraded push source carries no interval — the
+                # validator only fills one for `mode: "poll"` — so the
+                # floor is what it polls at.
+                routine.schedule_interval_seconds = (
+                    source.poll_interval_s or effective_poll_floor(None))
                 routine.schedule_cron_local = "@every"
             else:
                 sched = source.schedule or {}

@@ -220,38 +220,177 @@ def _clamp_top(raw: Any, default: int) -> int:
     return max(1, min(n, _MAX_TOP))
 
 
-def _member_rows(chat: dict) -> list[dict]:
-    """Flatten `$expand=members` into name + address.
+def _member_id(m: Any) -> str:
+    """One member's stable identity, for set arithmetic.
 
-    There is deliberately no "the other participant" field. Graph flags no
-    member as the signed-in user, the chat id that encodes both user ids is
-    documented as opaque, and resolving it via /me would cost a User.Read
-    scope no tool here otherwise needs. Naming everyone is honest; guessing
-    which one is you is not.
+    `userId` is the AAD object id on an `aadUserConversationMember`, and
+    it is the SAME id space `chatMessage.mentions[].mentioned.user.id`
+    and `chatMessage.from.user.id` use — which is what lets "am I
+    mentioned" be answered without asking Graph who I am. A guest or a
+    federated member can arrive without one; their address is the only
+    other thing that identifies them across two chats.
+    """
+    if not isinstance(m, dict):
+        return ""
+    return str(m.get("userId") or m.get("email") or "").strip().casefold()
+
+
+def _member_ids(chat: dict) -> set:
+    return {i for i in (_member_id(m) for m in (chat.get("members") or [])) if i}
+
+
+def _identify_self(chats: list) -> tuple[Optional[str], str]:
+    """Which of these members is the signed-in user — by set arithmetic,
+    not by asking.
+
+    This connector holds `Chat.Read` and `ChatMessage.Send` and nothing
+    else. Graph marks no member as the caller, the chat id that encodes
+    both participants' ids is documented opaque, access tokens are
+    documented opaque to clients, and `GET /me` needs `User.Read` — a
+    scope every existing Teams connection would have to be re-consented
+    to gain. So the answer is derived from the one thing `/me/chats`
+    guarantees: the caller is a member of EVERY chat it returns.
+
+    Two rules, both deductions rather than guesses:
+
+      R1. A `oneOnOne` chat Graph returns with exactly ONE member is the
+          user's chat with themselves — there is no other 1:1 chat a
+          person can be in alone — so that member is the caller.
+      R2. Otherwise, intersect the member sets. Teams allows exactly one
+          `oneOnOne` chat per pair, so two of them have different
+          partners and the intersection is exactly the caller. Group
+          chats are folded in for reach, and the answer is accepted ONLY
+          when the intersection is a single identity: two colleagues who
+          share every one of the user's chats leave two, and two is not
+          an answer.
+
+    Returns `(id, reason)`; `id` is None whenever the deduction does not
+    close, and `reason` says which way it failed so the caller can put
+    it in front of a person instead of guessing.
+    """
+    typed = [c for c in chats if isinstance(c, dict)]
+    for c in typed:
+        if str(c.get("chatType") or "") == "oneOnOne":
+            ids = _member_ids(c)
+            if len(ids) == 1:
+                return next(iter(ids)), "your chat with yourself names you"
+    sets = [s for s in (_member_ids(c) for c in typed) if s]
+    if len(sets) < 2:
+        return None, (
+            "we can only work out which member is you from two or more "
+            "chats, and this account has fewer than that"
+        )
+    common = set.intersection(*sets)
+    if len(common) == 1:
+        return next(iter(common)), "you are the one member every chat shares"
+    if not common:
+        return None, (
+            "no single member appears in every one of your chats, which "
+            "should be impossible — Graph returned member lists this "
+            "connector cannot read"
+        )
+    return None, (
+        f"{len(common)} people appear in every one of your chats, so which "
+        f"one is you cannot be told apart from here"
+    )
+
+
+def _member_rows(chat: dict, self_id: Optional[str]) -> list[dict]:
+    """Flatten `$expand=members` into name + address, marking the caller.
+
+    `is_self` is only ever stamped from a CLOSED deduction (see
+    `_identify_self`); when self is unknown every member carries false,
+    never a guess.
     """
     out: list[dict] = []
     for m in (chat.get("members") or [])[:_MAX_MEMBERS]:
+        mid = _member_id(m)
         out.append({
             "display_name": m.get("displayName"),
             "email": m.get("email"),
+            "is_self": bool(self_id) and mid == self_id,
         })
     return out
 
 
-def _message_row(m: dict) -> dict:
+#: `chatMessage.from` is an identitySet: exactly one of these keys is
+#: populated, and WHICH one is the author's kind. A bot posts under
+#: `application`; a Teams-connected device under `device`; a system
+#: message ("X joined the chat") populates none of them.
+_AUTHOR_KINDS = ("user", "application", "device")
+
+
+def _author(m: dict) -> tuple[str, dict]:
+    """`(kind, identity)` off a chatMessage's `from`.
+
+    Returns `("", {})` for a system message, which is neither a person
+    nor a bot — "Skip bots" must not eat "Dana joined the chat".
+    """
+    frm = m.get("from")
+    if not isinstance(frm, dict):
+        return "", {}
+    for kind in _AUTHOR_KINDS:
+        ident = frm.get(kind)
+        if isinstance(ident, dict) and ident:
+            return kind, ident
+    return "", {}
+
+
+def _mention_rows(m: dict) -> list[dict]:
+    """`chatMessage.mentions` flattened to who was named.
+
+    `mentioned` is an identitySet like `from`, so a channel @-mention, a
+    tagged bot and a named person all arrive here and are told apart by
+    the same key.
+    """
+    out: list[dict] = []
+    for mention in (m.get("mentions") or []):
+        if not isinstance(mention, dict):
+            continue
+        target = mention.get("mentioned")
+        kind, ident = ("", {})
+        if isinstance(target, dict):
+            for k in _AUTHOR_KINDS + ("conversation", "tag"):
+                got = target.get(k)
+                if isinstance(got, dict) and got:
+                    kind, ident = k, got
+                    break
+        out.append({
+            "text": mention.get("mentionText"),
+            "kind": kind,
+            "id": ident.get("id"),
+            "display_name": ident.get("displayName"),
+        })
+    return out
+
+
+def _message_row(m: dict, self_id: Optional[str]) -> dict:
     body = m.get("body") or {}
-    frm = (m.get("from") or {}).get("user") or {}
-    return {
+    author_kind, author = _author(m)
+    mentions = _mention_rows(m)
+    row = {
         "id": m.get("id"),
         "created_at": m.get("createdDateTime"),
+        "last_modified_at": m.get("lastModifiedDateTime"),
         # System messages ("X joined the chat", "chat renamed") carry
         # from: null. That is data, not a parse failure.
-        "sender": frm.get("displayName"),
+        "sender": author.get("displayName"),
+        # "user" | "application" | "device" | "" — the half of "Skip
+        # bots" that no query language here can express, so it rides on
+        # the row and the narrowing happens over the returned list.
+        "author_type": author_kind,
         "message_type": m.get("messageType"),
         "body_content_type": body.get("contentType"),
         "body": (body.get("content") or "")[:_MAX_BODY_CHARS],
         "deleted_at": m.get("deletedDateTime"),
+        "mentions": mentions,
     }
+    if self_id:
+        row["mentions_me"] = any(
+            str(x.get("id") or "").strip().casefold() == self_id
+            for x in mentions
+        )
+    return row
 
 
 class TeamsProvider(BaseConnectorProvider):
@@ -336,23 +475,51 @@ class TeamsProvider(BaseConnectorProvider):
                 result, ordered = await self._list_chats(
                     access_token=access_token, user_id=ctx.user_id, top=top,
                 )
+                raw = [c for c in (result.get("value") or [])
+                       if isinstance(c, dict)]
+                self_id, self_reason = _identify_self(raw)
                 chats = []
-                for c in (result.get("value") or []):
-                    members = _member_rows(c)
+                for c in raw:
+                    members = _member_rows(c, self_id)
+                    ids = _member_ids(c)
                     chats.append({
                         "id": c.get("id"),
                         # One-on-one chats always have topic: null.
                         "topic": c.get("topic"),
                         "chat_type": c.get("chatType"),
                         "last_updated_at": c.get("lastUpdatedDateTime"),
+                        # The CALLER's own read mark. Graph puts it on
+                        # every /chats row for a delegated token, which
+                        # is the only place in this connector that
+                        # answers "has this person seen it" — chat
+                        # messages themselves carry no read state, so a
+                        # message stamped after this is the one honest
+                        # definition of unread available here.
+                        "last_read_at": (
+                            (c.get("viewpoint") or {})
+                            .get("lastMessageReadDateTime")
+                        ),
                         "web_url": c.get("webUrl"),
                         "members": members,
+                        # The user's chat with THEMSELVES: the only chat
+                        # this connector can post into and still be able
+                        # to say nobody else reads it. A closed
+                        # deduction or false — never a maybe.
+                        "is_self_chat": bool(self_id) and ids == {self_id},
                     })
                 return ConnectorOk(content=json.dumps({
                     "chats": chats,
                     # The sort is best-effort (see _list_chats); say so
                     # rather than let the agent claim "most recent".
                     "ordered_by_recent": ordered,
+                    "self_identified": bool(self_id),
+                    # Present either way: a caller that needs the self
+                    # chat and finds none has to be able to tell "you
+                    # have not opened one" from "we could not work out
+                    # which member is you", because only the first is
+                    # something the person can fix.
+                    "self_note": self_reason,
+                    "self_user_id": self_id,
                 }))
 
             if tool_name == "teams__read_chat_messages":
@@ -362,25 +529,83 @@ class TeamsProvider(BaseConnectorProvider):
                         message="chat_id required", retryable=False,
                     )
                 top = _clamp_top(tool_input.get("max_results", 25), 25)
+                mentions_only = bool(tool_input.get("mentions_only"))
+                since_read = bool(tool_input.get("since_last_read"))
+
+                # "Mentions me" needs to know who "me" is, and this
+                # connector can only deduce that from the chat list
+                # (see `_identify_self`). One extra GET, and ONLY when
+                # the caller asked for the narrowing.
+                self_id: Optional[str] = None
+                if mentions_only:
+                    listed, _ = await self._list_chats(
+                        access_token=access_token, user_id=ctx.user_id,
+                        top=_MAX_TOP,
+                    )
+                    self_id, why = _identify_self(listed.get("value") or [])
+                    if not self_id:
+                        # Refused, not silently widened: the caller asked
+                        # for messages naming THEM, and returning
+                        # everything under that request is the narrowing
+                        # that lies.
+                        return ConnectorToolError(
+                            message=(
+                                f"Cannot filter to messages that mention you: "
+                                f"{why}. Read the chat without mentions_only, "
+                                f"or use the mentions on each message."
+                            ),
+                            retryable=False,
+                        )
+
+                params: dict[str, Any] = {"$top": top}
+                since: Optional[str] = None
+                if since_read:
+                    since = await self._last_read_at(
+                        chat_id, access_token=access_token,
+                        user_id=ctx.user_id,
+                    )
+                if since:
+                    # Graph IGNORES `$filter` on this endpoint unless
+                    # `$orderby` names the same property (see the module
+                    # docstring), so the two move together or neither
+                    # does anything at all.
+                    params["$orderby"] = "lastModifiedDateTime desc"
+                    params["$filter"] = f"lastModifiedDateTime gt {since}"
+                else:
+                    # Descending only — Graph rejects `asc` here. No
+                    # $select: this endpoint doesn't support it.
+                    params["$orderby"] = "createdDateTime desc"
+
                 result = await _graph(
                     "GET",
                     f"{GRAPH_API}/chats/{_path_id(chat_id)}/messages",
                     access_token=access_token,
                     user_id=ctx.user_id,
                     scope_hint="Chat.Read",
-                    params={
-                        "$top": top,
-                        # Descending only — Graph rejects `asc` here. No
-                        # $select: this endpoint doesn't support it.
-                        "$orderby": "createdDateTime desc",
-                    },
+                    params=params,
                 )
-                messages = [_message_row(m) for m in (result.get("value") or [])]
-                return ConnectorOk(content=json.dumps({
+                messages = [_message_row(m, self_id)
+                            for m in (result.get("value") or [])]
+                if mentions_only:
+                    # Graph exposes no mentions predicate on this
+                    # endpoint, so the narrowing runs over the returned
+                    # page — which is why `count` below is the count of
+                    # what the caller is actually handed.
+                    messages = [m for m in messages if m.get("mentions_me")]
+                payload: dict[str, Any] = {
                     "chat_id": chat_id,
                     "count": len(messages),
                     "messages": messages,
-                }))
+                }
+                if since_read:
+                    # Absent viewpoint is a real state (a chat the user
+                    # has never opened), and it must not read as "no new
+                    # messages".
+                    payload["since_last_read_at"] = since
+                    payload["since_last_read_applied"] = bool(since)
+                if mentions_only:
+                    payload["mentions_only_applied"] = True
+                return ConnectorOk(content=json.dumps(payload))
 
             if tool_name == "teams__send_chat_message":
                 chat_id = tool_input.get("chat_id")
@@ -421,6 +646,29 @@ class TeamsProvider(BaseConnectorProvider):
             )
         except _MicrosoftConnectorError as e:
             return e.result
+
+    async def _last_read_at(
+        self, chat_id: Any, *, access_token: str, user_id: str,
+    ) -> Optional[str]:
+        """When this user last read this chat, or None.
+
+        `chat.viewpoint` is the CALLER's own read mark — the only read
+        state anywhere in Teams' delegated surface, since a chatMessage
+        carries none. A chat the user has never opened has no viewpoint
+        at all, and that is a state, not a failure: the caller is told
+        the bound was not applied rather than being handed an empty
+        page that reads as "nothing new".
+        """
+        chat = await _graph(
+            "GET",
+            f"{GRAPH_API}/chats/{_path_id(chat_id)}",
+            access_token=access_token,
+            user_id=user_id,
+            scope_hint="Chat.Read",
+            params={"$select": "id,viewpoint"},
+        )
+        mark = (chat.get("viewpoint") or {}).get("lastMessageReadDateTime")
+        return str(mark) if mark else None
 
     async def _list_chats(
         self, *, access_token: str, user_id: str, top: int,

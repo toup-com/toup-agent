@@ -14,7 +14,7 @@ from app.agent.automations.spec import (
     unanswered_variables as spec_unanswered,
 )
 from app.agent.automations.spec_v2 import (
-    ValidatedSpecV2, unanswered_variables,
+    MAX_SOURCES, ValidatedSpecV2, unanswered_variables,
 )
 
 
@@ -158,8 +158,12 @@ def test_multi_source_validates_and_each_lane_keeps_its_dedupe():
 
 
 def test_source_limits_and_duplicates():
+    # R43 raised MAX_SOURCES 4 -> 12 (one schedule plus up to eleven instant
+    # lanes), so the count has to be read from the constant or the test stops
+    # testing the cap the moment it moves again.
     many = [{"id": f"s{i}", "mode": "schedule",
-             "schedule": {"cron_local": "0 8 * * *"}} for i in range(5)]
+             "schedule": {"cron_local": "0 8 * * *"}}
+            for i in range(MAX_SOURCES + 1)]
     with pytest.raises(SpecError) as ei:
         validate_spec(good_spec(trigger={"sources": many}), REGISTRY)
     assert {"too_many_sources", "duplicate_schedule_source"} <= codes(ei)

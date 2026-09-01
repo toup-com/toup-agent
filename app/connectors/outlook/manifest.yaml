@@ -51,6 +51,13 @@ tools:
           type: string
           description: |
             Microsoft Graph KQL search over the mailbox — free text, or one of the property restrictions message search supports: from:, to:, subject:, body:, hasAttachments:, received: (e.g. "from:alice@contoso.com", "subject:invoice"). This is NOT an OData $filter: "isRead eq false" here is searched as that literal phrase and matches nothing — use `is_read` for read/unread, which Graph cannot express in a search at all. Omit for the whole mailbox.
+        folder:
+          type: string
+          description: |
+            Read ONE mail folder instead of the whole mailbox. Either a folder id from `outlook__list_folders`, or one of Graph's well-known names: inbox, archive, sentitems, drafts, deleteditems, junkemail. Omit for every folder. This is a real scope — `query` is a KQL search and cannot name a folder.
+        to_me:
+          type: boolean
+          description: true = only mail addressed to this mailbox (searched as KQL `to:<your address>`). The address is resolved from the connected account; omit for everything that arrived.
         is_read:
           type: boolean
           description: false = unread only, true = read only; omit for both.
@@ -76,6 +83,27 @@ tools:
       default: allow
       deny: []
 
+  - name: outlook__list_folders
+    description: |
+      List the mail folders in this mailbox — Inbox, Archive, Sent Items and every folder the user made themselves — each with how many messages it holds and how many are unread. Use this to answer "which folders do I have", or to turn a folder NAME the user said into the id `outlook__list_messages` takes as `folder`. Inbox / Archive / Sent Items lead the list and carry `well_known`, identified by ID rather than by display name (which is localised).
+    input_schema:
+      type: object
+      properties:
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: How many folders to return. Default 25.
+          default: 25
+      required: []
+    mutates: false
+    elevation: false
+    output_redaction: []
+    pii: low
+    channel_policy:
+      default: allow
+      deny: []
+
   - name: outlook__get_message
     description: Fetch the full body, headers, and metadata of one Outlook message by id.
     input_schema:
@@ -94,7 +122,7 @@ tools:
 
   - name: outlook__create_draft
     description: |
-      Compose a draft in the user's Outlook Drafts folder. NOTHING is sent — the user reviews and sends it themselves from Outlook. This is the only mail-writing action automations may use.
+      Compose a draft in the user's Outlook Drafts folder. NOTHING is sent — the user reviews and sends it themselves from Outlook. This is the only mail-writing action automations may use. Can carry files via `attachments` — that is how a one-page PDF, a CSV or a markdown file reaches the user as a FILE rather than as text pasted into the body.
     input_schema:
       type: object
       properties:
@@ -109,10 +137,30 @@ tools:
           type: string
         bcc:
           type: string
+        is_read:
+          type: boolean
+          description: Mark the draft read (true) or unread (false) as it is created. Omit to leave Outlook's own default. A brief delivered to the user's own mailbox sets true — it is a record, not a new thing to open.
+        attachments:
+          type: array
+          maxItems: 3
+          description: Files to attach. At most 3, and at most 3 MB decoded in total — Microsoft Graph's inline `fileAttachment` ceiling; anything larger needs an upload session this connector does not open. A malformed entry refuses the whole draft rather than writing one silently missing its file.
+          items:
+            type: object
+            properties:
+              filename:
+                type: string
+                description: Name the file arrives under, e.g. "brief.pdf".
+              content_type:
+                type: string
+                description: MIME type, e.g. "application/pdf". Defaults to application/octet-stream.
+              content_base64:
+                type: string
+                description: The file's bytes, base64-encoded (standard alphabet, padded).
+            required: [filename, content_base64]
       required: [to, subject, body]
     mutates: true
     elevation: false
-    output_redaction: ["body", "cc", "bcc"]
+    output_redaction: ["body", "cc", "bcc", "attachments"]
     pii: high
     rate_limit: "10/min"
     channel_policy:
@@ -173,6 +221,26 @@ automation:
       description: A new email arrives in your Outlook inbox.
       source_tool: outlook__list_messages
       poll_args:
+        max_results: 25
+      items_path: messages
+      dedupe_field: id
+      fields:
+        id: id
+        subject: subject
+        from: from
+        preview: preview
+        received_at: received_at
+    # R43 §7. `kind:` is Graph's own KQL property restriction, so a
+    # meeting request is separable from ordinary mail without an OData
+    # $filter this tool does not forward. §7's third Outlook event, "a
+    # vendor thread moves", is NOT here: it needs a KQL query naming the
+    # vendors, and `_EVENT_PARAM_PINS` has no pin kind that can fill a
+    # free-text query, so the row would refuse forever.
+    - key: meeting_request
+      description: A meeting invitation arrives in your Outlook mail.
+      source_tool: outlook__list_messages
+      poll_args:
+        query: kind:meetings
         max_results: 25
       items_path: messages
       dedupe_field: id
