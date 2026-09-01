@@ -83,6 +83,10 @@ from app.agent.turn_timing import BOOKKEEPING_TOOLS, TurnWaterfall
 from app.services.background_tasks import spawn as _spawn_bg
 
 from app.services.memory_log import describe_memory
+# The product's one default persona. Imported rather than restated — see
+# DEFAULT_SOUL_CONTENT below. `soul_compiler` imports nothing, so this cannot
+# cycle.
+from app.services.soul_compiler import OPERATING_MODEL as _OPERATING_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -573,11 +577,19 @@ IDENTITY_SECTION_HEADERS: Dict[str, str] = {
 # every turn until they configure tone — so it must already feel like a
 # person, not a corporate assistant. The agent NAME is left to the
 # anchor below; here we set voice and posture.
+#
+# The operating model is IMPORTED, never restated. It is the product's one
+# default persona (see soul_compiler.OPERATING_MODEL for what it is and where
+# it comes from), and a user with no soul row must get the same agent as a user
+# with one — the only difference between them is a name and a tone, not what
+# the thing does. Two copies of a 150-word prompt block is two prompt blocks
+# that drift.
 DEFAULT_SOUL_CONTENT = (
     "You are the user's personal agent — present in their life as a "
     "real person who happens to be exceptionally capable. Not a "
     "chatbot, not an FAQ, not a help desk. Be warm, direct, curious. "
-    "A trusted friend who can also actually get things done."
+    "A trusted friend who can also actually get things done.\n"
+    + _OPERATING_MODEL
 )
 
 

@@ -31,13 +31,33 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/soul", tags=["soul"])
 
-# Default soul config for new users
+# Default soul config for new users.
+#
+# DISPLAY-ONLY on this side — GET returns it when there is no row and persists
+# nothing — but it is not cosmetic, because it is what the clients PREFILL from.
+# The mobile onboarding no longer asks about personality (it saves this and moves
+# on), so whatever is written here is what a new agent actually becomes.
+#
+# It must stay in lockstep with the mobile app's `src/shared/soul.ts`
+# DEFAULT_SOUL, and the lockstep has a specific shape: the POSITIVE trait ids
+# here must equal that file's STYLE_TRAITS[style] exactly, or Settings → Soul
+# opens on "Adjusted from Professional Partner." with a Reset link that changes
+# nothing (its `traitsEdited` compares positives only). Negative poles — the
+# `no_emoji` below — are free to add and are how an axis gets an answer at all:
+# omitting a pair entirely says nothing about it and the model picks for itself.
+#
+# `professional` rather than the old `casual`: the default persona is Claude
+# Cowork's working model (soul_compiler.OPERATING_MODEL), and casual's
+# instruction is "like a close friend… OK to use slang" while professional's is
+# "concisely… structured and clear… respect the user's time… but don't be
+# stiff". The warmth is asserted by the baseline posture line above it; the
+# register should be the one that belongs to an agent running someone's errands.
 _DEFAULTS = {
     "name": "Agent",
     "color": "#9B59B6",
     "pronouns": "they",
-    "style": "casual",
-    "traits": ["uses_humor", "concise", "proactive", "references_past"],
+    "style": "professional",
+    "traits": ["no_emoji", "direct", "proactive", "asks_questions", "references_past"],
     "custom_instructions": "",
 }
 

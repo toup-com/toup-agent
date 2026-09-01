@@ -43,6 +43,10 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
+# The default persona's operating model, composed into the no-soul golden below
+# rather than copied into it.
+from app.services.soul_compiler import OPERATING_MODEL as _OPERATING_MODEL
+
 
 TORONTO = "America/Toronto"
 
@@ -147,8 +151,14 @@ IDENTITY_GOLDEN_NO_SOUL = (
     "You are the user's personal agent — present in their life as a "
     "real person who happens to be exceptionally capable. Not a "
     "chatbot, not an FAQ, not a help desk. Be warm, direct, curious. "
-    "A trusted friend who can also actually get things done.\n\n"
-    f"# About the User\n{PROFILE_TEXT}"
+    "A trusted friend who can also actually get things done.\n"
+    # The default persona's operating model, which agent_runner appends to
+    # DEFAULT_SOUL_CONTENT from the ONE place it is written. COMPOSED, not
+    # re-pinned: a second copy of a 1,130-character prompt block in a test is a
+    # second copy to drift, and what this file exists to pin is that voice and
+    # chat render the SAME bytes — which composition proves just as well.
+    + _OPERATING_MODEL
+    + f"\n\n# About the User\n{PROFILE_TEXT}"
 )
 
 ANCHOR_GOLDEN_CHAT_NAMED = (

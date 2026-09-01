@@ -51,6 +51,58 @@ TRAIT_INSTRUCTIONS = {
 }
 
 
+# ── How the agent works, for everyone ─────────────────────────────────────
+# WHO the agent is, above, is one line and always has been. This is HOW it
+# works, and it is not a preference: the mobile client stopped asking new users
+# to choose a personality (four style cards and six switches, put to someone who
+# has not met their agent yet), so the product needs one strong default, and
+# this is it.
+#
+# The model is Anthropic's Claude Cowork, at the founder's request: you hand it
+# a goal rather than instructions, it plans and carries the whole thing through,
+# it produces real work instead of descriptions of work, and it reports the
+# outcome instead of narrating the steps. Sourced from Anthropic's product and
+# support pages plus two captures of the Cowork system prompt (2026-01-16 and
+# 2026-08-17); the specific rules below are the ones that survive being lifted
+# out of a desktop file-workspace and into a phone agent.
+#
+# ONE CORRECTION worth recording, because it is the thing everyone gets wrong
+# about Cowork: it does NOT default to "assume and proceed". An attended Cowork
+# session is told to ask ONE structured question before starting real work.
+# "Make the most reasonable call and state the assumption" is its UNATTENDED
+# rule, for scheduled and background runs — which is why the clause below is
+# scoped to exactly that case rather than written as the general posture. The
+# attended half of that behaviour is the `asks_questions` trait, which the new
+# default turns on (see the mobile app's src/shared/soul.ts DEFAULT_SOUL).
+#
+# THE RULE FOR EDITING THIS: it may not assert anything a STYLE or a TRAIT owns.
+# compile_soul appends this, then the style line, then one line per trait into
+# one prompt, so a sentence here about humour, emoji, length, bluntness,
+# volunteering suggestions, asking questions, or remembering the past either
+# duplicates a trait or contradicts its opposite pole — the exact defect the
+# STYLE_INSTRUCTIONS comment above was written about. Everything below is about
+# WHAT THE AGENT DOES, which no trait covers.
+OPERATING_MODEL = (
+    "You are handed goals, not instructions. Take the whole errand: work out "
+    "what \"done\" looks like, do every step you can do yourself, and come back "
+    "with the result rather than with a plan for the user to carry out.\n"
+    "When the work IS a thing — a document, a spreadsheet, an app, a list, an "
+    "image — make the thing and hand it over. A description of it is not it.\n"
+    "Reach for your tools rather than talking about them, and go and look "
+    "things up rather than answering about the present-day world from memory. "
+    "When a task needs an account or a service the user has not mentioned, "
+    "check whether it is connected and say what you find.\n"
+    "Do not narrate the work. No \"Let me...\", no \"Now I'll...\", no commentary "
+    "between steps. When it is done, say what happened.\n"
+    "Check your own work before you call it finished.\n"
+    "When the user is not there to answer — a scheduled run, something that "
+    "lands while they are asleep — make the most reasonable call, say plainly "
+    "what you assumed, and carry on. Stop and ask only when every way forward "
+    "is irreversible and genuinely needs their decision.\n"
+    "Own a mistake plainly and fix it, without collapsing into apology."
+)
+
+
 def compile_soul(config: dict) -> str:
     """Compile structured soul config dict into system prompt text.
 
@@ -73,6 +125,7 @@ def compile_soul(config: dict) -> str:
         "person who happens to be exceptionally capable. Not a chatbot, not "
         "an FAQ. Talk like someone who actually knows them and cares."
     )
+    lines.append(OPERATING_MODEL)
 
     pronouns = config.get("pronouns", "they")
     if pronouns and pronouns != "they":
