@@ -335,12 +335,40 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
     return out
 
 
+class PoolMemberSwapRefused(RuntimeError):
+    """`provision_container(recreate=True)` was aimed at a warm-pool member.
+
+    Raised rather than performed, because the named path binds a DIFFERENT
+    database from the one the pool slot holds — see the block inside
+    `provision_container` for the full account. Callers should either use a
+    pool primitive or accept the deferred update; none of them should catch
+    this and retry with `allow_pool_swap=True`.
+    """
+
+
+class ContainerTeardownIncomplete(RuntimeError):
+    """`destroy_container` could not confirm that the tenant is really gone.
+
+    Distinct from "there was nothing to destroy", which is still a `False`
+    return. This is raised when a step we OWED did not land — the bridge did
+    not answer, or answered non-2xx — and it is raised rather than logged
+    because of what the silence used to buy: `user_deletion` records
+    `container_destroyed=True` on any non-exceptional return, so a bridge
+    outage during account deletion wiped the user's platform row, reported
+    success, and left the container running and the database on disk with
+    nothing left pointing at it. The delete-account copy promises the user
+    that their messages, memories, integrations and apps are permanently
+    erased; this exception is what keeps that promise honest.
+    """
+
+
 async def provision_container(
     db: AsyncSession,
     user_id: str,
     agent_config: Optional[AgentConfig] = None,
     recreate: bool = False,
     override_image_tag: Optional[str] = None,
+    allow_pool_swap: bool = False,
 ) -> ManagedContainer:
     """Provision a new Docker container for a user's agent, via the bridge.
 
@@ -362,6 +390,43 @@ async def provision_container(
     existing = result.scalar_one_or_none()
     if existing and existing.status in ("running", "provisioning") and not recreate:
         return existing
+
+    # ── The pool→named swap is DATA LOSS, and it was reachable from four
+    # callers by accident. ────────────────────────────────────────────────
+    #
+    # A warm-pool tenant's Postgres database is named from the SLOT
+    # (`bridge/pool_addon.py::_pool_db_name` → `toup_agent_feed0017`). A named
+    # tenant's is named from the USER (`container.db_name = toup_agent_<prefix>`
+    # further down this function). They are two different databases, and
+    # nothing migrates one to the other — so re-provisioning a pool member
+    # through this named path silently moves the user onto an EMPTY database.
+    # Every message, automation and memory they had is still on disk, in a
+    # database their agent no longer opens. The comment on the caller that did
+    # this most often said the cost was "a cold boot once".
+    #
+    # Observed in production 2026-08-31 15:48 UTC: a transient
+    # `bridge create_tenant failed: 500` made `update_container_env` fall
+    # through here for a user who had been on `toup-agent-pool-17` twenty-five
+    # seconds earlier.
+    #
+    # This refuses instead. A stale env var, a missed image bump or a deferred
+    # key rotation are all recoverable; an account that reads as empty is not.
+    # Operators who genuinely intend the migration pass `allow_pool_swap=True`
+    # and are responsible for moving the data first.
+    if (
+        recreate
+        and existing
+        and (existing.container_name or "").startswith("toup-agent-pool-")
+        and not allow_pool_swap
+    ):
+        raise PoolMemberSwapRefused(
+            f"refusing to re-provision pool member {existing.container_name!r} "
+            f"for user {prefix} through the named path: the named tenant binds "
+            f"database toup_agent_{prefix}, while this user's data is in the "
+            f"pool slot's own database. Use the pool primitives "
+            f"(/v1/pool/refresh-config, /v1/pool/restart-member, "
+            f"/v1/pool/refresh-image) or migrate the database first."
+        )
 
     # Fetch agent_config if caller didn't pass one
     if not agent_config:
@@ -572,6 +637,40 @@ async def backfill_sentinel_image_containers(
         # purpose); a NULL-id-ONLY match is health-gated and skipped when the agent
         # is actually reachable — `_verify_and_heal_pool_claim` owns claim health,
         # and A2 backfills the id on the next fresh claim.
+        # A POOL member is never RE-PROVISIONED from here. Both arms of this
+        # reconciler's predicate fire on pool rows in normal operation — a
+        # slot's `image_tag` is stale bookkeeping by design, and `container_id`
+        # is NULL until the claim path records it — and the rebuild it would
+        # perform binds `toup_agent_<prefix>` instead of the slot's own
+        # database, i.e. it empties the account. Unattended, every 180 s.
+        #
+        # It is not simply skipped either: this loop is the only durable
+        # backstop a wedged member has once `_verify_and_heal_pool_claim`'s
+        # 30 s budget is spent, and a skip would leave one stuck forever. The
+        # pool primitive restarts it in place, keeping its database.
+        if (mc.container_name or "").startswith("toup-agent-pool-"):
+            skipped += 1
+            try:
+                from app.services.prewarm_service import _is_agent_actually_healthy
+                healthy = await _is_agent_actually_healthy(mc.user_id)
+            except Exception:
+                # A failed probe is not evidence of a wedge, and the action it
+                # would trigger is a restart of somebody's live container.
+                healthy = True
+            if not healthy:
+                logger.warning(
+                    "[reconciler] pool member %s (user=%s) is unreachable — "
+                    "restarting IN PLACE. A named recreate here would bind an "
+                    "empty toup_agent_%s.",
+                    mc.container_name, str(mc.user_id)[:8], str(mc.user_id)[:8],
+                )
+                try:
+                    await restart_container(db, mc.user_id)
+                    await db.commit()
+                except Exception:
+                    logger.exception("[reconciler] pool restart failed for %s",
+                                     str(mc.user_id)[:8])
+            continue
         image_is_sentinel = (mc.image_tag or "").endswith(":latest")
         if not image_is_sentinel and mc.container_id is None:
             try:
@@ -868,7 +967,17 @@ async def start_container(db: AsyncSession, user_id: str) -> Optional[ManagedCon
 
 
 async def restart_container(db: AsyncSession, user_id: str) -> Optional[ManagedContainer]:
-    """Restart tenant container via bridge."""
+    """Restart tenant container via bridge.
+
+    Pool-aware, like `destroy_container` already was. `/v1/tenants/<prefix>/restart`
+    only knows named tenants, so for a `toup-agent-pool-NN` member it 404s —
+    and the caller that reaches here most often is `container_monitor`, after
+    three failed health probes. The 404 was recorded as `status='error'`, which
+    is the state the pool reclaimer treats as "this slot is free". A member
+    that was merely wedged therefore became a candidate for reclamation, and a
+    reclaimed slot is TRUNCATEd on respawn. `/v1/pool/restart-member` restarts
+    the container in place and re-applies its bind.
+    """
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
     )
@@ -876,14 +985,26 @@ async def restart_container(db: AsyncSession, user_id: str) -> Optional[ManagedC
     if not container:
         return None
     prefix = user_id[:8]
+    is_pool = (container.container_name or "").startswith("toup-agent-pool-")
     try:
         async with _bridge_client() as client:
-            r = await client.post(f"/v1/tenants/{prefix}/restart")
+            if is_pool:
+                r = await client.post(
+                    "/v1/pool/restart-member",
+                    json={"user_id": str(user_id), "prefix": prefix},
+                )
+            else:
+                r = await client.post(f"/v1/tenants/{prefix}/restart")
             r.raise_for_status()
     except httpx.HTTPError as e:
-        err = f"bridge restart failed: {e}"
-        logger.error(err)
-        container.status = "error"
+        # `repr`, not `str`: an httpx timeout stringifies to "".
+        err = f"bridge restart failed: {e!r}"
+        logger.error("[restart_container] %s pool=%s: %s", prefix, is_pool, err)
+        # A failed restart says nothing about whether the SLOT is free, and
+        # `status='error'` is exactly what the reclaimer reads as free. Record
+        # the fault in `error_message`, leave `status` alone.
+        if not is_pool:
+            container.status = "error"
         container.error_message = err[:500]
         await db.commit()
         return container
@@ -897,13 +1018,30 @@ async def restart_container(db: AsyncSession, user_id: str) -> Optional[ManagedC
 async def destroy_container(db: AsyncSession, user_id: str) -> bool:
     """Remove a tenant container (DB + network + Caddy route) via bridge.
 
-    Pool members vs ad-hoc tenants:
-    - If the container's name is `toup-agent-pool-NN`, it was bound from
-      the warm pool. Use `/v1/pool/release` so the bridge drains via
-      /admin/drain, revokes the DB role, and the reconciler reaps and
-      respawns the slot to maintain target.
-    - Otherwise it's a slow-path tenant container; use the legacy
-      `/v1/tenants/<prefix>` DELETE which drops DB, network, route.
+    Returns False when there was nothing to destroy. Raises
+    `ContainerTeardownIncomplete` when there WAS and it did not land — the two
+    used to be the same `True`, and the difference is whether a user who asked
+    for their account to be erased still has a database on the VPS.
+
+    BOTH teardowns are attempted, and which ones are owed is NOT read off
+    `container_name`:
+
+    * The warm-pool slot is released for every user, always, by `user_id`.
+      `/v1/pool/release` is idempotent and reports `found`, so asking costs one
+      round trip and answers the only authority that knows — the BRIDGE.
+      `container_name` is not that authority and cannot be: the R40 swap
+      (`update_container_env` falling through to a named recreate) rewrites it
+      to a named container while the bridge keeps the slot ASSIGNED forever.
+      Fleet audit on 2026-08-31 found four slots leaked exactly that way — 09,
+      17, 27 and 28, all four containers still running 23 hours later, and
+      THREE of them belonging to accounts that had already been deleted. Their
+      databases were never dropped, because a slot that is never released is
+      never reaped and a slot that is never reaped is never respawned.
+    * The named container is deleted when the local row names one. That is a
+      claim about THIS platform's own bookkeeping, which is exactly what the
+      local row is authoritative for.
+
+    A swapped user is both at once, which is why this is not an if/else.
     """
     result = await db.execute(
         select(ManagedContainer).where(ManagedContainer.user_id == user_id)
@@ -912,24 +1050,44 @@ async def destroy_container(db: AsyncSession, user_id: str) -> bool:
     if not container:
         return False
     prefix = user_id[:8]
-    is_pool_member = (
-        container.container_name
-        and container.container_name.startswith("toup-agent-pool-")
+    named_locally = bool(container.container_name) and not (
+        container.container_name.startswith("toup-agent-pool-")
     )
-    try:
-        if is_pool_member:
-            from app.services.pool_service import release_pool_member
-            await release_pool_member(prefix=prefix, user_id=user_id)
-        else:
+
+    failures: list[str] = []
+
+    from app.services.pool_service import release_pool_member
+    release = await release_pool_member(prefix=prefix, user_id=user_id)
+    if not release.ok:
+        failures.append(f"pool release: {release.detail or 'refused'}")
+    elif release.found and named_locally:
+        # The swap's signature, and worth a line of its own in the trail: the
+        # platform thought this user was a named tenant while the bridge was
+        # still holding a slot for them.
+        logger.warning(
+            "[destroy] user %s was named locally (%s) but the bridge still held "
+            "a pool slot — released both",
+            prefix, container.container_name,
+        )
+
+    if named_locally:
+        try:
             async with _bridge_client() as client:
                 r = await client.delete(f"/v1/tenants/{prefix}")
                 # 204 is the expected response; 404 (already gone) is also OK
                 if r.status_code not in (204, 404):
                     r.raise_for_status()
-    except httpx.HTTPError as e:
-        logger.error("bridge destroy failed for %s: %s", user_id[:8], e)
-        # Continue — mark DB row regardless. Operator can reconcile if bridge
-        # state drifts.
+        except httpx.HTTPError as e:
+            logger.error("bridge destroy failed for %s: %r", user_id[:8], e)
+            failures.append(f"named delete: {e!r}")
+
+    if failures:
+        # NOT marked deleted. The row is the only thing that still points at a
+        # container we could not remove; wiping it is what orphans it.
+        raise ContainerTeardownIncomplete(
+            f"tenant {prefix} not confirmed destroyed — " + "; ".join(failures)
+        )
+
     container.status = "deleted"
     container.stopped_at = datetime.utcnow()
     await db.commit()
@@ -990,7 +1148,48 @@ async def get_container_status(db: AsyncSession, user_id: str) -> Optional[dict]
     }
 
 
+# One config push per user at a time. TWELVE call sites reach this function and
+# nothing coordinated them: the 2026-08-31 trail has
+# `[update_container_env] pool refresh failed for 51d4ed2f` logged TWICE in the
+# same millisecond, i.e. two concurrent bridge calls for one user — which, on
+# the code as it then stood, was two concurrent container recreates on a shared
+# VPS host. That is the load that made a neighbouring tenant time out.
+#
+# A per-user lock rather than a global one: two different users being pushed at
+# once is normal and fine. Keyed weakly enough that the dict is bounded by
+# concurrent pushes, not by user count.
+_ENV_PUSH_LOCKS: dict = {}
+
+
+def _env_push_lock(user_id: str) -> asyncio.Lock:
+    lock = _ENV_PUSH_LOCKS.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ENV_PUSH_LOCKS[user_id] = lock
+    return lock
+
+
 async def update_container_env(
+    db: AsyncSession,
+    user_id: str,
+    agent_config: AgentConfig,
+) -> Optional[ManagedContainer]:
+    """Push a new agent_config to the bridge. Serialized per user."""
+    lock = _env_push_lock(user_id)
+    if lock.locked():
+        logger.info("[update_container_env] %s: a push is already in flight — waiting",
+                    user_id[:8])
+    async with lock:
+        try:
+            return await _update_container_env(db, user_id, agent_config)
+        finally:
+            # Only the last waiter clears the entry, so the dict cannot grow
+            # with every user the platform has ever pushed.
+            if not lock.locked() and _ENV_PUSH_LOCKS.get(user_id) is lock:
+                _ENV_PUSH_LOCKS.pop(user_id, None)
+
+
+async def _update_container_env(
     db: AsyncSession,
     user_id: str,
     agent_config: AgentConfig,
@@ -1027,35 +1226,72 @@ async def update_container_env(
         # at signup, then forward to the bridge.
         from app.services.pool_service import _build_bind_payload
         payload = await _build_bind_payload(db, user_id, agent_config)
-        try:
-            async with _bridge_client() as client:
-                resp = await client.post("/v1/pool/refresh-config", json=payload)
-                if resp.status_code == 404:
-                    # Bridge no longer tracks this prefix as pool-bound
-                    # (pool registry drift). Fall through to recreate
-                    # path — the user will eat a cold boot once, then
-                    # be on a regular tenant container.
-                    logger.warning(
-                        "[update_container_env] pool drift for %s: bridge says no pool member. Falling through.",
+        # Three attempts, because the failure this guards against is a
+        # transient bridge stall — the one seen at 2026-08-31 15:48 UTC was a
+        # single 500 — and the old code answered ONE such stall by moving the
+        # user to a different, empty database. It logged the exception with
+        # `%s`, which for an httpx timeout is the empty string, so the trail
+        # read "pool refresh failed for 51d4ed2f: ." and named nothing.
+        last_err = "unknown"
+        for attempt in range(1, 4):
+            try:
+                async with _bridge_client() as client:
+                    resp = await client.post("/v1/pool/refresh-config", json=payload)
+                    if resp.status_code == 404:
+                        # Bridge no longer tracks this prefix as pool-bound
+                        # (pool registry drift). This used to fall through to
+                        # `provision_container(recreate=True)` "so the user
+                        # eats a cold boot once" — but the named path binds
+                        # `toup_agent_<prefix>` while this user's history is in
+                        # the slot's own `toup_agent_feedNNNN`, so the real
+                        # cost was the whole account reading as empty.
+                        #
+                        # Drift is an operator problem, not a user problem.
+                        # Leave the container alone: it is still running and
+                        # still bound to the right database, only its env is
+                        # one push behind.
+                        logger.error(
+                            "[POOL-DRIFT] bridge reports no pool member for %s while "
+                            "managed_containers says %s. Config push DEFERRED — the "
+                            "container keeps serving the correct database. Reconcile "
+                            "the pool registry; do NOT re-provision this user through "
+                            "the named path.",
+                            user_id[:8], container.container_name,
+                        )
+                        container.error_message = "pool_registry_drift: config push deferred"
+                        await db.commit()
+                        return container
+                    resp.raise_for_status()
+                    logger.info(
+                        "[update_container_env] pool refresh OK for %s (no recreate)",
                         user_id[:8],
                     )
-                    return await provision_container(
-                        db, user_id, agent_config=agent_config, recreate=True,
+                    if container.error_message and container.error_message.startswith(
+                        ("pool_registry_drift", "pool_refresh_failed")
+                    ):
+                        container.error_message = None
+                        await db.commit()
+                    return container
+            except httpx.HTTPError as e:
+                last_err = repr(e)
+                if attempt < 3:
+                    logger.info(
+                        "[update_container_env] pool refresh attempt %d/3 failed for %s (%s) — retrying",
+                        attempt, user_id[:8], last_err,
                     )
-                resp.raise_for_status()
-                logger.info(
-                    "[update_container_env] pool refresh OK for %s (no recreate)",
-                    user_id[:8],
-                )
-                return container
-        except httpx.HTTPError as e:
-            logger.warning(
-                "[update_container_env] pool refresh failed for %s: %s. Falling through to recreate.",
-                user_id[:8], e,
-            )
-            return await provision_container(
-                db, user_id, agent_config=agent_config, recreate=True,
-            )
+                    await asyncio.sleep(0.5 * attempt)
+        # Still failing after three tries. The container is untouched and still
+        # holds the user's data; the only thing lost is the freshness of one
+        # env push, which the next successful call restores.
+        logger.error(
+            "[POOL-REFRESH-FAILED] %s: %s after 3 attempts. Config push DEFERRED — "
+            "container %s left running on its own database. Recreating it here "
+            "would move the user to an empty tenant DB.",
+            user_id[:8], last_err, container.container_name,
+        )
+        container.error_message = f"pool_refresh_failed: {last_err[:200]}"
+        await db.commit()
+        return container
 
     return await provision_container(
         db, user_id, agent_config=agent_config, recreate=True,

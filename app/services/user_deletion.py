@@ -58,7 +58,12 @@ Source of truth is the users row's existence. If `user` is None on
 entry, return a no-op receipt. Re-running the cascade on a user
 whose row still exists is safe because:
   - Stripe.delete_customer is idempotent (200 on already-deleted)
-  - destroy_container returns cleanly on already-gone containers
+  - destroy_container returns cleanly on already-gone containers, and
+    RAISES when a teardown it owed did not land — which is what makes
+    this step a real hard-fail. It used to swallow a bridge outage and
+    return True, so the cascade wiped the platform row, reported
+    `container_destroyed: true`, and left a running container and a
+    live database with nothing pointing at them.
   - archive_project is idempotent
   - All table deletes are WHERE user_id = uid → empty rowset on
     second call
@@ -275,8 +280,12 @@ async def delete_user_completely(
 
     # ── Container teardown via bridge (HARD-FAIL) ──────────────────────
     # Hands off to the bridge: docker rm + network rm + tenant DB drop +
-    # Caddy route removal. destroy_container is idempotent (returns
-    # cleanly on 404) so re-running after a partial failure is safe.
+    # Caddy route removal, AND the warm-pool slot release — a slot that is
+    # never released is never reaped, and a slot that is never reaped keeps
+    # its database. destroy_container is idempotent (returns cleanly on 404)
+    # so re-running after a partial failure is safe, and it raises rather
+    # than returning when a step it owed did not land, which is the only
+    # reason "HARD-FAIL" in this heading is true.
     try:
         from app.services.docker_host_service import destroy_container
         await destroy_container(db, user_id)

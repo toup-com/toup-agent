@@ -51,13 +51,28 @@ async def _get_agent_proxy_info(
     user_id: str, db: AsyncSession
 ) -> Optional[Tuple[str, str]]:
     """Return (agent_url, agent_api_key) if the user has a remote agent."""
+    # WHERE THE DATA ACTUALLY IS. `serving_locally()` is true in an agent
+    # container and in a monolith/dev run — the AGENT_ONLY tables are in THIS
+    # process's database and there is nothing to proxy to. Without this the
+    # agent can resolve its OWN `agent_configs` row and proxy to itself over
+    # the public internet: harmless while a failed hop fell through to the
+    # local SELECT, and a 503 over a perfectly readable local database now that
+    # it does not. `tenant_proxy.agent_proxy_info` has always had this guard;
+    # these two copies never did.
+    from app.api.tenant_proxy import serving_locally
+    if serving_locally():
+        return None
+    # NOT gated on `deploy_status == "active"` — see the note in
+    # `day_chats._get_agent_proxy_info`. A container mid-redeploy, or one a
+    # stale-deploy sweep marked "error" 15 minutes later, is very often still
+    # up and holding the user's entire history; skipping the proxy for those
+    # users served them the platform's own empty tables instead.
     try:
         async with db.begin_nested():
             result = await db.execute(
                 select(AgentConfig.agent_url, AgentConfig.agent_api_key)
                 .where(
                     AgentConfig.user_id == user_id,
-                    AgentConfig.deploy_status == "active",
                 )
             )
             row = result.first()
@@ -68,30 +83,93 @@ async def _get_agent_proxy_info(
     return None
 
 
+class SessionsAgentUnreachable(Exception):
+    """The tenant owns these sessions and did not answer. Never swallowed.
+
+    Same defect as `day_chats.AgentUnreachable`, and the same 2026-08-31
+    incident: this module is the FALLBACK the mobile client reaches for when
+    `/api/day-chats` fails, so a silent `None` here meant both the primary and
+    the recovery path answered "you have no history" while the tenant was
+    merely slow. See `day_chats.AgentUnreachable` for the full account.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+class SessionsAgentSaidNo(Exception):
+    """A 4xx from the tenant — an answer, forwarded verbatim."""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.body = body
+
+
+# The WHOLE LADDER has to fit inside the mobile client's 15 s abort — see the
+# note on `day_chats._PROXY_TIMEOUT_S`. 2 × 6 s + 0.4 s = 12.4 s worst case.
+_SESSIONS_PROXY_TIMEOUT_S = 6.0
+_SESSIONS_PROXY_ATTEMPTS = 2
+_SESSIONS_PROXY_BACKOFF_S = 0.4
+
+
+def _sessions_unreachable(exc: Exception) -> HTTPException:
+    """See `day_chats._unreachable` — same shape, same reason. The cause is
+    logged, never sent: a user cannot act on "ReadTimeout()"."""
+    logger.warning("[sessions] answering 503 agent_unreachable: %s",
+                   getattr(exc, "detail", exc))
+    return HTTPException(
+        status_code=503,
+        detail="Your agent did not answer in time. Your history is safe — try again.",
+        headers={"Retry-After": "2", "X-Toup-Reason": "agent_unreachable"},
+    )
+
+
 async def _proxy_sessions(
     agent_url: str, agent_api_key: str, path: str, params: Optional[dict] = None
 ):
     """Proxy a sessions request to the VPS agent.
 
     TKT-LAT-007: uses the shared agent_http client.
+
+    Raises `SessionsAgentUnreachable` on transport failure or a 5xx, and
+    `SessionsAgentSaidNo` on a 4xx. It never returns `None`: the caller cannot
+    tell an empty account from an unread one, and every caller below sits in
+    front of a screen that renders those two identically.
     """
+    import asyncio
+
     from app.services.agent_http import get_agent_http_client
 
     url = f"{agent_url}/api/sessions/{path}" if path else f"{agent_url}/api/sessions"
-    try:
-        client = get_agent_http_client()
-        resp = await client.get(
-            url,
-            headers={"X-Agent-Key": agent_api_key},
-            params=params or {},
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        logger.warning("Agent sessions proxy %s returned %s", url, resp.status_code)
-    except Exception as e:
-        logger.warning("Agent sessions proxy %s failed: %s", url, e)
-    return None
+    last = "unknown"
+    for attempt in range(1, _SESSIONS_PROXY_ATTEMPTS + 1):
+        try:
+            client = get_agent_http_client()
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": agent_api_key},
+                params=params or {},
+                timeout=_SESSIONS_PROXY_TIMEOUT_S,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            if 400 <= resp.status_code < 500:
+                raise SessionsAgentSaidNo(resp.status_code, resp.text[:300])
+            last = f"HTTP {resp.status_code}"
+        except SessionsAgentSaidNo:
+            raise
+        except Exception as e:
+            # `repr`, not `str`: httpx timeout exceptions stringify to "".
+            last = repr(e)
+        if attempt < _SESSIONS_PROXY_ATTEMPTS:
+            logger.info("Agent sessions proxy %s attempt %d/%d failed (%s) — retrying",
+                        url, attempt, _SESSIONS_PROXY_ATTEMPTS, last)
+            await asyncio.sleep(_SESSIONS_PROXY_BACKOFF_S)
+    logger.warning("Agent sessions proxy %s failed after %d attempts: %s",
+                   url, _SESSIONS_PROXY_ATTEMPTS, last)
+    raise SessionsAgentUnreachable(last)
 
 
 @router.post("", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -161,7 +239,14 @@ async def create_session(
 async def list_sessions(
     channel: Optional[str] = None,
     active_only: bool = False,
-    limit: int = Query(20, ge=1, le=100),
+    # `le` was 100, and the shipped mobile client asks for 120 and 360:
+    # `api.getDayChats(n)` falls back to `getSessions(n * 4)` when day-chats
+    # fails, so the whole recovery path had been answering 422 in production —
+    # proven in the 2026-08-31 trail, two 422s inside the same second as the
+    # day-chats timeout that summoned them. The client is clamped in the same
+    # round, but binaries already on phones are not, so the ceiling moves here
+    # too. A session row is small and this route is offset-paginated.
+    limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -180,7 +265,16 @@ async def list_sessions(
             params["channel"] = channel
         if active_only:
             params["active_only"] = "true"
-        data = await _proxy_sessions(proxy[0], proxy[1], "", params)
+        # The tenant is authoritative for this list. A failed hop used to fall
+        # through to the platform DB, which holds only the voice/web sessions
+        # merged below — so an unreachable tenant answered 200 with a partial
+        # list that read as the whole account. 503 instead.
+        try:
+            data = await _proxy_sessions(proxy[0], proxy[1], "", params)
+        except SessionsAgentSaidNo as e:
+            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+        except SessionsAgentUnreachable as e:
+            raise _sessions_unreachable(e)
         if data is not None:
             # Merge platform-local sessions (voice + browser) into proxy response
             # These channels run on the platform, not the VPS agent, so their
@@ -285,9 +379,16 @@ async def get_session(
         proxy = await _get_agent_proxy_info(current_user.id, db)
         if proxy:
             params = {"include_messages": str(include_messages).lower(), "message_limit": message_limit}
-            data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
-            if data is not None:
-                return JSONResponse(content=data)
+            # `is_local` already proved this session is NOT in the platform
+            # DB, so falling through on a failed hop reaches a query that can
+            # only 404 — "session not found" for a session that exists.
+            try:
+                data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
+            except SessionsAgentSaidNo as e:
+                raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            except SessionsAgentUnreachable as e:
+                raise _sessions_unreachable(e)
+            return JSONResponse(content=data)
 
     # Build query with optional message loading
     query = select(Conversation).where(
@@ -462,9 +563,14 @@ async def get_session_messages(
         proxy = await _get_agent_proxy_info(current_user.id, db)
         if proxy:
             params = {"limit": limit, "offset": offset}
-            data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
-            if data is not None:
-                return JSONResponse(content=data)
+            # Same as above: not local, so the fall-through can only 404.
+            try:
+                data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
+            except SessionsAgentSaidNo as e:
+                raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            except SessionsAgentUnreachable as e:
+                raise _sessions_unreachable(e)
+            return JSONResponse(content=data)
 
     # Verify session ownership
     session_query = select(Conversation.id, Conversation.channel).where(
@@ -929,9 +1035,19 @@ async def get_messages_by_date(
     # Try proxying to remote agent first (pass tz_offset through)
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        data = await _proxy_sessions(proxy[0], proxy[1], f"by-date/{date_str}/messages", {"limit": limit, "tz_offset": tz_offset})
-        if data is not None:
-            return JSONResponse(content=data)
+        # This route IS the mobile client's fallback when /api/day-chats fails.
+        # Answering it with a silent empty list is how one slow tenant became
+        # "my messages were deleted".
+        try:
+            data = await _proxy_sessions(
+                proxy[0], proxy[1], f"by-date/{date_str}/messages",
+                {"limit": limit, "tz_offset": tz_offset},
+            )
+        except SessionsAgentSaidNo as e:
+            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+        except SessionsAgentUnreachable as e:
+            raise _sessions_unreachable(e)
+        return JSONResponse(content=data)
 
     # Local: find sessions for this date, adjusted for client timezone.
     # tz_offset is in minutes from UTC (e.g. -210 means UTC+3:30).

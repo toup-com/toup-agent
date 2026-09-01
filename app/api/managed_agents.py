@@ -249,7 +249,13 @@ async def destroy(
     db: AsyncSession = Depends(get_db),
 ):
     """Destroy a managed container."""
-    success = await docker_host_service.destroy_container(db, current_user.id)
+    try:
+        success = await docker_host_service.destroy_container(db, current_user.id)
+    except docker_host_service.ContainerTeardownIncomplete as e:
+        # 502, not 404 and not 500: the container is still there and the user
+        # should be told to try again, not told it is gone. Same contract as
+        # POST /auth/delete-account, which returns 502 when this step aborts.
+        raise HTTPException(502, str(e))
     if not success:
         raise HTTPException(404, "No managed container found")
     return {"status": "deleted"}

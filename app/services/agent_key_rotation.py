@@ -158,9 +158,22 @@ async def rotate_agent_api_key(
     #    hot-flip smoke suite alongside the connector-dispatch flag
     #    flip — search docs/integrations/02-rollout.md for "Hot-flip
     #    smoke (mandatory, blocks T5e)".
+    #    POOL MEMBERS TAKE THE OTHER DOOR. This comment used to claim
+    #    `provision_container` is "the only path that updates env on non-pool
+    #    tenants" while the code applied it to pool tenants too — and the named
+    #    recreate binds `toup_agent_<prefix>`, not the slot's own database, so
+    #    rotating one pool user's key emptied their account. `update_container_env`
+    #    is pool-aware (`/v1/pool/refresh-config` → the agent's `/admin/bind`),
+    #    which is also the right semantic here: the key changes in place, the
+    #    container and its data are untouched.
     try:
-        from app.services.docker_host_service import provision_container
-        await provision_container(db, user_id, agent_config=cfg, recreate=True)
+        from app.services.docker_host_service import (
+            provision_container, update_container_env,
+        )
+        if (container.container_name or "").startswith("toup-agent-pool-"):
+            await update_container_env(db, user_id, cfg)
+        else:
+            await provision_container(db, user_id, agent_config=cfg, recreate=True)
     except Exception as bridge_exc:
         logger.exception("[rotate-key] bridge recreate failed for %s", user_id[:8])
         await _rollback_to_old_key(db, cfg, old_key, bridge_exc)
@@ -309,10 +322,20 @@ async def _rollback_to_old_key(
     # tenant container may be running with whatever env the failed
     # rotation half-set; operator alert via the audit row.
     try:
-        from app.services.docker_host_service import provision_container
-        await provision_container(
-            db, cfg.user_id, agent_config=cfg, recreate=True,
+        from app.services.docker_host_service import (
+            provision_container, update_container_env,
         )
+        # Same door as the forward path — a rollback must not be the thing that
+        # moves a pool user onto an empty database.
+        mc = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == cfg.user_id)
+        )).scalar_one_or_none()
+        if mc and (mc.container_name or "").startswith("toup-agent-pool-"):
+            await update_container_env(db, cfg.user_id, cfg)
+        else:
+            await provision_container(
+                db, cfg.user_id, agent_config=cfg, recreate=True,
+            )
     except Exception as e:
         logger.exception(
             "[rotate-key] rollback bridge recreate failed for %s: %s "

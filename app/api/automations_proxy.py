@@ -47,6 +47,12 @@ from app.db.models import AutomationGrant, AutomationTemplate, User
 router = APIRouter(prefix="/automations", tags=["automations (platform)"])
 logger = logging.getLogger(__name__)
 
+# Below the mobile client's 15 s per-attempt budget by a clear margin, so the
+# platform is always the side that answers first on a slow tenant.
+_READ_TIMEOUT_S = 12.0
+# A mutation is not abandoned early: see `_proxy`.
+_WRITE_TIMEOUT_S = 30.0
+
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-encoding",
@@ -442,8 +448,32 @@ async def _proxy(
     await _flag_or_404(db, uid)
     target = await _get_agent_target(uid, db)
     if target is None:
-        raise HTTPException(status_code=404,
-                            detail="No active agent for this user")
+        # WHY THIS IS NOT A 404. The client's rule is "404/405 = the feature is
+        # not on this backend, render absence" — so this answer painted "No
+        # automations yet" over a full account. But `_get_agent_target`
+        # requires `deploy_status == 'active'`, and a container that is
+        # redeploying, provisioning or errored is none of those while the
+        # user's automations sit intact inside it. `_flag_or_404` above is the
+        # one honest 404 here: the feature really is off for this user.
+        #
+        # A user who has never set an agent up is the remaining case, and 503
+        # is right for them too — the platform is mid-provisioning, and the
+        # onboarding surface, not this screen, is what tells them so.
+        from app.db.models import AgentConfig as _AC
+        try:
+            row = (await db.execute(
+                select(_AC.deploy_status).where(_AC.user_id == uid)
+            )).first()
+        except Exception:
+            row = None
+        state = (row[0] if row else None) or "none"
+        logger.info("[automations_proxy] no active agent for %s (deploy_status=%s)",
+                    uid[:8], state)
+        raise HTTPException(
+            status_code=503,
+            detail="Your agent is still starting up. Nothing has changed — try again in a moment.",
+            headers={"Retry-After": "5", "X-Toup-Reason": "agent_provisioning"},
+        )
     agent_url, agent_api_key = target
     url = f"{agent_url.rstrip('/')}/api/automations{sub_path}"
     headers = {
@@ -454,19 +484,50 @@ async def _proxy(
     }
     body = await request.body()
     from app.services.agent_http import get_agent_http_client
+    method = request.method.upper()
+    # THE TIMEOUT HIERARCHY, which was inverted. The mobile client aborts every
+    # request at 15 s (`api.ts DEFAULT_TIMEOUT_MS`); this proxy waited 30 s. So
+    # for the whole 15–30 s band the phone had already given up and drawn
+    # "The server didn't answer" while the platform was still patiently holding
+    # the connection — and when the tenant finally answered, that answer went
+    # nowhere. Measured 2026-08-31: `GET /api/automations/summary -> 200
+    # 22677ms`, a correct response the user never saw.
+    #
+    # A READ now fails fast and honestly INSIDE the client's budget, so the
+    # client's retry (which it now has) is what recovers the blip. A WRITE
+    # keeps the long budget: abandoning a mutation mid-flight does not undo it,
+    # it only makes the outcome unknown to both sides.
+    read_only = method in ("GET", "HEAD")
+    timeout_s = _READ_TIMEOUT_S if read_only else _WRITE_TIMEOUT_S
     try:
         client = get_agent_http_client()
         resp = await client.request(
-            request.method.upper(), url,
+            method, url,
             params=dict(request.query_params),
             headers=headers,
             content=body if body else None,
-            timeout=30.0,
+            timeout=timeout_s,
+        )
+    except httpx.TimeoutException as e:
+        # 504, not 502: "answered too slowly" and "did not answer at all" are
+        # different operational facts and the trail could not tell them apart —
+        # `str()` of an httpx timeout is the empty string, so the old
+        # "failed: %s" logged nothing at all after the colon.
+        logger.warning("automations_proxy %s %s timed out after %.0fs: %r",
+                       method, url, timeout_s, e)
+        raise HTTPException(
+            status_code=504,
+            detail="Your agent is taking longer than usual. Nothing has changed — try again.",
+            headers={"Retry-After": "3", "X-Toup-Reason": "agent_slow"},
         )
     except httpx.RequestError as e:
-        logger.warning("automations_proxy %s %s failed: %s",
-                       request.method, url, e)
-        raise HTTPException(status_code=502, detail="Agent unreachable")
+        logger.warning("automations_proxy %s %s failed: %r",
+                       method, url, e)
+        raise HTTPException(
+            status_code=502,
+            detail="Agent unreachable",
+            headers={"Retry-After": "3", "X-Toup-Reason": "agent_unreachable"},
+        )
     dark = _translate_agent_dark(resp)
     if dark is not None:
         logger.warning(

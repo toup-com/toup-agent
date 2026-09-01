@@ -71,12 +71,28 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tupl
     `from app.api.day_chats import` would resolve fine but pulling in
     its proxy helper is cleaner kept local).
     """
+    # WHERE THE DATA ACTUALLY IS. `serving_locally()` is true in an agent
+    # container and in a monolith/dev run — the AGENT_ONLY tables are in THIS
+    # process's database and there is nothing to proxy to. Without this the
+    # agent can resolve its OWN `agent_configs` row and proxy to itself over
+    # the public internet: harmless while a failed hop fell through to the
+    # local SELECT, and a 503 over a perfectly readable local database now that
+    # it does not. `tenant_proxy.agent_proxy_info` has always had this guard;
+    # these two copies never did.
+    from app.api.tenant_proxy import serving_locally
+    if serving_locally():
+        return None
+    # NOT gated on `deploy_status == "active"` — see the note in
+    # `day_chats._get_agent_proxy_info`. A container mid-redeploy, or one a
+    # stale-deploy sweep marked "error" 15 minutes later, is very often still
+    # up and holding the user's entire history; skipping the proxy for those
+    # users served them the platform's own empty tables instead.
     try:
         from app.db.models import AgentConfig
         async with db.begin_nested():
             result = await db.execute(
                 select(AgentConfig.agent_url, AgentConfig.agent_api_key).where(
-                    AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active"
+                    AgentConfig.user_id == user_id
                 )
             )
             row = result.first()
@@ -113,8 +129,12 @@ async def _proxy_messages_since(
         # don't pretend the message exists by returning [].
         if resp.status_code == 404:
             return "404"
+        logger.warning("messages_recover proxy %s returned %s", url, resp.status_code)
     except Exception as e:
-        logger.warning("messages_recover proxy %s failed: %s", url, e)
+        # `repr`: an httpx timeout stringifies to the empty string, which is
+        # how the sibling day-chats proxy came to log "failed: " and name
+        # nothing during the 2026-08-31 outage.
+        logger.warning("messages_recover proxy %s failed: %r", url, e)
     return None
 
 
@@ -146,10 +166,18 @@ async def messages_since(
             raise HTTPException(status_code=404, detail="Message not found")
         if data is not None:
             return JSONResponse(content=data)
-        # Proxy unreachable — fall through. In platform mode the local
-        # tables don't exist, so the SELECT below will trip the
-        # missing-table guard and return []. That's a degraded but
-        # safe response: chat keeps showing what it had, no crash.
+        # Proxy unreachable. This used to fall through to a local SELECT that
+        # returns [] in platform mode, on the argument that it was "degraded
+        # but safe: chat keeps showing what it had". It is the same shape as
+        # the day-chats defect of 2026-08-31 — a failure rendered as an
+        # authoritative "nothing new" — and both callers of this route already
+        # treat a non-2xx as "skip this tick and poll again", which is the
+        # behaviour the fall-through was trying to approximate. Say it plainly.
+        raise HTTPException(
+            status_code=503,
+            detail="Your agent did not answer in time. Nothing has been lost — retrying.",
+            headers={"Retry-After": "2", "X-Toup-Reason": "agent_unreachable"},
+        )
 
     # Agent mode (or platform fallback): local query.
     try:

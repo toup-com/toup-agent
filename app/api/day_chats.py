@@ -316,12 +316,37 @@ def _with_web_refs(rec: dict) -> dict:
 
 async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str]]:
     """Return (agent_url, agent_api_key) if the user has a remote agent."""
+    # WHERE THE DATA ACTUALLY IS. `serving_locally()` is true in an agent
+    # container and in a monolith/dev run — the AGENT_ONLY tables are in THIS
+    # process's database and there is nothing to proxy to. Without this the
+    # agent can resolve its OWN `agent_configs` row and proxy to itself over
+    # the public internet: harmless while a failed hop fell through to the
+    # local SELECT, and a 503 over a perfectly readable local database now that
+    # it does not. `tenant_proxy.agent_proxy_info` has always had this guard;
+    # the three hand-rolled copies (here, sessions.py, messages_recover.py)
+    # never did.
+    from app.api.tenant_proxy import serving_locally
+    if serving_locally():
+        return None
     try:
         from app.db.models import AgentConfig
         async with db.begin_nested():
+            # NOT gated on `deploy_status == "active"`.
+            #
+            # `deploy_status` is set to "deploying" for the whole of a redeploy
+            # and to "error" by a stale-deploy sweep 15 minutes later — while
+            # the container is very often still up and holding the user's
+            # entire history. Requiring "active" therefore skipped the proxy
+            # for exactly those users and served them the platform's own empty
+            # tables instead: the 2026-08-31 defect through a second door, and
+            # one a retry cannot help with because nothing failed.
+            #
+            # A URL and a key is the whole test. What the tenant is actually
+            # doing is decided by the HTTP call — which now answers 503 rather
+            # than an empty list when it does not come back.
             result = await db.execute(
                 select(AgentConfig.agent_url, AgentConfig.agent_api_key)
-                .where(AgentConfig.user_id == user_id, AgentConfig.deploy_status == "active")
+                .where(AgentConfig.user_id == user_id)
             )
             row = result.first()
             if row and row.agent_url and row.agent_api_key:
@@ -331,29 +356,136 @@ async def _get_agent_proxy_info(user_id: str, db: AsyncSession) -> Optional[Tupl
     return None
 
 
+class AgentSaidNo(Exception):
+    """The tenant answered with a 4xx. That is an answer, and it is forwarded.
+
+    Kept apart from `AgentUnreachable` because exactly one route depends on the
+    difference: `app-conversation/{app_id}` uses 404 to mean "no conversation
+    for this app yet", and a client that reads a 503 as that 404 starts a
+    second thread beside the one the user was already in.
+    """
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.body = body
+
+
+class AgentUnreachable(Exception):
+    """The user's history lives in their tenant agent and we could not read it.
+
+    Raised — never swallowed — because the alternative was the 2026-08-31
+    incident: `_proxy_day_chats` returned `None` for every failure, the caller
+    read that as "nothing to say" and fell through to a SELECT against the
+    PLATFORM database, which does not have the `day_chats` table at all. That
+    SELECT raised `UndefinedTableError`, which the handler below turns into
+    `200 []` — so a ten-second timeout to one tenant reached the phone as an
+    empty, successful history, and the user reported his messages deleted.
+
+    A user with no agent (`proxy is None`) still takes the local path; that is
+    what the local path is FOR. A user WITH an agent whose agent did not answer
+    gets a 503 and the client keeps whatever it already had on screen.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
+# The tenant read budget, and it is the WHOLE LADDER that has to fit.
+#
+# The number that matters is `attempts × timeout + backoff`, not the per-attempt
+# timeout: the mobile client aborts at 15 s (`api.ts DEFAULT_TIMEOUT_MS`), so a
+# retry ladder that can run to 20 s re-creates the exact inversion this round
+# exists to remove — the platform still politely waiting while the phone has
+# already drawn an error, and the honest 503 arriving after nobody is listening.
+#
+# 2 × 6 s + 0.4 s = 12.4 s worst case. Generous: a healthy tenant answers this
+# route in well under a second, and the 10 s ceiling was only ever reached while
+# a neighbouring container was being recreated on the same host.
+_PROXY_TIMEOUT_S = 6.0
+# One cheap retry. The failure this exists for is a transient host stall, not a
+# broken tenant: a second attempt costs a user nothing when the first attempt
+# already failed, and it is the difference between "your history is gone" and
+# a half-second hiccup nobody sees.
+_PROXY_ATTEMPTS = 2
+_PROXY_BACKOFF_S = 0.4
+
+
 async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", params: dict = None):
     """Proxy a day-chats request to the VPS agent.
 
     TKT-LAT-007: uses the shared agent_http client so calendar opens
     (which fire many day-chat hops on the chat page) don't pay a
     TLS handshake per request.
+
+    Raises `AgentUnreachable` when the tenant does not answer, or answers with
+    anything other than 200. Returning `None` for that case is what made a
+    tenant hiccup indistinguishable from an empty account.
     """
+    import asyncio
+
     from app.services.agent_http import get_agent_http_client
 
     url = f"{agent_url}/api/day-chats/{path}" if path else f"{agent_url}/api/day-chats"
-    try:
-        client = get_agent_http_client()
-        resp = await client.get(
-            url,
-            headers={"X-Agent-Key": agent_api_key},
-            params=params or {},
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        logger.warning("Day-chats proxy %s failed: %s", url, e)
-    return None
+    last: str = "unknown"
+    for attempt in range(1, _PROXY_ATTEMPTS + 1):
+        try:
+            client = get_agent_http_client()
+            resp = await client.get(
+                url,
+                headers={"X-Agent-Key": agent_api_key},
+                params=params or {},
+                timeout=_PROXY_TIMEOUT_S,
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            # A 4xx is the tenant ANSWERING — most importantly the 404 that
+            # `app-conversation/{id}` returns to mean "no conversation yet".
+            # Forward it verbatim; retrying it would only waste the budget and
+            # translating it to 503 would tell the client to wait for an answer
+            # it has already been given.
+            if 400 <= resp.status_code < 500:
+                raise AgentSaidNo(resp.status_code, resp.text[:300])
+            # A 5xx was previously silent: `_proxy_day_chats` only logged
+            # inside `except`, so a tenant answering 500 produced no line at
+            # all and then an empty history. Say what happened, then retry.
+            last = f"HTTP {resp.status_code}"
+        except AgentSaidNo:
+            raise
+        except Exception as e:
+            # `str(httpx.ReadTimeout())` is the EMPTY STRING, so the old
+            # "failed: %s" wrote "failed: " and the production trail for this
+            # incident could not name its own cause. `repr` always says which
+            # exception it was.
+            last = repr(e)
+        if attempt < _PROXY_ATTEMPTS:
+            logger.info(
+                "Day-chats proxy %s attempt %d/%d failed (%s) — retrying",
+                url, attempt, _PROXY_ATTEMPTS, last,
+            )
+            await asyncio.sleep(_PROXY_BACKOFF_S)
+    logger.warning("Day-chats proxy %s failed after %d attempts: %s",
+                   url, _PROXY_ATTEMPTS, last)
+    raise AgentUnreachable(last)
+
+
+def _unreachable(exc: "AgentUnreachable") -> HTTPException:
+    """The one shape every day-chats route returns when the tenant is silent.
+
+    503 + `Retry-After`, never 200 and never 404: the client has to be able to
+    tell "you have no history" from "we could not read your history", because
+    it caches the first one and retries the second.
+    """
+    # The cause reaches the trail here and NOT the client: "ReadTimeout()" is
+    # what an operator needs and nothing a user can act on.
+    logger.warning("[day_chats] answering 503 agent_unreachable: %s",
+                   getattr(exc, "detail", exc))
+    return HTTPException(
+        status_code=503,
+        detail="Your agent did not answer in time. Your history is safe — try again.",
+        headers={"Retry-After": "2", "X-Toup-Reason": "agent_unreachable"},
+    )
 
 
 @router.get("")
@@ -371,15 +503,21 @@ async def list_day_chats(
     Works in read-only mode regardless of feature flag state. Returns empty list
     if no day_chats exist (backfill hasn't run yet).
     """
-    # Platform mode: proxy to user's VPS agent
+    # Platform mode: proxy to user's VPS agent. The tenant is AUTHORITATIVE for
+    # a user who has one — there is no second copy of their history down here,
+    # so a failed hop must never continue into the local SELECT below.
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         params = {"limit": limit}
         if before:
             params["before"] = before
-        data = await _proxy_day_chats(proxy[0], proxy[1], "", params)
-        if data is not None:
-            return JSONResponse(content=data)
+        try:
+            data = await _proxy_day_chats(proxy[0], proxy[1], "", params)
+        except AgentSaidNo as e:
+            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+        except AgentUnreachable as e:
+            raise _unreachable(e)
+        return JSONResponse(content=data)
 
     query = (
         select(DayChat)
@@ -525,12 +663,19 @@ async def get_day_chat_messages(
 
     Works in read-only mode regardless of feature flag state.
     """
-    # Platform mode: proxy to user's VPS agent
+    # Platform mode: proxy to user's VPS agent. See `list_day_chats` — a
+    # tenant that did not answer is a 503, never an empty day.
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        data = await _proxy_day_chats(proxy[0], proxy[1], f"{date_str}/messages", {"limit": limit})
-        if data is not None:
-            return JSONResponse(content=data)
+        try:
+            data = await _proxy_day_chats(
+                proxy[0], proxy[1], f"{date_str}/messages", {"limit": limit},
+            )
+        except AgentSaidNo as e:
+            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+        except AgentUnreachable as e:
+            raise _unreachable(e)
+        return JSONResponse(content=data)
 
     try:
         target_date = Date.fromisoformat(date_str)
@@ -763,12 +908,19 @@ async def resolve_app_conversation(
     """
     import json as _json
 
-    # Platform mode: proxy to user's VPS agent
+    # Platform mode: proxy to user's VPS agent. Same rule as the two routes
+    # above: silence upstream is a 503, not "this app has no conversation" —
+    # the client uses a 404 here to decide it may start a NEW one, and doing
+    # that on a timeout orphans the thread the user was already in.
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
-        data = await _proxy_day_chats(proxy[0], proxy[1], f"app-conversation/{app_id}")
-        if data is not None:
-            return JSONResponse(content=data)
+        try:
+            data = await _proxy_day_chats(proxy[0], proxy[1], f"app-conversation/{app_id}")
+        except AgentSaidNo as e:
+            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+        except AgentUnreachable as e:
+            raise _unreachable(e)
+        return JSONResponse(content=data)
 
     # Find today's day chat
     user_tz = getattr(current_user, 'timezone', None)

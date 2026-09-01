@@ -29,7 +29,8 @@ import asyncio
 import logging
 import secrets
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -562,7 +563,31 @@ async def wait_for_pool_quiescence(timeout_s: float) -> tuple[bool, str]:
     return False, f"still busy after {int(timeout_s)}s: {last}"
 
 
-async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[str] = None) -> bool:
+@dataclass(frozen=True)
+class PoolRelease:
+    """What the bridge said when we asked it to release a slot.
+
+    `ok` and `found` are DIFFERENT questions and the caller needs both.
+    "The bridge answered and no slot matched" is success with nothing to do;
+    "the bridge never answered" is a slot we may still be holding. The old
+    signature was a bare bool that collapsed the two, and `destroy_container`
+    discarded even that — which is how three pool slots ended up ASSIGNED to
+    accounts that no longer exist, their containers still running and their
+    databases still on disk, while the deletion receipt said
+    `container_destroyed: true`.
+    """
+
+    ok: bool
+    found: bool = False
+    detail: str = ""
+
+    def __bool__(self) -> bool:      # back-compat for truthiness call sites
+        return self.ok
+
+
+async def release_pool_member(
+    prefix: Optional[str] = None, user_id: Optional[str] = None
+) -> PoolRelease:
     """Tell the bridge a user has been deleted / churned.
 
     Bridge marks the pool member DRAINING; the reconciler completes the
@@ -571,11 +596,13 @@ async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[st
     out-of-band). Slot is reusable once the reconciler reaps it; the
     next allocation creates a fresh DB role + password.
 
-    Returns True if the bridge accepted the release (including the
-    "no pool member matches" case — that's idempotent success).
+    NOTE the consequence of that last paragraph for deletion: a slot that is
+    never released is never reaped, so its database is never dropped. A failed
+    release is therefore not a tidiness problem, it is the user's data staying
+    on disk after they asked for it to be erased.
     """
     if not prefix and not user_id:
-        return False
+        return PoolRelease(ok=False, detail="neither prefix nor user_id given")
     body: dict = {}
     if prefix:
         body["prefix"] = prefix
@@ -590,16 +617,57 @@ async def release_pool_member(prefix: Optional[str] = None, user_id: Optional[st
                     "[pool_service] bridge release %s: %s",
                     resp.status_code, resp.text[:200],
                 )
-                return False
+                return PoolRelease(
+                    ok=False, detail=f"bridge {resp.status_code}: {resp.text[:120]}"
+                )
             data = resp.json()
             logger.info(
                 "[pool_service] pool release: found=%s slot=%s prefix=%s user=%s",
                 data.get("found"), data.get("slot"), prefix, str(user_id)[:8] if user_id else "",
             )
-            return True
+            return PoolRelease(ok=True, found=bool(data.get("found")))
     except Exception as e:
-        logger.warning("[pool_service] bridge release unreachable: %s", e)
+        # %r, not %s: str(httpx.ReadTimeout()) is the EMPTY STRING, which is why
+        # the production trail for this class of failure names no cause at all.
+        logger.warning("[pool_service] bridge release unreachable: %r", e)
+        return PoolRelease(ok=False, detail=repr(e))
+
+
+# A pool claim is "fresh" for as long as the signup that made it could still
+# plausibly be in flight. Inside that window the slot database holds nothing —
+# the user has not sent a message — so the named recreate strands no data.
+# Outside it, the same call is the R40 data-loss defect.
+POOL_CLAIM_FRESH_WINDOW = timedelta(minutes=15)
+
+
+async def _load_container(db, user_id: str):
+    """The user's ManagedContainer row, or None. Never raises: this runs inside
+    a fire-and-forget guard and a failed lookup must degrade to "unknown", not
+    to a swallowed exception that skips the heal entirely."""
+    try:
+        from app.db.models import ManagedContainer
+        row = await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )
+        return row.scalar_one_or_none()
+    except Exception:
+        logger.warning("[pool-heal] could not read managed_containers for %s", user_id[:8])
+        return None
+
+
+def _claim_is_fresh(mc) -> bool:
+    """Was this container claimed recently enough that its database is empty?
+
+    UNKNOWN answers FALSE. A lookup that failed, a row with no timestamps, a
+    mock in a test — none of those are evidence that the slot holds nothing,
+    and the cost of guessing wrong is the user's whole account.
+    """
+    ts = getattr(mc, "started_at", None) or getattr(mc, "created_at", None)
+    if not isinstance(ts, datetime):
         return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts) < POOL_CLAIM_FRESH_WINDOW
 
 
 async def _verify_and_heal_pool_claim(
@@ -666,10 +734,61 @@ async def _verify_and_heal_pool_claim(
             "— re-provisioning via slow path (recreate=True)",
             user_id[:8], budget_s,
         )
+        # HEAL THE POOL MEMBER IN PLACE FIRST.
+        #
+        # `provision_container(recreate=True)` binds `toup_agent_<prefix>`,
+        # while a pool member's data lives in the slot's own
+        # `toup_agent_feedNNNN` — so the "reliable slow path" this used to take
+        # unconditionally is also the path that empties an account (R40; see
+        # `docker_host_service.PoolMemberSwapRefused`). A wedged member is
+        # usually just wedged: `/v1/pool/restart-member` restarts the container
+        # and re-applies its bind, keeping the database it already has.
+        from app.services.docker_host_service import provision_container, restart_container
         from app.db.database import async_session_maker
-        from app.services.docker_host_service import provision_container
+
         async with async_session_maker() as heal_db:
-            await provision_container(heal_db, user_id, recreate=True)
+            mc = await _load_container(heal_db, user_id)
+            is_pool = bool(mc and (mc.container_name or "").startswith("toup-agent-pool-"))
+            if is_pool:
+                logger.warning(
+                    "[pool-heal] restarting pool member %s for user=%s in place "
+                    "(a named recreate would bind an empty toup_agent_%s)",
+                    mc.container_name, user_id[:8], user_id[:8],
+                )
+                try:
+                    await restart_container(heal_db, user_id)
+                    await heal_db.commit()
+                except Exception:
+                    logger.exception("[pool-heal] pool restart failed user=%s", user_id[:8])
+                # Give the restart the same budget the claim got, then re-check.
+                deadline2 = asyncio.get_event_loop().time() + budget_s
+                while asyncio.get_event_loop().time() < deadline2:
+                    if await _is_agent_actually_healthy(user_id):
+                        logger.info("[pool-heal] user=%s recovered after an in-place restart",
+                                    user_id[:8])
+                        return
+                    await asyncio.sleep(interval_s)
+
+            # Still unreachable. The named recreate is the last resort, and it
+            # is only safe while the claim is FRESH — at that point the user
+            # has never sent a message and the slot database holds nothing to
+            # strand. An established member reaching here is exactly the
+            # data-loss case, so it is left for an operator instead.
+            if is_pool and not _claim_is_fresh(mc):
+                logger.error(
+                    "[pool-heal] REFUSING the named recreate for user=%s: pool member %s "
+                    "is not a fresh claim, and re-provisioning would bind an empty "
+                    "toup_agent_%s and strand the slot's data. It has been restarted in "
+                    "place; operator action required if it is still unreachable.",
+                    user_id[:8], mc.container_name, user_id[:8],
+                )
+                return
+            # `allow_pool_swap=is_pool`, not a bare True: a NAMED tenant taking
+            # this path never needed the override, and passing it anyway states
+            # an intent the call does not have.
+            await provision_container(
+                heal_db, user_id, recreate=True, allow_pool_swap=is_pool,
+            )
             await heal_db.commit()
         logger.info("[pool-heal] re-provisioned user=%s to a reachable container", user_id[:8])
     except Exception:
