@@ -498,7 +498,13 @@ async def provision_container(
             await db.commit()
         raise RuntimeError(err)
     except httpx.HTTPError as e:
-        err = f"bridge unreachable: {e}"
+        # `str(httpx.ReadTimeout())` is the EMPTY STRING. That is literally how
+        # the 2026-09-06 trail came to read "bridge unreachable: " — twice, for
+        # the two duplicate prewarms — and named neither the class of failure
+        # nor the elapsed budget. `repr` carries both the class and any args;
+        # the same fix already exists at _update_container_env's retry loop and
+        # at backfill_sentinel_image_containers' `type(e).__name__`.
+        err = f"bridge unreachable: {e!r}"
         logger.error(err)
         if existing:
             existing.status = "error"
@@ -894,10 +900,36 @@ async def container_reconciler_loop() -> None:
         return
     logger.info("[container-reconciler] started (tick=%ss)", interval)
     from app.db.database import async_session_maker
+    # Fast stranded sub-tick. The 180 s full scan is UNCHANGED — this only
+    # subdivides the sleep so a signup whose provisioning lost its response is
+    # discovered in ~15 s instead of ~180 s. On 2026-09-06 the bridge finished
+    # the bind at 18:18:11 and this loop reported it at 18:19:12: 61 s of a
+    # working agent that the platform did not know it had, 27 s of which the
+    # user's app was still retrying.
+    fast = int(getattr(settings, "stranded_fast_scan_interval_s", 0) or 0)
+    if fast > 0:
+        fast = max(1, min(fast, interval))
     while True:
         # Sleep first: the boot path already runs one backfill before this
         # loop starts, so an immediate tick would be redundant churn.
-        await asyncio.sleep(interval)
+        if fast > 0:
+            slept = 0
+            while slept < interval:
+                nap = min(fast, interval - slept)
+                await asyncio.sleep(nap)
+                slept += nap
+                if slept >= interval:
+                    break  # the full tick below covers this moment
+                try:
+                    from app.services.pool_service import reclaim_stranded_fast
+                    fs = await reclaim_stranded_fast()
+                    if fs.get("adopted"):
+                        logger.info("[container-reconciler] stranded-fast: %s", fs)
+                except Exception:
+                    # Never let the cheap pass take the durable loop with it.
+                    logger.exception("[container-reconciler] stranded-fast failed")
+        else:
+            await asyncio.sleep(interval)
         try:
             async with async_session_maker() as db:
                 summary = await backfill_sentinel_image_containers(db)

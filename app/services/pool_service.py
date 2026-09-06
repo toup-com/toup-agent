@@ -44,6 +44,39 @@ from app.services.background_tasks import spawn as _spawn_bg
 logger = logging.getLogger(__name__)
 
 
+# Postgres `lock_timeout` fires SQLSTATE 55P03 (lock_not_available). asyncpg
+# raises LockNotAvailableError; SQLAlchemy wraps it in an OperationalError with
+# the original hanging off `.orig`. Match on the sqlstate first — the class
+# names differ across drivers, the sqlstate does not.
+_LOCK_TIMEOUT_SQLSTATE = "55P03"
+
+
+def _is_lock_timeout(exc: BaseException) -> bool:
+    """True only for "somebody else holds this lock", never for a DB failure."""
+    for e in (exc, getattr(exc, "orig", None)):
+        if e is None:
+            continue
+        if getattr(e, "sqlstate", None) == _LOCK_TIMEOUT_SQLSTATE:
+            return True
+        if getattr(e, "pgcode", None) == _LOCK_TIMEOUT_SQLSTATE:
+            return True
+        if "LockNotAvailable" in type(e).__name__:
+            return True
+    return False
+
+
+class ProvisionDriveTaken(Exception):
+    """Another driver (another replica, or another task on this one) already
+    holds this user's claim lock.
+
+    Raised instead of returning None so callers can tell "nobody is doing this,
+    fall back to the slow path" from "somebody is doing this, do NOT start a
+    second one". The 2026-09-06 incident is what the distinction is for: two
+    prewarms 19 ms apart both drove a cold named provision for a user the pool
+    was already binding.
+    """
+
+
 async def _build_bind_payload(
     db: AsyncSession,
     user_id: str,
@@ -209,10 +242,44 @@ async def claim_for_user(
     from app.db.database import get_engine as _get_engine
     if _get_engine().dialect.name == "postgresql":
         from sqlalchemy import text as _text
-        await db.execute(
-            _text("SELECT pg_advisory_xact_lock(hashtext(:k)::bigint)"),
-            {"k": f"pool_claim:{user_id}"},
-        )
+        # BOUNDED. The wait used to be unbounded, so a second replica sat here
+        # for the entire length of the first replica's bridge call — up to 30 s
+        # holding a request worker and a DB connection to learn something it
+        # could have observed instead. `lock_timeout` applies to advisory-lock
+        # acquisition in Postgres, so a loser now raises promptly and we switch
+        # to discovery, which is the answer we actually wanted. 0 restores the
+        # legacy unbounded wait.
+        _wait_s = int(getattr(settings, "pool_claim_lock_wait_s", 0) or 0)
+        try:
+            if _wait_s > 0:
+                await db.execute(_text(f"SET LOCAL lock_timeout = '{_wait_s}s'"))
+            await db.execute(
+                _text("SELECT pg_advisory_xact_lock(hashtext(:k)::bigint)"),
+                {"k": f"pool_claim:{user_id}"},
+            )
+            if _wait_s > 0:
+                # Scope the timeout to the lock, not to the bridge call's own
+                # statements further down this transaction.
+                await db.execute(_text("SET LOCAL lock_timeout = 0"))
+        except Exception as _le:
+            if _wait_s <= 0 or not _is_lock_timeout(_le):
+                # NOT contention. A connection reset, a dead pool, a syntax
+                # error — anything else here must keep its own meaning.
+                # Swallowing it as "somebody else is driving" would make
+                # claim_or_prewarm return True and provision NOBODY, turning a
+                # DB blip into a user with no agent at all.
+                raise
+            await db.rollback()
+            logger.info(
+                "[pool_service] another driver holds the claim lock for %s (%s) "
+                "— observing instead of duplicating",
+                str(user_id)[:8], type(_le).__name__,
+            )
+            signup_trace(user_id, "claim_contended", type(_le).__name__)
+            ensure_discovery(user_id, reason="claim_lock_contended")
+            raise ProvisionDriveTaken(
+                f"claim lock for {str(user_id)[:8]} held by another driver"
+            )
 
     # Existing container check — same idempotency the slow path has. Re-read
     # AFTER the lock so a loser that just blocked sees the winner's freshly
@@ -307,9 +374,23 @@ async def claim_for_user(
             "[pool_service] bridge claim returned %s: %s",
             e.response.status_code, e.response.text[:200],
         )
+        signup_trace(user_id, "claim_timeout", f"http_{e.response.status_code}")
+        # A 5xx can still leave a completed bind behind (the bind and the
+        # response are not the same event), so ask rather than assume.
+        if e.response.status_code >= 500:
+            ensure_discovery(user_id, reason="claim_5xx")
         return None
     except httpx.HTTPError as e:
-        logger.warning("[pool_service] bridge unreachable: %s", e)
+        # `str(httpx.ReadTimeout())` is the EMPTY STRING, which is how the
+        # 2026-09-06 trail came to read "bridge unreachable: " and name
+        # nothing at all. repr() carries the class; `%r` on the exception
+        # would too. Same fix already applied at
+        # docker_host_service._update_container_env's retry loop.
+        logger.warning("[pool_service] bridge unreachable: %r", e)
+        signup_trace(user_id, "claim_timeout", type(e).__name__)
+        # THE FIX. A timed-out claim is not a failed claim: on 2026-09-06 the
+        # bridge finished this exact bind 2 s after we stopped listening.
+        ensure_discovery(user_id, reason="claim_timeout")
         return None
 
     # Bridge response shape: {ok, container_name, host_port, db_pool_slot}
@@ -392,6 +473,10 @@ async def claim_for_user(
         "[pool_service] Claimed %s for user %s (agent_url=%s)",
         container_name, user_id[:8], agent_url,
     )
+    signup_trace(user_id, "claim_ok", f"slot={container_name}")
+    # The registry just changed; a poller reading a 2 s-old cache would
+    # otherwise miss its own success.
+    _invalidate_pool_list_cache()
     return container
 
 
@@ -822,6 +907,17 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
                 # somehow does, the periodic reconciler still covers us.
                 logger.warning("[pool_service] could not spawn pool-heal guard for %s", user_id[:8])
             return True
+    except ProvisionDriveTaken:
+        # Somebody else owns this user's provisioning. Falling through to
+        # schedule_prewarm here would be the 2026-09-06 duplicate: a SECOND
+        # driver taking the cold NAMED path (POST /v1/tenants) for a user the
+        # pool is already binding. Observe instead — claim_for_user has already
+        # started discovery, which adopts whatever the winner produces.
+        logger.info(
+            "[pool_service] provisioning for %s is already being driven — observing",
+            user_id[:8],
+        )
+        return True
     except Exception:
         logger.exception("[pool_service] claim_for_user raised; falling through to prewarm")
         # Critical: roll back the session so the rest of auth.register
@@ -1261,4 +1357,605 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
             )
     except Exception:
         pass
+    return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Late-success discovery (2026-09-06 incident)
+#
+# The claim that "failed" at 18:18:09 had in fact SUCCEEDED at 18:18:11: the
+# bridge finished binding toup-agent-pool-73 two seconds after the platform's
+# flat 30 s httpx timeout fired on both callers. Nothing on the platform asked
+# again. The user's app (build 109) gave up at 18:18:45 and the 180 s
+# container reconciler only noticed at 18:19:12.
+#
+# A timed-out bridge call is not evidence that nothing happened — it is
+# evidence that we do not know. Everything below exists to go and ask,
+# promptly, cheaply, and without ever binding a second slot.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _t_ms(t0: float) -> int:
+    return int((time.monotonic() - t0) * 1000)
+
+
+# user prefix -> monotonic clock at registration (or at first sighting when
+# registration is not in this process's history). Bounded FIFO: this is a log
+# convenience, never a source of truth.
+_TRACE_T0: dict = {}
+_TRACE_T0_MAX = 512
+
+
+def _trace_origin(user_id: str) -> float:
+    key = str(user_id)[:8]
+    t0 = _TRACE_T0.get(key)
+    if t0 is None:
+        if len(_TRACE_T0) >= _TRACE_T0_MAX:
+            # FIFO evict — dicts preserve insertion order.
+            for k in list(_TRACE_T0)[: _TRACE_T0_MAX // 4]:
+                _TRACE_T0.pop(k, None)
+        t0 = time.monotonic()
+        _TRACE_T0[key] = t0
+    return t0
+
+
+def seed_signup_trace(user_id: str) -> None:
+    """Stamp t0 for a user's signup trace. Call from the registration path so
+    every later `elapsed_ms` is measured from registration rather than from
+    whenever this process first heard of them."""
+    key = str(user_id)[:8]
+    _TRACE_T0.pop(key, None)
+    _trace_origin(key)
+
+
+def signup_trace(user_id: str, hop: str, detail: str = "") -> None:
+    """One structured line per provisioning hop, keyed by the user's 8-hex
+    prefix. Deliberately boring: no secrets, no message content, no PII — a
+    prefix, a hop name, an elapsed_ms and a short mechanical detail.
+
+    Hops: registered | prewarm_start | claim_ok | claim_timeout |
+          discovered | adopted | bound | ready
+    (plus a few mechanical ones: prewarm_dedupe, discover_start, discover_give_up,
+     config_sync_deferred).
+    """
+    try:
+        pfx = str(user_id)[:8]
+        logger.info(
+            "[signup-trace] user=%s hop=%s elapsed_ms=%d detail=%s",
+            pfx, hop, _t_ms(_trace_origin(pfx)), (detail or "")[:120],
+        )
+    except Exception:
+        pass
+
+
+# ── The cheap bridge read ────────────────────────────────────────────────
+#
+# `GET /v1/pool/list` is the only route on the DEPLOYED bridge that can answer
+# "which slot is user X bound to" without shelling out to docker: its handler
+# is a plain `def` (FastAPI threadpool, so it cannot block the bridge's event
+# loop) and its body is one members.json read. It answers for every user at
+# once, which is why the result is cached and single-flighted below — twenty
+# concurrent pollers must cost the bridge one call, not twenty.
+#
+# `bridge_pool_whois_route` swaps in a per-user route when one exists.
+
+_POOL_LIST_CACHE: dict = {"ts": -1e9, "data": None}
+_POOL_LIST_LOCK: Optional[asyncio.Lock] = None
+_WHOIS_UNAVAILABLE = False
+
+
+def _pool_list_lock() -> asyncio.Lock:
+    # Created lazily: a module-level asyncio.Lock binds to the loop running at
+    # import time, and this module is imported before the app's loop exists.
+    global _POOL_LIST_LOCK
+    if _POOL_LIST_LOCK is None:
+        _POOL_LIST_LOCK = asyncio.Lock()
+    return _POOL_LIST_LOCK
+
+
+def _invalidate_pool_list_cache() -> None:
+    _POOL_LIST_CACHE["ts"] = -1e9
+    _POOL_LIST_CACHE["data"] = None
+
+
+async def _pool_list(timeout_s: float) -> Optional[dict]:
+    ttl = float(getattr(settings, "provision_discovery_cache_ttl_s", 2.0) or 0)
+    now = time.monotonic()
+    cached = _POOL_LIST_CACHE.get("data")
+    if cached is not None and (now - _POOL_LIST_CACHE["ts"]) < ttl:
+        return cached
+    async with _pool_list_lock():
+        now = time.monotonic()
+        cached = _POOL_LIST_CACHE.get("data")
+        if cached is not None and (now - _POOL_LIST_CACHE["ts"]) < ttl:
+            return cached
+        from app.services.docker_host_service import get_bridge_client
+        client = await get_bridge_client()
+        r = await client.get("/v1/pool/list", timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        _POOL_LIST_CACHE["data"] = data
+        _POOL_LIST_CACHE["ts"] = time.monotonic()
+        return data
+
+
+def _is_adoptable(slot: Optional[dict]) -> bool:
+    """Is this slot a COMPLETED bind we may adopt?
+
+    `ASSIGNED` alone is not enough. The bridge stamps `assigned_user_id` and
+    moves the slot to ASSIGNING/ASSIGNED around the bind, and `/v1/pool/whois`
+    reports `bound` separately for exactly that reason — it is the stronger
+    signal of the two. Adopting an unbound slot publishes an agent_url for a
+    container that cannot answer yet. `/v1/pool/list` carries no `bound` key,
+    so absence means "not contradicted", never "false".
+    """
+    if not slot:
+        return False
+    if slot.get("state") != "ASSIGNED":
+        return False
+    return slot.get("bound") is not False
+
+
+def _whois_to_member(body: dict) -> Optional[dict]:
+    """Translate `GET /v1/pool/whois`'s CLAIM-shaped body into the registry
+    shape `_member_to_slot` reads.
+
+    The two are genuinely different vocabularies and the whois one is NOT a
+    member: `slot` is a string, the ids are `user_id`/`prefix` rather than
+    `assigned_user_id`/`assigned_prefix`, and the port/db/container fields are
+    the claim response's names. A previous version of this adapter guessed
+    (`body.get("member") or body.get("slot") or body`) and picked the string
+    "73", so every whois answer raised AttributeError — a crash reachable only
+    once the route was deployed and this module's own tests were all green.
+    """
+    if not body or body.get("found") is False:
+        return None
+    if not body.get("container_name"):
+        return None
+    return {
+        "slot": body.get("slot"),
+        "container_name": body.get("container_name"),
+        "docker_id": body.get("container_id"),
+        "port": body.get("host_port"),
+        "db_name": body.get("db_pool_slot"),
+        "state": body.get("state"),
+        "assigned_user_id": body.get("user_id"),
+        "assigned_prefix": body.get("prefix"),
+        "bound": body.get("bound"),
+    }
+
+
+def _member_to_slot(m: dict) -> dict:
+    """Normalise one `/v1/pool/list` member into the shape the adopt path
+    wants. Field names mirror bridge/pool_addon.py's members.json writer."""
+    return {
+        "slot": m.get("slot"),
+        "container_name": m.get("container_name"),
+        "container_id": m.get("docker_id"),
+        "host_port": m.get("port"),
+        "db_name": m.get("db_name"),
+        "state": str(m.get("state") or "").upper(),
+        "prefix": m.get("assigned_prefix"),
+        # Only /v1/pool/whois reports this; a registry member carries no such
+        # key and must therefore read None, not False. See `_is_adoptable`.
+        "bound": m.get("bound"),
+    }
+
+
+async def bridge_lookup_user_slot(
+    user_id: str, *, timeout_s: Optional[float] = None,
+) -> Optional[dict]:
+    """ADAPTER. The one place the bridge read is chosen — swap the endpoint
+    here, nowhere else.
+
+    Returns a normalised slot dict (see `_member_to_slot`) or None when the
+    bridge does not know this user. Raises on transport failure so callers can
+    tell "the bridge says no" from "the bridge did not answer": those have
+    different meanings and only the first one is an answer.
+    """
+    if timeout_s is None:
+        timeout_s = float(getattr(settings, "provision_discovery_read_timeout_s", 8) or 8)
+    global _WHOIS_UNAVAILABLE
+    route = (getattr(settings, "bridge_pool_whois_route", "") or "").strip()
+    if route and not _WHOIS_UNAVAILABLE:
+        try:
+            from app.services.docker_host_service import get_bridge_client
+            client = await get_bridge_client()
+            r = await client.get(
+                route, params={"user_id": str(user_id)}, timeout=timeout_s,
+            )
+            if r.status_code in (404, 405, 501):
+                # Configured but not deployed. Degrade once, not every poll.
+                _WHOIS_UNAVAILABLE = True
+            else:
+                r.raise_for_status()
+                m = _whois_to_member(r.json() or {})
+                if m is None:
+                    # The bridge ANSWERED "no bind for this user". That is an
+                    # answer, not a failure — do not fall through to the list.
+                    return None
+                return _member_to_slot(m)
+        except httpx.HTTPStatusError:
+            raise
+        except httpx.HTTPError:
+            raise
+
+    data = await _pool_list(timeout_s)
+    if not data:
+        return None
+    uid = str(user_id)
+    for m in (data.get("members") or []):
+        if str(m.get("assigned_user_id") or "") == uid:
+            return _member_to_slot(m)
+    return None
+
+
+# ── Adoption ─────────────────────────────────────────────────────────────
+
+async def _bound_agent_url(db: AsyncSession, user_id: str) -> Optional[str]:
+    """The user's agent_url IFF the platform's own row set is already
+    consistent: a running container AND a config carrying both the url and the
+    key. Anything less is not "bound" — a row without the key is the shape that
+    401s every chat, which is what makes a partial adopt worse than none."""
+    try:
+        mc = (await db.execute(
+            select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+        )).scalar_one_or_none()
+        if not mc or mc.status != "running":
+            return None
+        cfg = (await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == user_id)
+        )).scalar_one_or_none()
+        if not cfg or not cfg.agent_url or not cfg.agent_api_key:
+            return None
+        return cfg.agent_url
+    except Exception:
+        return None
+
+
+def _is_named_container(name: Optional[str]) -> bool:
+    n = name or ""
+    return n.startswith("toup-agent-") and not n.startswith("toup-agent-pool-")
+
+
+async def _adopt_discovered_bind(user_id: str, slot: dict) -> Optional[str]:
+    """Adopt a bind the bridge has confirmed, through the SAME path
+    `[pool-reclaim] healed stranded` uses: `claim_for_user`.
+
+    Going through claim_for_user rather than writing the row from `slot` is not
+    ceremony. `_build_bind_payload` mints `agent_api_key` with a compare-and-set
+    and the claim that timed out never committed it — the bridge pushed key K to
+    the agent while the platform kept NULL. A DB-only adopt would therefore
+    produce a row that looks healthy and 401s on the first chat message. The
+    bridge's per-user idempotent claim re-pushes the bind, so platform and agent
+    end up holding the same key.
+
+    Returns the agent_url on success, None otherwise. Never raises.
+    """
+    from app.db.database import async_session_maker
+    try:
+        async with async_session_maker() as db:
+            already = await _bound_agent_url(db, user_id)
+            if already:
+                return already
+
+            mc = (await db.execute(
+                select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+            )).scalar_one_or_none()
+
+            # NEVER move a named tenant onto a pool slot on the strength of a
+            # registry read. The named tenant's database is toup_agent_<prefix>
+            # and the pool slot's is the slot's own — re-homing is data loss
+            # (see provision_container's PoolMemberSwapRefused for the mirror
+            # image of this refusal). An operator owns that migration.
+            if mc is not None and _is_named_container(mc.container_name) and (
+                slot.get("container_name") != mc.container_name
+            ):
+                logger.error(
+                    "[discovery] user=%s bridge reports pool slot %s while the "
+                    "platform row names %s. NOT adopting — a named tenant's data "
+                    "lives in its own database. Reconcile by hand.",
+                    str(user_id)[:8], slot.get("container_name"), mc.container_name,
+                )
+                return None
+
+            # A row wedged at 'provisioning' short-circuits every future
+            # claim_for_user (its existing-row check returns it untouched), and
+            # reclaim only unsticks it after 15 minutes. The bridge saying
+            # ASSIGNED is proof the provisioning it describes is over, so the
+            # unstick here is evidence-gated rather than clock-gated.
+            if mc is not None and mc.status == "provisioning":
+                mc.status = "error"
+                mc.error_message = "[discovery] unstuck: bridge reports ASSIGNED"
+                await db.commit()
+
+            try:
+                c = await claim_for_user(db, user_id)
+            except ProvisionDriveTaken:
+                # The winner is mid-bind. Its own commit is the adoption; the
+                # next discovery tick will see the converged rows. Racing it
+                # here is exactly the second assignment we must not create.
+                return None
+            if c is None:
+                return None
+            cfg = (await db.execute(
+                select(AgentConfig).where(AgentConfig.user_id == user_id)
+            )).scalar_one_or_none()
+            return cfg.agent_url if cfg else None
+    except Exception:
+        logger.exception("[discovery] adopt failed for user=%s", str(user_id)[:8])
+        return None
+
+
+# Per-replica dedupe of discovery loops. Cross-replica duplicates are harmless:
+# every adopt funnels through claim_for_user's per-user advisory lock and the
+# bridge's own per-user idempotent claim, so the second one is a no-op.
+_DISCOVERY_INFLIGHT: set = set()
+
+
+def ensure_discovery(user_id: str, *, reason: str = "") -> None:
+    """Start the bounded discovery loop for `user_id` unless one is already
+    running in this process. Safe to call from anywhere, including from an
+    exception handler. Never raises, never blocks."""
+    if not getattr(settings, "provision_discovery_enabled", True):
+        return
+    uid = str(user_id)
+    if uid in _DISCOVERY_INFLIGHT:
+        return
+    try:
+        _DISCOVERY_INFLIGHT.add(uid)
+        _spawn_bg(
+            discover_and_adopt_bind(uid, reason=reason),
+            name=f"discover:{uid[:8]}",
+        )
+    except Exception:
+        _DISCOVERY_INFLIGHT.discard(uid)
+        logger.warning("[discovery] could not start loop for %s", uid[:8])
+
+
+async def discover_and_adopt_bind(
+    user_id: str,
+    *,
+    reason: str = "",
+    budget_s: Optional[float] = None,
+    interval_s: Optional[float] = None,
+) -> Optional[str]:
+    """Poll the bridge for a bind that completed after we stopped listening,
+    and adopt it. Bounded; the 180 s reconciler remains the backstop.
+
+    Returns the agent_url once the platform's rows are consistent, else None.
+    """
+    uid = str(user_id)
+    if budget_s is None:
+        budget_s = float(getattr(settings, "provision_discovery_max_s", 120) or 120)
+    if interval_s is None:
+        interval_s = float(getattr(settings, "provision_discovery_interval_s", 5) or 5)
+    read_timeout = float(getattr(settings, "provision_discovery_read_timeout_s", 8) or 8)
+    from app.db.database import async_session_maker
+    started = time.monotonic()
+    signup_trace(uid, "discover_start", f"reason={reason} budget_s={int(budget_s)}")
+    try:
+        while (time.monotonic() - started) < budget_s:
+            # Someone else (the reconciler, another replica, the original
+            # claim finishing late) may have converged already.
+            try:
+                async with async_session_maker() as db:
+                    url = await _bound_agent_url(db, uid)
+                if url:
+                    signup_trace(uid, "bound", "already_converged")
+                    return url
+            except Exception:
+                logger.warning("[discovery] DB check failed for %s", uid[:8])
+
+            slot = None
+            try:
+                slot = await bridge_lookup_user_slot(uid, timeout_s=read_timeout)
+            except Exception as e:
+                # The bridge did not answer. That is not "no bind" — keep asking.
+                logger.info(
+                    "[discovery] user=%s lookup failed (%s) — will retry",
+                    uid[:8], type(e).__name__,
+                )
+
+            if _is_adoptable(slot):
+                # ASSIGNED only. `assigned_user_id` is stamped at ASSIGNING,
+                # i.e. BEFORE the agent has been bound, so adopting on that
+                # state would publish an agent_url for a container that cannot
+                # yet answer.
+                signup_trace(uid, "discovered", f"slot={slot.get('container_name')}")
+                url = await _adopt_discovered_bind(uid, slot)
+                if url:
+                    signup_trace(uid, "adopted", f"slot={slot.get('container_name')}")
+                    return url
+                # Adopt refused or failed — the next tick re-reads the truth.
+                _invalidate_pool_list_cache()
+
+            await asyncio.sleep(interval_s)
+    finally:
+        _DISCOVERY_INFLIGHT.discard(uid)
+    signup_trace(uid, "discover_give_up", f"after_s={int(time.monotonic() - started)}")
+    return None
+
+
+async def try_adopt_stranded(db: AsyncSession, user_id: str) -> Optional[str]:
+    """ONE bounded discovery attempt. Returns the user's agent_url if the
+    platform now holds a consistent bind for them, else None.
+
+    CONTRACT (Lane D / ws_chat_proxy may import this defensively):
+
+    * **Bounded.** Total wall clock is capped by
+      `settings.provision_adopt_budget_s` (default 3 s). If the work overruns
+      it is NOT cancelled — it keeps running in the background and this call
+      answers None. Cancelling mid-adopt would abort a DB commit or a bridge
+      bind, which is worse than answering "not yet".
+    * **Cheap in the common case.** The first thing it does is a pure-DB read;
+      if the rows are already consistent it returns the url with zero bridge
+      traffic. The bridge read it may then do is docker-free and shared with
+      every other caller within a ~2 s window.
+    * **Safe to call while a client is waiting**, and safe to call repeatedly:
+      adoption funnels through `claim_for_user`'s per-user Postgres advisory
+      lock and the bridge's per-user idempotent claim, so N concurrent calls
+      produce at most one bind and exactly one managed_containers row.
+    * **Never raises.** Every failure is None.
+    * `db` is used only for the initial read. All writes happen on a private
+      session so this can never commit or poison the caller's transaction.
+    * Returns None when discovery is disabled
+      (`settings.provision_discovery_enabled=False`).
+    """
+    if not getattr(settings, "provision_discovery_enabled", True):
+        return None
+    uid = str(user_id)
+    try:
+        url = await _bound_agent_url(db, uid)
+        if url:
+            return url
+    except Exception:
+        pass
+
+    budget = float(getattr(settings, "provision_adopt_budget_s", 3.0) or 3.0)
+    read_timeout = min(budget, float(
+        getattr(settings, "provision_discovery_read_timeout_s", 8) or 8
+    ))
+
+    async def _once() -> Optional[str]:
+        slot = await bridge_lookup_user_slot(uid, timeout_s=read_timeout)
+        if not _is_adoptable(slot):
+            return None
+        signup_trace(uid, "discovered", "via=try_adopt_stranded")
+        url = await _adopt_discovered_bind(uid, slot)
+        if url:
+            signup_trace(uid, "adopted", "via=try_adopt_stranded")
+        return url
+
+    task = _spawn_bg(_once(), name=f"adopt-once:{uid[:8]}")
+    done, _pending = await asyncio.wait({task}, timeout=budget)
+    if task in done:
+        try:
+            return task.result()
+        except Exception:
+            return None
+    # Overran the budget. Leave it running — it holds the only in-flight
+    # adopt for this user and cancelling it mid-write is the one genuinely
+    # dangerous option.
+    return None
+
+
+# ── Cross-replica dedupe ─────────────────────────────────────────────────
+
+async def try_take_provision_drive(db: AsyncSession, user_id: str) -> bool:
+    """Non-blocking, cross-replica "am I the one driving provisioning for this
+    user?" Returns True iff this transaction now owns the drive.
+
+    A Postgres transaction-scoped advisory lock, which is the right primitive
+    here for three reasons: it is visible to every replica (unlike the
+    in-process `_ENV_PUSH_LOCKS`), it needs no schema and no TTL bookkeeping
+    because it dies with its transaction, and a replica that crashes or is
+    redeployed mid-bridge-call releases it automatically — so "retry after a
+    lost response" is safe by construction rather than by a timeout guess.
+
+    The caller MUST keep this session's transaction open for the duration of
+    the work it guards; on commit or rollback the lock is released.
+
+    Non-Postgres engines (the sqlite test paths) always answer True — there is
+    only one process there, so there is nothing to dedupe.
+    """
+    try:
+        from app.db.database import get_engine as _get_engine
+        if _get_engine().dialect.name != "postgresql":
+            return True
+        from sqlalchemy import text as _text
+        got = (await db.execute(
+            _text("SELECT pg_try_advisory_xact_lock(hashtext(:k)::bigint)"),
+            {"k": f"provision_drive:{user_id}"},
+        )).scalar()
+        return bool(got)
+    except Exception:
+        # A lock we cannot take is not a reason to skip provisioning. Fail
+        # OPEN: a duplicate drive is idempotent, a skipped one is a dead agent.
+        logger.warning(
+            "[provision-drive] advisory lock check failed for %s — proceeding",
+            str(user_id)[:8],
+        )
+        return True
+
+
+# ── The fast stranded pass ───────────────────────────────────────────────
+
+async def _recently_stranded_user_ids(db: AsyncSession, limit: int = 10) -> list:
+    """Users who signed up in the last `stranded_fast_window_min` minutes and
+    still have no running container. Deliberately much narrower than
+    `_stranded_user_ids`: this runs every 15 s, so it must be a handful of rows
+    and it must find nothing in the steady state (in which case the pass costs
+    one indexed query and ZERO bridge calls)."""
+    from datetime import timedelta as _td
+    from sqlalchemy import and_, or_
+    from app.db.models import User
+
+    cutoff = datetime.utcnow() - _td(
+        minutes=int(getattr(settings, "stranded_fast_window_min", 30) or 30)
+    )
+    rows = await db.execute(
+        select(User.id)
+        .outerjoin(AgentConfig, AgentConfig.user_id == User.id)
+        .outerjoin(ManagedContainer, ManagedContainer.user_id == User.id)
+        .where(
+            User.is_active == True,  # noqa: E712
+            User.created_at >= cutoff,
+            AgentConfig.hosting_mode == "managed",
+            or_(
+                ManagedContainer.id.is_(None),
+                ManagedContainer.status != "running",
+            ),
+        )
+        .order_by(User.created_at.desc())
+        .limit(limit)
+    )
+    return [str(uid) for uid in rows.scalars().all()]
+
+
+async def reclaim_stranded_fast() -> dict:
+    """15 s sub-tick of the container reconciler: for RECENT signups only, ask
+    the bridge whether a bind already exists and adopt it.
+
+    This is not a second reconciliation system — every adopt goes through
+    `claim_for_user`, exactly as `reclaim_stranded_users` does, so the two
+    racing produces one bind and one row. What it changes is latency: on
+    2026-09-06 the truth existed at 18:18:11 and the 180 s scan reported it at
+    18:19:12. Never raises.
+    """
+    summary: dict = {"candidates": 0, "adopted": 0}
+    if not getattr(settings, "provision_discovery_enabled", True):
+        return {"skipped": "discovery_disabled"}
+    if not getattr(settings, "use_container_pool", False):
+        return {"skipped": "pool_disabled"}
+    try:
+        from app.db.database import async_session_maker
+        async with async_session_maker() as db:
+            candidates = await _recently_stranded_user_ids(db)
+        summary["candidates"] = len(candidates)
+        if not candidates:
+            return summary
+        read_timeout = float(
+            getattr(settings, "provision_discovery_read_timeout_s", 8) or 8
+        )
+        for uid in candidates:
+            try:
+                slot = await bridge_lookup_user_slot(uid, timeout_s=read_timeout)
+            except Exception as e:
+                logger.info(
+                    "[stranded-fast] lookup failed (%s) — 180s scan still covers it",
+                    type(e).__name__,
+                )
+                break  # bridge is not answering; do not hammer it per user
+            if _is_adoptable(slot):
+                signup_trace(uid, "discovered", "via=stranded_fast")
+                if await _adopt_discovered_bind(uid, slot):
+                    summary["adopted"] += 1
+                    signup_trace(uid, "adopted", "via=stranded_fast")
+                    logger.warning(
+                        "[stranded-fast] adopted late bind user=%s -> %s",
+                        uid[:8], slot.get("container_name"),
+                    )
+    except Exception:
+        logger.exception("[stranded-fast] pass failed")
     return summary

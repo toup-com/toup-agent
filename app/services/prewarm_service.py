@@ -157,6 +157,11 @@ async def schedule_prewarm(user_id: str) -> PrewarmStatus:
         "[PREWARM-START] user=%s ts=%s",
         str(user_id)[:8], _iso_now(),
     )
+    try:
+        from app.services.pool_service import signup_trace
+        signup_trace(user_id, "prewarm_start", "scheduled")
+    except Exception:
+        pass
     return "queued"
 
 
@@ -171,8 +176,46 @@ async def _run_prewarm(user_id: str) -> None:
     until `boot_progress.ready=true`, then emits `[BOOT-READY]`. The
     aggregator pairs this with the prior `[PREWARM-START]` (boot
     duration) and the later `[WAKE-CLICK]` (user-visible gap)."""
+    from app.services import pool_service as _pool
     try:
         async with async_session_maker() as db:
+            # ── Cross-replica dedupe (2026-09-06) ────────────────────────
+            # BOTH platform replicas started a prewarm for the same user 19 ms
+            # apart (18:17:39.262 / .281) and both drove a full cold
+            # `provision_container` — POST /v1/tenants, the NAMED path — for a
+            # user the pool was already binding. Nothing serialised them:
+            # schedule_prewarm's status check is a read on one replica's
+            # snapshot, and `_ENV_PUSH_LOCKS` is in-process.
+            #
+            # A transaction-scoped Postgres advisory lock is the smallest thing
+            # that is actually cross-replica. The loser does not queue behind
+            # the winner (that was the old cost of the blocking lock in
+            # claim_for_user) — it observes, and discovery adopts whatever the
+            # winner produces. The lock is held for as long as THIS session's
+            # transaction, which spans the bridge call below, and dies with the
+            # connection if this replica is redeployed mid-flight, so a retry
+            # after a lost response is safe by construction.
+            #
+            # SCOPE, precisely — an xact lock lives until the next COMMIT on
+            # THIS session, and `provision_container` commits once
+            # (`existing.status = 'provisioning'`) before its bridge call. That
+            # commit is reachable only when a managed_containers row already
+            # exists, and in that case `provision_container` early-returns on
+            # `status in ('running','provisioning')` and never calls the bridge
+            # at all — `schedule_prewarm` has already stamped 'provisioning'
+            # above. So on the one path that does reach the bridge (no row —
+            # the fresh signup, which is the 2026-09-06 case) the lock is held
+            # across the whole call. Do not insert a commit between here and
+            # provision_container: it would silently reduce this to a no-op.
+            if not await _pool.try_take_provision_drive(db, user_id):
+                _pool.signup_trace(user_id, "prewarm_dedupe", "another_driver")
+                logger.info(
+                    "[PREWARM] user=%s another driver owns provisioning — observing",
+                    str(user_id)[:8],
+                )
+                _pool.ensure_discovery(user_id, reason="prewarm_dedupe")
+                return
+
             agent_config = (
                 await db.execute(
                     select(AgentConfig).where(AgentConfig.user_id == user_id)
@@ -189,14 +232,22 @@ async def _run_prewarm(user_id: str) -> None:
             await db.refresh(agent_config)
             agent_url = agent_config.agent_url
             agent_api_key = agent_config.agent_api_key
+        _pool.signup_trace(user_id, "bound", "via=prewarm")
         # Poll /agent/health for boot_ready outside the session — keeps
         # the DB connection idle while we wait on network I/O.
         await _await_boot_ready(user_id, agent_url, agent_api_key)
     except Exception as e:
+        # `%s` on an httpx timeout is the EMPTY STRING — that is how the
+        # 2026-09-06 trail came to read "task failed: bridge unreachable: "
+        # and name nothing. `%r` carries the class.
         logger.error(
-            "[PREWARM] user=%s task failed: %s",
+            "[PREWARM] user=%s task failed: %r",
             str(user_id)[:8], e, exc_info=True,
         )
+        _pool.signup_trace(user_id, "claim_timeout", f"prewarm:{type(e).__name__}")
+        # A provisioning call that lost its response is not a provisioning call
+        # that did nothing. Go and ask.
+        _pool.ensure_discovery(user_id, reason="prewarm_failed")
 
 
 async def _await_boot_ready(
@@ -235,6 +286,11 @@ async def _await_boot_ready(
                             str(user_id)[:8], _iso_now(),
                             boot.get("phase", "ready"),
                         )
+                        try:
+                            from app.services.pool_service import signup_trace
+                            signup_trace(user_id, "ready", boot.get("phase", "ready"))
+                        except Exception:
+                            pass
                         return
         except Exception:
             # Container still starting / Caddy route still propagating.

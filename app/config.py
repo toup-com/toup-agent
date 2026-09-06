@@ -2194,6 +2194,70 @@ class Settings(BaseSettings):
     # and burning a convergence-sweep slot (canary 533354ce, 2026-07-29).
     bridge_upgrade_timeout_s: int = 330
 
+    # ── Late-success discovery for provisioning (2026-09-06 incident) ──
+    # The bridge's pool bind can outlive the platform's flat
+    # `bridge_request_timeout_s`: on 2026-09-06 the bind completed at
+    # 18:18:11 while both platform callers had already raised ReadTimeout
+    # at 18:18:09, and the only thing that noticed was the 180 s container
+    # reconciler at 18:19:12 — 61 s after the truth existed and 27 s after
+    # the user's app had stopped retrying. A timed-out claim is therefore
+    # NOT evidence that no bind happened; it is evidence that we do not yet
+    # know. These knobs drive the bounded poll that goes and asks.
+    provision_discovery_enabled: bool = True
+    # How often the discovery loop asks the bridge "which slot is user X on".
+    provision_discovery_interval_s: int = 5
+    # Total wall-clock budget for one discovery loop. Beyond this the 180 s
+    # reconciler is the backstop again. 120 s comfortably covers the bridge's
+    # worst-case bind (3×10 s + 2×3 s = 36 s) plus a saturated event loop.
+    provision_discovery_max_s: int = 120
+    # Per-read timeout for the cheap bridge lookup. Shorter than
+    # bridge_request_timeout_s — a read that cannot answer in this long is not
+    # worth waiting for when we will ask again in 5 s — but NOT as short as it
+    # wants to be: /v1/pool/list was measured at 10.2 s and /v1/health at 9 s
+    # under 2026-09-06's load, so a tighter bound would time out on every poll
+    # and silently degrade discovery back to the 180 s reconciler.
+    provision_discovery_read_timeout_s: int = 15
+    # The bridge lookup answers for EVERY user in one response, so concurrent
+    # pollers share one call within this window instead of stampeding a bridge
+    # whose event loop is already blocked by docker work.
+    provision_discovery_cache_ttl_s: float = 2.0
+    # Budget for `pool_service.try_adopt_stranded` — the one-shot hook the WS
+    # proxy may call while a client is waiting. It must never become the thing
+    # the user is waiting on, so the adopt continues in the background when it
+    # overruns and the hook answers None.
+    provision_adopt_budget_s: float = 3.0
+    # The bridge read used by the discovery adapter. Empty = derive the answer
+    # from `GET /v1/pool/list` (docker-free, present on the deployed bridge
+    # today, one members.json read). Set to e.g. "/v1/pool/whois" once a
+    # cheaper per-user route exists; the adapter falls back to the list route
+    # if that route answers 404/405, and remembers not to ask again — so this
+    # default is safe against a bridge that has not deployed the route yet.
+    bridge_pool_whois_route: str = "/v1/pool/whois"
+    # Sub-tick of container_reconciler_loop: a narrow "recently stranded"
+    # pass so a user whose provisioning lost its response is discovered in
+    # ~15 s instead of ~180 s. The full 180 s scan is unchanged.
+    stranded_fast_scan_interval_s: int = 15
+    # How far back the fast pass looks. Long enough to cover a signup whose
+    # every provisioning attempt failed, short enough that the query stays a
+    # handful of rows.
+    stranded_fast_window_min: int = 30
+    # Bounded wait for the per-user `pool_claim:` advisory lock. A second
+    # replica used to BLOCK here for the full length of the first replica's
+    # bridge call; now it gives up quickly and switches to observing. 0 keeps
+    # the legacy unbounded wait.
+    pool_claim_lock_wait_s: int = 5
+    # PUT /api/agent-setup/config: total budget for the bridge-side env sync.
+    # The installed client (build 109) aborts every REST call at 15 s, so a
+    # save that blocks on `bridge_request_timeout_s` is a guaranteed
+    # "Could not save — the server took too long" for a write that had
+    # already been committed. Beyond this budget the sync is handed to a
+    # background retry and the response says `sync_deferred: true`.
+    agent_setup_sync_timeout_s: int = 8
+    # Same reasoning for the fail-closed identity write-through (agent_name /
+    # agent_color must reach the tenant). Still fail-closed — it just fails
+    # inside the client's budget instead of outside it.
+    agent_setup_identity_sync_budget_s: float = 10.0
+
     # ── Audio stream proxy (Phase 1, /api/media/{id}/audio_stream) ─
     # Per-tenant concurrent stream cap, enforced PER-REPLICA via an
     # in-process semaphore. Effective global cap is N × replicas until
