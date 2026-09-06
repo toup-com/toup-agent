@@ -1116,6 +1116,63 @@ class Settings(BaseSettings):
     # log line `[PERF] ws_proxy_agent_wait_ms=…` fires regardless of
     # the flag so we can see real-world wait distributions.
     agent_ws_proxy_fast_fail: bool = False
+    # ── FAST_FAIL warm-up hold (2026-09-06 incident) ───────────────
+    # The warning above came true. AGENT_WS_PROXY_FAST_FAIL was flipped ON
+    # in production without resizing anything, and `retry_after_ms` is not
+    # a hint: BOTH clients use it INSTEAD of their own exponential ladder
+    # (mobile `_agentStartingRetryMs ?? Math.min(WARMUP_BASE_MS * 2 **
+    # attempt, WARMUP_MAX_MS)`), so one integer x the client's attempt cap
+    # IS the client's whole warm-up budget. At 2000 x 15 that is ~34 s,
+    # measured on the wire at 34.66 s for the incident user, against a
+    # p90 first-claim latency of 41.7 s and a p95 of 92.3 s.
+    #
+    # Raising retry_after_ms alone cannot fix it, because build 109 clamps
+    # it: `Math.max(500, Math.min(base, 10000))`. 15 attempts x 10 s is a
+    # 146 s ceiling, and the incident agent was ready at T+74 s only
+    # because the reconciler happened to be quick — the same claim path
+    # has produced 367 s. So the server has to buy time itself: it HOLDS
+    # the accepted socket and polls readiness before answering.
+    #
+    # `agent_ws_proxy_hold_ms` is bounded by a CLIENT constant, not by
+    # taste. build 109's `TURN_SILENT_GRACE_MS = 12_000` arms a one-shot
+    # timer immediately before `ws.send(frame)`: if no turn-bearing frame
+    # arrives within 12 s, the attempt is torn down, and the SECOND such
+    # strike in one send raises a terminal "Connection lost — no reply
+    # arrived" after two attempts (`silentStrikes` is not reset between
+    # attempts). A hold >= 12 s therefore turns today's 34 s of retrying
+    # into ~25 s and a hard error — strictly worse. 9000 leaves 3 s of
+    # margin for RTT and JS-thread scheduling. Do NOT raise this above
+    # ~10 s without shipping a client that re-arms that grace.
+    agent_ws_proxy_hold_ms: int = 9000
+    # Readiness poll cadence inside the hold. Each poll is one indexed
+    # SELECT on agent_configs (`_get_agent_ws_info`), so at the default
+    # cap this is <= 200 queries/s worst case; 1000 ms keeps that well
+    # under the platform's normal query rate while costing at most 1 s of
+    # extra latency once the agent appears.
+    agent_ws_proxy_hold_poll_ms: int = 1000
+    # Bounded concurrency. A held socket costs one task + one semaphore
+    # slot; beyond the cap the proxy degrades to the pre-existing
+    # immediate fast-fail rather than queueing (queueing would make a
+    # thundering herd wait behind itself and blow the client's 12 s
+    # grace). Per replica.
+    agent_ws_proxy_hold_max_concurrent: int = 200
+    # Total warm-up coverage this proxy tries to buy the client, from
+    # which retry_after_ms is DERIVED (see _compute_retry_after_ms):
+    #   total ~= attempts * hold_ms + (attempts - 1) * retry_after_ms
+    # With hold 9000, attempts 15 and the client's own 10 000 ms clamp the
+    # achievable maximum is ~281 s; the target is expressed as 300 s so
+    # the computation saturates at the clamp and any future raise of
+    # hold_ms automatically spends less on retry_after_ms.
+    agent_ws_proxy_target_coverage_ms: int = 300_000
+    # build 109 `MAX_WARMUP_ATTEMPTS = 15` (web's ladder is 20). The
+    # smaller number is the one to size against.
+    agent_ws_proxy_client_attempts: int = 15
+    # build 109 clamps retry_after_ms to [500, 10000]; sending more is
+    # silently discarded, so this is the useful ceiling.
+    agent_ws_proxy_retry_after_max_ms: int = 10_000
+    # Ask pool_service to adopt a user stranded with no agent_url at all,
+    # once per held connection. Defensive import — the hook may not exist.
+    agent_ws_proxy_hold_adopts_stranded: bool = True
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"

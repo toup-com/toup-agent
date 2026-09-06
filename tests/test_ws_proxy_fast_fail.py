@@ -9,11 +9,21 @@ This ticket introduces:
     of the flag — so we can see real-world distributions).
   * `agent_ws_proxy_fast_fail` flag (default OFF). When ON, returns
     WS close code 4503 "agent_starting" + a JSON
-    `{type: agent_starting, retry_after_ms: 2000}` frame so the
+    `{type: agent_starting, retry_after_ms: N}` frame so the
     frontend can render "Waking…" and retry.
   * Default behavior preserved (6×5s retry) until the frontend ships
     the 4503 handler — flipping the flag without that work would just
     turn a 30-s spinner into a hard error.
+
+2026-09-06 — the flag WAS flipped on in production and nothing was
+resized. `retry_after_ms` is consumed by both clients as an OVERRIDE of
+their own exponential ladder, so 2000 x 15 attempts was the entire mobile
+warm-up budget: ~34 s, measured on the wire, against a p90 first-claim
+latency of 41.7 s. Every test in this file was green throughout, because
+every test in this file asserts source strings. The behavioural coverage
+now lives in tests/test_ws_proxy_warmup_harness.py, which ports the
+build-109 client and drives it against this handler. The four tests added
+at the bottom here are the structural invariants that harness cannot see.
 """
 
 from __future__ import annotations
@@ -94,3 +104,50 @@ def test_no_blocking_sleep_in_fast_fail_path():
     assert "_attempts_used = 1" in branch
     # And specifically: no asyncio.sleep inside the fast-fail body.
     assert "asyncio.sleep" not in branch
+
+
+# ── 2026-09-06 incident: the warm-up hold ─────────────────────────────
+# Structural invariants only. Anything behavioural belongs in
+# tests/test_ws_proxy_warmup_harness.py, which runs the real handler.
+
+def test_retry_after_ms_is_never_a_literal_again():
+    """The integer that caused the incident must not come back as a
+    literal. It is DERIVED from the coverage target and the hold, so the
+    two halves of one budget cannot drift apart again."""
+    src = _ws_proxy_src()
+    assert '"retry_after_ms": _compute_retry_after_ms()' in src
+    assert '"retry_after_ms": 2000' not in src
+    assert '"retry_after_ms": 6000' not in src
+
+
+def test_hold_lives_inside_the_fast_fail_branch():
+    """FAST_FAIL=false must keep its original 6x5 s poll and 4404 close
+    with no hold anywhere near it — the hold exists only to replace the
+    13 ms answer the flag introduced."""
+    src = _ws_proxy_src()
+    assert "if not agent_info and _ws_settings.agent_ws_proxy_fast_fail:" in src
+    # ...and the legacy branch is still the one that answers when the flag
+    # is off (the 6x5 s loop assertions above already pin the loop itself).
+    assert "code=4404" in src
+
+
+def test_hold_default_stays_under_the_client_silent_grace():
+    """build 109 (and origin/main, byte-identical here) arm
+    TURN_SILENT_GRACE_MS = 12_000 just before ws.send(). A hold at or above
+    that produces a terminal "Connection lost" after two attempts — worse
+    than shipping nothing. 10 000 is the absolute ceiling and 9000 is the
+    shipped value; this test is the tripwire on someone "just" raising it."""
+    from app.config import Settings
+    default = Settings.model_fields["agent_ws_proxy_hold_ms"].default
+    assert 0 < default <= 10_000, default
+    assert default < 12_000
+
+
+def test_hold_is_bounded_and_degrades_rather_than_queues():
+    """A held socket costs a slot; past the cap the proxy must fall back to
+    the immediate fast-fail (today's behaviour), never queue."""
+    src = _ws_proxy_src()
+    assert "_get_hold_sem()" in src
+    assert "if not _hold_sem_obj.locked():" in src
+    from app.config import Settings
+    assert Settings.model_fields["agent_ws_proxy_hold_max_concurrent"].default > 0
