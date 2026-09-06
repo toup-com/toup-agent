@@ -8,6 +8,7 @@ PUT  /api/soul/sync  → agent-side endpoint to receive soul sync from platform
 
 import asyncio
 import logging
+import uuid
 import time as _time
 from datetime import datetime, timezone
 from typing import Optional
@@ -16,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.db import get_db
 from app.db.models import Identity, User, AgentConfig
@@ -144,33 +146,54 @@ async def _save_soul_impl(
     config_dict = req.model_dump()
     compiled_text = compile_soul(config_dict)
 
-    # Upsert SoulConfig
+    # Upsert SoulConfig — a REAL upsert, not read-modify-write.
+    #
+    # The old shape was SELECT -> branch -> db.add(), with the commit ~160 lines
+    # and one 12s VPS-sync deadline further down. Two concurrent first-time
+    # saves for the same user therefore BOTH missed the SELECT and BOTH emitted
+    # an INSERT; `ix_soul_configs_user_id` is unique, so the loser died at that
+    # far-away `await db.commit()` with a UniqueViolationError and returned 500
+    # for a save that had in fact succeeded. Seen in production 2026-09-06, when
+    # a new user's onboarding Continue tap and Wake tap overlapped because the
+    # first save took 7.9s.
+    #
+    # ON CONFLICT makes the write atomic in one statement. Two alternatives were
+    # tried against real Postgres and BOTH fail, so do not "simplify" back to
+    # them: wrapping the flush in `db.begin_nested()` still leaves the session in
+    # PendingRollbackError at the outer commit, and expunging the failed instance
+    # raises InvalidRequestError because the savepoint already evicted it.
+    # See backend/tests/test_soul_upsert_race.py.
+    _now = datetime.utcnow()
+    _mutable = {
+        "name": req.name,
+        "color": req.color,
+        "pronouns": req.pronouns,
+        "style": req.style,
+        "traits": req.traits,
+        "custom_instructions": req.custom_instructions,
+        "compiled_text": compiled_text,
+        "updated_at": _now,
+    }
+    _stmt = pg_insert(SoulConfig.__table__).values(
+        id=str(uuid.uuid4()),
+        user_id=current_user.id,
+        created_at=_now,
+        **_mutable,
+    )
+    # `id` and `created_at` are deliberately NOT in the update set: a second
+    # save must not rotate the primary key or re-stamp the row's birth.
+    # `vps_soul_synced_at` is not here either — it is assigned further down,
+    # after the sync actually succeeds.
+    _stmt = _stmt.on_conflict_do_update(
+        index_elements=[SoulConfig.__table__.c.user_id],
+        set_={k: _stmt.excluded[k] for k in _mutable},
+    )
+    await db.execute(_stmt)
+
     result = await db.execute(
         select(SoulConfig).where(SoulConfig.user_id == current_user.id)
     )
-    config = result.scalar_one_or_none()
-
-    if config:
-        config.name = req.name
-        config.color = req.color
-        config.pronouns = req.pronouns
-        config.style = req.style
-        config.traits = req.traits
-        config.custom_instructions = req.custom_instructions
-        config.compiled_text = compiled_text
-        config.updated_at = datetime.utcnow()
-    else:
-        config = SoulConfig(
-            user_id=current_user.id,
-            name=req.name,
-            color=req.color,
-            pronouns=req.pronouns,
-            style=req.style,
-            traits=req.traits,
-            custom_instructions=req.custom_instructions,
-            compiled_text=compiled_text,
-        )
-        db.add(config)
+    config = result.scalar_one()
 
     # Upsert Identity(type='soul') — same record prompt_builder reads
     id_result = await db.execute(
