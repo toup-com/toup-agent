@@ -63,7 +63,14 @@ async def _bg_finalize_signup(user_id: str) -> None:
     try:
         from app.db import async_session_maker
         from app.services.free_tier_activation import activate_free_tier
-        from app.services.pool_service import claim_or_prewarm
+        from app.services.pool_service import (
+            claim_or_prewarm, seed_signup_trace, signup_trace,
+        )
+        # Same t0 as auth.register's — this IS the registration for an OAuth
+        # signup, and it is the last point before the claim where nothing has
+        # happened yet.
+        if seed_signup_trace(user_id, only_if_absent=True):
+            signup_trace(user_id, "registered", "via=oauth_google", origin="signup")
         async with async_session_maker() as bg_db:
             try:
                 await activate_free_tier(bg_db, user_id, force_env_push=False)
@@ -96,6 +103,9 @@ async def _bg_finalize_oauth_signup(user_id: str, email_verified: bool) -> None:
     try:
         from app.db import async_session_maker
         from app.services.credit_service import CreditService
+        from app.services.pool_service import seed_signup_trace, signup_trace
+        if seed_signup_trace(user_id, only_if_absent=True):
+            signup_trace(user_id, "registered", "via=oauth", origin="signup")
         async with async_session_maker() as bg_db:
             # One-time free grant — provider-verified; no-op if already granted.
             try:
@@ -373,6 +383,19 @@ async def register(
     # signal that consumes a slot.
     user = await create_user(db, email=user_data.email, password=user_data.password, name=user_data.name)
     await record_signup(client_ip)
+
+    # t0 for [signup-trace]. Registration is the only instant "signup to usable
+    # agent" can be measured from, and nothing stamped it: `seed_signup_trace`
+    # had no caller, so every later hop was timed from whenever that process
+    # first happened to see this user — which on the claim path is the claim
+    # itself, printing `elapsed_ms=0` for a 4 s hop (production, 2026-09-07).
+    # Two log lines total, no I/O, no DB round trip.
+    try:
+        from app.services.pool_service import seed_signup_trace, signup_trace
+        seed_signup_trace(str(user.id))
+        signup_trace(str(user.id), "registered", "via=password", origin="signup")
+    except Exception:
+        pass
 
     # When the grant is gated on email verification, send the one-click
     # verification link so the user can unlock their free credits. Scheduled

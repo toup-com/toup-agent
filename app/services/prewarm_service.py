@@ -216,6 +216,28 @@ async def _run_prewarm(user_id: str) -> None:
                 _pool.ensure_discovery(user_id, reason="prewarm_dedupe")
                 return
 
+            # ── The OTHER door (2026-09-06) ──────────────────────────────
+            # `provision_drive:` only excludes prewarm-vs-prewarm. The claim
+            # path locks a DIFFERENT key (`pool_claim:`), so a PUT /api/soul
+            # prewarm — PREWARM_ON_SOUL_SAVE is true in production — could
+            # drive POST /v1/tenants for a user whose pool bind was still in
+            # flight. That is the door the incident used: two PREWARM-STARTs at
+            # 18:17:39 reached the bridge's create_tenant at 18:18:00, eleven
+            # seconds before the pool bind finished at 18:18:11.
+            #
+            # Probed non-blockingly and taken for the same transaction that
+            # spans the bridge call below, so a claim starting later blocks on
+            # its own bounded wait and then observes.
+            if not await _pool.try_take_claim_drive(db, user_id):
+                _pool.signup_trace(user_id, "prewarm_dedupe", "claim_in_flight")
+                logger.info(
+                    "[PREWARM] user=%s a pool claim is in flight — observing "
+                    "instead of driving the named path",
+                    str(user_id)[:8],
+                )
+                _pool.ensure_discovery(user_id, reason="claim_in_flight")
+                return
+
             agent_config = (
                 await db.execute(
                     select(AgentConfig).where(AgentConfig.user_id == user_id)

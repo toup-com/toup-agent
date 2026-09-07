@@ -31,6 +31,131 @@ logger = logging.getLogger("toup.scheduler")
 scheduler: Optional[AsyncIOScheduler] = None
 
 
+# ── Deterministic per-tenant cron spread ─────────────────────────────
+#
+# Every wall-clock cron in this codebase used to name the same INSTANT in
+# every process that ran it, and ~95 agent containers run the same image on
+# one 16-core VPS. Measured 2026-09-07 on four independent containers, the
+# `day_archival` job fired at 15:00:00.023, .028, .093 and .438 UTC — a
+# fleet-wide burst inside half a second, every hour. On 2026-09-07 15:00:00
+# that burst stalled a brand-new tenant's very first turn: its own scheduler
+# logged `Run time of job "Memory Maintenance: day_archival" was missed by
+# 0:00:05.77`, the platform saw a 7 s WebSocket accept and two HTTP
+# ReadTimeouts, and the client's 12 s silent-turn grace expired and
+# reconnected. Any user who starts a turn in the first seconds of any hour
+# pays for the whole fleet's maintenance.
+#
+# The trigger must stay WALL-CLOCK — that is not negotiable and the reason is
+# recorded twice below and in agent_main.py: an IntervalTrigger measures its
+# next fire from scheduler START, and this fleet is recreated far more often
+# than hourly, so an elapsed-time timer is reset before it ever fires (that is
+# exactly how `memory_decay` went its entire life without running once).
+#
+# So: keep the wall clock, move each tenant to its OWN second of it. The
+# offset is a hash of a stable per-tenant identifier, which makes it
+# deterministic (no random jitter that redraws on every restart — an
+# APScheduler `jitter` only perturbs the fire time, it does not give a
+# container a stable slot, and a fleet of independent random draws still
+# clusters), reproducible from the identifier alone, and unchanged across
+# restarts, recreates and image upgrades.
+_CRON_SPREAD_ID_ENV = "TOUP_CRON_SPREAD_ID"
+
+
+def tenant_cron_identity() -> str:
+    """A stable string identifying THIS tenant/process for cron spreading.
+
+    Order is chosen for stability, not for prettiness:
+
+    1. ``TOUP_CRON_SPREAD_ID`` — an operator override, and what the tests use.
+    2. The tenant DATABASE name. Every agent container is created with its own
+       ``DATABASE_URL`` (``toup_agent_feed0047`` for pool slot 47,
+       ``toup_agent_<prefix>`` for a dedicated tenant) and KEEPS it across
+       bind, restart, blue-green upgrade and recreate — verified on the host.
+       It is therefore more stable than the bound user id, which is absent
+       while a pool slot sits in the lobby and only appears at bind: preferring
+       the user id would move a slot's cron slot the first time it restarted
+       after being claimed.
+    3. The bound user id, for any deployment whose database URL is empty.
+    4. The hostname, last resort.
+
+    On the platform (Railway, 2 replicas) every replica resolves the same
+    platform database name and therefore the same slot — which is exactly
+    today's behaviour, minus the collision with the agent fleet's minute 0.
+    """
+    import os
+
+    override = os.environ.get(_CRON_SPREAD_ID_ENV)
+    if override and override.strip():
+        return override.strip()
+
+    try:
+        from app.config import settings as _s
+        url = str(getattr(_s, "database_url", "") or "")
+        if url:
+            name = url.rsplit("/", 1)[-1].split("?")[0].strip()
+            if name:
+                return name
+    except Exception:  # noqa: BLE001 - identity must never break boot
+        pass
+
+    try:
+        from app.services import runtime_identity as _ri
+        uid = _ri.get_user_id()
+        if uid:
+            return str(uid)
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        import socket
+        return socket.gethostname() or "toup-agent"
+    except Exception:  # noqa: BLE001
+        return "toup-agent"
+
+
+def cron_slot_seconds(job_id: str, span_seconds: int, identity: Optional[str] = None) -> int:
+    """Deterministic offset in ``[0, span_seconds)`` for ``job_id`` on this tenant.
+
+    blake2b, NOT the builtin ``hash()``: Python randomises string hashing per
+    process (PYTHONHASHSEED), so a builtin hash would hand the same container a
+    different slot on every restart — stable-looking in one process and
+    worthless in production. Salted with the job id so a tenant's several
+    hourly jobs do not all land on the same second either.
+    """
+    import hashlib
+
+    if span_seconds <= 0:
+        return 0
+    ident = identity if identity is not None else tenant_cron_identity()
+    digest = hashlib.blake2b(
+        f"{job_id}\x00{ident}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % span_seconds
+
+
+def spread_hourly_cron(job_id: str, identity: Optional[str] = None) -> CronTrigger:
+    """An hourly wall-clock trigger on this tenant's own second of the hour."""
+    slot = cron_slot_seconds(job_id, 3600, identity)
+    return CronTrigger(minute=slot // 60, second=slot % 60)
+
+
+def spread_daily_cron(
+    job_id: str,
+    hour: int,
+    window_minutes: int = 60,
+    identity: Optional[str] = None,
+) -> CronTrigger:
+    """A daily wall-clock trigger spread across ``window_minutes`` from ``hour``.
+
+    The window is clamped to one hour so the job never escapes the hour it was
+    configured for — a daily job at 03:00 stays inside 03:00–03:59.
+    """
+    window = max(1, min(int(window_minutes), 60))
+    slot = cron_slot_seconds(job_id, window * 60, identity)
+    return CronTrigger(hour=hour, minute=slot // 60, second=slot % 60)
+
+
+
 # v3: `run_decay_for_all_users` and `run_consolidation_for_all_users` are
 # DELETED with `decay_service` and `consolidation_service`
 # (docs/memory/rebuild-2026-08-v3.md §1.1). Both walked every active user's
@@ -1033,12 +1158,18 @@ def setup_scheduler(
     try:
         from app.config import settings as _s
         if getattr(_s, "enable_day_recall", False):
+            # ...on THIS deployment's own second of the hour, not on
+            # everyone's minute 0 — see `spread_hourly_cron` above.
             scheduler.add_job(
                 run_end_of_day_archival,
-                trigger=CronTrigger(minute=0),
+                trigger=spread_hourly_cron("day_archival"),
                 id="day_archival",
                 name="End-of-Day Archival Summaries",
                 replace_existing=True,
+                # A miss used to SKIP the hour outright (APScheduler's default
+                # grace is one second), so an archival lost to a busy minute
+                # was lost silently.
+                misfire_grace_time=300,
             )
     except Exception as e:
         logger.warning("Could not register day_archival job: %s", e)

@@ -77,6 +77,56 @@ class ProvisionDriveTaken(Exception):
     """
 
 
+class ClaimOutcomeUnknown(ProvisionDriveTaken):
+    """The bridge never gave a usable answer, so we do not know what it did.
+
+    A timeout or a 5xx on POST /v1/pool/claim is not "no slot". On 2026-09-06
+    the bridge finished that exact bind two seconds after the platform stopped
+    listening, and the named create the platform started instead reached the
+    host: `docker network tnt_aec1977b` is stamped 18:18:00 with zero
+    containers, eleven seconds BEFORE the pool bind completed at 18:18:11. It
+    only failed to produce a second container because Postgres was at 300/300.
+    Two completed versions of the same race are still on the VPS: prefixes
+    667cf3de and 51d4ed2f each have a named container serving them AND a pool
+    slot the bridge reports ASSIGNED+bound that serves nobody.
+
+    A SUBCLASS of ProvisionDriveTaken, deliberately, and not a sibling: every
+    `except ProvisionDriveTaken` in this tree already means "somebody else owns
+    this user's outcome — observe, do not start a second path", which is
+    exactly what an unknown outcome demands. A sibling would have had to be
+    added to three handlers by hand and the one that got missed would be this
+    incident again.
+
+    `ensure_discovery` is always started before this is raised, so something
+    IS still watching for the late bind.
+    """
+
+
+# The advisory key `claim_for_user` takes for the duration of a bind. Named
+# once so `try_take_claim_drive` and the lock below can never drift apart.
+def _claim_drive_key(user_id: str) -> str:
+    return f"pool_claim:{user_id}"
+
+
+async def _release_claim_drive(db: AsyncSession) -> None:
+    """Hand `pool_claim:<user>` back before returning from claim_for_user
+    without a container.
+
+    An xact-scoped advisory lock lives until the session's next commit or
+    rollback, and every early return below this point does neither — so on the
+    pool-exhausted path the lock was still held while the caller went on to
+    schedule a prewarm, and the prewarm now refuses to drive while somebody
+    holds it. Rolling back discards only the uncommitted CAS that mints
+    `agent_api_key`; `activate_free_tier` commits its own work, and the key is
+    re-minted and re-pushed by the bridge's idempotent claim on the next
+    attempt — which is what already happened when the session simply closed.
+    """
+    try:
+        await db.rollback()
+    except Exception:
+        logger.warning("[pool_service] could not release the claim drive lock")
+
+
 async def _build_bind_payload(
     db: AsyncSession,
     user_id: str,
@@ -194,7 +244,8 @@ async def _build_bind_payload(
 
 
 async def claim_for_user(
-    db: AsyncSession, user_id: str, *, force: bool = False
+    db: AsyncSession, user_id: str, *, force: bool = False,
+    origin: str = "signup",
 ) -> Optional[ManagedContainer]:
     """Claim a pool container for `user_id`. Returns the populated
     ManagedContainer row on success, None on pool-exhausted-or-disabled.
@@ -255,7 +306,7 @@ async def claim_for_user(
                 await db.execute(_text(f"SET LOCAL lock_timeout = '{_wait_s}s'"))
             await db.execute(
                 _text("SELECT pg_advisory_xact_lock(hashtext(:k)::bigint)"),
-                {"k": f"pool_claim:{user_id}"},
+                {"k": _claim_drive_key(user_id)},
             )
             if _wait_s > 0:
                 # Scope the timeout to the lock, not to the bridge call's own
@@ -275,7 +326,8 @@ async def claim_for_user(
                 "— observing instead of duplicating",
                 str(user_id)[:8], type(_le).__name__,
             )
-            signup_trace(user_id, "claim_contended", type(_le).__name__)
+            signup_trace(user_id, "claim_contended", type(_le).__name__,
+                         origin=origin)
             ensure_discovery(user_id, reason="claim_lock_contended")
             raise ProvisionDriveTaken(
                 f"claim lock for {str(user_id)[:8]} held by another driver"
@@ -366,6 +418,13 @@ async def claim_for_user(
                     "[pool_service] Pool exhausted — fallback to provision for user %s",
                     user_id[:8],
                 )
+                # DEFINITE: the bridge answered, and it bound nothing. Hand the
+                # `pool_claim:` advisory lock back before returning, because
+                # the caller's next move is schedule_prewarm and the prewarm
+                # now refuses to drive while that lock is held. An xact lock
+                # lives until this session's next commit/rollback, and nothing
+                # below commits on this path.
+                await _release_claim_drive(db)
                 return None
             resp.raise_for_status()
             data = resp.json()
@@ -374,11 +433,21 @@ async def claim_for_user(
             "[pool_service] bridge claim returned %s: %s",
             e.response.status_code, e.response.text[:200],
         )
-        signup_trace(user_id, "claim_timeout", f"http_{e.response.status_code}")
+        signup_trace(user_id, "claim_timeout", f"http_{e.response.status_code}",
+                     origin=origin)
         # A 5xx can still leave a completed bind behind (the bind and the
-        # response are not the same event), so ask rather than assume.
+        # response are not the same event), so ask rather than assume — and
+        # RAISE, so no caller reads it as "the pool had nothing for this user"
+        # and opens the cold named door beside the bind we may already own.
         if e.response.status_code >= 500:
             ensure_discovery(user_id, reason="claim_5xx")
+            await _release_claim_drive(db)
+            raise ClaimOutcomeUnknown(
+                f"bridge claim for {str(user_id)[:8]} answered "
+                f"{e.response.status_code}; the bind may have completed"
+            )
+        # A 4xx IS an answer: the bridge rejected the request and bound
+        # nothing. Definite → the named fallback is correct.
         return None
     except httpx.HTTPError as e:
         # `str(httpx.ReadTimeout())` is the EMPTY STRING, which is how the
@@ -387,11 +456,19 @@ async def claim_for_user(
         # would too. Same fix already applied at
         # docker_host_service._update_container_env's retry loop.
         logger.warning("[pool_service] bridge unreachable: %r", e)
-        signup_trace(user_id, "claim_timeout", type(e).__name__)
+        signup_trace(user_id, "claim_timeout", type(e).__name__, origin=origin)
         # THE FIX. A timed-out claim is not a failed claim: on 2026-09-06 the
         # bridge finished this exact bind 2 s after we stopped listening.
         ensure_discovery(user_id, reason="claim_timeout")
-        return None
+        # ...and it is not a claim that FOUND NOTHING either, which is what
+        # `return None` used to tell claim_or_prewarm. Discovery owns this
+        # user's outcome now; a second driver taking the named path would
+        # produce the duplicate the class docstring documents.
+        await _release_claim_drive(db)
+        raise ClaimOutcomeUnknown(
+            f"bridge claim for {str(user_id)[:8]} timed out ({type(e).__name__}); "
+            f"the bind may have completed"
+        )
 
     # Bridge response shape: {ok, container_name, host_port, db_pool_slot}
     container_name = data.get("container_name")
@@ -473,7 +550,7 @@ async def claim_for_user(
         "[pool_service] Claimed %s for user %s (agent_url=%s)",
         container_name, user_id[:8], agent_url,
     )
-    signup_trace(user_id, "claim_ok", f"slot={container_name}")
+    signup_trace(user_id, "claim_ok", f"slot={container_name}", origin=origin)
     # The registry just changed; a poller reading a 2 s-old cache would
     # otherwise miss its own success.
     _invalidate_pool_list_cache()
@@ -898,7 +975,7 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
     the guard runs in the background.
     """
     try:
-        c = await claim_for_user(db, user_id)
+        c = await claim_for_user(db, user_id, origin="signup")
         if c is not None:
             try:
                 _spawn_bg(_verify_and_heal_pool_claim(user_id))
@@ -907,15 +984,18 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
                 # somehow does, the periodic reconciler still covers us.
                 logger.warning("[pool_service] could not spawn pool-heal guard for %s", user_id[:8])
             return True
-    except ProvisionDriveTaken:
-        # Somebody else owns this user's provisioning. Falling through to
-        # schedule_prewarm here would be the 2026-09-06 duplicate: a SECOND
-        # driver taking the cold NAMED path (POST /v1/tenants) for a user the
-        # pool is already binding. Observe instead — claim_for_user has already
-        # started discovery, which adopts whatever the winner produces.
+    except ProvisionDriveTaken as e:
+        # Somebody else owns this user's outcome — either another driver holds
+        # the claim lock, or (ClaimOutcomeUnknown) the bridge never told us
+        # what OUR OWN call did. Falling through to schedule_prewarm here is
+        # the 2026-09-06 duplicate: a SECOND driver taking the cold NAMED path
+        # (POST /v1/tenants) for a user the pool is already binding. Observe
+        # instead — claim_for_user has already started discovery, which adopts
+        # whatever the bind produces.
         logger.info(
-            "[pool_service] provisioning for %s is already being driven — observing",
-            user_id[:8],
+            "[pool_service] provisioning for %s is already being driven (%s) "
+            "— observing",
+            user_id[:8], type(e).__name__,
         )
         return True
     except Exception:
@@ -1044,6 +1124,7 @@ async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
         .outerjoin(ManagedContainer, ManagedContainer.user_id == User.id)
         .where(
             User.is_active == True,  # noqa: E712
+            User.id.notin_(_deletion_in_flight_user_ids()),
             or_(
                 # Managed users: heal a missing row or a non-running
                 # pool-bound row, regardless of signup age.
@@ -1097,6 +1178,57 @@ async def _stranded_user_ids(db: AsyncSession, limit: int = 15) -> list[str]:
         .limit(limit)
     )
     return [str(uid) for uid in rows.scalars().all()]
+
+
+# ── Accounts the backstop must not touch ─────────────────────────────────
+#
+# `destroy_container` leaves the row at status='deleted' while it still names
+# the pool slot, and the User row survives (still `is_active`) until the very
+# last step of `delete_user_completely`. That is EXACTLY the shape both
+# stranded predicates look for, so a deletion in flight reads as a stranded
+# signup — measured on 2026-09-07, where the 15 s fast pass put
+# `GET /v1/pool/whois?user_id=c7905c52-…` on the bridge four seconds after that
+# account's slot had been released. The fast pass only adopts and the member
+# was already DRAINING, so nothing happened; the 180 s scan does not adopt, it
+# CLAIMS, and a tick landing in the same window binds a fresh pool container,
+# database and Caddy route to an account whose deletion has already passed the
+# point where anything would release them.
+#
+# `deletion_audit_events` is the right marker and needs no new column: it is
+# INSERTed and committed as the FIRST transaction of `delete_user_completely`,
+# before Stripe and before the container, and it outlives the user row.
+#
+# 'failed' is split by step on purpose. Stripe runs first and aborts before any
+# local teardown — "the user is still functional and an admin can retry" — so
+# those users are ordinary customers and must still be healed. From the
+# container step onward, teardown was owed and did not land
+# (`ContainerTeardownIncomplete`), and claiming a NEW slot on top of that is
+# how a released-but-not-reaped slot becomes a permanently leaked one.
+_DELETION_PAST_TEARDOWN_STEPS = ("container", "openai", "cascade", "user_row")
+
+
+def _deletion_in_flight_user_ids():
+    """Scalar subquery of user ids whose account deletion must not be undone.
+
+    A clean deletion removes the user row, so 'succeeded' never matches
+    anything the predicates could join to; it is left out rather than excluded
+    so the intent stays readable."""
+    from app.db.models import DeletionAuditEvent
+    from sqlalchemy import and_, or_
+    return (
+        select(DeletionAuditEvent.user_id)
+        .where(
+            or_(
+                DeletionAuditEvent.status == "in_progress",
+                and_(
+                    DeletionAuditEvent.status == "failed",
+                    DeletionAuditEvent.failure_step.in_(
+                        _DELETION_PAST_TEARDOWN_STEPS
+                    ),
+                ),
+            )
+        )
+    )
 
 
 async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
@@ -1177,7 +1309,7 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                         mc.error_message = "[pool-reclaim] unstuck stale provisioning"
                         await udb.commit()
                     # Step 3: the claim (activation happens inside).
-                    c = await claim_for_user(udb, uid)
+                    c = await claim_for_user(udb, uid, origin="reclaim")
                 if c is not None:
                     summary["claimed"] += 1
                     logger.warning(
@@ -1304,7 +1436,7 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
         for uid, cname in keyless_pool[:max_per_tick]:
             try:
                 async with async_session_maker() as udb:
-                    c = await claim_for_user(udb, uid, force=True)
+                    c = await claim_for_user(udb, uid, force=True, origin="heal")
                 if c is not None:
                     summary["rebound"] = summary.get("rebound", 0) + 1
                     logger.warning(
@@ -1379,50 +1511,103 @@ def _t_ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
 
 
-# user prefix -> monotonic clock at registration (or at first sighting when
-# registration is not in this process's history). Bounded FIFO: this is a log
+# user prefix -> monotonic clock at registration. Bounded FIFO: this is a log
 # convenience, never a source of truth.
+#
+# It used to stamp t0 on FIRST SIGHTING, which made the number meaningless:
+# nothing seeded it at registration (`seed_signup_trace` had no caller at all),
+# so on the claim path the origin WAS the claim and every hop printed
+# `elapsed_ms=0`. Production printed exactly that for a 4 s register->bound on
+# 2026-09-07, and for two reclaims of months-old users during the P0 walk.
 _TRACE_T0: dict = {}
 _TRACE_T0_MAX = 512
 
 
-def _trace_origin(user_id: str) -> float:
-    key = str(user_id)[:8]
-    t0 = _TRACE_T0.get(key)
-    if t0 is None:
-        if len(_TRACE_T0) >= _TRACE_T0_MAX:
-            # FIFO evict — dicts preserve insertion order.
-            for k in list(_TRACE_T0)[: _TRACE_T0_MAX // 4]:
-                _TRACE_T0.pop(k, None)
-        t0 = time.monotonic()
-        _TRACE_T0[key] = t0
-    return t0
+def _trace_put(key: str, t0: float) -> None:
+    if len(_TRACE_T0) >= _TRACE_T0_MAX:
+        # FIFO evict — dicts preserve insertion order.
+        for k in list(_TRACE_T0)[: _TRACE_T0_MAX // 4]:
+            _TRACE_T0.pop(k, None)
+    _TRACE_T0[key] = t0
 
 
-def seed_signup_trace(user_id: str) -> None:
+def _trace_origin(user_id: str) -> Optional[float]:
+    """t0 for this user, or None when this process never saw their
+    registration. None is a real answer and prints as `elapsed_ms=null`.
+
+    With two Railway replicas the claim routinely completes in the process that
+    did NOT serve the registration, and a fabricated t0 there reports a long
+    hop as instantaneous — which is the same string a genuinely instant hop
+    produces, so the two could not be told apart."""
+    return _TRACE_T0.get(str(user_id)[:8])
+
+
+def seed_signup_trace(user_id: str, *, only_if_absent: bool = False) -> bool:
     """Stamp t0 for a user's signup trace. Call from the registration path so
     every later `elapsed_ms` is measured from registration rather than from
-    whenever this process first heard of them."""
+    whenever this process first heard of them.
+
+    Returns True iff this call stamped it. `only_if_absent=True` is for the
+    background finalizers, which run AFTER `auth.register` in the same process
+    on the password path: re-seeding there would move t0 forward past the work
+    it is supposed to measure, and re-emitting `registered` would double-count
+    one signup. On the OAuth paths there is no earlier seed and they are the
+    registration, so they stamp it and emit the hop.
+    """
     key = str(user_id)[:8]
-    _TRACE_T0.pop(key, None)
-    _trace_origin(key)
+    if only_if_absent and key in _TRACE_T0:
+        return False
+    _trace_put(key, time.monotonic())
+    return True
 
 
-def signup_trace(user_id: str, hop: str, detail: str = "") -> None:
+def signup_trace(
+    user_id: str,
+    hop: str,
+    detail: str = "",
+    *,
+    origin: str = "signup",
+    created_at=None,
+) -> None:
     """One structured line per provisioning hop, keyed by the user's 8-hex
     prefix. Deliberately boring: no secrets, no message content, no PII — a
-    prefix, a hop name, an elapsed_ms and a short mechanical detail.
+    prefix, a hop name, an origin, an elapsed_ms and a short mechanical detail.
 
     Hops: registered | prewarm_start | claim_ok | claim_timeout |
           discovered | adopted | bound | ready
     (plus a few mechanical ones: prewarm_dedupe, discover_start, discover_give_up,
      config_sync_deferred).
+
+    `origin` says WHY this hop happened — signup | reclaim | discovery | heal.
+    Without it `hop=claim_ok` covers a fresh registration, the 180 s stranded
+    backstop re-claiming a months-old user, a discovery adopt and the keyless
+    sweep's force re-bind, and on-call cannot tell which they are looking at.
+
+    `created_at` is the one way to get an elapsed on a replica that did not
+    serve the registration, and it takes a VALUE the caller already holds —
+    never a user id to look up. A logging helper must not issue a DB round trip.
     """
     try:
         pfx = str(user_id)[:8]
+        t0 = _trace_origin(pfx)
+        if t0 is None and created_at is not None:
+            # Wall-clock delta, converted to this process's monotonic frame and
+            # cached so later hops for the same user stay consistent.
+            try:
+                now = datetime.utcnow()
+                ref = created_at
+                if getattr(ref, "tzinfo", None) is not None:
+                    ref = ref.replace(tzinfo=None)
+                age = (now - ref).total_seconds()
+                if age >= 0:
+                    t0 = time.monotonic() - age
+                    _trace_put(pfx, t0)
+            except Exception:
+                t0 = None
+        elapsed = "null" if t0 is None else str(_t_ms(t0))
         logger.info(
-            "[signup-trace] user=%s hop=%s elapsed_ms=%d detail=%s",
-            pfx, hop, _t_ms(_trace_origin(pfx)), (detail or "")[:120],
+            "[signup-trace] user=%s hop=%s origin=%s elapsed_ms=%s detail=%s",
+            pfx, hop, origin or "unknown", elapsed, (detail or "")[:120],
         )
     except Exception:
         pass
@@ -1670,7 +1855,7 @@ async def _adopt_discovered_bind(user_id: str, slot: dict) -> Optional[str]:
                 await db.commit()
 
             try:
-                c = await claim_for_user(db, user_id)
+                c = await claim_for_user(db, user_id, origin="discovery")
             except ProvisionDriveTaken:
                 # The winner is mid-bind. Its own commit is the adoption; the
                 # next discovery tick will see the converged rows. Racing it
@@ -1733,7 +1918,8 @@ async def discover_and_adopt_bind(
     read_timeout = float(getattr(settings, "provision_discovery_read_timeout_s", 8) or 8)
     from app.db.database import async_session_maker
     started = time.monotonic()
-    signup_trace(uid, "discover_start", f"reason={reason} budget_s={int(budget_s)}")
+    signup_trace(uid, "discover_start", f"reason={reason} budget_s={int(budget_s)}",
+                 origin="discovery")
     try:
         while (time.monotonic() - started) < budget_s:
             # Someone else (the reconciler, another replica, the original
@@ -1742,7 +1928,7 @@ async def discover_and_adopt_bind(
                 async with async_session_maker() as db:
                     url = await _bound_agent_url(db, uid)
                 if url:
-                    signup_trace(uid, "bound", "already_converged")
+                    signup_trace(uid, "bound", "already_converged", origin="discovery")
                     return url
             except Exception:
                 logger.warning("[discovery] DB check failed for %s", uid[:8])
@@ -1762,10 +1948,12 @@ async def discover_and_adopt_bind(
                 # i.e. BEFORE the agent has been bound, so adopting on that
                 # state would publish an agent_url for a container that cannot
                 # yet answer.
-                signup_trace(uid, "discovered", f"slot={slot.get('container_name')}")
+                signup_trace(uid, "discovered", f"slot={slot.get('container_name')}",
+                             origin="discovery")
                 url = await _adopt_discovered_bind(uid, slot)
                 if url:
-                    signup_trace(uid, "adopted", f"slot={slot.get('container_name')}")
+                    signup_trace(uid, "adopted", f"slot={slot.get('container_name')}",
+                                 origin="discovery")
                     return url
                 # Adopt refused or failed — the next tick re-reads the truth.
                 _invalidate_pool_list_cache()
@@ -1773,7 +1961,8 @@ async def discover_and_adopt_bind(
             await asyncio.sleep(interval_s)
     finally:
         _DISCOVERY_INFLIGHT.discard(uid)
-    signup_trace(uid, "discover_give_up", f"after_s={int(time.monotonic() - started)}")
+    signup_trace(uid, "discover_give_up", f"after_s={int(time.monotonic() - started)}",
+                 origin="discovery")
     return None
 
 
@@ -1821,10 +2010,10 @@ async def try_adopt_stranded(db: AsyncSession, user_id: str) -> Optional[str]:
         slot = await bridge_lookup_user_slot(uid, timeout_s=read_timeout)
         if not _is_adoptable(slot):
             return None
-        signup_trace(uid, "discovered", "via=try_adopt_stranded")
+        signup_trace(uid, "discovered", "via=try_adopt_stranded", origin="discovery")
         url = await _adopt_discovered_bind(uid, slot)
         if url:
-            signup_trace(uid, "adopted", "via=try_adopt_stranded")
+            signup_trace(uid, "adopted", "via=try_adopt_stranded", origin="discovery")
         return url
 
     task = _spawn_bg(_once(), name=f"adopt-once:{uid[:8]}")
@@ -1879,6 +2068,40 @@ async def try_take_provision_drive(db: AsyncSession, user_id: str) -> bool:
         return True
 
 
+async def try_take_claim_drive(db: AsyncSession, user_id: str) -> bool:
+    """Non-blocking probe of the SAME advisory key `claim_for_user` holds for
+    the length of a bind. False means a pool claim for this user is in flight.
+
+    `try_take_provision_drive` is not enough on its own: it keys on
+    `provision_drive:<uid>` while claim_for_user keys on `pool_claim:<uid>`,
+    so nothing at all excluded a soul-save prewarm from driving
+    POST /v1/tenants for a user the pool was mid-bind on. That is the door the
+    2026-09-06 incident actually used — the two PREWARM-STARTs at 18:17:39
+    reached the bridge's create_tenant at 18:18:00, eleven seconds before the
+    pool bind completed.
+
+    Non-Postgres engines answer True: one process, nothing to serialise.
+    """
+    try:
+        from app.db.database import get_engine as _get_engine
+        if _get_engine().dialect.name != "postgresql":
+            return True
+        from sqlalchemy import text as _text
+        got = (await db.execute(
+            _text("SELECT pg_try_advisory_xact_lock(hashtext(:k)::bigint)"),
+            {"k": _claim_drive_key(user_id)},
+        )).scalar()
+        return bool(got)
+    except Exception:
+        # Fail OPEN, same as try_take_provision_drive: a duplicate drive is
+        # idempotent on the bridge, a skipped one is a user with no agent.
+        logger.warning(
+            "[provision-drive] claim-lock probe failed for %s — proceeding",
+            str(user_id)[:8],
+        )
+        return True
+
+
 # ── The fast stranded pass ───────────────────────────────────────────────
 
 async def _recently_stranded_user_ids(db: AsyncSession, limit: int = 10) -> list:
@@ -1900,6 +2123,7 @@ async def _recently_stranded_user_ids(db: AsyncSession, limit: int = 10) -> list
         .outerjoin(ManagedContainer, ManagedContainer.user_id == User.id)
         .where(
             User.is_active == True,  # noqa: E712
+            User.id.notin_(_deletion_in_flight_user_ids()),
             User.created_at >= cutoff,
             AgentConfig.hosting_mode == "managed",
             or_(
@@ -1948,10 +2172,10 @@ async def reclaim_stranded_fast() -> dict:
                 )
                 break  # bridge is not answering; do not hammer it per user
             if _is_adoptable(slot):
-                signup_trace(uid, "discovered", "via=stranded_fast")
+                signup_trace(uid, "discovered", "via=stranded_fast", origin="discovery")
                 if await _adopt_discovered_bind(uid, slot):
                     summary["adopted"] += 1
-                    signup_trace(uid, "adopted", "via=stranded_fast")
+                    signup_trace(uid, "adopted", "via=stranded_fast", origin="discovery")
                     logger.warning(
                         "[stranded-fast] adopted late bind user=%s -> %s",
                         uid[:8], slot.get("container_name"),

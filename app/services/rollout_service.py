@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import statistics
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Awaitable, Callable, Optional, Sequence
 
 import httpx
 from sqlalchemy import func, select, update
@@ -266,6 +268,9 @@ async def _observe_canary_signal(
     stability_hold_s: float = _CANARY_STABILITY_HOLD_S,
     stability_interval_s: float = _CANARY_STABILITY_INTERVAL_S,
     agent_key: "str | None" = None,
+    canary_prefix: "str | None" = None,
+    peer_prefixes: "Sequence[str]" = (),
+    stats_fetch: "Optional[_ResourceStatsFetch]" = None,
 ) -> tuple[bool, str]:
     """Signal-based canary observation. Returns (passed, reason).
 
@@ -326,6 +331,22 @@ async def _observe_canary_signal(
                 return (False, f"stability hold failed: {type(e).__name__}: {str(e)[:200]}")
             await asyncio.sleep(stability_interval_s)
 
+        # Phase 2b: the resource gate. Health proves the agent ANSWERS; this
+        # proves what it COSTS while answering nothing. It runs after the
+        # stability hold so the sample covers a settled container rather than
+        # its boot, and before the turn probe so a runaway image is refused
+        # without also being handed a model call.
+        if canary_prefix:
+            gate_ok, gate_why = await _resource_gate(
+                canary_prefix, peer_prefixes, stats_fetch=stats_fetch,
+            )
+            if not gate_ok:
+                return (False, f"resource gate failed: {gate_why}")
+        else:
+            logger.warning(
+                "[CANARY-OBSERVE] no canary prefix supplied — resource gate SKIPPED"
+            )
+
         # Phase 3: one REAL plain turn, end to end — model call included.
         # Health can only prove the runner exists; this proves a chat turn
         # completes on the new image. The founder discovered tonight's
@@ -366,6 +387,357 @@ async def _observe_canary_signal(
 
     elapsed = cap_seconds - max(0.0, deadline - time.time())
     return (True, f"healthy (boot + stability + turn probe passed in {elapsed:.0f}s)")
+
+
+# ─── Resource gate + fleet visibility (2026-09-06 incident) ───────
+#
+# Rollout 48191bdd promoted `a962b7340717` at 13:31-13:39 with
+# "completed: 7 ok, 0 failed/rolled-back of 7 total" and
+# health_checks_passed=3 on every attempt. The bridge then blue-greened 41 real
+# users' pool slots onto it. Measured on the host nine hours later:
+#
+#     a962b7340717 (41 assigned)   18.0 % CPU each    6.99 xact/s per DB
+#     11022e00cedf (30 assigned)    3.25 %            1.46 xact/s
+#     7edaed3ab644 (13 slots)       3.42 %            1.40 xact/s
+#
+# host load 42-55 on 16 cores, tenant Postgres 292-302 of max_connections=300,
+# pgbouncer dead twice. Every gate above was green throughout, because every
+# gate asks the same question — does /agent/health answer 200, and does one turn
+# complete. An idle container burning 3.6x its neighbours answers yes to both.
+#
+# So the canary now also has to be CHEAP. The bridge answers
+# `GET /v1/tenants/{prefix}/stats`; the comparison group is the other dedicated
+# tenants in this same rollout, which are still on the prior tag while the
+# canary is observed — a live A/B rather than a remembered baseline.
+
+_ResourceStatsFetch = Callable[[str], Awaitable[tuple[Optional["TenantStats"], str]]]
+
+# Below these the ratio rules are not applied: 2.5x of a ~0 median is ~0, which
+# would turn "the fleet is quiet right now" into "fail on any measurable CPU"
+# and make the gate a property of the sampling window instead of the image.
+_GATE_MEDIAN_FLOOR_CPU = 0.5      # % of one core
+_GATE_MEDIAN_FLOOR_XACT = 0.2     # transactions/s
+
+
+@dataclass(frozen=True)
+class TenantStats:
+    """The bridge's `GET /v1/tenants/{prefix}/stats` body.
+
+    Contract (implemented bridge-side in the same wave):
+      {prefix, container_name, image_tag, cpu_pct_60s, mem_mb, pg_backends,
+       xact_per_s, sampled_at}
+    `cpu_pct_60s` is a 60 s cgroup `usage_usec` delta as a percentage of ONE
+    core — a single `docker stats` sample was what a synchronised top-of-hour
+    burst fooled on 2026-09-07 00:59:55.
+    """
+
+    prefix: str
+    container_name: str
+    image_tag: str
+    cpu_pct_60s: float
+    mem_mb: float
+    pg_backends: int
+    # None = the bridge could not read the tenant DB (`pg_reason`). The CPU
+    # rules still apply; the transaction rule is skipped and the reason is
+    # carried into the verdict so the rollout notes say what was NOT checked.
+    xact_per_s: Optional[float]
+    sampled_at: float
+    xact_reason: str = ""
+
+    @classmethod
+    def from_body(cls, body: object) -> "Optional[TenantStats]":
+        """Parse, or None. A body with no CPU measurement is NOT a zero —
+        treating an absent number as 0 is how a gate silently passes.
+
+        Field names follow what the bridge actually ships (`cpu_pct` over
+        `cpu_window_s`, ≤5 s, sampled on demand); `cpu_pct_60s` is accepted as
+        the name this contract was first written against. An absent
+        `xact_per_s` is tolerated ONLY together with the bridge's `pg_reason`
+        — a body that names neither is malformed.
+        """
+        if not isinstance(body, dict):
+            return None
+        try:
+            cpu = body.get("cpu_pct")
+            if cpu is None:
+                cpu = body.get("cpu_pct_60s")
+            if cpu is None:
+                return None
+            xact = body.get("xact_per_s")
+            reason = str(body.get("pg_reason") or "")
+            if xact is None and not reason:
+                return None
+            return cls(
+                prefix=str(body.get("prefix") or ""),
+                container_name=str(body.get("container_name") or ""),
+                image_tag=str(body.get("image_tag") or ""),
+                cpu_pct_60s=float(cpu),
+                mem_mb=float(body.get("mem_mb") or 0.0),
+                pg_backends=int(body.get("pg_backends") or 0),
+                xact_per_s=None if xact is None else float(xact),
+                sampled_at=float(body.get("sampled_at") or 0.0),
+                xact_reason=reason if xact is None else "",
+            )
+        except (TypeError, ValueError):
+            return None
+
+
+async def _bridge_get(path: str, *, timeout_s: float) -> tuple[Optional[dict], str]:
+    """One read-only bridge GET. Returns (body, reason). Never raises.
+
+    `reason` is 'ok' or a human string that ends up in a rollout note, so it
+    carries the HTTP code — a 404 (route not deployed) and a ReadTimeout (bridge
+    wedged) have different operator answers and must not read alike.
+    """
+    from app.services.docker_host_service import _bridge_client
+    try:
+        async with _bridge_client(timeout_s=int(max(1, timeout_s))) as client:
+            resp = await client.get(path)
+        if resp.status_code == 404:
+            return None, "HTTP 404 (route not implemented on this bridge)"
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        body = resp.json()
+        return (body if isinstance(body, dict) else None), (
+            "ok" if isinstance(body, dict) else "non-object body"
+        )
+    except Exception as e:  # httpx errors, JSON errors, cert errors
+        return None, f"{type(e).__name__}: {str(e)[:160]}"
+
+
+async def _fetch_tenant_stats(prefix: str) -> tuple[Optional[TenantStats], str]:
+    body, why = await _bridge_get(
+        # The bridge clamps the window to 5 s; ask for all of it — a 3 s
+        # default is one scheduler tick wide.
+        f"/v1/tenants/{prefix}/stats?window_s=5",
+        timeout_s=float(getattr(settings, "rollout_resource_gate_timeout_s", 20.0)),
+    )
+    if body is None:
+        return None, why
+    stats = TenantStats.from_body(body)
+    return (stats, "ok") if stats else (None, "malformed stats body")
+
+
+def _resource_gate_verdict(
+    canary: TenantStats,
+    peers: "Sequence[TenantStats]",
+    *,
+    cpu_pct_max: float,
+    cpu_ratio_max: float,
+    xact_ratio_max: float,
+) -> tuple[bool, str]:
+    """Pure verdict on one measured canary against a measured baseline.
+
+    Three rules, OR-ed, each of which the incident image trips:
+      cpu_pct_60s > cpu_pct_max            18.0  > 12
+      cpu_pct_60s > cpu_ratio_max x median 18.0  > 2.5 x 3.25
+      xact_per_s  > xact_ratio_max x med    6.99 > 3   x 1.46
+    """
+    xact_txt = ("unmeasured" if canary.xact_per_s is None
+                else f"{canary.xact_per_s:.2f}/s")
+    facts = f"cpu={canary.cpu_pct_60s:.1f}% xact={xact_txt}"
+    if canary.xact_per_s is None:
+        facts += f" (xact rule skipped: {canary.xact_reason or 'no reading'})"
+    measured_xact = [p.xact_per_s for p in peers if p.xact_per_s is not None]
+    if peers:
+        med_cpu = statistics.median(p.cpu_pct_60s for p in peers)
+        med_xact = statistics.median(measured_xact) if measured_xact else 0.0
+        facts += f" vs {len(peers)} peer median cpu={med_cpu:.1f}% xact={med_xact:.2f}/s"
+    else:
+        med_cpu = med_xact = 0.0
+        facts += " (0 peers measurable — absolute ceiling only)"
+
+    if canary.cpu_pct_60s > cpu_pct_max:
+        return False, f"idle CPU {canary.cpu_pct_60s:.1f}% exceeds the {cpu_pct_max:.0f}% ceiling ({facts})"
+    if med_cpu >= _GATE_MEDIAN_FLOOR_CPU and canary.cpu_pct_60s > cpu_ratio_max * med_cpu:
+        return False, (
+            f"idle CPU {canary.cpu_pct_60s:.1f}% is "
+            f"{canary.cpu_pct_60s / med_cpu:.1f}x the fleet median ({facts})"
+        )
+    if (canary.xact_per_s is not None and med_xact >= _GATE_MEDIAN_FLOOR_XACT
+            and canary.xact_per_s > xact_ratio_max * med_xact):
+        return False, (
+            f"tenant-DB xact rate {canary.xact_per_s:.2f}/s is "
+            f"{canary.xact_per_s / med_xact:.1f}x the fleet median ({facts})"
+        )
+    return True, f"within budget ({facts})"
+
+
+async def _resource_gate(
+    canary_prefix: str,
+    peer_prefixes: "Sequence[str]",
+    *,
+    stats_fetch: "Optional[_ResourceStatsFetch]" = None,
+) -> tuple[bool, str]:
+    """Measure the canary and its still-on-the-prior-tag peers. (ok, reason).
+
+    UNAVAILABLE FAILS. A canary we could not measure is not a canary that
+    passed — that reading is what made 48191bdd say "7 ok". The escape hatch is
+    an explicit operator act (ROLLOUT_ALLOW_NO_RESOURCE_GATE=1), recorded in the
+    reason so it shows up in the rollout notes and the alert.
+    """
+    if not getattr(settings, "rollout_resource_gate_enabled", True):
+        return True, "resource gate disabled (ROLLOUT_RESOURCE_GATE_ENABLED=false)"
+
+    fetch = stats_fetch or _fetch_tenant_stats
+    canary_stats, why = await fetch(canary_prefix)
+    if canary_stats is None:
+        msg = f"resource gate unavailable for {canary_prefix}: {why}"
+        if getattr(settings, "rollout_allow_no_resource_gate", False):
+            return True, msg + " — allowed by ROLLOUT_ALLOW_NO_RESOURCE_GATE"
+        return False, msg + " — set ROLLOUT_ALLOW_NO_RESOURCE_GATE=1 to roll without it"
+
+    sample = int(getattr(settings, "rollout_resource_gate_peer_sample", 6) or 0)
+    wanted = [p for p in peer_prefixes if p and p != canary_prefix][:max(0, sample)]
+    peers: list[TenantStats] = []
+    if wanted:
+        results = await asyncio.gather(
+            *(fetch(p) for p in wanted), return_exceptions=True
+        )
+        for r in results:
+            if isinstance(r, tuple) and r[0] is not None:
+                peers.append(r[0])
+
+    ok, verdict = _resource_gate_verdict(
+        canary_stats, peers,
+        cpu_pct_max=float(getattr(settings, "rollout_resource_gate_cpu_pct_max", 12.0)),
+        cpu_ratio_max=float(getattr(settings, "rollout_resource_gate_cpu_ratio_max", 2.5)),
+        xact_ratio_max=float(getattr(settings, "rollout_resource_gate_xact_ratio_max", 3.0)),
+    )
+    logger.info("[CANARY-OBSERVE] resource gate %s: %s", "ok" if ok else "FAIL", verdict)
+    return ok, verdict
+
+
+# ─── Fleet visibility ─────────────────────────────────────────────
+#
+# `image_lag_seconds` on /v1/pool/health is `now - current_image_tag_ts` — how
+# long ago someone SET the tag. On 2026-09-07 it read 83405 while 30 of 74
+# assigned slots ran an image two generations old, and it would have read 83405
+# with every slot converged. `assigned_stale` is written only inside the
+# bridge's auto-upgrade branch, which is skipped while
+# BRIDGE_POOL_AUTO_UPGRADE_ASSIGNED=0 — so a PAUSED fleet and a CONVERGED fleet
+# are the same reading, and the pause (set on the bridge's root-only env at
+# 14:35) went unreported for nine hours. The bridge's `fleet` block answers the
+# real question; this is the platform side that watches it.
+
+# last_alert_ts / last_log_ts are None until the first one fires: seeding them
+# with 0.0 makes "never alerted" indistinguishable from "alerted at the epoch",
+# and every rate limiter that starts at 0 suppresses its own first alert for
+# the whole interval — which is the one alert an operator was waiting for.
+_FLEET_STATE: dict = {"split_since": None, "last_alert_ts": None, "last_log": "", "last_log_ts": None}
+_FLEET_LOG_INTERVAL_S = 600.0
+
+
+def _reset_fleet_watch_state() -> None:
+    """Test seam — the split clock is module state by design (the reconciler
+    is the only ticker and the platform runs one loop per replica)."""
+    _FLEET_STATE.update({"split_since": None, "last_alert_ts": None, "last_log": "", "last_log_ts": None})
+
+
+def _fleet_warnings(fleet: dict, split_for_s: float, *, split_alert_after_s: Optional[float] = None) -> list[str]:
+    """Which of the two conditions this fleet is in. Pure.
+
+    A split is NORMAL while a rollout converges (49 of 50 pool members inside
+    30 minutes, 2026-08-01) — it is only a fault once it stops moving, or once
+    the mechanism that would move it is switched off.
+    """
+    after = float(
+        split_alert_after_s
+        if split_alert_after_s is not None
+        else getattr(settings, "rollout_fleet_split_alert_after_s", 7200)
+    )
+    behind = int(fleet.get("assigned_on_other") or 0)
+    generic_behind = int(fleet.get("generic_on_other") or 0)
+    out: list[str] = []
+    if behind <= 0 and generic_behind <= 0:
+        return out
+    if not fleet.get("auto_upgrade_assigned", True) and behind > 0:
+        out.append(
+            f"assigned-slot auto-upgrade is OFF with {behind} slot(s) behind "
+            f"{fleet.get('current_image_tag') or 'the current tag'} — nothing will converge them"
+        )
+    elif split_for_s >= after:
+        out.append(
+            f"fleet split for {int(split_for_s // 60)} min: {behind} assigned + "
+            f"{generic_behind} generic slot(s) off {fleet.get('current_image_tag') or 'the current tag'}"
+        )
+    return out
+
+
+async def fleet_status(now: Optional[float] = None) -> dict:
+    """What the bridge says the fleet is running, plus how long it has said it.
+
+    Never raises. `available: False` means UNKNOWN — an older bridge or an
+    unreachable one — and is deliberately not the same shape as a converged
+    fleet, because reading "unknown" as "fine" is the failure this whole block
+    exists to end.
+    """
+    t = time.time() if now is None else now
+    body, why = await _bridge_get("/v1/pool/health", timeout_s=10.0)
+    if body is None:
+        return {"available": False, "fleet": None, "reason": f"bridge: {why}",
+                "split_for_seconds": 0, "warnings": []}
+    fleet = body.get("fleet")
+    if not isinstance(fleet, dict):
+        return {"available": False, "fleet": None,
+                "reason": "bridge /v1/pool/health carries no 'fleet' block (bridge predates the contract)",
+                "split_for_seconds": 0, "warnings": []}
+
+    split = int(fleet.get("assigned_on_other") or 0) + int(fleet.get("generic_on_other") or 0) > 0
+    if split:
+        if _FLEET_STATE["split_since"] is None:
+            _FLEET_STATE["split_since"] = t
+        split_for = max(0.0, t - float(_FLEET_STATE["split_since"]))
+    else:
+        _FLEET_STATE["split_since"] = None
+        split_for = 0.0
+
+    return {
+        "available": True,
+        "fleet": fleet,
+        "reason": "ok",
+        "split_for_seconds": int(split_for),
+        "warnings": _fleet_warnings(fleet, split_for),
+    }
+
+
+async def _fleet_watch_once(now: Optional[float] = None) -> None:
+    """One reconciler tick of fleet observation: log on change, page on fault.
+
+    Rate-limited on both halves — the reconciler ticks every 30 s, and a fleet
+    that has been split for nine hours must produce one page, not 1080.
+    """
+    t = time.time() if now is None else now
+    try:
+        st = await fleet_status(now=t)
+    except Exception:
+        logger.exception("[ROLLOUT-FLEET] status read failed")
+        return
+    if not st["available"]:
+        if _FLEET_STATE["last_log_ts"] is None or t - float(_FLEET_STATE["last_log_ts"]) >= _FLEET_LOG_INTERVAL_S:
+            _FLEET_STATE["last_log_ts"] = t
+            logger.info("[ROLLOUT-FLEET] unavailable: %s", st["reason"])
+        return
+
+    f = st["fleet"]
+    line = (
+        f"current={f.get('current_image_tag')} assigned_on_current={f.get('assigned_on_current')} "
+        f"assigned_on_other={f.get('assigned_on_other')} generic_on_other={f.get('generic_on_other')} "
+        f"auto_upgrade_assigned={f.get('auto_upgrade_assigned')} images={f.get('images')}"
+    )
+    if (line != _FLEET_STATE["last_log"] or _FLEET_STATE["last_log_ts"] is None
+            or t - float(_FLEET_STATE["last_log_ts"]) >= _FLEET_LOG_INTERVAL_S):
+        _FLEET_STATE["last_log"] = line
+        _FLEET_STATE["last_log_ts"] = t
+        logger.info("[ROLLOUT-FLEET] %s split_for=%ss", line, st["split_for_seconds"])
+
+    if not st["warnings"]:
+        return
+    interval = float(getattr(settings, "rollout_fleet_alert_interval_s", 21600))
+    if _FLEET_STATE["last_alert_ts"] is not None and t - float(_FLEET_STATE["last_alert_ts"]) < interval:
+        return
+    _FLEET_STATE["last_alert_ts"] = t
+    await _send_telegram("warning", "Fleet: " + "; ".join(st["warnings"]))
 
 
 # ─── Per-tenant upgrade + rollback ────────────────────────────────
@@ -806,7 +1178,19 @@ async def _drive_rollout(db: AsyncSession, rollout: Rollout) -> None:
         await db.commit()
 
     agent_url = await _agent_url(db, canary)
-    proceed = await _canary_observe_loop(db, rollout, canary, canary_attempt.prior_tag, agent_url)
+    # Heartbeat REQUIRED, for the same reason the canary UPGRADE above has one:
+    # the observation is a single await from the reconciler's point of view and
+    # it can legitimately outrun `_STUCK_HEARTBEAT_MIN` (3 min). Boot gate 75 s
+    # + stability hold 60 s + resource gate (two bounded bridge reads) + turn
+    # probe up to 120 s is already past 180 s on the happy path, so a healthy
+    # canary could be orphaned mid-observe and re-driven for no reason. Its own
+    # session per beat — an inline stamp through `db` went silent after ~5.5 min
+    # once already (2026-08-01), which is what `_heartbeating` documents itself
+    # as existing to prevent.
+    async with _heartbeating(rollout.id, "canary-observe"):
+        proceed = await _canary_observe_loop(
+            db, rollout, canary, canary_attempt.prior_tag, agent_url
+        )
     if not proceed:
         return
 
@@ -904,8 +1288,12 @@ async def _canary_observe_loop(
     signal it needs.
 
     Idempotent across resumer invocations: reads `resume_after` from the
-    rollout row, computes the remaining cap from there. If `resume_after`
-    is already past or `canary_wait_minutes=0`, short-circuits success.
+    rollout row and computes the remaining cap from there.
+    `canary_wait_minutes=0` (an explicit operator choice) short-circuits
+    success. A `resume_after` that has already PASSED does not: that is the
+    shape every reconciler resume arrives in, and it used to short-circuit
+    success too — the fleet batched onto an image nobody had observed. It now
+    re-arms the operator's window from now and observes.
     """
     if not agent_url or rollout.canary_wait_minutes <= 0:
         return True
@@ -913,11 +1301,19 @@ async def _canary_observe_loop(
     deadline = rollout.resume_after or datetime.utcnow()
     remaining_s = max(0.0, (deadline - datetime.utcnow()).total_seconds())
     if remaining_s <= 0:
-        logger.info(
-            "[ROLLOUT] %s canary observation deadline already passed — proceeding to batch",
-            rollout.id,
+        # The reconciler resumes a canary_observing rollout precisely when
+        # `resume_after` has passed (the driver died mid-observation), so this
+        # was the resume path's ONLY shape — and it returned True here, before
+        # `_observe_canary_signal` was ever called: no boot gate, no stability
+        # hold, no resource gate, no turn probe. The gate added for the
+        # 2026-09-06 incident lives inside that call and had no say. Observe
+        # now, with the operator's full window measured from this moment.
+        remaining_s = float(rollout.canary_wait_minutes) * 60.0
+        logger.warning(
+            "[ROLLOUT] %s canary observation deadline already passed — "
+            "observing now with the full %.0fs window before batching",
+            rollout.id, remaining_s,
         )
-        return True
 
     logger.info(
         "[ROLLOUT] %s canary signal-based observe (cap=%.0fs)",
@@ -935,8 +1331,26 @@ async def _canary_observe_loop(
         canary_key = _row.scalar_one_or_none()
     except Exception:
         logger.warning("[ROLLOUT] %s could not resolve canary agent key — turn probe skipped", rollout.id)
+    # The resource gate's comparison group: the other tenants in this rollout,
+    # which are still on the prior tag while the canary is observed. That is a
+    # live A/B — the same discriminator that separated 18.0 % from 3.25 % on
+    # the host after the fact, available before the fleet is batched.
+    peer_prefixes: list[str] = []
+    try:
+        peers = await _running_tenants(db)
+        peer_prefixes = [
+            c.user_id[:8] for c in peers
+            if c.user_id and c.id != canary.id
+        ]
+    except Exception:
+        logger.warning(
+            "[ROLLOUT] %s could not list peers for the resource gate — "
+            "the absolute ceiling still applies", rollout.id,
+        )
     passed, reason = await _observe_canary_signal(
         agent_url, cap_seconds=remaining_s, agent_key=canary_key,
+        canary_prefix=(canary.user_id or "")[:8] or None,
+        peer_prefixes=peer_prefixes,
     )
     if passed:
         logger.info("[ROLLOUT] %s canary %s", rollout.id, reason)
@@ -1108,6 +1522,14 @@ async def rollout_reconciler_loop() -> None:
             await _convergence_sweep_once()
         except Exception:
             logger.exception("[ROLLOUT-SWEEP] tick failed; will retry")
+        # Fleet watch — its own try/except for the same reason the sweep has
+        # one: a bridge blip must not take down the loop that resumes rollouts.
+        # Rate-limited internally; the reconciler's 30s cadence is not its
+        # logging cadence.
+        try:
+            await _fleet_watch_once()
+        except Exception:
+            logger.exception("[ROLLOUT-FLEET] tick failed; will retry")
         # NOTE (bulletproof plan M): the legacy prewarm reconciler
         # (`reconcile_stuck_provisioning`) used to piggy-back here. It was
         # removed — `pool_service.reclaim_stranded_users` (180s tick in the
@@ -1712,7 +2134,12 @@ async def _resume_rollout_task(rollout_id: str) -> None:
         )).scalar_one_or_none()
 
         agent_url = await _agent_url(db, canary)
-        proceed = await _canary_observe_loop(db, rollout, canary, prior, agent_url)
+        # Now that a passed deadline is observed rather than waved through,
+        # this await lasts boot + stability + gate + turn probe — past the
+        # reconciler's 180 s heartbeat threshold on the happy path, exactly
+        # as in _drive_rollout. Same beat, same reason.
+        async with _heartbeating(rollout.id, "canary-observe-resumed"):
+            proceed = await _canary_observe_loop(db, rollout, canary, prior, agent_url)
         if not proceed:
             return
 

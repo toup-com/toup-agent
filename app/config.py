@@ -1173,6 +1173,10 @@ class Settings(BaseSettings):
     # Ask pool_service to adopt a user stranded with no agent_url at all,
     # once per held connection. Defensive import — the hook may not exist.
     agent_ws_proxy_hold_adopts_stranded: bool = True
+    # #720: read the client's socket while dialing the agent so a client that
+    # gives up mid-dial is never answered with a replay it cannot settle.
+    # AGENT_WS_PROXY_DIAL_WATCH=false restores the unwatched dial (rollback).
+    agent_ws_proxy_dial_watch: bool = True
     # Storage backend for generated files. "local" writes to {agent_workspace_dir}/generated/.
     # "s3" is stubbed for a follow-up PR.
     files_storage_backend: str = "local"
@@ -2380,6 +2384,45 @@ class Settings(BaseSettings):
     # not a rollout gate: flip via ROLLOUT_CONVERGENCE_SWEEP=false if a
     # sweep ever misbehaves. Pinned in tests/test_rollout_convergence_sweep.py.
     rollout_convergence_sweep: bool = True
+    # ── Canary resource gate (2026-09-06 incident) ─────────────
+    # Rollout 48191bdd promoted image a962b7340717 with "7 ok, 0 failed" and
+    # health_checks_passed=3 on every attempt. That image's voice supervisor
+    # opened 3 connections + 3 SELECTs per second on every container, bound or
+    # not; nine hours later the 41 user containers carrying it measured 18.0 %
+    # CPU and 6.99 xact/s each against 3.25 % / 1.46 xact/s for the image they
+    # replaced, the host sat at load 42-55 on 16 cores and tenant Postgres hit
+    # 302 of max_connections=300. Every gate the rollout owns was green, because
+    # every gate asks whether the agent ANSWERS, never what it COSTS at rest.
+    # This one reads `GET /v1/tenants/{prefix}/stats` from the bridge for the
+    # canary and for peers still on the prior tag, during the stability hold.
+    rollout_resource_gate_enabled: bool = True
+    # A canary we cannot measure is not a canary that passed: an unavailable
+    # gate FAILS the rollout. Set ROLLOUT_ALLOW_NO_RESOURCE_GATE=1 to ship
+    # anyway (a bridge older than the /stats route, an emergency roll) — it is
+    # deliberately an explicit operator act, logged in the rollout notes.
+    rollout_allow_no_resource_gate: bool = False
+    # Absolute ceiling. 12 % sits between the measured idle baseline (3-5 %)
+    # and the incident (18 %), and applies even with no peer to compare against.
+    rollout_resource_gate_cpu_pct_max: float = 12.0
+    # Relative ceilings against the median of the peers still on the prior tag.
+    # The incident was 5.5x on CPU and 4.8x on transactions; 2.5x/3x leave room
+    # for a genuinely busier tenant without leaving room for a polling loop.
+    rollout_resource_gate_cpu_ratio_max: float = 2.5
+    rollout_resource_gate_xact_ratio_max: float = 3.0
+    # How many peers to sample. The comparison group is the OTHER dedicated
+    # tenants in the same rollout, which are still on the prior tag while the
+    # canary is being observed — a real A/B, not a historical baseline.
+    rollout_resource_gate_peer_sample: int = 6
+    rollout_resource_gate_timeout_s: float = 20.0
+    # Fleet-split watch. `image_lag_seconds` is `now - current_image_tag_ts`
+    # (how long ago a tag was SET), so it reads 83405 whether every slot is
+    # converged or 30 of 74 are two images behind — which is what it read on
+    # 2026-09-07 while 30 were. The bridge's `fleet` block answers the real
+    # question; these two decide when a split stops being a rollout in flight
+    # and becomes a fleet nobody is converging. 2 h is past every measured
+    # convergence window (49 of 50 pool members inside 30 min, 2026-08-01).
+    rollout_fleet_split_alert_after_s: int = 7200
+    rollout_fleet_alert_interval_s: int = 21600
     infra_alert_telegram_token: str = ""    # Dedicated infra bot (split from admin_alert_*)
     infra_alert_telegram_chat_id: str = ""
 

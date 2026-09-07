@@ -891,11 +891,18 @@ def test_the_voice_route_spawns_the_refresh_off_the_response_path():
 
 def test_the_rollover_is_registered_hourly_and_on_a_CRON_trigger():
     """RC3.1: an interval trigger's first fire is measured from scheduler
-    start, and this fleet is recreated more often than an hour."""
+    start, and this fleet is recreated more often than an hour.
+
+    The literal moved on 2026-09-07 (`_MMCron(minute=5)` →
+    `_mm_hourly_cron("current_context_rollover")`) because minute 5 named the
+    same second in all ~95 containers — see tests/test_tenant_cron_spread.py.
+    The invariant this test exists for is unchanged and asserted below: the
+    trigger is still WALL-CLOCK, never an interval.
+    """
     src = _src("agent_main.py")
     assert '"current_context_rollover"' in src
     block = src[src.index('"current_context_rollover"'):]
-    assert "_MMCron(minute=5)" in block[:400]
+    assert '_mm_hourly_cron("current_context_rollover")' in block[:400]
     assert "IntervalTrigger" not in block[:400]
     assert "_IT(" not in block[:400]
 

@@ -297,6 +297,141 @@ async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: st
     return await resolve_day_chat_id_for_now(db_session, user_id, tz_override=tz_override)
 
 
+class _PresaveWithoutConversation(Exception):
+    """The client's `session_id` names no conversation on this tenant and this
+    handler may not invent one. Not an error — the run's own save owns the
+    message. Caught separately from the generic pre-save failure so a routine,
+    expected deferral never reads as a broken write in the logs."""
+
+
+async def _ensure_presave_conversation(
+    db_session,
+    user_id: str,
+    session_id: str,
+    channel: Optional[str],
+    client_tz: Optional[str] = None,
+):
+    """Return the `Conversation` row the pre-save may stamp on the message.
+
+    `messages.conversation_id` is NOT NULL with an FK onto `conversations.id`,
+    and the pre-save below stamped it with the CLIENT's `session_id` while only
+    ever SELECTing that row — never creating it. A client can legitimately hold
+    a `session_id` this tenant has no row for: the mobile client persists the
+    last id in SecureStore and never clears it (`sessionStore.ts`'s
+    `clearSessionId` has no callers), so the first message after a signup, a
+    re-install onto a new tenant, or an account switch carries a stranger's id.
+    Observed live on 2026-09-07 15:00:13.4Z on a brand-new tenant:
+    `[WS] Failed to pre-save user message: ForeignKeyViolation conversation_id
+    … not present in "conversations"`. The message was therefore never
+    persisted and no `user_message_persisted` ack was sent, so the installed
+    client's ledger kept it PENDING and re-sent it on the next reconnect.
+
+    Creating the row with `id=session_id` — rather than letting the run mint a
+    fresh one — is what makes the run REUSE it: `AgentRunner
+    ._get_or_create_session` looks the session up by `(id, user_id)` first and
+    returns it when the channel matches and it is the same local day, which is
+    exactly the row written here.
+
+    Raises `_PresaveWithoutConversation` when the pre-save must be deferred:
+
+    * `session_id` is not a UUID — the `app-{id}` bridge shim and anything else
+      the runner deliberately normalises away. `conversations.id` is
+      `String(36)`; inventing a row for those would fight the shim.
+    * the channel is one of `INDEXED_SYSTEM_CHANNELS` — those rows are governed
+      by a partial unique index and have ONE writer,
+      `resolve_or_create_day_conversation`. A blind insert here would either
+      collide with it or become a second writer.
+    * the insert loses a race or the tenant has no `users` row yet.
+    """
+    import uuid as _uuid_pc
+    from sqlalchemy import select as _select_pc
+    from sqlalchemy.exc import SQLAlchemyError as _SAError_pc
+    from app.db.models import Conversation as _Conversation_pc
+
+    async def _lookup():
+        return (await db_session.execute(
+            _select_pc(_Conversation_pc).where(
+                _Conversation_pc.id == session_id,
+                _Conversation_pc.user_id == user_id,
+            )
+        )).scalar_one_or_none()
+
+    existing = await _lookup()
+    if existing is not None:
+        return existing
+
+    try:
+        _uuid_pc.UUID(str(session_id))
+    except (ValueError, AttributeError, TypeError):
+        raise _PresaveWithoutConversation(
+            "session_id is not a UUID (bridge shim or legacy form)"
+        )
+
+    from app.agent.channel_util import resolve_channel as _resolve_channel_pc
+    from app.agent.conversation_resolver import (
+        INDEXED_SYSTEM_CHANNELS as _INDEXED_PC,
+    )
+
+    _channel = _resolve_channel_pc(
+        explicit=channel, user_id=user_id, site="ws_presave",
+    )
+    if _channel in _INDEXED_PC:
+        raise _PresaveWithoutConversation(
+            f"channel {_channel!r} is index-governed; its resolver owns the row"
+        )
+
+    # The OTHER foreign key on `conversations` is onto `users`, and a
+    # container bound milliseconds before the first message may not have that
+    # row yet. Ask before writing, because the failure is not merely an
+    # IntegrityError to catch: `resolve_day_chat_id_for_now` below swallows its
+    # own flush error and answers None, which leaves the transaction ABORTED —
+    # every later statement then dies with InFailedSQLTransactionError, a class
+    # no IntegrityError handler sees. (Found by the falsifier, not by reading.)
+    from app.db.models import User as _User_pc
+
+    if (await db_session.execute(
+        _select_pc(_User_pc.id).where(_User_pc.id == user_id)
+    )).scalar_one_or_none() is None:
+        raise _PresaveWithoutConversation(
+            "tenant has no users row for this owner yet"
+        )
+
+    _day_chat_id = None
+    try:
+        _day_chat_id = await _resolve_day_chat_id_for_now(
+            db_session, user_id, tz_override=client_tz,
+        )
+    except Exception as _dce:  # noqa: BLE001 — the hint is optional
+        logger.debug("[WS] pre-save day-chat hint unavailable: %s", _dce)
+        _day_chat_id = None
+
+    db_session.add(_Conversation_pc(
+        id=session_id,
+        user_id=user_id,
+        channel=_channel,
+        is_active=True,
+        day_chat_id=_day_chat_id,
+    ))
+    try:
+        await db_session.flush()
+    except _SAError_pc as _ie:
+        # Two sockets can pre-save the same new session in the same instant.
+        # Nothing else of this pre-save has been staged yet, so a full rollback
+        # is the cheapest way back to a usable transaction.
+        await db_session.rollback()
+        raced = await _lookup()
+        if raced is not None:
+            return raced
+        raise _PresaveWithoutConversation(f"conversation insert rejected: {_ie}")
+
+    logger.info(
+        "[WS] pre-save created conversation %s for user=%s channel=%s "
+        "(client held a session id this tenant did not have)",
+        session_id, user_id[:8], _channel,
+    )
+    return await _lookup()
+
+
 # ── CONTRACTS-R31 §4.1 — the automation-session refusal ──────────────
 #
 # The first build that speaks the thread route. Below it the app can only
@@ -3464,7 +3599,7 @@ async def ws_chat(
                 if session_id and not _is_system_action:
                     try:
                         from app.db.database import async_session_maker
-                        from app.db.models import Message as DbMessage, Conversation
+                        from app.db.models import Message as DbMessage
                         # Idempotency: derive a deterministic UUID from
                         # (user_id, client_msg_id). If the client retries the
                         # same message after a dropped WS, the same derived
@@ -3520,6 +3655,14 @@ async def ws_chat(
                                     # never told to wait on a phantom turn.
                                     _clear_active_turn(user_id, _turn_mission_id)
                                     continue
+                            # The conversation must EXIST before a message can
+                            # name it — `messages.conversation_id` is NOT NULL
+                            # with an FK, and this block only ever SELECTed the
+                            # row. See `_ensure_presave_conversation`.
+                            _conv = await _ensure_presave_conversation(
+                                _presave_db, user_id, session_id, channel,
+                                client_tz=client_tz,
+                            )
                             _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
                             # Build kwargs defensively: omit reply_to_message_id
                             # when None so SQLAlchemy doesn't reference the
@@ -3541,9 +3684,6 @@ async def ws_chat(
                             _new_msg = DbMessage(**_msg_kwargs)
                             _presave_db.add(_new_msg)
                             # Update conversation timestamp
-                            _conv = (await _presave_db.execute(
-                                __import__('sqlalchemy').select(Conversation).where(Conversation.id == session_id)
-                            )).scalar_one_or_none()
                             if _conv:
                                 _conv.message_count = (_conv.message_count or 0) + 1
                                 _conv.updated_at = __import__('datetime').datetime.utcnow()
@@ -3567,6 +3707,14 @@ async def ws_chat(
                                         "Run init_db / migration 049 to enable persistence.",
                                     )
                                     await _presave_db.rollback()
+                                    # The rollback also undid the conversation
+                                    # this pre-save may have just created — it
+                                    # was flushed, not committed — so the retry
+                                    # would hit the same FK the fix exists for.
+                                    _conv = await _ensure_presave_conversation(
+                                        _presave_db, user_id, session_id, channel,
+                                        client_tz=client_tz,
+                                    )
                                     _msg_kwargs.pop("reply_to_message_id", None)
                                     _new_msg = DbMessage(**_msg_kwargs)
                                     _presave_db.add(_new_msg)
@@ -3599,6 +3747,14 @@ async def ws_chat(
                                 })
                             except Exception:
                                 pass
+                    except _PresaveWithoutConversation as _pnc:
+                        # Expected, not broken: the run's own save owns this
+                        # message (`save_user_message` below reads
+                        # `_user_msg_presaved`, still False here).
+                        logger.info(
+                            "[WS] pre-save deferred to the run — %s (user=%s session=%s)",
+                            _pnc, user_id[:8], session_id,
+                        )
                     except Exception as _pse:
                         logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
 

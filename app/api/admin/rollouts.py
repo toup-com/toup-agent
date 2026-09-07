@@ -5,6 +5,9 @@ Endpoints:
   POST   /api/admin/rollout/start         CI webhook (X-Rollout-Secret)
   POST   /api/admin/rollout/manual        Admin-authenticated manual trigger
   GET    /api/admin/rollout/latest        Active rollout (or most recent)
+  GET    /api/admin/rollout/fleet         Which images the fleet is on, per
+                                          the bridge — and whether a split
+                                          has stopped converging
   GET    /api/admin/rollout/{id}          Rollout with full attempt breakdown
   POST   /api/admin/rollout/{id}/cancel   Mark in-flight rollout cancelled
   POST   /api/admin/rollout/force-orphan  Force any active rollout → aborted_orphan
@@ -377,6 +380,27 @@ async def set_canary(
         "canary": {"user_id": target.id, "email": target.email},
         "previous": ({"user_id": previous.id, "email": previous.email} if previous else None),
     }
+
+
+@router.get("/fleet")
+async def get_fleet(_=Depends(require_admin)):
+    """What the fleet is actually running, and for how long it has been split.
+
+    The question this answers could not be asked from the platform before.
+    `/v1/pool/health.image_lag_seconds` is `now - current_image_tag_ts` — how
+    long ago a tag was SET — so on 2026-09-07 it read 83405 while 30 of 74
+    assigned slots ran an image two generations old, and it would have read
+    83405 with the fleet fully converged. `assigned_stale` is written only
+    inside the bridge's auto-upgrade branch, which is skipped while
+    BRIDGE_POOL_AUTO_UPGRADE_ASSIGNED=0, so a PAUSED fleet reads exactly like a
+    converged one. 41 users sat on the hot image for nine hours with nothing
+    reporting it.
+
+    `available: false` means UNKNOWN (an older bridge, or an unreachable one) —
+    never "converged". Same shape the reconciler's fleet watch alerts on.
+    """
+    from app.services.rollout_service import fleet_status
+    return await fleet_status()
 
 
 @router.get("/latest", response_model=RolloutSummaryResp)

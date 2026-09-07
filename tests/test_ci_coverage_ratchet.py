@@ -403,7 +403,12 @@ def test_debt_is_not_growing_silently():
     # main red the moment R43 merged; the third shipped WITHOUT its entry and
     # failed in the platform sweep with "no such table: automations" — the
     # exact failure the R42 note above was written to prevent.
-    CEILING = 98
+    # Wave 1 of the 2026-09-06 incident (+1): test_signup_trace_register_hop.py
+    # registers for real, and create_user seeds `identities` (AGENT_ONLY); its
+    # sibling test_signup_trace_wiring.py needs `managed_containers`
+    # (PLATFORM_ONLY). One suite, two exclusive tables, so the register hop was
+    # split into the agent-mode step. ROUTING entry; it RUNS there.
+    CEILING = 99
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

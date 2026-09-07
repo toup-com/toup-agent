@@ -190,7 +190,29 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
 # definitions, surfacing as "column X of relation Y does not exist"
 # the moment a new feature column was referenced (e.g. routines.schedule_kind
 # from migration 042 broke every reminder create call).
+#
+# "Loud in stdout for the operator" was not true enough to be useful, and
+# measured read-only on the production host on 2026-09-07 the upgrade is
+# failing on EVERY container sampled — the canary 533354ce, the bound slot
+# pool-47 and the generic slot pool-85 all log
+# `sqlalchemy.exc.ProgrammingError: (psycopg2.errors.DuplicateTable) relation
+# "users" already exists` from inside the FIRST migration, and none of their
+# tenant databases has an `alembic_version` relation at all
+# (`SELECT to_regclass('alembic_version')` → NULL on all three). The schema
+# those containers actually run comes from `app/db/database.py`'s
+# ADD COLUMN IF NOT EXISTS self-heal, not from this line. The old `|| echo`
+# emitted one sentence, mid-boot, with no marker a health check could read,
+# so the state was invisible to every instrument the fleet has.
+#
+# So: record the OUTCOME where something can read it. The marker file is what
+# `/agent/health`'s `schema.alembic_boot` reports (see `agent_schema_status`
+# in agent_main.py); `TOUP_ALEMBIC_BOOT_MARKER` overrides its path for tests.
+# This changes observability ONLY — the swallow stays, deliberately, because
+# whether the mechanism of record is alembic or the self-heal is a separate
+# decision. See the PR body.
+#
 # Ensure the workspace/skills are owned by `toup` (uid 1000) at boot — a dropped
 # `exec` runs as toup and must read+write them. Covers the case where a runtime
 # mount arrives owned by another uid. Best-effort; never fails boot.
-CMD ["bash", "-c", "chown -R toup:toup /app/workspace /app/skills 2>/dev/null || true; alembic upgrade head || echo '[boot] alembic upgrade failed — continuing without applying migrations; check logs above'; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]
+ENV TOUP_ALEMBIC_BOOT_MARKER=/tmp/toup-alembic-boot
+CMD ["bash", "-c", "chown -R toup:toup /app/workspace /app/skills 2>/dev/null || true; if alembic upgrade head; then _toup_alembic=ok; else _toup_alembic=failed; fi; echo \"$_toup_alembic\" > \"$TOUP_ALEMBIC_BOOT_MARKER\" 2>/dev/null || true; echo \"[boot] ALEMBIC_BOOT=$_toup_alembic — see /agent/health .schema; a 'failed' here means this tenant DB is served by database.py self-heal, not by the migration chain\"; exec uvicorn agent_main:app --host 0.0.0.0 --port 8001"]

@@ -84,6 +84,90 @@ _boot_progress = {"percent": 0, "phase": "starting", "ready": False}
 #: exposes the full text. None on a clean boot.
 _agent_init_error: "str | None" = None
 
+
+# ── Schema delivery: is the migration chain alive on this tenant? ──
+#
+# Measured read-only on the production host 2026-09-07: `alembic upgrade head`
+# fails inside the FIRST migration on every container sampled — the canary
+# 533354ce, the bound pool slot 47 and the generic slot 85 all log
+# `(psycopg2.errors.DuplicateTable) relation "users" already exists`, and none
+# of their tenant databases has an `alembic_version` relation at all. The
+# schema those containers run comes from `app/db/database.py`'s
+# ADD COLUMN IF NOT EXISTS self-heal. Dockerfile.agent's `|| echo` swallowed
+# the failure into one sentence mid-boot, so nothing the fleet can query knew.
+#
+# No user impact today. The cost is future: a schema change shipped ONLY as an
+# alembic migration silently does not apply, fleet-wide, and the round's
+# "databases stay migratable" guarantee is not real. This makes the state
+# READABLE — it deliberately does not change the mechanism, which is a separate
+# decision (see the PR body: `alembic stamp head` vs. making the self-heal
+# canonical).
+#
+# Cached: one query per process. The answer cannot change without a restart —
+# the upgrade runs once, before uvicorn.
+_ALEMBIC_BOOT_MARKER_ENV = "TOUP_ALEMBIC_BOOT_MARKER"
+_ALEMBIC_BOOT_MARKER_DEFAULT = "/tmp/toup-alembic-boot"
+_schema_status_cache: "dict | None" = None
+
+
+def read_alembic_boot_marker(path: "str | None" = None) -> str:
+    """What the boot CMD recorded: 'ok', 'failed', or 'unknown'.
+
+    'unknown' is an honest third value, not a synonym for ok: an image built
+    before the marker existed, a read-only /tmp, or a process started some
+    other way all land here, and reporting those as healthy is exactly the
+    blindness this exists to remove.
+    """
+    import os
+
+    try:
+        target = path or os.environ.get(
+            _ALEMBIC_BOOT_MARKER_ENV, _ALEMBIC_BOOT_MARKER_DEFAULT
+        )
+        with open(target, "r", encoding="utf-8") as fh:
+            value = fh.read().strip().lower()
+        return value if value in ("ok", "failed") else "unknown"
+    except Exception:  # noqa: BLE001 — a health field may never raise
+        return "unknown"
+
+
+async def read_alembic_version() -> "str | None":
+    """The revision stamped on THIS tenant DB, or None when the table is absent.
+
+    None is the production answer today on every container sampled, and it is
+    the difference between "migrations ran" and "migrations were attempted".
+    """
+    try:
+        from sqlalchemy import text as _sql_text
+        from app.db.database import async_session_maker as _sm
+
+        async with _sm() as _db:
+            if not await _db.scalar(_sql_text("SELECT to_regclass('alembic_version')")):
+                return None
+            return await _db.scalar(_sql_text("SELECT version_num FROM alembic_version LIMIT 1"))
+    except Exception:  # noqa: BLE001 — a health field may never raise
+        return None
+
+
+async def agent_schema_status(refresh: bool = False) -> dict:
+    """`/agent/health`'s `schema` object. Diagnostic ONLY — law 1: nothing may
+    gate service on a label. The rollout canary and the bridge health tick read
+    it; neither restarts on it."""
+    global _schema_status_cache
+    if _schema_status_cache is not None and not refresh:
+        return _schema_status_cache
+    boot = read_alembic_boot_marker()
+    version = await read_alembic_version()
+    _schema_status_cache = {
+        "alembic_boot": boot,
+        "alembic_version": version,
+        # BOTH halves: a container whose upgrade exited 0 because there was
+        # nothing to do still has no chain if the table is absent, and a
+        # stamped table proves nothing if this boot's upgrade blew up.
+        "alembic_ok": boot == "ok" and version is not None,
+    }
+    return _schema_status_cache
+
 # ── Paths that skip API key auth (health checks, root) ─────────────
 # Pool admin endpoints (`/api/admin/bind` etc.) are public to the
 # X-Agent-Key middleware but enforce their own POOL_ADMIN_TOKEN check
@@ -1159,7 +1243,19 @@ async def lifespan(app: FastAPI):
             and cron_service
             and cron_service.scheduler
         ):
-            from apscheduler.triggers.cron import CronTrigger as _MMCron
+            # Wall-clock triggers, but on THIS tenant's own second of the
+            # hour. `_MMCron(minute=0)` named the same instant in all ~95
+            # containers: measured 2026-09-07, four independent containers
+            # fired day_archival at 15:00:00.023–15:00:00.438Z. That burst
+            # stalled a new tenant's first turn (its own scheduler logged the
+            # job "was missed by 0:00:05.77"; the platform saw a 7 s WS accept
+            # and two ReadTimeouts). The reasoning for keeping the wall clock —
+            # and for a HASHED offset rather than APScheduler `jitter` — is
+            # recorded at `spread_hourly_cron` in app/scripts/scheduled_tasks.py.
+            from app.scripts.scheduled_tasks import (
+                spread_daily_cron as _mm_daily_cron,
+                spread_hourly_cron as _mm_hourly_cron,
+            )
 
             _mm_jobs = []
             try:
@@ -1192,7 +1288,10 @@ async def lifespan(app: FastAPI):
                         # start, and the fleet is recreated on every merge to
                         # main (median gap 0.3h at the 2026-08 audit) — so an
                         # interval job never fired once.
-                        _MMCron(hour=settings.consolidation_cron_hour, minute=0),
+                        _mm_daily_cron(
+                            "memory_consolidation",
+                            hour=settings.consolidation_cron_hour,
+                        ),
                     ),
                     # Current context's day rollover (memory v3 §6). HOURLY
                     # and CRON — hourly because a fleet of users in every
@@ -1204,7 +1303,7 @@ async def lifespan(app: FastAPI):
                     (
                         "current_context_rollover",
                         _context_rollover,
-                        _MMCron(minute=5),
+                        _mm_hourly_cron("current_context_rollover"),
                     ),
                     # retrieval_feedback_analysis is RETIRED with sentence
                     # retrieval (memory v3 §3.1). It read `retrieval_events`,
@@ -1227,7 +1326,11 @@ async def lifespan(app: FastAPI):
                     # hourly interval also never fires on a fleet that
                     # restarts more often than hourly.
                     _mm_jobs.append(
-                        ("day_archival", run_end_of_day_archival, _MMCron(minute=0))
+                        (
+                            "day_archival",
+                            run_end_of_day_archival,
+                            _mm_hourly_cron("day_archival"),
+                        )
                     )
             except Exception as e:
                 print(f"⚠️ Memory maintenance imports failed: {e}")
@@ -1241,6 +1344,12 @@ async def lifespan(app: FastAPI):
                         id=_mm_id,
                         name=f"Memory Maintenance: {_mm_id}",
                         replace_existing=True,
+                        # APScheduler's default grace is ONE SECOND, so the
+                        # 5.77 s miss recorded on 2026-09-07 did not run late —
+                        # it did not run at all, and said so in one log line
+                        # nobody reads. A missed archival is a day with no
+                        # summary; five minutes of grace is cheap.
+                        misfire_grace_time=300,
                     )
                     _mm_registered.append(_mm_id)
                 except Exception as e:
@@ -2181,6 +2290,12 @@ async def agent_health():
         _turn_ready = _ws_chat_mod._agent_runner is not None
     except Exception:
         _turn_ready = False
+    # Schema delivery — see `agent_schema_status`. Cached after the first call.
+    try:
+        _schema = await agent_schema_status()
+    except Exception:
+        _schema = {"alembic_boot": "unknown", "alembic_version": None,
+                   "alembic_ok": False}
     # How many chat turns are in flight right now (count only — no identities).
     # The rollout reads this to DEFER an upgrade rather than SIGKILL a live
     # reply (round 24 turn-safety). Best-effort: a read that fails must never
@@ -2213,6 +2328,7 @@ async def agent_health():
         "has_session_secret": _has_session_secret,
         "db_ok": _db_ok,
         "db_recoveries": _db_recoveries,
+        "schema": _schema,
         # Reports the actual resolved default — what the runtime will use —
         # not just the raw settings field. Closes the gap where /agent/health
         # advertised a stale model after a settings.agent_model bump.

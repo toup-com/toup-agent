@@ -378,3 +378,79 @@ def test_the_file_still_satisfies_the_ci_deploy_hook():
     assert size >= 10000, f"ci-deploy.sh rejects files < 10000 bytes; this is {size}"
     with tempfile.NamedTemporaryFile(suffix=".pyc") as out:
         py_compile.compile(str(BRIDGE), cfile=out.name, doraise=True)
+
+
+# ── one HTTP client per process, not one per member ──────────────
+
+HTTP_CLIENT_CTORS = {"httpx.AsyncClient", "httpx.Client"}
+HTTP_CLIENT_FACTORIES = {"_ahttp", "_shttp"}
+
+
+def test_http_clients_are_built_in_one_place(tree):
+    """`httpx.AsyncClient()` runs `ssl.create_default_context()` in its
+    constructor — 40.3 ms of CPU MEASURED on the bridge host's own
+    interpreter — for every client, used or not. Every probe in this file is
+    `http://127.0.0.1:<port>`, so the context is never used.
+
+    Built per member per tick (84 health checks + 74 authenticated probes at
+    the 2026-09-07 fleet size) that is 6.37 s of CPU on the EVENT-LOOP
+    THREAD every 30 s, which `_offload` cannot help with: it is not a
+    subprocess, it is Python on the loop. Production, same day, 129 samples
+    of the loopback static `/v1/health`: p50 7 ms, 9 % over 1 s, max 4.60 s,
+    5-9 s of main-thread CPU per tick.
+
+    So the constructors live in exactly two factories and nowhere else.
+    """
+    funcs = _functions(tree)
+    offenders = []
+    for name, info in funcs.items():
+        if name in HTTP_CLIENT_FACTORIES:
+            continue
+        for call, lineno in info["calls"]:
+            if call in HTTP_CLIENT_CTORS:
+                offenders.append(f"pool_addon.py:{lineno} {name}() -> {call}()")
+    assert not offenders, (
+        "these build their own httpx client instead of reusing the shared "
+        "one; each costs a 40 ms ssl.create_default_context() on the calling "
+        "thread, and the reconciler does it once per member per tick:\n  "
+        + "\n  ".join(sorted(offenders))
+    )
+
+
+def test_the_shared_client_factories_exist_and_are_used(tree):
+    """Anti-vacuity for the guard above: the factories must exist, must be
+    the only constructors, and must actually be called by the probe paths."""
+    funcs = _functions(tree)
+    for fac in HTTP_CLIENT_FACTORIES:
+        assert fac in funcs, f"{fac}() is gone — the guard above is vacuous"
+        built = {c for c, _ in funcs[fac]["calls"]} & HTTP_CLIENT_CTORS
+        assert built, f"{fac}() no longer constructs a client"
+    for caller in ("_health_check", "_authenticated_probe",
+                   "_wait_for_lobby_health", "_call_admin_bind"):
+        assert caller in funcs, f"{caller} not found"
+        used = {c for c, _ in funcs[caller]["calls"]} & HTTP_CLIENT_FACTORIES
+        assert used, (
+            f"{caller}() does not go through the shared client factory — it "
+            f"is back to building one per call, which is the whole defect"
+        )
+
+
+def test_the_reconciler_gathers_are_bounded(tree):
+    """`asyncio.gather` over 84 members schedules 84 first-steps in ONE loop
+    iteration. Even with the SSL cost gone, that makes the tick's first
+    slice grow with the fleet; the semaphore keeps each slice small and
+    bounds open file descriptors. It must NOT be on the bind or lobby paths
+    — a signup cannot be made to queue behind 84 health probes."""
+    funcs = _functions(tree)
+    for probe in ("_health_check", "_authenticated_probe"):
+        src = ast.get_source_segment(BRIDGE.read_text("utf-8"), funcs[probe]["node"]) or ""
+        assert "_probe_sem" in src, (
+            f"{probe}() no longer takes the probe semaphore; a gather over "
+            f"the whole fleet is unbounded again"
+        )
+    for hot in ("_call_admin_bind", "_wait_for_lobby_health"):
+        src = ast.get_source_segment(BRIDGE.read_text("utf-8"), funcs[hot]["node"]) or ""
+        assert "_probe_sem" not in src, (
+            f"{hot}() took the probe semaphore — a claim would now wait "
+            f"behind the reconciler's fleet-wide health pass"
+        )

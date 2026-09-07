@@ -69,6 +69,26 @@ def test_the_list_is_not_empty():
     assert len(flags) >= 5, f"only parsed {len(flags)} flags: {flags}"
 
 
+# Flags read by the AGENT IMAGE but not by this checkout's Settings.
+#
+# The guard below assumes the fleet image is built from the same tree as
+# this test. That assumption failed on 2026-09-06 and has not been true
+# since: the running image (7edaed3ab644) is built from
+# codex/mobile-voice-agent-runtime, six commits main does not have, and it
+# is that image's config.py — not this one — that reads
+# VOICE_TASKS_ENABLED.
+#
+# The name must still be in `_FEATURE_FLAG_ENVS`: the bridge's
+# BRIDGE_VOICE_TASKS_FORCE_OFF branch lives inside `for k in
+# _FEATURE_FLAG_ENVS`, so without membership the voice runtime's only
+# emergency rollback is unreachable code, and neither recreate path strips
+# the fossil value a container was born with.
+#
+# Spelled out one name at a time on purpose — a typo is still a failure,
+# which is what this guard is for.
+IMAGE_SIDE_FLAGS = frozenset({"VOICE_TASKS_ENABLED"})
+
+
 @pytest.mark.parametrize("flag", _forwarded_flags())
 def test_forwarded_flag_maps_to_a_real_settings_field(flag: str):
     """A forwarded env var with no Settings field is dead weight.
@@ -77,10 +97,31 @@ def test_forwarded_flag_maps_to_a_real_settings_field(flag: str):
     not exist the container receives an env var nothing reads, so the
     feature it was meant to enable stays off with no error anywhere.
     """
+    if flag in IMAGE_SIDE_FLAGS:
+        pytest.skip(f"{flag} is read by the agent image, not by this tree")
     field = flag.lower()
     assert field in Settings.model_fields, (
         f"bridge forwards {flag} but there is no settings.{field} — the "
         f"container gets an env var nothing reads, so the flag does nothing"
+    )
+
+
+@pytest.mark.parametrize("flag", sorted(IMAGE_SIDE_FLAGS))
+def test_an_image_side_exemption_is_real_and_still_needed(flag: str):
+    """Two ways the exemption above can rot, both caught here.
+
+    It must name a flag the bridge actually forwards (so it cannot cover a
+    typo), and it must stop existing the moment the field lands on this
+    tree — an exemption that is no longer needed is a hole in the guard.
+    """
+    assert flag in _forwarded_flags(), (
+        f"{flag} is exempted from the Settings check but the bridge does not "
+        f"forward it — delete the exemption or fix the spelling"
+    )
+    assert flag.lower() not in Settings.model_fields, (
+        f"settings.{flag.lower()} exists in this tree now, so {flag} is no "
+        f"longer image-side — remove it from IMAGE_SIDE_FLAGS and let the "
+        f"real guard cover it"
     )
 
 

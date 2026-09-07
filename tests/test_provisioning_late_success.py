@@ -235,9 +235,12 @@ async def test_timed_out_claim_is_discovered_and_adopted(monkeypatch):
     install_fake_bridge(monkeypatch, bridge)
 
     # 1. The claim that "failed".
+    #    It used to `return None`, which callers read as "the pool had nothing
+    #    for this user" and answered with the cold NAMED path. It now raises
+    #    ClaimOutcomeUnknown: a lost response is not a negative answer.
     async with async_session_maker() as db:
-        got = await ps.claim_for_user(db, uid)
-    assert got is None, "a ReadTimeout must not be reported as a claim"
+        with pytest.raises(ps.ClaimOutcomeUnknown):
+            await ps.claim_for_user(db, uid)
     assert bridge.bound is True, "fixture invariant: the bridge DID bind"
 
     # 2. WHERE THE OLD TREE STOPPED. This is the state the user was left in
@@ -605,7 +608,8 @@ async def test_pool_claim_timeout_names_the_failure(monkeypatch, caplog):
 
     with caplog.at_level(logging.WARNING, logger="app.services.pool_service"):
         async with async_session_maker() as db:
-            assert await ps.claim_for_user(db, uid) is None
+            with pytest.raises(ps.ClaimOutcomeUnknown):
+                await ps.claim_for_user(db, uid)
 
     lines = [r.getMessage() for r in caplog.records if "bridge unreachable" in r.getMessage()]
     assert lines, "the timeout must be logged at all"
@@ -681,7 +685,8 @@ async def test_a_timed_out_claim_starts_discovery_by_itself(monkeypatch):
         ps, "ensure_discovery", lambda u, **k: started.append((u, k.get("reason"))),
     )
     async with async_session_maker() as db:
-        assert await ps.claim_for_user(db, uid) is None
+        with pytest.raises(ps.ClaimOutcomeUnknown):
+            await ps.claim_for_user(db, uid)
     assert started == [(uid, "claim_timeout")], (
         f"a claim that lost its response must ask again; got {started!r}"
     )
