@@ -715,6 +715,18 @@ async def init_db():
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS progress_step INTEGER",
         "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS progress_total INTEGER",
+        # 101 — durable managed-task claim/fencing and independent delivery
+        # cursors. Agents self-heal this table at boot; platform Alembic has a
+        # matching guarded migration for environments that own build_jobs.
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS claim_owner VARCHAR(64)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS claim_token VARCHAR(64)",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS claim_expires_at TIMESTAMP",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS state_revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS delivery_revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS receipt_revision INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE build_jobs ADD COLUMN IF NOT EXISTS spoken_revision INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS ix_build_jobs_source_claim "
+        "ON build_jobs (source_kind, status, claim_expires_at)",
         "CREATE INDEX IF NOT EXISTS ix_build_jobs_archived_at ON build_jobs (archived_at)",
         # The Activity list's hot query is "this user's un-archived jobs,
         # newest first". Without this it is a seq-scan + sort over the

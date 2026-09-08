@@ -324,6 +324,8 @@ async def reconcile_delivered_turn_jobs(
             )
         )).scalars().all()
         for job in rows:
+            if getattr(job, "source_kind", None) == "voice_task":
+                continue
             cfg = job.config_json if isinstance(job.config_json, dict) else {}
             if cfg.get("handed_off"):
                 continue  # spawn / start_mission owns it now

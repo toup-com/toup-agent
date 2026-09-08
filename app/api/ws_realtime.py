@@ -60,6 +60,8 @@ from sqlalchemy import select
 from app.config import settings
 from app.agent.tool_definitions import get_agent_tools, get_extended_tools
 from app.api.voice import detect_script_language
+from app.api.realtime_lifecycle import ResponseCoordinator, FunctionCallSupervisor
+from app.api.voice_task_relay import VoiceTaskRelay, VOICE_TASK_TOOL, VOICE_TASK_INSTRUCTIONS
 
 from app.services.memory_log import describe_memory
 
@@ -3442,6 +3444,7 @@ async def realtime_voice_ws(
     # it for every helper this session calls (model, session config, think,
     # metering, …). One read, one source of truth for the whole connection.
     _v2_ctx.set(_resolve_v2_for_user(user_id))
+    managed_voice = bool(_v2_active() and settings.voice_tasks_enabled and not onboarding)
     logger.info("[REALTIME] voice v2=%s for user %s", _v2_active(), user_id[:8])
 
     async def _status(stage: str) -> None:
@@ -3844,7 +3847,18 @@ async def realtime_voice_ws(
         return
 
     # ── 6. Configure session: cached-or-base config now, full context behind ──
+    allowed_function_names: set[str] = set()
+
     def _session_config(instr: str, tools: list, language: Optional[str] = None) -> dict:
+        # Apply the managed-work tool at every cached/full-context boundary.
+        # Cached configuration cannot bypass a disabled `think` tool or keep a
+        # rollout tool alive after the flag is turned off.
+        tools = [t for t in tools if t.get("name") != "voice_task"]
+        if managed_voice and any(t.get("name") == "think" for t in tools):
+            tools = [*tools, VOICE_TASK_TOOL]
+            instr += "\n" + VOICE_TASK_INSTRUCTIONS
+        allowed_function_names.clear()
+        allowed_function_names.update(t.get("name", "") for t in tools)
         return build_session_config(
             instr, tools, voice, language, pinned=_pinned_lang is not None,
         )
@@ -3908,12 +3922,24 @@ async def realtime_voice_ws(
         await websocket.close()
         return
 
+    async def _send_provider(event: dict) -> None:
+        await openai_ws.send(json.dumps(event))
+
+    # From here onward every provider write is serialized through one owner.
+    # Function execution has a separate bounded worker, so the provider reader
+    # can continue processing VAD, cancel, and response lifecycle events.
+    lifecycle = ResponseCoordinator(_send_provider)
+    functions = FunctionCallSupervisor(lifecycle, max_pending=8)
+
     # The user can talk NOW. The VAD/format config is written to the OpenAI
     # socket ahead of any relayed audio (same-socket FIFO), so frames the
     # client sends immediately are processed under the right config. The
     # session_id follows on its own frame when the VPS session lands.
     try:
-        await websocket.send_json({"type": "ready"})
+        await websocket.send_json({
+            "type": "ready",
+            "capabilities": {"voice_tasks": managed_voice},
+        })
     except Exception:
         _cancel_bg()
         try:
@@ -4010,7 +4036,7 @@ async def realtime_voice_ws(
             )
         try:
             final_instr = instr or _first_instructions
-            await openai_ws.send(json.dumps(_session_config(final_instr, tools, language)))
+            await lifecycle.send_event(_session_config(final_instr, tools, language))
             if instr and _usable:
                 _instr_cache[user_id] = (instr, tools, time.monotonic())
             logger.info(
@@ -4049,6 +4075,104 @@ async def realtime_voice_ws(
     _announce_t = asyncio.create_task(_announce_session())
     _bg_tasks.append(_announce_t)
 
+    async def _voice_session_id() -> str:
+        nonlocal db_session_id
+        if not db_session_id:
+            db_session_id = await asyncio.wait_for(
+                asyncio.shield(_session_t), timeout=15.0,
+            )
+        return db_session_id or ""
+
+    async def _task_request(method: str, path: str, *, body=None, params=None):
+        vps = await _get_vps_info(user_id)
+        if vps:
+            return await _vps_api(
+                *vps, method, path, json_body=body, params=params, timeout=15.0,
+            )
+        # In monolith/agent mode, use the same authenticated task service
+        # directly. There is no fallback to an untracked AgentRunner turn.
+        if _agent_runner is not None:
+            from app.api.voice_tasks import local_voice_task_request
+            try:
+                return await local_voice_task_request(
+                    _agent_runner, user_id, method, path, body=body, params=params,
+                )
+            except Exception:
+                logger.warning("[REALTIME] Local voice task request failed", exc_info=True)
+        return None
+
+    async def _task_emit(frame: dict) -> None:
+        if settings.security_leak_filter:
+            from app.services.model_alias import public_model_label
+            frame = dict(frame)
+            if frame.get("task"):
+                frame["task"] = dict(frame["task"])
+                if frame["task"].get("model"):
+                    frame["task"]["model"] = public_model_label(frame["task"]["model"])
+            if isinstance(frame.get("tasks"), list):
+                frame["tasks"] = [
+                    dict(t, model=public_model_label(t["model"])) if t.get("model") else t
+                    for t in frame["tasks"]
+                ]
+        await websocket.send_json(frame)
+
+    voice_tasks = (
+        VoiceTaskRelay(_task_request, _task_emit, lifecycle, _voice_session_id)
+        if managed_voice else None
+    )
+    voice_controls: asyncio.Queue = asyncio.Queue(maxsize=16)
+
+    async def _control_worker() -> None:
+        while True:
+            msg = await voice_controls.get()
+            try:
+                if voice_tasks is None:
+                    continue
+                kind = msg.get("type", "")
+                if kind == "voice_task.sync":
+                    await voice_tasks.sync()
+                elif kind in {"voice_task.received", "voice_task.spoken"}:
+                    await voice_tasks.acknowledge(
+                        task_id=str(msg.get("task_id", "")),
+                        revision=msg.get("revision", -1),
+                        kind=kind.rsplit(".", 1)[-1],
+                    )
+                else:
+                    action = kind.rsplit(".", 1)[-1]
+                    result = await voice_tasks.control(
+                        action=action,
+                        task_id=str(msg.get("task_id", "")),
+                        request_id=str(
+                            msg.get("request_id")
+                            or f"{action}:{msg.get('task_id', '')}"
+                        ),
+                        message=str(msg.get("message", ""))[:20000],
+                    )
+                    if result.startswith("ERROR"):
+                        await websocket.send_json({
+                            "type": "voice_task.error",
+                            "message": result,
+                            "task_id": msg.get("task_id"),
+                        })
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("[REALTIME] Voice task control failed", exc_info=True)
+                await websocket.send_json({
+                    "type": "voice_task.error",
+                    "message": "Task status is temporarily unavailable.",
+                    "task_id": msg.get("task_id"),
+                })
+            finally:
+                voice_controls.task_done()
+
+    voice_control_worker: Optional[asyncio.Task] = None
+    if voice_tasks is not None:
+        voice_tasks.start()
+        voice_control_worker = asyncio.create_task(
+            _control_worker(), name="voice-task-controls",
+        )
+
     # ── 6b. Auto-greet in onboarding mode ─────────────────────
     # Wait for client's "audio_ready" signal before greeting, so audio doesn't get dropped.
     # The client sends this after getUserMedia + AudioContext are fully set up.
@@ -4056,13 +4180,19 @@ async def realtime_voice_ws(
 
     # ── 7. Bidirectional relay ────────────────────────────────
     # Track state for transcript accumulation and persistence
-    response_text_accum = ""
+    # A provider can finish an interrupted response after a newer response has
+    # started. Keep transcript buffers keyed by the provider response ID so
+    # late deltas cannot be attributed to the current turn.
+    response_text_by_id: dict[str, str] = {}
+    seen_response_ids: set[str] = set()
+    seen_transcript_ids: set[str] = set()
     # Media this turn started, attached to the assistant row when it persists so
     # the day thread renders a real Toup card instead of bare text. Survives the
     # function-call response (which carries no spoken text) and is consumed by
     # the spoken response that follows it.
     pending_media = None
     last_user_text = ""  # Track last user message for memory extraction
+    latest_user_text = ""  # Stable input for a detached think submission.
     # V1 kept the legacy "gpt-4o-realtime" label; V2 reports the real slug.
     default_turn_model = realtime_model() if _v2_active() else "gpt-4o-realtime"
     turn_model = default_turn_model  # Model used for current turn (changes if deep_think is called)
@@ -4073,9 +4203,6 @@ async def realtime_voice_ws(
     last_audio_item: dict = {"id": None, "content_index": 0}
     speech_stopped_at: dict = {"t": 0.0}
     first_audio_of_response: dict = {"pending": False}
-
-    # One response at a time, by construction — see _ResponseGate.
-    _resp_gate = _ResponseGate(lambda payload: openai_ws.send(payload))
 
     # The app-reported Live Activity mission for THIS call (config frame).
     # A dict so both relay loops close over one slot.
@@ -4089,8 +4216,65 @@ async def realtime_voice_ws(
     # the card should die immediately, no grace.
     got_stop: dict = {"v": False}
 
+    # Transcript/history writes share ordering but do not share the provider
+    # reader's latency budget. Values are copied at enqueue time so a later
+    # utterance cannot alter an earlier database row.
+    persistence: asyncio.Queue = asyncio.Queue(maxsize=128)
+
+    async def _persist_worker() -> None:
+        while True:
+            record = await persistence.get()
+            try:
+                sid = await _voice_session_id()
+                if sid:
+                    await _save_voice_messages(
+                        user_id,
+                        sid,
+                        record["user_text"],
+                        record["assistant_text"],
+                        model=record["model"],
+                        media=record["media"],
+                        tool_events=record["tool_events"],
+                    )
+                if (
+                    record["memory_user"] and record["assistant_text"]
+                    and settings.auto_extract_memories
+                ):
+                    await _curate_voice_turn(
+                        user_id, record["memory_user"], record["assistant_text"],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[REALTIME] Transcript persistence failed")
+            finally:
+                persistence.task_done()
+
+    def _enqueue_persist(
+        *, user_text: str = "", assistant_text: str = "",
+        model: Optional[str] = None, media=None, tool_events=None,
+        memory_user: str = "",
+    ) -> None:
+        try:
+            persistence.put_nowait({
+                "user_text": user_text,
+                "assistant_text": assistant_text,
+                "model": model,
+                "media": media,
+                "tool_events": list(tool_events) if tool_events else None,
+                "memory_user": memory_user,
+            })
+        except asyncio.QueueFull as exc:
+            # A session generating 128 unsaved turns has lost its persistence
+            # backend. Fail the relay rather than pretend history was saved.
+            raise RuntimeError("voice transcript persistence queue is full") from exc
+
+    persist_worker = asyncio.create_task(
+        _persist_worker(), name="voice-transcript-persistence",
+    )
+
     async def safe_response_create() -> None:
-        await _resp_gate.create()
+        await lifecycle.request_response()
 
     screen_sharing_active = False
     first_frame_sent = False
@@ -4126,7 +4310,7 @@ async def realtime_voice_ws(
                 description = resp.json()["choices"][0]["message"]["content"]
 
             # Inject the screen description as a user message into the Realtime conversation
-            await openai_ws.send(json.dumps({
+            await lifecycle.send_event({
                 "type": "conversation.item.create",
                 "item": {
                     "type": "message",
@@ -4136,7 +4320,7 @@ async def realtime_voice_ws(
                         "text": f"[Screen context: {description}]",
                     }],
                 },
-            }))
+            })
 
             # Only trigger a response on the first frame so agent acknowledges
             if is_first:
@@ -4159,10 +4343,10 @@ async def realtime_voice_ws(
 
                 if msg_type == "audio":
                     # Relay PCM16 audio chunk
-                    await openai_ws.send(json.dumps({
+                    await lifecycle.send_event({
                         "type": "input_audio_buffer.append",
                         "audio": msg["data"],
-                    }))
+                    })
 
                 elif msg_type == "config":
                     # Update voice or other settings
@@ -4170,13 +4354,13 @@ async def realtime_voice_ws(
                     if "voice" in msg:
                         requested = msg["voice"]
                         voice = requested if requested in VALID_VOICES else "alloy"
-                        await openai_ws.send(json.dumps({
+                        await lifecycle.send_event({
                             "type": "session.update",
                             "session": {
                                 "type": "realtime",
                                 "audio": {"output": {"voice": voice}},
                             },
-                        }))
+                        })
                     # Client's IANA zone. Voice has none in the WebRTC
                     # payload, so without this the relay falls back to a
                     # platform users row that is NULL for most users and
@@ -4252,14 +4436,14 @@ async def realtime_voice_ws(
                     # UI sent a text event (e.g., color selection) — inject into OpenAI conversation
                     inject_content = msg.get("text", "")
                     if inject_content:
-                        await openai_ws.send(json.dumps({
+                        await lifecycle.send_event({
                             "type": "conversation.item.create",
                             "item": {
                                 "type": "message",
                                 "role": "user",
                                 "content": [{"type": "input_text", "text": inject_content}],
                             },
-                        }))
+                        })
                         await safe_response_create()
                         logger.info("[REALTIME] Injected text: %s", inject_content[:60])
 
@@ -4280,7 +4464,7 @@ async def realtime_voice_ws(
                     _np_title = str(msg.get("title") or "").strip()[:200]
                     if _np_title:
                         try:
-                            await openai_ws.send(json.dumps({
+                            await lifecycle.send_event({
                                 "type": "conversation.item.create",
                                 "item": {
                                     "type": "message",
@@ -4294,7 +4478,7 @@ async def realtime_voice_ws(
                                         ),
                                     }],
                                 },
-                            }))
+                            })
                             logger.info("[REALTIME] now_playing → %s", _np_title[:60])
                         except Exception as e:  # noqa: BLE001
                             logger.warning("[REALTIME] now_playing inject failed: %s", e)
@@ -4308,21 +4492,28 @@ async def realtime_voice_ws(
                     # follow-ups go incoherent (documented OpenAI failure mode
                     # for WebSocket transports, where the client owns playback).
                     if _v2_active() and last_audio_item["id"] is not None:
+                        reported_item = str(msg.get("item_id") or msg.get("item") or "")
+                        # New clients identify the exact assistant item. Ignore a
+                        # late clock report for an earlier item; accepting it
+                        # would truncate the wrong conversation history.
+                        if reported_item and reported_item != last_audio_item["id"]:
+                            continue
                         try:
                             audio_end_ms = max(0, int(msg.get("ms", 0)))
                         except (TypeError, ValueError):
                             audio_end_ms = 0
-                        if audio_end_ms > 0:
-                            await openai_ws.send(json.dumps({
-                                "type": "conversation.item.truncate",
-                                "item_id": last_audio_item["id"],
-                                "content_index": last_audio_item["content_index"],
-                                "audio_end_ms": audio_end_ms,
-                            }))
-                            logger.info(
-                                "[REALTIME] truncated %s at %dms (barge-in)",
-                                last_audio_item["id"], audio_end_ms,
-                            )
+                        # Zero milliseconds is meaningful: the item reached the
+                        # client but no audio was heard before interruption.
+                        await lifecycle.send_event({
+                            "type": "conversation.item.truncate",
+                            "item_id": last_audio_item["id"],
+                            "content_index": last_audio_item["content_index"],
+                            "audio_end_ms": audio_end_ms,
+                        })
+                        logger.info(
+                            "[REALTIME] truncated %s at %dms (barge-in)",
+                            last_audio_item["id"], audio_end_ms,
+                        )
 
                 elif msg_type == "interrupt":
                     # Explicit client barge-in: the user tapped the orb (or the
@@ -4332,11 +4523,27 @@ async def realtime_voice_ws(
                     # and the next turn queues behind it. response.cancel on an
                     # already-finished response answers response_cancel_not_active,
                     # which the error branch swallows as benign.
-                    if _resp_gate.active:
+                    await lifecycle.interrupt_speech()
+                    try:
+                        await lifecycle.send_event({"type": "response.cancel"})
+                    except Exception:
+                        pass
+
+                elif msg_type in {
+                    "voice_task.cancel", "voice_task.steer", "voice_task.sync",
+                    "voice_task.received", "voice_task.spoken",
+                }:
+                    if voice_tasks is not None:
                         try:
-                            await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                        except Exception:
-                            pass
+                            if msg_type == "voice_task.steer" and not msg.get("request_id"):
+                                raise ValueError("A correction request ID is required")
+                            voice_controls.put_nowait(msg)
+                        except (asyncio.QueueFull, TypeError, ValueError):
+                            await websocket.send_json({
+                                "type": "voice_task.error",
+                                "message": "Task control was not accepted. Please retry.",
+                                "task_id": msg.get("task_id"),
+                            })
 
                 # Client-side telemetry. The two failures that end a voice call
                 # most often are not visible from here at all: the mic never
@@ -4361,9 +4568,219 @@ async def realtime_voice_ws(
             logger.warning("[REALTIME] client_to_openai error: %s", e)
             _vcount("client_relay_died", user_id, err=type(e).__name__)
 
+    async def _execute_function(func_name: str, arguments: dict, call_id: str) -> str:
+        """Execute one socket-scoped function outside the provider reader."""
+        nonlocal turn_model, pending_media
+        _frame_media = None
+        result = ""
+        _turn["tools"] += 1
+        logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
+
+        # A cold session advertises no tools until its full context lands. A
+        # correctly ordered provider cannot call one before that update, but
+        # legacy/replayed frames can arrive at the boundary. Resolve the
+        # already-started context build before deciding the call is forbidden;
+        # this wait lives on the function worker, never the provider reader.
+        if not allowed_function_names and not full_context_applied.is_set():
+            try:
+                await asyncio.wait_for(full_context_applied.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                pass
+
+        if func_name not in allowed_function_names:
+            result = "ERROR: This function is not available in the current session."
+            await websocket.send_json(_tool_completed_frame(call_id, func_name, result))
+            return result
+
+        await websocket.send_json({"type": "state", "state": "tool_use"})
+        _tc_title, _tc_detail = _tool_activity(func_name, arguments)
+        await websocket.send_json({
+            "type": "tool_call.started",
+            "call_id": call_id,
+            "name": func_name,
+            "title": _tc_title,
+            "detail": _tc_detail,
+        })
+
+        try:
+            if func_name == "navigate_to":
+                path = arguments.get("path", "/")
+                allowed_paths = {
+                    "/", "/chat", "/brain/user", "/brain/agent",
+                    "/workspace", "/dashboard", "/agent",
+                }
+                if path not in allowed_paths:
+                    result = f"Invalid path '{path}'."
+                else:
+                    await websocket.send_json({"type": "navigate", "path": path})
+                    names = {
+                        "/": "Hub", "/chat": "Chat", "/brain/user": "User Brain",
+                        "/brain/agent": "Agent Brain", "/workspace": "Workspace",
+                        "/dashboard": "Dashboard", "/agent": "Agent Setup",
+                    }
+                    result = (
+                        f"Navigated to {names.get(path, path)}. "
+                        "Voice conversation continues."
+                    )
+
+            elif func_name == "play_media":
+                result, played_media = await _play_media_direct(
+                    user_id,
+                    str(arguments.get("query", "")),
+                    variety=bool(arguments.get("variety")),
+                )
+                if played_media:
+                    pending_media = played_media
+                    _frame_media = played_media
+
+            elif func_name == "think":
+                task = _think_task(arguments, latest_user_text)
+                if voice_tasks is not None:
+                    # This call only confirms durable acceptance. AgentRunner
+                    # continues under VoiceTaskService after this socket closes.
+                    result = await voice_tasks.submit(
+                        request_id=call_id,
+                        message=task,
+                        user_message=latest_user_text,
+                    )
+                else:
+                    relay = _InnerToolRelay(
+                        websocket, call_id, sink=turn_tool_events,
+                    )
+                    result, turn_model_used = await _think(
+                        user_id, task, db_session_id, relay=relay,
+                    )
+                    turn_model = turn_model_used
+
+            elif func_name == "voice_task" and voice_tasks is not None:
+                result = await voice_tasks.control(
+                    action=str(arguments.get("action", "")),
+                    task_id=str(arguments.get("task_id", "")),
+                    request_id=call_id,
+                    message=str(arguments.get("message", ""))[:20000],
+                )
+
+            elif func_name == "set_onboarding_phase":
+                phase = arguments.get("phase", "")
+                await websocket.send_json({
+                    "type": "onboarding_phase", "phase": phase,
+                })
+                result = (
+                    f"Onboarding UI phase set to '{phase}'. "
+                    f"The user can now see the {phase} interface."
+                )
+
+            elif func_name == "finalize_onboarding":
+                result = await _finalize_onboarding(
+                    user_id,
+                    agent_name=arguments.get("agent_name"),
+                    personality=arguments.get("personality"),
+                )
+                try:
+                    from app.db.database import async_session_maker as _asm
+                    from app.db.models import AgentConfig
+                    async with _asm() as _db:
+                        cfg = (await _db.execute(
+                            select(AgentConfig).where(AgentConfig.user_id == user_id)
+                        )).scalar_one_or_none()
+                        if cfg:
+                            cfg.onboarding_completed = True
+                            await _db.commit()
+                            logger.info(
+                                "[REALTIME] Onboarding finalized for user %s",
+                                user_id[:8],
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "[REALTIME] Failed to mark onboarding complete: %s", exc,
+                    )
+                await websocket.send_json({
+                    "type": "onboarding_phase", "phase": "done",
+                })
+
+                try:
+                    vps = await _get_vps_info(user_id)
+                    if vps:
+                        await _vps_api(
+                            *vps, "POST", "/api/workflows/generate-from-onboarding",
+                        )
+                        logger.info(
+                            "[REALTIME] Triggered workspace generation for %s",
+                            user_id[:8],
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[REALTIME] Workspace generation trigger failed: %s", exc,
+                    )
+
+            else:
+                result = await _execute_tool(user_id, func_name, arguments)
+        except asyncio.CancelledError:
+            raise
+        except Exception as tool_error:
+            logger.exception(
+                "[REALTIME] Tool %s raised — session stays up", func_name,
+            )
+            _vcount(
+                "tool_dispatch_exception", user_id,
+                tool=func_name, err=type(tool_error).__name__,
+            )
+            result = (
+                "ERROR: that didn't go through just now — a temporary problem "
+                "on our side, not a missing capability. Say so briefly and "
+                "offer to retry."
+            )
+
+        if (
+            onboarding and func_name == "memory_store"
+            and "onboarding complete" in arguments.get("content", "").lower()
+        ):
+            try:
+                from app.db.database import async_session_maker as _asm
+                from app.db.models import AgentConfig
+                async with _asm() as _db:
+                    cfg = (await _db.execute(
+                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                    )).scalar_one_or_none()
+                    if cfg:
+                        cfg.onboarding_completed = True
+                        await _db.commit()
+                        logger.info(
+                            "[REALTIME] Onboarding completed for user %s", user_id[:8],
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "[REALTIME] Failed to mark onboarding complete: %s", exc,
+                )
+
+        result_str = result if isinstance(result, str) else str(result)
+        await websocket.send_json(_tool_completed_frame(
+            call_id, func_name, result_str, media=_frame_media,
+        ))
+        return result_str
+
+    async def _run_function(func_name: str, arguments: dict, call_id: str) -> str:
+        try:
+            return await _execute_function(func_name, arguments, call_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[REALTIME] Function failed: %s", func_name)
+            result = (
+                "ERROR: Execution failed; external effects may be unknown. "
+                "Check status before retrying."
+            )
+            try:
+                await websocket.send_json(_tool_completed_frame(
+                    call_id, func_name, result,
+                ))
+            except Exception:
+                pass
+            return result
+
     async def openai_to_client():
         """Relay OpenAI Realtime API events → browser."""
-        nonlocal response_text_accum, db_session_id, last_user_text, turn_model
+        nonlocal db_session_id, last_user_text, latest_user_text, turn_model
         nonlocal pending_media
         # `turn_tool_events` is REBOUND below (``turn_tool_events = []``, the
         # per-turn reset). Without this declaration that assignment makes the
@@ -4377,6 +4794,12 @@ async def realtime_voice_ws(
             async for raw_msg in openai_ws:
                 event = json.loads(raw_msg)
                 etype = event.get("type", "")
+
+                if etype in {
+                    "response.output_audio.delta",
+                    "response.output_audio_transcript.delta",
+                } and not lifecycle.accepts_response(event.get("response_id", "")):
+                    continue
 
                 # ── Audio response chunks → browser (GA: response.output_audio.delta) ──
                 if etype == "response.output_audio.delta":
@@ -4396,6 +4819,9 @@ async def realtime_voice_ws(
                                 )
                     await websocket.send_json({
                         "type": "audio_delta",
+                        "response_id": event.get("response_id"),
+                        "item_id": event.get("item_id"),
+                        "content_index": event.get("content_index", 0),
                         "data": event.get("delta", ""),
                         # Which assistant item this audio belongs to. The
                         # client's played-ms clock is per-TURN; truncation is
@@ -4408,7 +4834,10 @@ async def realtime_voice_ws(
                 # ── Assistant text transcript (partial; GA: response.output_audio_transcript.delta) ──
                 elif etype == "response.output_audio_transcript.delta":
                     delta = event.get("delta", "")
-                    response_text_accum += delta
+                    response_id = str(event.get("response_id", ""))
+                    response_text_by_id[response_id] = (
+                        response_text_by_id.get(response_id, "") + delta
+                    )
                     await websocket.send_json({
                         "type": "response_text",
                         "text": delta,
@@ -4417,21 +4846,37 @@ async def realtime_voice_ws(
 
                 # ── Response complete ──
                 elif etype == "response.done":
-                    _replay = await _resp_gate.on_done()
                     response = event.get("response", {})
+                    response_id = str(response.get("id", ""))
+                    if response_id in seen_response_ids:
+                        continue
+                    seen_response_ids.add(response_id)
+                    response_visible = lifecycle.accepts_response(response_id)
+                    await lifecycle.response_done(
+                        response_id,
+                        status=str(response.get("status") or "completed"),
+                        call_ids=[
+                            str(item.get("call_id"))
+                            for item in response.get("output", [])
+                            if item.get("type") == "function_call" and item.get("call_id")
+                        ],
+                    )
 
                     _meter_t = _maybe_meter_response(user_id, response, using_platform_key)
                     if _meter_t is not None:
                         _meter_tasks.append(_meter_t)
                     # Extract final text from output items
-                    full_text = response_text_accum
+                    full_text = response_text_by_id.pop(response_id, "")
                     for item in response.get("output", []):
                         if item.get("type") == "message":
                             for content in item.get("content", []):
                                 if content.get("type") in ("audio", "output_audio") and content.get("transcript"):
                                     full_text = content["transcript"]
 
-                    if full_text:
+                    if (
+                        full_text and response_visible
+                        and response.get("status") != "cancelled"
+                    ):
                         # Alias the model id before it crosses the WS boundary —
                         # voice is the always-on white-label channel; the raw
                         # turn_model (incl. cross-provider ids after a think turn)
@@ -4443,31 +4888,18 @@ async def realtime_voice_ws(
                             _rt_model = public_model_label(_rt_model)
                         await websocket.send_json({
                             "type": "response_done",
+                            "response_id": response_id,
                             "text": full_text,
                             "model": _rt_model,
                         })
 
-                        # Persist assistant message to DB. Await the SHARED
-                        # session task (still in flight on a cold agent) —
-                        # creating a second session here would fork the
-                        # conversation into two VPS threads.
-                        if not db_session_id:
-                            try:
-                                db_session_id = await asyncio.wait_for(asyncio.shield(_session_t), timeout=10.0)
-                                if db_session_id:
-                                    logger.info("[REALTIME] Late-resolved DB session for assistant: %s", db_session_id[:8])
-                                    await websocket.send_json({"type": "session_id", "session_id": db_session_id})
-                            except Exception:
-                                logger.warning("[REALTIME] Session still unresolved at assistant persist — skipping this turn")
-                        if db_session_id:
-                            try:
-                                await _save_voice_messages(
-                                    user_id, db_session_id, "", full_text,
-                                    model=turn_model, media=pending_media,
-                                    tool_events=turn_tool_events or None,
-                                )
-                            except Exception as e:
-                                logger.exception("[REALTIME] Failed to save assistant message")
+                        _enqueue_persist(
+                            assistant_text=full_text,
+                            model=turn_model,
+                            media=pending_media,
+                            tool_events=turn_tool_events,
+                            memory_user=last_user_text,
+                        )
                         # Consumed. Cleared HERE and not with the other per-turn
                         # resets below, because a tool turn fires response.done
                         # TWICE: once for the function-call response (no spoken
@@ -4543,8 +4975,8 @@ async def realtime_voice_ws(
                                                 "instead — what you actually heard always wins "
                                                 "over this note."
                                             )
-                                    await openai_ws.send(json.dumps(_session_config(
-                                        instr2, applied_ctx["tools"], applied_ctx["language"])))
+                                    await lifecycle.send_event(_session_config(
+                                        instr2, applied_ctx["tools"], applied_ctx["language"]))
                                     applied_ctx["directive"] = want
                                     logger.info(
                                         "[REALTIME] Reply-language directive -> %s "
@@ -4557,51 +4989,31 @@ async def realtime_voice_ws(
                                 except Exception:
                                     logger.warning("[REALTIME] Reply-language session.update failed")
 
-                        # Write this spoken turn to memory (background).
-                        if last_user_text and full_text and settings.auto_extract_memories:
-                            asyncio.create_task(
-                                _curate_voice_turn(user_id, last_user_text, full_text)
-                            )
-                            last_user_text = ""  # Reset so we don't re-write
+                        last_user_text = ""  # Captured in the persistence record.
 
-                    response_text_accum = ""
-                    turn_model = default_turn_model  # Reset for next turn
-
-                    await websocket.send_json({"type": "state", "state": "listening"})
-
-                    # A continuation that was deferred because THIS response was
-                    # active runs now. (If a VAD response was also queued behind
-                    # us, the create below collides, the error handler re-queues
-                    # it, and the next response.done replays it — self-healing
-                    # by construction, invisible to the user.)
-                    if _replay:
-                        await safe_response_create()
+                    if response_visible:
+                        turn_model = default_turn_model  # Reset for next turn
+                        await websocket.send_json({"type": "state", "state": "listening"})
 
                 # ── User speech transcript ──
                 elif etype == "conversation.item.input_audio_transcription.completed":
                     transcript = event.get("transcript", "")
+                    transcript_id = str(
+                        event.get("item_id") or event.get("event_id") or ""
+                    )
+                    if transcript_id and transcript_id in seen_transcript_ids:
+                        continue
+                    if transcript_id:
+                        seen_transcript_ids.add(transcript_id)
                     if transcript.strip():
                         user_text = transcript.strip()
                         await websocket.send_json({
                             "type": "transcript",
                             "text": user_text,
                         })
-                        # Save user message to DB — same shared-session rule
-                        # as the assistant persist above.
-                        if not db_session_id:
-                            try:
-                                db_session_id = await asyncio.wait_for(asyncio.shield(_session_t), timeout=10.0)
-                                if db_session_id:
-                                    logger.info("[REALTIME] Late-resolved DB session: %s", db_session_id[:8])
-                                    await websocket.send_json({"type": "session_id", "session_id": db_session_id})
-                            except Exception:
-                                logger.warning("[REALTIME] Session still unresolved at user persist — skipping this turn")
-                        if db_session_id:
-                            try:
-                                await _save_voice_messages(user_id, db_session_id, user_text, "")
-                            except Exception as e:
-                                logger.exception("[REALTIME] Failed to save user transcript")
+                        _enqueue_persist(user_text=user_text)
                         last_user_text = user_text
+                        latest_user_text = user_text
                         # The reply-language directive is NOT decided here any
                         # more. It needs both halves of the turn — the
                         # transcript and the reply the model produced from the
@@ -4610,11 +5022,13 @@ async def realtime_voice_ws(
 
                 # ── VAD: user started speaking (barge-in) ──
                 elif etype == "input_audio_buffer.speech_started":
+                    await lifecycle.speech_started()
                     await websocket.send_json({"type": "speech_started"})
                     await websocket.send_json({"type": "state", "state": "listening"})
 
                 # ── VAD: user stopped speaking → thinking ──
                 elif etype == "input_audio_buffer.speech_stopped":
+                    await lifecycle.speech_stopped()
                     if _v2_active():
                         speech_stopped_at["t"] = time.monotonic()
                         first_audio_of_response["pending"] = True
@@ -4622,187 +5036,68 @@ async def realtime_voice_ws(
 
                 # ── Response started → speaking ──
                 elif etype == "response.created":
-                    _resp_gate.on_created()
-                    await websocket.send_json({"type": "state", "state": "speaking"})
+                    response = event.get("response", {})
+                    response_id = str(response.get("id", ""))
+                    response_metadata = response.get("metadata") or {}
+                    await lifecycle.response_created(
+                        response_id, metadata=response_metadata,
+                    )
+                    speech_frame = None
+                    if voice_tasks is not None:
+                        # Resolve every accepted provider token, including a
+                        # late ACK from an interrupted epoch. Stale audio stays
+                        # suppressed below, but consuming its socket token keeps
+                        # later terminal announcements from being blocked.
+                        speech_frame = await voice_tasks.speech_started_frame(
+                            response_id=response_id,
+                            metadata=response_metadata,
+                        )
+                    if lifecycle.accepts_response(response_id):
+                        if speech_frame is not None:
+                            await websocket.send_json(speech_frame)
+                        await websocket.send_json({"type": "state", "state": "speaking"})
 
-                # ── Function call completed → execute tool ──
+                # ── Function call completed → enqueue tool ──
                 elif etype == "response.output_item.done":
                     item = event.get("item", {})
                     if item.get("type") == "function_call":
-                        func_name = item.get("name", "")
-                        call_id = item.get("call_id", "")
+                        func_name = str(item.get("name", ""))
+                        call_id = str(item.get("call_id", ""))
+                        response_id = str(
+                            event.get("response_id") or item.get("response_id") or ""
+                        )
+                        if not call_id:
+                            logger.warning(
+                                "[REALTIME] Ignoring function item without call_id: %s",
+                                func_name,
+                            )
+                            continue
+                        # Older Realtime fixtures/clients did not include a
+                        # response_id on output_item.done. Fence that call with
+                        # a synthetic one-call response instead of letting one
+                        # malformed provider frame kill the whole voice relay.
+                        # Modern frames retain their real response/batch ID.
+                        legacy_response = not response_id
+                        if legacy_response:
+                            response_id = f"legacy:{call_id}"
                         try:
                             arguments = json.loads(item.get("arguments", "{}"))
-                        except json.JSONDecodeError:
+                        except (json.JSONDecodeError, TypeError):
                             arguments = {}
-
-                        _turn["tools"] += 1
-                        logger.info("[REALTIME] Function call: %s(%s)", func_name, arguments)
-                        # Structured card for THIS call's completed frame (play_media
-                        # only). Deliberately separate from `pending_media`, which is
-                        # the persist-side slot cleared on a later response.done — a
-                        # failed play must not ship a previous play's card.
-                        _frame_media = None
-                        # Legacy coarse flag (kept for older app builds that only
-                        # read state) + the discrete lifecycle event the tool UI uses.
-                        await websocket.send_json({"type": "state", "state": "tool_use"})
-                        _tc_title, _tc_detail = _tool_activity(func_name, arguments)
-                        await websocket.send_json({
-                            "type": "tool_call.started",
-                            "call_id": call_id,
-                            "name": func_name,
-                            "title": _tc_title,
-                            "detail": _tc_detail,
-                        })
-
-                        # Everything below runs INSIDE this try. Until
-                        # 2026-08-20 it did not, and the cost of that was the
-                        # whole call: `openai_to_client` IS the relay loop, so a
-                        # raise anywhere in tool dispatch unwound it, sent one
-                        # `relay_error`, and ended the session — the user saw
-                        # their words transcribed and then nothing. A tool that
-                        # fails is ordinary (a container mid-rollout, a 422, a
-                        # connector timeout); it must come back as a failed
-                        # RESULT the model can speak about, with the call still
-                        # up. See test_voice_turn_survives.
-                        result = ""
-                        try:
-                            # ── Client-side tool: navigate_to ──
-                            if func_name == "navigate_to":
-                                path = arguments.get("path", "/")
-                                _ALLOWED = {"/", "/chat", "/brain/user", "/brain/agent",
-                                            "/workspace", "/dashboard", "/agent"}
-                                if path not in _ALLOWED:
-                                    result = f"Invalid path '{path}'."
-                                else:
-                                    await websocket.send_json({"type": "navigate", "path": path})
-                                    _NAMES = {"/": "Hub", "/chat": "Chat", "/brain/user": "User Brain",
-                                              "/brain/agent": "Agent Brain", "/workspace": "Workspace",
-                                              "/dashboard": "Dashboard", "/agent": "Agent Setup"}
-                                    result = f"Navigated to {_NAMES.get(path, path)}. Voice conversation continues."
-
-                            # ── Play media: straight to the agent's resolver ──
-                            elif func_name == "play_media":
-                                result, _played = await _play_media_direct(
-                                    user_id, str(arguments.get("query", "")),
-                                    variety=bool(arguments.get("variety")))
-                                # Carried to this turn's assistant persist so the
-                                # thread gets the same Toup media card a chat play
-                                # produces. Cleared after the persist below.
-                                if _played:
-                                    pending_media = _played
-                                    _frame_media = _played
-
-                            # ── Think: delegate reasoning to best model ──
-                            elif func_name == "think":
-                                task = _think_task(arguments, last_user_text)
-                                _relay = _InnerToolRelay(websocket, call_id, sink=turn_tool_events)
-                                result, turn_model_used = await _think(
-                                    user_id, task, db_session_id, relay=_relay)
-                                turn_model = turn_model_used
-
-                            # ── Onboarding: set UI phase ──
-                            elif func_name == "set_onboarding_phase":
-                                phase = arguments.get("phase", "")
-                                await websocket.send_json({
-                                    "type": "onboarding_phase",
-                                    "phase": phase,
-                                })
-                                result = f"Onboarding UI phase set to '{phase}'. The user can now see the {phase} interface."
-
-                            # ── Onboarding: finalize (compile profiles, mark complete) ──
-                            elif func_name == "finalize_onboarding":
-                                result = await _finalize_onboarding(
-                                    user_id,
-                                    agent_name=arguments.get("agent_name"),
-                                    personality=arguments.get("personality"),
-                                )
-                                try:
-                                    from app.db.database import async_session_maker as _asm
-                                    from app.db.models import AgentConfig
-                                    async with _asm() as _db:
-                                        _cfg = (await _db.execute(
-                                            select(AgentConfig).where(AgentConfig.user_id == user_id)
-                                        )).scalar_one_or_none()
-                                        if _cfg:
-                                            _cfg.onboarding_completed = True
-                                            await _db.commit()
-                                            logger.info("[REALTIME] Onboarding finalized for user %s", user_id[:8])
-                                except Exception as oe:
-                                    logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
-                                await websocket.send_json({"type": "onboarding_phase", "phase": "done"})
-
-                                # Trigger personalized workspace generation on VPS
-                                try:
-                                    _vps = await _get_vps_info(user_id)
-                                    if _vps:
-                                        _agent_url, _agent_key = _vps
-                                        await _vps_api(
-                                            _agent_url, _agent_key, "POST",
-                                            "/api/workflows/generate-from-onboarding",
-                                        )
-                                        logger.info("[REALTIME] Triggered workspace generation for %s", user_id[:8])
-                                except Exception as _wg_err:
-                                    logger.warning("[REALTIME] Workspace generation trigger failed: %s", _wg_err)
-
-                            else:
-                                # ── Server-side tools ──
-                                result = await _execute_tool(user_id, func_name, arguments)
-                        except Exception as _tool_err:
-                            logger.exception(
-                                "[REALTIME] Tool %s raised — session stays up", func_name,
+                        if not isinstance(arguments, dict):
+                            arguments = {}
+                        # submit() reserves call_id synchronously. The callback
+                        # runs on the bounded worker and never blocks this reader.
+                        functions.submit(
+                            call_id=call_id,
+                            response_id=response_id,
+                            run=lambda name=func_name, args=arguments, cid=call_id:
+                                _run_function(name, args, cid),
+                        )
+                        if legacy_response:
+                            await lifecycle.response_done(
+                                response_id, call_ids=[call_id],
                             )
-                            _vcount("tool_dispatch_exception", user_id,
-                                    tool=func_name, err=type(_tool_err).__name__)
-                            # Phrased for the model, which will say it out loud:
-                            # it should retry or explain, not announce that it
-                            # lacks the capability (the 2026-07-31 shape).
-                            result = (
-                                "ERROR: that didn't go through just now — a "
-                                "temporary problem on our side, not a missing "
-                                "capability. Say so briefly and offer to retry."
-                            )
-
-                        # Check if onboarding just completed (legacy detection via memory_store)
-                        if (onboarding and func_name == "memory_store"
-                                and "onboarding complete" in arguments.get("content", "").lower()):
-                            try:
-                                from app.db.database import async_session_maker as _asm
-                                from app.db.models import AgentConfig
-                                async with _asm() as _db:
-                                    _cfg = (await _db.execute(
-                                        select(AgentConfig).where(AgentConfig.user_id == user_id)
-                                    )).scalar_one_or_none()
-                                    if _cfg:
-                                        _cfg.onboarding_completed = True
-                                        await _db.commit()
-                                        logger.info("[REALTIME] Onboarding completed for user %s", user_id[:8])
-                            except Exception as oe:
-                                logger.warning("[REALTIME] Failed to mark onboarding complete: %s", oe)
-
-                        # Discrete completion event → client findings card.
-                        _res_str = result if isinstance(result, str) else str(result)
-                        await websocket.send_json(_tool_completed_frame(
-                            call_id, func_name, _res_str, media=_frame_media))
-
-                        # Send result back to OpenAI
-                        await openai_ws.send(json.dumps({
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "function_call_output",
-                                "call_id": call_id,
-                                "output": result,
-                            },
-                        }))
-
-                        # Ask for the spoken reply. By the time a tool result is
-                        # ready, THIS response (the function-call one) is already
-                        # done and its response.done is queued unread behind us —
-                        # and if the user spoke during the tool run, the VAD has
-                        # opened a response of its own. safe_response_create
-                        # defers the continuation past whatever is active instead
-                        # of colliding with it.
-                        await safe_response_create()
 
                 # ── Errors from OpenAI ──
                 # THREE classes, and raw API text never crosses the WS boundary.
@@ -4816,6 +5111,12 @@ async def realtime_voice_ws(
                     error_obj = event.get("error", {})
                     error_msg = error_obj.get("message", "Unknown OpenAI error")
                     error_code = error_obj.get("code", "") or ""
+                    await lifecycle.response_error(
+                        str(error_obj.get("event_id", "")),
+                        retry_on_active=(
+                            error_code == "conversation_already_has_active_response"
+                        ),
+                    )
                     logger.error("[REALTIME] OpenAI error: %s (code=%s)", error_msg, error_code)
 
                     # Conversation-state race the relay itself resolves: our
@@ -4823,7 +5124,6 @@ async def realtime_voice_ws(
                     # response. Re-queue it for the next response.done and tell
                     # the user NOTHING — the session is healthy.
                     if error_code == "conversation_already_has_active_response":
-                        _resp_gate.on_conflict()
                         continue
 
                     payload = classify_realtime_error(error_code, error_msg)
@@ -4888,6 +5188,17 @@ async def realtime_voice_ws(
     try:
         await asyncio.wait({_t_client, _t_openai}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        if _t_openai.done() and not got_stop["v"]:
+            if functions.pending_count:
+                # The provider can disappear just after delivering a function
+                # call. Give its already-owned callback time to confirm a
+                # durable task before socket-scoped teardown cancels it.
+                await functions.wait_idle(timeout=3.0)
+            elif not _apply_t.done():
+                # Small compatibility grace for the context update already in
+                # flight; unlike waiting on the blocked client reader, this
+                # returns as soon as the owned task settles.
+                await asyncio.wait({_apply_t}, timeout=0.25)
         # The surviving sibling gets a short grace before the cancel: on a
         # clean 'stop' the openai side may be mid-way through persisting the
         # final assistant message, and an immediate cancel() lost that last
@@ -4895,7 +5206,13 @@ async def realtime_voice_ws(
         # reader still cannot hold teardown hostage.
         _pending = [t for t in (_t_client, _t_openai) if not t.done()]
         if _pending:
-            await asyncio.wait(_pending, timeout=3.0)
+            # An explicit stop/provider EOF can now cancel the blocked sibling
+            # immediately: provider-side callback grace was handled above.
+            # A client drop keeps the pre-existing bounded grace because the
+            # provider reader may be accepting a durable task.
+            grace = 0.0 if got_stop["v"] or _t_openai.done() else 3.0
+            if grace:
+                await asyncio.wait(_pending, timeout=grace)
         for _t in (_t_client, _t_openai):
             if not _t.done():
                 _t.cancel()
@@ -4903,6 +5220,24 @@ async def realtime_voice_ws(
                     await _t
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+        # These are observers/callback waiters owned by this socket. Closing
+        # them never cancels work already accepted by VoiceTaskService.
+        await functions.close()
+        if voice_control_worker is not None:
+            voice_control_worker.cancel()
+            await asyncio.gather(voice_control_worker, return_exceptions=True)
+        if voice_tasks is not None:
+            await voice_tasks.close()
+        await lifecycle.close()
+        try:
+            await asyncio.wait_for(persistence.join(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.error(
+                "[REALTIME] Transcript drain timed out; %d queued",
+                persistence.qsize(),
+            )
+        persist_worker.cancel()
+        await asyncio.gather(persist_worker, return_exceptions=True)
         logger.info("[REALTIME] Session ended for user %s", user_id[:8])
         _cancel_bg()
         # Before the sockets go: these charges are for audio OpenAI has already

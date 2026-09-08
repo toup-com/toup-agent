@@ -328,12 +328,50 @@ _WEB_KEYWORDS = {
     "search", "google", "look up", "lookup", "find online",
     "search the web", "search online", "web search",
     "what is the latest", "latest news", "current",
+    # Persian mobile/chat requests. Without these, ordinary searches fell to
+    # FULL intent and paid for every tool and skill prompt before doing the
+    # same web_search an English request reached directly.
+    "گوگل", "در اینترنت", "در وب",
+    "آنلاین",
+    "با منبع", "با منابع", "آب و هوا", "آب‌وهوا", "هواشناسی",
 }
+
+_PERSIAN_SEARCH_RE = re.compile(
+    r'(?:جست(?:[\u200c\s-]*و[\u200c\s-]*)?جو|سرچ)',
+    re.IGNORECASE,
+)
+
+# A bare Persian search verb is not an internet signal by itself.  The same
+# verb is how users ask to search their inbox, calendar, or workspace.  Keep
+# those turns on the full capability surface; explicit web signals such as
+# ``در وب``, ``گوگل``, sources, news, price, or weather still route to web.
+_PERSIAN_OWNED_DATA_RE = re.compile(
+    r'(?:'
+    r'ایمیل|رایانامه|جیمیل|صندوق[\u200c\s-]*ورودی|'
+    r'پیام|پیام[\u200c\s-]*ها|چت|گفتگو|گفت[\u200c\s-]*و[\u200c\s-]*گو|مکالمه|'
+    r'واتساپ|تلگرام|اسلک|مخاطب|مخاطبان|'
+    r'تقویم|جلسه|جلسات|قرار|قرارها|رویداد|رویدادها|'
+    r'فایل|فایلها|فایل[\u200c\s-]*ها|پرونده|پرونده[\u200c\s-]*ها|'
+    r'پوشه|پوشه[\u200c\s-]*ها|سند|اسناد|دایرکتوری'
+    r'|گزارش|گزارش[\u200c\s-]*ها|درایو|فضای[\u200c\s-]*کاری|'
+    r'یادداشت|یادداشت[\u200c\s-]*ها|وظیفه|وظایف'
+    r')',
+    re.IGNORECASE,
+)
 
 _WEB_PATTERNS_RE = re.compile(
     r'\b(?:search|google|look\s*up|find)\b.*\b(?:online|web|internet|for me)\b'
     r'|https?://'
-    r'|\b(?:latest|current|recent|today)\b.*\b(?:news|price|weather|score|status|update)\b',
+    r'|\b(?:latest|current|recent|today)\b.*\b(?:news|price|weather|score|status|update)\b'
+    r'|گوگل'
+    r'|(?:آخرین|جدیدترین|فعلی|امروز|به[\u200c\s-]?روز|بروز).*'
+    r'(?:اخبار|خبر|قیمت|آب[\u200c\s-]?و[\u200c\s-]?هوا|هواشناسی|امتیاز|وضعیت|آپدیت)'
+    # ``بررسی کن`` and temporal adjectives such as ``آخرین`` are ordinary in
+    # owned-data requests (mail, calendars, and workspace files).  They cannot
+    # be sufficient web signals: filtering those turns to TOOLS_WEB hides the
+    # very connector/file tool the user named.  Public-information nouns or an
+    # explicit source/link request keep research phrasing on the web path.
+    r'|(?:تحقیق|بررسی).*(?:در[\u200c\s-]?(?:اینترنت|وب)|آنلاین|منبع|منابع|لینک|اخبار|خبر|قیمت|هواشناسی)',
     re.IGNORECASE,
 )
 
@@ -759,15 +797,22 @@ def classify_query_intent(message: str) -> QueryIntent:
     if _MEDIA_PATTERNS_RE.search(normalized):
         scores["media"] += 3
 
-    # Web
-    for kw in _WEB_KEYWORDS:
-        if kw in normalized:
-            scores["web"] += 2
-    if _WEB_PATTERNS_RE.search(normalized):
-        scores["web"] += 3
-    # URLs are a strong web signal
-    if "http://" in normalized or "https://" in normalized:
-        scores["web"] += 5
+    # Web.  An explicitly named owned-data target keeps the broad capability
+    # surface even when a modifier such as ``آنلاین``, ``آخرین``, ``قیمت``,
+    # or a URL also appears.  Full intent still includes web tools; the key is
+    # not to hide the inbox/calendar/filesystem tool needed for the first step.
+    _persian_owned_data_target = bool(_PERSIAN_OWNED_DATA_RE.search(normalized))
+    if not _persian_owned_data_target:
+        for kw in _WEB_KEYWORDS:
+            if kw in normalized:
+                scores["web"] += 2
+        if _WEB_PATTERNS_RE.search(normalized):
+            scores["web"] += 3
+        if _PERSIAN_SEARCH_RE.search(normalized):
+            scores["web"] += 3
+        # URLs are a strong web signal
+        if "http://" in normalized or "https://" in normalized:
+            scores["web"] += 5
 
     # Code
     for kw in _CODE_KEYWORDS:
@@ -785,6 +830,14 @@ def classify_query_intent(message: str) -> QueryIntent:
             scores["agent"] += 2
     if _AGENT_PATTERNS_RE.search(normalized):
         scores["agent"] += 3
+
+    # Capability preservation is a routing invariant, not merely a web-score
+    # tweak.  An owned-data request can also contain scheduling, code, media,
+    # public-web, or agent words; every narrower profile risks hiding one half
+    # of that mixed request.  Full retains both the named private-data tool and
+    # web_search/web_fetch when public evidence is also requested.
+    if _persian_owned_data_target:
+        return _finish(INTENT_FULL)
 
     # Find the highest-scoring category
     max_score = max(scores.values())

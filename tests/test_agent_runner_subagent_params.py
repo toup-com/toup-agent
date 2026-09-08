@@ -274,6 +274,14 @@ _SUBAGENT_PARAM_CALLERS = {
         "`think`'s task string is the REALTIME MODEL's synthesis, not what "
         "the user said — mining it is the 409A incident. Voice memory is "
         "written from the real transcript via /internal/curate-turn.",
+    "app/agent/voice_tasks.py":
+        "The durable managed voice task (wave 2 of the 2026-09-06 incident, "
+        "#736): `runner.run(managed_voice_task=True, save_user_message=False, "
+        "save_assistant_message=False, disable_post_processing=True, "
+        "current_job_id=task_id)`. Same class as ws_realtime's `think` — the "
+        "prompt is the realtime model's task text, not the user's words; the "
+        "task's own progress ledger (voice_task_relay) is its record, not "
+        "`messages`; voice memory still comes from the real transcript.",
     "app/api/api_v1.py":
         "`disable_post_processing=not req.save` — the internal agent-turn "
         "routes map the caller's `save` flag onto all three.",

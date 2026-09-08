@@ -154,6 +154,30 @@ def test_english_is_a_PIN_target_and_never_an_inference():
     assert next_reply_directive(EN, "Sure — here it is.", set()) is None
 
 
+
+def _cut_at_provider_send(built: str) -> str:
+    """Everything up to the first send to the provider after the directive
+    is built. Main sent straight to the socket (`await openai_ws.send`); the
+    voice runtime routes every provider event through the realtime lifecycle
+    (`await lifecycle.send_event`). Either is the same fence."""
+    ends = [i for i in (built.find("await openai_ws.send"),
+                        built.find("await lifecycle.send_event")) if i >= 0]
+    assert ends, "no provider send follows the directive construction"
+    return built[: min(ends)]
+
+
+def _persist_anchor(src: str) -> int:
+    """Where the assistant reply is persisted in the response.done branch.
+    Main saved inline and logged '[REALTIME] Failed to save assistant message'
+    on failure; the voice runtime hands the same row to its persist worker
+    (`_enqueue_persist(assistant_text=full_text, …)`)."""
+    for needle in ('"[REALTIME] Failed to save assistant message"',
+                   "assistant_text=full_text"):
+        i = src.find(needle)
+        if i >= 0:
+            return i
+    raise AssertionError("the assistant-reply persist is gone from ws_realtime")
+
 def test_a_pinned_directive_does_not_defer_to_the_audio():
     """The two wordings are different on purpose.
 
@@ -166,7 +190,7 @@ def test_a_pinned_directive_does_not_defer_to_the_audio():
     # Anchor on the directive's own heading, not on `if _pinned_lang:` — that
     # string first appears on the CONNECT path, where there is no else branch.
     built = src[src.index('lang_name = _REPLY_LANG_NAMES[want]'):]
-    built = built[: built.index("await openai_ws.send")]
+    built = _cut_at_provider_send(built)
     pinned, inferred = built.split("# Current speech language", 1)
     # Fragments that sit on ONE source line — "explicit choice" spans a string
     # concatenation and never appears contiguously in the source.
@@ -258,7 +282,7 @@ def test_the_directive_is_decided_where_BOTH_halves_are_known():
     )
     assert "response.done" in src
     call = src.index("want = next_reply_directive(")
-    persist = src.index('"[REALTIME] Failed to save assistant message"')
+    persist = _persist_anchor(src)
     assert call > persist, "the decision must run in the assistant-reply branch"
 
 
@@ -287,7 +311,7 @@ def test_the_directive_text_puts_the_audio_above_itself():
     # `_REPLY_LANG_NAMES` quotes the old sentence on purpose, and a module-wide
     # substring test would forbid describing the bug that was fixed.
     built = src[src.index("# Current speech language"):]
-    built = built[: built.index("await openai_ws.send")]
+    built = _cut_at_provider_send(built)
     assert "The user is speaking" not in built, "the standing-fact wording is back"
     assert "what you actually heard always wins" in built
     assert "expected reply language" in built

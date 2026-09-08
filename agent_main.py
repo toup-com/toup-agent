@@ -47,6 +47,7 @@ from app.api.models import router as models_router
 from app.api.webhooks import router as webhooks_router, set_webhook_refs
 from app.api.voice import router as voice_router
 from app.api.ws_realtime import router as ws_realtime_router, set_realtime_refs
+from app.api.voice_tasks import router as voice_tasks_router
 from app.api.ws_browser import router as ws_browser_router, set_ws_browser_refs
 from app.api.dashboard import router as dashboard_router
 from app.api.library import router as library_router
@@ -647,6 +648,7 @@ async def lifespan(app: FastAPI):
     agent_runner = None
     tool_executor = None
     app_manager = None
+    voice_task_service = None
 
     try:
         from app.agent.telegram_bot import ToupTelegramBot
@@ -717,6 +719,28 @@ async def lifespan(app: FastAPI):
         set_realtime_refs(tool_executor, agent_runner)
         set_agent_runner(agent_runner, ws_broadcast=broadcast_to_user)
         set_ws_browser_refs(agent_runner, skill_loader)
+        _voice_identity_bound = runtime_identity.is_bound()
+        _voice_pool_lobby = (
+            runtime_identity.is_pool_generic() and not _voice_identity_bound
+        )
+        from app.agent.voice_tasks import voice_task_supervisor_boot_allowed
+        if voice_task_supervisor_boot_allowed(
+            enabled=settings.voice_tasks_enabled,
+            bound=_voice_identity_bound,
+            passive=_bg_passive_active,
+        ):
+            from app.agent.voice_tasks import get_voice_task_service
+            voice_task_service = get_voice_task_service(agent_runner)
+            await voice_task_service.start()
+        elif settings.voice_tasks_enabled:
+            # Generic lobby containers still point at the shared pool DB, and a
+            # passive blue-green slot overlaps the serving owner. Both remain
+            # dormant. After bind, the first voice submit/list starts the
+            # singleton lazily; passive slots start it after promotion below.
+            _reason = "pool lobby" if _voice_pool_lobby else (
+                "blue-green passive" if _bg_passive_active else "unbound identity"
+            )
+            print(f"🎙️ Voice task supervisor deferred: {_reason}")
 
         # ── Recover jobs orphaned by a previous crash/restart ─────────
         # Logic + rationale live in app/agent/job_recovery.py (extracted so
@@ -1789,6 +1813,22 @@ async def lifespan(app: FastAPI):
                     print(f"🟢 [BG_PROMOTE] marker written at {_BG_MARKER}")
                 except Exception as e:
                     logger.warning("[BG_PROMOTE] marker write failed: %s", e)
+
+                # The passive slot can now recover queued/expired durable voice
+                # work without racing the old serving container. Generic lobby
+                # containers use submit/list as their post-bind lazy-start path.
+                if (settings.voice_tasks_enabled and runtime_identity.is_bound()
+                        and not is_passive_boot()):
+                    try:
+                        from app.agent.voice_tasks import get_voice_task_service
+                        _voice_service = get_voice_task_service(agent_runner)
+                        await _voice_service.start()
+                        print("🟢 [BG_PROMOTE] Voice task supervisor started")
+                    except Exception as e:
+                        logger.warning(
+                            "[BG_PROMOTE] voice task start failed (non-fatal): %s", e,
+                            exc_info=True,
+                        )
             except asyncio.CancelledError:
                 # Container shutting down before we finished — fine.
                 raise
@@ -1806,13 +1846,29 @@ async def lifespan(app: FastAPI):
     # ── Shutdown (reverse order) ──────────────────────────────
     logger.info("[SHUTDOWN] Agent shutting down — marking in-flight jobs as failed")
 
+    # Deliberately UNGATED. Gating on settings.voice_tasks_enabled meant the
+    # stop path was skipped exactly when the flag had been turned off while a
+    # supervisor was already running, so the loop kept polling through shutdown
+    # and its in-flight tasks were never marked unknown. On a process that
+    # never started one this is free: close_voice_task_services() iterates an
+    # empty registry.
+    try:
+        from app.agent.voice_tasks import close_voice_task_services
+        await close_voice_task_services()
+    except Exception as _voice_close_error:
+        logger.warning("[SHUTDOWN] Voice task close failed: %s", _voice_close_error)
+
     # Checkpoint: mark any running jobs as failed before exit
     try:
         from app.db.models import BuildJob
         from sqlalchemy import select as _shutdown_sel
         async with async_session_maker() as _sdb:
             _running = await _sdb.execute(
-                _shutdown_sel(BuildJob).where(BuildJob.status == "running")
+                _shutdown_sel(BuildJob).where(
+                    BuildJob.status == "running",
+                    (BuildJob.source_kind.is_(None)
+                     | (BuildJob.source_kind != "voice_task")),
+                )
             )
             _running_jobs = _running.scalars().all()
             for _rj in _running_jobs:
@@ -2014,6 +2070,7 @@ app.include_router(models_router, prefix=settings.api_prefix)    # GET /api/mode
 app.include_router(webhooks_router, prefix=settings.api_prefix)
 app.include_router(voice_router, prefix=settings.api_prefix)
 app.include_router(ws_realtime_router, prefix=settings.api_prefix)
+app.include_router(voice_tasks_router, prefix=settings.api_prefix)
 app.include_router(dashboard_router, prefix=settings.api_prefix)
 # The file library — /api/library/* (id-based) and the /api/workspace/*
 # path shapes the shipped clients call — a VIRTUAL tree over this tenant's

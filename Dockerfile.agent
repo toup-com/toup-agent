@@ -173,6 +173,14 @@ ENV AUTOPILOT_USER_ALLOWLIST="871bac24-c366-42b5-b224-8802c73aef3a,c47c5b4b-16d2
 # and removing this line + rollout is the fleet kill switch.
 ENV SUBAGENT_SPAWNING_ENABLED=true
 
+# Durable work launched from realtime voice. The platform-side
+# VOICE_TASKS_ENABLED gate is enabled only after the rollout is complete, but
+# the agent image must carry the same default so newly spawned and
+# blue-green-upgraded tenant containers can actually run the supervisor.
+# The bridge may still override this for an explicit staged rollback.
+ENV VOICE_TASKS_ENABLED=true \
+    VOICE_TASKS_FORCE_ON=true
+
 # Agent listens on 8001 internally (mapped to unique host port)
 EXPOSE 8001
 

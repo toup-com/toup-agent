@@ -64,7 +64,8 @@ _RESUME_TIMEOUT_S = 5.0
 
 async def _resume_job_for_action(
     db: AsyncSession, *, user_id: str, action_id: str, outcome: str,
-    detail: Optional[str] = None,
+    detail: Optional[str] = None, payload: Optional[dict] = None,
+    result: Optional[dict] = None,
 ) -> None:
     """Tell the tenant agent this card is decided, so the job it parked
     can terminalise.
@@ -89,9 +90,14 @@ async def _resume_job_for_action(
             return
         agent_url, agent_key = agent[0], agent[1]
         client = get_agent_http_client()
+        callback = {"action_id": action_id, "outcome": outcome, "detail": detail}
+        if isinstance(payload, dict):
+            callback["payload"] = payload
+        if isinstance(result, dict):
+            callback["result"] = result
         resp = await client.post(
             f"{agent_url.rstrip('/')}/api/agent/jobs/resolve-pending-action",
-            json={"action_id": action_id, "outcome": outcome, "detail": detail},
+            json=callback,
             headers={"X-Agent-Key": agent_key},
             timeout=_RESUME_TIMEOUT_S,
         )
@@ -550,6 +556,7 @@ async def approve_pending_action(
     # and it must be durable before anything downstream is told about it.
     await _resume_job_for_action(
         db, user_id=user_id, action_id=row.id, outcome=outcome_status,
+        payload=final_payload, result=result_payload,
         detail=(
             None if outcome_status == "executed"
             else str(result_payload.get("message") or "")[:200] or None

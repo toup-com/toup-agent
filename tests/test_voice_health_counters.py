@@ -59,7 +59,15 @@ async def test_a_healthy_session_records_open_and_turn_outcomes(relay, monkeypat
     client = FakeClientWS()
     openai_ws = FakeOpenAIWS([
         _function_call("think", {"task": "search"}),
-        {"type": "response.done", "response": {"output": [
+        # The realtime lifecycle keys every response on the provider's
+        # `response.id` (OpenAI always sends one); a done event without it
+        # is refused and the relay loop dies — which this test would then
+        # count instead of the turn. A `response.created` precedes it, as
+        # from the real provider: a done for a response the lifecycle never
+        # saw created is not the audible generation, and is not persisted
+        # or counted as a turn.
+        {"type": "response.created", "response": {"id": "resp-1"}},
+        {"type": "response.done", "response": {"id": "resp-1", "output": [
             {"type": "message", "content": [
                 {"type": "audio", "transcript": "Here you go."}]},
         ]}},
@@ -91,7 +99,8 @@ async def test_a_spoken_turn_with_no_tool_call_is_counted(relay, monkeypatch):
 
     client = FakeClientWS()
     openai_ws = FakeOpenAIWS([
-        {"type": "response.done", "response": {"output": [
+        {"type": "response.created", "response": {"id": "resp-1"}},
+        {"type": "response.done", "response": {"id": "resp-1", "output": [
             {"type": "message", "content": [
                 {"type": "audio", "transcript": "I think it's probably X."}]},
         ]}},

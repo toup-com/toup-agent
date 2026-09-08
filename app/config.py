@@ -1064,6 +1064,18 @@ class Settings(BaseSettings):
     # regardless. Platform-api only; the agent side needs no flag, because
     # route existence IS the flag.
     voice_realtime_tool_events: bool = False
+    # Durable managed work accepted from a realtime voice call. Dark until the
+    # agent image and the platform relay both expose the versioned protocol.
+    voice_tasks_enabled: bool = False
+    # Agent images carry the durable supervisor. A dedicated-container
+    # blue-green upgrade can otherwise clone an obsolete VOICE_TASKS_ENABLED=0
+    # from the old .env and silently keep the new protocol dark. This
+    # agent-only default makes the image and platform gates converge; operators
+    # can set VOICE_TASKS_FORCE_ON=false for an emergency rollback.
+    voice_tasks_force_on: bool = True
+    voice_task_max_seconds: float = 900.0
+    voice_task_max_active: int = 4
+    voice_task_poll_seconds: float = 1.0
     # TKT-LAT-015: pin Haiku for the Toup-Code supervisor loop. The
     # supervisor only makes routing decisions (click/type/scroll/done) in
     # ≤800 tokens — Opus/GPT-5.5 is overkill and burns ~$0.20–$1 per
@@ -2720,6 +2732,44 @@ class Settings(BaseSettings):
             object.__setattr__(self, "platform_api_url", f"{base}{prefix}")
         elif base != (self.platform_api_url or ""):
             object.__setattr__(self, "platform_api_url", base)
+        return self
+
+    @model_validator(mode="after")
+    def _activate_agent_voice_tasks(self) -> "Settings":
+        """Resolve the agent-side voice-task gate, most specific signal first.
+
+        Only ``run_mode == "agent"`` is touched; platform and monolith
+        processes keep following ``VOICE_TASKS_ENABLED`` exactly.
+
+        1. ``VOICE_TASKS_FORCE_ON`` falsey -> OFF. ``Dockerfile.agent`` bakes
+           ``VOICE_TASKS_ENABLED=true`` into every image, so "stop forcing"
+           can only mean "off"; leaving the baked value standing would make
+           the documented emergency rollback a no-op.
+        2. ``VOICE_TASKS_ENABLED`` present in the PROCESS environment wins,
+           in both directions. That variable is what ``docker run -e`` and
+           the bridge set, i.e. the only channel through which an operator
+           can address one specific container, so an explicit off must
+           survive. Before this, an explicit off was discarded and the
+           feature had no reliable kill switch at all.
+        3. Otherwise -> ON, the image default.
+
+        Rule 3 is still the stale-flag fix rule 2 might look like it undoes:
+        a blue-green upgrade clones an obsolete ``.env`` FILE, pydantic reads
+        it, but a dotenv value never lands in ``os.environ`` — so it falls
+        through to rule 3 and is correctly ignored.
+        """
+        if self.run_mode != "agent":
+            return self
+        if not self.voice_tasks_force_on:
+            object.__setattr__(self, "voice_tasks_enabled", False)
+            return self
+        import os
+        # Presence, not truthiness: pydantic has already parsed the value into
+        # self.voice_tasks_enabled, and a blank or unparseable one never gets
+        # this far (it is a ValidationError while Settings is constructed).
+        if os.environ.get("VOICE_TASKS_ENABLED") is not None:
+            return self
+        object.__setattr__(self, "voice_tasks_enabled", True)
         return self
 
     @model_validator(mode="after")

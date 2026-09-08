@@ -408,7 +408,13 @@ def test_debt_is_not_growing_silently():
     # sibling test_signup_trace_wiring.py needs `managed_containers`
     # (PLATFORM_ONLY). One suite, two exclusive tables, so the register hop was
     # split into the agent-mode step. ROUTING entry; it RUNS there.
-    CEILING = 99
+    # Wave 2 (+2): test_agent_runner_voice_context_isolation.py and
+    # test_voice_task_kill_switch.py came with the voice runtime and drive
+    # `conversations`/`build_jobs` (AGENT_ONLY). ROUTING entries; both RUN in
+    # the agent-mode step (14/14 and 19/19 there; 'no such table' in the sweep).
+    # Wave 2 (+1 more): test_voice_task_supervisor_polling.py, same runtime, same
+    # tables (11/11 under agent). ROUTING entry; it RUNS in the agent-mode step.
+    CEILING = 102
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

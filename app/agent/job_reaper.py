@@ -96,6 +96,10 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
         reaped: list[tuple[str, str, str]] = []
         builds: list[str] = []
         for job in jobs:
+            # Explicit leases and fencing own this lane. The generic age-based
+            # reaper cannot distinguish a long model/tool call from a zombie.
+            if getattr(job, "source_kind", None) == "voice_task":
+                continue
             last_alive = last_event_ts.get(job.id) or job.created_at
             if last_alive and last_alive >= cutoff:
                 continue

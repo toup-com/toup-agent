@@ -525,6 +525,36 @@ _INBOUND_MEDIA_CTX: contextvars.ContextVar[tuple] = contextvars.ContextVar(
 _DISABLED_TOOLS_CTX: contextvars.ContextVar[frozenset] = contextvars.ContextVar(
     "tool_executor_disabled_tools", default=frozenset(),
 )
+# Every field below belongs to one AgentRunner invocation. ToolExecutor is a
+# process singleton and managed voice work can overlap ordinary chat, so
+# instance attributes here would cross-contaminate files, confirmation cards,
+# media, and progress callbacks. Mutable containers are freshly installed at
+# run start; child tasks created for parallel reads inherit the same container
+# reference so their append/add operations remain visible to the parent run.
+_RUN_ATTACHMENTS_CTX: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "tool_executor_run_attachments", default=None,
+)
+_RUN_GOOGLE_DOCS_CTX: contextvars.ContextVar[Optional[set]] = contextvars.ContextVar(
+    "tool_executor_run_google_docs", default=None,
+)
+_RUN_PENDING_IDS_CTX: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "tool_executor_run_pending_action_ids", default=None,
+)
+_RUN_PENDING_CARDS_CTX: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "tool_executor_run_pending_action_cards", default=None,
+)
+_RUN_PROGRESS_CTX: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "tool_executor_run_progress", default=None,
+)
+_RUN_CREDENTIAL_CONFIRM_CTX: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "tool_executor_run_credential_confirm", default=None,
+)
+_RUN_LAST_PENDING_CTX: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "tool_executor_run_last_pending_action", default=None,
+)
+_RUN_LAST_MEDIA_CTX: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "tool_executor_run_last_media", default=None,
+)
 
 # Per-tool output limits (bytes)
 TOOL_OUTPUT_LIMITS: Dict[str, int] = {
@@ -931,6 +961,7 @@ class ToolExecutor:
         # consumed-before-read trap as `_last_media`. This list is written
         # once and cleared only at turn start.
         self.staged_pending_action_ids: List[str] = []
+        self.staged_pending_actions: List[Dict[str, Any]] = []
 
     # ── Per-call ContextVar-backed state (Phase 8) ──────────────
     #
@@ -981,6 +1012,86 @@ class ToolExecutor:
         # Coerce to frozenset so callers can't hand us a mutable set
         # and expect later .add() calls to propagate via the property.
         _DISABLED_TOOLS_CTX.set(frozenset(value or ()))
+
+    @property
+    def pending_attachments(self) -> List[Dict[str, Any]]:
+        value = _RUN_ATTACHMENTS_CTX.get()
+        if value is None:
+            value = []
+            _RUN_ATTACHMENTS_CTX.set(value)
+        return value
+
+    @pending_attachments.setter
+    def pending_attachments(self, value) -> None:
+        _RUN_ATTACHMENTS_CTX.set(list(value or ()))
+
+    @property
+    def google_docs_created_this_run(self) -> set:
+        value = _RUN_GOOGLE_DOCS_CTX.get()
+        if value is None:
+            value = set()
+            _RUN_GOOGLE_DOCS_CTX.set(value)
+        return value
+
+    @google_docs_created_this_run.setter
+    def google_docs_created_this_run(self, value) -> None:
+        _RUN_GOOGLE_DOCS_CTX.set(set(value or ()))
+
+    @property
+    def staged_pending_action_ids(self) -> List[str]:
+        value = _RUN_PENDING_IDS_CTX.get()
+        if value is None:
+            value = []
+            _RUN_PENDING_IDS_CTX.set(value)
+        return value
+
+    @staged_pending_action_ids.setter
+    def staged_pending_action_ids(self, value) -> None:
+        _RUN_PENDING_IDS_CTX.set(list(value or ()))
+
+    @property
+    def staged_pending_actions(self) -> List[Dict[str, Any]]:
+        value = _RUN_PENDING_CARDS_CTX.get()
+        if value is None:
+            value = []
+            _RUN_PENDING_CARDS_CTX.set(value)
+        return value
+
+    @staged_pending_actions.setter
+    def staged_pending_actions(self, value) -> None:
+        _RUN_PENDING_CARDS_CTX.set([dict(item) for item in (value or ())])
+
+    @property
+    def _on_tool_progress(self) -> Optional[Any]:
+        return _RUN_PROGRESS_CTX.get()
+
+    @_on_tool_progress.setter
+    def _on_tool_progress(self, value: Optional[Any]) -> None:
+        _RUN_PROGRESS_CTX.set(value)
+
+    @property
+    def _on_credential_confirm_request(self) -> Optional[Any]:
+        return _RUN_CREDENTIAL_CONFIRM_CTX.get()
+
+    @_on_credential_confirm_request.setter
+    def _on_credential_confirm_request(self, value: Optional[Any]) -> None:
+        _RUN_CREDENTIAL_CONFIRM_CTX.set(value)
+
+    @property
+    def _last_pending_action(self) -> Optional[Any]:
+        return _RUN_LAST_PENDING_CTX.get()
+
+    @_last_pending_action.setter
+    def _last_pending_action(self, value: Optional[Any]) -> None:
+        _RUN_LAST_PENDING_CTX.set(value)
+
+    @property
+    def _last_media(self) -> Optional[Any]:
+        return _RUN_LAST_MEDIA_CTX.get()
+
+    @_last_media.setter
+    def _last_media(self, value: Optional[Any]) -> None:
+        _RUN_LAST_MEDIA_CTX.set(value)
 
     def set_chat_id(self, chat_id: Optional[int]):
         """Set the current Telegram chat ID for send_file/send_photo tools."""
@@ -1308,6 +1419,7 @@ class ToolExecutor:
                 # Separate, unconsumed record for the job finalizer — see the
                 # field's docstring for why it can't just read the above.
                 self.staged_pending_action_ids.append(str(action_id))
+                self.staged_pending_actions.append(dict(card))
                 # R38: a caller that has to DRAW the card itself (the
                 # automation thread renders one `needs_you` turn per
                 # staged action). Per-task, so one turn's card can never
@@ -6116,6 +6228,25 @@ class ToolExecutor:
         resolved = path if os.path.isabs(path) else os.path.join(base, path)
         self._guard_path(resolved, base)
         return resolved
+
+    def resolve_operation_path(
+        self, tool_name: str, tool_input: Dict[str, Any],
+    ) -> str:
+        """Resolve checkpoint identity through the same path rules as I/O.
+
+        Operation freshness must see ``state.json``, ``./state.json`` and an
+        absolute workspace path as the same target.  ``write_file`` also has a
+        native document-placement rewrite, so apply it here before taking the
+        real path.  This method performs no I/O or directory creation.
+        """
+        payload = tool_input if isinstance(tool_input, dict) else {}
+        raw = payload.get("path") or payload.get("file_path") or payload.get("filename")
+        base = self._session_workspace or self._get_user_workspace()
+        path = os.path.expanduser(str(raw or ""))
+        resolved = path if os.path.isabs(path) else os.path.join(base, path)
+        if str(tool_name or "").strip().lower() == "write_file":
+            resolved, _ = self._normalize_document_write_path(resolved)
+        return os.path.realpath(resolved)
 
     def _allowed_path_roots(self, base: str) -> list:
         """Realpath'd roots the file tools may touch: the workspace(s), the

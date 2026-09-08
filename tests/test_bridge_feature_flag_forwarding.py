@@ -71,22 +71,14 @@ def test_the_list_is_not_empty():
 
 # Flags read by the AGENT IMAGE but not by this checkout's Settings.
 #
-# The guard below assumes the fleet image is built from the same tree as
-# this test. That assumption failed on 2026-09-06 and has not been true
-# since: the running image (7edaed3ab644) is built from
-# codex/mobile-voice-agent-runtime, six commits main does not have, and it
-# is that image's config.py — not this one — that reads
-# VOICE_TASKS_ENABLED.
-#
-# The name must still be in `_FEATURE_FLAG_ENVS`: the bridge's
-# BRIDGE_VOICE_TASKS_FORCE_OFF branch lives inside `for k in
-# _FEATURE_FLAG_ENVS`, so without membership the voice runtime's only
-# emergency rollback is unreachable code, and neither recreate path strips
-# the fossil value a container was born with.
-#
-# Spelled out one name at a time on purpose — a typo is still a failure,
-# which is what this guard is for.
-IMAGE_SIDE_FLAGS = frozenset({"VOICE_TASKS_ENABLED"})
+# Empty since the voice runtime landed on main (wave 2, 2026-09-07): every
+# flag the bridge forwards is now a field of THIS tree's Settings, which is
+# what the guard below assumes. The set stays so the next branch-built image
+# has somewhere to declare its exemption — and the second assertion in
+# `test_an_image_side_exemption_is_real_and_still_needed` retires each entry
+# the moment its field lands, which is exactly how the VOICE_TASKS_ENABLED
+# entry left.
+IMAGE_SIDE_FLAGS: frozenset = frozenset()
 
 
 @pytest.mark.parametrize("flag", _forwarded_flags())
@@ -144,6 +136,7 @@ def test_an_image_side_exemption_is_real_and_still_needed(flag: str):
     # delivery path at all.
     "VOICE_CONTEXT_FROM_AGENT",
     "VOICE_CONTEXT_FROM_AGENT_USER_IDS",
+    "VOICE_TASKS_ENABLED",
 ])
 def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     """Dropping one of these from the bridge list is how a fleet silently

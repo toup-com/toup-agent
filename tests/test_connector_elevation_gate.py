@@ -351,7 +351,7 @@ async def test_double_approve_executes_once(register_elevated, alice_user_id):
 
 @pytest.mark.asyncio
 async def test_edits_are_applied_and_undeclared_keys_dropped(
-    register_elevated, alice_user_id,
+    register_elevated, alice_user_id, monkeypatch,
 ):
     """The card exists so the user can fix the draft — the edit has to
     actually reach the provider. And an argument the manifest never
@@ -359,6 +359,12 @@ async def test_edits_are_applied_and_undeclared_keys_dropped(
     _, provider = register_elevated()
     await _seed_identity(alice_user_id)
     staged = await _stage(alice_user_id)
+    callbacks = []
+
+    async def capture_callback(db, **kwargs):
+        callbacks.append(kwargs)
+
+    monkeypatch.setattr(api, "_resume_job_for_action", capture_callback)
 
     async with async_session_maker() as db:
         await api.approve_pending_action(
@@ -376,6 +382,14 @@ async def test_edits_are_applied_and_undeclared_keys_dropped(
     assert sent["body"] == "Edited body."
     assert sent["subject"] == "Hi", "unedited fields must survive"
     assert "evil_extra" not in sent
+    assert len(callbacks) == 1
+    callback = callbacks[0]
+    assert callback["user_id"] == alice_user_id
+    assert callback["action_id"] == staged.action_id
+    assert callback["outcome"] == "executed"
+    assert callback["payload"] == sent
+    assert callback["result"]["kind"] == "ok"
+    assert callback["detail"] is None
 
 
 @pytest.mark.asyncio

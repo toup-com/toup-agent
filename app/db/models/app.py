@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import String, Text, DateTime, Integer, Float, ForeignKey, JSON
+from sqlalchemy import String, Text, DateTime, Integer, Float, ForeignKey, JSON, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -207,6 +207,27 @@ class BuildJob(Base):
     # steps rebuild.
     progress_step: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     progress_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Durable execution ownership for work that is accepted independently of
+    # an HTTP/WebSocket lifetime (currently managed voice tasks).  A random
+    # claim_token fences a stale coroutine even when the same replica id is
+    # reused.  Queued rows may be reclaimed; an expired running row is never
+    # replayed because an external side effect may already have happened.
+    claim_owner: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claim_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # The database revision and the three delivery cursors are deliberately
+    # separate.  A failed socket emit must be able to retry the same revision,
+    # and restoring a snapshot must never imply that its summary was heard.
+    state_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    delivery_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    receipt_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    spoken_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index("ix_build_jobs_source_claim", "source_kind", "status", "claim_expires_at"),
+    )
 
 
 class JobEvent(Base):

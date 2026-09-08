@@ -30,7 +30,7 @@ try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:  # pragma: no cover — VPS Python 3.12 has it
     ZoneInfo = None  # type: ignore
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,15 @@ from app.agent.context_manager import (
     estimate_tokens,
     estimate_messages_tokens,
     is_context_overflow_error,
+)
+from app.agent.operation_identity import (
+    mutation_invalidates_read,
+    resolved_operation_is_read,
+    tool_operation_cacheable_read,
+    tool_operation_checkpoint,
+    tool_operation_kind,
+    tool_operation_key,
+    tool_result_is_confirmation,
 )
 from app.agent.tool_definitions import (
     get_agent_tools,
@@ -302,6 +311,9 @@ _RUN_DISABLED_TOOLS_CTX: contextvars.ContextVar[Optional[frozenset]] = contextva
 # research arc and still lands a real synthesis.
 _RUN_MAX_ITER_CTX: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
     "agent_runner_max_iterations", default=None,
+)
+_RUN_MANAGED_VOICE_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "agent_runner_managed_voice", default=False,
 )
 
 
@@ -750,6 +762,10 @@ class AgentResponse:
     # in-run ceiling tripped so callers can transition honestly.
     credits_spent: float = 0.0
     stopped_reason: str = ""
+    # Structured server-owned completion facts. Managed voice tasks use this
+    # for pending-action operation ids and media; fetched/tool text never gains
+    # system-message privilege through this field.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
@@ -1570,6 +1586,12 @@ class AgentRunner:
         # None = all (every caller but the automation thread). See
         # `scope_connector_tools` for why the thread must scope.
         connector_scope: Optional[List[str]] = None,
+        # A managed voice task outlives its realtime socket and therefore uses
+        # the ordinary agent iteration budget. Corrections are persisted by
+        # its owner and drained at safe execution barriers.
+        managed_voice_task: bool = False,
+        steering_check: Optional[Callable[[], Coroutine[Any, Any, List[str]]]] = None,
+        managed_resolved_operations: Optional[Iterable[Dict[str, Any]]] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -1690,7 +1712,9 @@ class AgentRunner:
             except Exception:  # noqa: BLE001
                 logger.debug("[AGENT] on_tool_event sink failed", exc_info=True)
 
-        # Reset pending attachments — belongs to this run only.
+        _RUN_MANAGED_VOICE_CTX.set(bool(managed_voice_task and (channel or "").strip().lower() == "voice"))
+        # Reset all transient executor state — each property is ContextVar
+        # backed, so overlapping chat/voice runs cannot drain one another.
         self.tools.pending_attachments = []
         # Same lifetime, and it MUST be cleared here: left set, the next turn's
         # "now make me a Word version" would be refused as a duplicate of a doc
@@ -1699,6 +1723,9 @@ class AgentRunner:
         # Same lifetime again: a card the user approved (or ignored) two turns
         # ago must not park this turn's job.
         self.tools.staged_pending_action_ids = []
+        self.tools.staged_pending_actions = []
+        self.tools._last_pending_action = None
+        self.tools._last_media = None
         _attachments_emitted_count = 0
 
         # ── Classify query intent (lightweight, <1ms) ─────────────────
@@ -1899,7 +1926,8 @@ class AgentRunner:
             # resolved session_id; `_vjob` itself is bound at the top of the
             # method, so no path through the turn can reach the tool loop
             # with the name unbound.
-            if (channel or "").strip().lower() == "voice" and settings.voice_turn_jobs:
+            if ((channel or "").strip().lower() == "voice"
+                    and settings.voice_turn_jobs and not managed_voice_task):
                 try:
                     _vjob = VoiceTurnJob(
                         user_id=user_id, conversation_id=session_id,
@@ -1973,7 +2001,7 @@ class AgentRunner:
             # 17-tool-call, 113-second answer is not a slow answer — it is no
             # answer. Told the number in Runtime Context, the model plans a
             # shorter arc instead of being cut off mid-way.
-            if (channel or "").strip().lower() == "voice":
+            if (channel or "").strip().lower() == "voice" and not managed_voice_task:
                 _vmax = int(getattr(settings, "voice_max_tool_iterations", 8) or 8)
                 _RUN_MAX_ITER_CTX.set(max(2, _vmax))
                 logger.info("[AGENT] channel=voice — tool-iteration ceiling %d", max(2, _vmax))
@@ -2846,8 +2874,100 @@ class AgentRunner:
 
         text_buf = ""
         _max_iter = self._effective_max_iterations()
+        _filesystem_path_resolver = getattr(
+            self.tools, "resolve_operation_path", None,
+        )
+        if not callable(_filesystem_path_resolver):
+            _filesystem_path_resolver = None
+        _resolved_operations: Dict[str, Dict[str, Any]] = {}
+        _resolved_records: List[Dict[str, Any]] = []
+        for _operation in managed_resolved_operations or ():
+            if not isinstance(_operation, dict):
+                continue
+            _operation_key = str(_operation.get("operation_key") or "")
+            if len(_operation_key) == 64 and all(
+                char in "0123456789abcdef" for char in _operation_key.lower()
+            ):
+                _record = dict(_operation)
+                _resolved_records.append(_record)
+                _resolved_operations[_operation_key] = _record
+        # An executed operation key always wins over an earlier card's staged
+        # alias. This is what lets a separately authorised operation use the
+        # same arguments without being conflated with an edited card.
+        for _record in _resolved_records:
+            for _alias in _record.get("operation_aliases") or ():
+                _alias_key = str(_alias or "")
+                if len(_alias_key) == 64 and all(
+                    char in "0123456789abcdef" for char in _alias_key.lower()
+                ):
+                    _resolved_operations.setdefault(_alias_key, _record)
+
+        def _resolved_operation(
+            tc: Dict[str, Any], snapshot_iteration: int,
+        ) -> Optional[Dict[str, Any]]:
+            tool_name = str(tc.get("name") or "")
+            tool_input = tc.get("input") or {}
+            operation_key = tool_operation_key(
+                tool_name, tool_input,
+            )
+            record = _resolved_operations.get(operation_key)
+            if record is None:
+                return None
+            current_kind = tool_operation_kind(tool_name, tool_input)
+            if current_kind == "read":
+                if not tool_operation_cacheable_read(tool_name, tool_input):
+                    return None
+                # Calls proposed by one model response share a bounded snapshot.
+                # A later model round is a new observation boundary, so ordinary
+                # run-local reads execute again.  Durable records loaded above
+                # intentionally have no run-local snapshot marker: they are
+                # completed managed-task evidence used after restart/continuation.
+                if (record.get("checkpoint_scope") == "run"
+                        and record.get("snapshot_iteration") != snapshot_iteration):
+                    return None
+            elif resolved_operation_is_read(record):
+                # Classification can tighten between deployments.  Read
+                # evidence must never become a replay guard for a call that is
+                # currently known to mutate state.
+                return None
+            return {
+                **record,
+                "matched_as_alias": operation_key != record.get("operation_key"),
+            }
+
+        def _drop_read_checkpoints(
+            mutation_tool: Optional[str] = None,
+            mutation_input: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            for key, operation in list(_resolved_operations.items()):
+                should_drop = (
+                    resolved_operation_is_read(operation)
+                    if mutation_tool is None
+                    else mutation_invalidates_read(
+                        mutation_tool,
+                        mutation_input or {},
+                        operation,
+                        filesystem_path_resolver=_filesystem_path_resolver,
+                    )
+                )
+                if should_drop:
+                    _resolved_operations.pop(key, None)
+
+        async def _take_corrections() -> List[str]:
+            if steering_check is None:
+                return []
+            values = await steering_check()
+            corrections = [
+                str(v).strip() for v in (values or []) if str(v).strip()
+            ]
+            if corrections:
+                _drop_read_checkpoints()
+            return corrections
+
         for iteration in range(_max_iter):
             logger.info(f"[AGENT] Iteration {iteration + 1}/{_max_iter}")
+            for _correction in await _take_corrections():
+                messages.append({"role": "user", "content": _correction})
 
             # Budget checkpoint B: a breach discovered after tool
             # execution must never start another LLM call. Redundant
@@ -3326,6 +3446,25 @@ class AgentRunner:
             if assistant_content:
                 messages.append({"role": "assistant", "content": assistant_content})
 
+            # A correction received while the model was generating supersedes
+            # proposed calls. Close every tool-use block with an explicit
+            # skipped result, retain prior completed work, then let the next
+            # iteration answer the corrected request.
+            _round_corrections = await _take_corrections()
+            if _round_corrections:
+                if pending_tool_calls:
+                    messages.append({"role": "user", "content": [
+                        {
+                            "type": "tool_result", "tool_use_id": tc["id"],
+                            "content": "Skipped: the user changed the request before execution.",
+                            "is_error": True,
+                        }
+                        for tc in pending_tool_calls
+                    ]})
+                for _correction in _round_corrections:
+                    messages.append({"role": "user", "content": _correction})
+                continue
+
             _is_final_round = stop_reason != "tool_use" or not pending_tool_calls
             # Round 4 (item 8): the model's own thinking for this round is a
             # step-level event — the closing (tool-less) round is attributed
@@ -3487,7 +3626,20 @@ class AgentRunner:
                                 exc_info=True,
                             )
 
-            _parallel_tcs = [tc for tc in pending_tool_calls if tc["name"] in PARALLEL_SAFE_TOOLS]
+            _parallel_tcs = []
+            for tc in pending_tool_calls:
+                if tc["name"] in BOOKKEEPING_TOOLS:
+                    continue
+                if tc["name"] in PARALLEL_SAFE_TOOLS:
+                    if _resolved_operation(tc, iteration) is None:
+                        _parallel_tcs.append(tc)
+                    continue
+                # Do not hoist a later read across a mutation. A non-audited
+                # read remains sequential but is not a dependency barrier:
+                # calls emitted in one model response cannot consume one
+                # another's output. Unknown tools classify as mutations.
+                if tool_operation_kind(tc["name"], tc.get("input") or {}) == "mutation":
+                    break
             # The web batch runs concurrently when there are ≥2 web calls, OR
             # when there is bookkeeping to overlap with — create_job is 0.6–1 s
             # and update_job 0.5 s of DB + notify work (measured), and paying
@@ -3526,16 +3678,59 @@ class AgentRunner:
                 else:
                     _par_res = await _batch_coro
                 _parallel_results.update(_par_res)
+                _parallel_unique = len({
+                    tool_operation_key(tc["name"], tc.get("input") or {})
+                    for tc in _parallel_tcs
+                })
                 _wf.mark("tool_batch", int((time.perf_counter() - _t_par) * 1000),
                          t0_ms=int((_t_par - _wf.t0) * 1000), n=len(_parallel_tcs),
+                         unique_operations=_parallel_unique,
                          tools=[tc["name"] for tc in _parallel_tcs],
                          with_bookkeeping=bool(_bk_tcs) or None)
             elif _bk_tcs:
                 await _run_bookkeeping()
+            # Reads already completed by the parallel batch remain useful. A
+            # correction arriving during them prevents only work that has not
+            # started yet, especially mutations.
+            _post_batch_corrections = await _take_corrections()
             for tc in pending_tool_calls:
                 if cancel_check and cancel_check():
                     logger.info("[AGENT] Cancelled before tool execution")
                     raise asyncio.CancelledError("Generation cancelled by user")
+
+                _pre = _parallel_results.get(tc["id"])
+                _prior_operation = _resolved_operation(tc, iteration)
+                if _pre is None and (
+                    _post_batch_corrections or _prior_operation is not None
+                ):
+                    if _post_batch_corrections:
+                        _why = "Skipped: the user changed the request before execution."
+                        _is_error = True
+                    else:
+                        _prior_result = str(_prior_operation.get("result") or "")
+                        if _prior_operation.get("matched_as_alias"):
+                            _why = (
+                                "This staged action was already resolved with the user's approved "
+                                "edits and was not staged again."
+                            )
+                        elif _prior_operation.get("checkpoint_scope") == "run":
+                            _why = (
+                                "Reused the prior result; this exact operation already completed "
+                                "in this run and was not executed again."
+                            )
+                        else:
+                            _why = (
+                                "Reused durable checkpoint result; this exact tool operation was "
+                                "already resolved and was not executed again."
+                            )
+                        if _prior_result:
+                            _why += f"\nPrior result: {_prior_result}"
+                        _is_error = not bool(_prior_operation.get("ok"))
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": tc["id"],
+                        "content": _why, "is_error": _is_error,
+                    })
+                    continue
 
                 logger.info(f"[AGENT] Tool called: {tc['name']}({json.dumps(tc['input'])[:200]})")
                 all_tool_calls.append(tc)
@@ -3554,7 +3749,6 @@ class AgentRunner:
 
                 _t_tool = time.perf_counter()
                 _t_tool_started_ms = int(time.time() * 1000)
-                _pre = _parallel_results.get(tc["id"])
                 if _pre is not None:
                     # Already executed concurrently above; reuse its result and
                     # its real wall-clock timing so the PERF log and persisted
@@ -3581,6 +3775,36 @@ class AgentRunner:
 
                 logger.info(f"[PERF] tool_exec({tc['name']}): {_elapsed_ms:.0f}ms — {len(result)} chars")
                 logger.info(f"[AGENT] Tool result: {result[:200]}")
+                if (not str(result).lstrip().upper().startswith("ERROR")
+                        and not tool_result_is_confirmation(result)):
+                    checkpoint = tool_operation_checkpoint(
+                        tc["name"],
+                        tc.get("input") or {},
+                        filesystem_path_resolver=_filesystem_path_resolver,
+                    )
+                    if checkpoint["operation_kind"] == "mutation":
+                        _drop_read_checkpoints(tc["name"], tc.get("input") or {})
+                    _cacheable_read = (
+                        checkpoint["operation_kind"] == "read"
+                        and tool_operation_cacheable_read(
+                            tc["name"], tc.get("input") or {},
+                        )
+                    )
+                    if (managed_voice_task and checkpoint["operation_kind"] == "mutation") or _cacheable_read:
+                        operation_key = tool_operation_key(
+                            tc["name"], tc.get("input") or {},
+                        )
+                        _resolved_operations[operation_key] = {
+                            "operation_key": operation_key,
+                            "operation_id": str(tc.get("id") or "")[:64],
+                            "tool_name": tc["name"],
+                            "status": "executed",
+                            "ok": True,
+                            "result": str(result)[:4000],
+                            "checkpoint_scope": "run",
+                            **({"snapshot_iteration": iteration} if _cacheable_read else {}),
+                            **checkpoint,
+                        }
                 await _hb.emit(HookEvent.AFTER_TOOL_CALL, {"tool": tc["name"], "result_len": len(result)})
                 # Ground the citation gate: URLs the model was shown (any tool
                 # output) and URLs it fetched itself. A tool that errored
@@ -3748,7 +3972,15 @@ class AgentRunner:
                     "content": result,
                 })
 
+                # Sequential tools may take long enough for a correction to
+                # arrive. Keep this completed result and stop later calls from
+                # starting; never interrupt an in-flight external operation.
+                if not _post_batch_corrections:
+                    _post_batch_corrections = await _take_corrections()
+
             messages.append({"role": "user", "content": tool_results})
+            for _correction in _post_batch_corrections:
+                messages.append({"role": "user", "content": _correction})
 
             # After first tool use, escalate to full toolset for subsequent iterations
             # so the agent isn't constrained if it discovers it needs more tools.
@@ -3849,6 +4081,24 @@ class AgentRunner:
 
         # ── Phase 3: Save to DB (short-lived session) ────────────
         t_phase3 = time.perf_counter()
+        # Snapshot managed-voice metadata before _save_messages consumes the
+        # single-value compatibility fields.  The lists are the durable source
+        # for multi-card turns; the last item preserves the legacy singular
+        # response field without rereading a cleared ToolExecutor attribute.
+        _voice_pending_action_ids = (
+            list(getattr(self.tools, "staged_pending_action_ids", []) or [])
+            if managed_voice_task else []
+        )
+        _voice_pending_actions = (
+            list(getattr(self.tools, "staged_pending_actions", []) or [])
+            if managed_voice_task else []
+        )
+        _voice_pending_action = (
+            _voice_pending_actions[-1] if _voice_pending_actions else None
+        )
+        _voice_media = (
+            getattr(self.tools, "_last_media", None) if managed_voice_task else None
+        )
         # Save messages synchronously (fast, needed for conversation continuity).
         # Sub-agent runs pass save_assistant_message=False so the child's
         # reply does not pollute the user's Day-as-Chat — Phase 4's
@@ -4319,7 +4569,7 @@ class AgentRunner:
                 # design, and the resume path closes it when the card is
                 # answered.
                 _staged_actions = list(
-                    getattr(self.tools, "staged_pending_action_ids", []) or []
+                    _voice_pending_action_ids
                 )
                 _park = bool(_staged_actions)
                 _now = datetime.utcnow()
@@ -4508,6 +4758,13 @@ class AgentRunner:
             asst_message_id=asst_message_id,
             credits_spent=round(_run_credits, 4),
             stopped_reason=_stopped_reason,
+            metadata={
+                "pending_action_ids": _voice_pending_action_ids,
+                "pending_actions": _voice_pending_actions,
+                **({"pending_action": _voice_pending_action}
+                   if _voice_pending_action else {}),
+                **({"media": _voice_media} if _voice_media else {}),
+            } if managed_voice_task else {},
         )
 
     async def _execute_tools_parallel(
@@ -4529,8 +4786,25 @@ class AgentRunner:
         """
         sem = asyncio.Semaphore(max(1, cap))
 
-        async def _one(tc: Dict[str, Any]) -> Dict[str, Any]:
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for index, tc in enumerate(tcs):
+            operation_key = tool_operation_key(tc["name"], tc.get("input") or {})
+            key = (
+                operation_key
+                if tool_operation_cacheable_read(tc["name"], tc.get("input") or {})
+                else f"{operation_key}:{tc.get('id') or index}"
+            )
+            groups.setdefault(key, []).append(tc)
+        grouped_calls = list(groups.values())
+        if len(grouped_calls) != len(tcs):
+            logger.info(
+                "[PERF] read_coalesce logical=%d unique=%d saved=%d",
+                len(tcs), len(grouped_calls), len(tcs) - len(grouped_calls),
+            )
+
+        async def _one(group: List[Dict[str, Any]]) -> Dict[str, Any]:
             async with sem:
+                tc = group[0]
                 started_ms = int(time.time() * 1000)
                 # Emit from HERE, not from the sequential loop below: these
                 # calls run concurrently and BEFORE that loop, so emitting
@@ -4541,11 +4815,14 @@ class AgentRunner:
                 # sources instead of silently losing them.
                 _ef = event_fields or {}
                 if on_tool_event:
-                    await on_tool_event({
-                        "phase": "start", "call_id": tc["id"], "name": tc["name"],
-                        "input": tc.get("input") or {}, "started_ms": started_ms,
-                        **_ef,
-                    })
+                    for logical_call in group:
+                        await on_tool_event({
+                            "phase": "start", "call_id": logical_call["id"],
+                            "name": logical_call["name"],
+                            "input": logical_call.get("input") or {},
+                            "started_ms": started_ms,
+                            **_ef,
+                        })
                 try:
                     result = await self.tools.execute(tc["name"], tc["input"])
                 except Exception as e:
@@ -4553,26 +4830,40 @@ class AgentRunner:
                     result = f"ERROR: Tool crashed: {type(e).__name__}: {e}"
                 _done_ms = int(time.time() * 1000)
                 if on_tool_event:
-                    _ev: Dict[str, Any] = {
-                        "phase": "end", "call_id": tc["id"], "name": tc["name"],
-                        "input": tc.get("input") or {}, "result": result,
-                        "started_ms": started_ms, "completed_ms": _done_ms,
-                        "elapsed_ms": _done_ms - started_ms,
-                        **_ef,
-                    }
-                    if tc["name"] in WEB_DOMAIN_TOOLS:
-                        _d, _u = extract_web_refs(tc["name"], tc.get("input"), result)
-                        if _d:
-                            _ev["domains"], _ev["urls"] = _d, _u
-                    await on_tool_event(_ev)
+                    for logical_call in group:
+                        _ev: Dict[str, Any] = {
+                            "phase": "end", "call_id": logical_call["id"],
+                            "name": logical_call["name"],
+                            "input": logical_call.get("input") or {}, "result": result,
+                            "started_ms": started_ms, "completed_ms": _done_ms,
+                            "elapsed_ms": _done_ms - started_ms,
+                            **_ef,
+                        }
+                        if len(group) > 1:
+                            _ev["coalesced_operation_id"] = tc["id"]
+                        if logical_call["name"] in WEB_DOMAIN_TOOLS:
+                            _d, _u = extract_web_refs(
+                                logical_call["name"],
+                                logical_call.get("input"),
+                                result,
+                            )
+                            if _d:
+                                _ev["domains"], _ev["urls"] = _d, _u
+                        await on_tool_event(_ev)
                 return {
                     "result": result,
                     "started_ms": started_ms,
                     "completed_ms": int(time.time() * 1000),
                 }
 
-        gathered = await asyncio.gather(*[_one(tc) for tc in tcs])
-        results = {tc["id"]: g for tc, g in zip(tcs, gathered)}
+        gathered = await asyncio.gather(*[_one(group) for group in grouped_calls])
+        results: Dict[str, Dict[str, Any]] = {}
+        for group, gathered_result in zip(grouped_calls, gathered):
+            for index, tc in enumerate(group):
+                results[tc["id"]] = {
+                    **gathered_result,
+                    "coalesced": index > 0,
+                }
 
         # Ticket 6: cap the AGGREGATE token load across this parallel web batch
         # (all PARALLEL_SAFE web tools) so a multi-fetch turn can't flood the
@@ -5958,6 +6249,14 @@ class AgentRunner:
             _channel_safe,
             "Unknown channel — format conservatively: short, minimal markdown.",
         )
+        if _channel_safe == "voice" and _RUN_MANAGED_VOICE_CTX.get():
+            _channel_guidance = (
+                "Managed work requested during a live voice conversation. "
+                "Return a complete written result with verified sources and registered files. "
+                "The voice layer will speak a short summary while the full result remains visible. "
+                "Apply user corrections to future work without repeating completed actions, preserve "
+                "all confirmation requirements, and never claim an unconfirmed external action succeeded."
+            )
 
         # Time is rendered in the USER'S LOCAL TIMEZONE, never UTC. The
         # agent faces the user; the user cares about their clock, not the
@@ -5983,7 +6282,9 @@ class AgentRunner:
             "- STALENESS RULE: your training knowledge of anything that changes over time — the newest/latest/current/most-capable model, product, version, price, release, ranking, or who holds a role — is OUT OF DATE relative to today's date above. Any such claim MUST come from THIS TURN's web_search/web_fetch results, never from memory. Every search result shows a `published:` date: prefer the NEWEST dated result from the OFFICIAL domain; when sources disagree, the official domain and the newer date win. If the thing you remember does not appear in this turn's results, do not assert it — search again with a NEUTRAL query (no site: operator) and confirm on the official site. Two agreeing sources, or say plainly that you could not verify.",
             "- CITATIONS: link only to URLs that appear verbatim in this turn's tool results. Never compose, guess, or recall a URL. Unverified links are stripped and marked before the user sees them.",
             (
-                "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated')."
+                ("- This managed voice task remains active independently of speech and the socket. Finish the tracked work, produce the full written result, and do not open another job or mission for it."
+                 if _RUN_MANAGED_VOICE_CTX.get() else
+                 "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated').")
                 if _channel_safe == "voice" else
                 "- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` — in the SAME response as the first step's tool calls, never alone — and advance it with `update_job(current_step=k)` in the same response as the next step's tools. Do not call update_job to mark it completed; the system completes it when your reply is delivered. Every response spent on bookkeeping alone is a round-trip the user waits through. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask."
             ),

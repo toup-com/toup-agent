@@ -158,6 +158,12 @@ async def recover_orphaned_jobs(
 
         for job in rows:
             try:
+                # Managed voice jobs use explicit owner/token/lease fencing.
+                # Their service marks an expired RUNNING claim unknown and
+                # never replays it; the generic restart policy must not race
+                # that decision or silently turn it into a retryable job.
+                if getattr(job, "source_kind", None) == "voice_task":
+                    continue
                 if job.created_at and (now - job.created_at) < grace:
                     out.skipped_in_grace += 1
                     continue

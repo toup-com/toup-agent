@@ -1,14 +1,17 @@
 """Agent API endpoints - for Toup agent to store and retrieve memories"""
 
 import json
+from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import desc, select, and_
+from sqlalchemy import desc, select, and_, update as sa_update
 
 from app.db import get_db, Memory, Entity, EntityLink, AgentConfig
-from app.db.models import AgentSecurityEvent, EVENT_AGENT_KEY_ROTATED
+from app.db.models import (
+    AgentSecurityEvent, ConnectorPendingAction, EVENT_AGENT_KEY_ROTATED,
+)
 from app.schemas import (
     AgentStoreRequest, AgentRecallRequest, AgentRecallResponse,
     AgentGraphRequest, AgentGraphResponse,
@@ -597,6 +600,23 @@ class AgentRuntimeFlagsResponse(BaseModel):
     subagent_spawning_enabled: bool
 
 
+async def _authenticated_agent_tenant(
+    db: AsyncSession, x_agent_key: Optional[str], x_agent_user_id: Optional[str],
+) -> str:
+    """Validate the standard tenant-agent header pair against platform state."""
+    if not x_agent_key or not x_agent_user_id:
+        raise HTTPException(
+            status_code=401, detail="X-Agent-Key + X-Agent-User-Id required",
+        )
+    cfg = (await db.execute(select(AgentConfig).where(and_(
+        AgentConfig.user_id == x_agent_user_id,
+        AgentConfig.agent_api_key == x_agent_key,
+    )))).scalar_one_or_none()
+    if cfg is None:
+        raise HTTPException(status_code=403, detail="agent key mismatch")
+    return str(x_agent_user_id)
+
+
 @router.get("/runtime-flags", response_model=AgentRuntimeFlagsResponse)
 async def get_runtime_flags(
     x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
@@ -613,21 +633,15 @@ async def get_runtime_flags(
     ``streaming.py``, ``credits.py``, etc. Validates the (user, key)
     pair against the agent_configs row so a tenant can only read its
     own flags. 401 on missing headers, 403 on key mismatch."""
-    if not x_agent_key or not x_agent_user_id:
-        raise HTTPException(
-            status_code=401,
-            detail="X-Agent-Key + X-Agent-User-Id required",
-        )
-
-    cfg = (await db.execute(
-        select(AgentConfig).where(
-            and_(
-                AgentConfig.user_id == x_agent_user_id,
-                AgentConfig.agent_api_key == x_agent_key,
-            )
-        )
-    )).scalar_one_or_none()
+    await _authenticated_agent_tenant(db, x_agent_key, x_agent_user_id)
+    cfg = (await db.execute(select(AgentConfig).where(
+        AgentConfig.user_id == x_agent_user_id
+    ))).scalar_one_or_none()
     if cfg is None:
+        # The helper above proved the (user, key) row exists a moment ago;
+        # a miss here is still a mismatch, never a 500 (`scalar_one` raised
+        # NoResultFound — main's contract, pinned by
+        # test_subagent_spawning_tenant_flag.py, is 403).
         raise HTTPException(status_code=403, detail="agent key mismatch")
 
     return AgentRuntimeFlagsResponse(
@@ -635,6 +649,101 @@ async def get_runtime_flags(
             getattr(cfg, "subagent_spawning_enabled", False)
         ),
     )
+
+
+class AgentPendingActionStatus(BaseModel):
+    action_id: str
+    connector_id: str
+    tool_name: str
+    payload: dict
+    status: str
+    decided_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    result: Optional[dict] = None
+
+
+def _agent_action_status(row: ConnectorPendingAction) -> AgentPendingActionStatus:
+    try:
+        payload_value = json.loads(row.payload_json) if row.payload_json else {}
+        payload = payload_value if isinstance(payload_value, dict) else {}
+    except (TypeError, ValueError):
+        payload = {}
+    result = None
+    if row.result_json:
+        try:
+            value = json.loads(row.result_json)
+            result = value if isinstance(value, dict) else {"value": value}
+        except (TypeError, ValueError):
+            result = {"kind": "unparseable"}
+    return AgentPendingActionStatus(
+        action_id=row.id, connector_id=row.connector_id,
+        tool_name=row.tool_name, payload=payload, status=row.status,
+        decided_at=row.decided_at.isoformat() if row.decided_at else None,
+        expires_at=row.expires_at.isoformat() if row.expires_at else None,
+        result=result,
+    )
+
+
+async def _owned_agent_action(
+    db: AsyncSession, action_id: str, user_id: str,
+) -> ConnectorPendingAction:
+    row = (await db.execute(select(ConnectorPendingAction).where(
+        ConnectorPendingAction.id == action_id,
+        ConnectorPendingAction.user_id == user_id,
+    ))).scalar_one_or_none()
+    if row is None:
+        # Ownership misses are indistinguishable from absent ids.
+        raise HTTPException(status_code=404, detail="No such pending action")
+    return row
+
+
+@router.get(
+    "/pending-actions/{action_id}", response_model=AgentPendingActionStatus,
+)
+async def agent_pending_action_status(
+    action_id: str,
+    x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
+    x_agent_user_id: Optional[str] = Header(default=None, alias="X-Agent-User-Id"),
+    db: AsyncSession = Depends(get_db),
+) -> AgentPendingActionStatus:
+    """Authoritative reconciliation read for a tenant's durable task worker."""
+    user_id = await _authenticated_agent_tenant(db, x_agent_key, x_agent_user_id)
+    row = await _owned_agent_action(db, action_id, user_id)
+    if row.status == "pending" and row.expires_at <= datetime.utcnow():
+        now = datetime.utcnow()
+        await db.execute(sa_update(ConnectorPendingAction).where(
+            ConnectorPendingAction.id == row.id,
+            ConnectorPendingAction.status == "pending",
+        ).values(status="expired", decided_at=now,
+                 decided_via="voice_task_reconcile"))
+        await db.commit()
+        row = await _owned_agent_action(db, action_id, user_id)
+    return _agent_action_status(row)
+
+
+@router.post(
+    "/pending-actions/{action_id}/cancel", response_model=AgentPendingActionStatus,
+)
+async def agent_cancel_pending_action(
+    action_id: str,
+    x_agent_key: Optional[str] = Header(default=None, alias="X-Agent-Key"),
+    x_agent_user_id: Optional[str] = Header(default=None, alias="X-Agent-User-Id"),
+    db: AsyncSession = Depends(get_db),
+) -> AgentPendingActionStatus:
+    """Reject a still-pending card; an approval that won remains authoritative."""
+    user_id = await _authenticated_agent_tenant(db, x_agent_key, x_agent_user_id)
+    row = await _owned_agent_action(db, action_id, user_id)
+    if row.status == "pending":
+        now = datetime.utcnow()
+        next_status = "expired" if row.expires_at <= now else "rejected"
+        await db.execute(sa_update(ConnectorPendingAction).where(
+            ConnectorPendingAction.id == row.id,
+            ConnectorPendingAction.status == "pending",
+        ).values(status=next_status, decided_at=now,
+                 decided_via="voice_task_cancel"))
+        await db.commit()
+        row = await _owned_agent_action(db, action_id, user_id)
+    return _agent_action_status(row)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -649,6 +758,11 @@ class ResolvePendingActionRequest(BaseModel):
     outcome: str
     #: Optional one-line reason, shown to the user on the non-happy paths.
     detail: Optional[str] = None
+    #: Final arguments after any approval-card edits. Older platform versions
+    #: may omit these; the agent also performs an authoritative status read.
+    payload: Optional[dict] = None
+    #: Redacted terminal provider result, when the callback carries it.
+    result: Optional[dict] = None
 
 
 class ResolvePendingActionResponse(BaseModel):
@@ -716,6 +830,23 @@ async def resolve_job_for_pending_action(
     from app.db.database import async_session_maker
     from app.db.models import BuildJob
 
+    # Managed voice jobs keep a multi-card ledger and may need a continuation
+    # after approval. Let their durable service consume this callback first;
+    # its platform poller is still the source of recovery when this hop is lost.
+    voice_resolved = 0
+    try:
+        from app.api.api_v1 import _agent_runner
+        if _agent_runner is not None:
+            from app.agent.voice_tasks import get_voice_task_service
+            voice_resolved = await get_voice_task_service(
+                _agent_runner
+            ).resolve_pending_action(
+                action_id=body.action_id, outcome=body.outcome,
+                detail=body.detail, payload=body.payload, result=body.result,
+            )
+    except Exception:  # callback acceleration must not block legacy resolvers
+        voice_resolved = 0
+
     resolved: list[tuple[str, str, str]] = []
     automation_run_ids: set[str] = set()
     async with async_session_maker() as db:
@@ -723,6 +854,8 @@ async def resolve_job_for_pending_action(
             select(BuildJob).where(BuildJob.status == STATUS_WAITING_ON_USER)
         )).scalars().all()
         for job in rows:
+            if job.source_kind == "voice_task":
+                continue
             cfg = job.config_json or {}
             if not isinstance(cfg, dict):
                 continue
@@ -803,6 +936,6 @@ async def resolve_job_for_pending_action(
             pass
 
     return ResolvePendingActionResponse(
-        resolved=len(resolved),
-        status=new_status if resolved else None,
+        resolved=len(resolved) + voice_resolved,
+        status=new_status if (resolved or voice_resolved) else None,
     )

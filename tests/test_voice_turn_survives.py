@@ -143,7 +143,21 @@ def relay(monkeypatch):
         return None
     monkeypatch.setattr(rt, "_save_voice_messages", _save)
 
-    return rt
+    yield rt
+
+    # The real endpoint spawns a fire-and-forget task on socket close —
+    # `_defer_voice_la_end` sleeps a 6 s grace and then touches the DB to end
+    # the voice card (a deliberate cross-request backstop; see the comment on
+    # `_voice_session_owner`). The endpoint returns before it runs, so under
+    # CI's shared in-memory DB it wakes during teardown and hits a database
+    # being dropped ("Cannot operate on a closed database"). Cancelling it is
+    # synchronous and enough — a cancelled `asyncio.sleep` never reaches the
+    # DB code — the same idea as test_signup_trace_wiring draining its leaked
+    # discovery loops. Production keeps the grace; this is only the harness
+    # cleaning up after driving the real socket.
+    for _t in list(getattr(rt, "_deferred_la_tasks", ())):
+        if not _t.done():
+            _t.cancel()
 
 
 async def _drive(rt, monkeypatch, events):
