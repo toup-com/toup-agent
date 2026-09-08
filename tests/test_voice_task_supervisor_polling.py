@@ -20,6 +20,38 @@ from app.db.database import get_engine
 from app.db.models import BuildJob, Conversation, User
 
 
+@pytest.fixture(autouse=True)
+async def _drain_voice_task_bg():
+    """Cancel any voice-task background task that outlived the test.
+
+    `VoiceTaskService.close()` stops the SUPERVISOR, but a submitted task's own
+    tasks (`handle.task`, `handle.deadline_task` in voice_tasks.py) are left
+    running on purpose — accepted work is not cancelled by a socket close in
+    production. Under CI's shared in-memory DB that is a cross-test hazard: a
+    leaked task writes a status row to `build_jobs` after the next test's
+    conftest fixture has dropped the schema and before it recreates it, and the
+    write fails "no such table: build_jobs" — a rare, timing-only flake that
+    passed on the PR run and failed on the merge run. Cancelling here makes the
+    suite deterministic; production keeps the accepted-work behaviour. Same
+    idea as test_voice_turn_survives draining its LA-end task.
+    """
+    yield
+    import asyncio as _asyncio
+    leaked = [
+        t for t in _asyncio.all_tasks()
+        if not t.done()
+        and "voice_tasks" in (
+            (t.get_coro() is not None
+             and getattr(t.get_coro(), "cr_code", None) is not None
+             and t.get_coro().cr_code.co_filename) or ""
+        )
+    ]
+    for t in leaked:
+        t.cancel()
+    if leaked:
+        await _asyncio.gather(*leaked, return_exceptions=True)
+
+
 def _result(text: str = "Finished") -> SimpleNamespace:
     return SimpleNamespace(
         text=text,

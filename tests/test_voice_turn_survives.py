@@ -103,8 +103,18 @@ def _function_call(name, arguments, call_id="call_1"):
     }
 
 
+def _in_voice_runtime(task) -> bool:
+    """True if a task's coroutine lives in the voice runtime (ws_realtime or
+    voice_tasks) — the files whose fire-and-forget work outlives a driven
+    socket and must not touch the DB after a test's schema is dropped."""
+    coro = task.get_coro()
+    fn = getattr(coro, "cr_code", None)
+    path = getattr(fn, "co_filename", "") if fn is not None else ""
+    return "ws_realtime" in path or "voice_tasks" in path
+
+
 @pytest.fixture
-def relay(monkeypatch):
+async def relay(monkeypatch):
     """Everything outside the relay loop stubbed; the loop itself is real."""
     from app.api import ws_realtime as rt
     from app.api import _ws_auth_helpers as auth
@@ -145,19 +155,28 @@ def relay(monkeypatch):
 
     yield rt
 
-    # The real endpoint spawns a fire-and-forget task on socket close —
-    # `_defer_voice_la_end` sleeps a 6 s grace and then touches the DB to end
-    # the voice card (a deliberate cross-request backstop; see the comment on
-    # `_voice_session_owner`). The endpoint returns before it runs, so under
-    # CI's shared in-memory DB it wakes during teardown and hits a database
-    # being dropped ("Cannot operate on a closed database"). Cancelling it is
-    # synchronous and enough — a cancelled `asyncio.sleep` never reaches the
-    # DB code — the same idea as test_signup_trace_wiring draining its leaked
-    # discovery loops. Production keeps the grace; this is only the harness
-    # cleaning up after driving the real socket.
-    for _t in list(getattr(rt, "_deferred_la_tasks", ())):
-        if not _t.done():
-            _t.cancel()
+    # The real endpoint spawns fire-and-forget tasks on socket close — chiefly
+    # `_defer_voice_la_end`, which sleeps a 6 s grace and then touches the DB to
+    # end the voice card (a deliberate cross-request backstop; see the comment
+    # on `_voice_session_owner`). The endpoint returns before they run, so under
+    # CI's shared in-memory DB one wakes during teardown and hits a database
+    # being dropped ("Cannot operate on a closed database"). Cancelling is not
+    # enough on its own — a bare `.cancel()` only SCHEDULES cancellation, and an
+    # already-started DB call still races drop_db — so we AWAIT every cancelled
+    # task here, before conftest's autouse `_reset_database` (which tears down
+    # after this module-level fixture) drops the schema. Production keeps the
+    # grace; this only cleans up after driving the real socket. Same idea as
+    # test_signup_trace_wiring draining its discovery loops.
+    import asyncio as _asyncio
+    _leaked = [
+        _t for _t in _asyncio.all_tasks()
+        if not _t.done() and _t is not _asyncio.current_task()
+        and _in_voice_runtime(_t)
+    ]
+    for _t in _leaked:
+        _t.cancel()
+    if _leaked:
+        await _asyncio.gather(*_leaked, return_exceptions=True)
 
 
 async def _drive(rt, monkeypatch, events):
