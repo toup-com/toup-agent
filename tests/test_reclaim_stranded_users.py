@@ -220,10 +220,12 @@ async def test_keyless_sweep_runs_with_zero_stranded_candidates(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_sweep_probes_named_containers_and_restarts_on_401(monkeypatch):
+async def test_sweep_probes_named_containers_and_defers_401_repair(monkeypatch):
     """The authenticated sweep must cover NAMED containers too (the oldest
     users were invisible to the original pool-only sweep). A named tenant
-    that 401s its own key gets a bridge restart, NOT a pool force-claim."""
+    that 401s may actually be split from a pool-backed public route; neither a
+    blind restart nor a pool force-claim is authorized without ownership
+    evidence."""
     from unittest.mock import AsyncMock
     from app.services import pool_service as ps
 
@@ -259,8 +261,9 @@ async def test_sweep_probes_named_containers_and_restarts_on_401(monkeypatch):
 
     assert summary.get("keyless") == 1
     claim.assert_not_awaited()
-    restart.assert_awaited_once()
-    assert summary.get("restarted") == 1
+    restart.assert_not_awaited()
+    assert summary.get("keyless_named_deferred") == 1
+    assert summary.get("restarted", 0) == 0
 
 
 @pytest.mark.asyncio
@@ -344,3 +347,13 @@ async def test_sweep_mass_transport_failure_records_no_strikes(monkeypatch):
 
     restart.assert_not_awaited()
     assert not ps._PROBE_STRIKES, "transport mass-failure must not strike"
+
+
+def test_reconciler_alert_does_not_claim_unverified_users_were_healed():
+    import inspect
+    from app.services import pool_service as ps
+
+    src = inspect.getsource(ps.reclaim_stranded_users)
+    assert "Users were healed automatically" not in src
+    assert "end-user chat" in src
+    assert "readiness still requires verification" in src

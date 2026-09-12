@@ -849,14 +849,10 @@ async def _verify_and_heal_pool_claim(
     eventually heals this, but a brand-new user shouldn't eat a multi-minute
     dead window on their very first message.
 
-    This polls the agent's real `/agent/health` for a short budget (pool
-    members are pre-warmed, so a healthy one passes in a few seconds). If it
-    never comes up, we re-provision via the reliable slow path
-    (`provision_container(recreate=True)` — the same call the reconciler/
-    backfill use, which creates a real `toup-agent-{prefix}` container AND
-    records container_id). Fire-and-forget: never raises into the caller, so
-    it can't affect the signup request. The reconciler remains the durable
-    backstop for the case where a platform redeploy kills this task mid-flight.
+    This polls the agent's real `/agent/health` for a short budget. A miss is
+    observation only: it never restarts or cold-swaps the assigned member.
+    Fire-and-forget; never raises into the caller. The authenticated periodic
+    reconciler remains the durable repair backstop.
     """
     try:
         from app.services.prewarm_service import _is_agent_actually_healthy
@@ -893,66 +889,15 @@ async def _verify_and_heal_pool_claim(
             await asyncio.sleep(interval_s)
         logger.warning(
             "[pool-heal] pool claim for user=%s never became reachable in %.0fs "
-            "— re-provisioning via slow path (recreate=True)",
+            "— preserving its canonical assignment for reconciliation",
             user_id[:8], budget_s,
         )
-        # HEAL THE POOL MEMBER IN PLACE FIRST.
-        #
-        # `provision_container(recreate=True)` binds `toup_agent_<prefix>`,
-        # while a pool member's data lives in the slot's own
-        # `toup_agent_feedNNNN` — so the "reliable slow path" this used to take
-        # unconditionally is also the path that empties an account (R40; see
-        # `docker_host_service.PoolMemberSwapRefused`). A wedged member is
-        # usually just wedged: `/v1/pool/restart-member` restarts the container
-        # and re-applies its bind, keeping the database it already has.
-        from app.services.docker_host_service import provision_container, restart_container
-        from app.db.database import async_session_maker
-
-        async with async_session_maker() as heal_db:
-            mc = await _load_container(heal_db, user_id)
-            is_pool = bool(mc and (mc.container_name or "").startswith("toup-agent-pool-"))
-            if is_pool:
-                logger.warning(
-                    "[pool-heal] restarting pool member %s for user=%s in place "
-                    "(a named recreate would bind an empty toup_agent_%s)",
-                    mc.container_name, user_id[:8], user_id[:8],
-                )
-                try:
-                    await restart_container(heal_db, user_id)
-                    await heal_db.commit()
-                except Exception:
-                    logger.exception("[pool-heal] pool restart failed user=%s", user_id[:8])
-                # Give the restart the same budget the claim got, then re-check.
-                deadline2 = asyncio.get_event_loop().time() + budget_s
-                while asyncio.get_event_loop().time() < deadline2:
-                    if await _is_agent_actually_healthy(user_id):
-                        logger.info("[pool-heal] user=%s recovered after an in-place restart",
-                                    user_id[:8])
-                        return
-                    await asyncio.sleep(interval_s)
-
-            # Still unreachable. The named recreate is the last resort, and it
-            # is only safe while the claim is FRESH — at that point the user
-            # has never sent a message and the slot database holds nothing to
-            # strand. An established member reaching here is exactly the
-            # data-loss case, so it is left for an operator instead.
-            if is_pool and not _claim_is_fresh(mc):
-                logger.error(
-                    "[pool-heal] REFUSING the named recreate for user=%s: pool member %s "
-                    "is not a fresh claim, and re-provisioning would bind an empty "
-                    "toup_agent_%s and strand the slot's data. It has been restarted in "
-                    "place; operator action required if it is still unreachable.",
-                    user_id[:8], mc.container_name, user_id[:8],
-                )
-                return
-            # `allow_pool_swap=is_pool`, not a bare True: a NAMED tenant taking
-            # this path never needed the override, and passing it anyway states
-            # an intent the call does not have.
-            await provision_container(
-                heal_db, user_id, recreate=True, allow_pool_swap=is_pool,
-            )
-            await heal_db.commit()
-        logger.info("[pool-heal] re-provisioned user=%s to a reachable container", user_id[:8])
+        # A 30-second public-route miss is uncertainty, not proof the
+        # assigned member is broken. In particular, restarting and then
+        # cold-swapping to `toup-agent-{prefix}` creates a second database and
+        # overwrites AgentConfig while the bridge still routes the pool slot.
+        # The authenticated periodic reconciler owns any later repair.
+        return
     except Exception:
         # Never let the guard crash — the periodic container reconciler is the
         # durable backstop if this fails or a redeploy kills it mid-flight.
@@ -969,10 +914,8 @@ async def claim_or_prewarm(db: AsyncSession, user_id: str) -> bool:
     itself doesn't depend on this).
 
     On a successful pool claim we additionally spawn a fire-and-forget
-    `_verify_and_heal_pool_claim` guard so a member that's stale/unreachable
-    self-heals within ~30s instead of leaving a brand-new user stuck on their
-    first message (see that function). Registration latency is unaffected —
-    the guard runs in the background.
+    `_verify_and_heal_pool_claim` guard to observe readiness without mutating
+    the just-created ownership mapping. Registration latency is unaffected.
     """
     try:
         c = await claim_for_user(db, user_id, origin="signup")
@@ -1335,9 +1278,9 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     #   200          → healthy, clear strikes.
     #   401/403      → keyless/desynced. Pool: force re-claim (bridge
     #                  idempotent claim re-pushes the full bind — no-op if
-    #                  healthy). Named: restart via bridge (keys re-enter from
-    #                  .env at boot) + alert, because named 401s mean key
-    #                  drift, which should be impossible.
+    #                  healthy). Named: alert and preserve for ownership
+    #                  reconciliation; a route/config split cannot be repaired
+    #                  by restarting the named container.
     #   404/4xx      → routing problem (Caddy "unknown tenant") — the bridge
     #                  route reconciler owns that; never restart a healthy
     #                  agent over a missing route.
@@ -1451,13 +1394,19 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                     "[pool-reclaim] keyless re-bind failed user=%s: %s", uid[:8], e
                 )
 
-        # Keyless NAMED tenants → restart (env re-injects keys at boot).
+        # A named 401 can be an ownership split: the public route may still be
+        # a pool slot while the platform row/key says named. Restarting the
+        # named container can never repair that route and produced an endless
+        # two-replica restart loop in the 2026-09-12 incident. Preserve both
+        # databases for evidence-backed operator reconciliation.
         for uid, cname in keyless_named[:RESTARTS_PER_TICK]:
-            ok = await _restart_sick_container(uid, cname)
-            summary["restarted"] = summary.get("restarted", 0) + (1 if ok else 0)
+            summary["keyless_named_deferred"] = (
+                summary.get("keyless_named_deferred", 0) + 1
+            )
             logger.warning(
-                "[pool-reclaim] named tenant 401 user=%s container=%s restart=%s",
-                uid[:8], cname, ok,
+                "[pool-reclaim] named tenant 401 user=%s container=%s; "
+                "restart refused pending ownership reconciliation",
+                uid[:8], cname,
             )
 
         # Sick (2 consecutive 5xx/timeout ticks) → restart via bridge.
@@ -1476,16 +1425,20 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     # Tell the operator whenever a self-heal actually fired (rate-limited so a
     # flapping loop can't flood the chat).
     try:
-        healed = {
+        activity = {
             k: v for k, v in summary.items()
-            if k in ("claimed", "rebound", "restarted", "keyless", "sick", "failed") and v
+            if k in (
+                "claimed", "rebound", "restarted", "keyless", "sick",
+                "failed", "keyless_named_deferred",
+            ) and v
         }
-        if healed:
+        if activity:
             from app.services.alerting import send_infra_alert
             await send_infra_alert(
                 "pool-selfheal", "warning",
-                f"Self-heal fired: {healed}. Users were healed automatically — "
-                "if this repeats, something upstream is broken.",
+                f"Reconciliation activity: {activity}. Action counts confirm only "
+                "that a claim/rebind/restart request succeeded; end-user chat "
+                "readiness still requires verification.",
             )
     except Exception:
         pass

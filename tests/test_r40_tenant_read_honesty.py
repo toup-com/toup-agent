@@ -544,93 +544,29 @@ def test_the_agent_never_proxies_to_itself():
         )
 
 
-def test_a_wedged_pool_member_is_restarted_in_place_before_anything_else():
-    """`_verify_and_heal_pool_claim` used to answer an unreachable claim with
-    `provision_container(recreate=True)` unconditionally — the named path,
-    which binds `toup_agent_<prefix>` while the member's data is in the slot's
-    own database. A wedged member is usually just wedged, and
-    `/v1/pool/restart-member` fixes that without touching the database."""
+def test_post_claim_guard_never_restarts_or_cold_swaps_a_pool_member():
+    """A readiness miss is uncertainty, not permission to mutate ownership."""
     fn = _POOL_SRC.split("async def _verify_and_heal_pool_claim(")[1].split("\nasync def ")[0]
-    assert has_code(fn, "await restart_container(heal_db, user_id)"), (
-        "the in-place restart is gone — the heal goes straight to the named "
-        "recreate again"
-    )
-    assert code_index(fn, "restart_container(heal_db") < code_index(fn, "provision_container("), (
-        "the named recreate runs before the in-place restart it exists to avoid"
-    )
+    executable = code_only(fn)
+    assert "restart_container" not in executable
+    assert "provision_container" not in executable
 
 
-def test_the_only_allowed_pool_swap_is_gated_on_a_fresh_claim():
-    """After the in-place restart, the named recreate is the last resort — and
-    it is safe only while the claim is FRESH: at that point the user has never
-    sent a message and the slot database holds nothing to strand. It is the one
-    caller in the tree that may opt out of `PoolMemberSwapRefused`."""
+def test_no_claim_age_can_authorize_a_pool_to_named_swap():
+    """A user can write within seconds, so freshness never proves emptiness."""
     fn = _POOL_SRC.split("async def _verify_and_heal_pool_claim(")[1].split("\nasync def ")[0]
-    assert has_code(fn, "allow_pool_swap=is_pool"), (
-        "the opt-out moved out of the heal guard, or stopped being conditional "
-        "on the container actually being a pool member"
-    )
-    assert has_code(fn, "if is_pool and not _claim_is_fresh(mc):"), (
-        "the freshness gate is gone — an established pool member reaching this "
-        "line is silently moved onto an empty database"
-    )
-    assert code_index(fn, "_claim_is_fresh(mc)") < code_index(fn, "allow_pool_swap=is_pool"), (
-        "the gate runs after the swap it is supposed to prevent"
-    )
+    executable = code_only(fn)
+    assert "allow_pool_swap" not in executable
+    assert "_claim_is_fresh" not in executable
 
-    # UNKNOWN must answer FALSE. A failed lookup, a row with no timestamps and
-    # a mock are none of them evidence that the slot holds nothing.
-    from app.services.pool_service import _claim_is_fresh, POOL_CLAIM_FRESH_WINDOW
-    from datetime import datetime, timedelta, timezone
-
-    class _Bare:
-        pass
-
-    assert _claim_is_fresh(None) is False, "a missing row must not read as fresh"
-    assert _claim_is_fresh(_Bare()) is False, "a row with no timestamp must not read as fresh"
-
-    class _Old:
-        started_at = datetime.now(timezone.utc) - timedelta(days=30)
-    assert _claim_is_fresh(_Old()) is False
-
-    class _New:
-        started_at = datetime.now(timezone.utc) - timedelta(seconds=20)
-    assert _claim_is_fresh(_New()) is True
-
-    class _Naive:
-        started_at = datetime.utcnow() - timedelta(seconds=20)
-    assert _claim_is_fresh(_Naive()) is True, (
-        "a naive timestamp (which is what SQLAlchemy hands back for these "
-        "columns) must be read as UTC, not crash the comparison"
-    )
-
-    # …and the window is actually SHORT. A guard that admits every claim is not
-    # a guard: widening it to ten years left every assertion above green.
-    assert POOL_CLAIM_FRESH_WINDOW <= timedelta(hours=1), (
-        f"POOL_CLAIM_FRESH_WINDOW is {POOL_CLAIM_FRESH_WINDOW} — the heal fires "
-        f"within `budget_s` (30 s) of the claim, so anything approaching an hour "
-        f"stops excluding the established members this exists to protect"
-    )
-
-    # Nothing ELSE in the tree opts out. `code_only` per file, because
-    # `docker_host_service` necessarily NAMES the override in the docstring and
-    # the comment that explain when it is allowed — a raw grep counts those and
-    # a `__pycache__` blob besides.
     callers = []
     for path in sorted((BACKEND_DIR / "app").rglob("*.py")):
-        if "__pycache__" in str(path):
-            continue
-        src = path.read_text(encoding="utf-8")
-        if "allow_pool_swap=" not in src:
-            continue
-        code = code_only(src).replace(" ", "")
-        # An opt-out is any `allow_pool_swap=<something other than False>`.
-        if re.search(r"allow_pool_swap=(?!False\b)\w", code):
+        source = code_only(path.read_text(encoding="utf-8")).replace(" ", "")
+        if re.search(r"allow_pool_swap=(?!False\b)\w", source):
             callers.append(str(path.relative_to(BACKEND_DIR)))
-    assert callers == ["app/services/pool_service.py"], (
-        "the set of callers that opt out of the pool-swap guard changed; every "
-        "one of them silently moves a user onto an empty database unless it can "
-        f"prove the slot holds nothing:\n  " + "\n  ".join(callers)
+    assert callers == [], (
+        "runtime pool-to-named opt-outs must remain operator-only; found "
+        + ", ".join(callers)
     )
 
 
