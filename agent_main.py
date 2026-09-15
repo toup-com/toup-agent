@@ -155,19 +155,34 @@ async def agent_schema_status(refresh: bool = False) -> dict:
     gate service on a label. The rollout canary and the bridge health tick read
     it; neither restarts on it."""
     global _schema_status_cache
-    if _schema_status_cache is not None and not refresh:
-        return _schema_status_cache
-    boot = read_alembic_boot_marker()
-    version = await read_alembic_version()
-    _schema_status_cache = {
-        "alembic_boot": boot,
-        "alembic_version": version,
-        # BOTH halves: a container whose upgrade exited 0 because there was
-        # nothing to do still has no chain if the table is absent, and a
-        # stamped table proves nothing if this boot's upgrade blew up.
-        "alembic_ok": boot == "ok" and version is not None,
-    }
-    return _schema_status_cache
+    if _schema_status_cache is None or refresh:
+        boot = read_alembic_boot_marker()
+        version = await read_alembic_version()
+        _schema_status_cache = {
+            "alembic_boot": boot,
+            "alembic_version": version,
+            # BOTH halves: a container whose upgrade exited 0 because there was
+            # nothing to do still has no chain if the table is absent, and a
+            # stamped table proves nothing if this boot's upgrade blew up.
+            "alembic_ok": boot == "ok" and version is not None,
+        }
+    out = dict(_schema_status_cache)
+    # ── Where the boot actually went ──────────────────────────────
+    # `alembic_boot` says the chain did not run; `init_db` is therefore the
+    # schema mechanism, and it is 71 % of a p50 57 s cold boot. Reading the
+    # split used to mean grepping container logs on 99 hosts. It is a
+    # process-local dict of ints written once by `init_db()`, so it is free to
+    # read, it cannot change without a restart, and it is deliberately OUTSIDE
+    # the cache above — the cache exists to stop a DB QUERY per health poll,
+    # and this is not one.
+    try:
+        from app.db.database import init_db_timings
+        _t = init_db_timings()
+        if _t:
+            out["init_db"] = _t
+    except Exception:  # noqa: BLE001 — a health field may never raise
+        pass
+    return out
 
 # ── Paths that skip API key auth (health checks, root) ─────────────
 # Pool admin endpoints (`/api/admin/bind` etc.) are public to the

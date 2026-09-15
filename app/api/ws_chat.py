@@ -27,6 +27,7 @@ Authentication:
 
 import ast
 import asyncio
+import contextvars
 import json
 import logging
 import time
@@ -292,10 +293,166 @@ def _dedup_seen_client_msg(key: str) -> bool:
     return False
 
 
+class _PreTurn:
+    """Millisecond stopwatch for the platform's pre-turn block.
+
+    Everything from the frame landing on the socket to ``create_task(run)``
+    used to be the one dark segment of the turn: the agent side is
+    instrumented (``[PERF] phase1_total``, ``llm_ttft``, ``phase3_save``,
+    ``[TURN_WATERFALL]``) and the proxy logs its wait, but the ~7 sequential
+    DB sessions in between logged nothing at all. Measured turns therefore
+    had a hole exactly where the platform's own work lives.
+
+    One line per turn, ``key=value`` so Loki/grep can split it without a
+    parser. Costs a ``perf_counter()`` pair per block and one ``logger.info``
+    per turn — deliberately cheap enough to leave on in production, which is
+    the only place the numbers exist.
+    """
+
+    __slots__ = ("t0", "ms", "_open")
+
+    def __init__(self, t0: Optional[float] = None) -> None:
+        # t0 is the instant the FRAME landed, not the instant this object was
+        # built: the dispatch between them is the thing being measured.
+        self.t0 = time.perf_counter() if t0 is None else t0
+        self.ms: Dict[str, int] = {}
+        self._open: Dict[str, float] = {}
+
+    def start(self, name: str) -> None:
+        self._open[name] = time.perf_counter()
+
+    def end(self, name: str) -> int:
+        t = self._open.pop(name, None)
+        if t is None:
+            return 0
+        d = int((time.perf_counter() - t) * 1000)
+        # Accumulate: a block can legitimately run more than once per turn
+        # (the pre-save's reply_to retry), and reporting only the last pass
+        # would under-count exactly the slow case.
+        self.ms[name] = self.ms.get(name, 0) + d
+        return d
+
+    def elapsed_ms(self) -> int:
+        return int((time.perf_counter() - self.t0) * 1000)
+
+    def emit(self, **fields) -> None:
+        """One ``[PERF] ws_pre_turn`` line. Never raises — telemetry may not
+        cost a turn."""
+        try:
+            parts = [f"total_ms={self.elapsed_ms()}"]
+            for k in _PRE_TURN_KEYS:
+                parts.append(f"{k}_ms={self.ms.get(k, 0)}")
+            for k, v in fields.items():
+                if v is None:
+                    continue
+                parts.append(f"{k}={v}")
+            logger.info("[PERF] ws_pre_turn %s", " ".join(parts))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+#: Fixed key ORDER for the ws_pre_turn line. Fixed so a Loki/awk column
+#: position stays stable across releases; every key is always printed (0 when
+#: the block did not run) so "absent" and "fast" can never look alike — the
+#: distinction that made the `intent:judged` counter unreadable for two
+#: releases on the app side.
+_PRE_TURN_KEYS = (
+    # `lookups` is the WALL time the turn waited for the overlapped trio;
+    # `automation`/`reply_to`/`tz` are each lookup's own duration inside it,
+    # so they sum to more than `lookups` and that is the point — without them
+    # `lookups` cannot say which of the three is the slow one.
+    "lookups", "automation", "reply_to", "tz", "appctx", "ledger", "presave",
+    "attach", "fast_media", "task_detect",
+)
+
+
 async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: str = None):
     """Thin wrapper around the shared helper. See app.db.message_helpers."""
     from app.db.message_helpers import resolve_day_chat_id_for_now
     return await resolve_day_chat_id_for_now(db_session, user_id, tz_override=tz_override)
+
+
+#: The day chat this turn's user message was stamped with, published for the
+#: agent run task that `create_task` spawns from this context (a ContextVar is
+#: COPIED into the task at creation, so the task sees the value set here).
+#:
+#: THE HAND-OFF, and why it is inert today. The day chat is resolved three
+#: times per turn — `_ensure_presave_conversation`, the pre-save, and
+#: `agent_runner`'s own phase 1 — and each one is a live round trip even on a
+#: cache hit, because `get_or_create_day_chat` re-SELECTs the cached id to
+#: prove the row still exists. `_DayChatOnce` collapses the two that live in
+#: THIS file. The third is the runner's and is owned elsewhere, so this
+#: ContextVar is the seam: a future `agent_runner` may read it
+#: (`from app.api.ws_chat import CURRENT_TURN_DAY_CHAT_ID` — a LOCAL import
+#: inside the function, this module imports agent code at module scope) and
+#: skip its own resolve when it is not None. Nothing reads it today; it is
+#: set on every turn so that adoption is a one-line change on that side and
+#: needs nothing here.
+#:
+#: Contract for whoever adopts it: None means "not resolved" (a system action,
+#: a first message with no session, or a failed resolve) and MUST fall back to
+#: resolving. A non-None value is the id the user's row for THIS turn was
+#: actually stamped with, which is the same question phase 1 asks.
+CURRENT_TURN_DAY_CHAT_ID: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("toup_turn_day_chat_id", default=None)
+)
+
+
+class _DayChatOnce:
+    """Resolve this turn's day chat at most once, then hand the id back.
+
+    Deliberately LAZY rather than resolved once at the top of the turn. On a
+    tenant with no `users` row, `resolve_day_chat_id_for_now` swallows its own
+    flush error and answers None while leaving that session's TRANSACTION
+    ABORTED — every later statement then dies with
+    InFailedSQLTransactionError, a class no IntegrityError handler sees. That
+    is why `_ensure_presave_conversation` checks for the users row before it
+    asks, and why this memo is only ever filled from a site that is allowed to
+    ask.
+
+    `forget()` exists for the one case where a memoised id can go stale: a
+    caller that resolved inside a transaction and then ROLLED IT BACK has
+    un-created the DayChat row it may have just inserted, and stamping a
+    message with that id would be an FK violation. The un-memoised path
+    self-heals (the resolver re-SELECTs, finds nothing, recreates), so the
+    rollback sites must drop the memo to keep that property.
+    """
+
+    __slots__ = ("user_id", "tz_override", "_value", "_done")
+
+    def __init__(self, user_id: str, tz_override: Optional[str] = None) -> None:
+        self.user_id = user_id
+        self.tz_override = tz_override
+        self._value: Optional[str] = None
+        self._done = False
+
+    async def get(self, db_session) -> Optional[str]:
+        """The turn's day chat id, resolving at most once SUCCESSFULLY.
+
+        A failed resolve answers None and is NOT memoised. `None` is the
+        graceful-degradation contract — the message still saves, with
+        `day_chat_id` NULL — but a NULL day_chat_id is a row that is invisible
+        to the day index AND to `load_day_context`, which is the
+        "message not in canonical history" shape of the 2026-09-14 incident.
+        Before this memo existed, the pre-save asked again after
+        `_ensure_presave_conversation` had failed, on a session that may have
+        recovered; caching the failure would take that second chance away and
+        turn a transient blip into a permanently unindexed message.
+        """
+        if self._done:
+            return self._value
+        value = await _resolve_day_chat_id_for_now(
+            db_session, self.user_id, tz_override=self.tz_override,
+        )
+        if value is None:
+            return None
+        self._value = value
+        self._done = True
+        return self._value
+
+    def forget(self) -> None:
+        self._value = None
+        self._done = False
 
 
 class _PresaveWithoutConversation(Exception):
@@ -311,6 +468,7 @@ async def _ensure_presave_conversation(
     session_id: str,
     channel: Optional[str],
     client_tz: Optional[str] = None,
+    day_chat: Optional["_DayChatOnce"] = None,
 ):
     """Return the `Conversation` row the pre-save may stamp on the message.
 
@@ -397,11 +555,13 @@ async def _ensure_presave_conversation(
             "tenant has no users row for this owner yet"
         )
 
+    # Through the turn's memo when the caller brought one, so the pre-save
+    # below does not ask the same question a second time. The users-row check
+    # above is the precondition for asking at all — see _DayChatOnce.
+    _dc = day_chat if day_chat is not None else _DayChatOnce(user_id, client_tz)
     _day_chat_id = None
     try:
-        _day_chat_id = await _resolve_day_chat_id_for_now(
-            db_session, user_id, tz_override=client_tz,
-        )
+        _day_chat_id = await _dc.get(db_session)
     except Exception as _dce:  # noqa: BLE001 — the hint is optional
         logger.debug("[WS] pre-save day-chat hint unavailable: %s", _dce)
         _day_chat_id = None
@@ -420,6 +580,10 @@ async def _ensure_presave_conversation(
         # Nothing else of this pre-save has been staged yet, so a full rollback
         # is the cheapest way back to a usable transaction.
         await db_session.rollback()
+        # The rollback may have un-created a DayChat this call just inserted;
+        # a memo still holding its id would stamp a message with a row that
+        # does not exist. Re-resolving is what the un-memoised path always did.
+        _dc.forget()
         raced = await _lookup()
         if raced is not None:
             return raced
@@ -519,6 +683,105 @@ async def _automation_id_for_session(session_id: str) -> Optional[str]:
     except Exception as e:  # noqa: BLE001 — see docstring
         logger.debug("[WS] automation session lookup skipped: %s", e)
         return None
+
+
+#: A gathered slot that has not been read yet. With the overlap flag OFF
+#: each lookup fires at the site that consumes it, exactly as it did before
+#: the gather existed, and this is what the slot holds until then. A distinct
+#: object rather than None, because None is a legitimate lookup ANSWER.
+_UNREAD = object()
+
+
+def _lookup_result(value):
+    """Unwrap one `asyncio.gather(..., return_exceptions=True)` slot.
+
+    `return_exceptions=True` captures **BaseException**, not just Exception —
+    a `CancelledError` among them. Treating that as "this lookup failed" turns
+    a turn the client cancelled into a turn that quietly runs on with a
+    missing lookup, which is the opposite of what cancellation means. Only an
+    ordinary Exception is a lookup failure; anything else is the turn ending
+    and must propagate.
+    """
+    if isinstance(value, BaseException) and not isinstance(value, Exception):
+        raise value
+    return value
+
+
+async def _timed(pt: "_PreTurn", name: str, coro):
+    """Await `coro`, recording its OWN duration under `name`.
+
+    Used inside `asyncio.gather`, where wall-clock time is shared: each
+    lookup still reports what it individually cost, and the gather's own
+    `lookups_ms` reports what the turn actually waited. Both numbers are
+    needed — `lookups_ms` alone cannot say which of the three is slow.
+    """
+    pt.start(name)
+    try:
+        return await coro
+    finally:
+        pt.end(name)
+
+
+async def _reply_to_row(candidate: str):
+    """FETCH ONLY — the reply-to target row, or None, or the Exception.
+
+    **This function performs no authorization.** It takes no `user_id` for
+    that reason: the ownership decision lives at the call site, next to the
+    log lines that record it, and describing it here would put the auth
+    boundary in two places with only one of them enforcing.
+
+    What it does return is the two owner columns the caller needs to make
+    that decision — `conv_user_id` and `dc_user_id`, OUTER-joined so a missing
+    Conversation or DayChat row (older data, race conditions) still yields the
+    side that resolved instead of failing the whole query.
+
+    Its own short-lived session, so it can run concurrently with the
+    automation and timezone reads — never two operations on one AsyncSession.
+    Read-only and SILENT: every log line this feeds stays at the call site, so
+    overlapping the wait does not reorder the pre-turn log.
+    """
+    from app.db.database import async_session_maker as _rt_sm
+    from app.db.models import Message as _RtMsg, Conversation as _RtConv
+    from app.db.models.day_chat import DayChat as _RtDC
+    try:
+        async with _rt_sm() as _rt_db:
+            return (await _rt_db.execute(
+                select(
+                    _RtMsg.id,
+                    _RtMsg.role,
+                    _RtMsg.content,
+                    _RtMsg.created_at,
+                    _RtConv.user_id.label("conv_user_id"),
+                    _RtDC.user_id.label("dc_user_id"),
+                )
+                .select_from(_RtMsg)
+                .outerjoin(_RtConv, _RtMsg.conversation_id == _RtConv.id)
+                .outerjoin(_RtDC, _RtMsg.day_chat_id == _RtDC.id)
+                .where(_RtMsg.id == candidate)
+            )).first()
+    except Exception as exc:  # noqa: BLE001 — reported to the call site
+        return exc
+
+
+async def _stored_user_tz(user_id: str):
+    """`(row_exists, users.timezone)` on its own short-lived session.
+
+    Two values, not one: a tenant with no `users` row and a tenant whose
+    timezone is NULL both answer None for the column, and only the FIRST must
+    skip the persist below. Collapsing them would queue a rebucket and drop
+    the tz cache for a user that does not exist yet — which on a freshly-bound
+    container is every first message.
+    """
+    from app.db.database import async_session_maker as _tz_sm
+    from app.db.models import User
+    try:
+        async with _tz_sm() as _tz_db:
+            row = (await _tz_db.execute(
+                select(User.id, User.timezone).where(User.id == user_id)
+            )).first()
+        return (row is not None, row[1] if row is not None else None)
+    except Exception as exc:  # noqa: BLE001 — reported to the call site
+        return exc
 
 
 async def broadcast_to_user(
@@ -3090,6 +3353,11 @@ async def ws_chat(
                 except WebSocketDisconnect:
                     logger.info(f"[WS] Client disconnected: {user_id}")
                     return
+                # The turn's t0 for [PERF] ws_pre_turn / ws_ttfb. Taken here
+                # rather than at the `message` branch so JSON parsing and
+                # dispatch are inside the measurement — they are part of the
+                # dark segment too.
+                _t_frame = time.perf_counter()
 
                 try:
                     msg = json.loads(raw)
@@ -3185,6 +3453,10 @@ async def ws_chat(
                     await websocket.send_json({"type": "error", "message": "Empty message"})
                     continue
 
+                # Everything from here to `create_task(_agent_runner.run(...))`
+                # is the platform's pre-turn block — see _PreTurn.
+                _pt = _PreTurn(_t_frame)
+
                 # ── Onboarding trigger (DEPRECATED — Soul page is now the onboarding)
                 is_onboarding_msg = False
                 if text == "__ONBOARDING_START__":
@@ -3230,6 +3502,80 @@ async def ws_chat(
                                 client_tz[:64], user_id[:8],
                             )
                             client_tz = None
+                # ── The three independent pre-turn reads ──
+                #
+                # The automation lookup, the reply-to target lookup and the
+                # stored-timezone read run one after another, each opening its
+                # OWN short-lived session from the sessionmaker and each
+                # waiting a full round trip before the next one starts. None
+                # of them reads what another writes, so that serialization is
+                # incidental: three waits where one would do, and on the
+                # agent's NullPool engine three TCP+TLS+SCRAM handshakes.
+                #
+                # OPT-IN (`settings.ws_pre_turn_overlap`, WS_PRE_TURN_OVERLAP),
+                # and default OFF for CAPACITY, not correctness — the tenant
+                # Postgres host is still `max_connections=300` with no
+                # PgBouncer `max_db_connections`, and overlapping adds up to 2
+                # concurrent connections per in-flight turn. See the setting's
+                # docstring for the enablement condition (host runbook steps
+                # 2+3). OFF is the pre-existing path exactly: the automation
+                # lookup here, the other two at the sites that consume them,
+                # same order, same sessions, same log lines.
+                #
+                # What does NOT move either way is the order their results are
+                # APPLIED. The automation refusal is still decided before the
+                # reply-to pointer is resolved, which is still before the
+                # timezone is persisted, and every log line stays where it was
+                # — the helpers are silent by construction for that reason.
+                #
+                # Own session each, never two operations on one AsyncSession:
+                # concurrent use of a single session is undefined behaviour in
+                # SQLAlchemy's asyncio layer, and PgBouncer sees three ordinary
+                # short transactions rather than anything session-scoped.
+                _reply_to_id_raw = msg.get("reply_to_message_id")
+                _reply_candidate: Optional[str] = None
+                if _reply_to_id_raw and isinstance(_reply_to_id_raw, str):
+                    _c = _reply_to_id_raw.strip()
+                    if 0 < len(_c) <= 50:
+                        _reply_candidate = _c
+
+                _need_auto = bool(session_id) and not _is_thread_route_exempt(msg)
+                _overlap = bool(getattr(settings, "ws_pre_turn_overlap", False))
+
+                async def _skip():
+                    return None
+
+                _pt.start("lookups")
+                if _overlap:
+                    _auto_id, _reply_lookup, _tz_lookup = await asyncio.gather(
+                        _timed(_pt, "automation",
+                               _automation_id_for_session(session_id))
+                        if _need_auto else _skip(),
+                        _timed(_pt, "reply_to", _reply_to_row(_reply_candidate))
+                        if _reply_candidate else _skip(),
+                        _timed(_pt, "tz", _stored_user_tz(user_id))
+                        if client_tz else _skip(),
+                        # Neither helper raises — both answer with the
+                        # exception instead — but a gather that can cancel its
+                        # siblings on one failure is the wrong default on a
+                        # path where each lookup already fails soft on its own.
+                        return_exceptions=True,
+                    )
+                    _auto_id = _lookup_result(_auto_id)
+                    _reply_lookup = _lookup_result(_reply_lookup)
+                    _tz_lookup = _lookup_result(_tz_lookup)
+                else:
+                    _auto_id = (
+                        await _timed(_pt, "automation",
+                                     _automation_id_for_session(session_id))
+                        if _need_auto else None
+                    )
+                    # Read at the site that consumes them, which is where they
+                    # were read before the overlap existed.
+                    _reply_lookup = _UNREAD
+                    _tz_lookup = _UNREAD
+                _pt.end("lookups")
+
                 # ── CONTRACTS-R31 §4.1: an automation is asked in its own
                 # thread, never here.
                 #
@@ -3258,7 +3604,13 @@ async def ws_chat(
                 # setting D flips plus an optional `client_build` the
                 # app may start sending; TESTLOG-R31 records the flip.
                 if session_id and not _is_thread_route_exempt(msg):
-                    _auto_id = await _automation_id_for_session(session_id)
+                    # Resolved above; `_automation_id_for_session` fails soft
+                    # to None, so an unreachable lookup still lets an ordinary
+                    # chat message through exactly as before. Only an ordinary
+                    # Exception is a failure — `_lookup_result` has already
+                    # re-raised anything that is not.
+                    if isinstance(_auto_id, Exception):
+                        _auto_id = None
                     if _auto_id:
                         if _thread_route_enforced(msg):
                             await websocket.send_json({
@@ -3283,98 +3635,76 @@ async def ws_chat(
                 _is_system_action = bool(msg.get("system_action"))
 
                 # Cross-channel reply-to: client passes the target message id when
-                # the user used the Reply affordance. Resolve + authorize, capture
-                # the target's role/content/timestamp so we can render the LLM
-                # preamble even if the DB column isn't there yet (init_db ALTER
-                # may not have run on a freshly-deployed tenant). Specific
-                # columns only — selecting the whole ORM entity would fail when
-                # `reply_to_message_id` is mapped in code but missing in DB.
-                _reply_to_id_raw = msg.get("reply_to_message_id")
+                # the user used the Reply affordance. Authorize the row the
+                # gather above fetched and capture the target's
+                # role/content/timestamp, so we can render the LLM preamble
+                # even if the DB column isn't there yet (init_db ALTER may not
+                # have run on a freshly-deployed tenant). The query itself is
+                # `_reply_to_row` — specific columns only; selecting the whole
+                # ORM entity would fail when `reply_to_message_id` is mapped in
+                # code but missing in DB.
                 reply_to_message_id: Optional[str] = None
                 _reply_target_role: Optional[str] = None
                 _reply_target_content: Optional[str] = None
                 _reply_target_created_at = None
-                if _reply_to_id_raw and isinstance(_reply_to_id_raw, str):
-                    _candidate = _reply_to_id_raw.strip()
-                    if 0 < len(_candidate) <= 50:
-                        logger.info(
-                            "[WS] reply_to received target=%s user=%s",
-                            _candidate[:8], user_id[:8],
+                if _reply_candidate is not None:
+                    _candidate = _reply_candidate
+                    logger.info(
+                        "[WS] reply_to received target=%s user=%s",
+                        _candidate[:8], user_id[:8],
+                    )
+                    if _reply_lookup is _UNREAD:
+                        # Overlap off: the query fires here, after the log and
+                        # after the automation gate — where it always did.
+                        _pt.start("lookups")
+                        _reply_lookup = _lookup_result(await _timed(
+                            _pt, "reply_to", _reply_to_row(_candidate),
+                        ))
+                        _pt.end("lookups")
+                    if isinstance(_reply_lookup, Exception):
+                        logger.warning(
+                            "[WS] reply_to auth lookup failed err=%s: %s",
+                            type(_reply_lookup).__name__, _reply_lookup,
                         )
-                        try:
-                            from app.db.database import async_session_maker as _rt_sm
-                            from app.db.models import Message as _RtMsg, Conversation as _RtConv
-                            from app.db.models.day_chat import DayChat as _RtDC
-                            async with _rt_sm() as _rt_db:
-                                # Ownership check accepts EITHER:
-                                #   - Conversation.user_id == user_id, OR
-                                #   - DayChat.user_id == user_id
-                                # Conversation alone is too narrow: system-channel
-                                # rows (routine, trigger, radio output) historically
-                                # carried service-stamped or null user_id even though
-                                # the message itself sits in the user's day_chat.
-                                # Day_chat ownership is the canonical user boundary
-                                # per conversation.py:21-33's Reading-A invariant.
-                                # Outer-joins so a missing Conversation or DayChat
-                                # row (older data, race conditions) doesn't fail
-                                # the whole query — we just check the side that
-                                # resolved.
-                                _row = (await _rt_db.execute(
-                                    select(
-                                        _RtMsg.id,
-                                        _RtMsg.role,
-                                        _RtMsg.content,
-                                        _RtMsg.created_at,
-                                        _RtConv.user_id.label("conv_user_id"),
-                                        _RtDC.user_id.label("dc_user_id"),
-                                    )
-                                    .select_from(_RtMsg)
-                                    .outerjoin(_RtConv, _RtMsg.conversation_id == _RtConv.id)
-                                    .outerjoin(_RtDC, _RtMsg.day_chat_id == _RtDC.id)
-                                    .where(_RtMsg.id == _candidate)
-                                )).first()
-                                if _row is None:
-                                    # Loud — id from the frontend doesn't match
-                                    # any row. Could be a stale optimistic id
-                                    # the client never reconciled, or a typo'd
-                                    # payload. Either way the user's reply
-                                    # context is lost; surface it in prod logs.
-                                    logger.warning(
-                                        "[WS] reply_to target=%s does not exist in messages "
-                                        "table (user=%s) — frontend may have sent a stale id",
-                                        _candidate[:8], user_id[:8],
-                                    )
-                                elif (
-                                    _row.conv_user_id == user_id
-                                    or _row.dc_user_id == user_id
-                                ):
-                                    reply_to_message_id = _row.id
-                                    _reply_target_role = _row.role
-                                    _reply_target_content = _row.content
-                                    _reply_target_created_at = _row.created_at
-                                    _via = "conv" if _row.conv_user_id == user_id else "day_chat"
-                                    logger.info(
-                                        "[WS] reply_to authorized target=%s role=%s content_len=%d via=%s",
-                                        _candidate[:8], _row.role,
-                                        len(_row.content or ""), _via,
-                                    )
-                                else:
-                                    # Real ownership failure: row exists but is
-                                    # in some other user's tree. Warn (not info)
-                                    # so prod alerts flag this — could be an
-                                    # IDOR attempt OR a legitimate user reply
-                                    # we've still got an auth-boundary gap on.
-                                    logger.warning(
-                                        "[WS] reply_to target=%s rejected (user=%s, "
-                                        "conv_user=%s, dc_user=%s) — dropping pointer",
-                                        _candidate[:8], user_id[:8],
-                                        (_row.conv_user_id or "")[:8] if _row.conv_user_id else "NULL",
-                                        (_row.dc_user_id or "")[:8] if _row.dc_user_id else "NULL",
-                                    )
-                        except Exception as _rt_err:
+                    else:
+                        _row = _reply_lookup
+                        if _row is None:
+                            # Loud — id from the frontend doesn't match
+                            # any row. Could be a stale optimistic id
+                            # the client never reconciled, or a typo'd
+                            # payload. Either way the user's reply
+                            # context is lost; surface it in prod logs.
                             logger.warning(
-                                "[WS] reply_to auth lookup failed err=%s: %s",
-                                type(_rt_err).__name__, _rt_err,
+                                "[WS] reply_to target=%s does not exist in messages "
+                                "table (user=%s) — frontend may have sent a stale id",
+                                _candidate[:8], user_id[:8],
+                            )
+                        elif (
+                            _row.conv_user_id == user_id
+                            or _row.dc_user_id == user_id
+                        ):
+                            reply_to_message_id = _row.id
+                            _reply_target_role = _row.role
+                            _reply_target_content = _row.content
+                            _reply_target_created_at = _row.created_at
+                            _via = "conv" if _row.conv_user_id == user_id else "day_chat"
+                            logger.info(
+                                "[WS] reply_to authorized target=%s role=%s content_len=%d via=%s",
+                                _candidate[:8], _row.role,
+                                len(_row.content or ""), _via,
+                            )
+                        else:
+                            # Real ownership failure: row exists but is
+                            # in some other user's tree. Warn (not info)
+                            # so prod alerts flag this — could be an
+                            # IDOR attempt OR a legitimate user reply
+                            # we've still got an auth-boundary gap on.
+                            logger.warning(
+                                "[WS] reply_to target=%s rejected (user=%s, "
+                                "conv_user=%s, dc_user=%s) — dropping pointer",
+                                _candidate[:8], user_id[:8],
+                                (_row.conv_user_id or "")[:8] if _row.conv_user_id else "NULL",
+                                (_row.dc_user_id or "")[:8] if _row.dc_user_id else "NULL",
                             )
 
                 # ── Persist timezone to User if changed ──
@@ -3384,17 +3714,39 @@ async def ws_chat(
                 # the user's future, and they were the two the old gate skipped.
                 # Shape and resolvability were both settled at parse time, so a
                 # truthy client_tz here is a name zoneinfo can load.
-                if client_tz:
+                # The READ happened in the gather above; the WRITE and every
+                # side effect it triggers stay HERE, at the point in the turn
+                # they have always run at. A second session is opened only when
+                # the value actually changed — a rare transition, and the one
+                # that has to be exactly right.
+                if client_tz and _tz_lookup is _UNREAD:
+                    # Overlap off: the read fires here, where it always did.
+                    _pt.start("lookups")
+                    _tz_lookup = _lookup_result(
+                        await _timed(_pt, "tz", _stored_user_tz(user_id))
+                    )
+                    _pt.end("lookups")
+                if client_tz and isinstance(_tz_lookup, Exception):
+                    # Same outcome and the same line as the in-place try/except
+                    # this read used to sit inside: the tz is simply not
+                    # persisted this turn.
+                    logger.debug("[WS] Timezone persistence skipped: %s", _tz_lookup)
+                elif client_tz and _tz_lookup:
                     try:
                         from app.db.database import async_session_maker as _tz_sm
                         from app.db.models import User
-                        async with _tz_sm() as _tz_db:
-                            _user = (await _tz_db.execute(
-                                select(User).where(User.id == user_id)
-                            )).scalar_one_or_none()
-                            if _user:
-                                _old_tz = _user.timezone
-                                if _old_tz != client_tz:
+                        _user_exists, _old_tz = _tz_lookup
+                        if _user_exists and _old_tz != client_tz:
+                            async with _tz_sm() as _tz_db:
+                                _user = (await _tz_db.execute(
+                                    select(User).where(User.id == user_id)
+                                )).scalar_one_or_none()
+                                if _user is not None:
+                                    # Re-read, not the gathered value: the row
+                                    # is being mutated, and a write must be
+                                    # made against what the DB holds now.
+                                    _old_tz = _user.timezone
+                                if _user is not None and _old_tz != client_tz:
                                     _user.timezone = client_tz
                                     await _tz_db.commit()
                                     logger.info("[WS] Updated timezone for %s: %s → %s", user_id[:8], _old_tz, client_tz)
@@ -3524,6 +3876,7 @@ async def ws_chat(
                 # message so the agent knows what the user is currently
                 # looking at. Inject as a hidden context block — agent sees
                 # it, user sees only their original text (via display_text).
+                _pt.start("appctx")
                 _page_ctx = msg.get("page_context")
                 if _page_ctx and isinstance(_page_ctx, dict):
                     try:
@@ -3556,6 +3909,7 @@ async def ws_chat(
                                 text = f"{_l2_ctx.render(is_layer2=_is_layer2)}\n\n{text}"
                     except Exception as e:
                         logger.warning(f"[WS] Failed to load app context: {e}")
+                _pt.end("appctx")
 
                 # Terminal activity: show user message
                 _tprint(f"\n{_CYAN_BOLD} user {_RESET} {text}")
@@ -3602,6 +3956,7 @@ async def ws_chat(
                 # FAILS OPEN if the ledger table is missing on an un-migrated
                 # tenant; the in-process guard + session-gated check still apply.
                 if _client_msg_id_top and not _is_system_action:
+                    _pt.start("ledger")
                     import uuid as _uuid_pm
                     from sqlalchemy.exc import IntegrityError as _IntegrityError
                     _pm_id = str(_uuid_pm.uuid5(
@@ -3634,6 +3989,7 @@ async def ws_chat(
                         # in-process guard is also wiped). Logged at error level so
                         # ops can see ledger unavailability on this critical path.
                         logger.error("[WS] exactly-once ledger unavailable, failing open: %s", _pm_err)
+                    _pt.end("ledger")
                     # NOTE (exactly-once contract): this ledger is the SOLE
                     # per-message guard against a second LLM call / credit charge
                     # on replay — the credit gate's own idempotency key is per
@@ -3717,7 +4073,10 @@ async def ws_chat(
                 _user_msg_presaved = False
                 _persisted_user_msg_id: Optional[str] = None
                 _persisted_day_chat_id: Optional[str] = None
+                # ONE resolution per turn for the two sites in this file.
+                _dc_once = _DayChatOnce(user_id, client_tz)
                 if session_id and not _is_system_action:
+                    _pt.start("presave")
                     try:
                         from app.db.database import async_session_maker
                         from app.db.models import Message as DbMessage
@@ -3782,9 +4141,9 @@ async def ws_chat(
                             # row. See `_ensure_presave_conversation`.
                             _conv = await _ensure_presave_conversation(
                                 _presave_db, user_id, session_id, channel,
-                                client_tz=client_tz,
+                                client_tz=client_tz, day_chat=_dc_once,
                             )
-                            _presave_dc_id = await _resolve_day_chat_id_for_now(_presave_db, user_id, tz_override=client_tz)
+                            _presave_dc_id = await _dc_once.get(_presave_db)
                             # Build kwargs defensively: omit reply_to_message_id
                             # when None so SQLAlchemy doesn't reference the
                             # column at all (lets regular user messages save
@@ -3856,7 +4215,7 @@ async def ws_chat(
                                     # would hit the same FK the fix exists for.
                                     _conv = await _ensure_presave_conversation(
                                         _presave_db, user_id, session_id, channel,
-                                        client_tz=client_tz,
+                                        client_tz=client_tz, day_chat=_dc_once,
                                     )
                                     _msg_kwargs.pop("reply_to_message_id", None)
                                     _new_msg = DbMessage(**_msg_kwargs)
@@ -3900,6 +4259,8 @@ async def ws_chat(
                         )
                     except Exception as _pse:
                         logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
+                    finally:
+                        _pt.end("presave")
 
                 # Accumulate streamed text for partial-save on error
                 _streamed_chunks: list = []
@@ -3960,8 +4321,30 @@ async def ws_chat(
                     chat_id=session_id,
                 )
 
+                # First-byte stamp. The agent side already logs
+                # `[PERF] llm_ttft` — the model's first token — but that clock
+                # starts at the LLM call, well inside run(). This one starts
+                # where the USER's does: the frame landing on the socket. The
+                # difference between the two is precisely the pre-turn block
+                # plus phase 1, which is the number this round exists to move.
+                # One line per turn (`_ttfb_seen` latches); the callback fires
+                # thousands of times on a long answer.
+                _ttfb_seen = {"done": False}
+
                 # Stream callbacks
                 async def on_text_chunk(chunk: str):
+                    if not _ttfb_seen["done"]:
+                        _ttfb_seen["done"] = True
+                        try:
+                            logger.info(
+                                "[PERF] ws_ttfb ttfb_ms=%d pre_turn_ms=%d "
+                                "channel=%s mission=%s user=%s",
+                                int((time.perf_counter() - _t_frame) * 1000),
+                                _pt.ms.get("_total", 0), channel or "unknown",
+                                _turn_mission_id, user_id[:8],
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     _streamed_chunks.append(chunk)
                     # Cheap inline guard: a long answer fires this callback
                     # thousands of times, and only the FIRST chunk after a
@@ -4169,6 +4552,7 @@ async def ws_chat(
                 _inbound_attachments: list = []
                 _media_items = msg.get("media", [])
                 if _media_items and isinstance(_media_items, list):
+                    _pt.start("attach")
                     import tempfile, base64 as _b64, os as _os
                     from app.agent.doc_generators import _persist as _persist_att
                     for _mi in _media_items[:5]:  # Max 5 attachments
@@ -4210,12 +4594,14 @@ async def ws_chat(
                                 logger.warning("[WS] Failed to persist inbound attachment: %s", _pe)
                         except Exception as _me:
                             logger.warning("[WS] Failed to process media attachment: %s", _me)
+                    _pt.end("attach")
 
                 # If the user message was already presaved (existing session),
                 # back-fill its attachments now that inbound media is persisted.
                 # The first-message path instead threads inbound_attachments into
                 # run() (below), which saves the user row with attachments.
                 if _inbound_attachments and _user_msg_presaved and _persisted_user_msg_id:
+                    _pt.start("attach")
                     try:
                         from app.db.database import async_session_maker as _att_sm
                         async with _att_sm() as _att_db:
@@ -4228,10 +4614,14 @@ async def ws_chat(
                                 await _att_db.commit()
                     except Exception as _ae:
                         logger.warning("[WS] Failed to back-fill presaved attachments: %s", _ae)
+                    finally:
+                        _pt.end("attach")
 
                 # ── Fast-path: detect play/music requests and fire media_play immediately ──
                 # Returns (modified_text, media_meta) if media was found, so agent skips play_media
+                _pt.start("fast_media")
                 _fast_result = await _fast_media_check(text, user_id, broadcast_queue)
+                _pt.end("fast_media")
                 _fast_text = _fast_result[0] if _fast_result else None
                 _agent_text = _fast_text or text
                 # Still set: `_handle_radio_toggle_locked` resolves a
@@ -4321,9 +4711,11 @@ async def ws_chat(
                 # Task intent detection — detect imperative task requests in regular chat
                 _chat_task_job_id = None
                 if channel != "vibecoding" and not _fast_result:
+                    _pt.start("task_detect")
                     _chat_task_job_id = await _detect_and_create_task(
                         text, user_id, session_id, broadcast_queue
                     )
+                    _pt.end("task_detect")
 
                 # Reply-to preamble (LLM-only): prepend a short quoted reference
                 # to `_agent_text` so the model treats the new user turn as a
@@ -4357,6 +4749,37 @@ async def ws_chat(
                 # stream callbacks, so the progress emitter closes over them.)
                 _user_text_preview = (_original_user_text or text or "")[:180]
 
+                # Published for the run task `create_task` is about to spawn:
+                # a ContextVar set here is copied into that task. Inert until
+                # `agent_runner` adopts it — see CURRENT_TURN_DAY_CHAT_ID.
+                #
+                # Set with a TOKEN and reset immediately after the task is
+                # created. The handler's context outlives the turn and is
+                # shared by every later iteration of this receive loop, so a
+                # value left set is visible to anything spawned afterwards —
+                # including turns that `continue` out before reaching here and
+                # the background tasks this handler fires. Leaving the PREVIOUS
+                # turn's day chat visible to a later one is the exact class of
+                # bug the ContextVar exists to help fix.
+                _dc_ctx_token = CURRENT_TURN_DAY_CHAT_ID.set(_persisted_day_chat_id)
+
+                # The pre-turn block ends HERE — the next statement hands the
+                # turn to the agent. One line, key=value, always emitted.
+                _pt.ms["_total"] = _pt.elapsed_ms()
+                _pt.emit(
+                    # Which mode produced these numbers: with overlap off,
+                    # lookups_ms is the SUM of the three; with it on, their
+                    # shared wall time. The two are not comparable without it.
+                    overlap=int(_overlap),
+                    channel=(channel or "unknown"),
+                    mission=_turn_mission_id,
+                    user=user_id[:8],
+                    presaved=int(_user_msg_presaved),
+                    fast=int(bool(_fast_result)),
+                    text_len=len(_agent_text or ""),
+                    att=len(_inbound_attachments),
+                )
+
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
                     display_user_message=_display_text,
@@ -4381,6 +4804,13 @@ async def ws_chat(
                     force_new_session=force_new_session,
                     received_at=_turn_received_ts,
                 ))
+                # The run task has copied the context; this handler must not
+                # keep carrying the value (see the set above).
+                try:
+                    CURRENT_TURN_DAY_CHAT_ID.reset(_dc_ctx_token)
+                except ValueError:  # pragma: no cover — different context
+                    CURRENT_TURN_DAY_CHAT_ID.set(None)
+
                 # From here any of this user's sockets can cancel this turn —
                 # see the `stop` branch in the receive loop. The per-socket
                 # watcher below is still the fast path for the common case.

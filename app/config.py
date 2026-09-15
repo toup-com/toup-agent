@@ -50,6 +50,37 @@ class Settings(BaseSettings):
     # soak on the canary before the fleet. See app/db/ddl_plan.py.
     init_db_plan_ddl: bool = False
 
+    # Run the three independent pre-turn reads (automation session, reply-to
+    # target, stored timezone) CONCURRENTLY instead of one after another.
+    #
+    # They are provably independent — read-only, one short-lived session each,
+    # none reads what another writes — and on the agent's NullPool engine each
+    # one is a fresh TCP+TLS+SCRAM handshake, so serially they are three
+    # handshakes deep on the critical path of every turn.
+    #
+    # Default OFF anyway, and the reason is capacity, not correctness. The
+    # live tenant Postgres host still runs `max_connections=300` with no
+    # `max_db_connections` cap on PgBouncer — steps 2 and 3 of
+    # docs/runbooks/host-capacity-and-alerting.md are written but NOT applied
+    # — and 15 of 95 samples sat at 297 backends inside the :00/:05 cron
+    # window. Overlapping raises the peak by up to 2 connections per in-flight
+    # turn, which is the wrong thing to add to a host that is already at its
+    # ceiling twice an hour.
+    #
+    # ENABLEMENT CONDITION, in order:
+    #   1. runbook Step 2 — `max_db_connections = 5` on pgbouncer (+ the idle
+    #      shrink), so one tenant cannot take the host down on its own;
+    #   2. runbook Step 3 — `max_connections` 300 -> 500 (restarts Postgres);
+    #   3. the backend high-water mark has headroom in the :00/:05 cron window.
+    # Then WS_PRE_TURN_OVERLAP=true, one tenant first.
+    #
+    # Until then OFF is the pre-existing serial path: the automation lookup at
+    # the top, the other two at the sites that consume them, same order, same
+    # sessions, same log lines. The `[PERF] ws_pre_turn` line reports per-
+    # lookup timings either way (and `overlap=0|1` says which mode produced
+    # them), so the decision can be made on measurements taken with it OFF.
+    ws_pre_turn_overlap: bool = False
+
     # Record the stack at every pool checkout and replay it if that connection
     # is garbage-collected without ever being checked in.
     #

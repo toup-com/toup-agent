@@ -274,6 +274,25 @@ async def get_db() -> AsyncSession:
             await session.close()
 
 
+# ── Boot phase timings, published on /agent/health ─────────────────
+# Container cold boot measured p50 57.3 s / p90 88.3 s (n=99, the 2026-09-14
+# pool walk) and init_db was 36.6 s of it — 71 %. What init_db spent it ON was
+# unknown: ~114 executed `ADD COLUMN IF NOT EXISTS` statements cannot cost 36 s
+# at local round-trip latency, so the split had to be MEASURED, not reasoned
+# about. This dict is that measurement, and `agent_schema_status` puts it on
+# /agent/health so the next pool walk yields a phase split from one poll
+# instead of log archaeology across 99 containers.
+#
+# Ints and short strings only — the endpoint is unauthenticated (see
+# `agent_schema_status`: class names, never messages).
+_INIT_DB_TIMINGS: dict = {}
+
+
+def init_db_timings() -> dict:
+    """A copy of the last `init_db()` run's phase timings; {} before boot."""
+    return dict(_INIT_DB_TIMINGS)
+
+
 async def init_db():
     """Initialize database tables and add any missing columns.
 
@@ -284,7 +303,30 @@ async def init_db():
     """
     from sqlalchemy import text, inspect as sa_inspect
     import logging
+    import time as _time_mod
     _logger = logging.getLogger(__name__)
+
+    _boot_t0 = _time_mod.perf_counter()
+    _INIT_DB_TIMINGS.clear()
+
+    def _phase(name: str, t0: float, **extra) -> int:
+        """Record and log one init_db phase. One line, key=value, greppable.
+
+        Never raises: this runs on the boot path of every container in the
+        fleet and a timing line may not be the reason one fails to start.
+        """
+        ms = int((_time_mod.perf_counter() - t0) * 1000)
+        try:
+            _INIT_DB_TIMINGS[f"{name}_ms"] = ms
+            for _k, _v in extra.items():
+                _INIT_DB_TIMINGS[_k] = _v
+            _logger.info(
+                "[BOOT] init_db phase=%s ms=%d%s", name, ms,
+                "".join(f" {_k}={_v}" for _k, _v in extra.items()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return ms
 
     from app.db.models.base import AGENT_ONLY_TABLES, PLATFORM_ONLY_TABLES, SHARED_TABLES
 
@@ -301,13 +343,16 @@ async def init_db():
 
     # Ensure pgvector extension exists before create_all tries to use VECTOR columns
     _has_pgvector = False
+    _t = _time_mod.perf_counter()
     async with engine.begin() as conn:
         try:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             _has_pgvector = True
         except Exception:
             _logger.warning("pgvector extension not available — vector columns will be skipped")
+    _phase("pgvector", _t, pgvector=int(_has_pgvector))
 
+    _t = _time_mod.perf_counter()
     async with engine.begin() as conn:
         try:
             await conn.run_sync(Base.metadata.create_all, tables=_allowed_tables)
@@ -316,6 +361,7 @@ async def init_db():
                 _logger.warning("create_all failed due to missing vector type — creating tables individually")
             else:
                 raise
+    _phase("create_all", _t, tables=len(_allowed_tables))
 
     # Tables whose DDL needs the pgvector extension (embedding columns).
     # Hoisted out of the fallback branch so the missing-table backstop
@@ -337,6 +383,7 @@ async def init_db():
     # memory_relationships (W0.1b) — same lesson as the _alter_statements
     # loop's 2026-04-28 incident below.
     if not _has_pgvector:
+        _t = _time_mod.perf_counter()
         for table in _allowed_tables:
             if table.name in _vector_tables:
                 _logger.info("Skipping table %s (needs pgvector)", table.name)
@@ -346,11 +393,13 @@ async def init_db():
                     await conn.run_sync(table.create, checkfirst=True)
             except Exception:
                 _logger.warning("Failed to create table %s", table.name)
+        _phase("create_fallback", _t, skipped_vector=len(_vector_tables))
 
     # ── Runtime safety assertion ──────────────────────────────────
     # Verify that forbidden tables were NOT created in this DB.
     # Catches the case where someone adds a model and forgets to
     # update the partition sets in base.py.
+    _t = _time_mod.perf_counter()
     try:
         async with engine.connect() as conn:
             _existing = await conn.run_sync(lambda sync_conn: sa_inspect(sync_conn).get_table_names())
@@ -377,6 +426,7 @@ async def init_db():
         raise
     except Exception as _e:
         _logger.warning("Could not verify table partitioning: %s", _e)
+    _phase("partition_check", _t)
 
     # ── Missing-table backstop (W0.1b) ────────────────────────────────
     # PROVEN in prod (tenant 871bac24): a DB can drift to a state where
@@ -391,6 +441,8 @@ async def init_db():
     # inspection round-trip) when the schema is complete. Runs BEFORE
     # the ALTER loop so healed tables also receive their index/backfill
     # statements below.
+    _t = _time_mod.perf_counter()
+    _backstop_created = 0
     try:
         async with engine.connect() as conn:
             _present_tables = set(await conn.run_sync(
@@ -404,6 +456,7 @@ async def init_db():
             try:
                 async with engine.begin() as conn:
                     await conn.run_sync(table.create, checkfirst=True)
+                _backstop_created += 1
                 _logger.warning(
                     "[init_db] table backstop: created missing table %s", table.name
                 )
@@ -414,6 +467,7 @@ async def init_db():
                 )
     except Exception as _e:
         _logger.warning("[init_db] table backstop skipped: %s", str(_e)[:200])
+    _phase("table_backstop", _t, created=_backstop_created)
 
     # Add missing columns to existing tables (create_all only creates new tables).
     #
@@ -1359,6 +1413,8 @@ async def init_db():
     # Fail-open everywhere: a failed snapshot leaves _ddl_skipped empty
     # and every statement runs, which is exactly the previous behaviour.
     _statements_to_run = _alter_statements
+    _ddl_planned_skip = 0
+    _t_plan_phase = _time_mod.perf_counter()
     if not _is_sqlite:
         try:
             import time as _time
@@ -1377,6 +1433,7 @@ async def init_db():
             )
             _to_run, _skip = plan(_alter_statements, _snap)
             _statements_to_run = _to_run
+            _ddl_planned_skip = len(_skip)
             _logger.info(
                 "[init_db] ddl_plan: %d of %d statements need to run "
                 "(%d already satisfied) — planned in %.0fms",
@@ -1391,8 +1448,44 @@ async def init_db():
                 "[init_db] ddl_plan unavailable, running the full list: %s",
                 str(_plan_err)[:200],
             )
+    # `stmt_total`, not `total`: `total_ms` lives in the same dict and the two
+    # must not read as a pair on the health endpoint.
+    _phase("ddl_plan", _t_plan_phase,
+           planned=len(_statements_to_run), planned_skip=_ddl_planned_skip,
+           stmt_total=len(_alter_statements))
 
+    # ── The self-heal DDL pass, bucketed by statement KIND ────────────
+    # 71 % of a 57 s cold boot lands somewhere in this loop, and "114 ALTERs"
+    # is not an explanation — at local round-trip latency they are milliseconds
+    # each. The list is not only ALTERs: it carries CREATE INDEX (which BUILDS
+    # the index, on a table that may be large), data backfills (UPDATE /
+    # DELETE, full scans) and DO blocks. Those are different costs with
+    # different fixes, so they are counted separately, and the single slowest
+    # statement is named — one line is usually the whole answer.
+    # Accumulated as FLOAT ms and rounded ONCE at the end. Rounding each
+    # statement to an int first is not a rounding error, it is a systematic
+    # one: 249 statements at 0.6 ms each report 0 ms in every bucket while the
+    # loop's wall clock reports 149. Verified on sqlite, where the whole pass
+    # is sub-millisecond per statement.
+    _ddl_ms = {"alter": 0.0, "index": 0.0, "backfill": 0.0, "other": 0.0}
+    _ddl_n = {"alter": 0, "index": 0, "backfill": 0, "other": 0}
+    _ddl_failed = 0
+    _ddl_slowest_ms = 0.0
+    _ddl_slowest = ""
+
+    def _ddl_kind(s: str) -> str:
+        head = s.lstrip()[:32].upper()
+        if head.startswith("CREATE INDEX") or head.startswith("CREATE UNIQUE INDEX"):
+            return "index"
+        if head.startswith("ALTER TABLE"):
+            return "alter"
+        if head.startswith(("UPDATE", "DELETE", "INSERT")):
+            return "backfill"
+        return "other"
+
+    _t_ddl = _time_mod.perf_counter()
     for stmt in _statements_to_run:
+        _t_stmt = _time_mod.perf_counter()
         try:
             if _is_sqlite:
                 # sqlite doesn't support `ADD COLUMN IF NOT EXISTS` — rewrite
@@ -1423,7 +1516,30 @@ async def init_db():
                 async with engine.begin() as conn:
                     await conn.execute(text(stmt))
         except Exception as _e:
+            _ddl_failed += 1
             _logger.warning("[init_db] alter skipped: %s — %s", stmt[:80], str(_e)[:200])
+        finally:
+            _stmt_ms = (_time_mod.perf_counter() - _t_stmt) * 1000.0
+            _k = _ddl_kind(stmt)
+            _ddl_ms[_k] += _stmt_ms
+            _ddl_n[_k] += 1
+            if _stmt_ms > _ddl_slowest_ms:
+                _ddl_slowest_ms = _stmt_ms
+                _ddl_slowest = " ".join(stmt.split())[:90]
+    _phase("ddl_exec", _t_ddl,
+           ran=len(_statements_to_run), failed=_ddl_failed,
+           n_alter=_ddl_n["alter"], n_index=_ddl_n["index"],
+           n_backfill=_ddl_n["backfill"], n_other=_ddl_n["other"],
+           alter_ms=round(_ddl_ms["alter"]), index_ms=round(_ddl_ms["index"]),
+           backfill_ms=round(_ddl_ms["backfill"]), other_ms=round(_ddl_ms["other"]),
+           slowest_ms=round(_ddl_slowest_ms))
+    if _ddl_slowest:
+        # The statement text last, so a value containing spaces still parses
+        # as "everything after stmt=".
+        _logger.info(
+            "[BOOT] init_db slowest ms=%d stmt=%s",
+            round(_ddl_slowest_ms), _ddl_slowest,
+        )
 
     # ── Structural backstop: auto-reconcile forgotten model columns ──
     # The explicit _alter_statements list above is the PRIMARY schema-heal
@@ -1435,11 +1551,14 @@ async def init_db():
     # get_user_by_id (every chat turn) with "column users.apple_sub does not
     # exist" → ws/chat 1006 → mobile "Connection lost". Additive-only; runs
     # against the same `engine` (so the same DB) the ALTERs above just healed.
+    _t = _time_mod.perf_counter()
     try:
         await _reconcile_missing_columns(engine, _has_pgvector, _logger)
     except Exception as _e:
         _logger.warning("[init_db] column reconcile skipped: %s", str(_e)[:200])
+    _phase("reconcile", _t)
 
+    _t = _time_mod.perf_counter()
     for stmt in _seed_statements:
         try:
             if _is_sqlite and "ON CONFLICT" in stmt:
@@ -1452,6 +1571,22 @@ async def init_db():
                 await conn.execute(text(stmt))
         except Exception as _e:
             _logger.warning("[init_db] seed skipped: %s — %s", stmt[:80], str(_e)[:200])
+    _phase("seeds", _t, seeds_n=len(_seed_statements))
+
+    # The one summary line. `alters` counts the statements this boot actually
+    # EXECUTED and `skipped` the ones the catalog planner proved unnecessary —
+    # the pair is what says whether the planner is armed on this tenant.
+    _total_ms = int((_time_mod.perf_counter() - _boot_t0) * 1000)
+    try:
+        _INIT_DB_TIMINGS["total_ms"] = _total_ms
+        _INIT_DB_TIMINGS["alters"] = len(_statements_to_run)
+        _INIT_DB_TIMINGS["skipped"] = _ddl_planned_skip
+        _logger.info(
+            "[BOOT] init_db total_ms=%d alters=%d skipped=%d failed=%d",
+            _total_ms, len(_statements_to_run), _ddl_planned_skip, _ddl_failed,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _rewrite_alter_for_sqlite(stmt: str):
