@@ -943,6 +943,56 @@ class Settings(BaseSettings):
     # fleet-wide.
     channel_envelope: bool = True
     channel_envelope_canary_user_ids: str = ""
+
+    # R44 — reasoning effort by intent. Measured 2026-09-13/14 over 79
+    # mobile-dominated turns: LLM ttft p50 2,947 ms is 75% of the turn while
+    # the median OUTPUT is 30 tokens, and a warm-cache turn (40,192 cached of
+    # ~41,000 input) still spent 1.5-4.4 s before its first token. That gap is
+    # reasoning time, not prefill — a "hi" is paying the model's default
+    # effort. `REASONING_EFFORT_BY_INTENT` (module constant below) maps ONLY
+    # the two categories where a deliberation budget buys nothing: `greeting`
+    # (46% of the sample) and `media` (7%), the latter because the turn's work
+    # is a tool call whose arguments the classifier already pinned.
+    #
+    # Request parameter, NOT input: `reasoning` is a top-level Responses field
+    # and never enters the cached prefix (tools + instructions + input), so
+    # varying it per turn cannot cost a cache hit — the same reason
+    # `tool_choice` is safe to vary (verified in prod: iteration 2 of a turn
+    # drops the allowed_tools restriction and still reads the full prefix).
+    # Flag-off sends no `reasoning` key at all, which is byte-identical to
+    # today's request.
+    reasoning_effort_by_intent: bool = True
+
+    # R44 — warm the provider's prompt-cache HEAD when a chat socket attaches.
+    # Measured 2026-09-13/14: of 26 misses in 76 iteration-1 calls, 7 had a
+    # BYTE-IDENTICAL head hash to the container's previous call and sat 4-6 h
+    # idle, and 15 were the container's first call in the window. The longest
+    # observed HIT gap was 1,616 s. So the misses are TTL, not layout and not
+    # key rotation (channel_converge is on, so the key is one stable scope per
+    # user and does not rotate at midnight) — and a MISS costs ttft p50
+    # 5,586 ms against a HIT's 2,611 ms.
+    #
+    # The warm replays the exact head `run()` last sent (app/agent/cache_warm
+    # explains why bytes are recorded rather than rebuilt) behind ONE Responses
+    # call, fire-and-forget, so it can never delay the connection. Idle gate:
+    # a user mid-conversation is already warm and a warm there is pure cost.
+    # SHIPPED DARK. Default False this round on purpose: the no-charge path
+    # has a platform half (llm_proxy honouring `system.cache_warm`) that must
+    # be deployed and observed BEFORE any agent starts sending warms, or every
+    # warm is a real ~10-credit charge to a user who asked for nothing. Enable
+    # only when all three hold: (1) the platform build with
+    # `_system_operation_for` is live everywhere, (2) llm_cache_warm_max_per_day
+    # is in place, (3) one canary tenant has been watched for a day and its
+    # llm_proxy_events rows for the warm carry operation_type='system.cache_warm'
+    # with no matching credit_ledger entry.
+    llm_cache_warm_on_connect: bool = False
+    llm_cache_warm_idle_s: int = 240
+    llm_cache_warm_min_gap_s: int = 300
+    # Blast-radius bound, per process and per user. The gates above already
+    # make a dozen warms a day unlikely; this is what caps the bill if one of
+    # them is wrong. Worst case at 12/day/user: 12 x 40,192 tok x $2.50/1M =
+    # $1.21 of TOUP-side provider spend per user per day, and $0 to the user.
+    llm_cache_warm_max_per_day: int = 12
     # Incident 2026-09-14: the day-index self-heal is now a service that runs in
     # its own session (app/services/day_chat_rebucket.py). This switch turns
     # every AUTOMATIC write path off without a rollback: `rebucket_user_days`
@@ -2989,6 +3039,33 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+
+# R44 — the per-intent reasoning-effort map. A category absent from this
+# dict sends NO `reasoning` parameter, which is exactly today's request, so
+# adding a key is the only way to change a category's behaviour. Keyed on
+# `QueryIntent.category` (app/agent/query_intent.py), the same value already
+# logged on the `[PERF] query_intent` line — so the effort a turn used is
+# reconstructable from the trail without a second classifier run.
+#
+# Only 'low', never 'minimal': media turns call a tool, and a tool call whose
+# arguments have to be composed from the user's sentence is the one thing a
+# stripped budget does measurably worse.
+REASONING_EFFORT_BY_INTENT: dict[str, str] = {
+    "greeting": "low",
+    "media": "low",
+}
+
+
+def reasoning_effort_for_intent(category: str | None) -> str | None:
+    """The Responses `reasoning.effort` for this turn, or None to send none.
+
+    Deterministic in the classifier's output alone — no clock, no history,
+    no model state — so the same message always produces the same request.
+    """
+    if not settings.reasoning_effort_by_intent:
+        return None
+    return REASONING_EFFORT_BY_INTENT.get((category or "").strip().lower())
 
 
 @lru_cache()

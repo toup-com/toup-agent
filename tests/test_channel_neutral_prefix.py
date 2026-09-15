@@ -507,3 +507,234 @@ def test_the_bridge_ships_both_flags():
         "CHANNEL_ENVELOPE missing from bridge/pool_addon.py::_FEATURE_FLAG_ENVS "
         "— the kill switch would have no delivery path to a running tenant"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R44 — one head per user across INTENTS, not just across channels
+# ══════════════════════════════════════════════════════════════════════
+#
+# The channel lineage was the first fork; the intent is the other axis of the
+# same question. `_build_system_prompt` takes an `intent` that selects
+# `include_skill_prompts` / `include_environment` / `include_media_section`,
+# so on the legacy path a greeting turn and a full turn are DIFFERENT
+# instructions bytes — a guaranteed provider miss whenever the category flips
+# between consecutive turns, and a warm that can only ever warm one variant.
+#
+# PR-1 already closed this: every one of those gates reads `(intent.X or
+# _stable)` (agent_runner.py ~6250 / ~6384 / ~6501 / ~6528), so under
+# `stable_prefix_layout` (default ON since 2026-08-05) the union is always
+# built. Measured here rather than asserted from the code: flag ON → ONE
+# variant, spread 0 tokens; flag OFF → four variants spanning ~1,126 est
+# tokens, the differences being `# Your Environment & Capabilities` and
+# `# Media Playback`. It is pinned now because nothing was pinning it, and
+# because the connect-time warm (app/agent/cache_warm.py) is only worth
+# issuing if the head it replays is the head the next turn asks for,
+# whatever the user happens to type.
+
+_INTENT_CATEGORIES = (
+    "greeting", "question", "memory", "web", "media",
+    "code", "scheduling", "agent", "full",
+)
+
+
+async def _prompts_by_intent():
+    """The REAL `_build_system_prompt`, once per intent category, one user."""
+    from app.agent import query_intent as _qi
+    from app.agent.agent_runner import AgentRunner
+    from app.agent.tool_executor import ToolExecutor
+    from app.db.database import async_session_maker
+    from app.db.models import User
+    from app.services.openai_agent_service import OpenAIAgentService
+
+    uid = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"{uid[:8]}@intent.local",
+                    hashed_password="x" * 60, name=_GOLDEN_USER_NAME))
+        await db.commit()
+
+    runner = AgentRunner(llm_service=OpenAIAgentService(),
+                         tool_executor=ToolExecutor(workspace=_WS))
+    out: dict[str, str] = {}
+    for cat in _INTENT_CATEGORIES:
+        intent = getattr(_qi, f"INTENT_{cat.upper()}")
+        async with async_session_maker() as db:
+            out[cat] = await runner._build_system_prompt(
+                db=db, user_id=uid, user_message="hi", channel="app",
+                intent=intent, client_tz="UTC", turn_context_out={},
+            )
+    return out
+
+
+@pytest.fixture
+def stable_layout_on(monkeypatch):
+    monkeypatch.setattr(settings, "stable_prefix_layout", True)
+
+
+@pytest.mark.asyncio
+async def test_every_intent_shares_one_system_prompt(envelope_on, stable_layout_on):
+    prompts = await _prompts_by_intent()
+    distinct = {hashlib.sha256(p.encode()).hexdigest() for p in prompts.values()}
+    assert len(distinct) == 1, (
+        "the system prompt forks on intent — a greeting turn and a full turn "
+        "are different cached heads:\n" + _first_divergence(prompts)
+    )
+
+
+@pytest.mark.asyncio
+async def test_greeting_then_full_is_one_byte_identical_head(
+    envelope_on, stable_layout_on,
+):
+    """The consecutive-turn case, spelled out: the exact pair the measured
+    pool-88 day kept alternating between."""
+    prompts = await _prompts_by_intent()
+    assert prompts["greeting"] == prompts["full"]
+
+
+@pytest.mark.asyncio
+async def test_the_intent_variants_under_test_are_real(envelope_on, stable_layout_on):
+    """Guard the guard: if the builder returned "" for every category the
+    two tests above would pass on nothing."""
+    prompts = await _prompts_by_intent()
+    assert len(prompts) == len(_INTENT_CATEGORIES)
+    assert all(len(p) > 2000 for p in prompts.values())
+    assert "# Your Environment & Capabilities" in prompts["greeting"], (
+        "the union is not being built — this section is the one the legacy "
+        "path drops for a greeting, so its absence means the fork is back"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_fork_is_real_when_the_stable_layout_is_off(envelope_on, monkeypatch):
+    """Sensitivity: with PR-1 off the prompts MUST diverge, or the three
+    tests above are measuring a builder that ignores intent entirely."""
+    monkeypatch.setattr(settings, "stable_prefix_layout", False)
+    prompts = await _prompts_by_intent()
+    distinct = {hashlib.sha256(p.encode()).hexdigest() for p in prompts.values()}
+    assert len(distinct) > 1
+    assert prompts["greeting"] != prompts["full"]
+
+
+def test_the_wire_tools_array_does_not_fork_on_intent():
+    """The other half of the head. The intent-filtered array is what the
+    legacy path sends; the stable path sends the channel array whatever the
+    intent, and moves the gating to `tool_choice`, which is not in the
+    cached prefix."""
+    from app.agent import query_intent as _qi
+    from app.agent.agent_runner import strip_vault_tool_for_channel
+    from app.agent.prefix_stability import strip_tools_for_channel
+    from app.agent.query_intent import filter_tools_by_intent
+
+    tools = [
+        {"name": n, "description": n, "input_schema": {}}
+        for n in ("web_search", "exec", "write_file", "play_media",
+                  "memory_search", "generate_image")
+    ]
+    filtered = {
+        cat: [t["name"] for t in filter_tools_by_intent(
+            tools, getattr(_qi, f"INTENT_{cat.upper()}"))]
+        for cat in _INTENT_CATEGORIES
+    }
+    assert len({tuple(v) for v in filtered.values()}) > 1, (
+        "filter_tools_by_intent no longer varies — this test proves nothing"
+    )
+    stable = [
+        t["name"] for t in strip_tools_for_channel(
+            tools, "app", strip_vault_tool_for_channel=strip_vault_tool_for_channel)
+    ]
+    for cat in _INTENT_CATEGORIES:
+        assert stable == [
+            t["name"] for t in strip_tools_for_channel(
+                tools, "app",
+                strip_vault_tool_for_channel=strip_vault_tool_for_channel)
+        ], f"the stable wire array moved for intent={cat}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# R44 — one head across local DATES, not just channels and intents
+# ══════════════════════════════════════════════════════════════════════
+#
+# `render_time_lines(stable=True)` used to leave `- Today's date: …` in the
+# runtime section, and test_stable_prefix called that "allowed to roll
+# daily". Daily is once per user per local midnight, and measured
+# 2026-09-13/14 it was 17/17 of the first-message-of-a-day misses on a
+# ~40,192-token head — ttft p50 5,586 ms against a hit's 2,611 ms. It also
+# forced the connect-time warm to refuse across midnight, and it is why the
+# goldens above had to be regenerated every calendar day to stay green.
+#
+# Measured the honest way: two timezones fourteen hours apart, ONE instant,
+# two different local dates. Before the move the heads differed by exactly
+# that line; after it they are byte-identical — which makes the head
+# tz-invariant as well, since the tz name travelled inside that sentence.
+
+_TZ_AHEAD = "Pacific/Kiritimati"   # UTC+14
+_TZ_BEHIND = "Pacific/Midway"      # UTC-11
+
+
+async def _prompt_and_tail(tz_name: str):
+    from app.agent.agent_runner import AgentRunner
+    from app.agent.tool_executor import ToolExecutor
+    from app.db.database import async_session_maker
+    from app.db.models import User
+    from app.services.openai_agent_service import OpenAIAgentService
+
+    uid = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"{uid[:8]}@dateinv.local",
+                    hashed_password="x" * 60, name=_GOLDEN_USER_NAME))
+        await db.commit()
+    runner = AgentRunner(llm_service=OpenAIAgentService(),
+                         tool_executor=ToolExecutor(workspace=_WS))
+    tail: dict = {}
+    async with async_session_maker() as db:
+        prompt = await runner._build_system_prompt(
+            db=db, user_id=uid, user_message="hi", channel="app",
+            client_tz=tz_name, turn_context_out=tail,
+        )
+    return prompt, tail
+
+
+def _local_dates_differ() -> bool:
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(timezone.utc)
+    return (now.astimezone(ZoneInfo(_TZ_AHEAD)).date()
+            != now.astimezone(ZoneInfo(_TZ_BEHIND)).date())
+
+
+@pytest.mark.asyncio
+async def test_the_head_is_identical_across_two_local_dates(
+    envelope_on, stable_layout_on,
+):
+    assert _local_dates_differ(), (
+        f"{_TZ_AHEAD} and {_TZ_BEHIND} are on the same local date right now — "
+        "they are 25 hours apart, so this can only mean the zones moved"
+    )
+    ahead, _ = await _prompt_and_tail(_TZ_AHEAD)
+    behind, _ = await _prompt_and_tail(_TZ_BEHIND)
+    assert ahead == behind, (
+        "the system prompt still moves with the user's local date — every "
+        "first message of a day is a guaranteed cache miss:\n"
+        + _first_divergence({_TZ_AHEAD: ahead, _TZ_BEHIND: behind})
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_date_still_reaches_the_model_in_the_turn_context_tail(
+    envelope_on, stable_layout_on,
+):
+    """Moved, not deleted. The tail is where the clock already lives, and it
+    sits after the history, so it costs no cached bytes."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    prompt, tail = await _prompt_and_tail(_TZ_AHEAD)
+    clock = tail.get("clock") or ""
+    expected = datetime.now(timezone.utc).astimezone(
+        ZoneInfo(_TZ_AHEAD)
+    ).strftime("Today's date: %A, %B %d, %Y")
+    assert expected in clock, f"tail does not state the date: {clock!r}"
+    assert _TZ_AHEAD in clock
+    # …and exactly once, nowhere in the cached head.
+    assert "Today's date: " not in prompt
+    assert clock.count("Today's date: ") == 1

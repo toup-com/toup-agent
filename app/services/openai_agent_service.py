@@ -112,6 +112,39 @@ def _responses_cache_key(prompt_cache_key: str) -> str:
     return f"{prompt_cache_key[:31]}-{digest}"
 
 
+# Families that accept the Responses `reasoning` object. Derived from the
+# model id for the same reason `wire_api_for` is (model_resolver ~l.100): a
+# container can be pointed at any model by env or per-tenant config, and an
+# unsupported `reasoning` key is a 400 on every turn — a whole-fleet outage
+# that looks like a model problem. gpt-4o (the non-reasoning fallback) is
+# deliberately excluded and gets no parameter.
+#: Header the platform proxy reads to tag a request as platform overhead
+#: rather than the user's turn (llm_proxy.proxy_responses). Only values the
+#: proxy allowlists are honoured there; the agent sending it is necessary but
+#: never sufficient.
+OPERATION_TYPE_HEADER = "X-Toup-Operation-Type"
+
+
+def is_system_operation(operation_type: Optional[str]) -> bool:
+    """True for platform overhead that must never be billed to the user.
+
+    Same "system." rule the platform enforces in three places already
+    (llm_proxy._log_event, llm_proxy._get_spend, credits.agent-deduct), named
+    once here so the agent side cannot drift from it.
+    """
+    return bool(operation_type and operation_type.startswith("system."))
+
+
+_REASONING_EFFORT_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def supports_reasoning_effort(model: str | None) -> bool:
+    """True when `model` accepts the Responses `reasoning: {effort}` param."""
+    if not model:
+        return False
+    return model.lower().strip().startswith(_REASONING_EFFORT_PREFIXES)
+
+
 def _anthropic_tools_to_openai(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Convert Anthropic-format tool definitions to OpenAI function-calling format.
@@ -266,10 +299,16 @@ class OpenAIAgentService:
         idempotency_key: Optional[str] = None,
         stable_prefix_active: bool = False,
         channel: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        operation_type: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
         same contract as AnthropicService so the agent loop is unchanged.
+
+        ``reasoning_effort`` is honoured on the Responses wire only (the chat
+        wire here exists for the gpt-4o fallback, which has no reasoning to
+        budget); it is a request parameter, never prompt input.
         """
         self._ensure_client()
         model = model or self.default_model
@@ -311,6 +350,8 @@ class OpenAIAgentService:
                 idempotency_key=idempotency_key,
                 stable_prefix_active=stable_prefix_active,
                 channel=channel,
+                reasoning_effort=reasoning_effort,
+                operation_type=operation_type,
             ):
                 yield _ev
             return
@@ -509,7 +550,10 @@ class OpenAIAgentService:
                     from app.services.credit_reporter import report_llm_usage_bg
                     from app.config import settings as _cr_settings
                     user_id = getattr(_cr_settings, "user_id", "") or ""
-                    if user_id:
+                    # R44 F1 — same exemption as the Responses wire. This path
+                    # is the gpt-4o fallback; a recorded head on that family
+                    # would warm through here.
+                    if user_id and not is_system_operation(operation_type):
                         report_llm_usage_bg(
                             user_id=user_id,
                             model=model,
@@ -767,6 +811,8 @@ class OpenAIAgentService:
         idempotency_key: Optional[str] = None,
         stable_prefix_active: bool = False,
         channel: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        operation_type: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a completion over the Responses API (/v1/responses), yielding
@@ -780,8 +826,20 @@ class OpenAIAgentService:
         today's stateless chat usage. include=reasoning.encrypted_content so
         reasoning items can be echoed back next turn (the API rejects a
         resubmitted function_call without its reasoning item on reasoning
-        models). No `reasoning` param is sent — parity with chat, where the
-        model's server-side default effort applies.
+        models).
+
+        `include=["reasoning.encrypted_content"]` stays unconditional. It was
+        re-examined in R44 as a cache suspect and cleared: it is a RESPONSE
+        directive — it asks for an extra field on the way back and adds
+        nothing to the request's cached prefix (tools + instructions + input).
+        Dropping it would only be safe on a build whose input carries no
+        `function_call` item, and the input builder emits one for every
+        tool_use in history, so any turn after a tool call would start
+        400-ing. Left on.
+
+        `reasoning: {effort}` IS sent when the caller asks for one (R44) —
+        also a request parameter, outside the prefix, so it can vary per turn
+        at no cache cost. Absent → the model's server-side default effort.
         """
         from app.services.model_resolver import supports_custom_temperature
 
@@ -797,6 +855,11 @@ class OpenAIAgentService:
             kwargs["instructions"] = system
         if supports_custom_temperature(model):
             kwargs["temperature"] = temperature
+        # R44: effort rides the request, never the prompt. Gated on the model
+        # family rather than trusted from the caller — agent_runner decides
+        # policy, this decides whether the wire can carry it.
+        if reasoning_effort and supports_reasoning_effort(model):
+            kwargs["reasoning"] = {"effort": reasoning_effort}
         # Same cache/abuse params as the chat wire (first-class Responses
         # params, verified against SDK types — prompt_cache_retention is
         # Literal["in-memory","24h"] on responses.create). Same effective
@@ -820,6 +883,16 @@ class OpenAIAgentService:
         # caller and the BYOK direct-to-OpenAI path unchanged.
         if channel:
             kwargs["extra_headers"] = {"X-Toup-Channel": str(channel)[:20]}
+        # R44 F1: platform-overhead marker. On the bundle/proxy path this is
+        # the ONLY way the platform can tell a cache warm from a turn — an
+        # untagged /responses call is logged with operation_type=None, which
+        # llm_proxy treats as user-attributable and charges. The proxy
+        # allowlists the value and checks the body still looks like a warm,
+        # so sending it is necessary and not sufficient.
+        if is_system_operation(operation_type):
+            kwargs.setdefault("extra_headers", {})[OPERATION_TYPE_HEADER] = (
+                str(operation_type)[:40]
+            )
 
         if tools:
             kwargs["tools"] = _anthropic_tools_to_responses(tools)
@@ -1013,11 +1086,19 @@ class OpenAIAgentService:
 
                 # Credit metering — same contract as the chat path (same
                 # helper-derived idempotency key, same cached_tokens forward).
+                #
+                # R44 F1: a system operation is NOT reported at all on this
+                # path. /credits/agent-deduct would exempt it by
+                # operation_type anyway, but skipping is what makes the warm
+                # free against a platform build that predates the exemption —
+                # and the manual/BYOK path mints a unique
+                # `oaireq:{completion_id}` key per call, so a single missed
+                # exemption is a real charge to a user who asked for nothing.
                 try:
                     from app.services.credit_reporter import report_llm_usage_bg
                     from app.config import settings as _cr_settings
                     user_id = getattr(_cr_settings, "user_id", "") or ""
-                    if user_id:
+                    if user_id and not is_system_operation(operation_type):
                         report_llm_usage_bg(
                             user_id=user_id,
                             model=model,

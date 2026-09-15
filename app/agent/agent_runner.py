@@ -3035,15 +3035,83 @@ class AgentRunner:
         # hashes of the three tiers that head the provider prefix (history
         # hashed BEFORE the volatile turn_context/user tail is appended).
         # Diff two turns' lines and the mutating tier names itself.
+        # R44 adds hist0 — an 8-hex hash of history[0] alone. prefix_head's
+        # `hist` covers the WHOLE list, so it changes on every append and can
+        # never answer the only question a pinned cache_read raises: did the
+        # FIRST input item (everything before it is instructions+tools) move?
+        # Two turns with equal hist0 and cached_beyond_head=0 prove the pin is
+        # not the prompt's layout, which is where a week of this went.
+        _head_est = 0
         try:
             _h_tools, _h_sys, _h_hist = head_hashes(
                 current_tools, system_prompt, history
             )
+            _h_hist0 = head_hashes([], "", history[:1])[2] if history else "-"
             logger.info(
-                "[PERF] prefix_head tools=%s sys=%s hist=%s n_hist=%d",
-                _h_tools, _h_sys, _h_hist, len(history),
+                "[PERF] prefix_head tools=%s sys=%s hist=%s hist0=%s n_hist=%d",
+                _h_tools, _h_sys, _h_hist, _h_hist0, len(history),
             )
         except Exception:
+            pass
+        # Estimate of the provider's cacheable HEAD (tools + instructions;
+        # the input array follows both). Only ever compared against the
+        # provider's own cached count to produce `cached_beyond_head`, so an
+        # estimator that is a few percent off still answers the yes/no the
+        # field exists for: is anything past the head being cached at all.
+        try:
+            _head_est = estimate_tokens(system_prompt) + estimate_tokens(
+                json.dumps(current_tools or [], ensure_ascii=False, default=str)
+            )
+        except Exception:
+            _head_est = 0
+
+        # R44 Task 2: effort is a pure function of the category already
+        # logged on [PERF] query_intent, resolved ONCE so every iteration of
+        # the turn sends the same value (a mid-run flip would make the trail
+        # unreadable and buys nothing — the escalation after a tool call is
+        # about tools, not deliberation). Anthropic has no equivalent
+        # parameter, so the kwarg is withheld entirely on that path rather
+        # than passed as None.
+        from app.config import reasoning_effort_for_intent
+        _reasoning_effort = reasoning_effort_for_intent(
+            getattr(query_intent, "category", None)
+        )
+        _llm_extra_kwargs: Dict[str, Any] = {}
+        if _reasoning_effort and not _is_claude_model(active_model):
+            _llm_extra_kwargs["reasoning_effort"] = _reasoning_effort
+
+        # R44 I2: hand the connect-time warm the EXACT bytes this turn is
+        # about to send. Recorded here rather than rebuilt in cache_warm
+        # because a warm whose head differs by one character is a paid no-op
+        # that reports itself as a success — see that module's docstring.
+        # Bookkeeping only; it never reads back into this turn.
+        try:
+            from app.agent import cache_warm as _cw
+            from datetime import datetime as _dt, timezone as _tz
+
+            _warm_today = None
+            try:
+                _warm_now = _dt.now(_tz.utc)
+                if client_tz:
+                    from zoneinfo import ZoneInfo as _ZI
+                    _warm_today = _warm_now.astimezone(_ZI(client_tz)).date()
+                else:
+                    _warm_today = _warm_now.date()
+            except Exception:  # noqa: BLE001 — a bad tz must not lose the record
+                _warm_today = _dt.now(_tz.utc).date()
+            _cw.record_head(
+                user_id or "", llm=active_llm, system_prompt=system_prompt,
+                tools=current_tools, model=active_model,
+                prompt_cache_key=None, safety_identifier=user_id or None,
+                stable_prefix_active=_stable_prefix, channel=channel,
+                local_date=_warm_today, tz_name=client_tz,
+                # R44 F3: a SUBAGENT run carries the sub-agent prompt and a
+                # `subagent:{job_id}` cache scope; recording it would aim the
+                # warm at a prefix no chat turn asks for. Any future non-main
+                # profile is excluded the same way rather than by name.
+                is_main_turn=(prompt_profile == PromptProfile.FULL),
+            )
+        except Exception:  # noqa: BLE001
             pass
 
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
@@ -3243,6 +3311,18 @@ class AgentRunner:
                     _cache_key = f"{user_id}:{_cache_scope}" if user_id and _cache_scope else None
                     _idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
 
+                    # R44 I2: the cache key is minted here, after the head is
+                    # already recorded, so the record is completed rather than
+                    # duplicated — a second derivation is a second thing to
+                    # drift. `note_llm_call` is what keeps a warm from firing
+                    # at a user who is mid-conversation.
+                    try:
+                        from app.agent import cache_warm as _cw_call
+                        _cw_call.set_cache_key(user_id or "", _cache_key)
+                        _cw_call.note_llm_call(user_id or "")
+                    except Exception:  # noqa: BLE001
+                        pass
+
                     # Liveness: cover the dead-air from here to the first
                     # surfaced stream event (reasoning TTFT can be many
                     # seconds on tool-first turns). Idempotent on the
@@ -3265,6 +3345,7 @@ class AgentRunner:
                         idempotency_key=_idem_key,
                         stable_prefix_active=_stable_prefix,
                         channel=channel,
+                        **_llm_extra_kwargs,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -3330,11 +3411,43 @@ class AgentRunner:
                                 except Exception:  # noqa: BLE001 — sink must never kill a turn
                                     logger.debug("[AGENT] on_usage sink failed", exc_info=True)
 
+                    # cached_beyond_head: how far the provider's cached
+                    # prefix reaches PAST tools+instructions. 0 means the
+                    # day's history is being re-prefilled in full every turn
+                    # even on a "hit" — which is what 36 consecutive prod
+                    # turns did on 2026-09-14 while cache_read sat pinned at
+                    # 40,192. Raw cache_read cannot show that: it is large and
+                    # constant either way.
+                    _cached_tok = int(
+                        event.usage.get("cache_read_input_tokens", 0) or 0
+                    )
+                    _cached_beyond_head = max(0, _cached_tok - _head_est)
                     logger.info(
                         f"[PERF] llm_total: {(time.perf_counter() - _t_llm_start) * 1000:.0f}ms "
                         f"(iteration {iteration + 1}, in={event.usage.get('input_tokens', 0)}, "
-                        f"out={event.usage.get('output_tokens', 0)}, stop={stop_reason})"
+                        f"out={event.usage.get('output_tokens', 0)}, stop={stop_reason}, "
+                        f"cached={_cached_tok}, head_est={_head_est}, "
+                        f"cached_beyond_head={_cached_beyond_head}, "
+                        f"effort={_reasoning_effort or '-'})"
                     )
+                    try:
+                        from app.services import health_signals as _hs_cache
+                        _hs_cache.incr(
+                            "llm_cache_hits" if _cached_tok > 0
+                            else "llm_cache_misses"
+                        )
+                    except Exception:  # noqa: BLE001 — a counter never costs a turn
+                        pass
+                    # R44 F4: the idle clock is re-stamped from the END of the
+                    # call, not only its start. One long iteration can outrun
+                    # `llm_cache_warm_idle_s`, and a socket attaching in that
+                    # window would have fired a warm alongside the very turn
+                    # about to read the cache.
+                    try:
+                        from app.agent import cache_warm as _cw_done
+                        _cw_done.note_llm_done(user_id or "")
+                    except Exception:  # noqa: BLE001
+                        pass
                     _llm_ms = int((time.perf_counter() - _t_llm_start) * 1000)
                     _llm_ttft_ms = (
                         int((_t_first_token - _t_llm_start) * 1000)

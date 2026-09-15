@@ -55,6 +55,17 @@ KNOWN_SIGNALS: tuple[str, ...] = (
     # gauge reads the CURRENT state (zero again once repaired); this one
     # says a tenant produced such a row at all.
     "future_dated_day_chats_seen",
+    # R44 — one pair per LLM CALL (not per turn; a tool turn makes several).
+    # A "hit" here only means the provider read SOME cached prefix, which in
+    # the 2026-09-14 sample was always exactly the tools+instructions head:
+    # read them with `cached_beyond_head` on the [PERF] llm_total line, which
+    # is the half that says whether the day's history is cached at all.
+    "llm_cache_hits",
+    "llm_cache_misses",
+    # Prompt-cache head warms issued on socket attach (app/agent/cache_warm).
+    # A warm that never lands still counts here — read it next to
+    # `cached=` on the [PERF] cache_warm line, which says whether it did.
+    "llm_cache_warms",
 )
 
 _LOCK = threading.Lock()

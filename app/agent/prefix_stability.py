@@ -124,11 +124,21 @@ def render_time_lines(
     """The three places wall-clock time is surfaced to the model.
 
     Legacy (stable=False) keeps minute resolution inside the system
-    prompt (the F-1 cache-buster). Stable layout keeps only day-stable
-    text in the system prompt and moves the minute clock AND the coarse
-    time-of-day word to the per-turn context message — the tod word
-    flips at 5/12/17/22 local, which was the last scheduled intra-day
-    prefix bust (W1.1).
+    prompt (the F-1 cache-buster). Stable layout keeps NO wall-clock text
+    in the system prompt at all: the minute clock, the coarse time-of-day
+    word AND the calendar date all ride the per-turn context message.
+
+    R44: the date was the last one left. W1.1 moved the tod word out
+    because it flipped 3-4x/day, and left `Today's date:` in the system
+    prompt as "allowed to roll daily" — but daily is once per user per
+    local midnight, and measured 2026-09-13/14 that was 17/17 of the
+    first-message-of-a-day cache misses, each costing ttft p50 5,586 ms
+    against a hit's 2,611 ms on a ~40,192-token head. It also meant a
+    connect-time warm could not replay a head across midnight, and that
+    the channel-prefix goldens had to be regenerated every calendar day
+    to stay green. The date sentence moves VERBATIM to `turn_context`, so
+    the model reads the same words in the same order; only the block it
+    arrives in changes.
 
     Returns keys: ``about_you`` (about_you section time line),
     ``runtime`` (runtime section date/time line), ``turn_context``
@@ -158,13 +168,25 @@ def render_time_lines(
             "subtly — late at night, be quieter and lower-energy; morning, be "
             "fresh. Don't announce the time of day; just feel it."
         ),
+        # R44: no date here either. Everything wall-clock is now one
+        # block, and this line is the pointer to it.
         "runtime": (
-            f"- Today's date: {now_local.strftime('%A, %B %d, %Y')} ({tz_name}). "
-            "The exact current time arrives in the <turn_context> block each turn."
+            "- Today's date and the exact current time arrive in the "
+            "<turn_context> block each turn."
         ),
+        # ONE LINE, and it must keep starting with "Current time:".
+        # `test_subagent_context_isolation` asserts that every non-blank line
+        # of a SUBAGENT's <turn_context> body starts with that prefix — the
+        # structural form of "a child sees its own clock and nothing of its
+        # parent's state". A second line, however innocent, reads as parent
+        # state leaking into an isolated child, so the date rides the same
+        # line rather than under it. Both sentences are verbatim: the clock
+        # clause is the string this key has always returned, and the date
+        # clause is the one that used to head the runtime section.
         "turn_context": (
             f"Current time: {now_local.strftime('%-I:%M %p')} ({tz_name}) "
-            f"— {time_of_day} for them"
+            f"— {time_of_day} for them. "
+            f"Today's date: {now_local.strftime('%A, %B %d, %Y')} ({tz_name})."
         ),
     }
 

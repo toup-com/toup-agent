@@ -418,6 +418,59 @@ def _embedding_cost_cents(total_tokens: int) -> Decimal:
 #: Header the agent uses to report which surface a turn came from.
 CHANNEL_HEADER = "x-toup-channel"
 
+#: R44 — the agent tags platform overhead (a prompt-cache warm) so it is not
+#: billed to the user. `_log_event` already exempts any operation_type
+#: starting with "system." from BOTH the credit charge and `_get_spend`, so
+#: this header reaches straight into the money path and is the one place a
+#: caller could try to exempt its own traffic.
+OPERATION_TYPE_HEADER = "x-toup-operation-type"
+
+#: An ALLOWLIST, not a "system.*" prefix test. The prefix alone would let any
+#: holder of an agent key invent `system.whatever` and stop paying for chat;
+#: a closed set means adding an exemption is a platform change, reviewed here.
+_ALLOWED_SYSTEM_OPERATIONS = frozenset({"system.cache_warm"})
+
+
+def _system_operation_for(raw: Optional[str], body: dict) -> Optional[str]:
+    """The operation_type to record, or None (→ user-attributable).
+
+    Two gates, because the header is client-supplied and lands on the billing
+    decision. The value must be one we issue, AND the request must still LOOK
+    like the operation it claims to be: a cache warm asks for at most a
+    handful of output tokens, forbids tool calls and sends a single input
+    item. A chat turn dressed in this header fails the shape test and is
+    billed normally, so the worst a leaked agent key buys is a free 16-token
+    completion — not free chat.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    if value not in _ALLOWED_SYSTEM_OPERATIONS:
+        logger.warning(
+            "[LLM-PROXY] rejected unknown operation_type header %r — billing "
+            "as a user request", value[:64],
+        )
+        return None
+    if value == "system.cache_warm":
+        try:
+            max_out = int(body.get("max_output_tokens") or 0)
+            items = body.get("input")
+            shape_ok = (
+                0 < max_out <= 32
+                and body.get("tool_choice") == "none"
+                and isinstance(items, list)
+                and len(items) == 1
+            )
+        except Exception:  # noqa: BLE001 — a malformed body is not a warm
+            shape_ok = False
+        if not shape_ok:
+            logger.warning(
+                "[LLM-PROXY] operation_type=%s claimed on a request that is "
+                "not shaped like a warm — billing as a user request", value,
+            )
+            return None
+    return value
+
 
 #: Hard ceiling matching llm_proxy_events.channel VARCHAR(20). A value longer
 #: than the column would raise on INSERT — inside the metering write that runs
@@ -1824,6 +1877,12 @@ async def proxy_responses(
     _enforce_rate_limit(config)
     req_channel = _sanitize_channel(request.headers.get(CHANNEL_HEADER))
     body = await request.json()
+    # R44: platform overhead (a prompt-cache warm) is logged for cost
+    # tracking but never charged and never counted against the user's cap —
+    # `_log_event` and `_get_spend` both key that off "system.".
+    req_operation = _system_operation_for(
+        request.headers.get(OPERATION_TYPE_HEADER), body,
+    )
     requested_model = body.get("model")
     # No claude-* default here — this endpoint is OpenAI-only, and letting
     # _route_chat's unknown-prefix→Anthropic default apply would route a
@@ -1932,6 +1991,7 @@ async def proxy_responses(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
                 channel=req_channel,
+                operation_type=req_operation,
             )
             logger.warning(
                 "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
@@ -1988,6 +2048,7 @@ async def proxy_responses(
                             cached_tokens=cached,
                             cache_write_tokens=cache_write,
                             channel=req_channel,
+                            operation_type=req_operation,
                         )
 
                 try:
@@ -2015,6 +2076,7 @@ async def proxy_responses(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, latency, False, "error",
                 channel=req_channel,
+                operation_type=req_operation,
             )
             raise HTTPException(502, f"Provider error: {e}")
         if resp.status_code >= 400:
@@ -2023,6 +2085,7 @@ async def proxy_responses(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
                 channel=req_channel,
+                operation_type=req_operation,
             )
             try:
                 detail = body_bytes.decode("utf-8", errors="replace")
@@ -2062,6 +2125,7 @@ async def proxy_responses(
             cached_tokens=cached,
             cache_write_tokens=cache_write,
             channel=req_channel,
+            operation_type=req_operation,
         )
 
         from fastapi.responses import JSONResponse

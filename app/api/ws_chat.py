@@ -3219,6 +3219,18 @@ async def ws_chat(
 
         logger.info(f"[WS] Authenticated user: {user_id}")
 
+        # R44: pay for the ~40k-token prompt-cache head while the user is
+        # still typing. Fire-and-forget and self-gating (idle window, min
+        # gap, denied channels, a recorded head to replay) — it returns
+        # before any I/O and never raises, so it cannot delay or fail this
+        # connection. No channel is passed: this socket does not know one at
+        # accept time (it arrives per message) and the browser extension dials
+        # the same endpoint, so a literal here would be a guess that silently
+        # disabled the warm's own deny list. It derives the channel from the
+        # user's last real turn instead.
+        from app.agent.cache_warm import schedule_warm as _schedule_warm
+        _schedule_warm(user_id)
+
         # Phase A/B: track this WS in the drain coordinator. Decremented
         # in the finally below. The increment happens here (post-auth)
         # rather than at accept-time so failed auth doesn't pin the

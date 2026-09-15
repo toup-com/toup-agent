@@ -12,10 +12,12 @@ reintroduce a prefix-buster:
   * ``build_allowed_tools_choice`` — matches the OpenAI SDK
     ``ChatCompletionAllowedToolChoiceParam`` shape and is deterministic
     for identical name sets.
-  * ``render_time_lines`` — the stable layout emits NO minute-resolution
-    text AND no time-of-day word into the system prompt (two calls a
-    minute apart — or straddling a 5/12/17/22 tod boundary — are
-    byte-identical); legacy keeps the old behavior byte-for-byte.
+  * ``render_time_lines`` — the stable layout emits NO wall-clock text of
+    any resolution into the system prompt: not the minute, not the
+    time-of-day word, and since R44 not the DATE either (two calls a
+    minute apart, straddling a 5/12/17/22 tod boundary, or straddling
+    local midnight are all byte-identical); legacy keeps the old behavior
+    byte-for-byte.
   * ``build_turn_context_message`` — single ephemeral user message with
     the injection-fencing envelope; empty parts → no message.
   * ``settings.stable_prefix_layout`` defaults ON since 2026-08-05 —
@@ -160,10 +162,52 @@ class TestRenderTimeLines:
         assert "morning" in before["turn_context"]
         assert "afternoon" in after["turn_context"]
 
-    def test_stable_runtime_line_changes_at_day_boundary(self):
+    def test_stable_system_lines_survive_local_midnight(self):
+        """R44 — inverted on purpose. This used to assert the runtime line
+        CHANGED at the day boundary ("date is allowed to roll daily"), and
+        daily is once per user per local midnight: measured 2026-09-13/14,
+        that line was 17/17 of the first-message-of-a-day cache misses on a
+        ~40,192-token head, at ttft p50 5,586 ms vs a hit's 2,611 ms."""
         a = render_time_lines(self.T1, "UTC", "afternoon", stable=True)
         c = render_time_lines(self.NEXT_DAY, "UTC", "morning", stable=True)
-        assert a["runtime"] != c["runtime"]  # date is allowed to roll daily
+        assert a["runtime"] == c["runtime"]
+        assert a["about_you"] == c["about_you"]
+        # The date still reaches the model — in the per-turn block, and it
+        # is the only thing in these lines that may differ across midnight.
+        assert a["turn_context"] != c["turn_context"]
+
+    def test_the_clock_part_is_one_line_starting_with_the_clock(self):
+        """Caught by CI on 5aff2b98, pinned here so the next one is caught
+        locally. `test_subagent_context_isolation` asserts that EVERY
+        non-blank line of a SUBAGENT's <turn_context> body starts with
+        "Current time:" — that is the structural form of "a child sees its
+        own clock and nothing of its parent's state". Putting the date on a
+        second line made an isolated child look like it was leaking parent
+        state, so the date rides the same line."""
+        for stable in (True,):
+            lines = render_time_lines(
+                self.T1, "Europe/Berlin", "afternoon", stable=stable,
+            )
+            body = lines["turn_context"]
+            rendered = [ln for ln in body.splitlines() if ln.strip()]
+            assert len(rendered) == 1, (
+                f"the clock part must be ONE line, got {rendered}"
+            )
+            assert rendered[0].startswith("Current time:")
+
+    def test_the_date_reaches_the_model_exactly_once_and_verbatim(self):
+        """The sentence must be the one the model reads today, moved — not
+        reworded. A behaviour change smuggled in behind a cache fix is the
+        expensive kind of regression, because nothing fails."""
+        lines = render_time_lines(self.T1, "Europe/Berlin", "afternoon", stable=True)
+        sentence = "Today's date: Thursday, July 23, 2026 (Europe/Berlin)."
+        assert sentence in lines["turn_context"]
+        whole = " ".join(
+            (lines["about_you"], lines["runtime"], lines["turn_context"])
+        )
+        assert whole.count("Today's date: Thursday") == 1
+        assert "July 23, 2026" not in lines["runtime"]
+        assert "July 23, 2026" not in lines["about_you"]
 
     def test_legacy_lines_byte_identical_regression(self):
         """W1.1 guardrail: the legacy (flag-off) path must not move a
@@ -719,9 +763,17 @@ class TestHeadHashes:
         assert len(a) == len(b) == len(c) == 8
 
     def test_runner_logs_prefix_head_before_stream(self):
-        assert '"[PERF] prefix_head tools=%s sys=%s hist=%s n_hist=%d"' in _SRC
+        # R44 added hist0 — history[0] alone. `hist` covers the whole list and
+        # so moves on every append; only hist0 can answer whether the FIRST
+        # input item (the one right after instructions+tools) changed, which
+        # is the single question a pinned cache_read raises.
+        assert (
+            '"[PERF] prefix_head tools=%s sys=%s hist=%s hist0=%s n_hist=%d"'
+            in _SRC
+        )
         # hashed from `history` (pre-tail), not `messages`
         assert "head_hashes(\n                current_tools, system_prompt, history\n            )" in _SRC
+        assert "head_hashes([], \"\", history[:1])" in _SRC
 
 
 # ── W2.3a — channel convergence ────────────────────────────────────────
