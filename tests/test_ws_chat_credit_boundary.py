@@ -60,9 +60,21 @@ def test_detail_extractor_reads_json_and_repr_and_rejects_garbage():
 
 
 def test_cold_state_falls_back_to_remote_preflight_in_order():
+    """Layer 2 (warm in-process state) is consulted before layer 3 (a round
+    trip to the platform), because the cheap answer is usually the right one.
+
+    The slice is to the END of the source after the anchor, not a fixed
+    character window. A window was a false regression waiting to happen: both
+    symbols appear exactly once in this file, so the only thing a window adds
+    is a failure when an unrelated guard is inserted between the anchor and
+    them — which is what happened when the rate-limited branch landed.
+    """
     import inspect
     from app.api import ws_chat
     src = inspect.getsource(ws_chat)
-    block = src.split('_extract_out_of_credits_detail(str(e))')[1][:1200]
+    assert src.count('build_exhausted_response()') == 2, (
+        "this probe assumes the layer-2/3 pair is the only use in the file"
+    )
+    block = src.split('_extract_out_of_credits_detail(str(e))')[1]
     assert block.index('build_exhausted_response()') < block.index('check_balance_remote')
     assert 'check_balance_remote(user_id=user_id)' in block

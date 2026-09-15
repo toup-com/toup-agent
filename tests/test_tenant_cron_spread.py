@@ -175,3 +175,74 @@ def test_a_missed_run_is_no_longer_dropped_on_the_floor():
     assert at > 0
     tail = src[at:at + 800]
     assert "misfire_grace_time" in tail
+
+
+# ── The seam the tests above do not cross: the RESOLVED fire instant ──────
+#
+# Everything above asserts on `cron_slot_seconds` and on the trigger's own
+# minute/second fields. What actually stampedes pgbouncer is APScheduler
+# computing the same *instant* for every container, so these two go through
+# `CronTrigger.get_next_fire_time` — the call the scheduler itself makes — and
+# measure the fleet the way Loki measured it during the incident.
+#
+# Fleet of record, 2026-09-13: 96 agent containers, 86 pool slots
+# (`toup_agent_feedNNNN`) plus named tenants (`toup_agent_<prefix>`).
+REAL_FLEET = [f"toup_agent_feed{n:04d}" for n in range(1, 87)] + [
+    f"toup_agent_{p}"
+    for p in (
+        "f261b564", "aa146569", "3703be10", "d65fb8a4", "dccbbb27",
+        "e5ec1759", "51d4ed2f", "667cf3de", "533354ce", "ed6507c4",
+    )
+]
+
+
+def _next_fires(job_id: str, identities) -> list:
+    from datetime import datetime
+
+    try:  # APScheduler 3 wants a tz-aware `now`; its own timezone util is safest
+        from apscheduler.util import astimezone
+        tz = astimezone("UTC")
+    except Exception:  # pragma: no cover - APScheduler 4
+        from datetime import timezone as _tz
+        tz = _tz.utc
+    now = datetime(2026, 9, 13, 10, 30, 0, tzinfo=tz)
+    return [
+        st.spread_hourly_cron(job_id, identity=i).get_next_fire_time(None, now)
+        for i in identities
+    ]
+
+
+def test_two_tenants_do_not_resolve_to_the_identical_next_fire_instant():
+    """The direct assertion, on the real fleet, for both hourly jobs.
+
+    Pre-fix this was 96 identical instants per job — Loki caught 96 containers
+    running `day_archival` inside 12.7 s at 13:00 on 2026-09-13, and minute :00
+    alone carried 18.7 % of all PostgreSQL connection-slot exhaustion.
+    """
+    from collections import Counter
+
+    for job in ("day_archival", "current_context_rollover"):
+        fires = _next_fires(job, REAL_FLEET)
+        assert None not in fires, f"{job}: a trigger resolved to no next fire"
+        worst = Counter(fires).most_common(1)[0][1]
+        assert worst <= 3, (
+            f"{job}: {worst} of {len(REAL_FLEET)} tenants fire on the SAME "
+            f"instant (pre-fix this was all {len(REAL_FLEET)})"
+        )
+        # And the burst window Loki measured must be gone, not merely thinned.
+        secs = sorted(f.timestamp() for f in fires)
+        in_window = max(sum(1 for x in secs if a <= x < a + 13) for a in secs)
+        assert in_window <= 6, (
+            f"{job}: {in_window} tenants inside one 13 s window — the incident "
+            f"measured 96 in 12.7 s"
+        )
+
+
+def test_one_tenants_two_hourly_jobs_do_not_resolve_to_the_same_instant():
+    """The job-id salt, asserted through the trigger rather than the hash: a
+    tenant whose two hourly jobs stacked would open both sets of connections
+    at once, which is the fleet-wide problem in miniature."""
+    a = _next_fires("day_archival", REAL_FLEET)
+    b = _next_fires("current_context_rollover", REAL_FLEET)
+    collisions = sum(1 for x, y in zip(a, b) if x == y)
+    assert collisions == 0, f"{collisions} tenants stack their two hourly jobs"

@@ -162,11 +162,20 @@ async def supervisor_loop() -> None:
         "[bridge-supervisor] started: interval=%ds timeout=%ds fails_before_alarm=%d",
         BRIDGE_PROBE_INTERVAL_S, BRIDGE_PROBE_TIMEOUT_S, BRIDGE_FAILS_BEFORE_ALARM,
     )
+    # LEADER-GATED (2026-09-12, L3-18). The bridge is a SINGLE process, and
+    # `_state` here is per-process, so two replicas watching it produce two
+    # CRITICALs and two recovery transitions for one event — a duplicate page
+    # with no extra information. This loop never mutates infra, so the gate
+    # costs nothing but the duplicate: the lease holder still probes every
+    # 60 s, and a dead holder is replaced within one TTL.
+    from app.services.infra_lease import acquire_lease, lease_ttl_for
+    _ttl = lease_ttl_for(BRIDGE_PROBE_INTERVAL_S)
     # Stagger first probe so platform startup isn't blocked.
     await asyncio.sleep(10)
     while True:
         try:
-            await _supervisor_tick()
+            if await acquire_lease("bridge_supervisor", ttl_s=_ttl):
+                await _supervisor_tick()
         except asyncio.CancelledError:
             logger.info("[bridge-supervisor] stopped")
             raise

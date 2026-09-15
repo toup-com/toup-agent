@@ -211,6 +211,18 @@ def render_day_history(
     lines = [day_history_header(len(rows), day_date, local_today)]
     for role, content, channel in rows:
         content = (content or "").strip()
+        if role == "assistant" and content:
+            # Same assistant-only strip as day_context_loader / recall_day /
+            # public_text: a persisted `[mobile 9:41pm] …` prefix must not be
+            # re-taught to the voice model as its own words. The CONTENT is
+            # stripped; the `You [channel]:` line shape stays byte-identical
+            # with the relay's copy.
+            try:
+                from app.agent.channel_annotations import strip_leaked_tags
+
+                content = strip_leaked_tags(content)[0].strip()
+            except Exception:  # noqa: BLE001
+                pass
         if role in ("user", "assistant") and content:
             speaker = "User" if role == "user" else "You"
             ch = f" [{channel}]" if channel else ""
@@ -423,7 +435,7 @@ async def _load_user_timezone(db: AsyncSession, user_id: str) -> Optional[str]:
         return None
 
 
-async def _load_newest_day(db: AsyncSession, user_id: str):
+async def _load_newest_day(db: AsyncSession, user_id: str, tz_name: Optional[str] = None):
     """(newest DayChat row | None, message rows) — the relay's day feed.
 
     Mirrors the exact query behind `GET /api/day-chats/{date}/messages`
@@ -431,30 +443,68 @@ async def _load_newest_day(db: AsyncSession, user_id: str):
     hands the relay): join for the conversation channel, hide historical
     raw autopilot rows, chronological, capped at DAY_MESSAGES_LIMIT, and
     `channel or "web"` exactly as the endpoint serializes it.
+
+    "Newest" means newest that has HAPPENED. A day whose local_date is in
+    the future cannot be the relay's feed — a mis-bucketed row (the
+    2026-09-14 incident) would otherwise hijack the whole day block on an
+    unrelated surface. The clamp needs the user's zone; with no zone, or
+    when the clamp finds nothing, fall back to the unclamped pick so a
+    tz-less user keeps exactly today's behaviour.
     """
     from app.db.models import Conversation, Message
     from app.db.models.day_chat import DayChat
 
-    newest = (await db.execute(
-        select(DayChat)
-        .where(DayChat.user_id == user_id)
-        .order_by(DayChat.local_date.desc())
-        .limit(1)
-    )).scalar_one_or_none()
+    import zoneinfo
+
+    newest = None
+    local_today = None
+    if tz_name:
+        try:
+            local_today = datetime.now(zoneinfo.ZoneInfo(tz_name)).date()
+        except Exception:
+            local_today = None
+    if local_today is not None:
+        newest = (await db.execute(
+            select(DayChat)
+            .where(DayChat.user_id == user_id, DayChat.local_date <= local_today)
+            .order_by(DayChat.local_date.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        # The zone is known and every day the user has is in their future:
+        # that is a tenant whose ONLY rows are mis-bucketed, and handing the
+        # voice model one of them is the hijack the clamp exists to prevent.
+        # An empty feed is the honest answer until the heal runs.
+        if newest is None:
+            return None, []
+    else:
+        newest = (await db.execute(
+            select(DayChat)
+            .where(DayChat.user_id == user_id)
+            .order_by(DayChat.local_date.desc())
+            .limit(1)
+        )).scalar_one_or_none()
     if newest is None:
         return None, []
 
+    # Message-first channel and the `(created_at, id)` tiebreaker — the same
+    # two rules the day route applies (day_chats._row_channel and its
+    # ordering), so a WhatsApp turn sharing a Conversation with a mobile
+    # turn is labelled by its own row and two same-millisecond rows are
+    # handed to the voice model in the order the chat client shows them.
     result = await db.execute(
-        select(Message.role, Message.content, Conversation.channel)
+        select(Message.role, Message.content, Message.channel, Conversation.channel)
         .join(Conversation, Message.conversation_id == Conversation.id)
         .where(
             Message.day_chat_id == newest.id,
             Conversation.channel != "autopilot",
         )
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.asc(), Message.id.asc())
         .limit(DAY_MESSAGES_LIMIT)
     )
-    rows = [(role, content, channel or "web") for role, content, channel in result.all()]
+    rows = [
+        (role, content, (msg_channel or conv_channel or "web"))
+        for role, content, msg_channel, conv_channel in result.all()
+    ]
     return newest, rows
 
 
@@ -626,7 +676,7 @@ async def build_voice_context(
 
         from app.config import settings as _settings
 
-        newest, rows = await _load_newest_day(db, user_id)
+        newest, rows = await _load_newest_day(db, user_id, tz_effective)
         if newest is not None and newest.local_date is not None:
             day_date = newest.local_date.isoformat()
         local_today = None

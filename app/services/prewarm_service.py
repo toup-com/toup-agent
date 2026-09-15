@@ -259,6 +259,22 @@ async def _run_prewarm(user_id: str) -> None:
         # the DB connection idle while we wait on network I/O.
         await _await_boot_ready(user_id, agent_url, agent_api_key)
     except Exception as e:
+        from app.services.docker_host_service import PoolMemberSwapRefused
+        if isinstance(e, PoolMemberSwapRefused):
+            # D-2: a pool member in error/stopped status reached the named
+            # path. The swap is silent data loss and was refused — this is not
+            # a failed provision, the pool slot's DB is intact. Log without a
+            # traceback and let discovery re-adopt / restart the member in
+            # place. (This path is normally unreachable because schedule_prewarm
+            # stamps status='provisioning' first, but the refusal is caught here
+            # too so a change upstream can never turn it into a 500 or a swap.)
+            logger.warning(
+                "[PREWARM] user=%s pool-member swap refused (%r) — data intact; "
+                "deferring to discovery", str(user_id)[:8], e,
+            )
+            _pool.signup_trace(user_id, "pool_swap_refused", "prewarm")
+            _pool.ensure_discovery(user_id, reason="pool_swap_refused")
+            return
         # `%s` on an httpx timeout is the EMPTY STRING — that is how the
         # 2026-09-06 trail came to read "task failed: bridge unreachable: "
         # and name nothing. `%r` carries the class.
@@ -326,6 +342,49 @@ async def _await_boot_ready(
     )
 
 
+# user prefix -> monotonic clock of the last logged probe miss. The readiness
+# poll runs every ~2 s for 30 s, so an unconditional log would be 15 lines per
+# user per heal attempt; one line per user per window keeps the signal and
+# bounds the noise. Bounded dict — this is a log convenience, never truth.
+_PROBE_MISS_LOGGED: dict = {}
+_PROBE_MISS_LOG_INTERVAL_S = 10.0
+
+
+def _log_probe_miss(
+    user_id: str, agent_url, *, status: int | None = None,
+    body: str = "", exc: str | None = None,
+) -> None:
+    """Record WHY the readiness probe said no. Rate-limited per user.
+
+    Never raises, and never logs a credential: `agent_url` is a public
+    hostname and the body prefix is whatever the proxy in front of the tenant
+    answered (a Caddy "Unknown tenant", a 502 page), which is exactly the
+    thing that had to be reconstructed from unrelated log lines on 12 Sep.
+    """
+    try:
+        import time as _time
+        key = str(user_id)[:8]
+        now = _time.monotonic()
+        last = _PROBE_MISS_LOGGED.get(key, -1e9)
+        if now - last < _PROBE_MISS_LOG_INTERVAL_S:
+            return
+        _PROBE_MISS_LOGGED[key] = now
+        if len(_PROBE_MISS_LOGGED) > 2000:
+            _PROBE_MISS_LOGGED.clear()
+        host = ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(str(agent_url or "")).netloc or str(agent_url or "")
+        except Exception:  # noqa: BLE001
+            host = str(agent_url or "")
+        logger.info(
+            "[PREWARM-HEALTH] user=%s host=%s status=%s exc=%s body=%r",
+            key, host, status, exc, (body or "")[:60],
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _is_agent_actually_healthy(user_id: str) -> bool:
     """Return True iff the agent's `/agent/health` reports
     `boot_progress.ready=true`. Fail-soft on any error — caller should
@@ -333,6 +392,7 @@ async def _is_agent_actually_healthy(user_id: str) -> bool:
     Uses the agent_url + agent_api_key already written by an earlier
     successful provision (we only get here after status was once set
     to 'provisioning', meaning provision_container at least started)."""
+    agent_url = None
     try:
         async with async_session_maker() as db:
             agent_config = (
@@ -349,6 +409,20 @@ async def _is_agent_actually_healthy(user_id: str) -> bool:
         async with _httpx.AsyncClient(timeout=4) as client:
             resp = await client.get(f"{agent_url}/agent/health", headers=headers)
             if resp.status_code != 200:
+                # THE missing log line (L10 §5h). This predicate decided the
+                # 30 s readiness window that escalated f261b564 to the named
+                # fallback, and it collapsed TLS-not-ready, 404-no-route,
+                # 502-upstream-dead and not-bound into one silent `False`. The
+                # entire cost of that investigation traces to its absence: the
+                # only surviving evidence that the route was 404ing was an
+                # unrelated soul-sync line. A host, a status and 60 characters
+                # of body separate "no route" (an ownership bug) from "dead
+                # upstream" (a boot race) at a glance.
+                _log_probe_miss(
+                    user_id, agent_url,
+                    status=resp.status_code,
+                    body=(resp.text or "")[:60],
+                )
                 return False
             data = resp.json()
             boot = data.get("boot_progress", {}) or {}
@@ -368,6 +442,7 @@ async def _is_agent_actually_healthy(user_id: str) -> bool:
                     return False
             return True
     except Exception as e:
+        _log_probe_miss(user_id, agent_url, exc=type(e).__name__)
         logger.info(
             "[PREWARM-RECONCILER] user=%s health-check failed (will re-fire): %s",
             str(user_id)[:8], e,

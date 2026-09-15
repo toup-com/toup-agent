@@ -214,6 +214,13 @@ async def load_day_context(
     annotated_messages: List[Dict[str, Any]] = []
 
     from app.agent.channel_util import resolve_channel
+    from app.agent.channel_annotations import strip_leaked_tags
+    # Rows already in the DB that START with the system's own annotation tag
+    # are what TEACH the model the pattern: leave them in and the output
+    # sanitizers fight a prompt that keeps demonstrating the format. Stripped
+    # BEFORE annotate_message below, so the tag the system adds and the tag
+    # the model copied stay distinguishable.
+    _leak_n = 0
     for msg, conv_channel in rows:
         if msg.role not in ("user", "assistant"):
             continue
@@ -222,6 +229,12 @@ async def load_day_context(
         # so the LLM sees the threading link instead of two unrelated
         # turns. UI side reads the structured reply_to_message_id column.
         _content = msg.content
+        if msg.role == "assistant":
+            # ASSISTANT ONLY. A user may legitimately have pasted such a
+            # string, and deleting their words is worse than the leak.
+            _content, _lk = strip_leaked_tags(_content or "")
+            if _lk:
+                _leak_n += 1
         _rt_id = getattr(msg, "reply_to_message_id", None)
         if _rt_id and _rt_id in _reply_targets:
             try:
@@ -250,6 +263,12 @@ async def load_day_context(
         )
         annotated_content = annotate_message(_content, _msg_channel, msg.created_at, tz_name=tz_name)
         annotated_messages.append({"role": msg.role, "content": annotated_content})
+
+    if _leak_n:
+        logger.info(
+            "[day_ctx] leaked_tags_stripped n=%d day_chat_id=%s",
+            _leak_n, (day_chat_id or "")[:8],
+        )
 
     # Estimate total tokens
     total_tokens = sum(_estimate_tokens(m["content"]) for m in annotated_messages)

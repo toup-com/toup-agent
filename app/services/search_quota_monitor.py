@@ -319,11 +319,17 @@ async def search_quota_monitor_loop() -> None:
     """Forever loop; start via asyncio.create_task in the lifespan."""
     interval = max(300, int(_cfg("search_quota_check_interval_s", 3600)))
     logger.info("[search-quota] monitor started (interval=%ss)", interval)
+    # LEADER-GATED (2026-09-12, L3-6). This module's own docstring at the top
+    # of the file names the duplicate-alert-per-replica flaw; this is the fix.
+    from app.services.infra_lease import acquire_lease, lease_ttl_for
+    _ttl = lease_ttl_for(interval)
     while True:
         try:
             # Sleep first: at boot the window holds whatever this replica's
             # predecessor left behind, and a deploy is the worst moment to page.
             await asyncio.sleep(interval)
+            if not await acquire_lease("search_quota_monitor", ttl_s=_ttl):
+                continue
             await check_search_quota()
         except asyncio.CancelledError:
             raise

@@ -38,6 +38,14 @@ def _mark_tools_cacheable(tools: Optional[List[Dict[str, Any]]]) -> Optional[Lis
     return marked
 
 
+_TURN_CONTEXT_OPEN = "<turn_context>"
+_RUNTIME_ENVELOPE_OPEN = "<runtime_envelope>"
+# Imported lazily-by-value rather than from source_conflict at module scope:
+# this service must stay importable in a platform process that does not ship
+# the agent package.
+_TURN_RULES_OPEN = "<turn_rules>"
+
+
 def _mark_messages_cacheable(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -54,29 +62,47 @@ def _mark_messages_cacheable(
     image content for some models, but for our agent loop the last message
     is always either user text or a tool_result with text — both supported.
 
-    PR-1 stable layout: the runner may append a per-turn ``<turn_context>``
-    message (volatile clock/memory/day blocks) between history and the
-    current user message. Its bytes differ every turn and it is never
-    persisted, so a breakpoint at the very end would cover a span that can
-    never re-match — every turn would re-WRITE the whole day history
-    (1.25x) and never read it back. Place the breakpoint on the last
-    message BEFORE the first trailing turn-context/user pair instead, so
-    the append-only history span stays cacheable and the volatile tail
-    sits after the breakpoint.
+    PR-1 stable layout: the runner may append per-turn volatile messages
+    (``<turn_context>``, the source-conflict ``<turn_rules>``, and the
+    ``<runtime_envelope>``) between history and the current user message.
+    Their bytes differ every turn and none is persisted, so a breakpoint at
+    the very end would cover a span that can never re-match — every turn
+    would re-WRITE the whole day history (1.25x) and never read it back.
+    Place the breakpoint on the last message BEFORE the volatile tail
+    instead, so the append-only history span stays cacheable.
+
+    The probe used to look only at -2 and -1, which was already wrong
+    whenever source_conflict fired (tail = history, turn_context, rules,
+    user → turn_context sits at -3, the probe misses it, and the breakpoint
+    lands on the current user message). The runtime envelope makes that
+    4-long tail universal, so this is a backwards SCAN over the trailing
+    volatile block rather than two fixed offsets.
     """
     if not messages:
         return messages
     out = [dict(m) for m in messages]
-    # Find a trailing <turn_context> message (at -1 or -2 — the runner puts
-    # it immediately before the current user message). Mark the message
-    # preceding it so the cached span ends at end-of-history.
     mark_idx = len(out) - 1
-    for probe in (len(out) - 2, len(out) - 1):
-        if probe >= 1:
-            c = out[probe].get("content")
-            if isinstance(c, str) and c.startswith("<turn_context>"):
-                mark_idx = probe - 1
-                break
+    # At most 4: turn_context + rules + envelope + the current user message.
+    # Bounded so a history row that happens to start with one of these
+    # sentinels cannot walk the breakpoint backwards through the day.
+    _volatile = (_TURN_CONTEXT_OPEN, _RUNTIME_ENVELOPE_OPEN, _TURN_RULES_OPEN)
+    last_volatile = None
+    # At most 5 probes: the current user message plus up to 4 volatile
+    # blocks. Bounded so a HISTORY row that happens to open with one of
+    # these sentinels cannot walk the breakpoint backwards through the day.
+    for probe in range(len(out) - 1, max(len(out) - 6, -1), -1):
+        c = out[probe].get("content")
+        if isinstance(c, str) and c.startswith(_volatile):
+            last_volatile = probe
+            continue
+        if probe == len(out) - 1:
+            # The current user message is always part of the tail; the
+            # volatile blocks sit immediately before it.
+            continue
+        # First non-volatile message before the tail: end of history.
+        break
+    if last_volatile is not None and last_volatile >= 1:
+        mark_idx = last_volatile - 1
     last = dict(out[mark_idx])
     content = last.get("content")
     if isinstance(content, str):
@@ -290,8 +316,8 @@ class AnthropicService:
         max_tokens = max_tokens or self.default_max_tokens
         # Pre-flight: gate on the last known credit state. See
         # services/credit_reporter.py for the rationale.
-        from app.services.credit_reporter import raise_if_exhausted
-        raise_if_exhausted()
+        from app.services.credit_reporter import raise_if_exhausted_async
+        await raise_if_exhausted_async()
 
         messages = _convert_messages_for_anthropic(messages)
         # TKT-LAT-001: mark the final message block cacheable so the
@@ -449,8 +475,8 @@ class AnthropicService:
         max_tokens = max_tokens or self.default_max_tokens
 
         # Pre-flight: gate on the last known credit state.
-        from app.services.credit_reporter import raise_if_exhausted
-        raise_if_exhausted()
+        from app.services.credit_reporter import raise_if_exhausted_async
+        await raise_if_exhausted_async()
 
         messages = _convert_messages_for_anthropic(messages)
         # TKT-LAT-001: mark the final message block cacheable so the

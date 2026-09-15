@@ -14,7 +14,8 @@ from typing import Optional
 import uuid
 
 from sqlalchemy import (
-    String, Integer, Boolean, DateTime, Numeric, ForeignKey, Index, JSON,
+    String, Integer, Boolean, DateTime, Numeric, ForeignKey, Index, JSON, Text,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -217,6 +218,28 @@ class AppleSubscription(Base):
     auto_renew_product_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     environment: Mapped[str] = mapped_column(String(16), nullable=False)  # Production | Sandbox
     last_notification_uuid: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # ── Grandfather (alembic 104) ────────────────────────────────────────
+    # Set by app.scripts.grandfather_unlimited on the legacy Apple payers who
+    # keep the Unlimited entitlement at their old price. Read by exactly one
+    # function, apple_iap_service.plan_for_subscription().
+    #
+    # It lives HERE and not in APPLE_SUB_PRODUCT_TO_PLAN because
+    # grandfathering is a property of a SUBSCRIPTION — of three specific
+    # original_transaction_ids — not of a product. Overloading the product
+    # map would hand Unlimited to every future holder of a legacy product id,
+    # permanently, un-revocably and with no record of why; and because the
+    # four legacy products must stay on sale in App Store Connect (removing
+    # them stops renewals, and EXPIRED downgrades), it would also let an
+    # Unlimited subscriber cross-grade down to $9.90 Starter from iOS
+    # Settings and keep Unlimited at half price.
+    grandfathered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # The product held AT THE MOMENT of the grandfather. READ by
+    # plan_for_subscription: the grandfather applies to THIS product and no
+    # other, so a cross-grade inside the subscription group (same
+    # original_transaction_id, so nothing else in the system disagrees)
+    # forfeits it rather than carrying Unlimited onto a cheaper tier. NULL
+    # counts as a match, so a hand-stamped or pre-104 row is never demoted.
+    grandfathered_product_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
@@ -225,4 +248,110 @@ class AppleSubscription(Base):
     __table_args__ = (
         Index("uq_apple_sub_orig_txn", "original_transaction_id", unique=True),
         Index("ix_apple_sub_user", "user_id"),
+    )
+
+
+# ── The admin override ────────────────────────────────────────────────
+
+SPONSOR_KIND_APPLE = "apple"
+SPONSOR_KIND_STRIPE = "stripe"
+
+
+class UnlimitedGrant(Base):
+    """An operator-issued UNLIMITED entitlement, linked to a paying sponsor.
+
+    The case this exists for: a paying subscriber has a second account (a
+    family member, a work address) that should ride on their subscription.
+    The founder's framing was "reuse the tagging mechanism" — there is no
+    tagging mechanism. ``users.role`` is a single-valued String(20) with two
+    production values, and ``role == 'admin'`` is the EXACT string
+    ``require_admin`` tests (``app/api/admin/deps.py``). Setting it on a
+    customer would hand them broadcast dispatch, fleet rollouts, other users'
+    data audits, invites, role changes and account deletion — and it would
+    *work* as an entitlement (``_is_unlimited_user`` is the same test), which
+    is precisely what would let the mistake live long enough to matter.
+
+    Three properties the table is shaped around:
+
+    **A grant is always sponsor-linked.** There is no unsponsored "comp"
+    kind, on purpose: rule 4.1(c) says linked, and a grant with no Apple
+    sponsor has no honest ``plan_source`` — NULL/'stripe' renders as 'web',
+    and iOS + 'web' matches none of the shipped client's three UI branches,
+    so the grantee would see no plan surface at all. The two App Review comps
+    stay as they are (off-ledger free balances).
+
+    **The sponsor link is DENORMALISED with no foreign key.**
+    ``apple_subscriptions.user_id`` is ON DELETE CASCADE, so deleting the
+    sponsor's account destroys the subscription row — and would take an FK'd
+    audit trail with it. The grant must still be able to say "sponsored by
+    original transaction 2000000912345678, which no longer exists". That is a
+    finding, not a dangling pointer, and ``_sponsor_is_live`` reads a missing
+    row as DEAD (fail closed).
+
+    **A row is never deleted.** Revoke and lapse are recorded on the row, and
+    exactly one of ``revoked_at`` (a human ended it) / ``lapsed_at`` (the
+    sponsor ended it) is set on a dead grant. The operator emails are
+    SNAPSHOTS so the trail still names them after their account is gone.
+
+    This table is a CONTROLLER of the entitlement, never an oracle on the
+    charge path: ``try_charge`` reads ``credit_balances.plan_id`` and nothing
+    else. See ``app/services/entitlement.py``'s module docstring.
+    """
+    __tablename__ = "unlimited_grants"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4()),
+    )
+
+    # WHO holds it.
+    granted_to_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False,
+    )
+
+    # WHAT sponsors it. No FK — see the class docstring.
+    sponsor_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    sponsor_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    sponsor_original_txn_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    sponsor_stripe_sub_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    # WHY, and a hard backstop independent of the sponsor.
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # WHO granted it.
+    granted_by_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    granted_by_email: Mapped[str] = mapped_column(String(320), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )
+
+    # HOW it ended.
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    revoked_by_user_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    revoked_by_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
+    revoked_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lapsed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lapsed_reason: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        # One LIVE grant per user. PARTIAL — a revoked or lapsed grant must not
+        # block a later one, and the audit row is never deleted, so a plain
+        # unique index here would make every user un-re-grantable forever after
+        # their first revoke. Declared for both dialects so the test lane
+        # exercises the real constraint rather than a weaker stand-in.
+        Index(
+            "uq_unlimited_grant_live", "granted_to_user_id", unique=True,
+            postgresql_where=text("revoked_at IS NULL AND lapsed_at IS NULL"),
+            sqlite_where=text("revoked_at IS NULL AND lapsed_at IS NULL"),
+        ),
+        Index("ix_unlimited_grant_user", "granted_to_user_id"),
+        Index("ix_unlimited_grant_sponsor_txn", "sponsor_original_txn_id"),
+        Index("ix_unlimited_grant_sponsor_usr", "sponsor_user_id"),
     )

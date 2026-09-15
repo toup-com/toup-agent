@@ -744,15 +744,36 @@ async def execute(
                     db, user_id, BUCKET_INTEGRATION, flat_fee,
                 )
                 if not pre.success:
+                    # An UNLIMITED account can never reach this branch on
+                    # BALANCE: its integration wallet holds 1,000,000 and
+                    # `check_balance` is entitlement-blind by design, which is
+                    # correct rather than merely lucky (design §8, site 8) —
+                    # a million remaining means no pre-flight in the system
+                    # can refuse it, whether or not it knows the concept
+                    # exists. Pinned by tests/test_free_tier_unchanged.py::
+                    # test_connector_preflight_never_refuses_unlimited.
+                    #
+                    # It CAN reach it on the rate ladder, and that refusal is
+                    # not about money — so it gets its own copy with no plan,
+                    # no renewal and no upgrade in it, and it is RETRYABLE,
+                    # because unlike an empty wallet it clears in seconds.
+                    from app.services.credit_exhausted import (
+                        REASON_RATE_LIMITED as _RL,
+                    )
+                    _rate_limited = pre.reason == _RL
                     _log(user_hash, connector_id, tool_name, channel,
-                         "credits_insufficient", started)
+                         "rate_limited" if _rate_limited else "credits_insufficient",
+                         started)
                     return ConnectorToolError(
                         message=(
+                            "You're going faster than we can serve right now. "
+                            "Give it a few seconds and try again."
+                            if _rate_limited else
                             "You're out of integration credits for this month. "
                             "Upgrade your plan or wait for the next renewal to "
                             "use connector tools again."
                         ),
-                        retryable=False,
+                        retryable=_rate_limited,
                     )
         except Exception as _credit_pre_err:
             logger.warning(

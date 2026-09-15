@@ -53,6 +53,8 @@ import re
 import shutil
 import signal
 import sys
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -97,7 +99,26 @@ _SIDECAR_PORT = int(os.environ.get("WHATSAPP_SIDECAR_PORT", "8002"))
 _SIDECAR_BASE = f"http://{_SIDECAR_HOST}:{_SIDECAR_PORT}"
 _SIDECAR_BOOT_TIMEOUT_S = 20.0   # how long start() waits for /health 200
 _SIDECAR_HTTP_TIMEOUT_S = 10.0
+# `/pair/status` answers a USER-FACING poll and must never hold one. The
+# mobile Channels panel reads it on every visit and every foreground for
+# every not-yet-linked user, so a sick sidecar has to cost ~2 s and a cached
+# snapshot, not the shared client's full budget. (The blocking client this
+# read used to open carried exactly this 2 s.)
+_PAIR_STATUS_TIMEOUT_S = 2.0
 _SSE_RECONNECT_BACKOFF_S = 2.0
+# The sidecar's SSE stream has NO REPLAY (sidecar.mjs `emitEvent` writes to
+# currently-attached clients and drops the rest), so a `connection_open` that
+# fires while nobody is attached is gone. The cached status is therefore a
+# CACHE, not a fact, and it is re-derived from the sidecar on this cadence.
+_RECONCILE_INTERVAL_S = 10.0
+# Unreachable sidecar: back off geometrically rather than hammer a dead port
+# for the life of the container.
+_RECONCILE_MAX_BACKOFF_S = 60.0
+# …and a FLOOR under the wake. `_wake_reconciler` fires on every SSE attach,
+# and a stream that EOFs cleanly re-attaches immediately, so a sick sidecar
+# that accepts and closes could otherwise drive back-to-back /health reads
+# for as long as it stays sick. No two reconcile reads closer than this.
+_RECONCILE_MIN_INTERVAL_S = 1.0
 
 
 def _resolve_sidecar_dir() -> Path:
@@ -125,15 +146,46 @@ def _resolve_sidecar_dir() -> Path:
 
 _active_channel: Optional["BaileysWhatsAppChannel"] = None
 
+# Monotonic token bumped once per restart. An instance that is not on the
+# CURRENT generation must stop dispatching: `_stopping` is only ever set by
+# `stop()`, and an instance evicted from the registry never receives one —
+# which is how a superseded adapter kept a second SSE stream open and ran
+# every inbound message a second time.
+_generation: int = 0
+
 
 def get_active_baileys_channel() -> Optional["BaileysWhatsAppChannel"]:
     return _active_channel
 
 
+def current_generation() -> int:
+    return _generation
+
+
+def bump_generation() -> int:
+    global _generation
+    _generation += 1
+    return _generation
+
+
+def _signal(name: str) -> None:
+    """Best-effort process-lifetime counter. The module is absent on older
+    images, and a health counter may never break a WhatsApp turn."""
+    try:
+        from app.services.health_signals import incr as _incr
+        _incr(name)
+    except Exception:
+        pass
+
+
 class BaileysWhatsAppChannel(BaseChannel):
     """Baileys-sidecar-backed WhatsApp adapter."""
 
-    def __init__(self, allowed_numbers: Optional[list[str]] = None):
+    def __init__(
+        self,
+        allowed_numbers: Optional[list[str]] = None,
+        generation: int = 0,
+    ):
         super().__init__(ChannelType.WHATSAPP)
         self.allowed_numbers: set[str] = {
             normalised
@@ -147,9 +199,29 @@ class BaileysWhatsAppChannel(BaseChannel):
         self._sweep_task: Optional[asyncio.Task] = None
         self._http: Optional[httpx.AsyncClient] = None
         self._stopping: bool = False
+        self._generation: int = generation
+        self._spawn_token: Optional[str] = None
+        self._adopted_sidecar: bool = False
 
-        # Cached state — refreshed on each /pair/status or sidecar event.
+        self._reconcile_task: Optional[asyncio.Task] = None
+        self._reconcile_wake: Optional[asyncio.Event] = None
+
+        # Cached state — re-derived from the sidecar by `_reconcile_forever`
+        # and advanced early by SSE. Every write goes through
+        # `_apply_sidecar_state`; nothing else may assign these three.
         self._session_status: str = "not_linked"
+        self._session_status_source: str = "init"
+        # Two DIFFERENT clocks, and conflating them is how a cache pretends
+        # to be fresh. `_status_since` moves only when the status VALUE
+        # changes — it is what tells a stale `linking` (creds wiped, nothing
+        # will ever move it) from a reconnect in flight. `_last_sidecar_read_at`
+        # moves only on a real READ of the sidecar, so a local optimistic
+        # write cannot make the cache look freshly confirmed.
+        self._status_since: float = time.monotonic()
+        self._last_sidecar_read_at: Optional[float] = None
+        # F2: the newest SSE/local write. A `/health` or `/pair/status` body
+        # serialised BEFORE it must not be applied after it.
+        self._last_push_write_at: float = float("-inf")
         self._connected: bool = False
         self._self_e164: Optional[str] = None
         self._latest_qr_data_url: Optional[str] = None
@@ -162,12 +234,29 @@ class BaileysWhatsAppChannel(BaseChannel):
 
     # ── Lifecycle ──────────────────────────────────────────────
 
-    async def start(self) -> None:
+    def is_current(self) -> bool:
+        """True while this instance is the one the process should route on.
+
+        Generation 0 is an UNMANAGED instance — constructed directly rather
+        than through `restart_whatsapp_channel`, which is the only caller
+        that bumps the counter. It has no rival to be superseded by, so it is
+        always current; otherwise a test double or a legacy code path would
+        silently drop every inbound the moment any restart had ever run in
+        the process."""
+        if self._stopping:
+            return False
+        return self._generation == 0 or self._generation == current_generation()
+
+    async def start(self) -> bool:
         """Spawn the sidecar + open the inbound event stream.
 
         Degrades gracefully: if Node isn't installed, the sidecar dir
         is missing, or the sidecar fails to boot within the timeout,
         we log + bail without crashing the rest of the agent.
+
+        Returns True only when the SSE stream is attached. The caller must
+        not register a False return: `send_text` would then hit its own
+        `self._http is None` guard and drop every outbound reply silently.
         """
         global _active_channel
 
@@ -178,7 +267,7 @@ class BaileysWhatsAppChannel(BaseChannel):
                 "QR-link mode disabled. Rebuild the agent image.",
                 sidecar_dir,
             )
-            return
+            return False
         if not (sidecar_dir / "node_modules").is_dir():
             logger.error(
                 "[WHATSAPP-BAILEYS] node_modules missing at %s — "
@@ -186,7 +275,7 @@ class BaileysWhatsAppChannel(BaseChannel):
                 "`npm install` during build.",
                 sidecar_dir,
             )
-            return
+            return False
 
         node_bin = shutil.which("node")
         if not node_bin:
@@ -194,7 +283,7 @@ class BaileysWhatsAppChannel(BaseChannel):
                 "[WHATSAPP-BAILEYS] `node` binary not on PATH — "
                 "QR-link mode disabled. Install Node 20+."
             )
-            return
+            return False
 
         # Spawn the sidecar. Its stdout/stderr are inherited so log
         # lines flow into `docker logs <container>` alongside Python
@@ -202,6 +291,10 @@ class BaileysWhatsAppChannel(BaseChannel):
         try:
             env = os.environ.copy()
             env.setdefault("WHATSAPP_SIDECAR_PORT", str(_SIDECAR_PORT))
+            # Identity for the /health check below: the only way to tell
+            # "my child answered" from "a stranger already owns the port".
+            self._spawn_token = uuid.uuid4().hex
+            env["WHATSAPP_SIDECAR_TOKEN"] = self._spawn_token
             self._sidecar_proc = await asyncio.create_subprocess_exec(
                 node_bin,
                 "sidecar.mjs",
@@ -214,9 +307,10 @@ class BaileysWhatsAppChannel(BaseChannel):
                 "[WHATSAPP-BAILEYS] sidecar spawned pid=%s port=%s dir=%s",
                 self._sidecar_proc.pid, _SIDECAR_PORT, sidecar_dir,
             )
+            _signal("wa_sidecar_spawns")
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] sidecar spawn failed")
-            return
+            return False
 
         # Wait for /health to come up — Node startup takes ~1-2s with
         # warm node_modules; allow up to _SIDECAR_BOOT_TIMEOUT_S.
@@ -230,9 +324,8 @@ class BaileysWhatsAppChannel(BaseChannel):
                 if resp.status_code == 200:
                     body = resp.json()
                     self._sidecar_booted_at = datetime.utcnow()
-                    self._session_status = body.get("session_status") or "not_linked"
-                    self._connected = bool(body.get("connected"))
-                    self._self_e164 = body.get("self_e164")
+                    self._apply_sidecar_state(body, "boot")
+                    self._check_sidecar_identity(body)
                     logger.info(
                         "[WHATSAPP-BAILEYS] sidecar healthy session=%s connected=%s",
                         self._session_status, self._connected,
@@ -247,7 +340,7 @@ class BaileysWhatsAppChannel(BaseChannel):
                 int(_SIDECAR_BOOT_TIMEOUT_S),
             )
             await self._teardown()
-            return
+            return False
 
         # Periodic sweep of the inbound dedupe table — same module the
         # Cloud API path uses.
@@ -257,8 +350,34 @@ class BaileysWhatsAppChannel(BaseChannel):
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] dedupe sweep init failed")
 
+        # A restart that started while we were waiting out the boot poll
+        # has already minted a newer generation; attaching a second SSE
+        # stream here is exactly the duplication this token exists to stop.
+        if not self.is_current():
+            logger.warning(
+                "[WHATSAPP-BAILEYS] start.superseded gen=%d current=%d",
+                self._generation, current_generation(),
+            )
+            await self._teardown()
+            return False
+
+        # The wake handle exists BEFORE the stream that fires it: a
+        # `_wake_reconciler()` with no Event behind it is a silent no-op,
+        # and the attach it reports is the one most worth reacting to.
+        self._reconcile_wake = asyncio.Event()
+
         # Long-lived SSE consumer.
         self._event_task = asyncio.create_task(self._consume_events_forever())
+
+        # …and the thing that makes the SSE stream an OPTIMISATION rather
+        # than the source of truth. A `connection_open` emitted between the
+        # boot /health read above and the stream actually attaching reaches
+        # nobody (no replay), and the cache then reports `linking` while the
+        # sidecar is linked — which is what clients render as "Not
+        # connected". `_consume_events_forever` wakes this loop the instant a
+        # stream attaches, so that window closes at once; failing that, one
+        # interval bounds it.
+        self._reconcile_task = asyncio.create_task(self._reconcile_forever())
 
         _active_channel = self
         logger.info(
@@ -281,12 +400,54 @@ class BaileysWhatsAppChannel(BaseChannel):
             )
             try:
                 await self._http.post("/pair/start")
-                self._session_status = "linking"
+                self._apply_sidecar_state(
+                    {"session_status": "linking", "connected": False,
+                     "self_e164": None},
+                    "local",
+                )
             except Exception:
                 logger.exception(
                     "[WHATSAPP-BAILEYS] auto-pair kick failed — user can "
                     "still trigger from Settings"
                 )
+
+        return True
+
+    def _check_sidecar_identity(self, body: dict) -> None:
+        """Compare the /health responder against the child we just spawned.
+
+        A MISSING `spawn_token` is UNKNOWN, not a stranger: a sidecar bundle
+        that predates the token answers without one, and treating that as a
+        foreign process would take WhatsApp dark on every such image.
+        """
+        theirs = body.get("spawn_token")
+        if theirs is None:
+            logger.info(
+                "[WHATSAPP-BAILEYS] sidecar.spawn_token_absent pid=%s — "
+                "sidecar bundle predates the token; identity unverified",
+                body.get("pid"),
+            )
+            return
+        if theirs == self._spawn_token:
+            return
+        logger.error(
+            "[WHATSAPP-BAILEYS] sidecar.port_owned_by_stranger ours=%s theirs=%s pid=%s",
+            (self._spawn_token or "")[:8], str(theirs)[:8], body.get("pid"),
+        )
+        self._adopted_sidecar = True
+        # Visible to the monitor, not only to /agent/health readers: an
+        # adopted stream is a session we can neither restart nor kill, and
+        # `restart_whatsapp_channel` excludes it from the config no-op so the
+        # next push respawns.
+        _signal("wa_sidecar_adopted")
+        # Our own child lost the bind and died. Forget it so `_teardown`
+        # cannot SIGTERM the stranger's pid — the pid is not ours to kill,
+        # and killing it takes down the session that is actually working.
+        if (
+            self._sidecar_proc is not None
+            and getattr(self._sidecar_proc, "returncode", None) is not None
+        ):
+            self._sidecar_proc = None
 
     async def stop(self) -> None:
         """Graceful shutdown — cancels the SSE consumer + sweep, then
@@ -300,7 +461,7 @@ class BaileysWhatsAppChannel(BaseChannel):
     async def _teardown(self) -> None:
         # Cancel background tasks first so they don't observe a
         # dying sidecar mid-iteration.
-        for task in (self._event_task, self._sweep_task):
+        for task in (self._event_task, self._sweep_task, self._reconcile_task):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -309,6 +470,8 @@ class BaileysWhatsAppChannel(BaseChannel):
                     pass
         self._event_task = None
         self._sweep_task = None
+        self._reconcile_task = None
+        self._reconcile_wake = None
 
         if self._http is not None:
             try:
@@ -342,7 +505,7 @@ class BaileysWhatsAppChannel(BaseChannel):
         with a small backoff so a sidecar bounce doesn't strand us.
         """
         backoff = _SSE_RECONNECT_BACKOFF_S
-        while not self._stopping:
+        while self.is_current():
             try:
                 async with httpx.AsyncClient(
                     base_url=_SIDECAR_BASE, timeout=None,
@@ -356,6 +519,11 @@ class BaileysWhatsAppChannel(BaseChannel):
                             await asyncio.sleep(backoff)
                             continue
                         backoff = _SSE_RECONNECT_BACKOFF_S  # reset on success
+                        # Attached NOW. Everything the sidecar emitted before
+                        # this instant was delivered to nobody, so the cache
+                        # may already be a lie; re-derive rather than wait out
+                        # a whole interval.
+                        self._wake_reconciler()
                         async for line in resp.aiter_lines():
                             if not line or line.startswith(":"):
                                 continue  # heartbeats / blank lines
@@ -390,18 +558,31 @@ class BaileysWhatsAppChannel(BaseChannel):
 
     async def _on_sidecar_event(self, payload: dict) -> None:
         """Route a single SSE event into the channel's state machine."""
+        # The loop can be parked mid-event when a newer generation lands;
+        # this is the second of the three exits (loop / event / inbound).
+        if not self.is_current():
+            return
         kind = payload.get("type")
 
         if kind == "qr":
             # The PNG data URL itself is fetched lazily via
             # /pair/status to avoid bloating SSE frames.
-            self._session_status = "linking"
+            self._apply_sidecar_state(
+                {"session_status": "linking", "connected": self._connected,
+                 "self_e164": self._self_e164},
+                "sse",
+            )
             return
 
         if kind == "connection_open":
-            self._connected = True
-            self._session_status = "linked"
-            self._self_e164 = payload.get("self_e164") or self._self_e164
+            self._apply_sidecar_state(
+                {
+                    "session_status": "linked",
+                    "connected": True,
+                    "self_e164": payload.get("self_e164") or self._self_e164,
+                },
+                "sse",
+            )
             logger.info(
                 "[WHATSAPP-BAILEYS] connection.open self=%s",
                 redact_phone(self._self_e164 or ""),
@@ -409,9 +590,11 @@ class BaileysWhatsAppChannel(BaseChannel):
             return
 
         if kind == "logged_out":
-            self._connected = False
-            self._session_status = "logged_out"
-            self._self_e164 = None
+            self._apply_sidecar_state(
+                {"session_status": "logged_out", "connected": False,
+                 "self_e164": None},
+                "sse",
+            )
             logger.warning("[WHATSAPP-BAILEYS] logged_out — relink required")
             return
 
@@ -422,7 +605,163 @@ class BaileysWhatsAppChannel(BaseChannel):
         # Unknown event types — log at debug, don't fail.
         logger.debug("[WHATSAPP-BAILEYS] event.unknown_type type=%s", kind)
 
+    # ── Sidecar state reconciliation ───────────────────────────
+
+    def _wake_reconciler(self) -> None:
+        """Ask for a sidecar re-read on the next loop turn. Never raises."""
+        ev = self._reconcile_wake
+        if ev is not None:
+            ev.set()
+
+    def _apply_sidecar_state(
+        self, body: Any, source: str, read_at: Optional[float] = None,
+    ) -> None:
+        """Adopt the sidecar's view of the session. THE one write path.
+
+        Every producer of session truth — the boot ``/health`` read, an SSE
+        frame, the reconciler, the ``/pair/status`` poll, a local pairing
+        action — lands here, so the transition log, the freshness stamp and
+        the ``wa_status_reconciled`` signal cannot be true of one producer
+        and false of another. ``source`` is one of ``boot`` | ``sse`` |
+        ``reconcile`` | ``pair_status`` | ``local``.
+
+        ``read_at`` is the monotonic instant the POLLED body was requested.
+        A poll is a snapshot of the past: a `/health` answer serialised
+        before a `connection_open` frame can still land after it and walk a
+        linked session back to `linking`. A polled body older than the
+        newest push write is therefore dropped, not merged — it has nothing
+        to say that the push has not already said better.
+        """
+        if not isinstance(body, dict):
+            return
+        polled = source in ("reconcile", "pair_status", "boot")
+        if polled and read_at is not None and read_at < self._last_push_write_at:
+            logger.debug(
+                "[WHATSAPP-BAILEYS] state.superseded source=%s — a push write "
+                "landed while this read was in flight", source,
+            )
+            return
+
+        prev_status = self._session_status
+        prev_connected = self._connected
+        prev_self = self._self_e164
+
+        status = body.get("session_status")
+        if status:
+            self._session_status = str(status)
+        self._connected = bool(body.get("connected"))
+        self._self_e164 = body.get("self_e164")
+
+        now = time.monotonic()
+        self._session_status_source = source
+        if polled:
+            # Only a real READ refreshes the "we asked the sidecar" clock.
+            self._last_sidecar_read_at = now
+        else:
+            self._last_push_write_at = now
+        if self._session_status != prev_status:
+            self._status_since = now
+
+        if (
+            self._session_status != prev_status
+            or self._connected != prev_connected
+            or self._self_e164 != prev_self
+        ):
+            logger.info(
+                "[WHATSAPP-BAILEYS] session.transition %s->%s connected=%s "
+                "self=%s source=%s",
+                prev_status, self._session_status, self._connected,
+                redact_phone(self._self_e164 or "") or "none", source,
+            )
+            if source == "reconcile":
+                # The SSE frame that should have carried this never arrived
+                # — the stream was not attached when the sidecar emitted it.
+                # Diagnostic only; nothing may gate on a health signal.
+                _signal("wa_status_reconciled")
+
+    async def _reconcile_once(self, source: str) -> bool:
+        """One ``/health`` read applied to the cache. Never raises.
+
+        Returns False when the sidecar could not be read, which is what
+        drives the caller's backoff.
+        """
+        client = self._http
+        if client is None:
+            return False
+        read_at = time.monotonic()
+        try:
+            resp = await client.get("/health")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "[WHATSAPP-BAILEYS] reconcile.sidecar_unreachable err=%s", exc,
+            )
+            return False
+        try:
+            if getattr(resp, "status_code", 0) != 200:
+                logger.debug(
+                    "[WHATSAPP-BAILEYS] reconcile.bad_status %s",
+                    getattr(resp, "status_code", None),
+                )
+                return False
+            body = resp.json()
+        except Exception as exc:
+            logger.debug("[WHATSAPP-BAILEYS] reconcile.bad_body err=%s", exc)
+            return False
+        self._apply_sidecar_state(body, source, read_at=read_at)
+        return True
+
+    async def _reconcile_forever(self) -> None:
+        """Keep the cached session state ≤ one interval behind the sidecar.
+
+        The sidecar is the only process that knows whether WhatsApp is
+        linked; SSE is how we hear about it QUICKLY, never how we learn it.
+        Sleeps ``_RECONCILE_INTERVAL_S`` between reads, wakes early when the
+        SSE stream (re)attaches, and backs off to ``_RECONCILE_MAX_BACKOFF_S``
+        while the sidecar is unreachable so a dead port never becomes a spin.
+        """
+        delay = _RECONCILE_INTERVAL_S
+        last_read = float("-inf")
+        while self.is_current():
+            ev = self._reconcile_wake
+            try:
+                if ev is None:
+                    await asyncio.sleep(delay)
+                else:
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                    ev.clear()
+                # The floor. A wake is a HINT, and a sidecar that accepts an
+                # SSE connection and immediately EOFs produces one per
+                # round-trip; without this, "re-derive on attach" becomes a
+                # hot loop against the very process that is already sick.
+                gap = time.monotonic() - last_read
+                if gap < _RECONCILE_MIN_INTERVAL_S:
+                    await asyncio.sleep(_RECONCILE_MIN_INTERVAL_S - gap)
+            except asyncio.CancelledError:
+                return
+            if not self.is_current():
+                return
+            last_read = time.monotonic()
+            try:
+                ok = await self._reconcile_once("reconcile")
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("[WHATSAPP-BAILEYS] reconcile.unexpected")
+                ok = False
+            delay = (
+                _RECONCILE_INTERVAL_S
+                if ok
+                else min(delay * 2, _RECONCILE_MAX_BACKOFF_S)
+            )
+
     async def _handle_inbound_message(self, payload: dict) -> None:
+        if not self.is_current():
+            return
         sender_e164 = (payload.get("from") or "").strip()
         text = (payload.get("text") or "").strip()
         message_id = (payload.get("message_id") or "").strip()
@@ -438,6 +777,7 @@ class BaileysWhatsAppChannel(BaseChannel):
             return
 
         # Dedupe — same DB table the Cloud API path uses.
+        _claimed = False
         try:
             from app.agent.channels.whatsapp_dedupe import claim as _dedupe_claim
             from app.config import settings as _settings
@@ -449,7 +789,9 @@ class BaileysWhatsAppChannel(BaseChannel):
                         "[WHATSAPP-BAILEYS] dedupe.skipped_retry chat=%s msg_id=%s",
                         redact_phone(sender_norm), message_id[:16],
                     )
+                    _signal("channel_events_deduped")
                     return
+                _claimed = True
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] dedupe.claim_failed")
 
@@ -459,6 +801,16 @@ class BaileysWhatsAppChannel(BaseChannel):
                 redact_phone(sender_norm),
             )
             return
+
+        # Counted AFTER the kind gate: `channel_events_claimed` is the
+        # numerator of the channel-orphan alert (claimed − persisted), so it
+        # must count only events the pipeline promised to persist. A
+        # sticker or voice note claims the dedupe row and legitimately
+        # never reaches the handler — counted above the gate, one photo
+        # paged "message vanished" every 30 minutes for the container's
+        # life.
+        if _claimed:
+            _signal("channel_events_claimed")
 
         self._inbound_count += 1
         self._last_inbound_at = datetime.utcnow()
@@ -617,13 +969,19 @@ class BaileysWhatsAppChannel(BaseChannel):
 
     # ── QR pairing API (consumed by /qr-* endpoints) ───────────
 
-    def get_pairing_status(self) -> dict:
+    async def get_pairing_status(self) -> dict:
         """Snapshot for the ``/qr-status`` polling endpoint.
 
-        Reaches into the sidecar synchronously via httpx — this method
-        is called from inside FastAPI request handlers which are
-        already async-friendly, but the API surface must stay sync to
-        avoid breaking older callers. We use a short blocking client.
+        Reads ``/pair/status`` over the SHARED async client. It used to open
+        a blocking ``httpx.Client`` here — and this runs inside a FastAPI
+        route on the agent's event loop, which the Settings modal polls
+        every ~1.5 s, so every poll stalled the whole loop for as long as
+        the sidecar took to answer, up to the client timeout.
+
+        Returns the sidecar's body with the four cache-authoritative keys
+        forced onto it: a body that omits one must not delete it from the
+        response, which is how a sparse answer used to hand ``/qr/status``
+        a snapshot with no ``session_status`` at all.
         """
         # Default snapshot uses cached state if sidecar is down.
         snapshot = {
@@ -636,28 +994,56 @@ class BaileysWhatsAppChannel(BaseChannel):
                 if self._latest_qr_at else None
             ),
         }
+        client = self._http
+        if client is None:
+            return snapshot
+        read_at = time.monotonic()
         try:
-            with httpx.Client(base_url=_SIDECAR_BASE, timeout=2.0) as client:
-                resp = client.get("/pair/status")
-                if resp.status_code == 200:
-                    body = resp.json()
-                    # Cache for next call + for SSE-driven status display.
-                    self._session_status = body.get("session_status") or self._session_status
-                    self._connected = bool(body.get("connected"))
-                    self._self_e164 = body.get("self_e164")
-                    self._latest_qr_data_url = body.get("qr_data_url")
-                    qr_at = body.get("qr_emitted_at")
-                    if qr_at:
-                        try:
-                            self._latest_qr_at = datetime.fromisoformat(
-                                qr_at.replace("Z", "+00:00")
-                            )
-                        except ValueError:
-                            pass
-                    return body
+            resp = await client.get(
+                "/pair/status", timeout=_PAIR_STATUS_TIMEOUT_S,
+            )
+            if getattr(resp, "status_code", 0) == 200:
+                body = resp.json()
+                # Cache for next call + for SSE-driven status display.
+                self._apply_sidecar_state(body, "pair_status", read_at=read_at)
+                self._latest_qr_data_url = body.get("qr_data_url")
+                qr_at = body.get("qr_emitted_at")
+                if qr_at:
+                    try:
+                        self._latest_qr_at = datetime.fromisoformat(
+                            qr_at.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        pass
+                merged = dict(snapshot)
+                if isinstance(body, dict):
+                    merged.update(body)
+                merged["session_status"] = self._session_status
+                merged["connected"] = self._connected
+                merged["self_e164"] = self._self_e164
+                merged["qr_data_url"] = self._latest_qr_data_url
+                merged.update(self._status_provenance())
+                return merged
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.debug("[WHATSAPP-BAILEYS] pair_status.fetch_failed %s", exc)
+        snapshot.update(self._status_provenance())
         return snapshot
+
+    def _status_provenance(self) -> dict:
+        """How old the cached status is and what last wrote it.
+
+        Rides BOTH the ``/qr/status`` body and ``health()`` because the
+        platform's no-downgrade rule needs the same three facts whichever
+        route it heard from — and a snapshot served from cache during a
+        sidecar outage must still say so rather than look fresh.
+        """
+        return {
+            "session_status_source": self._session_status_source,
+            "session_status_stable_s": self._status_stable_s(),
+            "since_last_sidecar_read_s": self._sidecar_read_age_s(),
+        }
 
     async def kick_pair(self) -> None:
         """Tell the sidecar to wipe auth + start a fresh QR flow."""
@@ -665,9 +1051,11 @@ class BaileysWhatsAppChannel(BaseChannel):
             return
         try:
             await self._http.post("/pair/start")
-            self._session_status = "linking"
-            self._connected = False
-            self._self_e164 = None
+            self._apply_sidecar_state(
+                {"session_status": "linking", "connected": False,
+                 "self_e164": None},
+                "local",
+            )
             self._latest_qr_data_url = None
             self._latest_qr_at = None
         except Exception:
@@ -692,9 +1080,10 @@ class BaileysWhatsAppChannel(BaseChannel):
         body = resp.json()
         if not body.get("ok"):
             raise RuntimeError(body.get("error") or "Pairing-code request failed")
-        self._session_status = "linking"
-        self._connected = False
-        self._self_e164 = None
+        self._apply_sidecar_state(
+            {"session_status": "linking", "connected": False, "self_e164": None},
+            "local",
+        )
         self._latest_qr_data_url = None
         self._latest_qr_at = None
         return str(body.get("pairing_code") or "")
@@ -706,14 +1095,26 @@ class BaileysWhatsAppChannel(BaseChannel):
                 await self._http.post("/pair/logout")
             except Exception:
                 logger.exception("[WHATSAPP-BAILEYS] logout.sidecar_call_failed")
-        self._session_status = "not_linked"
-        self._connected = False
-        self._self_e164 = None
+        self._apply_sidecar_state(
+            {"session_status": "not_linked", "connected": False,
+             "self_e164": None},
+            "local",
+        )
         self._latest_qr_data_url = None
         self._latest_qr_at = None
         logger.info("[WHATSAPP-BAILEYS] force_logout — session cleared")
 
     # ── Health surface ─────────────────────────────────────────
+
+    def _sidecar_read_age_s(self) -> Optional[int]:
+        """Seconds since we last READ the sidecar. None if we never have."""
+        if self._last_sidecar_read_at is None:
+            return None
+        return int(max(0.0, time.monotonic() - self._last_sidecar_read_at))
+
+    def _status_stable_s(self) -> int:
+        """Seconds the session_status VALUE has held, whatever wrote it."""
+        return int(max(0.0, time.monotonic() - self._status_since))
 
     def health(self) -> dict:
         """Mirrors the shape of ``WhatsAppChannel.health()`` so
@@ -721,9 +1122,35 @@ class BaileysWhatsAppChannel(BaseChannel):
         """
         return {
             "configured": True,
-            "started": self._sidecar_proc is not None,
+            # "started" used to mean "we once called create_subprocess_exec",
+            # which stayed True for an instance whose child died milliseconds
+            # later on EADDRINUSE. The SSE task's liveness is the fact an
+            # operator actually needs: no stream, no inbound.
+            "started": self._event_task is not None and not self._event_task.done(),
+            "generation": self._generation,
+            "is_current": self.is_current(),
+            "adopted_sidecar": self._adopted_sidecar,
+            "sidecar_alive": (
+                self._sidecar_proc is not None
+                and getattr(self._sidecar_proc, "returncode", None) is None
+            ),
             "mode": "qr_link",
             "session_status": self._session_status,
+            # `session_status` is a CACHE, and these three say how much to
+            # trust it. `session_status_stable_s` is the one the platform's
+            # downgrade rule reads: a `linking` that has not moved in a
+            # minute is a session whose credentials are gone, while a
+            # reconnect in flight is seconds old. `since_last_sidecar_read_s`
+            # is a different question — when did we last ASK — and a local
+            # optimistic write deliberately does not refresh it. Strings and
+            # ints are fine here; only `health_signals` is ints-only.
+            "session_status_source": self._session_status_source,
+            "session_status_stable_s": self._status_stable_s(),
+            "since_last_sidecar_read_s": self._sidecar_read_age_s(),
+            "reconciler_running": (
+                self._reconcile_task is not None
+                and not self._reconcile_task.done()
+            ),
             "connected": self._connected,
             "self_e164": self._self_e164,
             "allowed_numbers_count": len(self.allowed_numbers),

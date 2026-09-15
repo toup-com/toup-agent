@@ -66,6 +66,13 @@ async def _forward(
             resp = await client.get(url, headers=headers, timeout=15.0)
         else:
             resp = await client.post(url, headers=headers, json=body or {}, timeout=15.0)
+        # An agent-origin 401/403 is the PLATFORM's stale key, never the
+        # user's JWT — forwarding it verbatim signs the user out (D1).
+        from app.api.tenant_proxy import (
+            is_agent_auth_failure, agent_key_stale_json_response,
+        )
+        if is_agent_auth_failure(resp.status_code):
+            return agent_key_stale_json_response()
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except HTTPException:
         raise

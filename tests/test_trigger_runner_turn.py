@@ -269,6 +269,27 @@ def test_trigger_has_channel_guidance():
     assert "NEVER claim" in guidance
 
 
+def test_the_trigger_guidance_reaches_the_assembled_prompt_under_the_envelope():
+    """The dict is not the prompt. With the envelope on, the `- Channel:` line
+    that used to carry this guidance is gone and the per-turn descriptor is
+    the FIRST SENTENCE only — so the 'NEVER claim' pin has to travel in the
+    always-present surface_contracts section, keyed by the envelope's
+    `Contract: TRIGGER`. (tests/test_channel_neutral_prefix.py builds the real
+    prompt and asserts the string; this pins the wiring on the platform lane.)"""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "agent_runner.py").read_text()
+    contracts = src.split('section_parts["surface_contracts"] = (')[1].split("\n        )\n")[0]
+    assert 'CHANNEL_GUIDANCE["trigger"]' in contracts, (
+        "the trigger guidance is not part of the surface contracts — the envelope "
+        "drops its 'NEVER claim to have sent' pin"
+    )
+    assert "## TRIGGER — applies only when the runtime envelope names TRIGGER" in contracts
+    from app.agent.runtime_envelope import _CONTRACTS
+
+    assert _CONTRACTS.get("trigger") == "TRIGGER"
+
+
 def test_trigger_loses_background_scheduling_tools():
     from app.agent.prompt_profile import disabled_tools_for_channel
 

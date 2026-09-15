@@ -174,12 +174,28 @@ def test_day_chats_proxy_raises_on_timeout_and_retries_once(monkeypatch):
     )
 
 
-def test_day_chats_proxy_raises_on_5xx(monkeypatch):
-    """A 500 from the tenant used to return None SILENTLY — the helper only
-    logged inside `except`, so this failure mode had no trail at all."""
+def test_day_chats_proxy_does_not_retry_a_tenant_500(monkeypatch):
+    """A deterministic tenant 500 is an ANSWER. Retrying it is the same answer
+    at twice the load: on 2026-09-14 one user action cost six agent 500s
+    (3 client retries x 2 proxy attempts). 502/503/504 and transport errors —
+    a hop failing in FRONT of the tenant — stay in the retry set."""
     from app.api import day_chats
 
     client = _FakeClient([_Resp(500, text="boom")])
+    _patch_client(monkeypatch, client)
+
+    with pytest.raises(day_chats.AgentUnreachable) as ei:
+        asyncio.run(day_chats._proxy_day_chats("https://agent-x", "k"))
+    assert client.calls == 1, "a 500 is an answer, not a stall"
+    assert ei.value.reason == "agent_error"
+
+
+def test_day_chats_proxy_still_retries_a_502(monkeypatch):
+    """The other half of the split: a hop failing in front of the tenant is a
+    stall, and one retry is the whole point of the ladder."""
+    from app.api import day_chats
+
+    client = _FakeClient([_Resp(502, text="bad gateway"), _Resp(502, text="bad gateway")])
     _patch_client(monkeypatch, client)
 
     with pytest.raises(day_chats.AgentUnreachable):
@@ -601,7 +617,10 @@ def test_one_config_push_per_user_at_a_time():
         "the per-user push lock is gone — twelve callers can hit the bridge for "
         "one user at once again"
     )
-    assert has_code(wrapper, "await _update_container_env(db, user_id, agent_config)")
+    assert has_code(
+        wrapper,
+        "await _update_container_env(db, user_id, agent_config, pool_only=pool_only)",
+    ), "the wrapper must forward pool_only — a timezone push may never recreate a named tenant"
     # PER USER, not global: two different users pushing at once is normal.
     assert has_code(wrapper, "_env_push_lock(user_id)"), (
         "the lock is no longer keyed by user — a global one serialises the whole "
@@ -941,3 +960,221 @@ def test_a_user_facing_destroy_reports_502_not_404_when_teardown_fails():
         "worse into the 404 that means 'there was nothing there'"
     )
     assert has_code(src, "HTTPException(502")
+
+
+# ── 4. D-2: the recreate=False hole PR 738 left open ─────────────────────
+#
+# PR 738 shut the `recreate=True` door but the guard still required
+# `recreate=True`. `provision_container`'s early return only exits for status
+# `running`/`provisioning`, so a pool row in `error`/`stopped` (container_monitor
+# marks `error`; stop_container marks `stopped`) walked past it AND past the
+# recreate-gated guard, reaching the named path with `recreate=False` — the
+# Wake tap's `_provision_worker`. That cold-swapped the user onto an empty
+# `toup_agent_<prefix>` DB (onboarding incident 2026-09-12, still live @83abe6e2).
+
+def _pool_error_row_db(prefix="51d4ed2f-0000-0000-0000-000000000000",
+                       status="error", name="toup-agent-pool-17"):
+    class _MC:
+        container_name = name
+        pin_image_tag = None
+        user_id = prefix
+    _MC.status = status
+
+    class _Res:
+        def scalar_one_or_none(self):
+            return _MC()
+
+    class _DB:
+        async def execute(self, *a, **k):
+            return _Res()
+
+        async def commit(self):  # pragma: no cover - guard raises first
+            raise AssertionError("provision_container mutated the row before refusing")
+    return _DB()
+
+
+def _spy_bridge(monkeypatch):
+    """Patch docker_host_service._bridge_client with a spy that records entry.
+    Reaching the bridge at all for a pool member IS the data-loss bug."""
+    import contextlib
+    from app.services import docker_host_service as dhs
+    reached = {"n": 0}
+
+    @contextlib.asynccontextmanager
+    async def _client():
+        reached["n"] += 1
+        raise AssertionError("reached POST /v1/tenants for a pool member")
+        yield  # pragma: no cover
+    monkeypatch.setattr(dhs, "_bridge_client", _client)
+    return reached
+
+
+def test_pool_member_in_error_status_is_refused_with_recreate_false(monkeypatch):
+    """The D-2 core: `error` status + `recreate=False` must raise
+    PoolMemberSwapRefused and NEVER reach the bridge's /v1/tenants create."""
+    from app.services import docker_host_service as dhs
+    reached = _spy_bridge(monkeypatch)
+
+    with pytest.raises(dhs.PoolMemberSwapRefused):
+        asyncio.run(dhs.provision_container(
+            _pool_error_row_db(status="error"),
+            "51d4ed2f-0000-0000-0000-000000000000", recreate=False,
+        ))
+    assert reached["n"] == 0, "the named create path was reached for a pool member"
+
+
+def test_pool_member_in_stopped_status_is_refused_with_recreate_false(monkeypatch):
+    """`stop_container` marks a member `stopped`; `start_container` then calls
+    provision_container(recreate=False). Same swap, same refusal."""
+    from app.services import docker_host_service as dhs
+    reached = _spy_bridge(monkeypatch)
+
+    with pytest.raises(dhs.PoolMemberSwapRefused):
+        asyncio.run(dhs.provision_container(
+            _pool_error_row_db(status="stopped"),
+            "51d4ed2f-0000-0000-0000-000000000000", recreate=False,
+        ))
+    assert reached["n"] == 0
+
+
+def test_the_swap_guard_no_longer_requires_recreate():
+    """Structural: the refusal keys on the pool prefix + allow_pool_swap ALONE.
+    A guard that still said `recreate and existing …` is the D-2 hole. `has_code`
+    is comment-stripped, so the block's prose about `recreate` does not matter."""
+    block = _DHS_SRC.split("async def provision_container(")[1].split("\nasync def ")[0]
+    assert has_code(block, 'startswith("toup-agent-pool-")')
+    assert has_code(block, "not allow_pool_swap")
+    # The `recreate and existing` conjunction that gated the guard must be gone:
+    # with it, an error/stopped pool row on the recreate=False path skips the
+    # refusal and lands the user on an empty named database.
+    assert not has_code(block, "recreate and existing"), (
+        "the pool-swap guard still requires recreate=True — the recreate=False "
+        "hole (D-2) is open again"
+    )
+
+
+# ── 5. D1: an agent-origin 401/403 must not sign the user out ────────────
+#
+# `api.ts` treats ANY 401 as an expired JWT and clears the session
+# (`context.ts`), so forwarding a TENANT AGENT's 401 verbatim signs the user
+# out over a transient platform-key blip that self-heals in ~30 s. Map an
+# agent 401/403 to 503 + Retry-After + X-Toup-Reason: agent_key_stale; keep
+# every other 4xx (the agent's real answer) and a PLATFORM-auth 401 untouched.
+
+def _assert_key_stale(exc):
+    from fastapi import HTTPException
+    assert isinstance(exc, HTTPException)
+    assert exc.status_code == 503, f"agent auth failure became {exc.status_code}, not 503"
+    assert exc.headers.get("Retry-After"), "no Retry-After — the client cannot pace a retry"
+    assert exc.headers.get("X-Toup-Reason") == "agent_key_stale"
+
+
+def test_day_chats_agent_401_and_403_become_503_key_stale():
+    from app.api.day_chats import AgentSaidNo, _agent_4xx
+    _assert_key_stale(_agent_4xx(AgentSaidNo(401, "Authentication required")))
+    _assert_key_stale(_agent_4xx(AgentSaidNo(403, "Forbidden")))
+
+
+def test_day_chats_other_4xx_is_still_forwarded_verbatim():
+    """A 404 (`app-conversation/{id}` "no conversation yet"), 409, 413, 422 …
+    is the agent's real answer. Remapping it to 503 would start a second thread
+    beside the one the user is in — the exact regression the 404 forward exists
+    to prevent."""
+    from fastapi import HTTPException
+    from app.api.day_chats import AgentSaidNo, _agent_4xx
+    for code in (404, 409, 413, 422):
+        out = _agent_4xx(AgentSaidNo(code, "body"))
+        assert isinstance(out, HTTPException)
+        assert out.status_code == code, f"a tenant {code} must be forwarded verbatim"
+
+
+def test_sessions_agent_401_and_403_become_503_key_stale():
+    from app.api.sessions import SessionsAgentSaidNo, _sessions_4xx
+    _assert_key_stale(_sessions_4xx(SessionsAgentSaidNo(401, "Authentication required")))
+    _assert_key_stale(_sessions_4xx(SessionsAgentSaidNo(403, "Forbidden")))
+
+
+def test_sessions_other_4xx_is_still_forwarded_verbatim():
+    from fastapi import HTTPException
+    from app.api.sessions import SessionsAgentSaidNo, _sessions_4xx
+    for code in (404, 409, 422):
+        out = _sessions_4xx(SessionsAgentSaidNo(code, "body"))
+        assert isinstance(out, HTTPException)
+        assert out.status_code == code
+
+
+def test_tenant_proxy_agent_401_becomes_503_and_404_is_forwarded(monkeypatch):
+    from app.api import tenant_proxy
+
+    class _ReqClient:
+        def __init__(self, resp):
+            self._resp = resp
+            self.calls = 0
+
+        async def request(self, method, url, **kw):
+            self.calls += 1
+            return self._resp
+
+    import app.services.agent_http as agent_http
+
+    # Agent 401 → 503 agent_key_stale.
+    monkeypatch.setattr(agent_http, "get_agent_http_client",
+                        lambda: _ReqClient(_Resp(401, text="Authentication required")))
+    with pytest.raises(Exception) as ei:
+        asyncio.run(tenant_proxy.proxy_to_agent("https://a", "k", "memories/x", method="GET"))
+    _assert_key_stale(ei.value)
+
+    # Agent 404 → forwarded verbatim (the agent's real answer).
+    monkeypatch.setattr(agent_http, "get_agent_http_client",
+                        lambda: _ReqClient(_Resp(404, text="not found")))
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei2:
+        asyncio.run(tenant_proxy.proxy_to_agent("https://a", "k", "documents/x", method="GET"))
+    assert ei2.value.status_code == 404
+
+
+def test_a_route_maps_an_agent_401_to_503_key_stale(monkeypatch):
+    """End-to-end at the route the incident hit: an agent 401 on
+    `/api/day-chats/{date}/messages` must reach the phone as 503, never 401."""
+    from app.api import day_chats
+    monkeypatch.setattr(day_chats, "_get_agent_proxy_info",
+                        AsyncNoop(("https://agent-f261b564", "k")))
+    _patch_client(monkeypatch, _FakeClient([_Resp(401, text="Authentication required")]))
+    kind, res = _run_route(day_chats.get_day_chat_messages(
+        date_str="2026-09-12", limit=500, current_user=_User(), db=_ExplodingDB(),
+    ))
+    assert kind == "http"
+    _assert_key_stale(res)
+
+
+def test_a_platform_auth_401_stays_401(monkeypatch):
+    """A 401 raised by the PLATFORM (before/around the tenant call, not an
+    AgentSaidNo) must NOT be remapped — only agent-origin 4xx are. The remap
+    is scoped to the `except AgentSaidNo` block; `_get_agent_proxy_info` runs
+    outside it, so a platform 401 there propagates unchanged."""
+    from app.api import day_chats
+    from fastapi import HTTPException
+
+    async def _platform_401(*a, **k):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    monkeypatch.setattr(day_chats, "_get_agent_proxy_info", _platform_401)
+    kind, res = _run_route(day_chats.get_day_chat_messages(
+        date_str="2026-09-12", limit=500, current_user=_User(), db=_ExplodingDB(),
+    ))
+    assert kind == "http"
+    assert res.status_code == 401, "a platform-auth 401 must stay 401, never become 503"
+
+
+def test_both_proxy_files_no_longer_forward_an_agent_401_verbatim():
+    """Structural: the verbatim `status_code=e.status` forward must be gone
+    from the route handlers (it now lives only inside the _4xx helpers, which
+    remap 401/403)."""
+    for src, helper in ((_DAY_CHATS_SRC, "_agent_4xx"), (_SESSIONS_SRC, "_sessions_4xx")):
+        # every route forward goes through the helper now
+        assert f"raise {helper}(e)" in src
+        # and the helper is the ONLY place the raw verbatim forward survives
+        assert src.count('status_code=e.status, detail=e.body') == 1, (
+            "a route still forwards a tenant 4xx verbatim — an agent 401 there "
+            "signs the user out"
+        )

@@ -127,6 +127,69 @@ async def _release_claim_drive(db: AsyncSession) -> None:
         logger.warning("[pool_service] could not release the claim drive lock")
 
 
+async def ensure_agent_api_key(user_id: str) -> Optional[str]:
+    """CAS-mint the per-tenant `agent_api_key` and COMMIT it, in its own short
+    transaction. Returns the committed key, or None if it could not be done.
+
+    Why a separate transaction rather than reordering the caller's commit
+    (D-5): the claim path holds `pg_advisory_xact_lock('pool_claim:<uid>')`,
+    which is transaction-scoped. Committing the caller's transaction to make
+    the key visible would RELEASE that lock before the bridge call, and the
+    lock is the thing that makes two near-simultaneous claims produce one bind
+    instead of two containers with different keys (the 2026-06-30 and
+    2026-07-01 double-bind incidents). A second session commits the key while
+    the first keeps the lock.
+
+    Deadlock-proof by construction, not by inspection: every call site reaches
+    this with no uncommitted write on the `agent_configs` row (the claim path
+    has done only SELECTs, or `activate_free_tier` has already committed), but
+    "no caller ever will" is not a property a future edit preserves. So the
+    UPDATE runs under a short `lock_timeout` and ANY failure — contention,
+    a non-Postgres dialect, a DB blip — answers None and the caller falls back
+    to the in-transaction CAS, i.e. to exactly today's behaviour.
+
+    Safe to leave behind on a failed claim: the key is idempotent once set
+    (`WHERE agent_api_key IS NULL`), and a committed key with no bind is
+    strictly better than the state it replaces — the platform holding NULL
+    while the agent already holds K.
+    """
+    try:
+        from app.db.database import async_session_maker, get_engine
+        from sqlalchemy import update as _sa_update, text as _text
+
+        candidate = secrets.token_urlsafe(48)
+        async with async_session_maker() as kdb:
+            if get_engine().dialect.name == "postgresql":
+                await kdb.execute(_text("SET LOCAL lock_timeout = '2s'"))
+            await kdb.execute(
+                _sa_update(AgentConfig)
+                .where(
+                    AgentConfig.user_id == user_id,
+                    AgentConfig.agent_api_key.is_(None),
+                )
+                .values(agent_api_key=candidate)
+            )
+            await kdb.commit()
+            # Re-read rather than trusting `candidate`: the CAS is designed so
+            # exactly ONE racer sets the key and every racer reads back the
+            # SAME winning value. Returning our own candidate after losing the
+            # race is how the platform and the routed container end up holding
+            # different keys.
+            key = (await kdb.execute(
+                select(AgentConfig.agent_api_key).where(
+                    AgentConfig.user_id == user_id
+                )
+            )).scalar_one_or_none()
+        return key or None
+    except Exception as e:                              # noqa: BLE001
+        logger.info(
+            "[pool_service] pre-commit key mint unavailable for %s (%s) — "
+            "falling back to the in-transaction CAS",
+            str(user_id)[:8], type(e).__name__,
+        )
+        return None
+
+
 async def _build_bind_payload(
     db: AsyncSession,
     user_id: str,
@@ -165,6 +228,32 @@ async def _build_bind_payload(
     # routed container can always verify the session JWT. Idempotent once set.
     agent_api_key = agent_config.agent_api_key
     if not agent_api_key:
+        # COMMITTED BEFORE THE PUSH (D-5, 2026-09-12). The CAS used to run on
+        # the caller's transaction, which does not commit until AFTER the
+        # bridge call — and the bridge's `/v1/pool/claim` reaches the agent's
+        # `/api/admin/bind`, whose handler calls `ensure_mcp_initialized`
+        # SYNCHRONOUSLY. That fires `POST /api/mcp/mcp` inside the uncommitted
+        # window, `MCPAuthMiddleware` resolves `X-Agent-Key` with a fresh,
+        # deliberately UNCACHED read, sees nothing, and 401s. Measured on
+        # 12 Sep: key pushed 19:12:38.70, committed ~19:12:40.3, first MCP
+        # request 19:12:40.142 — inside it. `mcp_tools_cache` then fell back
+        # to an empty "stale" list and the agent ran with ZERO connector tools
+        # until 19:14:02, 82 s later. ~1.7 s per claim in the healthy case,
+        # and hit EVERY time because the bind handler fires immediately.
+        #
+        # Committed in its OWN short transaction, not by committing the
+        # caller's: the caller holds `pg_advisory_xact_lock('pool_claim:<uid>')`
+        # and that lock is xact-scoped, so committing there would release the
+        # very guard that makes two racing replicas produce one bind (the
+        # 2026-06-30 double-bind incident). A second session leaves it held.
+        minted = await ensure_agent_api_key(user_id)
+        if minted:
+            agent_api_key = minted
+            agent_config.agent_api_key = minted
+    if not agent_api_key:
+        # Fallback: the separate-session mint could not run (SQLite in tests,
+        # a lock timeout, a DB blip). Behave exactly as before — a key that is
+        # late-visible is still far better than no key at all.
         from sqlalchemy import update as _sa_update
         candidate = secrets.token_urlsafe(48)
         await db.execute(
@@ -197,6 +286,23 @@ async def _build_bind_payload(
         payload["user_name"] = _user_name
     if _user_email:
         payload["user_email"] = _user_email
+
+    # `users.timezone` is authority='tenant' (db/models/base.py), but the
+    # PLATFORM is where it is first LEARNED — the web captures it via Intl on
+    # boot and PATCHes /auth/profile. Without carrying it, a pool tenant's
+    # `users.timezone` stays NULL until its first web/mobile WS turn, and
+    # every tz-less channel (WhatsApp, Telegram, voice, routines) buckets its
+    # day in UTC — which is how a WhatsApp message at 01:40 UTC landed in a
+    # day chat dated tomorrow (2026-09-14). The key is `user_timezone`, NOT
+    # `timezone`: runtime_identity._get falls back to os.environ[KEY.upper()]
+    # and TIMEZONE/TZ are real container env vars.
+    #
+    # A falsy platform value emits NO key at all, which is what makes "never
+    # overwrite a non-null tenant value with null" structurally true on the
+    # receiving side rather than a promise.
+    _user_tz = (getattr(_u_row, "timezone", None) or "").strip() if _u_row else ""
+    if _user_tz:
+        payload["user_timezone"] = _user_tz
 
     # Channel + identity fields — same set as
     # `_agent_config_to_bridge_body` in docker_host_service. Pulled
@@ -978,16 +1084,179 @@ RECLAIM_FRESH_SIGNUP_WINDOW_DAYS = 30
 # for that user — a permanent dead-end unless something unsticks it.
 RECLAIM_PROVISIONING_STALE_MIN = 15
 
-# Authenticated-sweep strike ledger: consecutive 5xx/timeout probe failures
-# per user id. In-memory on purpose — a platform redeploy resets strikes,
-# which only delays a restart by one 180s tick. Two consecutive sick ticks
-# (≈6 min genuinely unresponsive) before restarting keeps one slow request
-# or GC pause from bouncing a healthy container.
-_PROBE_STRIKES: dict = {}
 PROBE_STRIKES_BEFORE_RESTART = 2
 # Restart at most N containers per tick — a sweep must never become a
 # restart storm (mass failures are guarded separately by the quorum check).
 RESTARTS_PER_TICK = 2
+# …and at most this many restarts for ONE user inside a rolling hour, across
+# replicas and across redeploys. The bridge's `tenant_health` already caps
+# itself at 3 per 1800 s and then logs "CRASH-LOOP … giving up"; on 12 Sep the
+# platform's UNCAPPED restarter overrode that cap every 195 s and re-fired its
+# give-up alert three times. The one safety device in the system that said
+# "stop" was defeated by a loop that had never heard of it (L3-5).
+MAX_RESTARTS_PER_USER_PER_HOUR = 3
+RESTART_WINDOW_S = 3600
+
+# After this many consecutive deferred ticks against one subject, the
+# per-subject alert escalates from "watching for convergence" to critical
+# "healing is NOT happening — needs operator reconciliation".
+KEYLESS_NAMED_ESCALATE_TICKS = 3
+
+
+# ── Sweep safety state (agent_probe_state) ────────────────────────────
+#
+# This was two module-level dicts, `_PROBE_STRIKES` and `_KEYLESS_NAMED_TICKS`,
+# and the 2026-09-12 incident is what per-process state costs (L3-11, §11.3):
+#
+#   * "two CONSECUTIVE sick ticks before a restart" was really "two ticks on
+#     EITHER replica", so a genuinely sick container restarted at twice the
+#     intended rate;
+#   * every Railway redeploy reset the safety state, so no cap could ever be
+#     reached across a deploy;
+#   * and the one sentence an operator needed — "f261b564: 46th consecutive
+#     tick, class=401, 0 successful probes since 19:12" — lived in one
+#     process's memory and in no query. `SELECT * FROM agent_probe_state WHERE
+#     consecutive_failures > 3` is the dashboard that did not exist.
+#
+# Read-modify-write is safe here WITHOUT row locking for one reason and only
+# one: the sweep runs under the `container_reconciler` lease, so exactly one
+# replica executes it per tick. If that gate is ever removed, this needs a CAS.
+
+
+def _probe_state_blank(uid: str) -> dict:
+    return {
+        "user_id": str(uid),
+        "consecutive_failures": 0,
+        "last_class": None,
+        "restarts_in_window": 0,
+        "restart_window_started_at": None,
+        "first_seen_at": None,
+        "escalated_at": None,
+        "dirty": False,
+        "delete": False,
+    }
+
+
+async def _probe_state_load(uids: list) -> dict:
+    """Load every row this tick could touch, in one query. Never raises —
+    an unreadable state table must degrade the sweep's MEMORY, never its
+    safety: with a blank state nothing has strikes, so nothing restarts."""
+    out = {str(u): _probe_state_blank(u) for u in uids}
+    if not uids:
+        return out
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import AgentProbeState
+        async with async_session_maker() as db:
+            rows = (await db.execute(
+                select(AgentProbeState).where(
+                    AgentProbeState.user_id.in_([str(u) for u in uids])
+                )
+            )).scalars().all()
+        for r in rows:
+            out[str(r.user_id)] = {
+                "user_id": str(r.user_id),
+                "consecutive_failures": int(r.consecutive_failures or 0),
+                "last_class": r.last_class,
+                "restarts_in_window": int(r.restarts_in_window or 0),
+                "restart_window_started_at": r.restart_window_started_at,
+                "first_seen_at": r.first_seen_at,
+                "escalated_at": r.escalated_at,
+                "dirty": False,
+                "delete": False,
+            }
+    except Exception:
+        logger.warning("[pool-reclaim] probe-state load failed; this tick runs "
+                       "with no memory", exc_info=True)
+    return out
+
+
+async def _probe_state_flush(states: dict) -> None:
+    """Persist the rows this tick changed. Never raises."""
+    changed = [s for s in states.values() if s.get("dirty") or s.get("delete")]
+    if not changed:
+        return
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import AgentProbeState
+        from sqlalchemy import delete as _delete
+        now = datetime.utcnow()
+        async with async_session_maker() as db:
+            for s in changed:
+                uid = s["user_id"]
+                if s.get("delete"):
+                    await db.execute(
+                        _delete(AgentProbeState).where(
+                            AgentProbeState.user_id == uid
+                        )
+                    )
+                    continue
+                row = (await db.execute(
+                    select(AgentProbeState).where(AgentProbeState.user_id == uid)
+                )).scalar_one_or_none()
+                if row is None:
+                    row = AgentProbeState(user_id=uid)
+                    db.add(row)
+                row.consecutive_failures = int(s["consecutive_failures"])
+                row.last_class = s["last_class"]
+                row.restarts_in_window = int(s["restarts_in_window"])
+                row.restart_window_started_at = s["restart_window_started_at"]
+                row.first_seen_at = s["first_seen_at"]
+                row.escalated_at = s["escalated_at"]
+                row.updated_at = now
+            await db.commit()
+    except Exception:
+        logger.warning("[pool-reclaim] probe-state flush failed; strikes and "
+                       "restart caps fall back to this tick only", exc_info=True)
+
+
+def _probe_state_ok(st: dict) -> None:
+    """A 200. The streak is over — drop the row rather than keep a zero."""
+    if (st["consecutive_failures"] or st["last_class"] or st["first_seen_at"]
+            or st["escalated_at"] or st["restarts_in_window"]):
+        st["delete"] = True
+
+
+def _probe_state_fail(st: dict, cls: str) -> dict:
+    """Record one non-200 sweep of class `cls`. Returns the mutated state."""
+    now = datetime.utcnow()
+    if st["last_class"] != cls:
+        # A different failure class is a different fault. Start the streak
+        # again so "46 consecutive 401s" can never be 20 timeouts plus 26 401s.
+        st["consecutive_failures"] = 0
+        st["first_seen_at"] = now
+        st["escalated_at"] = None
+    st["consecutive_failures"] = int(st["consecutive_failures"]) + 1
+    st["last_class"] = cls
+    if st["first_seen_at"] is None:
+        st["first_seen_at"] = now
+    st["dirty"] = True
+    return st
+
+
+def _restart_allowed(st: dict) -> bool:
+    """Is a restart for this user within MAX_RESTARTS_PER_USER_PER_HOUR?
+
+    The window is rolling-by-reset: it opens on the first restart and is
+    cleared once RESTART_WINDOW_S has passed since then. Crude on purpose —
+    the value of this cap is that it EXISTS and is shared across replicas and
+    redeploys, which the in-memory version never was.
+    """
+    now = datetime.utcnow()
+    started = st.get("restart_window_started_at")
+    if started is None or (now - started).total_seconds() >= RESTART_WINDOW_S:
+        return True
+    return int(st.get("restarts_in_window") or 0) < MAX_RESTARTS_PER_USER_PER_HOUR
+
+
+def _record_restart(st: dict) -> None:
+    now = datetime.utcnow()
+    started = st.get("restart_window_started_at")
+    if started is None or (now - started).total_seconds() >= RESTART_WINDOW_S:
+        st["restart_window_started_at"] = now
+        st["restarts_in_window"] = 0
+    st["restarts_in_window"] = int(st.get("restarts_in_window") or 0) + 1
+    st["dirty"] = True
 
 
 async def _restart_sick_container(user_id: str, container_name: str) -> bool:
@@ -1333,27 +1602,37 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
         transport_errors = sum(1 for _, _, s, _ in results if s is None)
         mass_failure = bool(results) and transport_errors > len(results) / 2
 
+        # Shared, durable strike/cap state. One query for every row this tick
+        # could touch; one flush at the end. Safe to read-modify-write without
+        # a row lock ONLY because the sweep is leader-gated (W1) — one replica
+        # per tick. See _probe_state_load.
+        states = await _probe_state_load([uid for uid, _, _, _ in results])
+
         keyless_pool: list = []
         keyless_named: list = []
         sick: list = []
         for uid, cname, status, err in results:
             is_pool = cname.startswith("toup-agent-pool-")
+            st = states.get(uid) or _probe_state_blank(uid)
+            states[uid] = st
             if status == 200:
-                _PROBE_STRIKES.pop(uid, None)
+                _probe_state_ok(st)
                 continue
             if status in (401, 403):
-                _PROBE_STRIKES.pop(uid, None)
-                (keyless_pool if is_pool else keyless_named).append((uid, cname))
+                _probe_state_fail(st, "401")
+                if is_pool:
+                    keyless_pool.append((uid, cname))
+                else:
+                    keyless_named.append((uid, cname))
                 continue
             if status is not None and status < 500:
                 # 404 etc. — routing, owned by the bridge route reconciler.
-                _PROBE_STRIKES.pop(uid, None)
+                _probe_state_fail(st, "4xx")
                 continue
             if mass_failure and status is None:
                 continue  # platform-egress blip; no per-agent strikes
-            strikes = _PROBE_STRIKES.get(uid, 0) + 1
-            _PROBE_STRIKES[uid] = strikes
-            if strikes >= PROBE_STRIKES_BEFORE_RESTART:
+            _probe_state_fail(st, "5xx" if status is not None else "transport")
+            if st["consecutive_failures"] >= PROBE_STRIKES_BEFORE_RESTART:
                 sick.append((uid, cname, status if status is not None else err))
 
         summary["keyless"] = len(keyless_pool) + len(keyless_named)
@@ -1394,51 +1673,180 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                     "[pool-reclaim] keyless re-bind failed user=%s: %s", uid[:8], e
                 )
 
-        # A named 401 can be an ownership split: the public route may still be
-        # a pool slot while the platform row/key says named. Restarting the
-        # named container can never repair that route and produced an endless
-        # two-replica restart loop in the 2026-09-12 incident. Preserve both
-        # databases for evidence-backed operator reconciliation.
-        for uid, cname in keyless_named[:RESTARTS_PER_TICK]:
+        # A named 401 is an OWNERSHIP question, and it is answerable: ask the
+        # bridge which container it believes owns this user and what Caddy
+        # dials for the hostname, then act only on what that says. Restarting
+        # the named container can never repair a platform-side row, which is
+        # why the pre-738 code restarted forever and the post-738 code deferred
+        # forever. Neither converged; this does, in one tick, for the one shape
+        # that produced the 12 Sep incident.
+        from app.services.alerting import send_infra_alert as _send_alert
+        for uid, cname in keyless_named:
+            st = states[uid]
+            ticks = st["consecutive_failures"]
+            outcome, ev = await _reconcile_named_401(uid, cname)
+            summary[f"named_401_{outcome}"] = (
+                summary.get(f"named_401_{outcome}", 0) + 1
+            )
+
+            if outcome == OWNERSHIP_ADOPT:
+                adopted = await _adopt_bridge_truth(uid, ev)
+                if adopted:
+                    summary["repaired"] = summary.get("repaired", 0) + 1
+                    _probe_state_ok(st)          # converged; drop the streak
+                    st["delete"] = True
+                    logger.warning(
+                        "[pool-reclaim] REPAIRED named/pool mismatch user=%s: "
+                        "platform row said %s, bridge says %s — adopted",
+                        uid[:8], cname, ev.get("pool_container"),
+                    )
+                    continue
+                summary["failed"] += 1
+                outcome = OWNERSHIP_UNKNOWN      # fall through to the alert
+
             summary["keyless_named_deferred"] = (
                 summary.get("keyless_named_deferred", 0) + 1
             )
             logger.warning(
-                "[pool-reclaim] named tenant 401 user=%s container=%s; "
-                "restart refused pending ownership reconciliation",
-                uid[:8], cname,
+                "[pool-reclaim] named tenant 401 user=%s container=%s "
+                "outcome=%s (tick %d) evidence=%s",
+                uid[:8], cname, outcome, ticks, ev,
             )
+            try:
+                if outcome == OWNERSHIP_AMBIGUOUS:
+                    # The state nobody owned. The bridge's route restorer
+                    # refuses it by design and reports it into a field that is
+                    # never logged; four accounts sat here for a day and one
+                    # went dark on the next Caddy restart with nothing paging.
+                    # This is that page.
+                    await _send_alert(
+                        "pool-ownership-ambiguous", "critical",
+                        f"{uid[:8]}: named AND pool ownership both present — "
+                        f"NOT acting. named_container="
+                        f"{ev.get('named_container')} db={ev.get('named_db')}; "
+                        f"pool_container={ev.get('pool_container')} "
+                        f"db={ev.get('pool_db')}; caddy_route="
+                        f"{ev.get('route_container') or ev.get('route_upstream')}; "
+                        f"platform_row={ev.get('platform_container')}. "
+                        f"401 for {ticks} consecutive ticks. Only an operator "
+                        "can decide which database holds this user's life.",
+                        subject=uid[:8],
+                    )
+                    st["escalated_at"] = st["escalated_at"] or datetime.utcnow()
+                    st["dirty"] = True
+                elif outcome == OWNERSHIP_NO_BIND:
+                    # NEVER force-claim here. An established user with no
+                    # bridge bind is an escalation, not a re-claim: a
+                    # force-claim binds an empty database (R40).
+                    await _send_alert(
+                        "pool-selfheal-stuck", "critical",
+                        f"{uid[:8]} answered 401/403 for {ticks} consecutive "
+                        f"ticks (container={cname}) and the bridge reports NO "
+                        "bind for this user at all. NOT re-claiming — a "
+                        "force-claim would bind an established account to a "
+                        "fresh empty slot. Needs an operator.",
+                        subject=uid[:8],
+                    )
+                    st["escalated_at"] = st["escalated_at"] or datetime.utcnow()
+                    st["dirty"] = True
+                elif ticks >= KEYLESS_NAMED_ESCALATE_TICKS:
+                    await _send_alert(
+                        "pool-selfheal-stuck", "critical",
+                        f"NOT healing: {uid[:8]} has answered 401/403 for {ticks} "
+                        f"consecutive reconciliation ticks (container={cname}, "
+                        f"since {st.get('first_seen_at')}). Bridge ownership "
+                        f"evidence: {ev}. A restart cannot repair a platform "
+                        "key/route mismatch — this needs operator "
+                        "reconciliation of named/pool ownership.",
+                        subject=uid[:8],
+                    )
+                    st["escalated_at"] = st["escalated_at"] or datetime.utcnow()
+                    st["dirty"] = True
+                else:
+                    await _send_alert(
+                        "pool-selfheal-stuck", "warning",
+                        f"{uid[:8]} answered 401/403 (container={cname}); restart "
+                        f"REFUSED — a restart can't fix a key/route mismatch. "
+                        f"Tick {ticks}; watching for convergence.",
+                        subject=uid[:8],
+                    )
+            except Exception:
+                pass
 
-        # Sick (2 consecutive 5xx/timeout ticks) → restart via bridge.
+        # Sick (2 consecutive 5xx/timeout ticks) → restart via bridge, bounded
+        # per tick AND per user per hour. The per-user cap is the half that was
+        # missing: the bridge caps itself at 3 restarts per 1800 s and then
+        # gives up loudly, and the platform's uncapped restarter overrode that
+        # every 195 s while re-firing the bridge's give-up alert (L3-5).
         for uid, cname, why in sick[:RESTARTS_PER_TICK]:
+            st = states[uid]
+            if not _restart_allowed(st):
+                summary["restart_capped"] = summary.get("restart_capped", 0) + 1
+                logger.warning(
+                    "[pool-reclaim] restart CAPPED for user=%s container=%s "
+                    "(%d in the last hour, max %d) — still probing so recovery "
+                    "is noticed", uid[:8], cname,
+                    st.get("restarts_in_window") or 0,
+                    MAX_RESTARTS_PER_USER_PER_HOUR,
+                )
+                if not st.get("escalated_at"):
+                    st["escalated_at"] = datetime.utcnow()
+                    st["dirty"] = True
+                    try:
+                        await _send_alert(
+                            "pool-selfheal-stuck", "critical",
+                            f"{uid[:8]} is still {why} after "
+                            f"{MAX_RESTARTS_PER_USER_PER_HOUR} restarts in an "
+                            f"hour (container={cname}). Restarting has stopped; "
+                            "probing continues. A container that does not come "
+                            "back from three restarts needs an operator.",
+                            subject=uid[:8],
+                        )
+                    except Exception:
+                        pass
+                continue
             ok = await _restart_sick_container(uid, cname)
-            _PROBE_STRIKES.pop(uid, None)
+            _record_restart(st)
+            st["consecutive_failures"] = 0
+            st["dirty"] = True
             summary["restarted"] = summary.get("restarted", 0) + (1 if ok else 0)
             logger.warning(
                 "[pool-reclaim] restarted sick agent user=%s container=%s "
                 "(reason=%s) ok=%s", uid[:8], cname, why, ok,
             )
+
+        await _probe_state_flush(states)
     except Exception:
         logger.exception("[pool-reclaim] authenticated sweep failed")
 
     # Law 4: healing is good; REPEATED healing means something upstream broke.
-    # Tell the operator whenever a self-heal actually fired (rate-limited so a
-    # flapping loop can't flood the chat).
+    # The rollup distinguishes actions REQUESTED (a claim/rebind/restart that
+    # returned 2xx) from state OBSERVED (probe classes this tick). A
+    # keyless_named_deferred entry was NOT healed — calling it "healed" is the
+    # exact lie PR 738 removed — so it lives under "observed", and the stuck
+    # subjects behind it are alerted PER-SUBJECT (with a consecutive-tick count
+    # and a critical escalation) in the loop above.
     try:
-        activity = {
-            k: v for k, v in summary.items()
-            if k in (
-                "claimed", "rebound", "restarted", "keyless", "sick",
-                "failed", "keyless_named_deferred",
-            ) and v
+        requested = {
+            k: summary[k] for k in ("claimed", "rebound", "restarted")
+            if summary.get(k)
         }
-        if activity:
+        observed = {
+            k: summary[k]
+            for k in ("keyless", "sick", "keyless_named_deferred", "failed")
+            if summary.get(k)
+        }
+        if requested or observed:
             from app.services.alerting import send_infra_alert
             await send_infra_alert(
                 "pool-selfheal", "warning",
-                f"Reconciliation activity: {activity}. Action counts confirm only "
+                f"Reconciliation tick — requested: {requested or '{}'}; "
+                f"observed: {observed or '{}'}. 'requested' counts confirm only "
                 "that a claim/rebind/restart request succeeded; end-user chat "
-                "readiness still requires verification.",
+                "readiness still requires verification. 'observed' are probe "
+                "states this tick — keyless_named_deferred entries were NOT "
+                "healed (a restart cannot fix a key/route mismatch) and are "
+                "alerted per-subject.",
             )
     except Exception:
         pass
@@ -1580,6 +1988,322 @@ def signup_trace(
 _POOL_LIST_CACHE: dict = {"ts": -1e9, "data": None}
 _POOL_LIST_LOCK: Optional[asyncio.Lock] = None
 _WHOIS_UNAVAILABLE = False
+_TENANT_TRUTH_UNAVAILABLE = False
+
+
+# ── Ownership truth (GET /v1/pool/tenant-truth) ───────────────────────
+#
+# The 4xx branch of the sweep used to defer routing to the bridge's route
+# reconciler, and the bridge's route reconciler refuses to act on exactly this
+# class of account (`named_and_pool_ownership_ambiguous`). Two healers, each
+# correctly deferring to the other, is zero healers — and four accounts sat in
+# that hole, one of which went dark on 13 Sep 01:59 with nothing paging (L3-3,
+# L3 §5). The platform's authenticated probe is the only thing that can see
+# "the key I hold does not open the door this hostname leads to"; to act on it
+# safely it needs to know WHICH container legitimately owns the user, and the
+# bridge is the authority on that.
+
+OWNERSHIP_ADOPT = "adopt"
+OWNERSHIP_AMBIGUOUS = "ambiguous"
+OWNERSHIP_NO_BIND = "no_bind"
+OWNERSHIP_UNKNOWN = "unknown"
+
+
+def _first_str(body: dict, *keys: str) -> Optional[str]:
+    for k in keys:
+        v = body.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _tenant_truth_view(body: dict) -> Optional[dict]:
+    """Normalise `/v1/pool/tenant-truth` into the four facts this decision
+    needs. Returns None when the body carries none of them.
+
+    Tolerant of spelling because the bridge is another lane's code and is not
+    in this repository — but never GUESSES. An unrecognised body answers None,
+    which routes to OWNERSHIP_UNKNOWN, which does nothing and alerts. The
+    alternative (assume "no named container" from a body we could not read)
+    would authorise an adopt on the strength of a parse failure, and this
+    branch's whole purpose is to stop acting on beliefs we cannot evidence.
+    """
+    if not isinstance(body, dict):
+        return None
+    pool = body.get("pool") if isinstance(body.get("pool"), dict) else {}
+    named = body.get("named") if isinstance(body.get("named"), dict) else {}
+    route = body.get("route") if isinstance(body.get("route"), dict) else {}
+
+    view = {
+        "prefix": _first_str(body, "prefix", "tenant", "user_prefix"),
+        "pool_container": (
+            _first_str(pool, "container_name", "container", "name")
+            or _first_str(body, "pool_container", "pool_container_name")
+        ),
+        "pool_db": (
+            _first_str(pool, "db_name", "db", "db_pool_slot")
+            or _first_str(body, "pool_db", "pool_db_name")
+        ),
+        "named_container": (
+            _first_str(named, "container_name", "container", "name")
+            or _first_str(body, "named_container", "named_container_name")
+        ),
+        "named_db": (
+            _first_str(named, "db_name", "db")
+            or _first_str(body, "named_db", "named_db_name")
+        ),
+        "route_container": (
+            _first_str(route, "container_name", "container", "upstream_container")
+            or _first_str(body, "route_container", "route_target_container")
+        ),
+        "route_upstream": (
+            _first_str(route, "upstream", "target", "dial")
+            or _first_str(body, "route_upstream", "route_target")
+        ),
+    }
+    if not any(view[k] for k in
+               ("pool_container", "named_container", "route_container",
+                "route_upstream")):
+        # The bridge may legitimately answer "I know this prefix and it has
+        # nothing" — but only if it SAYS so. An explicit empty answer is an
+        # answer; a body we could not read is not.
+        if body.get("found") is False or body.get("known") is True:
+            return view
+        return None
+    return view
+
+
+async def bridge_tenant_truth(
+    prefix: str, *, timeout_s: Optional[float] = None,
+) -> Optional[dict]:
+    """ADAPTER. `GET /v1/pool/tenant-truth?prefix=…` — the bridge's own view of
+    which container owns a tenant prefix and what Caddy dials for it.
+
+    Returns the normalised view, or None when the bridge cannot answer, does
+    not implement the route, or answers something this adapter cannot read.
+    None means "no evidence", never "no named container". Never raises — every
+    caller's safe action on no-evidence is to do nothing and alert.
+    """
+    global _TENANT_TRUTH_UNAVAILABLE
+    if _TENANT_TRUTH_UNAVAILABLE:
+        return None
+    if timeout_s is None:
+        timeout_s = float(
+            getattr(settings, "provision_discovery_read_timeout_s", 8) or 8
+        )
+    route = (
+        getattr(settings, "bridge_tenant_truth_route", "/v1/pool/tenant-truth")
+        or ""
+    ).strip()
+    if not route:
+        return None
+    try:
+        from app.services.docker_host_service import get_bridge_client
+        client = await get_bridge_client()
+        r = await client.get(
+            route, params={"prefix": str(prefix)}, timeout=timeout_s,
+        )
+        if r.status_code in (404, 405, 501):
+            # Configured but not deployed. Degrade ONCE, not once per subject
+            # per tick — 79 rows x 2 replicas x every 195 s is a lot of 404s.
+            _TENANT_TRUTH_UNAVAILABLE = True
+            logger.info(
+                "[pool-reclaim] bridge tenant-truth route not deployed (%s) — "
+                "named-401 repair degrades to alert-only", r.status_code,
+            )
+            return None
+        r.raise_for_status()
+        return _tenant_truth_view(r.json() or {})
+    except Exception as e:
+        logger.info(
+            "[pool-reclaim] tenant-truth read failed for %s: %s",
+            str(prefix)[:8], type(e).__name__,
+        )
+        return None
+
+
+def classify_named_401_ownership(
+    *,
+    platform_container: Optional[str],
+    slot: Optional[dict],
+    truth: Optional[dict],
+) -> tuple:
+    """Decide what a NAMED tenant's 401 means. Pure — the whole point.
+
+    Returns `(outcome, evidence)`. Three actionable outcomes and one
+    deliberate non-answer:
+
+      * ADOPT     — the bridge reports a POOL bind for this user, reports NO
+                    named container for the prefix, the Caddy route (when it
+                    reports one) names that same pool container, and the
+                    platform row names something ELSE. The platform is simply
+                    wrong; adopting the bridge's answer converges in one tick.
+                    This is the 12 Sep shape, and this branch would have ended
+                    that incident at 19:18.
+      * AMBIGUOUS — the bridge reports BOTH a pool bind and a named container
+                    for the prefix. Two databases, two candidate owners, and
+                    only a human can say which one holds the user's life. Do
+                    NOT act; page with both container names and both DB names.
+      * NO_BIND   — the bridge has no bind at all. A force-claim here binds an
+                    established user to a fresh EMPTY slot (R40), so this is an
+                    escalation, never a re-claim.
+      * UNKNOWN   — no evidence. Defer and alert, exactly as wave 1 did.
+    """
+    if truth is None:
+        return OWNERSHIP_UNKNOWN, {"reason": "no_bridge_truth"}
+
+    pool_c = truth.get("pool_container") or (
+        (slot or {}).get("container_name")
+        if str((slot or {}).get("container_name") or "").startswith(
+            "toup-agent-pool-")
+        else None
+    )
+    named_c = truth.get("named_container")
+    route_c = truth.get("route_container")
+    ev = {
+        "pool_container": pool_c,
+        "pool_db": truth.get("pool_db") or (slot or {}).get("db_name"),
+        "named_container": named_c,
+        "named_db": truth.get("named_db"),
+        "route_container": route_c,
+        "route_upstream": truth.get("route_upstream"),
+        "platform_container": platform_container,
+    }
+
+    if pool_c and named_c:
+        return OWNERSHIP_AMBIGUOUS, ev
+    if not pool_c and not named_c:
+        return OWNERSHIP_NO_BIND, ev
+    if not pool_c:
+        # A named container the bridge owns, and the platform row may or may
+        # not name it. Neither adopt (claim_for_user binds a POOL slot) nor
+        # "no bind" applies; an operator owns a named tenant's key drift.
+        return OWNERSHIP_UNKNOWN, dict(ev, reason="named_only")
+    if route_c and route_c != pool_c:
+        # The route disagrees with the bind. That IS the split, even though
+        # only one side reported a container.
+        return OWNERSHIP_AMBIGUOUS, dict(ev, reason="route_disagrees_with_bind")
+    if platform_container and platform_container == pool_c:
+        # Everyone already agrees on the container; the 401 is a key fault on
+        # a correctly-mapped pool member — the `keyless_pool` branch's job, and
+        # this row would not be here unless the name were mis-classified.
+        return OWNERSHIP_UNKNOWN, dict(ev, reason="platform_already_agrees")
+    return OWNERSHIP_ADOPT, ev
+
+
+async def _reconcile_named_401(user_id: str, container_name: str) -> tuple:
+    """Gather the bridge's ownership evidence for one named-401 subject and
+    classify it. Never raises: every read failure becomes "no evidence"."""
+    prefix = str(user_id)[:8]
+    slot = None
+    try:
+        slot = await bridge_lookup_user_slot(user_id)
+    except Exception as e:
+        # A raise means the bridge did not ANSWER (transport), which is not the
+        # same as "no bind" — `bridge_lookup_user_slot` draws that distinction
+        # deliberately and this branch must preserve it.
+        logger.info(
+            "[pool-reclaim] whois unavailable for %s: %s", prefix, type(e).__name__,
+        )
+    truth = await bridge_tenant_truth(prefix)
+    return classify_named_401_ownership(
+        platform_container=container_name or None, slot=slot, truth=truth,
+    )
+
+
+_IDENTITY_REPAIR_LOCKS: dict = {}
+
+
+async def reconcile_agent_identity(user_id: str) -> str:
+    """Ownership-aware repair for ONE user, callable off the chat path.
+
+    Returns the outcome string (`adopt` once repaired, else `ambiguous`,
+    `no_bind` or `unknown`). Single-flighted per user: two replicas hit this
+    simultaneously on a first message, as they did all through 12 Sep.
+
+    DIRECTION, and this is the invariant the chat path must never violate
+    (L4 skeptic C4): this ADOPTS the container the BRIDGE says owns the user
+    INTO the platform row. It never pushes the platform's stored key at
+    whatever the route happens to hit. At 19:14:42 on 12 Sep the route pointed
+    at pool-81 while the platform held the NAMED key; the other direction
+    would have bound that named key onto a live pool member and manufactured
+    the ambiguous-ownership state an operator then had to unpick by hand — a
+    fix that creates the P0 it is fixing.
+
+    Deliberately does NOT force-claim on any outcome. A force-claim binds an
+    established account to a fresh empty slot when the bridge has no bind
+    (R40), and for a correctly-mapped pool member with a stale key the sweep's
+    own `keyless_pool` branch is already the repair, on a 15 s cadence.
+    """
+    uid = str(user_id)
+    lock = _IDENTITY_REPAIR_LOCKS.get(uid)
+    if lock is None:
+        lock = _IDENTITY_REPAIR_LOCKS[uid] = asyncio.Lock()
+    async with lock:
+        try:
+            from app.db.database import async_session_maker
+            async with async_session_maker() as db:
+                mc = (await db.execute(
+                    select(ManagedContainer).where(
+                        ManagedContainer.user_id == uid
+                    )
+                )).scalar_one_or_none()
+            cname = (mc.container_name if mc else "") or ""
+            outcome, ev = await _reconcile_named_401(uid, cname)
+            if outcome == OWNERSHIP_ADOPT:
+                if await _adopt_bridge_truth(uid, ev):
+                    logger.warning(
+                        "[identity-repair] user=%s adopted %s over platform "
+                        "row %s", uid[:8], ev.get("pool_container"), cname,
+                    )
+                    return OWNERSHIP_ADOPT
+                return OWNERSHIP_UNKNOWN
+            logger.info(
+                "[identity-repair] user=%s outcome=%s — not acting (%s)",
+                uid[:8], outcome, ev,
+            )
+            return outcome
+        except Exception:
+            logger.warning(
+                "[identity-repair] user=%s failed", uid[:8], exc_info=True,
+            )
+            return OWNERSHIP_UNKNOWN
+        finally:
+            if len(_IDENTITY_REPAIR_LOCKS) > 512:
+                _IDENTITY_REPAIR_LOCKS.clear()
+
+
+async def _adopt_bridge_truth(user_id: str, evidence: dict) -> bool:
+    """Rewrite the platform row from the bridge's answer.
+
+    DIRECTION IS THE WHOLE POINT (L4 skeptic C4). This adopts the ROUTED
+    container's identity INTO the platform row. It never pushes the platform's
+    stored belief at whatever the route happens to hit: on 12 Sep the route
+    pointed at pool-81 while the platform held the NAMED key, and binding that
+    named key onto a live pool member would have manufactured the very
+    ambiguous-ownership state an operator then had to unpick by hand.
+    """
+    container = evidence.get("pool_container")
+    if not container:
+        return False
+    slot = {
+        "container_name": container,
+        "db_name": evidence.get("pool_db"),
+        "state": "ASSIGNED",
+        "bound": True,
+        "prefix": str(user_id)[:8],
+    }
+    try:
+        url = await _adopt_discovered_bind(
+            user_id, slot, bridge_confirmed_sole_owner=True,
+        )
+    except Exception:
+        logger.warning(
+            "[pool-reclaim] adopt from bridge truth failed for %s",
+            str(user_id)[:8], exc_info=True,
+        )
+        return False
+    return bool(url)
 
 
 def _pool_list_lock() -> asyncio.Lock:
@@ -1756,7 +2480,9 @@ def _is_named_container(name: Optional[str]) -> bool:
     return n.startswith("toup-agent-") and not n.startswith("toup-agent-pool-")
 
 
-async def _adopt_discovered_bind(user_id: str, slot: dict) -> Optional[str]:
+async def _adopt_discovered_bind(
+    user_id: str, slot: dict, *, bridge_confirmed_sole_owner: bool = False,
+) -> Optional[str]:
     """Adopt a bind the bridge has confirmed, through the SAME path
     `[pool-reclaim] healed stranded` uses: `claim_for_user`.
 
@@ -1788,7 +2514,7 @@ async def _adopt_discovered_bind(user_id: str, slot: dict) -> Optional[str]:
             # image of this refusal). An operator owns that migration.
             if mc is not None and _is_named_container(mc.container_name) and (
                 slot.get("container_name") != mc.container_name
-            ):
+            ) and not bridge_confirmed_sole_owner:
                 logger.error(
                     "[discovery] user=%s bridge reports pool slot %s while the "
                     "platform row names %s. NOT adopting — a named tenant's data "
@@ -1796,6 +2522,26 @@ async def _adopt_discovered_bind(user_id: str, slot: dict) -> Optional[str]:
                     str(user_id)[:8], slot.get("container_name"), mc.container_name,
                 )
                 return None
+            if bridge_confirmed_sole_owner and mc is not None and (
+                _is_named_container(mc.container_name)
+            ):
+                # The ONE way past the refusal above, and it is not a weakening
+                # of it: the caller has asked the bridge for the prefix's
+                # ownership and been told there is NO named container — the
+                # platform row names a container that does not exist, so there
+                # is no second database to lose. `classify_named_401_ownership`
+                # is the only producer of that evidence and it answers
+                # AMBIGUOUS (which never reaches here) the moment a named
+                # container IS reported. Keep those two facts together: a
+                # caller that sets this flag without the tenant-truth read is
+                # re-opening the R40 data-loss door.
+                logger.warning(
+                    "[discovery] user=%s adopting bridge truth %s over a "
+                    "platform row naming %s — the bridge reports NO named "
+                    "container for this prefix",
+                    str(user_id)[:8], slot.get("container_name"),
+                    mc.container_name,
+                )
 
             # A row wedged at 'provisioning' short-circuits every future
             # claim_for_user (its existing-row check returns it untouched), and

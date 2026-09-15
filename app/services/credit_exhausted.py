@@ -52,6 +52,13 @@ REASON_INSUFFICIENT_MESSAGE = "insufficient_message_credits"
 REASON_INSUFFICIENT_INTEGRATION = "insufficient_integration_credits"
 REASON_DAILY_CAP_EXCEEDED = "daily_cap_exceeded"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
+# The UNLIMITED rate ladder's last resort (unlimited_abuse, design §7). It is
+# a DEDICATED reason code and not one of the four above, because every one of
+# those means "you have run out of something you can buy more of" and this
+# means "you are going faster than we can serve, for a few seconds". Reusing
+# `insufficient_message_credits` for it would tell an unlimited subscriber
+# that their unlimited plan ran out — a lie, delivered with a price tag.
+REASON_RATE_LIMITED = "rate_limited"
 
 
 @dataclass
@@ -82,6 +89,16 @@ class ExhaustedResponse:
     # join with their base URL or wrap in a deep-link signer.
     cta_label: str = "Upgrade plan"
     cta_url: str = "/pricing"
+    # True when this response must carry NO call to action at all — set for
+    # REASON_RATE_LIMITED, where there is nothing to buy and nothing to fix.
+    #
+    # It exists as its own flag because BOTH shipped clients fall back on a
+    # falsy value: `payload.cta_url || '/pricing'` and
+    # `payload.cta_label || 'Upgrade plan'` (CreditExhaustedCard.tsx:163-166,
+    # ChatPage.tsx:2654-2655). So blanking the two fields does not remove the
+    # paywall button, it RESTORES it. A client that does not know this flag
+    # still gets the neutral label/url pair set below rather than "/pricing".
+    cta_hidden: bool = False
     # Free-form text the channel can use directly (Telegram, voice).
     message: str = ""
 
@@ -168,6 +185,18 @@ def format_message_text(
             "Please verify your email before continuing. Check your "
             "inbox for the verification link — once confirmed, your "
             "credits unlock immediately."
+        )
+
+    if reason == REASON_RATE_LIMITED:
+        # The ONLY copy in this module with no billing language in it, and
+        # that is the whole point: this fires on an account that is never
+        # denied and never charged, so a price, a plan name, a credit count
+        # or an upgrade link would each be a lie. Pinned by
+        # tests/test_credit_exhausted_copy.py::
+        # test_rate_limited_copy_has_no_billing_language.
+        return (
+            "You're going faster than we can serve right now. Give it a "
+            "few seconds and try again."
         )
 
     if reason == REASON_DAILY_CAP_EXCEEDED and daily_reset_at is not None:
@@ -344,6 +373,10 @@ def build_exhausted_response(
         balance_after=balance_after,
     )
 
+    # A rate-limited turn has nothing to buy and nothing to fix, so it carries
+    # no CTA. The neutral label/url pair is for clients that predate
+    # `cta_hidden` and would otherwise fall back to "Upgrade plan" → /pricing.
+    rate_limited = reason == REASON_RATE_LIMITED
     return ExhaustedResponse(
         reason=reason,
         bucket=bucket,
@@ -352,8 +385,9 @@ def build_exhausted_response(
         plan_display_name=plan_display_name,
         monthly_reset_at=monthly_reset_at,
         daily_reset_at=daily_reset_at,
-        cta_label="Upgrade plan",
-        cta_url="/pricing",
+        cta_label="Try again" if rate_limited else "Upgrade plan",
+        cta_url="#retry" if rate_limited else "/pricing",
+        cta_hidden=rate_limited,
         message=message,
     )
 
@@ -376,6 +410,7 @@ def response_to_http_detail(resp: ExhaustedResponse) -> dict:
         "daily_reset_at": resp.daily_reset_at.isoformat() if resp.daily_reset_at else None,
         "cta_label": resp.cta_label,
         "cta_url": resp.cta_url,
+        "cta_hidden": resp.cta_hidden,
         "message": resp.message,
     }
 
@@ -385,7 +420,33 @@ def response_to_stream_event(resp: ExhaustedResponse) -> dict:
 
     Used by agent_runner when an LLM service raises mid-stream so the
     chat client can render the same card as the proxy 402 path.
+
+    A RATE-LIMITED refusal does NOT ride that channel. `cta_hidden` mitigates
+    the two web clients, and only them: App Store build 109 does not read
+    `cta_hidden`, does not read `cta_label`/`cta_url` off the frame at all
+    (its own two readers are of a payload it synthesises itself), and renders
+    its own copy from `reason`. An unrecognised reason falls into
+    `blockedCopy`'s default branch, which is the app's HARDEST paywall —
+    headline "This needs a paid plan", body "Pick a plan and Ariya picks
+    straight back up.", CTA "See plans" — while `creditWallLine` replaces the
+    composer with "You're out of credits" and parks the user's message.
+    Shown to an Unlimited subscriber who is merely being paced. And the wall
+    only clears on `notifyCreditsReplenished()`, i.e. a purchase — which for
+    a `plan_source === 'iap'` account dead-ends on a screen that hides the
+    plan cards.
+
+    So a pacing refusal goes out as a plain `error` frame with no billing key,
+    which every client old and new renders neutrally. This mirrors what
+    ws_realtime already does on the voice path, and it is the same reasoning:
+    a client that cannot tell "slow down" from "you ran out" must not be sent
+    a frame that means the second.
     """
+    if resp.reason == REASON_RATE_LIMITED:
+        return {
+            "type": "error",
+            "code": REASON_RATE_LIMITED,
+            "message": resp.message,
+        }
     return {
         "type": "credit_exhausted",
         **response_to_http_detail(resp),

@@ -623,9 +623,9 @@ def test_fast_fail_off_path_is_untouched():
         calls: List[str] = []
         real_hold = proxy._hold_for_agent
 
-        async def spy(websocket, user_id, pre_read):
+        async def spy(websocket, user_id, pre_read, **kw):
             calls.append(user_id)
-            return await real_hold(websocket, user_id, pre_read)
+            return await real_hold(websocket, user_id, pre_read, **kw)
 
         mp.setattr(proxy, "_hold_for_agent", spy)
         mp.setattr(proxy, "asyncio", _ScaledAsyncio())

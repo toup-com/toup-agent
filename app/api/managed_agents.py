@@ -228,6 +228,17 @@ async def stop(
     container = await docker_host_service.stop_container(db, current_user.id)
     if not container:
         raise HTTPException(404, "No managed container found")
+    # A pool member is shared infrastructure and `stop_container` refuses it
+    # (2026-09-12, D-2's precondition: a parked pool row is what walks the next
+    # provision onto an empty database). Say so ADDITIVELY rather than
+    # answering `{"status": "running"}` to a stop request and letting the
+    # caller guess — a silent no-op is the shape of this whole incident.
+    if (container.container_name or "").startswith("toup-agent-pool-"):
+        return {
+            "status": container.status,
+            "stopped": False,
+            "reason": "pool_member_not_stoppable",
+        }
     return {"status": container.status}
 
 

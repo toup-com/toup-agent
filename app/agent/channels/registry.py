@@ -33,14 +33,66 @@ class ChannelRegistry:
     _channels: Dict[ChannelType, BaseChannel] = {}
 
     @classmethod
-    def register(cls, channel: BaseChannel) -> None:
-        """Add a channel adapter to the registry."""
-        if channel.channel_type in cls._channels:
-            logger.warning(
-                "[REGISTRY] Replacing existing %s adapter", channel.channel_type.value
-            )
+    def _set(cls, channel: BaseChannel) -> None:
         cls._channels[channel.channel_type] = channel
         logger.info("[REGISTRY] Registered channel: %s", channel.channel_type.value)
+
+    @classmethod
+    def register(cls, channel: BaseChannel) -> bool:
+        """Add a channel adapter to the registry.
+
+        REFUSES a silent replace. The previous body logged a warning and
+        overwrote the slot, which orphaned a LIVE adapter: nothing called
+        `stop()` on the evicted object, so its SSE stream, sidecar and
+        inbound dispatch all kept running for the life of the process and
+        every WhatsApp message was handled twice. A caller that genuinely
+        means to swap the adapter must say so via `replace()`.
+
+        Returns True when the slot now holds `channel`.
+        """
+        incumbent = cls._channels.get(channel.channel_type)
+        if incumbent is not None and incumbent is not channel:
+            logger.error(
+                "[REGISTRY] refusing to replace live %s adapter (%s) with %s — "
+                "call ChannelRegistry.replace() or unregister() first",
+                channel.channel_type.value,
+                incumbent.__class__.__name__,
+                channel.__class__.__name__,
+            )
+            return False
+        cls._set(channel)
+        return True
+
+    @classmethod
+    async def replace(cls, channel: BaseChannel) -> None:
+        """Stop + drop the incumbent, then register `channel` in its slot.
+
+        The caller is responsible for holding whatever lock serializes
+        restarts — this method does not create one.
+        """
+        incumbent = cls._channels.pop(channel.channel_type, None)
+        if incumbent is not None and incumbent is not channel:
+            try:
+                await incumbent.stop()
+            except Exception:
+                logger.exception(
+                    "[REGISTRY] stop failed while replacing %s",
+                    channel.channel_type.value,
+                )
+        cls._set(channel)
+
+    @classmethod
+    def unregister(cls, channel_type: ChannelType) -> Optional[BaseChannel]:
+        """Remove a channel adapter from the registry and return it.
+
+        Does NOT stop the adapter — callers that already tore it down
+        (agent_main's restart path) need only the slot cleared, and they
+        used to reach into `_channels` directly to do it.
+        """
+        removed = cls._channels.pop(channel_type, None)
+        if removed is not None:
+            logger.info("[REGISTRY] Unregistered channel: %s", channel_type.value)
+        return removed
 
     @classmethod
     def get(cls, channel_type: ChannelType) -> Optional[BaseChannel]:

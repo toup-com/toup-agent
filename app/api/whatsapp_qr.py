@@ -92,7 +92,7 @@ async def qr_status(_user=Depends(get_current_user)):
     closes; surfaces an error when ``"logged_out"``.
     """
     channel = _require_active_channel()
-    return channel.get_pairing_status()
+    return await channel.get_pairing_status()
 
 
 class PairCodeRequest(BaseModel):

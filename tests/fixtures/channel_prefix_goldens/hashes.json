@@ -1,0 +1,39 @@
+{
+  "_why": "Flag-OFF goldens for tests/test_channel_neutral_prefix.py. Captured from the build at agent_runner_sha256 below, which was origin/main 32fddc38 \u2014 i.e. the prompt as it shipped BEFORE the channel-neutral prefix. Regenerate only for a deliberate prompt change.",
+  "agent_runner_sha256": "82892d79c033be1787ef2682290c68b9e9dd8d023f5add1f315dd558767d3db5",
+  "full_text_channels": [
+    "web",
+    "mobile",
+    "voice",
+    "whatsapp",
+    "telegram",
+    "vibecoding",
+    "app"
+  ],
+  "git_rev": "eca82076c13e4a3c2d8a9cc6b3b1ce1cffeac065",
+  "sha256": {
+    "": "4660de813011a6d7e068c10d40c085a2a0a2b58fde07673a30373b5ad1e3cda4",
+    "admin": "b7fa7f06189e0b610769522ef7a037eabd3ea5c61dd2aa90bc47106803ce83a3",
+    "agent": "124029f5e5ea01cfc876bf85c0b619a6d7c22634dcbcc0b5fe10c815cf543392",
+    "agent_task": "4861b8df771f4d9136bbf16f991f3837b0ea731ee80a97363cdd87387308e4a0",
+    "api": "dcd4a92ac1aa7e5b506d6486a99df01a64f9a3d9bc0c31e52ebd25570a4e8c60",
+    "app": "0462f276ced3e748931d03f38685a246ad866e8ba848bfea3c45dd582c600560",
+    "automation": "b3ec6c81766a7bc542dbf03421b33b4fc8e78d000a3f36b8690b10e54e48e928",
+    "autopilot": "8207339d252a982ea8031c25b3add6fd9fdb7d5f118a889c2493d10f3001d917",
+    "discord": "16a4e71e37b69158f9dcb41375919948a101aec2751e0c6d66c209b26eff92dd",
+    "extension": "cdb439df2e2c0521862f5c26fea7fcbb88e93ac654d6111cbde05acea45b7152",
+    "health_probe": "eaaeed4fa3ecb55deabde311e82dfd7870658e060ee02ee4a6f2e00c629ab083",
+    "mobile": "ade60b59cb5d116f75e83999c4715e881330cf459f2a3a8b7d423a2b8da47660",
+    "routine": "f4c48107b83e3c5f517d26f4a8d7aa6a6c7ddae25f6702492a93fa19f831cd1e",
+    "slack": "ff060886069167b6e24f62bb522a3a246f21058caca952f5b3e13afcd56f7733",
+    "smoke-signal": "bd8aa41e885511cd57243e23f890d3db686b2ea35e328f1f4e8123c2c01aea6e",
+    "subagent": "be36cefb8d1b21ed66297e5901021f628b137f8d400d928d516d8adb02c4c74e",
+    "telegram": "0c7a7c4aeba531f699e5014720880c122753f53b57faeddea872c9faf5cddec3",
+    "trigger": "737dcaaa6036f305b38b1f13a0cc4cc723cbc053279d3be704fc2f92b5a79af7",
+    "vibecoding": "5e363da570fc9119a401c7f11dbf19cbea4033e73b98a36b025d7882012802fb",
+    "voice": "737408f8e96387eb0579380945b9da65e2be7b75060fc57e33c84cc543a3afda",
+    "web": "8a06260089b0bf2500b25cf807a247d94d4ab134216ef0896dfc660ba2a879a4",
+    "whatsapp": "c02fe722864077ebd60e9f32dc949ba27a9dd55d08dd6c7ccbc7b239808bdf00"
+  },
+  "user_name": "Golden"
+}

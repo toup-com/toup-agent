@@ -61,14 +61,24 @@ from app.db.models import (
     AppleSubscription, CreditBalance, CreditLedger, CreditReservation, GrantEligibility,
     SubscriptionPlan, User,
 )
+from app.db.plan_catalog import UNLIMITED_PLAN_ID
 from app.services.email_canonical import canonical_email_hash
 # The day boundary has exactly one implementation, and it lives in
 # credit_exhausted because that module is a stdlib-only leaf — this direction
 # cannot cycle. Both the gate that rolls the counter and every surface that
 # says WHEN it rolls must read the same rule, or the screen and the refusal
 # quote different times for the same user.
-from app.services.credit_exhausted import _daily_rollover_utc, _zone
+from app.services.credit_exhausted import (
+    REASON_RATE_LIMITED as _REASON_RATE_LIMITED,
+    _daily_rollover_utc,
+    _zone,
+)
 from app.services.abuse_metrics import emit as _emit, hp as _hp, uidp as _uidp
+# The unlimited rate ladder. Imported as a MODULE, not as its functions, so a
+# test can monkeypatch it and so the flag is read at call time rather than at
+# import time. It has no app imports beyond config/alerting/abuse_metrics, so
+# this direction cannot cycle.
+from app.services import unlimited_abuse
 
 
 # Plan-source markers stamped on credit_balances.plan_source. NULL/'stripe' ⇒
@@ -338,6 +348,12 @@ REASON_INSUFFICIENT_MESSAGE = "insufficient_message_credits"
 REASON_INSUFFICIENT_INTEGRATION = "insufficient_integration_credits"
 REASON_DAILY_CAP_EXCEEDED = "daily_cap_exceeded"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
+# Re-exported from credit_exhausted so the two reason vocabularies stay one
+# vocabulary (the module docstring's rule: "match credit_service.REASON_*
+# constants so callers downstream can read either source without
+# translation"). Emitted ONLY by the unlimited rate ladder — never by a
+# balance check — and it deliberately carries no billing meaning.
+REASON_RATE_LIMITED = _REASON_RATE_LIMITED
 
 
 def _split_message_charge(
@@ -444,8 +460,45 @@ def _is_unlimited_user(user) -> bool:
     """True iff this user has NO usage limits — admins. Such users are never
     denied at the credit gate and never deducted (their balance row is left
     untouched), so an operator/owner account can use the platform freely.
-    Centralized so try_charge, reserve, and the /status view all agree."""
+    Centralized so try_charge, reserve, and the /status view all agree.
+
+    UNCHANGED by the Unlimited entitlement work, deliberately: the free-tier
+    image quota and reserve_free_image_slot still read exactly "is this an
+    admin", and nothing that calls this today changes behaviour. The debit
+    switch is :func:`_entitlement_is_unlimited`, which is a strict superset.
+    """
     return user is not None and getattr(user, "role", None) == "admin"
+
+
+def _entitlement_is_unlimited(user, balance) -> bool:
+    """True iff this account holds the UNLIMITED entitlement — never denied at
+    the credit gate, never deducted, but still fully METERED.
+
+    Two sources, both already loaded by every caller (no extra query, no
+    second lock):
+
+      * ``role == 'admin'``                 — operators (the pre-existing meaning)
+      * ``balance.plan_id == 'unlimited'``  — the Unlimited plan, a
+                                              grandfathered legacy payer, or a
+                                              live admin override
+
+    The ``plan_id`` arm is the whole design. The BALANCE ROW is the single
+    materialisation of the entitlement, and every path that can create, renew,
+    lapse or revoke it writes exactly that column — so the gate, the six
+    pre-flights, ``/credits/status``, the image quota, the run-now cooldown and
+    provisioning all agree by construction.
+
+    Nothing here consults ``apple_subscriptions`` or ``unlimited_grants``.
+    Those are CONTROLLERS of the stamp, not oracles on the charge path
+    (docs/billing/UNLIMITED_ENTITLEMENT_DESIGN.md §4.4): ``try_charge`` runs on
+    every LLM event on every channel while holding ``SELECT … FOR UPDATE`` on
+    this row, and a hot-path oracle would both widen that lock and let the row
+    say ``unlimited`` while the gate quietly disagreed. Read
+    ``app.services.entitlement`` when you need the controller-side answer.
+    """
+    if _is_unlimited_user(user):
+        return True
+    return getattr(balance, "plan_id", None) == UNLIMITED_PLAN_ID
 
 
 async def free_tier_image_quota(db: AsyncSession, user_id: str) -> tuple[bool, int, int]:
@@ -1065,7 +1118,34 @@ class CreditService:
         question with the short-circuit removed. See
         :meth:`_shadow_observe_message_charge`.
         """
+        # ── UNLIMITED rate ladder (design §7) ───────────────────────────
+        # First statement, BEFORE any database work, and inert three times
+        # over for everyone else:
+        #   1. `unlimited_throttle_enabled` defaults False, so this is one
+        #      `getattr` on settings and a return;
+        #   2. with it on, `admission_verdict` is a dict lookup that answers
+        #      TIER_OK for any user it has never seen, and the only writer of
+        #      that dict is `try_charge`'s UNLIMITED branch — so no free,
+        #      legacy-paid or admin account can ever have an entry;
+        #   3. it can only pace or refuse, never grant.
+        # A free user's path through this method is therefore byte-for-byte
+        # what it was; see tests/test_free_tier_unchanged.py.
+        #
+        # The PACE half sits above `get_or_create_balance` on purpose: it
+        # sleeps, and doing that after the row is read would hold the read
+        # open for the whole delay. The REFUSE half sits below it, so the
+        # refusal can quote the account's real balance instead of a zero it
+        # would have had to invent.
+        _rate_admit = await unlimited_abuse.apply_admission(user_id)
         balance = await self.get_or_create_balance(db, user_id)
+        if not _rate_admit:
+            # Not "out of credits" — a dedicated reason with its own copy and
+            # no CTA (credit_exhausted.REASON_RATE_LIMITED). This account is
+            # never denied for money and must never be told it was.
+            return ChargeResult(
+                success=False, balance_after=_bucket_remaining(balance, bucket),
+                reason=REASON_RATE_LIMITED,
+            )
         required_q = _q(required, _AMOUNT_QUANTUM)
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
         if not enforcement:
@@ -1287,11 +1367,18 @@ class CreditService:
         # Email-verified gate (F13).
         deny_reason: Optional[str] = None
         user = await db.get(User, user_id)
-        # Admin accounts are UNLIMITED — never denied, never deducted. The
-        # balance row is left untouched (we still write a zero-amount ledger
-        # row for an audit trail). Centralized via _is_unlimited so try_charge,
-        # reserve, and the /status view all agree. See [[admin-unlimited-credits]].
-        is_unlimited = _is_unlimited_user(user)
+        # UNLIMITED accounts — admins, and anyone holding the `unlimited`
+        # plan (bought it, was grandfathered off a legacy Apple sub, or holds
+        # a live admin override) — are never denied and never deducted. The
+        # balance row is left untouched; we still write a zero-amount ledger
+        # row carrying the FULL metering (underlying_cost_cents, tokens,
+        # model, provider), because the ledger is where usage, shadow revenue
+        # and every abuse signal are actually read from. `balance` is already
+        # locked and `user` already loaded, so this costs no extra query.
+        is_unlimited = _entitlement_is_unlimited(user, balance)
+        unlimited_reason = (
+            "admin" if _is_unlimited_user(user) else "plan"
+        ) if is_unlimited else None
         if is_unlimited:
             deny_reason = None
         elif _email_verification_required(user):
@@ -1358,7 +1445,19 @@ class CreditService:
                 idempotency_key=idempotency_key, event_id=event_id, model=model,
                 provider=provider, input_tokens=input_tokens, output_tokens=output_tokens,
                 underlying_cost_cents=(_q(underlying_cost_cents) if underlying_cost_cents is not None else None),
-                metadata_json={"denied": True, "reason": deny_reason, **(metadata or {})},
+                # `plan_id` is stamped AT THE TIME OF THE DENIAL. Without it,
+                # credit_health's invariant 7 has to join back to
+                # credit_balances, which holds the plan the user has NOW — so
+                # the act of grandfathering an account that was refused
+                # yesterday re-attributes yesterday's denials to 'unlimited'
+                # and fires `credit-denied-unlimited` CRITICAL, on the very
+                # customer the operator has just unblocked. The alarm's whole
+                # value is being true on a single occurrence.
+                metadata_json={
+                    "denied": True, "reason": deny_reason,
+                    "plan_id": balance.plan_id,
+                    **(metadata or {}),
+                },
             )
             try:
                 db.add(ledger)
@@ -1384,7 +1483,7 @@ class CreditService:
                 reason=deny_reason, ledger_id=ledger.id,
             )
 
-        # Unlimited (admin) charges never deduct — the row stays put.
+        # Unlimited charges never deduct — the row stays put.
         # meter_only is the same deal, chosen per call instead of per user.
         will_deduct = (
             ((deny_reason is None) or (not enforcement))
@@ -1412,7 +1511,19 @@ class CreditService:
             metadata_json={
                 **(metadata or {}),
                 **({"shadow_would_deny": deny_reason} if (deny_reason and not enforcement) else {}),
-                **({"admin_unlimited": True} if is_unlimited else {}),
+                # `admin_unlimited` keeps its EXACT historical meaning
+                # (role == 'admin') so credit_health_monitor's _is_admin
+                # predicate and every historical query keep working.
+                **({"admin_unlimited": True} if _is_unlimited_user(user) else {}),
+                # `unlimited` is the uniform marker for "served without a
+                # debit BECAUSE the account is unlimited", stamped for admins
+                # too so the monitor needs one predicate rather than two.
+                # A zero-amount row with provider cost and NO reason marker is
+                # an alarm, not a shrug — that is what makes "unlimited" a
+                # falsifiable explanation instead of a catch-all.
+                **({"unlimited": True,
+                    "unlimited_reason": unlimited_reason,
+                    "credits_quoted": str(amount_q)} if is_unlimited else {}),
                 **({"meter_only": True, "credits_quoted": str(amount_q)} if meter_only else {}),
                 **({"meter_would_deny": deny_reason} if (meter_only and deny_reason) else {}),
             } or None,
@@ -1436,6 +1547,24 @@ class CreditService:
                         ledger_id=existing.id, idempotent_hit=True,
                     )
             raise
+
+        # ── UNLIMITED rate ladder: record, never refuse ─────────────────
+        # AFTER the flush, so a measurement can never cost us the ledger row
+        # it is measuring, and wrapped for the same reason the shadow probe
+        # above is: a measurement that can break a charge is worse than no
+        # measurement.
+        #
+        # `observe` never sleeps and never denies — this is a POST-hoc report
+        # (the provider has already been paid), and refusing here is exactly
+        # the 2026-08-03 defect of denying work that was already served. It
+        # only updates the counters that the ADMISSION side reads next turn.
+        if is_unlimited:
+            try:
+                await unlimited_abuse.observe(
+                    user_id, amount_q, event_type=event_type,
+                )
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("[unlimited-abuse] observe failed", exc_info=True)
 
         return ChargeResult(success=True, balance_after=Decimal(ledger.balance_after), ledger_id=ledger.id)
 
@@ -1467,10 +1596,16 @@ class CreditService:
 
         enforcement = getattr(settings, "credit_enforcement_enabled", False)
         remaining = _bucket_remaining(balance, bucket)
-        # Admins are UNLIMITED — never gated, never deducted. Reserve a
+        # UNLIMITED accounts are never gated and never deducted. Reserve a
         # zero-amount hold so the row exists for settle() (which clamps actual
         # to estimated=0 → the whole reserve/settle cycle is a balance no-op).
-        is_unlimited = _is_unlimited_user(await db.get(User, user_id))
+        #
+        # Deliberately NOT "reserve normally, settle at zero": that would hold
+        # real credits against a wallet the design says is never spent, and a
+        # crashed settle would leak the hold. Only the predicate changes here;
+        # the arithmetic is untouched.
+        _res_user = await db.get(User, user_id)
+        is_unlimited = _entitlement_is_unlimited(_res_user, balance)
         if enforcement and not is_unlimited and amount_q > remaining:
             return ReservationResult(
                 reservation_id="", estimated_amount=amount_q, balance_after=remaining,
@@ -1480,6 +1615,14 @@ class CreditService:
             )
 
         deducted = Decimal("0") if is_unlimited else amount_q
+        # Same marker discipline as try_charge: `admin_unlimited` keeps its
+        # historical role==admin meaning, `unlimited` is the uniform reason.
+        unlimited_meta = (
+            {"unlimited": True,
+             "unlimited_reason": "admin" if _is_unlimited_user(_res_user) else "plan",
+             **({"admin_unlimited": True} if _is_unlimited_user(_res_user) else {})}
+            if is_unlimited else {}
+        )
         split = _apply_delta(balance, bucket, -deducted)
         now = datetime.utcnow()
         reservation_id = str(uuid.uuid4())
@@ -1494,8 +1637,7 @@ class CreditService:
             id=reservation_id, user_id=user_id, event_type=event_type, bucket=bucket,
             estimated_amount=deducted, status=RESERVATION_OPEN,
             idempotency_key=idempotency_key, event_id=event_id,
-            metadata_json={**(metadata or {}), **split_meta,
-                           **({"admin_unlimited": True} if is_unlimited else {})} or None,
+            metadata_json={**(metadata or {}), **split_meta, **unlimited_meta} or None,
             expires_at=now + timedelta(seconds=ttl_seconds),
         ))
         db.add(CreditLedger(
@@ -1503,7 +1645,7 @@ class CreditService:
             amount=-deducted, balance_after=_bucket_remaining(balance, bucket),
             reservation_id=reservation_id, idempotency_key=idempotency_key,
             event_id=event_id, metadata_json={"action": "reserve", **(metadata or {}),
-                                              **({"admin_unlimited": True} if is_unlimited else {})},
+                                              **unlimited_meta},
         ))
         await db.flush()
         return ReservationResult(
@@ -1754,6 +1896,30 @@ class CreditService:
         if new_plan is None:
             raise ValueError(f"unknown plan {new_plan_id}")
         balance = await self._lock_balance(db, user_id)
+
+        # ── Unlimited transitions are ASSIGNED, never prorated ───────────
+        # The prorated body below computes (new.monthly - old.monthly) * ratio
+        # and hands it to _apply_delta, whose MESSAGE split leaves
+        # `from_purchased` UNCLAMPED (_split_message_charge). Crossing the
+        # ~1,000,000-credit gap in either direction therefore drives
+        # purchased_credits_remaining deeply negative for a user who never
+        # bought a pack: a downgrade the day after activating at ratio 0.30
+        # computes msg_delta ≈ -969,903, from_plan clamps at the ~300,070 the
+        # user holds, and the ~669,833 remainder lands on the purchased
+        # wallet. _bucket_remaining then reports a large negative balance and
+        # the account is bricked.
+        #
+        # Assignment is also the only honest answer for this transition:
+        # someone entering Unlimited gets the Unlimited allowance, and someone
+        # dropping out becomes a free user with a free user's wallet.
+        #
+        # ORDER IS LOAD-BEARING: this must sit ABOVE the proration block, and
+        # both arms read `balance.plan_id` before anything writes it.
+        if UNLIMITED_PLAN_ID in (balance.plan_id, new_plan_id):
+            return await self._apply_plan_change_absolute(
+                db, user_id, new_plan, reason=reason, balance=balance,
+            )
+
         old_plan = await db.get(SubscriptionPlan, balance.plan_id)
 
         old_msg = Decimal(old_plan.message_credits_monthly) if old_plan else Decimal("0")
@@ -1790,6 +1956,55 @@ class CreditService:
             ))
         balance.plan_id = new_plan_id
         balance.message_credits_daily_cap = new_plan.message_credits_daily_cap
+        await db.flush()
+
+    async def _apply_plan_change_absolute(
+        self, db: AsyncSession, user_id: str, new_plan: SubscriptionPlan, *,
+        reason: str, balance: CreditBalance,
+    ) -> None:
+        """Set the wallets to the target plan's allotment outright.
+
+        The Unlimited arm of :meth:`apply_plan_change`. Idempotent by
+        construction (it assigns rather than adding a delta), so a replayed
+        activation computes two zero deltas and writes NO ledger rows.
+
+        ``purchased_credits_remaining`` is NEVER touched, in either direction —
+        bought credits never expire. The daily counter IS zeroed, because a
+        six-figure ``used_today`` accumulated under a plan with no cap would
+        otherwise ride into the free tier and meet free's cap.
+
+        A lapsed Unlimited user therefore lands on byte-for-byte a fresh free
+        wallet, and (via ``downgrade_to_free`` clearing ``plan_source``) the
+        hourly clock renewal resumes for them.
+        """
+        from_plan_id = balance.plan_id
+        old_msg = Decimal(balance.message_credits_remaining)
+        old_int = Decimal(balance.integration_credits_remaining)
+        new_msg = _q(Decimal(new_plan.message_credits_monthly), _BALANCE_QUANTUM)
+        new_int = _q(Decimal(new_plan.integration_credits_monthly), _BALANCE_QUANTUM)
+
+        balance.message_credits_remaining = new_msg
+        balance.integration_credits_remaining = new_int
+        balance.message_credits_used_today = Decimal("0")
+        balance.message_credits_daily_cap = new_plan.message_credits_daily_cap
+        balance.plan_id = new_plan.id
+
+        meta = {"reason": reason, "from": from_plan_id, "to": new_plan.id,
+                "mode": "absolute"}
+        if new_msg != old_msg:
+            db.add(CreditLedger(
+                user_id=user_id, event_type="plan_change", bucket=BUCKET_MESSAGE,
+                amount=_q(new_msg - old_msg, _AMOUNT_QUANTUM),
+                balance_after=_bucket_remaining(balance, BUCKET_MESSAGE),
+                metadata_json=meta,
+            ))
+        if new_int != old_int:
+            db.add(CreditLedger(
+                user_id=user_id, event_type="plan_change", bucket=BUCKET_INTEGRATION,
+                amount=_q(new_int - old_int, _AMOUNT_QUANTUM),
+                balance_after=_bucket_remaining(balance, BUCKET_INTEGRATION),
+                metadata_json=meta,
+            ))
         await db.flush()
 
     # ── Apple subscription reconciliation + lifecycle ────────────────────
@@ -1876,6 +2091,18 @@ class CreditService:
         balance = await self._lock_balance(db, user_id)
         balance.plan_source = None
         await db.flush()
+        # The rate ladder's window dies with the entitlement it measures.
+        # Nothing else evicts before the 24h cutoff, so a lapsed account kept
+        # its counters and — with the throttle enabled — could still be paced
+        # or refused with REASON_RATE_LIMITED off traffic it ran while it was
+        # unlimited. This is the one funnel every end-of-entitlement path goes
+        # through (Apple EXPIRED / REVOKE / REFUND, the reconciler, a revoked
+        # or lapsed grant), which is why it is the only call site.
+        try:
+            from app.services import unlimited_abuse
+            unlimited_abuse.forget(user_id)
+        except Exception:  # pragma: no cover - bookkeeping must never fail a downgrade
+            logger.warning("[credits] could not clear the rate window", exc_info=True)
 
     async def renew_period(self, db: AsyncSession, user_id: str) -> bool:
         """Time-driven monthly renewal (the hourly cron's entrypoint).

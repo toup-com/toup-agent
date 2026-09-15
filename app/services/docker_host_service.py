@@ -43,6 +43,10 @@ from app.services.background_tasks import spawn as _spawn_bg
 
 logger = logging.getLogger(__name__)
 
+# Name prefix of a pool slot. The pool/named distinction is made on this
+# prefix throughout the module (`startswith("toup-agent-pool-")`).
+_POOL_NAME_PREFIX = "toup-agent-pool-"
+
 
 # ─── Image-tag resolution for new tenants ────────────────────────
 
@@ -336,13 +340,17 @@ def _agent_config_to_bridge_body(agent_config: Optional[AgentConfig]) -> dict:
 
 
 class PoolMemberSwapRefused(RuntimeError):
-    """`provision_container(recreate=True)` was aimed at a warm-pool member.
+    """`provision_container` was aimed at a warm-pool member without
+    `allow_pool_swap=True` — for ANY `recreate`, including `recreate=False`
+    against a pool row whose status is `error`/`stopped` (D-2).
 
     Raised rather than performed, because the named path binds a DIFFERENT
     database from the one the pool slot holds — see the block inside
     `provision_container` for the full account. Callers should either use a
-    pool primitive or accept the deferred update; none of them should catch
-    this and retry with `allow_pool_swap=True`.
+    pool primitive (repair in place) or accept the deferred update; none of
+    them should catch this and retry with `allow_pool_swap=True`. Catch it to
+    degrade gracefully (log, leave the pool row/route intact, hand off to
+    discovery) — never to surface a 500.
     """
 
 
@@ -406,16 +414,28 @@ async def provision_container(
     #
     # Observed in production 2026-08-31 15:48 UTC: a transient
     # `bridge create_tenant failed: 500` made `update_container_env` fall
-    # through here for a user who had been on `toup-agent-pool-17` twenty-five
-    # seconds earlier.
+    # through here (`recreate=True`) for a user who had been on
+    # `toup-agent-pool-17` twenty-five seconds earlier.
+    #
+    # The guard used to require `recreate=True`, which left a SECOND door open
+    # (D-2, still live at 83abe6e2 after PR 738 shut the recreate=True path):
+    # the early return above only exits for status `running`/`provisioning`, so
+    # a pool member whose row is `error` or `stopped` — `container_monitor`
+    # marks a container `error` after N unhealthy intervals with no pool
+    # exemption, and `stop_container` marks it `stopped` — walks straight past
+    # that early return AND past a recreate-gated guard, reaching the named path
+    # with `recreate=False` (the Wake tap's `_provision_worker`,
+    # `agent_setup.py`). The refusal therefore keys on `allow_pool_swap` ALONE,
+    # regardless of `recreate`: a genuinely broken pool member is repaired in
+    # place (`/v1/pool/restart-member` via `restart_container`) or re-adopted
+    # from the bridge, never cold-swapped to a named database.
     #
     # This refuses instead. A stale env var, a missed image bump or a deferred
     # key rotation are all recoverable; an account that reads as empty is not.
     # Operators who genuinely intend the migration pass `allow_pool_swap=True`
     # and are responsible for moving the data first.
     if (
-        recreate
-        and existing
+        existing
         and (existing.container_name or "").startswith("toup-agent-pool-")
         and not allow_pool_swap
     ):
@@ -909,6 +929,17 @@ async def container_reconciler_loop() -> None:
     fast = int(getattr(settings, "stranded_fast_scan_interval_s", 0) or 0)
     if fast > 0:
         fast = max(1, min(fast, interval))
+    # LEADER-GATED (2026-09-12, L3-1). This tick claims pool slots, force-claims
+    # keyless agents and restarts containers. It ran on BOTH Railway replicas
+    # with no election, so one bad platform-side mapping became 92 restarts in
+    # 2 h 28 m — every tick produced exactly one POST from each replica. A
+    # replica that does not hold the lease skips the work and sleeps; the lease
+    # TTL is 3x the interval, so a dead holder is replaced within one TTL with
+    # no operator. The fast sub-tick shares the SAME lease name: it is the same
+    # work at a finer grain and must have the same single owner.
+    from app.services.infra_lease import acquire_lease, lease_ttl_for
+    _lease = "container_reconciler"
+    _ttl = lease_ttl_for(interval)
     while True:
         # Sleep first: the boot path already runs one backfill before this
         # loop starts, so an immediate tick would be redundant churn.
@@ -920,6 +951,8 @@ async def container_reconciler_loop() -> None:
                 slept += nap
                 if slept >= interval:
                     break  # the full tick below covers this moment
+                if not await acquire_lease(_lease, ttl_s=_ttl):
+                    continue
                 try:
                     from app.services.pool_service import reclaim_stranded_fast
                     fs = await reclaim_stranded_fast()
@@ -930,6 +963,11 @@ async def container_reconciler_loop() -> None:
                     logger.exception("[container-reconciler] stranded-fast failed")
         else:
             await asyncio.sleep(interval)
+        if not await acquire_lease(_lease, ttl_s=_ttl):
+            # Another replica is the runner. Skip the whole tick — not half of
+            # it: backfill, reclaim and row-sync are one reconciliation pass and
+            # splitting them across replicas is how two healers become zero.
+            continue
         try:
             async with async_session_maker() as db:
                 summary = await backfill_sentinel_image_containers(db)
@@ -980,6 +1018,23 @@ async def stop_container(db: AsyncSession, user_id: str) -> Optional[ManagedCont
     container = result.scalar_one_or_none()
     if not container:
         return None
+    # A POOL member never leaves running/provisioning through this writer
+    # (2026-09-12, D-2's precondition). This is a DB-status-only op, and the
+    # status it writes is the one that walks the NEXT provision past
+    # provision_container's early return into the named path — rewriting
+    # db_name to toup_agent_<prefix> and landing an established user on an
+    # empty database. `start_container` calls `provision_container(db, uid)`
+    # with recreate=False, so `stop` then `start` on a pool-bound user was a
+    # two-call data-loss path. Wave 1 closed the door in provision_container;
+    # this stops the precondition being manufactured.
+    if (container.container_name or "").startswith("toup-agent-pool-"):
+        logger.warning(
+            "[stop_container] REFUSED for pool-bound user=%s container=%s — a "
+            "pool member is shared infrastructure, not this user's to stop; "
+            "releasing it is a bridge operation (unclaim), not a status write",
+            user_id[:8], container.container_name,
+        )
+        return container
     container.status = "stopped"
     container.stopped_at = datetime.utcnow()
     await db.commit()
@@ -1205,15 +1260,24 @@ async def update_container_env(
     db: AsyncSession,
     user_id: str,
     agent_config: AgentConfig,
+    *,
+    pool_only: bool = False,
 ) -> Optional[ManagedContainer]:
-    """Push a new agent_config to the bridge. Serialized per user."""
+    """Push a new agent_config to the bridge. Serialized per user.
+
+    `pool_only=True` is for callers whose payload is only worth a WARM
+    refresh (today: the timezone seed). A pool member goes through
+    /v1/pool/refresh-config as usual; any other container is left exactly
+    as it is, instead of taking the `provision_container(recreate=True)`
+    fall-through that destroys and re-runs it.
+    """
     lock = _env_push_lock(user_id)
     if lock.locked():
         logger.info("[update_container_env] %s: a push is already in flight — waiting",
                     user_id[:8])
     async with lock:
         try:
-            return await _update_container_env(db, user_id, agent_config)
+            return await _update_container_env(db, user_id, agent_config, pool_only=pool_only)
         finally:
             # Only the last waiter clears the entry, so the dict cannot grow
             # with every user the platform has ever pushed.
@@ -1225,6 +1289,8 @@ async def _update_container_env(
     db: AsyncSession,
     user_id: str,
     agent_config: AgentConfig,
+    *,
+    pool_only: bool = False,
 ) -> Optional[ManagedContainer]:
     """Push a new agent_config to the bridge and recreate the container.
 
@@ -1245,6 +1311,18 @@ async def _update_container_env(
     container = result.scalar_one_or_none()
     if not container:
         return None
+
+    if pool_only and not (container.container_name or "").startswith(_POOL_NAME_PREFIX):
+        # A named tenant. The caller asked for a warm refresh or nothing;
+        # the recreate at the tail of this function is the platform's most
+        # destructive container operation and a stale env value is not a
+        # reason to run it.
+        logger.info(
+            "[update_container_env] %s: pool_only push, container %s is not a "
+            "pool member — left untouched",
+            user_id[:8], container.container_name,
+        )
+        return container
 
     # Phase A (never-sleep): if this user is on a pool container, route
     # the env update through the bridge's /v1/pool/refresh-config which

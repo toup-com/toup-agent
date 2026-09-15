@@ -1752,6 +1752,22 @@ class ToupTelegramBot:
 
             self._session_map[chat_id] = response.session_id
 
+            # Publish the turn to this user's app / web sockets. Telegram
+            # bypasses BaseChannel entirely, so `make_channel_handler`'s
+            # echo never reaches it — same function, one frame shape.
+            try:
+                from app.agent.channel_echo import broadcast_channel_turn
+                asyncio.create_task(broadcast_channel_turn(
+                    user_id,
+                    origin_channel="telegram",
+                    session_id=response.session_id,
+                    persisted=getattr(response, "persisted", {}) or {},
+                    user_text=f"[Button clicked: {callback_data}]",
+                    assistant_text=response.text or "",
+                ))
+            except Exception:
+                logger.warning("channel.echo_failed channel=telegram", exc_info=True)
+
             # Extract reaction and buttons from response
             final_text = response.text
             final_text, reaction_emoji = extract_reaction(final_text)
@@ -2102,6 +2118,22 @@ class ToupTelegramBot:
 
             # Save session for continuity
             self._session_map[chat_id] = response.session_id
+
+            # Publish the turn to this user's app / web sockets. Telegram
+            # bypasses BaseChannel entirely, so `make_channel_handler`'s
+            # echo never reaches it — same function, one frame shape.
+            try:
+                from app.agent.channel_echo import broadcast_channel_turn
+                asyncio.create_task(broadcast_channel_turn(
+                    user_id,
+                    origin_channel="telegram",
+                    session_id=response.session_id,
+                    persisted=getattr(response, "persisted", {}) or {},
+                    user_text=text or "",
+                    assistant_text=response.text or "",
+                ))
+            except Exception:
+                logger.warning("channel.echo_failed channel=telegram", exc_info=True)
 
             # Extract reaction and buttons from response
             final_text = response.text

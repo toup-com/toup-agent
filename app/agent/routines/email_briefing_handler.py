@@ -232,14 +232,18 @@ class EmailBriefingHandler:
         # Credit pre-flight: skip cleanly when the user is already out
         # of message credits. Avoids burning a Gmail integration call
         # (charged to the integration bucket) just to drop the LLM
-        # summary step. raise_if_exhausted() uses in-process state from
-        # the last platform reply — cold-start fires fall through and
-        # the LLM step's normal 402 handling takes over.
+        # summary step. raise_if_exhausted_async() uses in-process state from
+        # the last platform reply, re-reading /credits/preflight first if that
+        # state has gone stale — cold-start fires fall through and the LLM
+        # step's normal 402 handling takes over. A scheduled routine's interval
+        # always exceeds the latch TTL, so this gate is ALWAYS looking at a
+        # stale latch; an expiry that simply opened it would make the gate
+        # unreachable and burn a charged Gmail call on every run.
         try:
-            from app.services.credit_reporter import raise_if_exhausted
+            from app.services.credit_reporter import raise_if_exhausted_async
             from app.services.credit_exhausted import OutOfCreditsError
             try:
-                raise_if_exhausted()
+                await raise_if_exhausted_async()
             except OutOfCreditsError as _oce:
                 return RoutineResult(
                     status="skipped",

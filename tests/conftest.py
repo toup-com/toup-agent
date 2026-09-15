@@ -111,6 +111,11 @@ def _build_test_app() -> FastAPI:
     # test can see — the response body has to be the thing under assertion.
     from app.api.credits import router as credits_router
     app.include_router(credits_router, prefix=settings.api_prefix)
+    # Mounted so test_unlimited_grants can exercise the admin override over
+    # HTTP. The require_admin guard and the 409/422 refusals are the point:
+    # a service-level test cannot see that the route is admin-gated at all.
+    from app.api.admin.billing import router as admin_billing_router
+    app.include_router(admin_billing_router, prefix=settings.api_prefix)
     return app
 
 

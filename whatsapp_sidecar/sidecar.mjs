@@ -52,6 +52,11 @@ import path from 'node:path';
 
 // ── Config ──────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.WHATSAPP_SIDECAR_PORT || '8002', 10);
+// Identity of the parent that spawned us. The Python adapter mints a
+// fresh token per spawn and compares it against /health, which is the
+// only way it can tell "my child booted" from "a stranger already owns
+// port 8002 and answered for it".
+const SPAWN_TOKEN = process.env.WHATSAPP_SIDECAR_TOKEN || null;
 // Allowlist of phone numbers (CSV, E.164). The sidecar uses this to
 // pre-resolve corresponding @lid identifiers via `onWhatsApp` once
 // connected, so inbound messages from LID-encoded senders can be
@@ -1158,6 +1163,8 @@ function handleHealth(req, res) {
     last_send_error: lastSendError,
     sse_listeners: sseClients.size,
     auth_dir: AUTH_DIR,
+    spawn_token: SPAWN_TOKEN,
+    pid: process.pid,
   });
 }
 
@@ -1190,6 +1197,22 @@ const server = http.createServer(async (req, res) => {
     error('http.unhandled', { route, err: String(e) });
     try { sendJson(res, 500, { ok: false, error: String(e) }); } catch {}
   }
+});
+
+// Without this, EADDRINUSE is an unhandled 'error' event: the process
+// throws and dies with nothing the spawning parent can see, while the
+// INCUMBENT sidecar goes on answering /health on the same port — which
+// is how one container ended up with two live SSE dispatchers.
+// Only a LISTEN failure is fatal. A later 'error' on the server object (a
+// client connection reset, an accept hiccup) must not take a healthy
+// dispatcher down with exit 17, which the parent reads as "port owned".
+server.on('error', (e) => {
+  const listenFailed = !e || e.syscall === undefined || e.syscall === 'listen' || !server.listening;
+  if (listenFailed) {
+    error('listen.failed', { port: PORT, code: e && e.code, err: String(e) });
+    process.exit(17);
+  }
+  error('server.error', { port: PORT, code: e && e.code, syscall: e.syscall, err: String(e) });
 });
 
 server.listen(PORT, '127.0.0.1', async () => {

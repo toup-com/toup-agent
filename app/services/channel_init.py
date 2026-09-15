@@ -31,8 +31,13 @@ def wake_lazy_channels() -> None:
     channel adapter whose token is now populated. Returns immediately;
     actual adapter init runs as background tasks.
 
-    Safe to call multiple times: each restart helper checks current
-    state before doing work."""
+    Safe to call multiple times, but not because the helpers are
+    idempotent on their own: `agent_main.restart_whatsapp_channel`
+    serializes on a module lock, coalesces a queued restart and
+    short-circuits on an unchanged config fingerprint. Concurrent binds
+    are the norm (both Railway replicas call refresh-config ~25 ms
+    apart), and before that lock two of these fire-and-forget tasks each
+    spawned a sidecar."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

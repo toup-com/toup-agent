@@ -137,6 +137,13 @@ def test_an_image_side_exemption_is_real_and_still_needed(flag: str):
     "VOICE_CONTEXT_FROM_AGENT",
     "VOICE_CONTEXT_FROM_AGENT_USER_IDS",
     "VOICE_TASKS_ENABLED",
+    # Incident 2026-09-14: the channel-neutral prefix flip (+ its canary
+    # list) and the day-index rebucket service's kill switch. The last one
+    # was documented as the kill switch and forwarded by nothing — review
+    # round 1 found it dead in both directions.
+    "CHANNEL_ENVELOPE",
+    "CHANNEL_ENVELOPE_CANARY_USER_IDS",
+    "DAY_CHAT_REBUCKET_ENABLED",
 ])
 def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     """Dropping one of these from the bridge list is how a fleet silently

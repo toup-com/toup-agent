@@ -26,13 +26,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import get_current_user
+from app.config import settings
 from app.db import get_db
 from app.db.models import (
     APPLE_SUB_ACTIVE, APPLE_SUB_BILLING_RETRY, APPLE_SUB_EXPIRED,
     APPLE_SUB_GRACE, APPLE_SUB_REVOKED,
     AppleSubscription, CreditLedger, User,
 )
-from app.services import apple_iap_service
+from app.services import apple_iap_service, entitlement
 from app.services.apple_iap_service import (
     APPLE_SUB_PRODUCT_TO_PLAN, PRODUCT_CREDITS, IapVerificationError,
 )
@@ -197,6 +198,15 @@ async def apple_subscribe_verify(
         )
     )).scalar_one_or_none()
 
+    # Re-resolve with the row in hand: `verified.plan_id` is the CATALOGUE
+    # plan (verify_subscription_transaction never sees the row), while a
+    # grandfathered legacy subscription entitles Unlimited. A restore /
+    # re-verify by one of the three grandfathered payers must not walk them
+    # back to Starter or Builder.
+    entitled_plan_id = apple_iap_service.plan_for_subscription(
+        verified.product_id, sub,
+    )
+
     already_active = False
     if (
         sub is not None
@@ -228,7 +238,7 @@ async def apple_subscribe_verify(
             sub.expires_date = verified.expires_date
             sub.environment = verified.environment
         await credit_service.activate_subscription(
-            db, current_user.id, verified.plan_id, "apple",
+            db, current_user.id, entitled_plan_id, "apple",
             verified.expires_date or _fallback_period_end(),
         )
 
@@ -236,7 +246,7 @@ async def apple_subscribe_verify(
 
     return AppleSubscribeResponse(
         ok=True,
-        plan_id=verified.plan_id,
+        plan_id=entitled_plan_id,
         plan_source="apple",
         renews_at=verified.expires_date.isoformat() if verified.expires_date else None,
         already_active=already_active,
@@ -293,8 +303,21 @@ async def apple_notifications(
         logger.warning("[iap] notification verify unexpected error: %s", e)
         return Response(status_code=200)
 
+    # Extracted BEFORE the handler runs, and off the OUTER payload only, so a
+    # handler that raises on its first line can still name itself. These are
+    # cheap getattrs on an already-decoded object; they cannot themselves be
+    # the thing that fails. `trace` is filled in by the handler as it learns
+    # the transaction's identity, so the alert below carries whatever was
+    # known at the moment of the raise.
+    _ntype = getattr(decoded, "notificationType", None)
+    _type_str = getattr(_ntype, "value", str(_ntype or "?"))
+    _sub = getattr(decoded, "subtype", None)
+    _subtype_str = getattr(_sub, "value", str(_sub or "")) if _sub is not None else ""
+    _notif_uuid = getattr(decoded, "notificationUUID", None)
+    trace: dict[str, Optional[str]] = {}
+
     try:
-        await _handle_notification(db, decoded)
+        await _handle_notification(db, decoded, trace=trace)
         await db.commit()
     except Exception as e:
         # A handler error must not turn into a 500 retry storm — log + ack.
@@ -303,6 +326,34 @@ async def apple_notifications(
             await db.rollback()
         except Exception:
             pass
+        # The 200 STAYS, and that is deliberate: Apple's retry would replay a
+        # handler whose apply_plan_change is NOT idempotent, and the reconciler
+        # is the correct retry. What was missing was anybody KNOWING. An
+        # unalerted swallow is how a renewal is lost forever — Apple treats the
+        # 200 as delivered and never redelivers, and until the reconciler
+        # shipped nothing in the system ever looked at that subscription again.
+        # send_infra_alert never raises (alerting.py), but this whole block is
+        # belt-and-braces: an alerting failure must not turn the ack into a 500.
+        try:
+            from app.services.alerting import send_infra_alert
+            _orig_txn = trace.get("original_transaction_id")
+            _interval = getattr(settings, "apple_reconcile_interval_s", 21600)
+            await send_infra_alert(
+                "apple-notification-handler", "critical",
+                f"App Store notification handler RAISED and was acked 200 — this "
+                f"notification is LOST and Apple will not retry. "
+                f"type={_type_str} subtype={_subtype_str or '-'} "
+                f"uuid={_notif_uuid} product={trace.get('product_id') or '?'} "
+                f"orig_txn={_orig_txn or '?'} "
+                f"err={type(e).__name__}: {e}. The reconciler will converge this "
+                f"subscription within {_interval}s (observe-only until "
+                f"apple_reconcile_apply is set) — check that it did.",
+                # Per-subscription so one broken subscription cannot suppress an
+                # alert about another.
+                subject=str(_orig_txn or _notif_uuid or "unknown"),
+            )
+        except Exception as alert_err:  # pragma: no cover - defensive
+            logger.warning("[iap] handler-error alert failed: %s", alert_err)
     return Response(status_code=200)
 
 
@@ -340,12 +391,20 @@ def _decode_inner_renewal_info(signed_renewal_info: Optional[str]):
     return None
 
 
-async def _handle_notification(db: AsyncSession, decoded) -> None:
+async def _handle_notification(
+    db: AsyncSession, decoded, *, trace: Optional[dict] = None,
+) -> None:
     """Dispatch an App Store Server Notification V2 by product class.
 
     Consumable credit packs (``PRODUCT_CREDITS``) keep the existing REFUND /
     REFUND_REVERSED clawback/regrant path, UNCHANGED. Subscription products
     (``APPLE_SUB_PRODUCT_TO_PLAN``) route to the lifecycle handler.
+
+    ``trace`` is an out-parameter, filled with the transaction's identity as
+    soon as it is known. The endpoint's ``except`` reads it so the alert on a
+    swallowed handler error can NAME the lost notification — the alternative
+    is a critical page that says only "something raised". Optional and
+    defaulted so every existing caller (and every test) is unaffected.
     """
     data = getattr(decoded, "data", None)
     signed_txn = getattr(data, "signedTransactionInfo", None) if data is not None else None
@@ -359,6 +418,10 @@ async def _handle_notification(db: AsyncSession, decoded) -> None:
         return
 
     product_id = getattr(decoded_txn, "productId", None)
+    if trace is not None:
+        trace["product_id"] = product_id
+        _otx = getattr(decoded_txn, "originalTransactionId", None)
+        trace["original_transaction_id"] = str(_otx) if _otx else None
 
     if product_id in APPLE_SUB_PRODUCT_TO_PLAN:
         renewal_info = _decode_inner_renewal_info(
@@ -445,7 +508,10 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
     notif_uuid = getattr(decoded, "notificationUUID", None)
 
     product_id = getattr(decoded_txn, "productId", None)
-    plan_id = APPLE_SUB_PRODUCT_TO_PLAN[product_id]
+    # The CATALOGUE plan — what this product was sold as. It is what the
+    # lifecycle mirror records; the ENTITLEMENT is resolved below, once the
+    # row is loaded.
+    catalog_plan_id = APPLE_SUB_PRODUCT_TO_PLAN[product_id]
     original_txn = getattr(decoded_txn, "originalTransactionId", None)
     if not original_txn:
         logger.warning("[iap] sub notification %s without originalTransactionId; skipping", type_str)
@@ -476,6 +542,15 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
             AppleSubscription.original_transaction_id == original_txn
         )
     )).scalar_one_or_none()
+
+    # Resolved AFTER the row load, and that ORDER is the point: a legacy
+    # product entitles Unlimited only for a subscription the grandfather
+    # command marked. Resolving from the product alone (where this line used
+    # to sit) would either revert a grandfathered payer's plan at their next
+    # DID_RENEW, or — if the product map were overloaded instead — hand
+    # Unlimited to any future holder of a legacy id, including a post-cutover
+    # cross-grade down to $9.90 Starter.
+    plan_id = apple_iap_service.plan_for_subscription(product_id, sub)
 
     # Dedup: a replayed notification (same UUID on the same row) is a no-op.
     if sub is not None and notif_uuid and sub.last_notification_uuid == notif_uuid:
@@ -534,6 +609,16 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
             if type_str == "EXPIRED" and subtype_str:
                 reason = f"apple:expired:{subtype_str.lower()}"
             await credit_service.downgrade_to_free(db, user_id, reason)
+            # An admin override sponsored by THIS subscription dies with it, in
+            # the SAME transaction as the sponsor's own downgrade — that
+            # synchronicity is what makes "lapses automatically, no manual
+            # step" true rather than a promise the reconciler has to keep. The
+            # sweep is the backstop for the channel that has already dropped a
+            # message once (the Sandbox Elite has read status='active' for 2.7
+            # months past expiry), not the mechanism.
+            await entitlement.lapse_grants_for_sponsor(
+                db, original_txn_id=original_txn, reason=reason,
+            )
 
     elif type_str == "REFUND_REVERSED":
         # Re-grant the lapsed sub if the user is currently free and the txn is
@@ -551,6 +636,13 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
     # MIGRATION, CONSUMPTION_REQUEST, TEST, …) → no entitlement change.
 
     # ── upsert the lifecycle mirror regardless of whether credits changed ──
+    #
+    # The mirror records `catalog_plan_id` — what the PRODUCT was sold as —
+    # not the resolved entitlement. That is the only in-DB record of what
+    # each subscription is actually being charged for, and overwriting it
+    # with 'unlimited' for a grandfathered legacy payer would destroy it. The
+    # entitlement lives on credit_balances.plan_id, and `grandfathered_at` on
+    # this row says how the two differ.
     new_status = _sub_status_for(type_str, subtype_str, grace_expires)
     if sub is None:
         # We have no user mapping for a fresh notification (e.g. SUBSCRIBED that
@@ -563,7 +655,7 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
             user_id=user_id,
             original_transaction_id=original_txn,
             product_id=product_id,
-            plan_id=plan_id,
+            plan_id=catalog_plan_id,
             status=new_status,
             expires_date=expires_date,
             auto_renew_status=auto_renew_status,
@@ -574,7 +666,7 @@ async def _handle_subscription_notification(db: AsyncSession, decoded, decoded_t
         db.add(sub)
     else:
         sub.product_id = product_id
-        sub.plan_id = plan_id
+        sub.plan_id = catalog_plan_id
         sub.status = new_status
         if expires_date is not None:
             sub.expires_date = expires_date

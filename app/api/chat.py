@@ -574,15 +574,18 @@ async def get_chat_history(
         )
     
     # Get messages
+    # `(created_at, id)` like the day and session routes: a presaved user
+    # row and its assistant row can share a millisecond.
     query = (
         select(Message)
         .where(Message.conversation_id == session_id)
-        .order_by(Message.created_at.asc())
+        .order_by(Message.created_at.asc(), Message.id.asc())
         .limit(limit)
     )
-    
+
     result = await db.execute(query)
     messages = result.scalars().all()
+    from app.api.message_cards import public_text
 
     # Bulk-resolve reply targets so the frontend's quoted card paints
     # immediately. Same pattern as api/day_chats.py and api/sessions.py.
@@ -593,7 +596,7 @@ async def get_chat_history(
         ChatMessageResponse(
             id=msg.id,
             role=msg.role,
-            content=msg.content,
+            content=public_text(msg.role, msg.content),
             created_at=msg.created_at,
             tokens_prompt=msg.tokens_prompt,
             tokens_completion=msg.tokens_completion,

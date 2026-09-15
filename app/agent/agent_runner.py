@@ -63,6 +63,10 @@ from app.agent.query_intent import (
     classify_query_intent, filter_tools_by_intent, QueryIntent, INTENT_FULL,
     with_inbound_image,
 )
+from app.agent.channel_annotations import (
+    make_stream_tag_filter,
+    strip_leaked_tags,
+)
 from app.agent.prefix_stability import (
     build_allowed_tools_choice,
     build_turn_context_message,
@@ -121,6 +125,13 @@ CORE_FACTS_LIMIT = 5
 # model emits several in one assistant turn. Everything NOT in this set —
 # stateful browser_* sessions, mutating tools, and any unknown/new tool —
 # stays sequential and in the model's original order (safe default).
+# Adding a tool here moves it into `_execute_tools_parallel`, whose `gather`
+# runs each call in a Task with a COPY of the context — every ContextVar the
+# tool writes (`_last_media`, `_last_pending_action`, `staged_pending_actions`,
+# the created-job registry) is then invisible to the turn. Read-only web tools
+# only. The same class already cost a production incident (2026-08-19: Round
+# 4's gather lost the create_job registry write). `play_media` survives purely
+# because it is absent from this set.
 PARALLEL_SAFE_TOOLS: frozenset = frozenset({
     "web_search",
     "web_fetch",
@@ -538,6 +549,19 @@ def same_local_day(started_utc, now_utc, tz_name: Optional[str]) -> bool:
     return started_utc.date() == now_utc.date()
 
 
+def _valid_tz(name: Optional[str]) -> bool:
+    """False for anything this tzdata cannot load. A name that ZoneInfo
+    rejects would be stored and then silently fall back to UTC on every
+    later read — a wrong zone that looks like a known one."""
+    if not name or ZoneInfo is None:
+        return bool(name)
+    try:
+        ZoneInfo(name)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def stable_prefix_enabled(user_id: Optional[str]) -> bool:
     """Whether the prefix-stable layout is active for this turn.
 
@@ -554,6 +578,81 @@ def stable_prefix_enabled(user_id: Optional[str]) -> bool:
     if not raw or not user_id:
         return False
     return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
+def _note_turn_persisted(persisted: Optional[Dict[str, Any]]) -> None:
+    """Count an assistant row AFTER the commit that made it durable.
+
+    `turns_completed` advances on ENTRY to `_save_messages`; this advances
+    `assistant_rows_written` (and `media_persisted` when the row carries a
+    card) once the caller's commit has returned. The two are deliberately
+    far apart: container_monitor alerts on `turns - rows`, and incrementing
+    them on adjacent lines — which is what the first cut did — made the gap
+    identically zero for every tenant, i.e. the flagship alert could never
+    fire. Never raises.
+    """
+    try:
+        from app.services import health_signals as _hs
+        _hs.incr("assistant_rows_written")
+        if (persisted or {}).get("media"):
+            _hs.incr("media_persisted")
+    except Exception:  # noqa: BLE001 — a counter never costs a turn
+        pass
+
+
+def channel_envelope_enabled(user_id: Optional[str]) -> bool:
+    """Whether the channel-neutral prefix + per-turn envelope is active.
+
+    Same global-or-canary shape as ``stable_prefix_enabled`` above, and for
+    the same reason: agent flags are fleet-wide, so a canary list is the only
+    way to prove a prefix-shape change on one tenant. Flag-off leaves the
+    system prompt byte-identical.
+    """
+    if getattr(settings, "channel_envelope", False):
+        return True
+    raw = getattr(settings, "channel_envelope_canary_user_ids", "") or ""
+    if not raw or not user_id:
+        return False
+    return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
+# What the user is physically looking at (or listening to). The channel says
+# TRANSPORT; this says SURFACE — the two were conflated often enough that the
+# agent once told a mobile user they were "on Telegram" because the channel
+# string alone was too terse to distinguish them.
+_CLIENT_SURFACES = {
+    "web": "Toup web app in a browser",
+    "app": "a Toup in-app workspace",
+    "mobile": "the Toup mobile app (iOS/Android)",
+    "voice": "a live Toup voice call",
+    "vibecoding": "the Toup Vibecoding IDE",
+    "extension": "the Toup Chrome side panel",
+    "telegram": "Telegram, talking to the Toup bot",
+    "whatsapp": "WhatsApp, talking to the Toup bot",
+    "discord": "Discord, via the Toup bot",
+    "slack": "Slack, via the Toup integration",
+    "api": "a developer API client (/v1/chat)",
+}
+_BACKGROUND_SURFACES = frozenset({
+    "trigger", "routine", "autopilot", "agent_task", "health_probe",
+    "cron", "heartbeat", "automation", "subagent", "agent",
+})
+
+
+def _client_surface_label(
+    channel: Optional[str], *, app_id: Optional[str] = None,
+    managed_voice: bool = False,
+) -> str:
+    ch = (channel or "").strip().lower()
+    if managed_voice and ch == "voice":
+        return "a live Toup voice call (managed task — the result is also written)"
+    if ch == "app" and app_id:
+        return "a Toup in-app workspace"
+    if ch in _CLIENT_SURFACES:
+        return _CLIENT_SURFACES[ch]
+    if ch in _BACKGROUND_SURFACES:
+        return "no live surface — nobody is present and nothing interactive renders"
+    return "an unknown surface — format conservatively"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -766,6 +865,13 @@ class AgentResponse:
     # for pending-action operation ids and media; fetched/tool text never gains
     # system-message privilege through this field.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # What _save_messages actually wrote this turn: user_message_id,
+    # user_created_at, asst_message_id, asst_created_at, day_chat_id,
+    # channel, media, tool_events, attachments. A channel adapter that has
+    # to echo this turn to the user's other clients builds its frames from
+    # here — re-reading the rows would race the frame it is building.
+    # Empty when the caller owns persistence (save_assistant_message=False).
+    persisted: Dict[str, Any] = field(default_factory=dict)
 
 
 OnTextChunk = Callable[[str], Coroutine[Any, Any, None]]
@@ -1571,6 +1677,23 @@ class AgentRunner:
         credit_budget: Optional[float] = None,
         current_job_id: Optional[str] = None,
         display_user_message: Optional[str] = None,
+        # A card the CHANNEL already dispatched before the turn started
+        # (ws_chat's fast-path media_play). It cannot ride `tools._last_media`:
+        # that property is ContextVar-backed and the transient-state reset at
+        # the top of this method clears it inside this run's OWN context copy,
+        # so a value set by the WS handler is erased before _save_messages can
+        # read it — the turn persisted metadata_json=NULL and the card died on
+        # reload (production 2026-09-14).
+        preset_media: Optional[Dict[str, Any]] = None,
+        # The channel's own id for the conversation this turn belongs to
+        # (a WhatsApp chat jid, a Discord/Slack channel id). Stamped into
+        # Conversation.metadata_json so a second allowlisted contact cannot
+        # land in the first one's thread.
+        channel_chat_id: Optional[str] = None,
+        # Where the reply will be DELIVERED, when that differs from where the
+        # turn arrived (a routine fan-out). Envelope-only; defaults to
+        # `channel`.
+        reply_channel: Optional[str] = None,
         client_tz: Optional[str] = None,
         app_id: Optional[str] = None,
         force_new_session: bool = False,
@@ -1727,6 +1850,17 @@ class AgentRunner:
         self.tools._last_pending_action = None
         self.tools._last_media = None
         _attachments_emitted_count = 0
+
+        # OUTPUT SANITIZER (stream). Wrapped ONCE here, so all three emit
+        # sites below and all eight downstream on_text_chunk consumers
+        # (ws_chat, telegram_bot x2, cron_service, streaming.py, thread_agent,
+        # ws_router, api_v1) are covered by one line instead of eight patches.
+        # Without it the leaked '[mobile 9:41pm]' flashes in the live bubble
+        # for the length of the stream — which is the thing the founder saw —
+        # even though the final text is sanitized below.
+        _tag_filter = make_stream_tag_filter(on_text_chunk)
+        if _tag_filter is not None:
+            on_text_chunk = _tag_filter
 
         # ── Classify query intent (lightweight, <1ms) ─────────────────
         t_classify = time.perf_counter()
@@ -1885,7 +2019,7 @@ class AgentRunner:
                     and not save_user_message
                     and not save_assistant_message
                 )
-                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz, ephemeral=_ephemeral_session)
+                session, is_new = await self._get_or_create_session(db, user_id, session_id, telegram_chat_id, channel=channel, app_id=app_id, force_new=force_new_session, client_tz=client_tz, ephemeral=_ephemeral_session, channel_chat_id=channel_chat_id)
                 session_id = session.id
                 logger.info(f"[PERF] get_or_create_session: {(time.perf_counter() - t_db) * 1000:.0f}ms")
 
@@ -2125,7 +2259,7 @@ class AgentRunner:
             # the system prompt; rendered as ONE per-turn <turn_context>
             # message after history at message-prep below. Function-local —
             # no shared runner state (this runner is a singleton).
-            _turn_context_parts: Dict[str, str] = {}
+            _turn_context_parts: Dict[str, Any] = {}
             _stable_layout = stable_prefix_enabled(user_id)
             system_prompt = await self._build_system_prompt(
                 db, user_id, user_message,
@@ -2382,11 +2516,53 @@ class AgentRunner:
             )
             _tc_msg = build_turn_context_message(
                 [_turn_context_parts[k] for k in _tc_order if k in _turn_context_parts]
-                + [v for k, v in sorted(_turn_context_parts.items()) if k not in _tc_order]
+                + [
+                    v for k, v in sorted(_turn_context_parts.items())
+                    # "__"-prefixed keys are out-params for run(), not
+                    # renderable parts (see turn_context_out["__envelope"]).
+                    if k not in _tc_order and not k.startswith("__")
+                ]
             )
             if _tc_msg:
                 messages.append(_tc_msg)
                 _tc_tokens = estimate_tokens(_tc_msg["content"])
+        # W-A3: the per-turn <runtime_envelope>. ORDER IS THE POINT — after
+        # the <turn_context> append (so its per-turn bytes stay behind the
+        # cacheable tools+system+history prefix) and before the user message
+        # (so messages[-1] is still the user turn). Every input is read from
+        # THIS request, never from the Conversation row: that is what makes it
+        # correct on a channel switch mid-day, and what lets it override a
+        # stale channel claim earlier in the conversation.
+        _envelope_meta = (
+            _turn_context_parts.get("__envelope")
+            if isinstance(_turn_context_parts, dict) else None
+        )
+        if _envelope_meta:
+            try:
+                from app.agent.runtime_envelope import (
+                    build_runtime_envelope_message,
+                    channel_capabilities,
+                )
+                _origin_ch = _envelope_meta.get("channel") or (channel or "unknown")
+                _reply_ch = (reply_channel or channel or _origin_ch)
+                _env_msg = build_runtime_envelope_message(
+                    origin_channel=_origin_ch,
+                    reply_channel=_reply_ch,
+                    client_surface=_client_surface_label(
+                        _origin_ch, app_id=app_id,
+                        managed_voice=bool(managed_voice_task),
+                    ),
+                    guidance=_envelope_meta.get("guidance") or "",
+                    capabilities=channel_capabilities(_reply_ch),
+                    request_id=idempotency_key,
+                    message_id=asst_message_id,
+                    day_chat_id=_day_chat_id,
+                    managed_voice=bool(managed_voice_task),
+                )
+                messages.append(_env_msg)
+                _tc_tokens += estimate_tokens(_env_msg["content"])
+            except Exception:  # noqa: BLE001 — never lose a turn over the envelope
+                logger.warning("[AGENT] runtime_envelope build failed", exc_info=True)
         # Item 7 (incident 2026-08-18, the Fable 5 → "Opus 5 is the
         # strongest" flip-flop): source-conflict rules for most-capable /
         # newest claims. Same NON-CACHED slot as <turn_context> — after
@@ -4079,6 +4255,37 @@ class AgentRunner:
                 user_id=user_id, channel=channel,
             )
 
+        # The stream filter may still be holding a prefix it never resolved
+        # (a turn whose entire text is "["). Release it before the turn ends,
+        # or the client is shown nothing at all for those characters.
+        if _tag_filter is not None:
+            try:
+                await _tag_filter.flush()
+            except Exception:  # noqa: BLE001
+                logger.debug("[AGENT] stream tag filter flush failed", exc_info=True)
+
+        # ── OUTPUT SANITIZER (final text) ────────────────────────
+        # UNCONDITIONAL, and that is the one stated exception to
+        # flag-off-is-byte-identical: that convention is about PROMPT shape,
+        # not about shipping a reply we know is wrong. This must sit AFTER
+        # apply_citation_gate (which can rewrite the head of the answer) and
+        # BEFORE _save_messages and the AgentResponse — it is the single line
+        # that keeps the leaked tag out of the DB, the `done` frame, the
+        # late-answer `message` frame, and every non-streaming channel
+        # (WhatsApp / Telegram / cron all consume AgentResponse.text).
+        if final_text:
+            final_text, _leaked_tag = strip_leaked_tags(final_text)
+            if _leaked_tag:
+                logger.warning(
+                    "[annotation_leak] user=%s channel=%s stripped=%r",
+                    (user_id or "")[:8], channel, _leaked_tag[:64],
+                )
+                try:
+                    from app.services import health_signals as _hs
+                    _hs.incr("channel_tag_prefixed_replies")
+                except Exception:  # noqa: BLE001 — a counter never costs a turn
+                    pass
+
         # ── Phase 3: Save to DB (short-lived session) ────────────
         t_phase3 = time.perf_counter()
         # Snapshot managed-voice metadata before _save_messages consumes the
@@ -4096,17 +4303,35 @@ class AgentRunner:
         _voice_pending_action = (
             _voice_pending_actions[-1] if _voice_pending_actions else None
         )
-        _voice_media = (
-            getattr(self.tools, "_last_media", None) if managed_voice_task else None
-        )
+        _tool_media = getattr(self.tools, "_last_media", None)
+        # Tool-set wins: the model may call play_media anyway (a second song,
+        # a correction), and the LAST thing that actually played is the card.
+        # The preset is the channel's fast-path play, handed in by value
+        # because `tools._last_media` is ContextVar-backed and this run's own
+        # transient-state reset erased it before _save_messages could read it.
+        _effective_media = _tool_media or preset_media
+        _voice_media = _effective_media if managed_voice_task else None
+        if _effective_media and not save_assistant_message:
+            logger.warning(
+                "[media-persist] DROPPED user=%s channel=%s reason=no_assistant_row "
+                "video=%s", (user_id or "")[:8], channel,
+                (_effective_media or {}).get("video_id"),
+            )
+        if _effective_media:
+            try:
+                from app.services import health_signals as _hs
+                _hs.incr("media_expected")
+            except Exception:  # noqa: BLE001
+                pass
         # Save messages synchronously (fast, needed for conversation continuity).
         # Sub-agent runs pass save_assistant_message=False so the child's
         # reply does not pollute the user's Day-as-Chat — Phase 4's
         # announce-back posts ONE channel="subagent" row via
         # write_subagent_message instead.
+        _persisted: Dict[str, Any] = {}
         if save_assistant_message:
             async with async_session_maker() as db:
-                await self._save_messages(
+                _persisted = await self._save_messages(
                     db=db,
                     session_id=session_id,
                     user_id=user_id,
@@ -4123,8 +4348,10 @@ class AgentRunner:
                     channel=channel,
                     tool_event_records=tool_event_records,
                     presented_app_slug=_presented_apps[-1] if _presented_apps else None,
+                    media_meta_override=_effective_media,
                 )
                 await db.commit()
+            _note_turn_persisted(_persisted)
             logger.info(f"[PERF] phase3_save: {(time.perf_counter() - t_phase3) * 1000:.0f}ms")
             _wf.mark("save", int((time.perf_counter() - t_phase3) * 1000),
                      t0_ms=int((t_phase3 - _wf.t0) * 1000))
@@ -4765,6 +4992,7 @@ class AgentRunner:
                    if _voice_pending_action else {}),
                 **({"media": _voice_media} if _voice_media else {}),
             } if managed_voice_task else {},
+            persisted=_persisted,
         )
 
     async def _execute_tools_parallel(
@@ -4950,7 +5178,134 @@ class AgentRunner:
                 "[AGENT] tz_seed_failed user=%s err=%s",
                 user_id[:8], _tz_seed_err,
             )
+
+        # (3) The zone the PLATFORM already knows, carried in on the bind
+        # payload. A pool tenant's users.timezone is NULL until the first
+        # web/mobile WS turn, so every tz-less channel (WhatsApp, Telegram,
+        # voice, routines) bucketed its day in UTC — the 2026-09-14 incident,
+        # where one user's day split into two day chats.
+        try:
+            from app.services import runtime_identity as _ri
+            _bind_tz = _ri.get_runtime_field("user_timezone")
+        except Exception:  # noqa: BLE001
+            _bind_tz = None
+        # 'UTC' is refused here as well as in `_nullfill_user_tz`: cached or
+        # returned, it is indistinguishable from a deliberate choice and it
+        # disables the tz-change repair path (ws_chat's gate reads
+        # `_old_tz != "UTC"`). A platform that only knows UTC knows nothing.
+        if _bind_tz and _valid_tz(_bind_tz) and _bind_tz.strip().upper() != "UTC":
+            await self._nullfill_user_tz(user_id, _bind_tz, source="bind")
+            _set_cached_user_tz(user_id, _bind_tz)
+            logger.info(
+                "[agent] tz_seed=bind user=%s channel=%s tz=%s",
+                user_id[:8], channel, _bind_tz,
+            )
+            return _bind_tz
+
+        # (4) LAST resort, phone-backed channels only: infer from the owner's
+        # own linked number. This is a GUESS — `_infer_tz_from_phone` returns
+        # the first zone for the number's area, which is wrong for a roaming
+        # user or a foreign SIM — so it is EPHEMERAL: returned for this turn,
+        # never persisted and never cached. It is still strictly better than
+        # UTC, because it is at least a real zone, which keeps the tz-change
+        # repair path live.
+        _phone_tz = self._tz_from_phone(channel)
+        if _phone_tz:
+            logger.info(
+                "[agent] tz_seed=phone user=%s channel=%s tz=%s "
+                "(ephemeral — not persisted, not cached)",
+                user_id[:8], channel, _phone_tz,
+            )
+            return _phone_tz
+
+        logger.warning(
+            "[agent] tz_unknown user=%s channel=%s — bucketing this turn in UTC",
+            user_id[:8], channel,
+        )
         return None
+
+    def _tz_from_phone(self, channel: Optional[str]) -> Optional[str]:
+        """Source 4 of `_resolve_effective_tz`: a zone inferred from the owner's
+        own linked phone number, phone-backed channels only. A GUESS —
+        `_infer_tz_from_phone` returns the first zone for the number's area,
+        which is wrong for a roaming user or a foreign SIM — so the caller keeps
+        it EPHEMERAL: used for this turn, never persisted, never cached. Still
+        strictly better than UTC, because a real zone keeps the tz-change
+        repair path live. Returns None for every other channel and whenever
+        nothing can be inferred."""
+        if (channel or "").strip().lower() not in ("whatsapp", "telegram"):
+            return None
+        _e164 = None
+        try:
+            from app.agent.channels.whatsapp_baileys import (
+                get_active_baileys_channel as _get_wa,
+            )
+            _ch = _get_wa()
+            _e164 = getattr(_ch, "_self_e164", None) if _ch else None
+        except Exception:  # noqa: BLE001 — a platform process has no sidecar
+            _e164 = None
+        if not _e164:
+            # The allowlist is only a tz source when it names exactly ONE
+            # number: with more entries there is no way to tell the owner
+            # from a third party, and seeding the owner's day from a
+            # stranger's area code is worse than not knowing.
+            _entries = [
+                e.strip() for e in
+                (getattr(settings, "whatsapp_baileys_allowlist", "") or "").split(",")
+                if e.strip()
+            ]
+            if len(_entries) == 1:
+                _e164 = _entries[0]
+        if _e164:
+            try:
+                from app.agent.skills.builtins.routines.skill import (
+                    _infer_tz_from_phone as _infer_tz,
+                )
+                _phone_tz = _infer_tz(_e164)
+            except Exception:  # noqa: BLE001 — phonenumbers may be absent
+                _phone_tz = None
+            if _phone_tz and _valid_tz(_phone_tz):
+                return _phone_tz
+        return None
+
+    async def _nullfill_user_tz(
+        self, user_id: str, tz_name: str, *, source: str,
+    ) -> None:
+        """Fill a BLANK tenant ``users.timezone``. Never overwrites.
+
+        Mirrors ``ws_realtime._persist_user_tz``: the tenant copy is
+        authoritative (models/base.py) and the chat WS is its high-frequency
+        writer, so a seed that overwrote would fight the client on every
+        refresh. Its own short-lived session — the caller's `db` belongs to
+        the turn and must not be dirtied by a best-effort write.
+
+        'UTC' is REFUSED. ws_chat's rebucket gate reads `_old_tz != "UTC"`, so
+        a stored 'UTC' is indistinguishable from a deliberate choice and
+        permanently disables the repair path this incident depends on — and
+        it would make routines register at UTC hours.
+        """
+        if not tz_name or tz_name.strip().upper() == "UTC":
+            return
+        try:
+            from sqlalchemy import update as _upd_tz
+            from app.db.database import async_session_maker as _sm_tz
+            from app.db.models import User as _User_tz
+            async with _sm_tz() as _tz_db:
+                await _tz_db.execute(
+                    _upd_tz(_User_tz)
+                    .where(_User_tz.id == user_id, _User_tz.timezone.is_(None))
+                    .values(timezone=tz_name)
+                )
+                await _tz_db.commit()
+            logger.info(
+                "[agent] tz_nullfill source=%s user=%s tz=%s",
+                source, user_id[:8], tz_name,
+            )
+        except Exception as _e:  # noqa: BLE001 — a seed never fails a turn
+            logger.warning(
+                "[agent] tz_nullfill failed source=%s user=%s: %s",
+                source, user_id[:8], _e,
+            )
 
     async def _get_or_create_session(
         self,
@@ -4963,6 +5318,7 @@ class AgentRunner:
         force_new: bool = False,
         client_tz: Optional[str] = None,
         ephemeral: bool = False,
+        channel_chat_id: Optional[str] = None,
     ):
         from sqlalchemy import select, and_
         from app.db.models import Conversation
@@ -5153,6 +5509,13 @@ class AgentRunner:
             _meta = json.dumps({"telegram_chat_id": telegram_chat_id})
         elif channel == "app" and app_id:
             _meta = json.dumps({"app_id": app_id})
+        elif channel_chat_id and _channel in ("whatsapp", "discord", "slack"):
+            # The channel's own conversation id. Without it `_resolve_session_id`
+            # keys its cache on (channel, chat_id) but has nothing in the DB to
+            # filter by, so a second allowlisted WhatsApp contact lands in the
+            # first contact's Conversation. The telegram and app lookups above
+            # key on different fields, so this shares the column safely.
+            _meta = json.dumps({"channel_chat_id": channel_chat_id})
 
         # System-driven channels are governed by the partial unique index
         # ix_conversations_system_channel_per_day (user_id, day_chat_id,
@@ -5215,7 +5578,7 @@ class AgentRunner:
         prompt_profile: Optional["PromptProfile"] = None,
         subagent_task_label: Optional[str] = None,
         automation_context: Optional[dict] = None,
-        turn_context_out: Optional[Dict[str, str]] = None,
+        turn_context_out: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
 
@@ -5271,6 +5634,20 @@ class AgentRunner:
         )
         _profile_sections = set(
             _sections_for(prompt_profile if prompt_profile is not None else _PP.FULL)
+        )
+        # W-A3: with the envelope on, NOTHING below may branch on channel —
+        # the per-turn channel facts ride <runtime_envelope> instead and the
+        # long per-surface contracts become always-present and explicitly
+        # scoped. Requires the stable layout: without it there is no
+        # turn_context slot to put the envelope beside, and the prompt is
+        # rebuilt per turn anyway. SUBAGENT is excluded because _run_inner
+        # appends no envelope for a child run — dropping the `- Channel:`
+        # line there would take the information away with nothing carrying
+        # it, and a subagent's prefix is a separate lineage by design.
+        _envelope = bool(
+            _stable
+            and channel_envelope_enabled(user_id)
+            and prompt_profile is not _PP.SUBAGENT
         )
 
         logger.info(f"[AGENT] Building system prompt for user: {user_id}")
@@ -5335,7 +5712,11 @@ class AgentRunner:
         # prompt_profile.VOICE_DISABLED_TOOLS), and a rule naming a tool the
         # model cannot call is worse than no rule — it reliably produces
         # "I can't do that from here" instead of the thing the model CAN do.
-        _voice_now = (channel or "").strip().lower() == "voice"
+        # Under the envelope the platform map always renders its non-voice
+        # variant; the voice-only clauses live in `surface_contracts`, scoped
+        # by the envelope's own Contract line. Keeping the branch keyed on
+        # this ONE name is what lets flag-off stay byte-identical.
+        _voice_now = (channel or "").strip().lower() == "voice" and not _envelope
         section_parts["platform_knowledge"] = (
             "# Platform Knowledge — How Toup Works\n"
             "You run on **Toup** — a personal-agent platform. The user lives "
@@ -5540,7 +5921,13 @@ class AgentRunner:
             # named `create_job` and routed search to `browser`. With the voice
             # tools removed that combination is the worst case — the model is
             # told to call something it does not have.
-            section_parts["platform_knowledge"] = _platform_knowledge_diet(_voice_now)
+            if _envelope:
+                # Explicit False, not `_voice_now`: this call site is the one
+                # the diet flag rewrites wholesale, and a reader has to be
+                # able to see that the cached map no longer forks.
+                section_parts["platform_knowledge"] = _platform_knowledge_diet(False)
+            else:
+                section_parts["platform_knowledge"] = _platform_knowledge_diet(_voice_now)
 
         # Who owns/founded Toup — a static company fact appended to the
         # always-on platform map so every agent can answer "who's behind
@@ -6053,7 +6440,7 @@ class AgentRunner:
         # the [[button]] affordance it insists on is unclickable in a voice
         # call. What voice needs is only the part that matters — call the tool,
         # don't search first, and say something short while it starts.
-        if channel == "voice" and (
+        if channel == "voice" and not _envelope and (
             intent.include_media_section or intent.category == "full" or _stable
         ):
             section_parts["media"] = (
@@ -6081,7 +6468,7 @@ class AgentRunner:
         # ── 5b. Media Playback (web channel, only if intent includes media) ──
         # PR-1 stable layout: channel-gated only — intent gating would flip
         # the section between turns of the same (web/app) session.
-        if channel in ("web", "app") and (intent.include_media_section or intent.category == "full" or _stable):
+        if channel in ("web", "app") and not _envelope and (intent.include_media_section or intent.category == "full" or _stable):
             section_parts["media"] = (
                 "# Media Playback (IMPORTANT — read carefully)\n"
                 "You have a `play_media` tool that plays music and videos directly in the user's player.\n"
@@ -6127,6 +6514,70 @@ class AgentRunner:
                 "(no buttons = user can't click to play = BAD)\n\n"
                 "When the user clicks one of these buttons, you will receive their choice as a message. "
                 "Immediately call `play_media(query=\"TITLE\", channel=\"netflix\")` to play it."
+            )
+
+        # ── 5b-neutral. Media Playback (every surface) ───────────────────────
+        # The union of the two variants above, with every surface-specific
+        # clause rewritten to defer to the envelope. This also closes a live
+        # defect: the two gates above are `voice` and `("web","app")`, so a
+        # MOBILE, WhatsApp or Telegram "play Kanye" turn carried NO media rules
+        # at all — not the name-only-what-the-tool-returned rule, not the
+        # audio-vs-video rule, not variety. That is the prompt-side context of
+        # the 2026-09-14 turn that announced a track it was not playing.
+        if _envelope and "media" in _profile_sections:
+            section_parts["media"] = (
+                "# Media Playback (IMPORTANT — read carefully)\n"
+                "You have a `play_media` tool that plays music and video for the user "
+                "on whatever device they are talking to you from.\n"
+                "Rules:\n"
+                "1. Call `play_media` IMMEDIATELY when the user asks to play something.\n"
+                "2. NEVER call web_search or web_fetch first. The tool searches internally.\n"
+                "3. For Netflix: `play_media(query=\"TITLE\", channel=\"netflix\")`.\n"
+                "4. For a vague request ('play a good documentary', 'play something chill') "
+                "pick one you know and call the tool directly — use your own knowledge, do "
+                "not search, do not ask which one.\n"
+                "5. Default channel is YouTube (free, no login needed).\n"
+                "6. NAME ONLY WHAT THE TOOL RETURNED. play_media (and the [SYSTEM] line for "
+                "a play that already started) gives you the resolved title — quote that "
+                "title exactly. Never announce the song the user asked for: search does not "
+                "always find it, and claiming to play a track while a different one is "
+                "audible is a lie the user can hear. If the tool says it could not find what "
+                "they named, tell them plainly and ask whether to keep what is playing.\n"
+                "7. Music plays as AUDIO by default (background-capable). Pass mode='video' "
+                "when the user asks to watch — \"video\", \"music video\", \"watch\" (e.g. the "
+                "user replies just \"Video\" after a song starts: call play_media again with "
+                "the same song and mode='video') — AND for anything that is not music: a "
+                "documentary, trailer, film, episode, interview or talk has nothing to "
+                "listen to, so it must be mode='video'. Never mode='video' when the "
+                "<runtime_envelope> capability line says media_player=native and the user "
+                "did not ask to watch.\n"
+                "8. For an open-ended music request — an artist, genre, or vibe rather than "
+                "one specific song (\"play me Drake\", \"some 80s rock\") — pass variety=true "
+                "so each request builds a fresh station instead of replaying the same track.\n"
+                "9. Playback continues after the track ends, in the same style, without you "
+                "doing anything. Never claim you cannot keep playing music.\n"
+                "10. Say ONE short line after the tool answers. Keep it short enough to be "
+                "read aloud when the <runtime_envelope> says markdown=none.\n\n"
+                "## Netflix Suggestions\n"
+                "When the <runtime_envelope> capability line says quick_reply_buttons=y, "
+                "EVERY Netflix title you mention, suggest or recommend MUST carry a "
+                "clickable [[Play TITLE on Netflix]] marker on the line immediately after "
+                "it — never a bare list of titles.\n\n"
+                "CORRECT example:\n"
+                "- **Conversations with a Killer: The Ted Bundy Tapes** — chilling interviews\n"
+                "[[Play Conversations with a Killer on Netflix]]\n"
+                "- **Night Stalker** — about Richard Ramirez\n"
+                "[[Play Night Stalker on Netflix]]\n\n"
+                "WRONG (never do this on a surface that renders them):\n"
+                "- **Night Stalker** — about Richard Ramirez\n"
+                "- **Dahmer – Monster** — the Ryan Murphy series\n"
+                "(no buttons = user can't click to play = BAD)\n\n"
+                "When the user clicks one of these markers you receive their choice as a "
+                "message: immediately call `play_media(query=\"TITLE\", channel=\"netflix\")`. "
+                "When the capability line says quick_reply_buttons=n, name the titles in "
+                "plain prose instead — the markers would reach the user as literal text.\n"
+                "Do NOT offer alternatives as buttons on a surface whose capability line "
+                "says quick_reply_buttons=n; say them, or leave them out."
             )
 
         # ── 6. Runtime context ─────────────────────────────────────
@@ -6258,6 +6709,18 @@ class AgentRunner:
                 "all confirmation requirements, and never claim an unconfirmed external action succeeded."
             )
 
+        # Hand the resolved channel + its guidance to run(), which builds the
+        # <runtime_envelope> from them. A DUNDER key: `_tc_order` and its
+        # alphabetical fallback skip anything starting with "__", so this can
+        # never be rendered INSIDE <turn_context> — that block is framed as
+        # reference DATA the model must not take instructions from, and the
+        # envelope's whole job is to give orders.
+        if turn_context_out is not None and _envelope:
+            turn_context_out["__envelope"] = {
+                "channel": _channel_safe,
+                "guidance": _channel_guidance,
+            }
+
         # Time is rendered in the USER'S LOCAL TIMEZONE, never UTC. The
         # agent faces the user; the user cares about their clock, not the
         # server's. Earlier versions included a "(UTC wall clock: ...Z)"
@@ -6265,11 +6728,21 @@ class AgentRunner:
         # UTC number and echoed it as "your time." So: local only.
         # Day name included ("Wednesday") so phrases like "today" resolve
         # cleanly without the agent having to parse a date string.
+        _annotation_rule = ""
+        if _envelope:
+            try:
+                from app.agent.runtime_envelope import ANNOTATION_RULE as _annotation_rule
+            except Exception:  # noqa: BLE001 — an older module: the sanitizer still strips
+                _annotation_rule = ""
         runtime_lines = [
             f"# Runtime Context",
             # PR-1: date-only in stable layout (minute clock → turn_context)
             _time_lines["runtime"],
-            f"- Channel: {_channel_safe} — {_channel_guidance}",
+            # W-A3: the single largest channel-dependent byte range in the
+            # cached prefix. Under the envelope the channel and its short
+            # descriptor travel per-turn instead; `_channel_guidance` is still
+            # computed above and handed to the envelope builder.
+            *([] if _envelope else [f"- Channel: {_channel_safe} — {_channel_guidance}"]),
             f"- Workspace directory: {settings.agent_workspace_dir}",
             f"- Max tool iterations: {self._effective_max_iterations()}",
             f"- You have FULL terminal/shell access via the `exec` tool. You can run any command, install packages, write scripts, manage files, use git, curl, python, node, etc.",
@@ -6281,7 +6754,14 @@ class AgentRunner:
             # it never saw. Static text — no per-turn bytes, prefix stays stable.
             "- STALENESS RULE: your training knowledge of anything that changes over time — the newest/latest/current/most-capable model, product, version, price, release, ranking, or who holds a role — is OUT OF DATE relative to today's date above. Any such claim MUST come from THIS TURN's web_search/web_fetch results, never from memory. Every search result shows a `published:` date: prefer the NEWEST dated result from the OFFICIAL domain; when sources disagree, the official domain and the newer date win. If the thing you remember does not appear in this turn's results, do not assert it — search again with a NEUTRAL query (no site: operator) and confirm on the official site. Two agreeing sources, or say plainly that you could not verify.",
             "- CITATIONS: link only to URLs that appear verbatim in this turn's tool results. Never compose, guess, or recall a URL. Unverified links are stripped and marked before the user sees them.",
+            # W-A3: the history-annotation rule. Byte-identical for every
+            # channel and every turn, so it belongs HERE (cached) and not in
+            # the per-turn envelope, where it was the largest uncached cost.
+            *([f"- {_annotation_rule}"] if _envelope else []),
             (
+                "- When the user asks you to DO something you will finish in this turn (research, produce, fix — anything beyond answering), create a trackable job with `create_job` — in the SAME response as the first step's tool calls, never alone — and advance it with `update_job(current_step=k)` in the same response as the next step's tools. Do not call update_job to mark it completed; the system completes it when your reply is delivered. Every response spent on bookkeeping alone is a round-trip the user waits through. For work that must CONTINUE after this conversation ('while I'm away', 'keep me updated'), use `start_mission` instead — never both for the same ask.\n"
+                "- Whether a deferral tool is available on THIS turn is stated on the <runtime_envelope> block's `Deferral:` line (create_job / update_job / start_mission, y or n) and by your tool list; a tool marked n, or absent from your tool list, must not be named to the user — say what you CAN do now instead."
+                if _envelope else
                 ("- This managed voice task remains active independently of speech and the socket. Finish the tracked work, produce the full written result, and do not open another job or mission for it."
                  if _RUN_MANAGED_VOICE_CTX.get() else
                  "- The user is speaking to you live. Finish the work in this turn and say the answer. Only `start_mission` defers, and only when they ask for work that outlives the call ('while I'm away', 'keep me updated').")
@@ -6304,8 +6784,9 @@ class AgentRunner:
         section_parts["runtime"] = "\n".join(runtime_lines)
 
         # ── 6b. Vibe Coding mode ─────────────────────────────────
-        if _channel_safe == "vibecoding":
-            section_parts["vibecoding"] = (
+        # Hoisted to a local so the envelope path can carry these exact bytes
+        # as one scoped surface contract — a second copy would drift.
+        _vibecoding_contract = (
                 "# VIBE CODING MODE (CRITICAL — READ EVERY WORD)\n"
                 "The user is in a live IDE workspace watching you code. They see a code editor on the left and chat on the right.\n\n"
                 "## ABSOLUTE RULES\n"
@@ -6346,49 +6827,80 @@ class AgentRunner:
                 "- Say 'Building your app!' not a 5000-word architecture doc\n"
                 "- Never dump markdown headers, bullet lists, or documentation as chat text\n\n"
                 "REMEMBER: The user is watching a live code editor. Every second you spend writing text instead of code is a second the editor stays empty."
+        )
+        if _channel_safe == "vibecoding" and not _envelope:
+            section_parts["vibecoding"] = _vibecoding_contract
+
+        # ── 6c. Surface contracts (always present, explicitly scoped) ──
+        # The long per-surface behavioural contracts used to be the reason the
+        # cached prefix forked: voice's guidance (1.8k chars) and platform-map
+        # variants only rendered on voice, extension's (2.2k) only on
+        # extension, vibecoding's (2.9k) only on vibecoding. They are all
+        # present on every turn now and each one names the surface it governs,
+        # so the bytes stay in the cached region (~10% on a hit) instead of
+        # being re-billed in full on every channel hop. The envelope's
+        # `Contract:` line says which one is in force THIS turn.
+        if _envelope and "surface_contracts" in _profile_sections:
+            section_parts["surface_contracts"] = (
+                "# Surface Contracts\n"
+                "Each contract below governs ONE surface. Apply a contract ONLY when the "
+                "<runtime_envelope> block for this turn names it on its `Contract:` line; "
+                "otherwise ignore it entirely — it is here so the wording never changes "
+                "between turns, not because it applies now.\n\n"
+                "## VOICE — applies only when the runtime envelope names VOICE\n"
+                + CHANNEL_GUIDANCE["voice"] + "\n"
+                "Also on this surface: the deferral tools (`create_job`, `update_job`, the "
+                "sub-agent tools) are NOT in your tool list — never name them, never promise "
+                "a report or a summary 'when it's ready'; later never arrives on voice. Only "
+                "`start_mission` defers, and only for work that outlives the call. A "
+                "question that a search answers is `web_search` → read the best results → "
+                "speak a short summary naming the two or three sources you used.\n\n"
+                "## EXTENSION — applies only when the runtime envelope names EXTENSION\n"
+                + CHANNEL_GUIDANCE["extension"] + "\n\n"
+                # G-19b: the unattended email-trigger turn. Its guidance ends
+                # in the "NEVER claim to have sent…" pin, which the per-turn
+                # descriptor (first sentence only) does not carry.
+                "## TRIGGER — applies only when the runtime envelope names TRIGGER\n"
+                + CHANNEL_GUIDANCE["trigger"] + "\n\n"
+                "## VIBECODING — applies only when the runtime envelope names VIBECODING\n"
+                + _vibecoding_contract
             )
 
-        # ── 7. Formatting rules (channel-aware) ───────────────────
-        if _channel_safe in ("app", "web", "vibecoding"):
+        # ── 7. Formatting rules ───────────────────────────────────
+        # W-A3: ONE block for every surface. The math/LaTeX/Unicode rules were
+        # already byte-identical in all four legacy branches; each marker
+        # family is now taught once and conditioned on the envelope's
+        # capability line, so the cached prefix stops forking on channel while
+        # a surface that cannot render a marker still never emits one.
+        if _envelope:
             section_parts["formatting"] = (
-                "# Formatting Rules\n"
-                "You are chatting with the user inside their " + ("app" if _channel_safe == "app" else "web browser") + ". Follow these rules:\n"
-                "- Use simple Markdown: **bold**, *italic*, `code`.\n"
-                "- Do NOT use LaTeX math formatting.\n"
-                "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
+                "# Formatting Rules (IMPORTANT)\n"
+                "Follow these rules strictly:\n"
+                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                "- The <runtime_envelope> capability line for THIS turn says how much markup "
+                "the surface renders. markdown=full → headings, tables and long code blocks "
+                "are fine. markdown=basic → **bold**, *italic*, `code` only; no headings, no "
+                "tables, short code blocks. markdown=none → plain spoken sentences, no markup "
+                "at all. Honour tables= and code_blocks= the same way, and keep replies under "
+                "max_message_chars when it is non-zero.\n"
                 "- Keep responses concise and conversational.\n"
-                "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
-                "- When the user greets you, greet them back like a friend would — not a help desk. If you know their name, use it. Skip 'How can I help you today?' (see voice rules above).\n"
-                "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools.\n"
-                "- When the user asks you to change something in the app (theme, colors, layout, text, features, etc.), "
-                "DO NOT just describe what you would do — actually DO it by calling your write_file/edit_file tools to modify the source code. "
-                "After editing, call the restart tool to apply changes. Read the relevant file first, make the edit, restart, and confirm what you changed.\n"
-                "- NEVER give the user localhost URLs. App previews are at: https://toup.ai/workspace/apps/{app-slug}\n"
-                "- After fixing or restarting an app, offer a [[open_app:{app-slug}]] chip so the user can see the result. Use the app's slug (e.g. [[open_app:Confidence-Booster]]).\n\n"
-                "# Navigating the User Between Pages\n"
-                "You can take the user to other Toup pages two ways — pick the one that matches intent:\n\n"
-                "**A) Tool — `navigate_to(path=...)` — auto-transfer.**\n"
-                "Use when the user EXPLICITLY asks to be taken somewhere ('take me to settings', "
-                "'open my brain', 'go to the dashboard'). Call the tool; the page changes immediately. "
-                "Don't also offer a chip in this case — just go.\n\n"
-                "**B) Chip — `[[navigate:/path]]` — clickable suggestion.**\n"
-                "Use when you're SUGGESTING a destination but the user might not want it ('your "
-                "portrait is on the brain page if you want to see it', 'integrations live at /agent/integrations'). "
-                "Drop the chip on the line after the suggestion — they tap if interested.\n\n"
-                "Allowed paths (same for both): `/`, `/chat`, `/brain/user`, `/brain/agent`, "
-                "`/workspace`, `/dashboard`, `/agent`, `/agent/soul`, `/agent/integrations`, "
-                "`/agent/tools`, `/agent/skills`. Anything else is rejected.\n\n"
-                "Example — explicit request:\n"
-                "  User: \"open my brain\"\n"
-                "  You: → call navigate_to(path=\"/brain/user\"), then say \"There you go.\"\n\n"
-                "Example — passive suggestion:\n"
-                "  User: \"how do I see my saved memories?\"\n"
-                "  You: \"They're on your User Brain page.\\n[[navigate:/brain/user]]\"\n\n"
-                "# Action Buttons\n"
-                "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
-                "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
-                "CRITICAL PLACEMENT RULE: Place [[option]] buttons DIRECTLY on the line after each question or suggestion.\n"
-                "NEVER collect all buttons at the end of the message. Each question gets its own buttons immediately below it.\n\n"
+                "- Do NOT expose internal implementation details (databases, bridges, "
+                "connections, file paths, error traces).\n"
+                "- When the user greets you, greet them back like a friend would — not a help "
+                "desk. If you know their name, use it. Skip 'How can I help you today?'.\n\n"
+                "# Interactive markers\n"
+                "Each family below renders on SOME surfaces and reaches the user as literal "
+                "text on the rest. Use ONLY when the <runtime_envelope> capability line says "
+                "so; when it does not, say the same thing in plain prose.\n\n"
+                "## Quick replies — [[button:LABEL|CALLBACK_DATA]] and bare [[Label]]\n"
+                "Use ONLY when the <runtime_envelope> capability line says so "
+                "(quick_reply_buttons=y). They are stripped from the text and rendered as "
+                "tappable chips. Put them DIRECTLY on the line after each question or "
+                "suggestion — never collect them at the end of the message. Keep labels short "
+                "(2-5 words), 2-4 per question, and callback_data under 64 chars.\n\n"
                 "CORRECT:\n"
                 "1. **Question one?**\n"
                 "[[Option A]] [[Option B]] [[Option C]]\n\n"
@@ -6398,79 +6910,154 @@ class AgentRunner:
                 "1. Question one?\n"
                 "2. Question two?\n"
                 "[[Option A]] [[Option B]] [[Option X]] [[Option Y]]\n\n"
-                "Keep button labels short (2-5 words). Use 2-4 buttons per question when relevant."
+                "## Reactions — [[reaction:EMOJI]]\n"
+                "Use ONLY when the <runtime_envelope> capability line says so "
+                "(reactions=y). Stripped before sending. React sparingly — at most once per "
+                "5-10 messages, and never to a routine message: genuinely funny (😂), "
+                "appreciation (❤️), acknowledgment (👍), thoughtful (🤔), impressive (🔥), "
+                "celebrating (🎉).\n\n"
+                "## Navigation chips — [[navigate:/path]]\n"
+                "Use ONLY when the <runtime_envelope> capability line says so "
+                "(quick_reply_buttons=y) — they render in the Toup web and app surfaces. Drop "
+                "one on the line after a destination you are SUGGESTING. When the user "
+                "EXPLICITLY asks to be taken somewhere ('take me to settings', 'open my "
+                "brain'), call the `navigate_to` tool instead and do not also offer a chip. "
+                "Allowed paths, both ways: `/`, `/chat`, `/brain/user`, `/brain/agent`, "
+                "`/workspace`, `/dashboard`, `/agent`, `/agent/soul`, `/agent/integrations`, "
+                "`/agent/tools`, `/agent/skills`. Anything else is rejected.\n\n"
+                "## App chips — [[open_app:slug]]\n"
+                "Use ONLY when the <runtime_envelope> capability line says so "
+                "(quick_reply_buttons=y). Offer one after fixing, building or restarting an "
+                "app so the user can see the result (e.g. [[open_app:Confidence-Booster]]). "
+                "NEVER give the user a localhost URL — app previews live at "
+                "https://toup.ai/workspace/apps/{app-slug}.\n\n"
+                "## Netflix chips — [[Play TITLE on Netflix]]\n"
+                "Use ONLY when the <runtime_envelope> capability line says so "
+                "(quick_reply_buttons=y). See the Media section for placement."
             )
-        elif _channel_safe in ("telegram", "cron", "heartbeat"):
-            # 'cron' and 'heartbeat' turns deliver their output to the user's
-            # Telegram (cron_service / heartbeat_service push via the bot), so
-            # they keep the Telegram-shaped rules incl. button/reaction syntax.
-            section_parts["formatting"] = (
-                "# Formatting Rules (IMPORTANT)\n"
-                "You are communicating via Telegram. Follow these rules strictly:\n"
-                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
-                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
-                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
-                "- Write fractions as a/b, not \\frac{a}{b}.\n"
-                "- Telegram supports basic Markdown: **bold**, *italic*, `code`, ```code blocks```.\n"
-                "- Do NOT use tables or complex formatting.\n"
-                "- Keep responses concise and readable on mobile.\n\n"
-                "# Reactions\n"
-                "You can react to the user's message with an emoji by including [[reaction:EMOJI]] "
-                "anywhere in your response. It will be stripped before sending. "
-                "React sparingly — at most 1 reaction per 5-10 messages. "
-                "React when: something is genuinely funny (😂), you appreciate something (❤️), "
-                "simple acknowledgment (👍), interesting/thoughtful (🤔), impressive (🔥), "
-                "celebrating (🎉). Don't react to routine messages.\n\n"
-                "# Inline Buttons\n"
-                "You can add inline buttons to your message by including [[button:LABEL|CALLBACK_DATA]] "
-                "markers. They will be stripped from text and rendered as clickable Telegram buttons. "
-                "Use buttons when offering clear choices, confirmations, or actions. "
-                "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
-                "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
-            )
-        elif _channel_safe == "mobile":
-            # The native app RENDERS [[button:Label|value]] markers as
-            # quick-reply chips (ChatMarkdown.tsx parses both [[button:...]]
-            # and bare [[Label]]), so mobile keeps the button teaching —
-            # but not the Telegram framing and not [[reaction:...]], which
-            # the app does not render.
-            section_parts["formatting"] = (
-                "# Formatting Rules (IMPORTANT)\n"
-                "Follow these rules strictly:\n"
-                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
-                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
-                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
-                "- Write fractions as a/b, not \\frac{a}{b}.\n"
-                "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
-                "- Do NOT use tables or complex formatting.\n"
-                "- Keep responses concise and easy to read on a small screen.\n\n"
-                "# Quick-Reply Buttons\n"
-                "You can offer tappable choices by including [[button:LABEL|CALLBACK_DATA]] "
-                "markers. They are stripped from the text and rendered as buttons in the app. "
-                "Use them for clear choices, confirmations, or actions. "
-                "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
-                "Keep labels short (2-5 words); don't overuse buttons — only when genuinely helpful."
-            )
-        else:
-            # Neutral messaging-surface rules for every other channel
-            # (voice, extension, discord, slack, whatsapp, unknown).
-            # NEVER teach [[button:...]] / [[reaction:...]] here — those
-            # markers render only on Telegram and the native app; on any
-            # other surface they leak into the message body as literal text
-            # (whatsapp_helpers strips them defensively for exactly that
-            # reason). Channel-specific tone lives in the Runtime Context
-            # channel line above.
-            section_parts["formatting"] = (
-                "# Formatting Rules (IMPORTANT)\n"
-                "Follow these rules strictly:\n"
-                "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
-                "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
-                "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
-                "- Write fractions as a/b, not \\frac{a}{b}.\n"
-                "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
-                "- Do NOT use tables or complex formatting.\n"
-                "- Keep responses concise and easy to read on a small screen."
-            )
+        if not _envelope:
+            if _channel_safe in ("app", "web", "vibecoding"):
+                section_parts["formatting"] = (
+                    "# Formatting Rules\n"
+                    "You are chatting with the user inside their " + ("app" if _channel_safe == "app" else "web browser") + ". Follow these rules:\n"
+                    "- Use simple Markdown: **bold**, *italic*, `code`.\n"
+                    "- Do NOT use LaTeX math formatting.\n"
+                    "- Use plain Unicode symbols for math: × ÷ √ → ⇒ ≤ ≥ ≠ ≈ ∞ π.\n"
+                    "- Keep responses concise and conversational.\n"
+                    "- Do NOT expose internal implementation details (databases, bridges, connections, file paths, error traces).\n"
+                    "- When the user greets you, greet them back like a friend would — not a help desk. If you know their name, use it. Skip 'How can I help you today?' (see voice rules above).\n"
+                    "- You have editing capabilities: you can modify the app's files, database, and navigation using your tools.\n"
+                    "- When the user asks you to change something in the app (theme, colors, layout, text, features, etc.), "
+                    "DO NOT just describe what you would do — actually DO it by calling your write_file/edit_file tools to modify the source code. "
+                    "After editing, call the restart tool to apply changes. Read the relevant file first, make the edit, restart, and confirm what you changed.\n"
+                    "- NEVER give the user localhost URLs. App previews are at: https://toup.ai/workspace/apps/{app-slug}\n"
+                    "- After fixing or restarting an app, offer a [[open_app:{app-slug}]] chip so the user can see the result. Use the app's slug (e.g. [[open_app:Confidence-Booster]]).\n\n"
+                    "# Navigating the User Between Pages\n"
+                    "You can take the user to other Toup pages two ways — pick the one that matches intent:\n\n"
+                    "**A) Tool — `navigate_to(path=...)` — auto-transfer.**\n"
+                    "Use when the user EXPLICITLY asks to be taken somewhere ('take me to settings', "
+                    "'open my brain', 'go to the dashboard'). Call the tool; the page changes immediately. "
+                    "Don't also offer a chip in this case — just go.\n\n"
+                    "**B) Chip — `[[navigate:/path]]` — clickable suggestion.**\n"
+                    "Use when you're SUGGESTING a destination but the user might not want it ('your "
+                    "portrait is on the brain page if you want to see it', 'integrations live at /agent/integrations'). "
+                    "Drop the chip on the line after the suggestion — they tap if interested.\n\n"
+                    "Allowed paths (same for both): `/`, `/chat`, `/brain/user`, `/brain/agent`, "
+                    "`/workspace`, `/dashboard`, `/agent`, `/agent/soul`, `/agent/integrations`, "
+                    "`/agent/tools`, `/agent/skills`. Anything else is rejected.\n\n"
+                    "Example — explicit request:\n"
+                    "  User: \"open my brain\"\n"
+                    "  You: → call navigate_to(path=\"/brain/user\"), then say \"There you go.\"\n\n"
+                    "Example — passive suggestion:\n"
+                    "  User: \"how do I see my saved memories?\"\n"
+                    "  You: \"They're on your User Brain page.\\n[[navigate:/brain/user]]\"\n\n"
+                    "# Action Buttons\n"
+                    "You can offer clickable action buttons by including [[Label]] markers in your response.\n"
+                    "These render as tappable chips in the chat UI. When the user taps one, it sends that label as a message.\n"
+                    "CRITICAL PLACEMENT RULE: Place [[option]] buttons DIRECTLY on the line after each question or suggestion.\n"
+                    "NEVER collect all buttons at the end of the message. Each question gets its own buttons immediately below it.\n\n"
+                    "CORRECT:\n"
+                    "1. **Question one?**\n"
+                    "[[Option A]] [[Option B]] [[Option C]]\n\n"
+                    "2. **Question two?**\n"
+                    "[[Option X]] [[Option Y]]\n\n"
+                    "WRONG:\n"
+                    "1. Question one?\n"
+                    "2. Question two?\n"
+                    "[[Option A]] [[Option B]] [[Option X]] [[Option Y]]\n\n"
+                    "Keep button labels short (2-5 words). Use 2-4 buttons per question when relevant."
+                )
+            elif _channel_safe in ("telegram", "cron", "heartbeat"):
+                # 'cron' and 'heartbeat' turns deliver their output to the user's
+                # Telegram (cron_service / heartbeat_service push via the bot), so
+                # they keep the Telegram-shaped rules incl. button/reaction syntax.
+                section_parts["formatting"] = (
+                    "# Formatting Rules (IMPORTANT)\n"
+                    "You are communicating via Telegram. Follow these rules strictly:\n"
+                    "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                    "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                    "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                    "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                    "- Telegram supports basic Markdown: **bold**, *italic*, `code`, ```code blocks```.\n"
+                    "- Do NOT use tables or complex formatting.\n"
+                    "- Keep responses concise and readable on mobile.\n\n"
+                    "# Reactions\n"
+                    "You can react to the user's message with an emoji by including [[reaction:EMOJI]] "
+                    "anywhere in your response. It will be stripped before sending. "
+                    "React sparingly — at most 1 reaction per 5-10 messages. "
+                    "React when: something is genuinely funny (😂), you appreciate something (❤️), "
+                    "simple acknowledgment (👍), interesting/thoughtful (🤔), impressive (🔥), "
+                    "celebrating (🎉). Don't react to routine messages.\n\n"
+                    "# Inline Buttons\n"
+                    "You can add inline buttons to your message by including [[button:LABEL|CALLBACK_DATA]] "
+                    "markers. They will be stripped from text and rendered as clickable Telegram buttons. "
+                    "Use buttons when offering clear choices, confirmations, or actions. "
+                    "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
+                    "Keep callback_data short (max 64 chars). Don't overuse buttons — only when genuinely helpful."
+                )
+            elif _channel_safe == "mobile":
+                # The native app RENDERS [[button:Label|value]] markers as
+                # quick-reply chips (ChatMarkdown.tsx parses both [[button:...]]
+                # and bare [[Label]]), so mobile keeps the button teaching —
+                # but not the Telegram framing and not [[reaction:...]], which
+                # the app does not render.
+                section_parts["formatting"] = (
+                    "# Formatting Rules (IMPORTANT)\n"
+                    "Follow these rules strictly:\n"
+                    "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                    "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                    "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                    "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                    "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
+                    "- Do NOT use tables or complex formatting.\n"
+                    "- Keep responses concise and easy to read on a small screen.\n\n"
+                    "# Quick-Reply Buttons\n"
+                    "You can offer tappable choices by including [[button:LABEL|CALLBACK_DATA]] "
+                    "markers. They are stripped from the text and rendered as buttons in the app. "
+                    "Use them for clear choices, confirmations, or actions. "
+                    "Example: [[button:Yes|confirm_yes]] [[button:No|confirm_no]]\n"
+                    "Keep labels short (2-5 words); don't overuse buttons — only when genuinely helpful."
+                )
+            else:
+                # Neutral messaging-surface rules for every other channel
+                # (voice, extension, discord, slack, whatsapp, unknown).
+                # NEVER teach [[button:...]] / [[reaction:...]] here — those
+                # markers render only on Telegram and the native app; on any
+                # other surface they leak into the message body as literal text
+                # (whatsapp_helpers strips them defensively for exactly that
+                # reason). Channel-specific tone lives in the Runtime Context
+                # channel line above.
+                section_parts["formatting"] = (
+                    "# Formatting Rules (IMPORTANT)\n"
+                    "Follow these rules strictly:\n"
+                    "- Do NOT use LaTeX math formatting. No $...$ or $$...$$ or \\(...\\) or \\[...\\] wrappers.\n"
+                    "- Use plain Unicode symbols for math: × (multiply), ÷ (divide), √ (square root), "
+                    "→ (arrow), ⇒ (implies), ≤ ≥ ≠ ≈ ∞ π.\n"
+                    "- Write fractions as a/b, not \\frac{a}{b}.\n"
+                    "- Keep formatting light: plain text with at most **bold**, *italic*, `code`.\n"
+                    "- Do NOT use tables or complex formatting.\n"
+                    "- Keep responses concise and easy to read on a small screen."
+                )
 
         # ── 8. Onboarding (CONDITIONAL) ────────────────────────────
         try:
@@ -6697,9 +7284,29 @@ class AgentRunner:
         # exactly like before.
         tool_event_records: Optional[List[Dict[str, Any]]] = None,
         presented_app_slug: Optional[str] = None,
-    ):
+        # The turn's media card, already resolved by the caller (tool-set
+        # value merged over any channel preset). None => fall back to the
+        # executor read below, for callers that have not been updated.
+        media_meta_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Persist the turn and return what was written.
+
+        The return value is the realtime echo's source of truth: a channel
+        adapter that has to broadcast this turn to the user's other clients
+        needs the row ids, their created_at, the day chat and the channel —
+        and re-reading them would race the very frame it is building.
+        """
         if tool_event_records is None:
             tool_event_records = []
+        # A turn that INTENDS to persist a reply. Its partner counter,
+        # `assistant_rows_written`, is raised by the caller after the commit
+        # (`_note_turn_persisted`) — see that helper for why the two must not
+        # sit on adjacent lines.
+        try:
+            from app.services import health_signals as _hs_turn
+            _hs_turn.incr("turns_completed")
+        except Exception:  # noqa: BLE001
+            pass
         from sqlalchemy import select
         from app.db.models import Message, Conversation
 
@@ -6755,10 +7362,29 @@ class AgentRunner:
             db.add(user_msg)
             msg_count += 1
 
-        # Capture media metadata from tool calls (play_media, play_netflix)
-        media_meta = getattr(self.tools, '_last_media', None)
-        if media_meta:
-            self.tools._last_media = None  # Clear after capture
+        # Capture media metadata (play_media / play_netflix, or a channel
+        # fast-path preset the caller merged in and handed over by value).
+        # Snapshot BEFORE the drain below. Reading `_last_media` again after
+        # it has been cleared makes the MISS condition unreachable and its
+        # tool_set= field a constant False — a guard whose precondition the
+        # line above it destroys, which nothing in this repo would catch.
+        _tool_set_media = getattr(self.tools, '_last_media', None)
+        # Tool-set wins: the model may call play_media anyway (a second song,
+        # a correction), and the LAST thing that actually played is the card.
+        # The caller's value is the channel's fast-path preset, i.e. the
+        # fallback, never an override of a real tool result.
+        media_meta = _tool_set_media or media_meta_override
+        # Always drain the mailbox, override or not: left set, this turn's
+        # card gets stapled onto the NEXT persisted turn.
+        if _tool_set_media:
+            self.tools._last_media = None
+        # No "MISS" branch here on purpose: once `media_meta` is the OR of the
+        # two producers, a card that reached this function is always written
+        # (`_meta["media"]` below), so the only way this turn loses one is by
+        # never reaching this function — which `_run_inner` logs as
+        # `[media-persist] DROPPED` and which `media_expected − media_persisted`
+        # counts. A guard on `not media_meta and (override or tool_set)` was
+        # `not (A or B) and (A or B)`: false for every input, silent forever.
 
         # Capture a staged elevation:true call (gmail send, linkedin post,
         # calendar write). The platform did NOT run it — it wants the user
@@ -6878,6 +7504,18 @@ class AgentRunner:
                 pass  # Non-fatal — DayChat stats are advisory
 
         await db.flush()
+        # Flushed, so the Python-side created_at defaults are populated.
+        return {
+            "user_message_id": (user_msg.id if save_user_message else None),
+            "user_created_at": (user_msg.created_at if save_user_message else None),
+            "asst_message_id": asst_msg.id,
+            "asst_created_at": asst_msg.created_at,
+            "day_chat_id": _day_chat_id,
+            "channel": _msg_channel,
+            "media": media_meta,
+            "tool_events": tool_event_records,
+            "attachments": _pending_atts,
+        }
     
     # ------------------------------------------------------------------
     # Memory: there is no extractor here any more.

@@ -14,9 +14,11 @@ in-flight handlers finish (or after the timeout).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
@@ -27,6 +29,19 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 
 POOL_ADMIN_TOKEN_ENV = "POOL_ADMIN_TOKEN"
+
+#: Serialises the identity-mutation section of `/admin/bind`. Rebuilt when the
+#: running loop changes: an `asyncio.Lock` binds to the loop it is first
+#: awaited on, and a lock held against a dead loop is a permanent wedge.
+_BIND_LOCK: "tuple[Any, asyncio.Lock] | None" = None
+
+
+def _bind_lock() -> asyncio.Lock:
+    global _BIND_LOCK
+    loop = asyncio.get_running_loop()
+    if _BIND_LOCK is None or _BIND_LOCK[0] is not loop:
+        _BIND_LOCK = (loop, asyncio.Lock())
+    return _BIND_LOCK[1]
 
 
 def _check_admin_token(token: Optional[str]) -> None:
@@ -72,6 +87,14 @@ _BIND_FIELDS = (
     # these, the user's first-message greeting was generic forever.
     "user_name",
     "user_email",
+    # The platform's copy of `users.timezone`. NULL-FILL ONLY on this side —
+    # db/models/base.py declares the TENANT row authoritative and ws_chat is
+    # the high-frequency writer, so a bind that overwrote it would fight the
+    # client on every refresh-config push. Deliberately NOT in
+    # runtime_identity._PAYLOAD_TO_SETTING: Settings has no `timezone` field,
+    # and registering one would log a warning per bind and pollute
+    # os.environ['USER_TIMEZONE'].
+    "user_timezone",
     "agent_color",
     "agent_name",
     "llm_mode",
@@ -170,33 +193,45 @@ async def admin_bind(
         str(user_id)[:8], len(filtered),
     )
 
-    # 1. Mutate settings so legacy `settings.<field>` reads see the
-    #    new identity. This is the alternative to a 141-file refactor
-    #    of `settings.user_id` -> `runtime_identity.get_user_id()`.
-    try:
-        applied = runtime_identity.apply_to_settings(filtered)
-        logger.info("[admin/bind] Applied %d fields to settings", applied)
-    except Exception as e:
-        logger.exception("[admin/bind] apply_to_settings failed")
-        raise HTTPException(status_code=500, detail=f"Settings apply failed: {e}") from e
+    # Steps 1-2 are the IDENTITY MUTATION, and they must land as a unit:
+    # settings, the per-process caches keyed off them, and runtime.json all
+    # describe one tenant, and a reader that sees half of that sees a
+    # container bound to nobody (503s every route) or to a mix. Concurrent
+    # binds are the norm — both Railway replicas call /v1/pool/refresh-config,
+    # observed 25 ms apart twice on pool-81 — so say it in code rather than
+    # relying on the fact that nothing here currently awaits.
+    #
+    # Deliberately NOT held across the rest of the handler: step 2d's MCP
+    # bootstrap makes a network call, and a lock spanning it would let one
+    # slow platform round-trip wedge every future bind on this container.
+    async with _bind_lock():
+        # 1. Mutate settings so legacy `settings.<field>` reads see the
+        #    new identity. This is the alternative to a 141-file refactor
+        #    of `settings.user_id` -> `runtime_identity.get_user_id()`.
+        try:
+            applied = runtime_identity.apply_to_settings(filtered)
+            logger.info("[admin/bind] Applied %d fields to settings", applied)
+        except Exception as e:
+            logger.exception("[admin/bind] apply_to_settings failed")
+            raise HTTPException(status_code=500, detail=f"Settings apply failed: {e}") from e
 
-    # 1b. Identity just changed — drop any per-process smart_fetch caches so a
-    #     re-bound pool container can never serve the previous tenant's cached
-    #     search results or fetched pages (defense in depth for tenant isolation).
-    try:
-        from app.agent.smart_fetch import clear_caches
-        clear_caches()
-    except Exception:
-        logger.warning("[admin/bind] smart_fetch cache clear failed", exc_info=True)
+        # 1b. Identity just changed — drop any per-process smart_fetch caches so a
+        #     re-bound pool container can never serve the previous tenant's cached
+        #     search results or fetched pages (defense in depth for tenant isolation).
+        try:
+            from app.agent.smart_fetch import clear_caches
+            clear_caches()
+        except Exception:
+            logger.warning("[admin/bind] smart_fetch cache clear failed", exc_info=True)
 
-    # 2. Write runtime.json (durable). After this returns, every
-    #    runtime_identity.is_bound() check returns True and the lobby
-    #    middleware lets traffic through.
-    try:
-        runtime_identity.write_runtime(filtered)
-    except Exception as e:
-        logger.exception("[admin/bind] runtime.json write failed")
-        raise HTTPException(status_code=500, detail=f"Runtime write failed: {e}") from e
+        # 2. Write runtime.json (durable). After this returns, every
+        #    runtime_identity.is_bound() check returns True and the lobby
+        #    middleware lets traffic through.
+        try:
+            runtime_identity.write_runtime(filtered)
+        except Exception as e:
+            logger.exception("[admin/bind] runtime.json write failed")
+            raise HTTPException(status_code=500, detail=f"Runtime write failed: {e}") from e
 
     # 2b. Ensure owner user row exists in the (now-bound) DB with the
     #     real name + email. Without `user_name`/`user_email` in the
@@ -212,6 +247,23 @@ async def admin_bind(
     #     user's message into a session whose user_id references users.id.
     real_user_name = (filtered.get("user_name") or "").strip() or "Agent Owner"
     real_user_email = (filtered.get("user_email") or "").strip() or f"{user_id[:8]}@agent.local"
+    # A tz this tzdata cannot load is worse than none — it would be stored and
+    # then raise in every date calculation that reads it. And 'UTC' is never
+    # stored: ws_chat's rebucket gate reads a stored 'UTC' as a real prior
+    # zone, so writing it would permanently disable the repair path for the
+    # exact users who need it.
+    _bind_tz = (filtered.get("user_timezone") or "").strip()
+    if _bind_tz:
+        if _bind_tz.upper() == "UTC":
+            _bind_tz = ""
+        else:
+            try:
+                ZoneInfo(_bind_tz)
+            except Exception:
+                logger.warning(
+                    "[admin/bind] ignoring unresolvable timezone %r", _bind_tz[:64]
+                )
+                _bind_tz = ""
     try:
         from app.db.database import async_session_maker as _sm
         from app.services.auth_service import get_user_by_id
@@ -224,6 +276,7 @@ async def admin_bind(
                     email=real_user_email,
                     hashed_password="",
                     name=real_user_name,
+                    timezone=_bind_tz or None,
                 ))
                 await _udb.commit()
                 logger.info(
@@ -242,12 +295,28 @@ async def admin_bind(
                 if existing.email != real_user_email and real_user_email != f"{user_id[:8]}@agent.local":
                     existing.email = real_user_email
                     changed = True
+                # NULL-FILL ONLY. A tenant that already knows its zone knows
+                # it better than the platform does.
+                if _bind_tz and not existing.timezone:
+                    existing.timezone = _bind_tz
+                    changed = True
                 if changed:
                     await _udb.commit()
                     logger.info(
                         "[admin/bind] Owner user row backfilled for %s (name=%r)",
                         user_id[:8], real_user_name,
                     )
+        if _bind_tz:
+            # A tz change can move the user's local_date, so the (user_id,
+            # local_date) day-chat cache has to go with the tz cache — a turn
+            # already in flight would otherwise keep resolving the pre-fill
+            # bucket for the full 300 s TTL. This is the `_with_day_chat`
+            # variant, which until now had zero callers repo-wide.
+            from app.agent._user_tz_cache import (
+                invalidate_cached_user_tz_with_day_chat,
+            )
+
+            invalidate_cached_user_tz_with_day_chat(user_id)
     except Exception as e:
         logger.exception("[admin/bind] Owner-user creation failed (non-fatal)")
         # Don't fail the bind on this — the user row will be created
@@ -259,30 +328,54 @@ async def admin_bind(
     #       AgentConfig.agent_name (agent_runner._build_system_prompt) and
     #       renders a clean "you don't have a name yet" when it's empty — it
     #       never invents one. So a claimed/refreshed container must carry
-    #       only the current owner's chosen name: we write agent_name/
-    #       agent_color from the bind payload, and CLEAR a stale agent_name
-    #       when the payload doesn't carry one (a fresh signup hasn't picked
-    #       a name yet at claim time). This kills the "wrong agent name shows
-    #       first, then flips to the chosen one" symptom — a freshly-claimed
-    #       container can no longer surface a leftover/leaked name; the user's
-    #       Soul choice arrives via /api/soul/sync. Savepoint-guarded because
-    #       very old tenant DBs may predate the agent_configs table.
+    #       only the current owner's chosen name; the user's Soul choice
+    #       arrives via /api/soul/sync. Savepoint-guarded because very old
+    #       tenant DBs may predate the agent_configs table.
+    #
+    #       A BIND MAY NOT CLEAR A NAME. This block used to read the name out
+    #       of `filtered` and write the result unconditionally, so a payload
+    #       that said nothing about the name NULLed whatever the user had
+    #       chosen. The obvious reading of that — "every bind erases the name"
+    #       — is FALSE and was checked: the bridge does carry `agent_name`
+    #       when the platform holds one (pool-17's runtime.json reads 'Aria'
+    #       and its tenant row still did after binds on 10 Sep), and
+    #       f261b564's NULL was inherited from a platform column that was
+    #       itself NULL because his Soul save rolled back.
+    #
+    #       The real defect is narrower: the platform's column is TRANSIENTLY
+    #       empty around a failed or racing Soul save, and both Railway
+    #       replicas push `refresh-config` on their own schedule, so a bind
+    #       lands in that window and copies the blank down over a name the
+    #       agent already had. So an empty value — absent, null or "" alike —
+    #       now means "the platform has nothing to tell me", never "clear it".
+    #       `POST /api/soul` is the only writer that may clear this column,
+    #       on both sides, which is the same rule the platform follows.
+    #
+    #       No isolation risk: the row is selected by `user_id`, so a slot
+    #       re-bound to a DIFFERENT user finds no row and starts clean. That,
+    #       not the unconditional write, is what stops a leftover name leaking.
     try:
         from app.db.database import async_session_maker as _sm2
         from app.db.models import AgentConfig as _AgentConfig
         from sqlalchemy import select
-        _bound_agent_name = (filtered.get("agent_name") or "").strip() or None
-        _bound_agent_color = (filtered.get("agent_color") or "").strip() or None
+
+        def _bound_identity(key: str) -> Optional[str]:
+            raw = payload.get(key, None)
+            return (raw.strip() or None) if isinstance(raw, str) else None
+
+        _bound_agent_name = _bound_identity("agent_name")
+        _bound_agent_color = _bound_identity("agent_color")
+        _skipped_blank_name = False
         async with _sm2() as _adb:
             async with _adb.begin_nested():
                 _ac = (await _adb.execute(
                     select(_AgentConfig).where(_AgentConfig.user_id == user_id)
                 )).scalar_one_or_none()
                 if _ac is not None:
-                    # Only overwrite the name (incl. clearing a stale one).
-                    # Color is only set when provided (no point clearing it).
-                    if _ac.agent_name != _bound_agent_name:
+                    if _bound_agent_name and _ac.agent_name != _bound_agent_name:
                         _ac.agent_name = _bound_agent_name
+                    elif not _bound_agent_name and _ac.agent_name:
+                        _skipped_blank_name = True
                     if _bound_agent_color and _ac.agent_color != _bound_agent_color:
                         _ac.agent_color = _bound_agent_color
                 elif _bound_agent_name or _bound_agent_color:
@@ -292,6 +385,13 @@ async def admin_bind(
                         agent_color=_bound_agent_color,
                     ))
             await _adb.commit()
+            if _skipped_blank_name:
+                # Worth a line: it means the platform's column was empty while
+                # this tenant had a name, which is the Soul-save race.
+                logger.info(
+                    "[admin/bind] Kept existing agent_name for %s — bind carried none",
+                    user_id[:8],
+                )
             logger.info(
                 "[admin/bind] Local AgentConfig identity reset for %s (name=%r)",
                 user_id[:8], _bound_agent_name,
@@ -361,6 +461,20 @@ async def admin_bind(
         wake_lazy_channels()
     except Exception as e:
         logger.info("[admin/bind] channel_init not available yet: %s", e)
+
+    # 4. Warm the verify browser. Boot only does this for an already-bound
+    #    container now, because a resident Brave in an unclaimed lobby spare
+    #    is ~104 MiB PSS for a build nobody can request. This is the other
+    #    half: the moment a container HAS a user, warm it — still earlier
+    #    than the app-build that needs it. Idempotent, which is required
+    #    rather than merely tidy: `refresh-config` is routine and both
+    #    Railway replicas push one.
+    try:
+        from app.agent.skills.builtins.app_html.verify import schedule_warm_browser
+        if schedule_warm_browser("bind"):
+            logger.info("[admin/bind] Verify browser warm-up scheduled")
+    except Exception as e:
+        logger.info("[admin/bind] browser warm-up not scheduled: %s", e)
 
     return {
         "ok": True,

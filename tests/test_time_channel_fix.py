@@ -80,32 +80,54 @@ def test_resolve_channel_custom_default():
 # Per-channel guidance: known vs unknown
 # ──────────────────────────────────────────────────────────────
 
-CHANNEL_GUIDANCE_TABLE = {
-    "web":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
-    "app":      "Full markdown and formatting OK. Long code blocks, tables, headings all fine.",
-    "mobile":   "Keep responses compact — short paragraphs, avoid large code blocks or tables. Users are on small screens.",
-    "voice":    "Conversational tone. No markdown. Sentences should read naturally when spoken aloud.",
-    "telegram": "Short messages. Basic markdown only (bold/italic). Avoid code blocks over ~20 lines.",
-    "discord":  "Full markdown and code blocks OK. Keep message length under ~2000 chars.",
-    "slack":    "Slack-flavored markdown (limited). Short messages preferred.",
-}
+# 2026-09-14: this block used to hold a hand-maintained COPY of
+# CHANNEL_GUIDANCE, seven entries deep, and asserted per-channel distinctness
+# over the copy. It had already drifted — the copy said web and app share one
+# string; production has given them their own since — and it would have stayed
+# green through D1, which removes that table from the cacheable system prompt
+# altogether. A green test describing a table the model no longer receives is
+# the "STALE: asserts something the code no longer does" class this suite
+# already carries nine entries of.
+#
+# Re-pointed at the REAL dict. What the prompt DOES with it is pinned in
+# tests/test_channel_neutral_prefix.py: under D1 the guidance leaves the
+# prefix and rides the per-turn <runtime_envelope> instead, so these
+# assertions describe the envelope's per-channel rules from here on.
+from app.agent.agent_runner import CHANNEL_GUIDANCE as CHANNEL_GUIDANCE_TABLE
+
+# The unknown-channel fallback, agent_runner.py:6250. Kept as a literal
+# because its whole purpose is to be the string for a channel not in the dict.
+UNKNOWN_GUIDANCE = "Unknown channel — format conservatively: short, minimal markdown."
 
 
 def test_known_channels_have_distinct_guidance():
-    """Every user-facing channel has its own guidance; no two are identical
-    (except web/app, which are intentional twins for content-area surfaces)."""
-    # Intentional duplicates: web and app both live in the content area.
-    unique_guidance = set(CHANNEL_GUIDANCE_TABLE.values())
-    assert len(unique_guidance) == len(CHANNEL_GUIDANCE_TABLE) - 1
+    """Every channel in the real table says something different. Two channels
+    sharing a string means one of them is being taught the wrong surface."""
+    assert len(set(CHANNEL_GUIDANCE_TABLE.values())) == len(CHANNEL_GUIDANCE_TABLE), (
+        "two channels share one guidance string: "
+        + repr(sorted(
+            k for k, v in CHANNEL_GUIDANCE_TABLE.items()
+            if list(CHANNEL_GUIDANCE_TABLE.values()).count(v) > 1
+        ))
+    )
 
 
 def test_mobile_guidance_is_compact():
-    assert "compact" in CHANNEL_GUIDANCE_TABLE["mobile"].lower() or \
-           "small screens" in CHANNEL_GUIDANCE_TABLE["mobile"].lower()
+    m = CHANNEL_GUIDANCE_TABLE["mobile"].lower()
+    assert "compact" in m or "small screen" in m
 
 
 def test_voice_guidance_excludes_markdown():
     assert "no markdown" in CHANNEL_GUIDANCE_TABLE["voice"].lower()
+
+
+def test_the_user_facing_channels_are_all_present():
+    """ANTI-VACUITY for the three above now that the table is the real one:
+    pin the channels a user can actually be on, so a deletion shows up here
+    rather than as a silently missing surface contract."""
+    for ch in ("web", "app", "mobile", "voice", "telegram", "whatsapp",
+               "discord", "slack", "extension"):
+        assert CHANNEL_GUIDANCE_TABLE.get(ch), f"no guidance for {ch!r}"
 
 
 def test_all_known_channels_covered_except_agent():
@@ -246,57 +268,33 @@ async def test_message_channel_column_nullable_and_backfillable():
 # Channel parity: the Runtime Context differs ONLY in channel + guidance
 # ──────────────────────────────────────────────────────────────
 
-def _runtime_context_fixture(channel: str, tz_name: str = "America/Toronto") -> str:
-    """Standalone reproduction of the Runtime Context block so we can diff
-    by channel without spinning up a full AgentRunner. Mirrors the code
-    in agent_runner.py:1443-1527 minus the db-dependent pieces."""
-    from zoneinfo import ZoneInfo
-    guidance_map = CHANNEL_GUIDANCE_TABLE.copy()
-    guidance = guidance_map.get(channel, "Unknown channel — format conservatively: short, minimal markdown.")
-    now_utc = datetime(2026, 4, 21, 15, 23, 0, tzinfo=timezone.utc)
-    now_local = now_utc.astimezone(ZoneInfo(tz_name))
-    return "\n".join([
-        "# Runtime Context",
-        f"- Current date/time: {now_local.strftime('%Y-%m-%d %H:%M')} "
-        f"{now_local.strftime('%Z')} "
-        f"(UTC offset {now_local.strftime('%z')}; UTC wall clock: "
-        f"{now_utc.strftime('%Y-%m-%d %H:%M')}Z)",
-        f"- User timezone: {tz_name} (source=client)",
-        f"- Channel: {channel} — {guidance}",
-    ])
+# 2026-09-14: three tests lived here that diffed a LOCAL hand-model of the
+# Runtime Context block ("- Channel: {channel} — {guidance}") across channels.
+# They asserted that the block differs per channel — which D1 makes false by
+# design: the channel line leaves the cacheable prefix so that every channel
+# shares one provider cache lineage, and the per-turn facts move into a
+# <runtime_envelope> message. Because the model was local, they would have
+# stayed GREEN through that change while describing a line the model no longer
+# receives.
+#
+# Deleted rather than repaired. Their replacements, against the REAL render:
+#   tests/test_channel_neutral_prefix.py
+#     - test_every_channel_shares_one_system_prompt      (the new invariant)
+#     - test_no_channel_guidance_string_survives_into_the_prefix
+#     - test_flag_off_is_byte_identical_to_the_goldens   (the old behaviour,
+#       pinned as bytes captured from origin/main rather than as a hand-model)
+# The unknown-channel fallback string itself is still pinned above.
 
 
-def test_channel_parity_web_vs_mobile_differs_only_in_channel_block():
-    """Two identical runs, one per channel. Everything below the channel
-    line should be byte-equal. Catches future regressions that gate
-    unrelated system-prompt content on channel."""
-    web = _runtime_context_fixture("web")
-    mobile = _runtime_context_fixture("mobile")
-    # They differ, yes — that's the point. But the current-time line should
-    # be identical.
-    web_lines = web.split("\n")
-    mobile_lines = mobile.split("\n")
-    assert web_lines[0] == mobile_lines[0]  # header
-    assert web_lines[1] == mobile_lines[1]  # current date/time
-    assert web_lines[2] == mobile_lines[2]  # timezone
-    # Line 3 is the channel line — this is the expected delta.
-    assert web_lines[3] != mobile_lines[3]
-    assert "Channel: web" in web_lines[3]
-    assert "Channel: mobile" in mobile_lines[3]
+def test_the_unknown_channel_fallback_string_is_unchanged():
+    """The one part of the deleted trio worth keeping here: `resolve_channel`
+    passes an unrecognised value straight through, and something has to say
+    what the agent is then told."""
+    from pathlib import Path
 
-
-def test_channel_parity_known_channels_all_render():
-    """Every known user-facing channel renders a non-empty Runtime Context
-    with a matching guidance line. No channel is accidentally missing."""
-    for channel in ("web", "app", "mobile", "voice", "telegram", "discord", "slack"):
-        out = _runtime_context_fixture(channel)
-        assert f"Channel: {channel}" in out
-        assert CHANNEL_GUIDANCE_TABLE[channel] in out
-
-
-def test_channel_parity_unknown_channel_gets_conservative_guidance():
-    out = _runtime_context_fixture("smoke-signal")
-    assert "format conservatively" in out
+    src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "agent_runner.py").read_text()
+    assert UNKNOWN_GUIDANCE in src
+    assert "smoke-signal" not in CHANNEL_GUIDANCE_TABLE
 
 
 # ──────────────────────────────────────────────────────────────

@@ -243,12 +243,21 @@ class HealthProbeScheduler:
 
     async def loop(self) -> None:
         """Long-running coroutine. Stagger first run by [0, interval/2)
-        so cold boots don't all probe at t=0."""
+        so cold boots don't all probe at t=0.
+
+        LEADER-GATED (2026-09-12, L3-1): the sweep WRITES connector identity
+        status and notifies agents. The stagger reduced collision; it never
+        prevented two replicas flipping the same row. A replica that does not
+        hold the lease skips the sweep and waits out its interval.
+        """
+        from app.services.infra_lease import acquire_lease, lease_ttl_for
+        _ttl = lease_ttl_for(self._interval_s)
         await asyncio.sleep(random.random() * (self._interval_s / 2))
         while not self._stop_event.is_set():
             try:
-                summary = await self.run_once()
-                logger.info("[health_probe] sweep: %s", summary)
+                if await acquire_lease("connector_health_probe", ttl_s=_ttl):
+                    summary = await self.run_once()
+                    logger.info("[health_probe] sweep: %s", summary)
             except Exception as e:
                 logger.exception("[health_probe] sweep raised: %s", e)
             try:

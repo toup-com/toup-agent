@@ -127,6 +127,91 @@ def _agent_detail(resp, default: str) -> str:
     return default
 
 
+def agent_key_stale_response() -> HTTPException:
+    """The client answer for a 401/403 that came FROM THE TENANT AGENT.
+
+    An agent-origin 401/403 means the PLATFORM's own `X-Agent-Key` is stale —
+    the agent was just rebound and the platform copy has not caught up (it
+    self-heals in ~30 s) — NOT that the user's JWT is bad. The mobile client
+    signs the user OUT on any 401 (`api.ts` clears the token and `context.ts`
+    tears the session down), so forwarding a tenant 401 verbatim logs the user
+    out over a transient key blip: the D1 catastrophe of the 2026-09-12
+    onboarding incident. Answer 503 + `Retry-After` + `X-Toup-Reason:
+    agent_key_stale` (the shape this module already uses for transport/5xx) so
+    the client retries instead of signing out. A genuine PLATFORM-auth 401 is
+    raised by the route's auth dependency BEFORE this proxy runs and never
+    reaches here.
+    """
+    return HTTPException(
+        status_code=503,
+        detail="Your agent is still starting up. Please try again in a moment.",
+        headers={"Retry-After": "3", "X-Toup-Reason": "agent_key_stale"},
+    )
+
+
+AGENT_KEY_STALE_HEADERS = {"Retry-After": "3", "X-Toup-Reason": "agent_key_stale"}
+AGENT_KEY_STALE_DETAIL = (
+    "Your agent is still starting up. Please try again in a moment."
+)
+
+
+def is_agent_auth_failure(status_code: int) -> bool:
+    """Is this status an agent-origin identity rejection?
+
+    The ONE predicate. Every proxy in `app/api/` must ask it rather than
+    spelling `in (401, 403)` again — `tests/test_agent_401_never_reaches_client.py`
+    greps for the bare pass-through this exists to replace.
+    """
+    return status_code in (401, 403)
+
+
+def agent_key_stale_json_response(**kwargs):
+    """The 503 answer, as a Response rather than an exception.
+
+    `proxy_to_agent`'s callers raise; the `*_proxy.py` modules return a raw
+    `Response` mirroring the agent's status, and THAT is the shape that kept
+    the D1 catastrophe alive after wave 1. `/api/routines` — one of the three
+    endpoints observed 401ing to the phone at 19:14:50.874 on 2026-09-12 — is
+    served by `routines_proxy._proxy`, which is a generic verbatim
+    pass-through with no `AgentSaidNo` gate and no 4xx discrimination at all.
+    Wave 1 fixed `day_chats`, `sessions` and `tenant_proxy`; this is the rest.
+    """
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=503,
+        content={"detail": AGENT_KEY_STALE_DETAIL},
+        headers=dict(AGENT_KEY_STALE_HEADERS),
+        **kwargs,
+    )
+
+
+def agent_passthrough_response(
+    resp, *, content=None, headers=None, media_type=None,
+):
+    """Mirror the agent's response to the client — EXCEPT a 401/403.
+
+    An agent-origin 401/403 means the PLATFORM's own `X-Agent-Key` is stale,
+    not that the user's JWT is bad. The mobile client signs the user OUT on
+    any 401 (`api.ts:233` clears the token; `context.ts` tears the session
+    down), so a verbatim forward logs a user out over a transient key blip
+    that self-heals in ~30 s. `content` defaults to `resp.content`.
+    """
+    from fastapi import Response
+    if is_agent_auth_failure(resp.status_code):
+        logger.warning(
+            "Agent answered %s — the platform's agent key is stale, not the "
+            "user's JWT; answering 503 agent_key_stale",
+            resp.status_code,
+        )
+        return agent_key_stale_json_response()
+    return Response(
+        content=resp.content if content is None else content,
+        status_code=resp.status_code,
+        headers=headers,
+        media_type=media_type,
+    )
+
+
 async def proxy_to_agent(
     agent_url: str,
     agent_api_key: str,
@@ -202,6 +287,15 @@ async def proxy_to_agent(
             return resp.json()
         except Exception:
             return None
+
+    if resp.status_code in (401, 403):
+        # An agent-origin 401/403 is a STALE PLATFORM KEY, not a bad user JWT.
+        # Forwarding it verbatim signs the user out (D1); answer 503 instead.
+        logger.warning(
+            "Agent proxy %s %s returned %s — platform key stale; "
+            "answering 503 agent_key_stale", method, url, resp.status_code,
+        )
+        raise agent_key_stale_response()
 
     if 400 <= resp.status_code < 500:
         # The agent is the authority on duplicates, unsupported types, size

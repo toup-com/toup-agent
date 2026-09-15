@@ -46,6 +46,7 @@ Used by:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
@@ -54,6 +55,7 @@ from typing import Optional
 import httpx
 
 from app.config import settings
+from app.db.plan_catalog import UNLIMITED_PLAN_ID
 from app.services.credit_exhausted import (
     ExhaustedResponse,
     OutOfCreditsError,
@@ -120,6 +122,11 @@ class CreditState:
     last_known_message_daily_cap: Optional[float] = None
     last_known_user_timezone: Optional[str] = None
     last_updated_at: Optional[datetime] = None
+    # The account this container reports for. Recorded so a STALE latch can be
+    # re-read authoritatively (`refresh_if_stale`) instead of guessed at by
+    # letting a paid provider call through. Every writer already has it in
+    # hand; nothing else in this module needs it.
+    last_user_id: Optional[str] = None
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     def record_deduct(
@@ -131,10 +138,13 @@ class CreditState:
         plan_display_name: Optional[str] = None,
         daily_cap: Optional[float] = None,
         user_timezone: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> None:
         with self._lock:
             self.last_outcome = outcome
             self.last_updated_at = datetime.now(timezone.utc)
+            if user_id:
+                self.last_user_id = user_id
             if period_end is not None:
                 self.last_known_period_end = period_end
             if plan_id is not None:
@@ -147,18 +157,110 @@ class CreditState:
                 self.last_known_user_timezone = user_timezone
 
     def is_exhausted(self) -> bool:
-        """True iff the latest known state says the user is out of credits."""
+        """True iff the latest known state says the user is out of credits.
+
+        Two guards, and both are about the same failure: this latch is the
+        ONLY gate on the manual/BYOK path, it is set by a deduct RESPONSE, and
+        the deduct only happens after an LLM call — which this latch is
+        blocking. So once it closes, nothing inside this process can ever
+        reopen it. Only `check_balance_remote` can, and its callers are agent
+        boot and the app-builder pre-flight.
+
+        1. **An UNLIMITED account is never exhausted.** The entitlement is
+           materialised on `credit_balances.plan_id`, and both `/agent-deduct`
+           and `/credits/preflight` already return `plan_id` on every call, so
+           this needs no wire change — `record_deduct` has been storing it all
+           along. Without this, a stale exhausted latch from BEFORE the
+           grandfather keeps refusing a customer whose plan now says
+           unlimited, and shows them an upgrade card while it does.
+
+        Guard 1 alone cannot rescue an account whose plan changed on the
+        platform AFTER the latch closed: `last_known_plan_id` is whatever the
+        last deduct said, and no deduct can happen while the latch is closed.
+        That is what STALENESS is for — see :meth:`latch_is_stale` and
+        :func:`refresh_if_stale`. Staleness is not an expiry: a stale latch
+        still refuses, and only a platform read may reopen it.
+        """
         with self._lock:
-            return self.last_outcome is not None and self.last_outcome.exhausted
+            return self._exhausted_locked()
+
+    def _exhausted_locked(self) -> bool:
+        """:meth:`is_exhausted` with the lock already held.
+
+        Split out because `build_exhausted_response` needs the same verdict
+        under the same lock, and ``threading.Lock`` is not reentrant — calling
+        the public method from inside the lock would deadlock the agent's
+        whole chat loop on the first exhausted turn.
+        """
+        if self.last_outcome is None or not self.last_outcome.exhausted:
+            return False
+        if self.last_known_plan_id == UNLIMITED_PLAN_ID:
+            logger.info(
+                "[credits] exhausted latch ignored — plan is %s",
+                UNLIMITED_PLAN_ID,
+            )
+            return False
+        return True
+
+    # ── staleness ────────────────────────────────────────────────────
+    #
+    # A latch older than `credit_exhausted_latch_ttl_s` is a cached refusal
+    # with no expiry, and the account behind it may have been topped up,
+    # renewed, granted or grandfathered minutes later. Parmida's container is
+    # holding exactly such a latch right now, and guard 1 above cannot help
+    # her: it reads `last_known_plan_id`, which is whatever the LAST DEDUCT
+    # said — 'builder' — and no deduct can happen while the latch is closed.
+    #
+    # Staleness is deliberately NOT an expiry of the latch itself. It was, for
+    # one revision, and that let one full LLM call through per exhausted
+    # account per TTL "to re-establish the truth" — which is 4/hour and 96/day,
+    # not the four a day the note claimed, because `record_deduct` re-arms the
+    # timer on every let-through. Three consequences, all bad:
+    #
+    #   * every let-through is provider spend billed to us and to nobody, and
+    #     with enforcement on it writes a `denied: true` ledger row carrying
+    #     real `underlying_cost_cents` — the exact denied-but-served shape
+    #     credit-health invariant 1 pages on ("expected steady state is zero",
+    #     critical at $5/window). The loosening manufactured a permanent alarm
+    #     stream on the channel this same change adds three alarms to.
+    #   * it defeated the routine handlers' clean-skip gate for EVERY plan,
+    #     free included. A scheduled routine's interval always exceeds the TTL,
+    #     so the latch was always stale at the top of a run: the gate never
+    #     fired, the Gmail call ran and debited the INTEGRATION bucket, and the
+    #     run ended 'failed' instead of 'skipped'.
+    #   * it answers a cheap question with an expensive call. `/credits/
+    #     preflight` is one authenticated GET to the platform and is
+    #     authoritative.
+    #
+    # So the timer marks the latch STALE, and only `refresh_if_stale` — a
+    # platform read, not a provider call — can clear it.
+
+    def latch_is_stale(self) -> bool:
+        """True iff we are latched and the latch is older than the TTL."""
+        with self._lock:
+            if not self._exhausted_locked():
+                return False
+            ttl = float(getattr(settings, "credit_exhausted_latch_ttl_s", 900))
+            updated = self.last_updated_at
+            if ttl <= 0 or updated is None:
+                return False
+            return (datetime.now(timezone.utc) - updated).total_seconds() > ttl
 
     def build_exhausted_response(self) -> Optional[ExhaustedResponse]:
         """Render the current exhausted state into a structured response.
 
         Returns None when state isn't exhausted (caller should not hit
         this branch — :func:`raise_if_exhausted` guards against it).
+
+        Reads the SAME verdict :meth:`is_exhausted` does, deliberately: this
+        method is not only reached through `raise_if_exhausted`. `ws_chat`'s
+        layer-2 fallback calls it directly to rebuild a card from warm state
+        after a raw provider billing error, so an unlimited (or stale) latch
+        that this method still honoured would put an upgrade card in front of
+        an unlimited subscriber by that route alone.
         """
         with self._lock:
-            if self.last_outcome is None or not self.last_outcome.exhausted:
+            if not self._exhausted_locked():
                 return None
             return build_exhausted_response(
                 reason=self.last_outcome.reason or REASON_INSUFFICIENT_MESSAGE,
@@ -193,6 +295,76 @@ def raise_if_exhausted() -> None:
     resp = _state.build_exhausted_response()
     if resp is not None:
         raise OutOfCreditsError(resp)
+
+
+# When we last ASKED the platform about a stale latch — monotonic, so a clock
+# change cannot make the back-off window infinite.
+_last_refresh_at: float = float("-inf")
+
+
+async def refresh_if_stale() -> bool:
+    """Re-read the platform when the exhausted latch is older than its TTL.
+
+    Returns True iff a read actually happened. Never raises: an unreachable
+    platform must not turn a credit gate into an outage.
+
+    This is the reopener. The latch is set by a deduct RESPONSE and the deduct
+    only happens after an LLM call the latch is blocking, so nothing inside
+    this process can clear it on its own — which is why an account
+    grandfathered on the platform stayed refused until its container
+    restarted. One authenticated GET to `/credits/preflight` answers the
+    question authoritatively and costs no provider spend; `check_balance_remote`
+    then feeds the answer back through `record_deduct`, so the very next
+    `raise_if_exhausted` sees the truth (including a plan that now reads
+    'unlimited', which guard 1 honours immediately).
+
+    Fails CLOSED on purpose. If the platform is unreachable or unconfigured we
+    keep honouring the latch: the alternative is to let a paid call through on
+    exactly the evidence we just failed to obtain.
+
+    At most one attempt per TTL, SUCCESS OR FAILURE. A successful read calls
+    `record_deduct`, which re-arms `last_updated_at` and so un-stales the latch
+    on its own — but a read that returns None (unreachable, or the platform not
+    configured) does not, and without `_last_refresh_at` every gate call in a
+    hot chat loop would fire another GET at a platform that is already down.
+    A credit gate must not become a retry storm against the thing it depends
+    on.
+    """
+    global _last_refresh_at
+    if not _state.latch_is_stale():
+        return False
+    ttl = float(getattr(settings, "credit_exhausted_latch_ttl_s", 900))
+    now_mono = time.monotonic()
+    if ttl > 0 and (now_mono - _last_refresh_at) < ttl:
+        return False
+    _last_refresh_at = now_mono
+    user_id = _state.last_user_id
+    if not user_id or _platform_endpoint("/credits/preflight") is None or not _agent_key():
+        logger.info(
+            "[credits] exhausted latch is stale but there is no way to re-read "
+            "it (user_id=%s, platform configured=%s) — keeping it closed",
+            bool(user_id), _platform_endpoint("/credits/preflight") is not None,
+        )
+        return False
+    logger.info(
+        "[credits] exhausted latch is stale — re-reading /credits/preflight "
+        "instead of letting a chargeable call through",
+    )
+    try:
+        await check_balance_remote(user_id=user_id, required=0.5)
+    except Exception:  # pragma: no cover - defensive; the callee already traps
+        logger.exception("[credits] stale-latch refresh failed; latch stands")
+    return True
+
+
+async def raise_if_exhausted_async() -> None:
+    """:func:`raise_if_exhausted`, preceded by a stale-latch refresh.
+
+    Every gate that can await should use this one. The sync form remains for
+    the handful of call sites that cannot, and is unchanged in meaning.
+    """
+    await refresh_if_stale()
+    raise_if_exhausted()
 
 
 # ── Authoritative HTTP pre-flight ───────────────────────────────────
@@ -298,6 +470,7 @@ async def check_balance_remote(
         period_end=period_end,
         plan_id=result.plan_id,
         plan_display_name=result.plan_display_name,
+        user_id=user_id,
     )
 
     return result
@@ -516,6 +689,7 @@ async def report_llm_usage(
         period_end=deduct_period_end,
         plan_id=data.get("plan_id"),
         plan_display_name=data.get("plan_display_name"),
+        user_id=user_id,
     )
 
     if outcome.exhausted and deduct_period_end is None:
@@ -635,6 +809,7 @@ async def report_flat_charge(
         period_end=deduct_period_end,
         plan_id=data.get("plan_id"),
         plan_display_name=data.get("plan_display_name"),
+        user_id=user_id,
     )
     return outcome
 

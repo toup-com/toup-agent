@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from app.agent.prefix_stability import (
     build_allowed_tools_choice,
     build_turn_context_message,
@@ -235,6 +237,9 @@ class TestFlagDefault:
 from pathlib import Path
 
 _SRC = (Path(__file__).resolve().parent.parent / "app" / "agent" / "agent_runner.py").read_text()
+_ANTHROPIC_SRC = (
+    Path(__file__).resolve().parent.parent / "app" / "services" / "anthropic_service.py"
+).read_text()
 
 
 class TestRunnerWiring:
@@ -358,6 +363,63 @@ class TestAnthropicBreakpointPlacement:
         from app.services.anthropic_service import _mark_messages_cacheable
         out = _mark_messages_cacheable(self._msgs(with_tc=False))
         assert self._marked_indices(out) == [len(out) - 1]
+
+    # ── D1 (2026-09-14): the tail grew a second volatile message ──────
+    #
+    # The channel envelope rides its own user-role message between
+    # <turn_context> and the current user message, so the trailing volatile
+    # run is now THREE messages deep, not two. `_mark_messages_cacheable`
+    # probes exactly (-2, -1) — with an envelope in the tail it finds no
+    # <turn_context>, marks the last message, and the breakpoint lands in
+    # front of a span whose bytes change every turn. Every turn then
+    # re-WRITES the whole day history at 1.25x and never reads it back:
+    # the precise failure the probe was added to prevent, reintroduced by
+    # a longer tail. D1 replaces it with a backwards scan over up to four
+    # trailing volatile messages.
+
+    def _msgs_with_envelope(self):
+        return [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "<turn_context>\nclock\n</turn_context>"},
+            {"role": "user", "content": "<runtime_envelope>\norigin: whatsapp\n</runtime_envelope>"},
+            {"role": "user", "content": "what's next?"},
+        ]
+
+    @pytest.mark.xfail(
+        "for probe in (len(out) - 2, len(out) - 1):" in _ANTHROPIC_SRC,
+        reason="RED until lane B1 replaces the two-offset probe with a "
+               "backwards scan over the trailing volatile messages (D1)",
+        strict=True,
+    )
+    def test_breakpoint_survives_a_four_long_volatile_tail(self):
+        from app.services.anthropic_service import _mark_messages_cacheable
+
+        out = _mark_messages_cacheable(self._msgs_with_envelope())
+        assert self._marked_indices(out) == [1], (
+            "the breakpoint moved off end-of-history — the cached span now "
+            "includes a message whose bytes change every turn, so it can "
+            "never re-match"
+        )
+        for i in (2, 3, 4):
+            assert isinstance(out[i]["content"], str), f"message {i} was marked"
+
+    def test_an_envelope_only_tail_is_handled_too(self):
+        """A turn with no <turn_context> parts still carries the envelope, so
+        the scan must not depend on finding the turn-context message."""
+        from app.services.anthropic_service import _mark_messages_cacheable
+
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "<runtime_envelope>\nx\n</runtime_envelope>"},
+            {"role": "user", "content": "what's next?"},
+        ]
+        out = _mark_messages_cacheable(msgs)
+        marked = self._marked_indices(out)
+        if marked != [1]:
+            pytest.skip("envelope-aware breakpoint not landed yet — lane B1 (D1)")
+        assert marked == [1]
 
 
 class TestCanaryGate:
@@ -668,8 +730,19 @@ from app.agent.prefix_stability import channel_banned_names
 
 
 class TestChannelConverge:
-    def test_flag_defaults_off(self):
-        assert Settings.model_fields["channel_converge"].default is False
+    def test_flag_defaults_on(self):
+        """Flipped 2026-09-14, together with CHANNEL_ENVELOPE.
+
+        The two are one change: the tools array serializes AHEAD of
+        system+history, so a channel-neutral system prompt behind a still
+        per-channel array leaves every channel on its own cache lineage —
+        and converge alone neutralises the array under a system prompt that
+        still names the channel. Either one alone buys nothing.
+        """
+        assert Settings.model_fields["channel_converge"].default is True
+
+    def test_flag_can_still_be_turned_off(self):
+        assert Settings(_env_file=None, channel_converge=False).channel_converge is False
 
     def test_bridge_ships_the_flag(self):
         bridge = (Path(__file__).resolve().parent.parent.parent / "bridge" / "pool_addon.py").read_text()

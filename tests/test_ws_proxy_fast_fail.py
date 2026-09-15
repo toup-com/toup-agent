@@ -115,7 +115,7 @@ def test_retry_after_ms_is_never_a_literal_again():
     literal. It is DERIVED from the coverage target and the hold, so the
     two halves of one budget cannot drift apart again."""
     src = _ws_proxy_src()
-    assert '"retry_after_ms": _compute_retry_after_ms()' in src
+    assert '"retry_after_ms": _compute_retry_after_ms(hold_ms)' in src
     assert '"retry_after_ms": 2000' not in src
     assert '"retry_after_ms": 6000' not in src
 

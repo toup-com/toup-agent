@@ -79,6 +79,7 @@ async def _proxy(
 
     # TKT-LAT-007 (wave 3): shared agent_http client.
     from app.services.agent_http import get_agent_http_client
+    from app.api.tenant_proxy import agent_passthrough_response
 
     try:
         client = get_agent_http_client()
@@ -97,9 +98,10 @@ async def _proxy(
         k: v for k, v in resp.headers.items()
         if k.lower() not in _HOP_BY_HOP
     }
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
+    # An agent-origin 401/403 is the PLATFORM's stale key, never the user's
+    # JWT — forwarding it verbatim signs the user out (D1, 2026-09-12).
+    return agent_passthrough_response(
+        resp,
         headers=out_headers,
         media_type=resp.headers.get("content-type"),
     )

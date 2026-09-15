@@ -126,6 +126,15 @@ async def _forward(request: Request, user_id: str, upstream_path: str, db: Async
         return Response(content=body, status_code=404,
                         media_type=resp.headers.get("content-type", "application/json"))
 
+    if resp.status_code in (401, 403):
+        # An agent-origin 401/403 is the PLATFORM's stale X-Agent-Key, never
+        # the user's JWT — forwarding it verbatim signs the user out (D1,
+        # 2026-09-12). Close the stream before answering: this one is opened
+        # with `send(..., stream=True)`.
+        await resp.aclose()
+        from app.api.tenant_proxy import agent_key_stale_json_response
+        return agent_key_stale_json_response()
+
     out_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _DROP_RESPONSE_HEADERS}
     media_type = resp.headers.get("content-type")
 

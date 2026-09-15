@@ -93,9 +93,12 @@ class SessionsAgentUnreachable(Exception):
     merely slow. See `day_chats.AgentUnreachable` for the full account.
     """
 
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, reason: str = "agent_unreachable"):
         super().__init__(detail)
         self.detail = detail
+        # See `day_chats.AgentUnreachable.reason` — `agent_error` means the
+        # tenant answered 500, which is an answer and is not retried.
+        self.reason = reason
 
 
 class SessionsAgentSaidNo(Exception):
@@ -117,13 +120,40 @@ _SESSIONS_PROXY_BACKOFF_S = 0.4
 def _sessions_unreachable(exc: Exception) -> HTTPException:
     """See `day_chats._unreachable` — same shape, same reason. The cause is
     logged, never sent: a user cannot act on "ReadTimeout()"."""
-    logger.warning("[sessions] answering 503 agent_unreachable: %s",
-                   getattr(exc, "detail", exc))
+    reason = getattr(exc, "reason", "agent_unreachable")
+    logger.warning("[sessions] answering 503 %s: %s",
+                   reason, getattr(exc, "detail", exc))
     return HTTPException(
         status_code=503,
         detail="Your agent did not answer in time. Your history is safe — try again.",
-        headers={"Retry-After": "2", "X-Toup-Reason": "agent_unreachable"},
+        headers={"Retry-After": "2", "X-Toup-Reason": reason},
     )
+
+
+def _sessions_4xx(e: "SessionsAgentSaidNo") -> HTTPException:
+    """See `day_chats._agent_4xx` — same reason, same shape.
+
+    A 401/403 FROM THE TENANT AGENT is the platform's own `X-Agent-Key` being
+    stale, NOT a bad user JWT; forwarded verbatim it signs the user out of the
+    app (`api.ts` treats any 401 as an expired token). `/api/sessions` is the
+    FALLBACK the mobile client reaches for when `/api/day-chats` fails, so a
+    forwarded 401 here signs the user out on the recovery path too. Map 401/403
+    to 503 + `Retry-After` + `X-Toup-Reason: agent_key_stale`; forward every
+    other 4xx (the agent's real answer) verbatim. A platform-auth 401 is raised
+    before the tenant call and never reaches here.
+    """
+    if e.status in (401, 403):
+        logger.warning(
+            "[sessions] tenant answered %s — platform agent key stale; "
+            "answering 503 agent_key_stale (forwarding would sign the user out)",
+            e.status,
+        )
+        return HTTPException(
+            status_code=503,
+            detail="Your agent is still starting up. Please try again in a moment.",
+            headers={"Retry-After": "3", "X-Toup-Reason": "agent_key_stale"},
+        )
+    return HTTPException(status_code=e.status, detail=e.body or "Agent declined")
 
 
 async def _proxy_sessions(
@@ -157,8 +187,20 @@ async def _proxy_sessions(
                 return resp.json()
             if 400 <= resp.status_code < 500:
                 raise SessionsAgentSaidNo(resp.status_code, resp.text[:300])
+            # A deterministic tenant 500 is an ANSWER; retrying it is the same
+            # answer at twice the load. Only 502/503/504 and transport errors
+            # (a hop failing in FRONT of the tenant) stay in the retry set.
+            # `day_chats._proxy_day_chats` makes the same split — the two
+            # doors have to agree or the fallback is slower than the path it
+            # stands in for.
+            if resp.status_code == 500:
+                logger.warning(
+                    "Agent sessions proxy %s: tenant answered 500 — not retried "
+                    "(deterministic)", url,
+                )
+                raise SessionsAgentUnreachable("HTTP 500", reason="agent_error")
             last = f"HTTP {resp.status_code}"
-        except SessionsAgentSaidNo:
+        except (SessionsAgentSaidNo, SessionsAgentUnreachable):
             raise
         except Exception as e:
             # `repr`, not `str`: httpx timeout exceptions stringify to "".
@@ -272,7 +314,7 @@ async def list_sessions(
         try:
             data = await _proxy_sessions(proxy[0], proxy[1], "", params)
         except SessionsAgentSaidNo as e:
-            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            raise _sessions_4xx(e)
         except SessionsAgentUnreachable as e:
             raise _sessions_unreachable(e)
         if data is not None:
@@ -385,7 +427,7 @@ async def get_session(
             try:
                 data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
             except SessionsAgentSaidNo as e:
-                raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+                raise _sessions_4xx(e)
             except SessionsAgentUnreachable as e:
                 raise _sessions_unreachable(e)
             return JSONResponse(content=data)
@@ -567,7 +609,7 @@ async def get_session_messages(
             try:
                 data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
             except SessionsAgentSaidNo as e:
-                raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+                raise _sessions_4xx(e)
             except SessionsAgentUnreachable as e:
                 raise _sessions_unreachable(e)
             return JSONResponse(content=data)
@@ -592,7 +634,10 @@ async def get_session_messages(
     query = (
         select(Message)
         .where(Message.conversation_id == session_id)
-        .order_by(Message.created_at.asc())
+        # (created_at, id) — the tiebreaker `day_context_loader` already has.
+        # Without it two rows sharing a timestamp come back in a different
+        # order on two fetches.
+        .order_by(Message.created_at.asc(), Message.id.asc())
         .offset(offset)
         .limit(limit)
     )
@@ -847,12 +892,16 @@ def _message_to_response(
     the resulting row just won't have a ``reply_to`` payload (the path
     doesn't carry one anyway).
 
-    ``conversation_channels`` is ``{conversation_id: channel}``. It exists
-    because ``Message.channel`` is only written for system senders (routine /
-    trigger / subagent / app_builder) — a voice turn leaves it NULL and carries
-    "voice" on its Conversation. Conversation first is also what
-    api/day_chats.py serializes, so the two paths agree on every row instead of
-    the fallback quietly reporting a different channel than the primary.
+    ``conversation_channels`` is ``{conversation_id: channel}`` — the
+    FALLBACK for a row whose own ``Message.channel`` is NULL. Message first,
+    Conversation second, then "web": the same order ``api/day_chats.py``
+    resolves, which is what makes this route and the primary one agree on
+    every row. (The old docstring justified Conversation-first by saying
+    ``Message.channel`` is only written for system senders. That was already
+    untrue for runner-saved rows, and it stopped being true altogether once
+    the ws_chat presave stamped the channel on both inserts — a WhatsApp turn
+    and a mobile turn can share a Conversation, and only the row knows which
+    it is.)
     """
     # Local import: sessions ↔ day_chats would cycle at module load.
     from app.api.day_chats import _serialize_tool_events
@@ -969,8 +1018,8 @@ def _message_to_response(
         tool_events=_serialize_tool_events(message),
         attachments=attachments_list,
         channel=(
-            (conversation_channels or {}).get(message.conversation_id)
-            or getattr(message, "channel", None)
+            getattr(message, "channel", None)
+            or (conversation_channels or {}).get(message.conversation_id)
         ),
         reply_to_message_id=getattr(message, "reply_to_message_id", None),
         reply_to=(reply_targets or {}).get(message.id),
@@ -1044,7 +1093,7 @@ async def get_messages_by_date(
                 {"limit": limit, "tz_offset": tz_offset},
             )
         except SessionsAgentSaidNo as e:
-            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            raise _sessions_4xx(e)
         except SessionsAgentUnreachable as e:
             raise _sessions_unreachable(e)
         return JSONResponse(content=data)

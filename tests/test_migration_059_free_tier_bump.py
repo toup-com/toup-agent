@@ -84,11 +84,22 @@ def test_database_py_seed_mirrors_post_bump_numbers():
     no-op (mig 053 already inserted, mig 059 then UPDATEd), but on
     CI test fixtures + brand-new tenant Postgres the INSERT fires and
     must use the post-bump numbers — otherwise tests against fresh
-    DBs would assert against 30/120/5."""
+    DBs would assert against 30/120/5.
+
+    ⚠️ The DAILY CAP half of this assertion was retired on 2026-09-13 and it
+    was retired because it was WRONG, not because it was inconvenient. It
+    demanded `15`, which is what 059 wrote; production has been NULL on all
+    five plan rows since the 2026-08-29 cap removal, so the seed this test
+    was pinning silently reimposed on every fresh environment, rebuilt DB and
+    new tenant a cap that a single gpt-5.5 turn (26-28 credits quoted) can
+    never satisfy — the exact configuration behind the 2026-08-03 incident.
+    Alembic 102 step 2 converges it; this test now pins the converged value.
+    059's own two credit numbers are unchanged and still asserted."""
     db_py = (BACKEND_DIR / "app/db/database.py").read_text(encoding="utf-8")
     # The free-tier INSERT must carry the post-bump numbers as
     # positional literals in the VALUES clause.
-    assert "VALUES ('free', 'Free', 0, 100, 500, 15" in db_py, (
-        "init_db seed must mirror mig 059's post-bump numbers "
-        "(100 msg / 500 int / 15 day-cap), not the legacy 30/120/5"
+    assert "VALUES ('free', 'Free', 0, 100, 500, NULL" in db_py, (
+        "init_db seed must mirror mig 059's post-bump credit numbers "
+        "(100 msg / 500 int), not the legacy 30/120 — and the daily cap "
+        "must be NULL, matching production and alembic 104, not 15"
     )

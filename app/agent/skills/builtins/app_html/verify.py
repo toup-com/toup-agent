@@ -525,6 +525,55 @@ async def warm_browser() -> bool:
         return False
 
 
+#: The in-flight warm task, so a repeat trigger is free. `_acquire_browser`
+#: is already lock-guarded and returns the live handle, so a second call
+#: cannot launch a second Brave — this only avoids the redundant task.
+_warm_task = None
+
+
+def browser_warm_boot_allowed(*, bound: bool) -> bool:
+    """Whether THIS container should warm a browser at boot.
+
+    An unbound generic pool spare must not. It keeps the browser resident for
+    the life of the process (that is the round-24 fix above, and it is right
+    for a container that will build apps), but a lobby spare may sit unclaimed
+    for days: the 2026-09-12 host carried ~11 such spares at ~104 MiB PSS each
+    for browsers nobody could ever ask for, on a 16-vCPU box already at load
+    21. `/admin/bind` calls `schedule_warm_browser` instead, so a claimed user
+    still gets a warm browser — one bind earlier than the app-build that needs
+    it.
+
+    A blue-green PASSIVE slot is deliberately still warmed: it is bound, it
+    takes the tenant over within ~90 s, and the promote path does not re-run
+    the boot block that would otherwise warm it.
+    """
+    return bool(bound)
+
+
+def schedule_warm_browser(reason: str) -> bool:
+    """Fire-and-forget `warm_browser()`; True when a task was actually started.
+
+    Never blocks the caller and never raises — both call sites (boot, bind) are
+    on latency-sensitive paths. Idempotent, which matters on the bind path:
+    `refresh-config` is routine and BOTH Railway replicas push one.
+    """
+    global _warm_task
+    if _browser is not None:
+        return False
+    if _warm_task is not None and not _warm_task.done():
+        return False
+
+    async def _warm_and_log() -> None:
+        ok = await warm_browser()
+        print(f"🌡️ Verify browser warm-up ({reason}): {'ok' if ok else 'unavailable'}")
+
+    try:
+        _warm_task = asyncio.create_task(_warm_and_log())
+        return True
+    except RuntimeError:  # no running loop — nothing to warm into
+        return False
+
+
 async def smoke_test(html: str, *, timeout: int = SMOKE_TIMEOUT_S) -> Report:
     """Open the app in a throwaway browser and collect what it throws.
 

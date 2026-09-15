@@ -143,6 +143,9 @@ def is_internal_marker(text: Optional[str], *, role: str = "assistant") -> bool:
     return bool(parsed) and set(parsed).issubset(JOB_MARKER_KEYS)
 
 
+_STRIP_UNAVAILABLE_WARNED = False
+
+
 def public_text(role: Optional[str], content: Optional[str]) -> str:
     """The body a client may render, given the row's role.
 
@@ -150,6 +153,13 @@ def public_text(role: Optional[str], content: Optional[str]) -> str:
     built from the projected fields. Every other role passes through
     unless :func:`is_internal_marker` recognises the body as a machine
     token.
+
+    A leaked ``[channel h:mmam]`` annotation is stripped from NON-USER rows
+    on the way out. Every client-facing serializer (sessions x2,
+    messages_recover, day_chats x2) funnels through this one function, so
+    the strip reaches the RELEASED App Store client and the web with no
+    client change. A user's own row is never touched — those are their
+    words, and a user may legitimately type a bracketed prefix.
     """
     if (role or "") == "job":
         return ""
@@ -161,6 +171,32 @@ def public_text(role: Optional[str], content: Optional[str]) -> str:
             "[message_cards] blanked an internal marker on a role=%r row", role,
         )
         return ""
+    if content and (role or "") != "user":
+        # Lazy import: message_cards is imported by platform-only modules and
+        # the sanitizer lives under app.agent.
+        try:
+            from app.agent.channel_annotations import strip_leaked_tags
+
+            cleaned, leaked = strip_leaked_tags(content)
+        except Exception:
+            # Fails OPEN — the row renders exactly as it does today. The
+            # strip is output hygiene, not a correctness gate, so a missing
+            # sanitizer must never 500 a history fetch. Said once per
+            # process, because silence here would hide a broken import.
+            global _STRIP_UNAVAILABLE_WARNED
+            if not _STRIP_UNAVAILABLE_WARNED:
+                _STRIP_UNAVAILABLE_WARNED = True
+                logger.warning(
+                    "[message_cards] channel_annotations.strip_leaked_tags "
+                    "unavailable — serving raw assistant text", exc_info=True,
+                )
+            return content
+        if leaked:
+            logger.info(
+                "[message_cards] stripped annotation leak role=%r n=%d",
+                role, len(leaked),
+            )
+            return cleaned
     return content or ""
 
 

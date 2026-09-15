@@ -5223,12 +5223,21 @@ class ToolExecutor:
                 if not rows:
                     return f"{header}\n\n[No user/assistant messages on this day.]"
 
+                from app.agent.channel_annotations import strip_leaked_tags
                 formatted: List[str] = []
                 for msg, channel in rows:
                     time_str = msg.created_at.strftime("%-I:%M%p").lower() if msg.created_at else ""
                     role_label = "User" if msg.role == "user" else "Agent"
                     tag = f"[{channel or 'web'} {time_str}]"
-                    formatted.append(f"{tag} {role_label}: {msg.content}")
+                    # Second producer of the same shape as the day-history
+                    # loader: without the same strip, a recall_day turn
+                    # re-teaches the model the pattern the other three fixes
+                    # just removed. Assistant rows only — a user's own pasted
+                    # text is theirs.
+                    _body = msg.content
+                    if msg.role == "assistant":
+                        _body, _ = strip_leaked_tags(_body or "")
+                    formatted.append(f"{tag} {role_label}: {_body}")
 
                 # v1 query filter: case-insensitive substring match + ±2 context window.
                 # Substring match — NOT regex — so metacharacters are literal.

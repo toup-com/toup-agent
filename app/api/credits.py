@@ -122,6 +122,38 @@ class CreditStatusResponse(BaseModel):
     # credit_service._is_unlimited_user). The frontend uses this to suppress
     # the low-balance pill / exhausted card and render "Unlimited".
     unlimited: bool = False
+    # WHY this account is unlimited: 'admin' | 'apple' | 'grant' | 'plan', or
+    # null when it is not. Computed ONLY for an account that already holds the
+    # entitlement — for everyone else it would be two queries to learn "no",
+    # and /status is called on every app foreground.
+    #
+    # 'plan' is deliberately distinguishable from the other three: it means the
+    # balance says unlimited and nothing explains it, which is the reconciler's
+    # `orphan_entitlement` class. A support surface should be able to tell an
+    # entitlement from an unexplained stamp.
+    unlimited_reason: Optional[str] = None
+    # What the account is actually BILLED for, when that differs from the plan
+    # it is entitled to. A grandfathered legacy payer is entitled to Unlimited
+    # while Apple keeps charging them for `ai.toup.app.sub.builder` — showing
+    # only "Unlimited" would hide the subscription they can cancel, on the one
+    # screen where that is the question.
+    # Null whenever there is no Apple subscription behind the plan.
+    #
+    # There is deliberately NO price here, and no `billed_price_cents`. It
+    # existed for one revision and was wrong in both amount and currency:
+    # `subscription_plans.price_cents` is the abandoned USD web ladder
+    # (1600/4000/8000/16000) that nobody has ever bought on, while Apple
+    # charges 9.90/19.90/39.90/98.90 and, for all three real payers, in CAD.
+    # So the one field whose job was to disclose "the price they are paying"
+    # stated roughly double it, with no currency attached — on the screen
+    # someone would use to decide whether to cancel. This schema has no source
+    # of truth for Apple storefront prices; the client has one, localised and
+    # correct, in StoreKit's `Product.displayPrice` for
+    # `subscription_product_id`. Use that. If a server-side price is ever
+    # genuinely needed, it needs a per-product Apple price table AND a currency
+    # field, and it must never fall back to the web catalogue.
+    billed_plan_id: Optional[str] = None
+    billed_plan_display_name: Optional[str] = None
     # Subscription source for the mobile billing UI:
     #   'iap'  → Apple auto-renewable sub (manage in iOS Settings)
     #   'web'  → Stripe sub or legacy paid (manage at toup.ai/account)
@@ -176,9 +208,49 @@ async def get_credit_status(
 ) -> CreditStatusResponse:
     """Workspace credit panel data — what the sidebar drawer renders."""
     view = await credit_service.get_balance_view(db, current_user.id)
-    from app.services.credit_service import _is_unlimited_user
+    # `unlimited` broadens from "role == admin" to "holds the unlimited
+    # entitlement" — a strict SUPERSET, so nothing that was true stops being
+    # true. The two meanings now agree by construction instead of colliding
+    # (the plan id and this boolean are both named "unlimited"). Its only
+    # consumer is web's LowBalancePill, which wants exactly this: never nag an
+    # unlimited account. Mobile reads it nowhere.
+    #
+    # `view` is a BalanceView, not the ORM row, and it carries plan_id — which
+    # is the only field _entitlement_is_unlimited reads off a balance.
+    from app.services.credit_service import _entitlement_is_unlimited
+    is_unlimited = _entitlement_is_unlimited(current_user, view)
+
+    # WHY, but only for an account that already holds it. A free user's
+    # /status must stay byte-for-byte the query profile it has always had, and
+    # resolve_unlimited costs two reads to answer "no" for them. For an admin
+    # it short-circuits on the first check and costs nothing either.
+    unlimited_reason: Optional[str] = None
+    if is_unlimited:
+        from app.services import entitlement
+        _, unlimited_reason = await entitlement.resolve_unlimited(db, current_user.id)
+
+    # What Apple actually charges for. `view.subscription_product_id` is
+    # already resolved from the active apple_subscriptions row (no extra
+    # query), and the CATALOGUE map is what the product was SOLD as — never
+    # plan_for_subscription(), which would answer 'unlimited' for a
+    # grandfathered legacy product and defeat the whole point of the field.
+    billed_plan_id: Optional[str] = None
+    billed_display: Optional[str] = None
+    if view.subscription_product_id:
+        from app.services.apple_iap_service import APPLE_SUB_PRODUCT_TO_PLAN
+        billed_plan_id = APPLE_SUB_PRODUCT_TO_PLAN.get(view.subscription_product_id)
+        if billed_plan_id:
+            billed_row = await db.get(SubscriptionPlan, billed_plan_id)
+            if billed_row is not None:
+                billed_display = billed_row.display_name
+                # NOT billed_row.price_cents — that is the web ladder, not what
+                # Apple charges. See the field comment on CreditStatusResponse.
+
     return CreditStatusResponse(
-        unlimited=_is_unlimited_user(current_user),
+        unlimited=is_unlimited,
+        unlimited_reason=unlimited_reason,
+        billed_plan_id=billed_plan_id,
+        billed_plan_display_name=billed_display,
         plan_id=view.plan_id,
         plan_display_name=view.plan_display_name,
         message=BucketStatus(

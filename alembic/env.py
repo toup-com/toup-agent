@@ -1,6 +1,101 @@
 """
 Alembic environment configuration for Toup.
 Supports async SQLAlchemy with PostgreSQL.
+
+
+DESIGN NOTE — this chain does not run on a tenant database, and fixing 007
+did not change that. Read before "fixing" the agent's boot.
+─────────────────────────────────────────────────────────────────────────
+`Dockerfile.agent`'s CMD runs `alembic upgrade head || echo '[boot] alembic
+upgrade failed — continuing'` before uvicorn, against the TENANT database.
+It has never once succeeded. Verified on the live fleet 2026-09-13:
+`to_regclass('alembic_version')` is NULL on `toup_agent_feed0081`,
+`toup_agent_feed0086` and `toup_agent_f261b564` alike, each with 62 public
+tables. The whole fleet, every boot, since 2026-02-13.
+
+Reproduced locally against a disposable `pgvector/pgvector:pg16` (the exact
+sequence is in the commit that added this note):
+
+  1. empty DB + `alembic upgrade head`
+     → dies at 007 on `document_chunks`, which NO migration creates. Alembic
+       runs the span in one transaction ("Will assume transactional DDL"), so
+       001-006 roll back and `alembic_version` is never written. 0 tables.
+  2. `init_db()` on that empty DB
+     → 62 tables, matching the live containers exactly. `create_all` plus
+       ~223 hand-maintained `_alter_statements`, with the platform-only ones
+       logging `[init_db] alter skipped: … relation "live_activities" does
+       not exist` and similar.
+  3. `alembic upgrade head` again, which is the fleet's SECOND boot
+     → `DuplicateTable: relation "users" already exists`, because step 1
+       stamped nothing and 001 re-runs against a populated schema.
+
+Guarding 007 (done) moves the wall; it does not remove it. Walking the chain
+one revision at a time on a fresh DB — each its own transaction, so a failure
+does not roll back its predecessors — reaches head 101 but with **11
+migrations failing**:
+
+  tenant tables that only `create_all` creates
+    021 day_chats · 040 routine_runs · 041 routines
+  platform-only tables a tenant DB will never have
+    022, 037, 060 managed_containers · 023 rollout_attempts ·
+    025 streaming_credentials · 027 ix_managed_containers_host_port ·
+    033 rollouts
+  a data backfill
+    086 `msg.metadata_json` (users.first_media_played_at)
+
+That distribution is the finding. Seven of the eleven touch tables that exist
+only in the PLATFORM database, so this is not a chain with a bug in it — it is
+a chain written for a different database, pointed at a tenant. Migration 086's
+own docstring already says so in plain words: *"Tenant DBs have no
+alembic_version row — their only migrator is app/db/database.py::init_db's
+`_alter_statements` list, which carries the mirror of this ALTER."*
+
+THE OPEN QUESTION: should boot `alembic stamp head` when `alembic_version` is
+absent but the schema is already populated? Not done here, deliberately.
+
+  What it buys: the `DuplicateTable` on every boot stops, and `ec99e8bb`'s
+  `/agent/health.schema` starts reporting something true.
+
+  What it risks:
+  • It declares 11 migrations applied that have never run. 086's backfill
+    genuinely has not — its ALTER is mirrored at `database.py:447` but its
+    UPDATE is mirrored NOWHERE, so `users.first_media_played_at` is NULL for
+    every pre-existing tenant row and the Media nav entry stays hidden for
+    users who have played something. Any future migration that assumes 086's
+    data landed would be wrong in a way nothing detects.
+  • DOUBLE-APPLY. Stamping head turns the future on: migration 102+ would then
+    run on tenant DBs on top of `_alter_statements` doing the same work. The
+    overlap already exists — `_alter_statements` carries 7 UPDATEs, of which
+    `UPDATE build_jobs SET job_type='auto_builder' WHERE job_type IS NULL` and
+    the `messages.channel` backfill are tenant tables also written by
+    migrations. Those two are idempotent by predicate (`WHERE … IS NULL`), so
+    today the collision is harmless — by luck, not by design. A column
+    removal, a type change, or a backfill without an idempotent predicate
+    would not be.
+  • A stamp is irreversible per database and there are ~96 of them.
+
+  How to verify it before shipping, on a disposable Postgres (never the fleet):
+    docker run --rm -d -p 55444:5432 -e POSTGRES_PASSWORD=x \
+      --name probe pgvector/pgvector:pg16
+    # A: the claim that stamping is safe TODAY
+    createdb probe_a; init_db(); alembic stamp head; alembic upgrade head
+      → must be a clean no-op.
+    # B: the claim that matters — the NEXT migration
+    write a throwaway 102 that both ALTERs and backfills, mirror it in
+    `_alter_statements` as the house style requires, then boot twice.
+      → if the backfill runs twice, option (b) is unsafe as stated and the
+        mirror rule has to change with it.
+    # C: the honest alternative
+    drop `alembic upgrade head` from Dockerfile.agent's CMD and boot.
+      → nothing should change, because `init_db` is already the only thing
+        delivering tenant schema. If that holds, (c) is the real fix and (b)
+        is a way of keeping a mechanism that does no work.
+
+  Recommendation: (c) — the chain is platform-authored and the agent should
+  not run it — with (b) acceptable only if test B above comes back clean AND
+  the `_alter_statements` mirror rule is rewritten to say which side owns a
+  backfill. Do not ship either as part of an incident fix; both change what
+  every container does to its own database at boot.
 """
 
 import asyncio

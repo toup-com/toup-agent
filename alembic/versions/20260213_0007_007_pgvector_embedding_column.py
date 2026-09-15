@@ -63,15 +63,35 @@ def upgrade() -> None:
           AND embedding IS NULL
     """)
 
-    # 7. Add vector column to document_chunks table
-    op.execute("ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding vector(1536)")
-
-    # 8. Migrate document_chunks data
+    # 7+8. document_chunks, GUARDED — no migration in this chain creates that
+    # table. Steps 2/5/9 ALTER `memories`, `entities` and `messages`, which
+    # 001_initial does create; `document_chunks` exists only because
+    # `init_db`'s `Base.metadata.create_all` makes it. So on an EMPTY database
+    # this statement raised UndefinedTable, alembic rolled the whole 001-006
+    # span back ("Will assume transactional DDL"), `alembic_version` was never
+    # stamped, and the NEXT boot re-ran 001 against a schema `init_db` had
+    # meanwhile populated → `DuplicateTable: relation "users" already exists`.
+    # That is the fleet's normal boot, on every container, since 2026-02-13.
+    #
+    # Guarded rather than CREATE TABLE'd on purpose: `DocumentChunk` already
+    # declares `embedding = Column(Vector())`, so wherever `create_all` makes
+    # the table it makes this column too, and there is nothing here to add.
+    # Restating the table's schema in a migration would put two definitions of
+    # it in the tree, which is the divergence this file is trying to survive.
+    # The DO block is what makes it work at all: a bare guarded ALTER still
+    # parses its table reference, while PL/pgSQL plans the body only if the
+    # branch is reached.
     op.execute("""
-        UPDATE document_chunks
-        SET embedding = embedding_json::vector
-        WHERE embedding_json IS NOT NULL
-          AND embedding IS NULL
+        DO $$
+        BEGIN
+            IF to_regclass('document_chunks') IS NOT NULL THEN
+                ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding vector(1536);
+                UPDATE document_chunks
+                SET embedding = embedding_json::vector
+                WHERE embedding_json IS NOT NULL
+                  AND embedding IS NULL;
+            END IF;
+        END $$;
     """)
 
     # 9. Add vector column to messages table

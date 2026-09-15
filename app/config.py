@@ -673,6 +673,60 @@ class Settings(BaseSettings):
     # Sample floors — below these a ratio or a zero is noise, not signal.
     credit_health_min_cost_cents: float = 200.0
     credit_health_min_events: int = 50
+    # ── The UNLIMITED entitlement's three invariants (design §6) ──────
+    # The rule the three share: a zero-amount ledger row means nothing on its
+    # own. The REASON is always a metadata marker, and a zero-amount row with
+    # provider cost and NO marker is an alarm. Without that, "unlimited"
+    # becomes an unfalsifiable explanation for any charge that stops landing —
+    # a bug and a feature would write identical rows.
+    #
+    # 5. Unlimited cost is BOUNDED. Per user, per window, over the provider
+    #    cost of rows marked `unlimited`. 1 credit = 1¢, so $25/day is 2,500
+    #    credits/day — more than any plan ever sold and more than the entire
+    #    platform's measured 30-day spend (2,003 credits). $100/day reaches the
+    #    1,000,000-credit backstop in 100 days.
+    credit_health_unlimited_usd_warning: float = 25.0
+    credit_health_unlimited_usd_critical: float = 100.0
+    # 6. SILENT zero charges — a usage row with real provider cost, amount 0,
+    #    and no `denied`/`admin_unlimited`/`unlimited`/`meter_only` marker.
+    #    Warning at one; critical at the same dollar bar invariant 1 uses.
+    credit_health_silent_zero_usd_critical: float = 5.0
+    # 7. Denial anomalies. A denial on an `unlimited` balance is critical on a
+    #    SINGLE occurrence and has no threshold — it is the one bug class this
+    #    entitlement must never produce. The spike bar below is the separate,
+    #    ordinary "denials are way up" warning; free-tier denials are the
+    #    system working and are only ever counted, never silenced. 88 denials
+    #    all-time makes 50 in 24h unambiguously a change, not a busy day.
+    credit_health_denial_spike: int = 50
+
+    # ── Apple subscription reconciler (app/services/apple_reconciler.py) ──
+    # Everything the platform knows about an Apple subscription arrives by
+    # PUSH, and that channel has already dropped a message: the Sandbox Elite
+    # row has read status='active' for 2.7 months past its expiry with
+    # last_notification_uuid NULL. There has never been a poll, an expiry scan
+    # or a single get_all_subscription_statuses call. This loop is what makes
+    # "drops back to Free automatically, on every channel, with no manual
+    # step" a guarantee rather than a promise the notification handler keeps.
+    apple_reconcile_enabled: bool = True
+    apple_reconcile_interval_s: int = 21600  # 6h; floor-clamped to 3600
+    # OBSERVE-ONLY on the first deploy. The same shadow-first discipline
+    # abuse_metrics and the unlimited throttle already use: read one clean
+    # pass, then flip. Every action is logged as `would=` while this is False.
+    apple_reconcile_apply: bool = False
+    # Ceiling on App Store Server API reads per pass; leftovers roll to the
+    # next pass, oldest-updated_at first so nothing starves.
+    apple_reconcile_max_api_calls: int = 100
+    # A monthly subscription that has produced no notification in this many
+    # days is either silently dead or a channel that stopped delivering.
+    # 31 days + slack.
+    apple_reconcile_stale_days: int = 40
+    # Sandbox rows are SCANNED and reported — the Sandbox Elite's drift is the
+    # standing evidence this loop exists for — but never MUTATED unless an
+    # operator opts in. A sandbox subscription renews every few minutes and
+    # expires within the hour; letting Apple's test environment move a real
+    # credit_balances row trades a visible drift for an invisible one.
+    apple_reconcile_scan_sandbox: bool = True
+    apple_reconcile_sandbox_apply: bool = False
 
     # Search-quota monitor (app/services/search_quota_monitor.py). Brave's
     # monthly rate-limit bucket reports limit 0 / remaining 0 on this plan, so
@@ -836,9 +890,38 @@ class Settings(BaseSettings):
     #   - prompt_cache_key scope collapses from {user}:{day_chat_id} to
     #     {user}:all — the key is a routing hint, and a per-day key threw
     #     away cross-midnight head reuse for zero benefit
-    # Default OFF: model-visible only via allowed_tools; flip after canary
-    # A/B (same recipe as PROMPT_DIET). Flag-off is byte-identical.
-    channel_converge: bool = False
+    # Default ON since 2026-09-14. It was OFF, and that made the W-A3
+    # channel-neutral system prompt a half-move: the tools array serializes
+    # AHEAD of system+history, so a per-channel array keeps every channel on
+    # its own cache lineage no matter what the system prompt says. The two
+    # flips are one change — converge alone converges the tools tier while
+    # the system tier still forks; the envelope alone converges the system
+    # tier while the array still forks, which is no lineage gain at all.
+    # Flag-off is byte-identical.
+    channel_converge: bool = True
+
+    # W-A3 channel-neutral cached prefix + per-turn <runtime_envelope>
+    # (app/agent/runtime_envelope.py). The system prompt stops forking on
+    # channel — the short per-surface descriptor rides the envelope, the long
+    # surface contracts become always-present and explicitly scoped — so one
+    # user's web/WhatsApp/mobile hops inside a day share ONE provider cache
+    # lineage instead of re-billing ~19,000 prefix tokens per hop. Flag-off is
+    # byte-identical (the output sanitizer in agent_runner is the one stated
+    # exception, and it is output hygiene, not prompt shape). The canary list
+    # is the only way to prove it on one tenant — agent flags are otherwise
+    # fleet-wide.
+    channel_envelope: bool = True
+    channel_envelope_canary_user_ids: str = ""
+    # Incident 2026-09-14: the day-index self-heal is now a service that runs in
+    # its own session (app/services/day_chat_rebucket.py). This switch turns
+    # every AUTOMATIC write path off without a rollback: `rebucket_user_days`
+    # itself returns a no-op result while it is off (so the endpoint heal in
+    # day_chats.py and the tz-learn trigger in ws_chat.py both stop), and
+    # scripts/rebucket_day_chats.py refuses `--apply` unless `--force`.
+    # Delivered to pool containers through bridge/pool_addon.py's
+    # _FEATURE_FLAG_ENVS (DAY_CHAT_REBUCKET_ENABLED) — a flag missing from that
+    # tuple is a kill switch nothing can reach.
+    day_chat_rebucket_enabled: bool = True
 
     # OpenAI wire API selection (gate G1 blocker; docs/audits/2026-07-g1-model-gate.md).
     # gpt-5.6-* 400s on /v1/chat/completions when function tools are present
@@ -1237,6 +1320,53 @@ class Settings(BaseSettings):
     # it on cannot change a single user's balance or refusal; see
     # tests/test_credit_shadow_mode.py.
     credit_shadow_admission_logging: bool = False
+
+    # ── UNLIMITED anti-abuse (app/services/unlimited_abuse.py, design §7) ──
+    # An account that is never denied and never debited has no natural
+    # ceiling, so the ceiling has to be stated. The ladder is
+    # log → alert → pace → refuse, and the last two SHIP OFF: a human using
+    # the app by hand must never reach any tier, and a false positive against
+    # a paying customer is worse than a large bill.
+    #
+    # Calibrated against measured reality, not intuition: the heaviest real
+    # user sent 140 chat messages in ~2 weeks, the mean charged turn is 1.975
+    # credits, the heaviest single turn ever recorded is 23, and the ENTIRE
+    # platform spent 2,003 credits over 30 days. The refuse bars below are
+    # ~50× the heaviest observed human DAY; 2,000 calls/hour is one call every
+    # 1.8 s sustained for an hour, which is not reachable by a person at a
+    # keyboard plus a voice session plus every automation they own.
+    unlimited_throttle_enabled: bool = False
+    # While disabled the module still emits `unlimited_throttle_would` shadow
+    # events carrying the tier it WOULD have applied — the same shadow-first
+    # discipline abuse_metrics was built for. Flip only after the shadow series
+    # shows zero would-be hits on real customers.
+    unlimited_throttle_grace_turns: int = 50
+    # Rolling 60-minute LLM-call counts (in-process; railway.json runs
+    # numReplicas 2, so each replica sees roughly half the traffic and this arm
+    # is a coarse tripwire — the AUTHORITATIVE 24h/30d arm is credit-health
+    # invariant 5, which is SQL over the ledger and sees every replica).
+    unlimited_calls_1h_notice: int = 300
+    unlimited_calls_1h_alert: int = 900
+    unlimited_calls_1h_refuse: int = 2000
+    # Rolling 24h charged-equivalent credits (1 credit = 1¢ of provider cost).
+    unlimited_credits_24h_notice: float = 1500.0
+    unlimited_credits_24h_alert: float = 5000.0
+    unlimited_credits_24h_refuse: float = 15000.0
+    # The pace tier admits the turn after a computed delay rather than
+    # refusing it. Capped, because a delay is recoverable and self-limiting
+    # while a denial is not.
+    unlimited_pace_max_delay_s: float = 20.0
+
+    # How long the agent's in-process "this user is out of credits" latch
+    # (credit_reporter.CreditState) counts as evidence. It is the ONLY gate on
+    # the manual/BYOK path, it is set by a deduct RESPONSE, and the deduct only
+    # happens after an LLM call — which the latch is blocking. So once it
+    # closes nothing in that process reopens it; only a container restart or an
+    # explicit `check_balance_remote` does. Past this age one call is allowed
+    # through and its deduct re-establishes the truth (the module's own "one
+    # slip" model, on a timer). Cost: at most one extra LLM call per exhausted
+    # user per TTL. 0 disables the expiry and restores the permanent latch.
+    credit_exhausted_latch_ttl_s: int = 900
     # Sybil resistance: when True, the one-time free-credit grant is deduped
     # per CANONICAL email identity (Gmail dot/+alias variants AND
     # delete→re-signup collapse to a single grant) via the grant_eligibility
@@ -2249,6 +2379,12 @@ class Settings(BaseSettings):
     # if that route answers 404/405, and remembers not to ask again — so this
     # default is safe against a bridge that has not deployed the route yet.
     bridge_pool_whois_route: str = "/v1/pool/whois"
+    # The bridge's ownership answer for one tenant prefix: which container it
+    # believes owns the user, and what Caddy actually dials for the hostname.
+    # Read ONLY by the named-401 repair, which does nothing without it — an
+    # unset or undeployed route degrades that branch to alert-only, never to
+    # a guess. Set to "" to disable the read entirely.
+    bridge_tenant_truth_route: str = "/v1/pool/tenant-truth"
     # Sub-tick of container_reconciler_loop: a narrow "recently stranded"
     # pass so a user whose provisioning lost its response is discovered in
     # ~15 s instead of ~180 s. The full 180 s scan is unchanged.
@@ -2437,6 +2573,16 @@ class Settings(BaseSettings):
     rollout_fleet_alert_interval_s: int = 21600
     infra_alert_telegram_token: str = ""    # Dedicated infra bot (split from admin_alert_*)
     infra_alert_telegram_chat_id: str = ""
+    # Per-CATEGORY cap on how many DISTINCT subjects may page inside one
+    # rate-limit window. Keying the window on (category, subject) — the
+    # 2026-09-12 fix for "one stuck account blinds the operator to every other
+    # self-heal event" — multiplies volume by the number of stuck subjects:
+    # four ambiguous accounts plus five permanently-MCP-401 tenants is nine
+    # independent windows. Past the cap the subjects are COLLECTED, not
+    # dropped, and named in a digest line on the next send in that category —
+    # so the trade is "one message naming K subjects" rather than K messages,
+    # and nothing becomes invisible. 0 disables the cap.
+    infra_alert_category_subject_cap: int = 5
 
     # ── Browser Proxy & Captcha ──
     browser_proxy: str = ""  # e.g. "http://user:pass@proxy.example.com:8080"

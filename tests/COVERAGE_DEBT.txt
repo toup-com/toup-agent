@@ -33,6 +33,9 @@ test_autopilot_approvals.py  # agent-mode
 test_autopilot_engine.py  # agent-mode
 test_autopilot_tick_hygiene.py  # agent-mode
 test_channel_day_consistency.py  # agent-mode
+test_channel_neutral_prefix.py  # agent-mode: _build_system_prompt SELECTs `identities` (AGENT_ONLY) — same lane as test_agent_runner_subagent_params.py
+test_day_chats_future_heal.py  # agent-mode: day_chats/conversations/messages/context_budget_logs are AGENT_ONLY — it drives the REAL list_day_chats over a seeded future-dated day, which is the only way the 2026-09-14 PendingRollback 500 can be reproduced at all
+test_agent_health_signals.py  # agent-mode: /agent/health probes the tenant DB, and the counters it exposes are raised on AGENT_ONLY write paths
 test_create_job_turn_context.py  # agent-mode
 test_day_chat_unification.py  # agent-mode
 test_job_reaper.py  # agent-mode

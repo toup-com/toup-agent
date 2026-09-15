@@ -14,8 +14,9 @@ from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, and_, or_, func, distinct, update
+from sqlalchemy import select, and_, or_, func, distinct
 from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +33,60 @@ from app.api.message_cards import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/day-chats", tags=["Day Chats"])
+
+
+def _row_channel(msg, conv_channel: Optional[str]) -> str:
+    """The channel of a ROW: `Message.channel` first, the Conversation's as a
+    fallback, then 'web'.
+
+    Message-first is the only order that survives a Conversation being reused
+    across surfaces — once a WhatsApp turn and a mobile turn can share a day,
+    the conversation's channel is a property of where the THREAD started, not
+    of who sent this row. Every row written before `Message.channel` was
+    stamped has NULL there, so a released client sees exactly today's value
+    for historical rows.
+
+    Deliberately NOT `channel_util.resolve_channel`: that logs an INFO line on
+    every conversation-level fallback, and this runs once per row on the
+    primary history fetch — 500 rows per chat open, per tenant.
+    """
+    own = getattr(msg, "channel", None)
+    if isinstance(own, str) and own.strip():
+        return own.strip()
+    if isinstance(conv_channel, str) and conv_channel.strip():
+        return conv_channel.strip()
+    return "web"
+
+
+class _CountedRoute(APIRoute):
+    """Counts 5xx answers out of this router into `health_signals`.
+
+    The agent process is the only one whose counters are read (they ride
+    `/agent/health`); the platform mounts the same router and keeps its own,
+    unread copy. Diagnostic only — nothing gates on it, and the exception is
+    always re-raised.
+    """
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def _handler(request):
+            try:
+                return await original(request)
+            except Exception as exc:
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    try:
+                        from app.services import health_signals
+
+                        health_signals.incr("day_chats_5xx")
+                    except Exception:
+                        pass
+                raise
+
+        return _handler
+
+
+router = APIRouter(prefix="/day-chats", tags=["Day Chats"], route_class=_CountedRoute)
 
 # When this router is mounted in `platform_main`, the platform DB
 # does NOT have the agent-only tables (`day_chats`, `conversations`,
@@ -387,9 +441,13 @@ class AgentUnreachable(Exception):
     gets a 503 and the client keeps whatever it already had on screen.
     """
 
-    def __init__(self, detail: str):
+    def __init__(self, detail: str, reason: str = "agent_unreachable"):
         super().__init__(detail)
         self.detail = detail
+        # `agent_unreachable` (silence, transport, 502/503/504) vs
+        # `agent_error` (the tenant answered 500). The client treats both as
+        # 503 — the split is for the trail and for anyone reading the header.
+        self.reason = reason
 
 
 # The tenant read budget, and it is the WHOLE LADDER that has to fit.
@@ -447,11 +505,25 @@ async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", p
             # it has already been given.
             if 400 <= resp.status_code < 500:
                 raise AgentSaidNo(resp.status_code, resp.text[:300])
+            # A 500 is the tenant ANSWERING, deterministically, with a
+            # failure — retrying it is three times the load for the same
+            # answer. That is the rule the mobile client states at
+            # `api.ts RETRY_STATUSES` and the server side never adopted: on
+            # 2026-09-14 one user action cost six agent 500s (3 client
+            # retries x 2 proxy attempts) and up to ~25 s of platform wait.
+            # 502/503/504 are a hop failing in front of the tenant and stay
+            # in the retry set.
+            if resp.status_code == 500:
+                logger.warning(
+                    "Day-chats proxy %s: tenant answered 500 — not retried "
+                    "(deterministic)", url,
+                )
+                raise AgentUnreachable("HTTP 500", reason="agent_error")
             # A 5xx was previously silent: `_proxy_day_chats` only logged
             # inside `except`, so a tenant answering 500 produced no line at
             # all and then an empty history. Say what happened, then retry.
             last = f"HTTP {resp.status_code}"
-        except AgentSaidNo:
+        except (AgentSaidNo, AgentUnreachable):
             raise
         except Exception as e:
             # `str(httpx.ReadTimeout())` is the EMPTY STRING, so the old
@@ -479,13 +551,155 @@ def _unreachable(exc: "AgentUnreachable") -> HTTPException:
     """
     # The cause reaches the trail here and NOT the client: "ReadTimeout()" is
     # what an operator needs and nothing a user can act on.
-    logger.warning("[day_chats] answering 503 agent_unreachable: %s",
-                   getattr(exc, "detail", exc))
+    reason = getattr(exc, "reason", "agent_unreachable")
+    logger.warning("[day_chats] answering 503 %s: %s",
+                   reason, getattr(exc, "detail", exc))
     return HTTPException(
         status_code=503,
         detail="Your agent did not answer in time. Your history is safe — try again.",
-        headers={"Retry-After": "2", "X-Toup-Reason": "agent_unreachable"},
+        headers={"Retry-After": "2", "X-Toup-Reason": reason},
     )
+
+
+def _agent_4xx(e: "AgentSaidNo") -> HTTPException:
+    """Turn a considered tenant 4xx into the client response.
+
+    A 401/403 FROM THE TENANT AGENT means the PLATFORM's own `X-Agent-Key` is
+    stale — the agent was just rebound and the platform copy has not caught up
+    (it self-heals in ~30 s). It does NOT mean the user's JWT is bad. But the
+    mobile client signs the user OUT on any 401 (`api.ts` clears the token and
+    `context.ts` tears the session down), so forwarding a tenant 401 verbatim
+    logs the user out over a transient key blip — the D1 catastrophe of the
+    2026-09-12 onboarding incident. Map 401/403 to 503 + `Retry-After` +
+    `X-Toup-Reason: agent_key_stale` (the same shape `_unreachable` uses for
+    5xx/transport) so the client RETRIES instead of signing out.
+
+    Every OTHER 4xx is the agent's real answer — most importantly the 404
+    `app-conversation/{id}` returns for "no conversation yet" — and is
+    forwarded verbatim. A genuine PLATFORM-auth 401 never reaches here: it is
+    raised by `get_current_user` before the tenant call and stays a 401.
+    """
+    if e.status in (401, 403):
+        logger.warning(
+            "[day_chats] tenant answered %s — platform agent key stale; "
+            "answering 503 agent_key_stale (forwarding would sign the user out)",
+            e.status,
+        )
+        return HTTPException(
+            status_code=503,
+            detail="Your agent is still starting up. Please try again in a moment.",
+            headers={"Retry-After": "3", "X-Toup-Reason": "agent_key_stale"},
+        )
+    return HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+
+
+# ── Day-chat self-heal plumbing ──────────────────────────────────────
+#
+# The heal is a SERVICE call in a SEPARATE session (see `list_day_chats`).
+# These three helpers are everything the endpoint itself needs to decide
+# whether to make that call.
+
+_HEAL_COOLDOWN_S = 60.0
+#: user_id -> monotonic timestamp of the last heal ATTEMPT. Advisory only —
+#: it is per-process and there are two platform replicas — but it is what
+#: stops a client retrying a 503 three times from running the repair six
+#: times for one user action. Real safety is that every write in the
+#: rebucket is idempotent.
+_HEAL_COOLDOWN: "dict[str, float]" = {}
+_HEAL_COOLDOWN_MAX = 4096
+
+
+def _rebucket_enabled() -> bool:
+    """Flag read through `getattr` so an older Settings (or a platform
+    process that has not picked up the new field) simply behaves as ON."""
+    from app.config import settings as _settings
+
+    return bool(getattr(_settings, "day_chat_rebucket_enabled", True))
+
+
+def _local_today(tz_name: Optional[str]) -> Optional[Date]:
+    """Today in the user's zone, or None when the zone will not load."""
+    if not tz_name:
+        return None
+    try:
+        import zoneinfo
+
+        return datetime.now(zoneinfo.ZoneInfo(tz_name)).date()
+    except Exception:
+        return None
+
+
+def _heal_cooldown_ok(user_id: str) -> bool:
+    """True at most once per `_HEAL_COOLDOWN_S` per user, and it CLAIMS the
+    window before returning True — the caller is about to await, and two
+    concurrent list calls would otherwise both pass."""
+    import time as _time
+
+    now = _time.monotonic()
+    last = _HEAL_COOLDOWN.get(user_id, 0.0)
+    if now - last < _HEAL_COOLDOWN_S:
+        return False
+    if len(_HEAL_COOLDOWN) > _HEAL_COOLDOWN_MAX:
+        _HEAL_COOLDOWN.clear()
+    _HEAL_COOLDOWN[user_id] = now
+    return True
+
+
+#: Upper bound on rows the gauge will inspect. A tenant's day_chats table
+#: holds one row per user per day; the SQL predicate below already reduces
+#: it to today-or-later, so the cap is a backstop, not a sampling choice.
+_FUTURE_GAUGE_LIMIT = 1000
+
+
+async def _count_future_dated_day_chats() -> int:
+    """Gauge body for `health_signals.future_dated_day_chats` — the tenant's
+    CURRENT count of rows that cannot exist (zero again once healed).
+
+    Bounded in SQL: a user's local today is within one calendar day of the
+    UTC date, so any local_date that is in a user's future is >= the UTC
+    date — the predicate cuts the scan to at most a couple of days' rows
+    before the exact per-zone test runs in Python. Registered only where a
+    tenant table lives (see the guard below): on the platform DB this table
+    is a monolith leftover shared across every user and nobody reads the
+    platform's copy of the counter.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    from app.db.database import async_session_maker as _sm
+
+    utc_today = _dt.now(_tz.utc).date()
+    async with _sm() as _db:
+        rows = (await _db.execute(
+            select(DayChat.local_date, User.timezone)
+            .join(User, DayChat.user_id == User.id)
+            .where(DayChat.local_date >= utc_today)
+            .limit(_FUTURE_GAUGE_LIMIT)
+        )).all()
+    n = 0
+    for local_date, tz_name in rows:
+        today = _local_today(tz_name)
+        if today is not None and local_date and local_date > today:
+            n += 1
+    return n
+
+
+def _gauge_process() -> bool:
+    """The gauge measures a TENANT table; the platform process only proxies."""
+    try:
+        from app.config import settings as _settings
+        return getattr(_settings, "run_mode", "monolith") != "platform"
+    except Exception:  # pragma: no cover
+        return True
+
+
+try:  # pragma: no cover - registration only; the measurement is lazy
+    from app.services import health_signals as _health_signals
+
+    if _gauge_process():
+        _health_signals.register_gauge(
+            "future_dated_day_chats", _count_future_dated_day_chats, ttl_s=60.0,
+        )
+except Exception:  # pragma: no cover
+    pass
 
 
 @router.get("")
@@ -514,7 +728,7 @@ async def list_day_chats(
         try:
             data = await _proxy_day_chats(proxy[0], proxy[1], "", params)
         except AgentSaidNo as e:
-            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            raise _agent_4xx(e)
         except AgentUnreachable as e:
             raise _unreachable(e)
         return JSONResponse(content=data)
@@ -545,67 +759,93 @@ async def list_day_chats(
         logger.info("[day_chats] local SELECT skipped (table absent in this DB): %s", str(exc)[:120])
         return JSONResponse(content=[])
 
-    # ── Self-healing: fix DayChats with future local_date ──
-    # This can happen when a user's timezone was NULL (defaulting to UTC) and
-    # messages were sent after midnight UTC but before midnight local. The DayChat
-    # got created with tomorrow's UTC date instead of today's local date.
-    # Fix: re-resolve the date using the user's current timezone and merge.
+    # ── Self-heal: a future-dated day is a MIS-BUCKETED day ──
+    #
+    # The repair lives in `app.services.day_chat_rebucket` and runs in its
+    # OWN session. The previous inline version re-pointed messages and
+    # conversations and then deleted the source day with a
+    # `context_budget_logs` row still referencing it; the ForeignKeyViolation
+    # was caught without a rollback, so THIS request's session stayed in
+    # PendingRollback and the items loop below 500'd. That is how a failed
+    # heal became a dead day index for 3 hours (2026-09-14).
+    #
+    # `before is None` because a future day can only appear on page one, and
+    # the old loop inspected whatever happened to be on the current page.
     user_tz = getattr(current_user, 'timezone', None)
-    if user_tz:
-        try:
-            import zoneinfo
-            tz = zoneinfo.ZoneInfo(user_tz)
-            local_today = datetime.now(tz).date()
-            _healed = False
-            for dc in list(day_chats):  # copy list — we may delete entries
-                if dc.local_date > local_today:
-                    _healed = True
-                    logger.warning(
-                        "[day_chats] Future-dated DayChat detected: id=%s local_date=%s > today=%s (tz=%s). Rebucketing.",
-                        dc.id[:8], dc.local_date, local_today, user_tz,
+    # Two signals, two meanings. The GAUGE `future_dated_day_chats` is the
+    # tenant's current state: re-measured at most once a minute here and on
+    # `/agent/health`, and forced after a heal that changed something so a
+    # repaired tenant does not page for an hour. The COUNTER
+    # `future_dated_day_chats_seen` is raised below by the number of
+    # impossible rows this user had BEFORE the heal — that is the fact that
+    # a tenant produced such a row, which a working heal would otherwise
+    # erase from every reading.
+    try:
+        from app.services import health_signals as _hs
+
+        await _hs.refresh_gauges(only="future_dated_day_chats")
+    except Exception:
+        pass
+
+    if before is None and user_tz and _rebucket_enabled():
+        local_today = _local_today(user_tz)
+        newest = (await db.execute(
+            select(func.max(DayChat.local_date)).where(DayChat.user_id == current_user.id)
+        )).scalar()
+        if local_today is not None and newest is not None and newest > local_today:
+            try:
+                from app.services import health_signals as _hs_seen
+                _n_future = (await db.execute(
+                    select(func.count()).select_from(DayChat).where(
+                        DayChat.user_id == current_user.id,
+                        DayChat.local_date > local_today,
                     )
-                    # Check if a DayChat for today already exists
-                    existing_today = (await db.execute(
-                        select(DayChat).where(
-                            and_(DayChat.user_id == current_user.id, DayChat.local_date == local_today)
-                        )
-                    )).scalar_one_or_none()
-
-                    if existing_today:
-                        # Merge: move all messages from the future DayChat to today's
-                        await db.execute(
-                            update(Message)
-                            .where(Message.day_chat_id == dc.id)
-                            .values(day_chat_id=existing_today.id)
-                        )
-                        # Update conversations too
-                        await db.execute(
-                            update(Conversation)
-                            .where(Conversation.day_chat_id == dc.id)
-                            .values(day_chat_id=existing_today.id)
-                        )
-                        # Delete the orphaned future DayChat
-                        await db.delete(dc)
-                        await db.commit()
-                        logger.info("[day_chats] Merged future DayChat %s into %s (today)", dc.id[:8], existing_today.id[:8])
-                    else:
-                        # No DayChat for today — just fix the date
-                        dc.local_date = local_today
-                        dc.timezone = user_tz
-                        await db.commit()
-                        logger.info("[day_chats] Fixed future DayChat %s: %s → %s", dc.id[:8], dc.local_date, local_today)
-
-            if _healed:
-                # Re-query after healing to get correct data
-                result = await db.execute(
-                    select(DayChat)
-                    .where(DayChat.user_id == current_user.id)
-                    .order_by(DayChat.local_date.desc())
-                    .limit(limit)
+                )).scalar() or 0
+                _hs_seen.incr("future_dated_day_chats_seen", int(_n_future))
+            except Exception:
+                pass
+        if (
+            local_today is not None
+            and newest is not None
+            and newest > local_today
+            and _heal_cooldown_ok(current_user.id)
+        ):
+            try:
+                from app.db.database import async_session_maker as _heal_sm
+                from app.services.day_chat_rebucket import rebucket_user_days
+                async with _heal_sm() as _hdb:
+                    res = await rebucket_user_days(
+                        _hdb, current_user.id, user_tz, scope='future',
+                    )
+                logger.warning(
+                    "[DAY-CHATS-HEAL] outcome=%s user=%s msgs=%d convs=%d cbls=%d "
+                    "created=%d deleted=%d retained=%d errors=%s",
+                    "rebucketed" if res.changed else "noop",
+                    current_user.id[:8], res.moved_messages, res.moved_conversations,
+                    res.moved_cbls, len(res.days_created), len(res.days_deleted),
+                    len(res.days_retained), res.per_date_errors or "-",
                 )
-                day_chats = result.scalars().all()
-        except Exception as _heal_err:
-            logger.warning("[day_chats] Self-healing failed: %s", _heal_err)
+                if res.changed:
+                    # The rows this request already read are stale now — the
+                    # repair happened on a different session.
+                    db.expire_all()
+                    day_chats = (await db.execute(query)).scalars().all()
+                    try:
+                        from app.services import health_signals as _hs_after
+                        await _hs_after.refresh_gauges(
+                            only="future_dated_day_chats", force=True,
+                        )
+                    except Exception:
+                        pass
+            except Exception as _heal_err:
+                # The request session was never handed to the rebucket, so it
+                # is still usable: log the exception CLASS and serve the day
+                # index unhealed rather than 500'ing it.
+                logger.warning(
+                    "[DAY-CHATS-HEAL] outcome=failed user=%s reason=%s: %s",
+                    current_user.id[:8], type(_heal_err).__name__, _heal_err,
+                )
+
 
     # TODO: collapse to single GROUP BY query — currently N+1 (one channel query
     # per day chat). For 90 days that's 91 queries. Fix when telemetry shows it matters.
@@ -614,13 +854,18 @@ async def list_day_chats(
         # Get distinct channels from MESSAGES (not Conversations) — because Telegram
         # sessions are long-lived and their Conversation.day_chat_id may point to a
         # different day. Message.day_chat_id is canonical for day membership.
+        # `.distinct()` on the SELECT, not `distinct(<expr>)` around a function:
+        # the ORM cannot locate `DISTINCT coalesce(...)` as a result column on
+        # Postgres and answers NoSuchColumnError — which on this route is a
+        # 500 for every tenant. Caught by the Postgres lane, invisible on SQLite.
         ch_result = await db.execute(
-            select(distinct(Conversation.channel))
+            select(func.coalesce(Message.channel, Conversation.channel).label("ch"))
             .select_from(Message)
             .join(Conversation, Message.conversation_id == Conversation.id)
             .where(Message.day_chat_id == dc.id)
+            .distinct()
         )
-        channels = sorted([r[0] for r in ch_result.all() if r[0]])
+        channels = sorted({r[0] for r in ch_result.all() if r[0]})
 
         # Count from messages table (canonical), not from DayChat.message_count (cached, can drift)
         msg_count_result = await db.execute(
@@ -672,7 +917,7 @@ async def get_day_chat_messages(
                 proxy[0], proxy[1], f"{date_str}/messages", {"limit": limit},
             )
         except AgentSaidNo as e:
-            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            raise _agent_4xx(e)
         except AgentUnreachable as e:
             raise _unreachable(e)
         return JSONResponse(content=data)
@@ -757,7 +1002,12 @@ async def get_day_chat_messages(
         msgs_result = await db.execute(
             select(Message)
             .where(Message.conversation_id.in_(session_ids))
-            .order_by(Message.created_at.asc())
+            # (created_at, id) — the tiebreaker `day_context_loader` already
+            # has. Two rows sharing a timestamp (a presave user row and a
+            # same-millisecond assistant row, or two channels' rows) came back
+            # in a different order on two fetches, and in a different order
+            # than the model saw.
+            .order_by(Message.created_at.asc(), Message.id.asc())
             .limit(limit)
         )
         messages = msgs_result.scalars().all()
@@ -775,7 +1025,7 @@ async def get_day_chat_messages(
                 "role": m.role,
                 "content": public_text(m.role, m.content),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
-                "channel": channel_map.get(m.conversation_id, "web"),
+                "channel": _row_channel(m, channel_map.get(m.conversation_id)),
                 "conversation_id": m.conversation_id,
                 "attachments": _serialize_attachments(m),
                 "media": _serialize_media(m),
@@ -840,7 +1090,12 @@ async def get_day_chat_messages(
                 # channel='routine', not this one.
                 Conversation.channel.notin_(HIDDEN_DAY_CHANNELS),
             )
-            .order_by(Message.created_at.asc())
+            # (created_at, id) — the tiebreaker `day_context_loader` already
+            # has. Two rows sharing a timestamp (a presave user row and a
+            # same-millisecond assistant row, or two channels' rows) came back
+            # in a different order on two fetches, and in a different order
+            # than the model saw.
+            .order_by(Message.created_at.asc(), Message.id.asc())
             .limit(limit)
         )
         rows = msgs_result.all()
@@ -868,7 +1123,7 @@ async def get_day_chat_messages(
             "role": msg.role,
             "content": public_text(msg.role, msg.content),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
-            "channel": channel or "web",
+            "channel": _row_channel(msg, channel),
             "conversation_id": msg.conversation_id,
             "attachments": _serialize_attachments(msg),
             "media": _serialize_media(msg),
@@ -917,7 +1172,7 @@ async def resolve_app_conversation(
         try:
             data = await _proxy_day_chats(proxy[0], proxy[1], f"app-conversation/{app_id}")
         except AgentSaidNo as e:
-            raise HTTPException(status_code=e.status, detail=e.body or "Agent declined")
+            raise _agent_4xx(e)
         except AgentUnreachable as e:
             raise _unreachable(e)
         return JSONResponse(content=data)

@@ -199,6 +199,15 @@ _subagent_manager = None
 _skill_loader = None
 _cron_service = None
 
+# WhatsApp restart serialization. Three fire-and-forget producers call
+# `restart_whatsapp_channel` (channel_init's wake, tunnel_client's every
+# config_update, the blue-green promote) and the old body's registry
+# read-modify-write straddled a 20 s `await ch.start()` — two concurrent
+# calls each saw an empty slot and both built a channel.
+_wa_restart_lock = None
+_wa_restart_waiting: int = 0
+_wa_config_fingerprint = None
+
 
 async def restart_telegram_bot():
     """Hot-restart the Telegram bot with a new token from settings.
@@ -275,12 +284,79 @@ def is_passive_boot() -> bool:
         return False
 
 
-async def restart_whatsapp_channel():
+def _wa_lock() -> asyncio.Lock:
+    """Lazily build the restart lock INSIDE the running loop.
+
+    An `asyncio.Lock()` constructed at import time binds to whatever loop
+    was current then; under uvicorn that is not the serving loop and the
+    lock silently never contends.
+    """
+    global _wa_restart_lock
+    if _wa_restart_lock is None:
+        _wa_restart_lock = asyncio.Lock()
+    return _wa_restart_lock
+
+
+def _whatsapp_adapter_to_stop(module_adapter):
+    """The WhatsApp adapter shutdown must stop: the module global when the
+    boot path set it, else whatever the registry holds (the deferred paths
+    register without touching the global)."""
+    if module_adapter is not None:
+        return module_adapter
+    try:
+        from app.agent.channels.registry import ChannelRegistry as _CR_stop
+        from app.agent.channels.base import ChannelType as _CT_stop
+        return _CR_stop.get(_CT_stop.WHATSAPP)
+    except Exception:
+        return None
+
+
+async def restart_whatsapp_channel(force: bool = False, register_app=None):
     """Hot-restart the WhatsApp channel after config sync.
 
     Called by tunnel_client when whatsapp_mode / allowlist / cloud-API
-    creds change. Stops the existing channel (if any), then re-runs the
-    same selection logic main() uses at boot to pick the right adapter.
+    creds change, by channel_init's wake on /admin/bind, by the
+    blue-green promote path, and by the lifespan boot. Every one of them
+    is fire-and-forget, so this wrapper is the serialization point:
+    without it two concurrent calls each read an empty registry slot,
+    each spawn a sidecar, and the loser's sidecar dies on EADDRINUSE
+    while its adapter attaches a SECOND SSE stream to the winner's.
+
+    `force=True` skips the config fingerprint (the promote path and the
+    lifespan boot genuinely must start a channel). `register_app` is the
+    FastAPI app, passed only by the boot path so a Cloud-API channel can
+    register its webhook routes once.
+    """
+    global _wa_restart_waiting
+    lock = _wa_lock()
+    if lock.locked() and _wa_restart_waiting > 0:
+        # A burst of config_updates would otherwise kill and re-spawn the
+        # sidecar once per update, serially. One restart runs, ONE more is
+        # queued behind it (it will see the newest config), the rest fold
+        # into that one. A count rather than a flag: the runner's `finally`
+        # used to clear a flag the NEXT waiter had set, so a fourth caller
+        # queued a redundant third restart.
+        logging.info("[RESTART] whatsapp restart already queued — coalescing")
+        return
+    _wa_restart_waiting += 1
+    acquired = False
+    try:
+        async with lock:
+            acquired = True
+            _wa_restart_waiting -= 1
+            await _restart_whatsapp_locked(force=force, register_app=register_app)
+    finally:
+        if not acquired:
+            # Cancelled while waiting: this caller never ran and must not be
+            # counted as a queued restart forever.
+            _wa_restart_waiting = max(0, _wa_restart_waiting - 1)
+
+
+async def _restart_whatsapp_locked(force: bool = False, register_app=None):
+    """The actual restart. Only ever called with `_wa_lock()` held.
+
+    Stops the existing channel (if any), then re-runs the same selection
+    logic main() uses at boot to pick the right adapter.
 
     Without this, a tunnel-pushed config change writes the new mode to
     .env but the running process still has whichever channel main()
@@ -290,7 +366,7 @@ async def restart_whatsapp_channel():
     `BaileysWhatsAppChannel` was never instantiated. This function
     closes the gap.
     """
-    global _agent_runner
+    global _agent_runner, _wa_config_fingerprint
     from app.config import settings as _s
     from app.agent.channels.registry import ChannelRegistry
     from app.agent.channels.shared import make_channel_handler
@@ -299,22 +375,7 @@ async def restart_whatsapp_channel():
         logging.warning("[RESTART] Cannot start WhatsApp channel — agent_runner not initialized")
         return
 
-    # Tear down whichever WhatsApp adapter is currently registered. Both
-    # cloud-API and QR-link extend BaseChannel(WHATSAPP), so the
-    # registry slot is the same.
     from app.agent.channels.base import ChannelType as _CT
-    existing = ChannelRegistry.get(_CT.WHATSAPP)
-    if existing is not None:
-        try:
-            await existing.stop()
-            print("🛑 WhatsApp channel stopped (config changed)")
-        except Exception as e:
-            logging.warning(f"[RESTART] WhatsApp stop error: {e}")
-        # Unregister so the next register() doesn't log a "replacing" warning.
-        try:
-            ChannelRegistry._channels.pop(_CT.WHATSAPP, None)
-        except Exception:
-            pass
 
     _wa_mode = (_s.whatsapp_mode or "").strip().lower()
     if not _wa_mode:
@@ -323,19 +384,103 @@ async def restart_whatsapp_channel():
         else:
             _wa_mode = "qr_link"
 
+    _allowlist = [
+        s.strip() for s in (_s.whatsapp_baileys_allowlist or "").split(",")
+        if s.strip()
+    ]
+    fp = (
+        _wa_mode,
+        frozenset(_allowlist),
+        _s.whatsapp_phone_number_id or "",
+        bool(_s.whatsapp_access_token),
+    )
+
+    # Both cloud-API and QR-link extend BaseChannel(WHATSAPP), so there is
+    # one registry slot to read and one to replace.
+    existing = ChannelRegistry.get(_CT.WHATSAPP)
+
+    # An unchanged config over a healthy adapter is a NO-OP. Every routine
+    # config push used to kill and re-spawn a working Baileys session,
+    # which is the churn that opened the duplication window in the first
+    # place (and tunnel_client's comment claimed this guarantee for a year
+    # without it existing).
+    if not force and existing is not None and fp == _wa_config_fingerprint:
+        _health_fn = getattr(existing, "health", None)
+        if _health_fn is None:
+            # No health() at all (a bare BaseChannel adapter): it was
+            # registered only because start() returned True, so it is
+            # started by construction.
+            _h = {"started": True}
+        else:
+            try:
+                _h = _health_fn()
+            except Exception:
+                _h = {}
+        # `is_current` / `sidecar_alive` / `adopted_sidecar` are absent on the
+        # Cloud API adapter, which has no generation and no child process: a
+        # registered, started one is by definition current and healthy. For
+        # Baileys, `started` only says the SSE task object is alive — the
+        # consumer loop swallows connection errors into a backoff forever —
+        # so a dead sidecar, or a stranger's sidecar we adopted and cannot
+        # restart or kill, must NOT take the no-op path: a config push is
+        # the only automatic recovery lever these states have.
+        if (
+            _h.get("started")
+            and _h.get("is_current", True)
+            and _h.get("sidecar_alive", True)
+            and not _h.get("adopted_sidecar", False)
+        ):
+            logging.info(
+                "[RESTART] whatsapp config unchanged and adapter healthy — no-op"
+            )
+            return
+        logging.warning(
+            "[RESTART] whatsapp config unchanged but adapter not healthy "
+            "(started=%s current=%s sidecar_alive=%s adopted=%s) — restarting",
+            _h.get("started"), _h.get("is_current", True),
+            _h.get("sidecar_alive", True), _h.get("adopted_sidecar", False),
+        )
+
+    if existing is not None:
+        try:
+            await existing.stop()
+            print("🛑 WhatsApp channel stopped (config changed)")
+        except Exception as e:
+            logging.warning(f"[RESTART] WhatsApp stop error: {e}")
+        # Clear the slot so the next register() is a first registration
+        # rather than a refused replace.
+        try:
+            ChannelRegistry.unregister(_CT.WHATSAPP)
+        except Exception:
+            pass
+
     try:
         if _wa_mode == "qr_link":
-            from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
-            _allowlist = [
-                s.strip() for s in (_s.whatsapp_baileys_allowlist or "").split(",")
-                if s.strip()
-            ]
-            ch = BaileysWhatsAppChannel(allowed_numbers=_allowlist)
+            from app.agent.channels.whatsapp_baileys import (
+                BaileysWhatsAppChannel,
+                bump_generation,
+            )
+            _gen = bump_generation()
+            ch = BaileysWhatsAppChannel(allowed_numbers=_allowlist, generation=_gen)
             ch.set_message_callback(
                 make_channel_handler(channel=ch, agent_runner=_agent_runner, user_id=_s.user_id)
             )
-            await ch.start()
+            _ok = await ch.start()
+            # The Cloud API adapter has no generation token; only Baileys does.
+            _is_current = getattr(ch, "is_current", None)
+            _current = _is_current() if callable(_is_current) else True
+            if not _ok or not _current:
+                # start() has five early returns that do not raise. A
+                # channel registered after one of them answers every
+                # outbound send with `send.no_session` and drops it.
+                logging.error(
+                    "[RESTART] WhatsApp QR-link did not start (ok=%s current=%s) — "
+                    "leaving the registry slot empty",
+                    _ok, _current,
+                )
+                return
             ChannelRegistry.register(ch)
+            _wa_config_fingerprint = fp
             print("📱 WhatsApp channel restarted (QR-link / Baileys sidecar)")
         elif _wa_mode == "cloud_api" and _s.whatsapp_phone_number_id and _s.whatsapp_access_token:
             from app.agent.channels.whatsapp_channel import WhatsAppChannel
@@ -349,8 +494,11 @@ async def restart_whatsapp_channel():
             ch.set_message_callback(
                 make_channel_handler(channel=ch, agent_runner=_agent_runner, user_id=_s.user_id)
             )
+            if register_app is not None:
+                ch.register_routes(register_app)
             await ch.start()
             ChannelRegistry.register(ch)
+            _wa_config_fingerprint = fp
             print("📱 WhatsApp channel restarted (Cloud API)")
     except Exception as e:
         logging.exception(f"[RESTART] Failed to start WhatsApp channel: {e}")
@@ -1497,57 +1645,36 @@ async def lifespan(app: FastAPI):
         else:
             _wa_mode = "qr_link"
 
-    if _wa_mode == "qr_link" and not _bg_passive_active:
-        try:
-            from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
-            from app.agent.channels.registry import ChannelRegistry
-            from app.agent.channels.shared import make_channel_handler
-            _allowlist = [
-                s.strip() for s in (settings.whatsapp_baileys_allowlist or "").split(",")
-                if s.strip()
-            ]
-            whatsapp_channel = BaileysWhatsAppChannel(allowed_numbers=_allowlist)
-            whatsapp_channel.set_message_callback(
-                make_channel_handler(
-                    channel=whatsapp_channel,
-                    agent_runner=agent_runner,
-                    user_id=settings.user_id,
-                )
-            )
-            await whatsapp_channel.start()
-            ChannelRegistry.register(whatsapp_channel)
-            print("📱 WhatsApp channel started (QR-link / Baileys sidecar)")
-        except Exception as e:
-            print(f"⚠️ WhatsApp QR-link error: {e}")
+    # A lobby-mode spare has `settings.user_id == ''` and an empty
+    # allowlist: the channel it would start can only drop every inbound
+    # at the ACL gate while holding an SSE listener and the sidecar's
+    # port. /admin/bind's `wake_lazy_channels` is the correct start point
+    # for a pool container. Legacy env-mode tenants have
+    # TOUP_POOL_GENERIC unset, so this gate is False for them.
+    _wa_lobby_hold = (
+        runtime_identity.is_pool_generic() and not runtime_identity.is_bound()
+    )
+
+    if _wa_lobby_hold:
+        print("📱 [LOBBY] WhatsApp deferred until /admin/bind")
     elif _wa_mode == "qr_link" and _bg_passive_active:
         # Baileys' /app/workspace/.whatsapp_auth/ would contend with the
         # still-running old container's auth state. Defer to post-promote.
         print("📱 [BG_PASSIVE] WhatsApp Baileys deferred to post-promote phase")
-    elif _wa_mode == "cloud_api" and settings.whatsapp_phone_number_id and settings.whatsapp_access_token:
+    else:
+        # Boot through the same serialized path every other producer
+        # takes, so a bind or a config push landing during boot cannot
+        # race this into a second sidecar.
         try:
-            from app.agent.channels.whatsapp_channel import WhatsAppChannel
-            from app.agent.channels.registry import ChannelRegistry
-            from app.agent.channels.shared import make_channel_handler
-            whatsapp_channel = WhatsAppChannel(
-                phone_number_id=settings.whatsapp_phone_number_id,
-                access_token=settings.whatsapp_access_token,
-                verify_token=settings.whatsapp_verify_token,
-                app_secret=settings.whatsapp_app_secret,
-                allowed_numbers=settings.whatsapp_allowed_numbers or None,
-            )
-            whatsapp_channel.set_message_callback(
-                make_channel_handler(
-                    channel=whatsapp_channel,
-                    agent_runner=agent_runner,
-                    user_id=settings.user_id,
-                )
-            )
-            whatsapp_channel.register_routes(app)
-            await whatsapp_channel.start()
-            ChannelRegistry.register(whatsapp_channel)
-            print("📱 WhatsApp channel started (Cloud API)")
+            await restart_whatsapp_channel(force=True, register_app=app)
         except Exception as e:
-            print(f"⚠️ WhatsApp Cloud API error: {e}")
+            print(f"⚠️ WhatsApp start error: {e}")
+        try:
+            from app.agent.channels.registry import ChannelRegistry as _CR_boot
+            from app.agent.channels.base import ChannelType as _CT_boot
+            whatsapp_channel = _CR_boot.get(_CT_boot.WHATSAPP)
+        except Exception:
+            whatsapp_channel = None
 
     # ── Platform Tunnel (connect terminal agent to toup.ai) ──
     tunnel_client = None
@@ -1744,14 +1871,22 @@ async def lifespan(app: FastAPI):
     # launch in a fresh container builds its profile from nothing and was
     # eating the app-build smoke budget ("couldn't open it — page never
     # settled" on a healthy install). Fire-and-forget; never delays ready.
+    #
+    # BOUND CONTAINERS ONLY. The warm browser stays resident for the life of
+    # the process, so an unclaimed lobby spare held ~104 MiB PSS for a build
+    # that cannot be requested: ~11 of them on the 2026-09-12 host, which was
+    # carrying 672 Brave processes at load 21 on 16 vCPU. `/admin/bind` warms
+    # a claimed container instead — see `browser_warm_boot_allowed`.
     try:
-        from app.agent.skills.builtins.app_html.verify import warm_browser as _warm_browser
+        from app.agent.skills.builtins.app_html.verify import (
+            browser_warm_boot_allowed as _warm_allowed,
+            schedule_warm_browser as _schedule_warm,
+        )
 
-        async def _warm_and_log():
-            ok = await _warm_browser()
-            print(f"🌡️ Verify browser warm-up: {'ok' if ok else 'unavailable'}")
-
-        asyncio.create_task(_warm_and_log())
+        if _warm_allowed(bound=runtime_identity.is_bound()):
+            _schedule_warm("boot")
+        else:
+            print("🌡️ Verify browser warm-up deferred: unbound container")
     except Exception as _we:  # noqa: BLE001 — warmth is best-effort
         print(f"⚠️ Browser warm-up not scheduled: {_we}")
 
@@ -1796,7 +1931,9 @@ async def lifespan(app: FastAPI):
                 # the channel boots with the current settings snapshot.
                 try:
                     if (settings.whatsapp_mode or "").strip().lower() == "qr_link":
-                        await restart_whatsapp_channel()
+                        # force: the passive slot deliberately skipped the
+                        # boot start, so the fingerprint is stale-but-equal.
+                        await restart_whatsapp_channel(force=True)
                         print("🟢 [BG_PROMOTE] WhatsApp Baileys started")
                 except Exception as e:
                     logger.warning(
@@ -1958,10 +2095,16 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
+    # The WhatsApp adapter is owned by the registry on the deferred paths
+    # (lobby container bound later, tunnel config push, blue-green promote):
+    # `whatsapp_channel` stays None there, and a shutdown that only read the
+    # module global left a live sidecar behind — the port-owned-by-stranger
+    # start the next process then had to adopt.
+    _wa_to_stop = _whatsapp_adapter_to_stop(whatsapp_channel)
     for ch_name, ch_obj in [
         ("Discord", discord_channel),
         ("Slack", slack_channel),
-        ("WhatsApp", whatsapp_channel),
+        ("WhatsApp", _wa_to_stop),
     ]:
         if ch_obj:
             try:
@@ -2256,10 +2399,26 @@ async def agent_health():
         except Exception:
             pass
 
-        _baileys = _wa_baileys()
+        # `_active_channel` (the module global `_wa_baileys()` reads) and
+        # the registry are two different notions of "live" and they can
+        # disagree — the registry is what routes outbound, so report that
+        # one and say out loud when the two differ.
+        _reg = None
+        try:
+            from app.agent.channels.registry import ChannelRegistry as _CR_h
+            from app.agent.channels.base import ChannelType as _CT_h
+            _reg = _CR_h.get(_CT_h.WHATSAPP)
+        except Exception:
+            _reg = None
+
+        from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel as _BWA_h
+
+        _active = _wa_baileys()
+        _baileys = _reg if isinstance(_reg, _BWA_h) else _active
         if _baileys is not None:
             whatsapp_status = _baileys.health()
             whatsapp_status["qr_supported"] = _qr_supported
+            whatsapp_status["registry_matches_active"] = (_reg is _active)
         else:
             _cloud = _wa_cloud()
             if _cloud is not None:
@@ -2279,6 +2438,28 @@ async def agent_health():
                 }
     except Exception:
         whatsapp_status = {"configured": False, "started": False, "qr_supported": False}
+
+    # Process-lifetime counters (ints only, never ids or text). The key is
+    # OMITTED on an image without the module so container_monitor can tell
+    # "this build has no counters" from "this build reports zero".
+    try:
+        from app.services.health_signals import (
+            refresh_gauges as _hs_refresh,
+            snapshot as _hs_snapshot,
+        )
+        # Gauges (the future-dated-day count) are re-measured here when their
+        # TTL has lapsed, so the platform's reading is never older than the
+        # TTL even for a tenant whose own clients never open the day index —
+        # the WhatsApp-only user of the 2026-09-14 incident. Bounded: the
+        # monitor's probe has a 10 s budget and a slow tenant DB must cost a
+        # stale gauge, never a false "down".
+        try:
+            await asyncio.wait_for(_hs_refresh(), timeout=2.0)
+        except Exception:
+            pass
+        _health_signals = _hs_snapshot()
+    except Exception:
+        _health_signals = None
 
     # Pool-bind state — lets the platform distinguish a GENERIC, not-yet-bound
     # warm container (which still reports boot_progress.ready=true) from one
@@ -2401,6 +2582,7 @@ async def agent_health():
             "slack": "enabled" if settings.slack_bot_token else "disabled",
             "whatsapp": whatsapp_status,
         },
+        **({"health_signals": _health_signals} if _health_signals is not None else {}),
     }
 
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -161,10 +162,38 @@ def write_runtime(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict) or not payload.get("user_id"):
         raise ValueError("write_runtime: payload missing user_id")
     RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = RUNTIME_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, RUNTIME_PATH)
+    # The temp file is UNIQUE per write. It used to be a fixed
+    # `runtime.json.tmp`, which two writers share: `write_text` opens with
+    # O_TRUNC, so there is a window in which that file is EMPTY, and another
+    # writer's `os.replace` landing inside it renames an empty file over
+    # runtime.json. `_load_from_disk` then soft-fails to None, `is_bound()`
+    # goes False, and LobbyAndDrainMiddleware 503s every route on a container
+    # that still looks healthy.
+    #
+    # Not reachable today, and that is worth stating precisely rather than
+    # overselling the fix: `admin_bind` is `async def`, this is its only
+    # caller in the backend, it is called synchronously (not through a thread
+    # pool), there is no `await` between the write and the rename, and the
+    # container runs ONE uvicorn worker — so two concurrent binds cannot
+    # interleave here. The fix is for the day one of those stops being true
+    # (a second worker, a thread, a second writer), because the cost is a
+    # `mkstemp` and the failure mode is a wedged tenant.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(RUNTIME_PATH.parent), prefix=".runtime.", suffix=".json.tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, sort_keys=True, indent=2)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, RUNTIME_PATH)
+    except BaseException:
+        # Never leave a partial temp behind — this directory is read by an
+        # operator looking for exactly one file.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     reload()
 
 

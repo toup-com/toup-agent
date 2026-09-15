@@ -6,6 +6,7 @@ Exports:
   users_router    — user & invite management (closed beta)
   invite_router   — public invite validation & signup (no auth)
   search_usage_router — per-user search-gateway usage rollups
+  billing_router  — the UNLIMITED admin override (grant / list / revoke)
   dispatch_router — operator → user announcements + the Admin threads
   set_bot_refs    — wire Telegram bot into the system dashboard
   require_admin   — FastAPI dependency for admin-only endpoints
@@ -18,6 +19,7 @@ from app.api.admin.rollouts import router as rollouts_router
 from app.api.admin.provider_apps import router as provider_apps_router
 from app.api.admin.live_activity import router as live_activity_debug_router
 from app.api.admin.search_usage import router as search_usage_router
+from app.api.admin.billing import router as billing_router
 from app.api.admin.deps import require_admin
 
 # Dispatch carries its own tables (admin_dispatches, admin_dispatch_targets,
@@ -44,6 +46,7 @@ __all__ = [
     "provider_apps_router",
     "live_activity_debug_router",
     "search_usage_router",
+    "billing_router",
     "dispatch_router",
     "set_bot_refs",
     "require_admin",

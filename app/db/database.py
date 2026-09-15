@@ -14,6 +14,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, AsyncEngin
 from sqlalchemy.pool import StaticPool, NullPool
 from app.config import settings
 from app.db.models import Base
+# Leaf module, no app imports of its own — the Unlimited plan's numbers live
+# in exactly one place so this seed and alembic 104 cannot drift.
+from app.db import plan_catalog as _PC
 
 logger = logging.getLogger(__name__)
 
@@ -1227,12 +1230,22 @@ async def init_db():
         # exercise the credit system silently 500 because the test
         # fixture never seeds plans.
         #
-        # Free-tier numbers reflect alembic 059 (post-bump):
-        # 100 msg / 500 int / 15 day-cap (was 30/120/5 from mig 053).
+        # Free-tier numbers reflect alembic 059 (post-bump) with the
+        # 2026-08-29 daily-cap removal: 100 msg / 500 int / NO day-cap.
         # On Postgres production, mig 059's UPDATE is authoritative for
         # the existing row; this seed only fires on fresh DBs (CI test
         # fixture, brand-new tenant Postgres) where DO NOTHING is a
         # no-op once any row exists.
+        #
+        # ⚠️ The daily cap is NULL, not 15, and that is the whole point of
+        # this line. Production has been NULL on all 5 plan rows and all
+        # 84 balance rows since the 2026-08-29 cap removal, but this seed
+        # kept writing 15 — so a fresh environment, a rebuilt DB or a new
+        # tenant silently reimposed a cap that a single gpt-5.5 turn
+        # (26–28 credits quoted) can never satisfy. That is the exact
+        # configuration behind the 2026-08-03 incident, and "free stays
+        # exactly as-is" means as-is IN PRODUCTION. Alembic 102 converges
+        # any environment that already ran 053 + 059.
         #
         # rollover_message_credits / rollover_integration_credits / active
         # are BOOLEAN columns. Use `false`/`true` literals — Postgres
@@ -1244,7 +1257,7 @@ async def init_db():
              integration_credits_monthly, message_credits_daily_cap,
              rollover_message_credits, rollover_integration_credits,
              rollover_max_pct, sort_order, active, created_at)
-           VALUES ('free', 'Free', 0, 100, 500, 15, false, false, 0, 0, true,
+           VALUES ('free', 'Free', 0, 100, 500, NULL, false, false, 0, 0, true,
                    CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
         """INSERT INTO subscription_plans
@@ -1278,6 +1291,39 @@ async def init_db():
              rollover_max_pct, sort_order, active, created_at)
            VALUES ('elite', 'Elite', 16000, 1500, 60000, NULL, true, true, 50,
                    40, true, CURRENT_TIMESTAMP)
+           ON CONFLICT (id) DO NOTHING""",
+        # ── Unlimited (alembic 104) ──────────────────────────────────
+        # The one plan sold from the cutover on. Its numbers come from
+        # app.db.plan_catalog so this seed, alembic 104 and the product
+        # map cannot drift — the price in particular is ONE constant with
+        # a TODO on it, because it must equal the App Store Connect price
+        # exactly. sort_order 5 puts it right after Free and ahead of the
+        # legacy tiers (10/20/30/40), so once those are active=false it is
+        # the only paid row and nothing that orders by sort_order can list
+        # it below a retired tier.
+        # active=false, matching alembic 104 — see the long note there. The
+        # short version: `active` has one reader, the PUBLIC pricing
+        # catalogue, and merchandising Unlimited is an operator step after
+        # the app build ships, not something a fresh environment does by
+        # existing.
+        #
+        # Only the NUMBERS are interpolated. The two string values are plain
+        # literals: every other row in this list is, the alembic twin uses
+        # bound parameters, and an interpolated display name would break this
+        # statement outright the day the tier is renamed to something with an
+        # apostrophe — at boot, on a path whose own comment explains that each
+        # statement runs in its own transaction so a failure passes quietly.
+        f"""INSERT INTO subscription_plans
+            (id, display_name, price_cents, message_credits_monthly,
+             integration_credits_monthly, message_credits_daily_cap,
+             rollover_message_credits, rollover_integration_credits,
+             rollover_max_pct, sort_order, active, created_at)
+           VALUES ('unlimited', 'Unlimited',
+                   {_PC.UNLIMITED_PRICE_CENTS},
+                   {_PC.UNLIMITED_MESSAGE_CREDITS_MONTHLY},
+                   {_PC.UNLIMITED_INTEGRATION_CREDITS_MONTHLY},
+                   NULL, false, false, 0, {_PC.UNLIMITED_SORT_ORDER}, false,
+                   CURRENT_TIMESTAMP)
            ON CONFLICT (id) DO NOTHING""",
     ]
     # Each migration statement runs in its OWN transaction so a failure

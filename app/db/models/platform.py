@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List
 import uuid
 
 from sqlalchemy import (
-    String, Text, DateTime, Float, Integer, Boolean, ForeignKey, Index, Numeric,
+    String, Text, DateTime, Float, Integer, BigInteger, Boolean, ForeignKey, Index, Numeric,
     JSON, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -471,4 +471,100 @@ class ProductEvent(Base):
         # every index and this table takes one row per RECIPIENT of a
         # broadcast; the only query that would want it is age-based pruning,
         # which is an occasional ops action that can afford a scan.
+    )
+
+
+class InfraLease(Base):
+    """One row per fleet-wide singleton loop — the lease that says which
+    replica may run it this tick.
+
+    Why a lease row and not `pg_advisory_lock` (2026-09-12 onboarding
+    incident, L3 §11.1): a session-scoped advisory lock is bound to a
+    CONNECTION, and this platform talks to Postgres through a transaction
+    pooler where the connection under a session is not stable — a lock you
+    cannot reliably release. `pg_advisory_xact_lock` IS safe there and is
+    the right tool for the short per-user critical sections `pool_service`
+    already guards, but holding one for the length of a 15-60 s reconciler
+    tick means holding an open transaction (and therefore a pooler
+    connection) for that whole tick, invisibly.
+
+    A row is cheap, needs no new infrastructure, is claimed and renewed in
+    ONE statement (no long transaction), hands over by TTL expiry when a
+    holder dies, and — the part no lock gives you — is QUERYABLE: "which
+    replica has been running the reconciler, and for how many ticks" becomes
+    an operator question with an answer.
+    """
+    __tablename__ = "infra_leases"
+
+    # The loop's name: 'container_reconciler', 'container_monitor', …
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # RAILWAY_REPLICA_ID when Railway provides one, else a per-process uuid.
+    holder: Mapped[str] = mapped_column(String(80), nullable=False)
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Bumped on every successful acquire/renew. The operator's "how long has
+    # this replica been the runner" without a second table.
+    tick_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+
+class AgentProbeState(Base):
+    """Per-tenant state for the authenticated reconciliation sweep.
+
+    This was two module-level dicts (`_PROBE_STRIKES`, `_KEYLESS_NAMED_TICKS`)
+    and the 2026-09-12 incident is what per-process state costs (L3-11, L3
+    §11.3):
+
+      * "two CONSECUTIVE sick ticks before a restart" was really "two ticks on
+        EITHER replica", so a genuinely sick container restarted at double the
+        intended rate;
+      * every Railway redeploy reset the safety state, so no cap could ever be
+        reached across a deploy;
+      * and the one number an operator needed — "f261b564: 46th consecutive
+        401 tick, 0 successful probes since 19:12" — existed in one process's
+        memory and in no query.
+
+    Deliberately NOT a FK cascade target with a relationship: this row is
+    safety state ABOUT a user, written by a background loop, and it must
+    survive anything that rewrites the container/config rows it describes.
+    It is keyed on user_id and cleared on a 200.
+    """
+    __tablename__ = "agent_probe_state"
+
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True,
+    )
+    # Consecutive non-200 sweeps. Cleared on a 200. THE convergence counter:
+    # the number the alert must carry.
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+    )
+    # '200' | '401' | '4xx' | '5xx' | 'transport'
+    last_class: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Restarts issued inside the current window (see restart_window_started_at).
+    restarts_in_window: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+    )
+    restart_window_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
+    # When this failure streak began — "since 19:12", the other half of the
+    # sentence an operator can act on.
+    first_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
+    # Set once the subject has been escalated to a critical page, so the
+    # escalation is announced once rather than every tick forever.
+    escalated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, default=datetime.utcnow, onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        # The dashboard that did not exist: SELECT * FROM agent_probe_state
+        # WHERE consecutive_failures > 3.
+        Index("ix_agent_probe_state_failures", "consecutive_failures"),
     )

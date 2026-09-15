@@ -91,7 +91,14 @@ _FULL_SECTIONS: tuple[str, ...] = (
     "doc_generation",    # Document generation (flag-gated)
     "media",             # Media playback (web/app only)
     "runtime",           # WHEN/WHERE
-    "vibecoding",        # Vibe coding mode override
+    "vibecoding",        # Vibe coding mode override (flag-off path only
+                         # once CHANNEL_ENVELOPE is on — see
+                         # surface_contracts below)
+    "surface_contracts", # W-A3: every long per-surface contract (voice,
+                         # extension, vibecoding), always present and each
+                         # scoped by the <runtime_envelope> Contract line.
+                         # A key missing from this tuple is built and then
+                         # SILENTLY DROPPED by the assembly filter.
     "automation_session",  # R29: automation session-thread context —
                            # only present when the turn is addressed
                            # to an automation's thread

@@ -175,14 +175,28 @@ async def test_try_charge_denies_when_enforced_and_insufficient(credit_user, mon
 
 
 async def test_try_charge_daily_cap_enforced(credit_user, monkeypatch):
-    """Free tier daily_cap = 15 (post-mig-059) → spending 16 in one day is denied."""
+    """A balance carrying daily_cap = 15 → spending 15.5 in one day is denied.
+
+    The cap is stamped on the BALANCE here rather than inherited from the free
+    plan row. Production has had no daily cap on any plan or any balance since
+    the 2026-08-29 removal, and alembic 104 corrected ``database.py``'s seed
+    (which still wrote 15) to match — so a test that leaned on the seed was
+    exercising a configuration that does not exist anywhere real. The cap
+    MACHINERY still has to work the day someone turns a cap back on, which is
+    what this asserts.
+    """
     from app.config import settings
-    from app.db import async_session_maker
+    from app.db import async_session_maker, CreditBalance
     from app.db.models import LEDGER_CHAT_MESSAGE
     from app.services.credit_service import (
         BUCKET_MESSAGE, REASON_DAILY_CAP_EXCEEDED, credit_service,
     )
     monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+
+    async with async_session_maker() as db:
+        bal = await db.get(CreditBalance, credit_user)
+        bal.message_credits_daily_cap = Decimal("15")
+        await db.commit()
 
     async with async_session_maker() as db:
         await credit_service.try_charge(

@@ -223,14 +223,14 @@ class AutopilotHandler:
         try:
             from app.services.credit_reporter import (
                 _agent_key, _platform_endpoint, check_balance_remote,
-                raise_if_exhausted,
+                raise_if_exhausted_async,
             )
             from app.services.credit_exhausted import OutOfCreditsError
         except ImportError:  # pragma: no cover — stripped test envs
             return None
 
         try:
-            raise_if_exhausted()
+            await raise_if_exhausted_async()
         except OutOfCreditsError:
             return await self._transition(
                 routine, db, state, now, MISSION_BLOCKED, "insufficient_credits",

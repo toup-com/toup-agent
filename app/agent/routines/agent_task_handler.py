@@ -77,10 +77,10 @@ class AgentTaskHandler:
         # Credit pre-flight: skip cleanly when the user is out. See
         # email_briefing_handler.py for the rationale.
         try:
-            from app.services.credit_reporter import raise_if_exhausted
+            from app.services.credit_reporter import raise_if_exhausted_async
             from app.services.credit_exhausted import OutOfCreditsError
             try:
-                raise_if_exhausted()
+                await raise_if_exhausted_async()
             except OutOfCreditsError as _oce:
                 return RoutineResult(
                     status="skipped",

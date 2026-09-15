@@ -281,8 +281,8 @@ class OpenAIAgentService:
         # event. Cheap, no extra HTTP — relies on state updated by
         # the previous call's deduct response. The first call after a
         # cold start fail-opens; subsequent calls are gated.
-        from app.services.credit_reporter import raise_if_exhausted
-        raise_if_exhausted()
+        from app.services.credit_reporter import raise_if_exhausted_async
+        await raise_if_exhausted_async()
 
         # G1 (docs/audits/2026-08-g1-cost-and-latency.md): gpt-5.6-*
         # rejects /v1/chat/completions when function tools are present —

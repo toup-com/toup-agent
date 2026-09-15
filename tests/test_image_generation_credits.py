@@ -187,20 +187,32 @@ async def test_image_charge_idempotent(credit_user, monkeypatch):
 
 async def test_high_quality_image_exceeds_free_daily_cap_when_enforced(credit_user, monkeypatch):
     """DOCUMENTS a real interaction: a HIGH-quality image (gpt-image-2 → 21.1cr)
-    exceeds the free-tier 15-credit daily message cap, so with enforcement ON a
-    fresh free user is denied with daily_cap_exceeded and nothing is deducted.
+    exceeds a 15-credit daily message cap, so with enforcement ON and a cap in
+    force the user is denied with daily_cap_exceeded and nothing is deducted.
 
     This is why image pricing/quality is config-tunable (settings.image_gen_*)
-    — operators can lower the default quality, raise the free daily cap, or
-    rely on purchased (IAP) credits, which bypass the cap.
+    — operators can lower the default quality, raise the daily cap, or rely on
+    purchased (IAP) credits, which bypass the cap.
+
+    The cap is stamped on the BALANCE rather than inherited from the free plan:
+    production has had no daily cap on any plan since the 2026-08-29 removal,
+    and alembic 104 corrected database.py's seed (which still wrote 15) to
+    match. Today a high-quality image on the free tier is refused by the
+    monthly BALANCE, not by a daily cap — but the interaction documented here
+    returns the moment anyone reinstates one.
     """
     from app.config import settings
-    from app.db import async_session_maker
+    from app.db import async_session_maker, CreditBalance
     from app.db.models import LEDGER_IMAGE_GEN, BUCKET_MESSAGE
     from app.services.credit_service import (
         credit_service, REASON_DAILY_CAP_EXCEEDED,
     )
     monkeypatch.setattr(settings, "credit_enforcement_enabled", True, raising=False)
+
+    async with async_session_maker() as db:
+        bal = await db.get(CreditBalance, credit_user)
+        bal.message_credits_daily_cap = Decimal("15")
+        await db.commit()
 
     before = Decimal((await _balance(credit_user)).message_credits_remaining)
     async with async_session_maker() as db:

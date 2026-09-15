@@ -88,6 +88,12 @@ def test_full_profile_has_every_historic_section():
         "media",
         "runtime",
         "vibecoding",
+        "surface_contracts",   # W-A3 (incident 2026-09-14): every long
+                               # per-surface contract (voice, extension,
+                               # trigger, vibecoding), always present and
+                               # explicitly scoped so the cached prefix stops
+                               # forking on channel; rendered only under the
+                               # channel envelope
         "automation_session",  # R29: present only when the turn is
                                # addressed to an automation's session
                                # thread (agent_runner builds it from

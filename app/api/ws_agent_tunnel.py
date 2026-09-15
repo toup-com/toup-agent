@@ -23,8 +23,10 @@ Protocol:
 """
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
+import math
 import time
 import uuid
 from typing import Optional
@@ -38,10 +40,36 @@ router = APIRouter(tags=["Agent Tunnel"])
 # ── Active tunnel connections (user_id → TunnelConnection) ───────────
 _tunnels: dict[str, "TunnelConnection"] = {}
 
-# Pending tool call futures (call_id → asyncio.Future)
-_pending_calls: dict[str, asyncio.Future] = {}
+# This state is intentionally process-local. Railway replicas do not share a
+# tunnel map, so neither this module nor /agent/tunnel-status may claim a
+# global pending-call census.
+#
+# Pending calls are owned by the exact user AND tunnel instance that received
+# them.  A replacement connection for one tenant must not cancel another
+# tenant's future (or adopt the retiring connection's potentially-side-effecting
+# call).
+@dataclass(frozen=True)
+class PendingCall:
+    user_id: str
+    tunnel: "TunnelConnection"
+    future: asyncio.Future
+
+
+_pending_calls: dict[str, PendingCall] = {}
 
 TOOL_CALL_TIMEOUT = 120  # seconds — tools like exec/browser can take a while
+HTTP_FORWARD_MAX_TIMEOUT = 30.0
+TUNNEL_REPLACE_CLOSE_TIMEOUT = 2.0
+TUNNEL_CONTROL_SEND_TIMEOUT = 5.0
+TUNNEL_CONFIG_SYNC_TIMEOUT = 30.0
+
+
+class TunnelDisconnected(ConnectionError):
+    """The exact tunnel owning an already-dispatched call disconnected."""
+
+
+class HTTPForwardOutcomeUnknown(RuntimeError):
+    """A mutating HTTP request may have reached the agent; never replay it."""
 
 
 class TunnelConnection:
@@ -52,10 +80,153 @@ class TunnelConnection:
         self.ws = ws
         self.connected_at = time.time()
         self.last_pong = time.time()
+        self.accepting_calls = False
 
     @property
     def uptime(self) -> float:
         return time.time() - self.connected_at
+
+
+def _new_pending(user_id: str, tunnel: TunnelConnection) -> tuple[str, PendingCall]:
+    """Register one call before its first await, bound to this connection."""
+    call_id = str(uuid.uuid4())
+    pending = PendingCall(
+        user_id=user_id,
+        tunnel=tunnel,
+        future=asyncio.get_running_loop().create_future(),
+    )
+    _pending_calls[call_id] = pending
+    return call_id, pending
+
+
+def _discard_pending(call_id: str, pending: PendingCall) -> None:
+    """Remove only this registration and settle its future for clean teardown."""
+    if _pending_calls.get(call_id) is pending:
+        _pending_calls.pop(call_id, None)
+    if not pending.future.done():
+        pending.future.cancel()
+    elif not pending.future.cancelled():
+        # Retrieve a disconnect exception even when dispatch/send failed before
+        # the caller reached its future await. Results return None here.
+        pending.future.exception()
+
+
+def _resolve_pending(
+    tunnel: TunnelConnection, call_id: object, result: object,
+) -> bool:
+    """Accept a result only from the connection that received the call."""
+    if not isinstance(call_id, str):
+        return False
+    pending = _pending_calls.get(call_id)
+    if (
+        pending is None
+        or pending.tunnel is not tunnel
+        or pending.user_id != tunnel.user_id
+        or pending.future.done()
+    ):
+        return False
+    pending.future.set_result(result)
+    return True
+
+
+def _fail_pending_for_tunnel(tunnel: TunnelConnection) -> int:
+    """Fail only calls dispatched to this exact retiring connection."""
+    failed = 0
+    for pending in list(_pending_calls.values()):
+        if pending.tunnel is tunnel and not pending.future.done():
+            pending.future.set_exception(
+                TunnelDisconnected("owning agent tunnel disconnected after dispatch")
+            )
+            failed += 1
+    return failed
+
+
+def _local_pending_count(user_id: str) -> int:
+    """Test/diagnostic helper; deliberately not a cross-replica claim."""
+    return sum(
+        pending.user_id == user_id and not pending.future.done()
+        for pending in _pending_calls.values()
+    )
+
+
+async def _install_tunnel(tunnel: TunnelConnection) -> TunnelConnection | None:
+    """Publish replacement before closing old so old cleanup cannot erase new."""
+    old = _tunnels.get(tunnel.user_id)
+    _tunnels[tunnel.user_id] = tunnel
+    if old is not None and old is not tunnel:
+        old.accepting_calls = False
+        try:
+            await asyncio.wait_for(
+                old.ws.close(code=4000), timeout=TUNNEL_REPLACE_CLOSE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            # Publication precedes the bounded close. If this handler is
+            # cancelled in that window, do not leave its connection current.
+            _retire_tunnel(tunnel)
+            raise
+        except Exception:
+            pass
+    return old
+
+
+def _retire_tunnel(tunnel: TunnelConnection) -> int:
+    """Remove only a still-current tunnel, but always retire its own calls."""
+    tunnel.accepting_calls = False
+    if _tunnels.get(tunnel.user_id) is tunnel:
+        del _tunnels[tunnel.user_id]
+    return _fail_pending_for_tunnel(tunnel)
+
+
+def _http_forward_failed_after_dispatch(method: str) -> None:
+    """Permit direct fallback only for methods that are safe to replay."""
+    if method.upper() in {"GET", "HEAD"}:
+        return
+    raise HTTPForwardOutcomeUnknown(
+        "agent outcome unknown after tunnel dispatch; request was not replayed"
+    )
+
+
+def _reject_nonfinite_json_constant(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+def _validated_http_result(method: str, result: object) -> object | None:
+    """Return finite JSON only; invalid post-dispatch data is uncertainty."""
+    try:
+        parsed = (
+            json.loads(result, parse_constant=_reject_nonfinite_json_constant)
+            if isinstance(result, str)
+            else result
+        )
+        if parsed is None:
+            raise ValueError("null tunnel response")
+        # Native dict/list results bypass json.loads, so recursively reject
+        # NaN/Infinity and other values JSONResponse cannot safely encode.
+        json.dumps(parsed, allow_nan=False)
+    except (TypeError, ValueError):
+        _http_forward_failed_after_dispatch(method)
+        return None
+    return parsed
+
+
+async def _send_current_control(
+    tunnel: TunnelConnection, payload: dict[str, object],
+) -> bool:
+    """Send setup control or retire this exact tunnel on transport failure."""
+    if _tunnels.get(tunnel.user_id) is not tunnel:
+        _retire_tunnel(tunnel)
+        return False
+    try:
+        await asyncio.wait_for(
+            tunnel.ws.send_json(payload), timeout=TUNNEL_CONTROL_SEND_TIMEOUT,
+        )
+    except Exception:
+        _retire_tunnel(tunnel)
+        return False
+    if _tunnels.get(tunnel.user_id) is not tunnel:
+        _retire_tunnel(tunnel)
+        return False
+    return True
 
 
 def get_tunnel(user_id: str) -> Optional[TunnelConnection]:
@@ -63,9 +234,24 @@ def get_tunnel(user_id: str) -> Optional[TunnelConnection]:
     return _tunnels.get(user_id)
 
 
+def _get_ready_tunnel(user_id: str) -> Optional[TunnelConnection]:
+    tunnel = _tunnels.get(user_id)
+    if tunnel is None or not tunnel.accepting_calls:
+        return None
+    return tunnel
+
+
+def _mark_tunnel_ready(tunnel: TunnelConnection) -> bool:
+    """Admit calls only after setup, and only if still the current tunnel."""
+    if _tunnels.get(tunnel.user_id) is not tunnel:
+        return False
+    tunnel.accepting_calls = True
+    return True
+
+
 def is_agent_connected(user_id: str) -> bool:
     """Check if a user's terminal agent is connected."""
-    return user_id in _tunnels
+    return _get_ready_tunnel(user_id) is not None
 
 
 async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
@@ -76,39 +262,51 @@ async def send_tool_call(user_id: str, tool_name: str, arguments: dict) -> str:
 
     Returns the tool result string, or an error message.
     """
-    tunnel = _tunnels.get(user_id)
+    tunnel = _get_ready_tunnel(user_id)
     if not tunnel:
         return "ERROR: Terminal agent not connected. Run `toup run` in your terminal."
 
-    call_id = str(uuid.uuid4())
-    future: asyncio.Future = asyncio.get_event_loop().create_future()
-    _pending_calls[call_id] = future
+    call_id, pending = _new_pending(user_id, tunnel)
 
     try:
-        # Send tool call to agent (include user_id so VPS sets _current_user_id)
-        await tunnel.ws.send_json({
-            "type": "tool_call",
-            "id": call_id,
-            "tool_name": tool_name,
-            "arguments": arguments,
-            "user_id": user_id,
-        })
-        logger.info("[TUNNEL] Sent tool_call %s → agent %s", tool_name, user_id[:8])
-
-        # Wait for result with timeout
-        result = await asyncio.wait_for(future, timeout=TOOL_CALL_TIMEOUT)
+        # The single deadline covers both potentially-backpressured dispatch
+        # and the result wait. Entering send makes the outcome uncertain.
+        async with asyncio.timeout(float(TOOL_CALL_TIMEOUT)):
+            await tunnel.ws.send_json({
+                "type": "tool_call",
+                "id": call_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "user_id": user_id,
+            })
+            logger.info(
+                "[TUNNEL] Sent tool_call %s → agent %s",
+                tool_name,
+                user_id[:8],
+            )
+            result = await pending.future
         return result
 
     except asyncio.TimeoutError:
         logger.warning("[TUNNEL] Tool call %s timed out for %s", tool_name, user_id[:8])
-        return f"ERROR: Tool '{tool_name}' timed out after {TOOL_CALL_TIMEOUT}s"
-    except WebSocketDisconnect:
-        return "ERROR: Terminal agent disconnected during tool execution"
+        return (
+            f"ERROR: Tool '{tool_name}' outcome is unknown after the finite "
+            f"{TOOL_CALL_TIMEOUT}s tunnel timeout; do not retry automatically."
+        )
+    except (TunnelDisconnected, WebSocketDisconnect):
+        return (
+            f"ERROR: Tool '{tool_name}' tunnel disconnected after dispatch; "
+            "outcome is unknown, so do not retry automatically."
+        )
     except Exception as e:
         logger.exception("[TUNNEL] Tool call %s failed", tool_name)
-        return f"ERROR: {e}"
+        return (
+            f"ERROR: Tool '{tool_name}' dispatch failed with "
+            f"{type(e).__name__}; outcome is unknown, so do not retry "
+            "automatically."
+        )
     finally:
-        _pending_calls.pop(call_id, None)
+        _discard_pending(call_id, pending)
 
 
 async def send_http_forward(
@@ -120,35 +318,50 @@ async def send_http_forward(
     Used when the agent is behind NAT and can't be reached directly.
     Returns the parsed JSON response, or None on failure.
     """
-    tunnel = _tunnels.get(user_id)
+    tunnel = _get_ready_tunnel(user_id)
     if not tunnel:
         return None
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or not 0 < float(timeout) <= HTTP_FORWARD_MAX_TIMEOUT
+    ):
+        raise ValueError(
+            f"timeout must be finite and in (0, {HTTP_FORWARD_MAX_TIMEOUT}]"
+        )
 
-    call_id = str(uuid.uuid4())
-    future: asyncio.Future = asyncio.get_event_loop().create_future()
-    _pending_calls[call_id] = future
+    call_id, pending = _new_pending(user_id, tunnel)
 
     try:
-        await tunnel.ws.send_json({
-            "type": "http_forward",
-            "id": call_id,
-            "method": method,
-            "path": path,
-            "headers": headers or {},
-            "body": body,
-        })
-        result = await asyncio.wait_for(future, timeout=timeout)
-        if isinstance(result, str):
-            return json.loads(result)
-        return result
+        # One total deadline covers send backpressure plus response latency.
+        # Once send is entered a mutating request must never be replayed.
+        async with asyncio.timeout(float(timeout)):
+            await tunnel.ws.send_json({
+                "type": "http_forward",
+                "id": call_id,
+                "method": method,
+                "path": path,
+                "headers": headers or {},
+                "body": body,
+            })
+            result = await pending.future
+        return _validated_http_result(method, result)
     except asyncio.TimeoutError:
         logger.warning("[TUNNEL] HTTP forward %s %s timed out for %s", method, path, user_id[:8])
+        _http_forward_failed_after_dispatch(method)
         return None
+    except (TunnelDisconnected, WebSocketDisconnect):
+        _http_forward_failed_after_dispatch(method)
+        return None
+    except HTTPForwardOutcomeUnknown:
+        raise
     except Exception as e:
         logger.warning("[TUNNEL] HTTP forward failed: %s", e)
+        _http_forward_failed_after_dispatch(method)
         return None
     finally:
-        _pending_calls.pop(call_id, None)
+        _discard_pending(call_id, pending)
 
 
 async def send_restart(user_id: str) -> bool:
@@ -157,7 +370,7 @@ async def send_restart(user_id: str) -> bool:
     Called when agent settings are saved on the platform.
     The agent will gracefully restart to pick up new config.
     """
-    tunnel = _tunnels.get(user_id)
+    tunnel = _get_ready_tunnel(user_id)
     if not tunnel:
         logger.info("[TUNNEL] No active tunnel for %s — cannot send restart", user_id[:8])
         return False
@@ -177,7 +390,7 @@ async def send_config_update(user_id: str, env_content: str) -> bool:
     The agent will write the new .env and restart to pick up changes.
     This is the mechanism that makes Agent Settings a live control panel.
     """
-    tunnel = _tunnels.get(user_id)
+    tunnel = _get_ready_tunnel(user_id)
     if not tunnel:
         logger.info("[TUNNEL] No active tunnel for %s — cannot push config", user_id[:8])
         return False
@@ -230,6 +443,45 @@ async def _authenticate_tunnel(token: str) -> Optional[str]:
     except Exception as e:
         logger.warning("[TUNNEL] JWT auth failed: %s", e)
     return None
+
+
+async def _push_latest_config(tunnel: TunnelConnection) -> bool:
+    """Best-effort DB config read; fail closed only on a transport send."""
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import AgentConfig
+        from sqlalchemy import select as _sel
+
+        async with async_session_maker() as db:
+            result = await db.execute(
+                _sel(AgentConfig).where(AgentConfig.user_id == tunnel.user_id)
+            )
+            config = result.scalars().first()
+            if not config:
+                return True
+
+            from app.api.agent_setup import _build_env, _automations_env_flag
+
+            env = _build_env(
+                config,
+                tunnel.user_id,
+                automations_enabled=await _automations_env_flag(tunnel.user_id),
+            )
+            if not await _send_current_control(
+                tunnel, {"type": "config_update", "env_content": env},
+            ):
+                return False
+            logger.info(
+                "[TUNNEL] Pushed config sync on connect for %s",
+                tunnel.user_id[:8],
+            )
+    except Exception as error:
+        logger.warning(
+            "[TUNNEL] Config sync on connect failed for %s: %s",
+            tunnel.user_id[:8],
+            error,
+        )
+    return True
 
 
 @router.websocket("/ws/agent-tunnel")
@@ -299,57 +551,45 @@ async def agent_tunnel_ws(
         return
 
     # ── Register tunnel ──
-    old_tunnel = _tunnels.get(user_id)
-    if old_tunnel:
-        logger.info("[TUNNEL] Replacing existing tunnel for %s", user_id[:8])
-        try:
-            await old_tunnel.ws.close(code=4000)
-        except Exception:
-            pass
-
     tunnel = TunnelConnection(user_id, websocket)
-    _tunnels[user_id] = tunnel
-    logger.info("[TUNNEL] Agent connected for user %s", user_id[:8])
-
-    await websocket.send_json({"type": "connected", "user_id": user_id})
-
-    # ── Push latest config on connect (sync keys saved while agent was offline) ──
+    old_tunnel = _tunnels.get(user_id)
+    if old_tunnel is not None:
+        logger.info("[TUNNEL] Replacing existing tunnel for %s", user_id[:8])
+    installed = False
+    heartbeat_task: asyncio.Task | None = None
     try:
-        from app.db.database import async_session_maker
-        from app.db.models import AgentConfig
-        from sqlalchemy import select as _sel
-        async with async_session_maker() as _db:
-            _result = await _db.execute(
-                _sel(AgentConfig).where(AgentConfig.user_id == user_id)
+        await _install_tunnel(tunnel)
+        installed = True
+        logger.info("[TUNNEL] Agent connected for user %s", user_id[:8])
+
+        if not await _send_current_control(
+            tunnel, {"type": "connected", "user_id": user_id},
+        ):
+            return
+        try:
+            config_ready = await asyncio.wait_for(
+                _push_latest_config(tunnel), timeout=TUNNEL_CONFIG_SYNC_TIMEOUT,
             )
-            _cfg = _result.scalars().first()
-            if _cfg:
-                from app.api.agent_setup import _build_env, _automations_env_flag
-                _env = _build_env(
-                    _cfg, user_id,
-                    automations_enabled=await _automations_env_flag(user_id),
-                )
-                await websocket.send_json({
-                    "type": "config_update",
-                    "env_content": _env,
-                })
-                logger.info("[TUNNEL] Pushed config sync on connect for %s", user_id[:8])
-    except Exception as _e:
-        logger.warning("[TUNNEL] Config sync on connect failed for %s: %s", user_id[:8], _e)
+        except asyncio.TimeoutError:
+            _retire_tunnel(tunnel)
+            return
+        if not config_ready:
+            return
+        if not _mark_tunnel_ready(tunnel):
+            return
 
-    # ── Heartbeat task ──
-    async def heartbeat():
-        while True:
-            try:
-                await asyncio.sleep(15)
-                await websocket.send_json({"type": "ping"})
-            except Exception:
-                break
+        # ── Heartbeat task ──
+        async def heartbeat():
+            while True:
+                try:
+                    await asyncio.sleep(15)
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
 
-    heartbeat_task = asyncio.create_task(heartbeat())
+        heartbeat_task = asyncio.create_task(heartbeat())
 
-    # ── Message loop ──
-    try:
+        # ── Message loop ──
         while True:
             raw = await websocket.receive_text()
             msg = json.loads(raw)
@@ -361,9 +601,7 @@ async def agent_tunnel_ws(
             elif msg_type == "tool_result":
                 call_id = msg.get("id")
                 result = msg.get("result", "")
-                future = _pending_calls.get(call_id)
-                if future and not future.done():
-                    future.set_result(result)
+                if _resolve_pending(tunnel, call_id, result):
                     logger.info("[TUNNEL] Got tool_result for %s", call_id[:8])
 
             elif msg_type == "status":
@@ -371,19 +609,16 @@ async def agent_tunnel_ws(
 
     except WebSocketDisconnect:
         logger.info("[TUNNEL] Agent disconnected for user %s", user_id[:8])
-    except Exception as e:
+    except Exception:
         logger.exception("[TUNNEL] Tunnel error for %s", user_id[:8])
     finally:
-        heartbeat_task.cancel()
-        # Clean up tunnel
-        if _tunnels.get(user_id) is tunnel:
-            del _tunnels[user_id]
-        # Cancel any pending tool calls
-        for call_id, future in list(_pending_calls.items()):
-            if not future.done():
-                future.set_exception(
-                    ConnectionError("Terminal agent disconnected")
-                )
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+        # A replacement is published before its predecessor is closed.  The
+        # retiring predecessor may fail only calls it actually received and
+        # must never erase the new current tunnel or another tenant's work.
+        if installed:
+            _retire_tunnel(tunnel)
 
 
 @router.get("/agent/tunnel-status")
@@ -418,7 +653,7 @@ async def tunnel_status(
     if user_id and user_id != caller:
         return {"connected": False}  # never disclose another tenant's presence
 
-    tunnel = _tunnels.get(caller)
+    tunnel = _get_ready_tunnel(caller)
     if not tunnel:
         return {"connected": False}
 
@@ -462,7 +697,7 @@ async def tunnel_status_me(
     if not user_id:
         return {"connected": False, "error": "auth required"}
 
-    tunnel = _tunnels.get(user_id)
+    tunnel = _get_ready_tunnel(user_id)
     if not tunnel:
         return {"connected": False, "user_id": user_id}
 
@@ -518,8 +753,8 @@ async def tunnel_debug(
     result["auth_user_id"] = user_id
 
     if user_id:
-        result["is_connected"] = user_id in _tunnels
-        tunnel = _tunnels.get(user_id)
+        result["is_connected"] = is_agent_connected(user_id)
+        tunnel = _get_ready_tunnel(user_id)
         if tunnel:
             result["tunnel_uptime"] = round(tunnel.uptime, 1)
 

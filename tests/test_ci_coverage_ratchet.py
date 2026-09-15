@@ -414,7 +414,16 @@ def test_debt_is_not_growing_silently():
     # the agent-mode step (14/14 and 19/19 there; 'no such table' in the sweep).
     # Wave 2 (+1 more): test_voice_task_supervisor_polling.py, same runtime, same
     # tables (11/11 under agent). ROUTING entry; it RUNS in the agent-mode step.
-    CEILING = 102
+    # Incident 2026-09-14 (+3): test_channel_neutral_prefix.py builds the REAL
+    # system prompt (`_build_system_prompt` SELECTs `identities`, AGENT_ONLY)
+    # to prove the prefix is byte-identical across channels;
+    # test_day_chats_future_heal.py drives the real list_day_chats over a
+    # seeded future-dated day (the only way the PendingRollback 500 reproduces;
+    # day_chats/messages/context_budget_logs are AGENT_ONLY);
+    # test_agent_health_signals.py probes /agent/health, which reads the tenant
+    # DB. ROUTING entries, all three RUN in the agent-mode step (42/42, 7/7,
+    # 14/14 there; 'no such table' in the sweep).
+    CEILING = 105
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

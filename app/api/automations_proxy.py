@@ -43,8 +43,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import get_current_user
 from app.db.database import get_db
 from app.db.models import AutomationGrant, AutomationTemplate, User
+from app.api.tenant_proxy import agent_passthrough_response
 
 router = APIRouter(prefix="/automations", tags=["automations (platform)"])
+
 logger = logging.getLogger(__name__)
 
 # Below the mobile client's 15 s per-attempt budget by a clear margin, so the
@@ -539,8 +541,10 @@ async def _proxy(
         k: v for k, v in resp.headers.items()
         if k.lower() not in _HOP_BY_HOP
     }
-    return Response(
-        content=resp.content, status_code=resp.status_code,
+    # An agent-origin 401/403 is the PLATFORM's stale key, never the user's
+    # JWT — forwarding it verbatim signs the user out (D1, 2026-09-12).
+    return agent_passthrough_response(
+        resp,
         headers=out_headers,
         media_type=resp.headers.get("content-type"),
     )
@@ -1215,8 +1219,10 @@ async def _proxy_accounts(
         k: v for k, v in resp.headers.items()
         if k.lower() not in _HOP_BY_HOP
     }
-    return Response(
-        content=resp.content, status_code=resp.status_code,
+    # An agent-origin 401/403 is the PLATFORM's stale key, never the user's
+    # JWT — forwarding it verbatim signs the user out (D1, 2026-09-12).
+    return agent_passthrough_response(
+        resp,
         headers=out_headers,
         media_type=resp.headers.get("content-type"),
     )

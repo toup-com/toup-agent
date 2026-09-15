@@ -99,24 +99,6 @@ class StubAsyncClient:
         self.closed = True
 
 
-class StubSyncClient:
-    """Blocking client used by ``get_pairing_status()``."""
-
-    def __init__(self, routes: Optional[dict[str, StubResponse]] = None):
-        self.routes = routes or {}
-        self.gets: list[str] = []
-
-    def __enter__(self) -> "StubSyncClient":
-        return self
-
-    def __exit__(self, *_exc: Any) -> None:
-        return None
-
-    def get(self, path: str, **_kw: Any) -> StubResponse:
-        self.gets.append(path)
-        return self.routes.get(f"GET {path}", StubResponse(200, {"ok": True}))
-
-
 class FakeHttpxModule:
     """Stands in for the `httpx` module attribute on whatsapp_baileys.
 
@@ -128,7 +110,6 @@ class FakeHttpxModule:
 
     def __init__(self) -> None:
         self.async_client: Optional[StubAsyncClient] = None
-        self.sync_client: Optional[StubSyncClient] = None
         self.async_ctor_kwargs: list[dict] = []
 
     def AsyncClient(self, **kwargs: Any) -> StubAsyncClient:  # noqa: N802
@@ -137,10 +118,16 @@ class FakeHttpxModule:
             raise ConnectionError("sidecar unreachable (test default)")
         return self.async_client
 
-    def Client(self, **_kwargs: Any) -> StubSyncClient:  # noqa: N802
-        if self.sync_client is None:
-            raise ConnectionError("sidecar unreachable (test default)")
-        return self.sync_client
+    def Client(self, **_kwargs: Any) -> Any:  # noqa: N802
+        # A TRIPWIRE, not a stub. `get_pairing_status()` used to open a
+        # blocking client here, from inside a FastAPI route — every
+        # ~1.5 s poll of the Settings modal stalled the agent's event
+        # loop for as long as the sidecar took to answer. Nothing in the
+        # adapter may construct a synchronous client again.
+        raise AssertionError(
+            "whatsapp_baileys constructed a BLOCKING httpx.Client — that "
+            "runs on the agent's event loop"
+        )
 
 
 class FakeProc:
@@ -257,11 +244,6 @@ class Harness:
         self.httpx.async_client = client
         return client
 
-    def pair_status_http(self, routes: dict) -> StubSyncClient:
-        client = StubSyncClient(routes)
-        self.httpx.sync_client = client
-        return client
-
     def quiet_background_tasks(self):
         """No SSE stream, no DB sweep — both are separate units."""
         async def _noop_events(_self):
@@ -303,6 +285,14 @@ class Harness:
         for task in (ch._event_task, ch._sweep_task):
             if task is not None:
                 await task
+        # The reconciler never returns on its own — cancel it explicitly.
+        recon = ch._reconcile_task
+        if recon is not None and not recon.done():
+            recon.cancel()
+            try:
+                await recon
+            except asyncio.CancelledError:
+                pass
 
 
 @pytest.fixture
@@ -411,22 +401,21 @@ class TestHealthPreStart:
 
 
 class TestPairingSnapshot:
-    def test_empty_when_sidecar_unreachable(self, wa):
+    async def test_empty_when_sidecar_unreachable(self, wa):
         """Sidecar down → cached snapshot, never a crash and never a
         stale 'linked' invented out of nothing."""
-        snap = wa.channel().get_pairing_status()
+        snap = await wa.channel().get_pairing_status()
         assert snap["qr_data_url"] is None
         assert snap["qr_emitted_at"] is None
         assert snap["self_e164"] is None
         assert snap["connected"] is False
         assert snap["session_status"] == "not_linked"
 
-    def test_poll_caches_sidecar_truth(self, wa):
-        """The poll is the only thing that keeps `/agent/health` honest
-        between SSE frames — it must WRITE BACK what the sidecar said,
-        not just return it."""
+    async def test_poll_caches_sidecar_truth(self, wa):
+        """The poll must WRITE BACK what the sidecar said, not just return
+        it — and it must do so over the SHARED ASYNC client."""
         ch = wa.channel()
-        sync = wa.pair_status_http({
+        client = wa.sidecar_http({
             "GET /pair/status": StubResponse(200, {
                 "session_status": "linked",
                 "connected": True,
@@ -435,8 +424,9 @@ class TestPairingSnapshot:
                 "qr_emitted_at": None,
             }),
         })
-        body = ch.get_pairing_status()
-        assert sync.gets == ["/pair/status"]
+        ch._http = client
+        body = await ch.get_pairing_status()
+        assert client.gets == ["/pair/status"]
         assert body["session_status"] == "linked"
         # …and the cache took it, so health() agrees without another poll.
         h = ch.health()
@@ -758,7 +748,7 @@ class TestPairingControls:
         assert "/pair/start" in client.post_paths, (
             f"kick_pair() never told the sidecar; posts={client.post_paths}"
         )
-        snap = ch.get_pairing_status()   # sidecar poll unreachable → cached
+        snap = await ch.get_pairing_status()
         assert snap["session_status"] == "linking"
         assert snap["connected"] is False
         assert snap["qr_data_url"] is None
@@ -818,3 +808,590 @@ class TestPairingControls:
                 "request_pairing_code()",
                 lambda: f"posts={client.posts}",
             )
+
+
+# ── the reconciler: the sidecar is the truth, SSE is the hurry ────
+#
+# Round 44. A `connection_open` emitted while no SSE consumer was attached
+# reaches nobody — sidecar.mjs `emitEvent` writes to the currently-attached
+# clients and keeps no replay — and `linked` used to be reachable ONLY from
+# that frame. Observed on pool slot 18 on 2026-09-14: the sidecar was linked,
+# the agent said `linking` forever, and every client rendered
+# "Not connected / Connect" for a session that was working.
+
+
+class TestSidecarReconciler:
+    async def test_a_missed_connection_open_is_recovered_within_one_tick(self, wa):
+        """The defect, end to end: boot sees `linking`, the SSE frame that
+        would have said `linked` is never delivered, and the reconciler is
+        the only thing that can find out."""
+        from app.services import health_signals as hs
+
+        hs.reset_for_tests()
+        wa.sidecar_bundle()
+        wa.node_on_path()
+        wa.will_spawn()
+        wa.quiet_background_tasks()
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "linking",
+                "connected": False,
+                "self_e164": None,
+            }),
+        })
+        ch = wa.channel(["+14155552671"])
+        await finish(ch.start(), "start()", lambda: f"health={ch.health()}")
+        assert ch.health()["session_status"] == "linking"
+
+        # The phone confirms. The sidecar flips; the frame reaches nobody.
+        client.routes["GET /health"] = StubResponse(200, {
+            "session_status": "linked",
+            "connected": True,
+            "self_e164": "+14155552671",
+        })
+        assert ch.health()["session_status"] == "linking", (
+            "the cache moved with no event and no read — impossible"
+        )
+
+        assert await ch._reconcile_once("reconcile") is True
+        h = ch.health()
+        assert h["session_status"] == "linked", (
+            f"the reconciler did not adopt the sidecar's truth: {h}"
+        )
+        assert h["connected"] is True
+        assert h["self_e164"] == "+14155552671"
+        assert h["session_status_source"] == "reconcile"
+        assert hs.get("wa_status_reconciled") == 1, (
+            "a status the SSE stream failed to deliver was recovered "
+            "silently — nothing on the fleet can see that happening"
+        )
+        hs.reset_for_tests()
+        await wa.drain(ch)
+
+    async def test_the_running_loop_recovers_it_without_being_poked(self, wa):
+        """Not the helper — the TASK `start()` creates. A reconcile method
+        nobody schedules fixes nothing."""
+        wa.sidecar_bundle()
+        wa.node_on_path()
+        wa.will_spawn()
+        wa.quiet_background_tasks()
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "linking", "connected": False, "self_e164": None,
+            }),
+        })
+        wa._mp.setattr(wa.mod, "_RECONCILE_INTERVAL_S", 0.01)
+        ch = wa.channel(["+14155552671"])
+        await finish(ch.start(), "start()", lambda: f"health={ch.health()}")
+        assert ch._reconcile_task is not None and not ch._reconcile_task.done()
+
+        client.routes["GET /health"] = StubResponse(200, {
+            "session_status": "linked", "connected": True,
+            "self_e164": "+14155552671",
+        })
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if ch.health()["session_status"] == "linked":
+                break
+        assert ch.health()["session_status"] == "linked", (
+            f"the reconcile task never re-read the sidecar: {ch.health()}"
+        )
+        await wa.drain(ch)
+
+    async def test_a_logged_out_sidecar_is_adopted_and_stays(self, wa):
+        """The user unlinked the device from their phone. That is a FACT,
+        and re-reading the sidecar must not talk us out of it."""
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "logged_out", "connected": False,
+                "self_e164": None,
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+        await ch._on_sidecar_event(
+            {"type": "connection_open", "self_e164": "+14155552671"}
+        )
+        assert ch.health()["session_status"] == "linked"
+
+        await ch._on_sidecar_event({"type": "logged_out"})
+        h = ch.health()
+        assert h["session_status"] == "logged_out"
+        assert h["self_e164"] is None
+        assert h["session_status_source"] == "sse"
+
+        assert await ch._reconcile_once("reconcile") is True
+        h = ch.health()
+        assert h["session_status"] == "logged_out", (
+            "a reconcile read undid an explicit logout"
+        )
+        assert h["self_e164"] is None
+
+    async def test_an_unreachable_sidecar_neither_raises_nor_spins(self, wa):
+        """A dead port must cost a handful of requests, not a hot loop for
+        the life of the container."""
+        class Boom(StubAsyncClient):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            async def get(self, path: str, **_kw: Any) -> StubResponse:
+                self.attempts += 1
+                raise ConnectionError("sidecar down")
+
+        ch = wa.channel()
+        ch._http = Boom()
+
+        # No raise, no state change, and the caller is told to back off.
+        assert await ch._reconcile_once("reconcile") is False
+        assert ch.health()["session_status"] == "not_linked"
+
+        wa._mp.setattr(wa.mod, "_RECONCILE_INTERVAL_S", 0.01)
+        wa._mp.setattr(wa.mod, "_RECONCILE_MAX_BACKOFF_S", 0.08)
+        ch._reconcile_wake = asyncio.Event()
+        task = asyncio.create_task(ch._reconcile_forever())
+        await asyncio.sleep(0.3)
+        assert not task.done(), (
+            f"the reconcile loop died on an unreachable sidecar: "
+            f"{task.exception() if task.done() else None}"
+        )
+        attempts = ch._http.attempts
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # 0.3 s at a flat 0.01 s interval would be ~30. With the geometric
+        # backoff (0.01→0.02→0.04→0.08, capped) it is a handful.
+        assert 2 <= attempts <= 10, (
+            f"{attempts} reads in 0.3s — the loop is not backing off"
+        )
+
+    async def test_a_bad_sidecar_answer_is_not_state(self, wa):
+        """Non-200 and unparseable bodies leave the cache alone."""
+        class Bad(StubAsyncClient):
+            def __init__(self, resp):
+                super().__init__()
+                self._resp = resp
+
+            async def get(self, path: str, **_kw: Any):
+                self.gets.append(path)
+                return self._resp
+
+        class Unparseable(StubResponse):
+            def json(self):
+                raise ValueError("not json")
+
+        ch = wa.channel()
+        await ch._on_sidecar_event(
+            {"type": "connection_open", "self_e164": "+14155552671"}
+        )
+
+        ch._http = Bad(StubResponse(503, {}))
+        assert await ch._reconcile_once("reconcile") is False
+        ch._http = Bad(Unparseable(200))
+        assert await ch._reconcile_once("reconcile") is False
+        ch._http = None
+        assert await ch._reconcile_once("reconcile") is False
+
+        assert ch.health()["session_status"] == "linked", (
+            "a failed read was treated as a state change"
+        )
+
+    async def test_health_reports_where_the_status_came_from(self, wa):
+        """`session_status` is a cache; an operator has to be able to tell a
+        fresh sidecar read from a boot value nothing has refreshed since."""
+        ch = wa.channel()
+        h = ch.health()
+        assert h["session_status_source"] == "init"
+        assert h["since_last_sidecar_read_s"] is None
+        assert h["reconciler_running"] is False
+
+        await ch._on_sidecar_event({"type": "connection_open"})
+        h = ch.health()
+        assert h["session_status_source"] == "sse"
+        assert isinstance(h["session_status_stable_s"], int)
+
+    async def test_a_push_write_does_not_pretend_the_sidecar_was_asked(self, wa):
+        """Two clocks, two questions. `since_last_sidecar_read_s` answers
+        "when did we last ASK" — an SSE frame or a local optimistic write is
+        not an answer to that, and stamping it there let a cache that had
+        not been confirmed in minutes look a second old."""
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "linked", "connected": True,
+                "self_e164": "+14155552671",
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+
+        # Never read → never asked.
+        await ch._on_sidecar_event({"type": "qr"})
+        assert ch.health()["since_last_sidecar_read_s"] is None, (
+            "an SSE frame was recorded as a sidecar read"
+        )
+        await ch.force_logout()
+        assert ch.health()["since_last_sidecar_read_s"] is None, (
+            "a local write was recorded as a sidecar read"
+        )
+
+        # A real read is.
+        assert await ch._reconcile_once("reconcile") is True
+        assert ch.health()["since_last_sidecar_read_s"] == 0
+
+    async def test_the_stability_clock_moves_only_on_a_VALUE_change(self, wa):
+        """`session_status_stable_s` is the platform's whole discriminator
+        between a session whose credentials are gone and a reconnect in
+        flight. A repeated read of the SAME status must not reset it."""
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "linking", "connected": False,
+                "self_e164": None,
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+        await ch._reconcile_once("reconcile")
+
+        # Backdate: the status has held for two minutes.
+        ch._status_since -= 120
+        assert ch.health()["session_status_stable_s"] >= 120
+
+        for _ in range(3):
+            await ch._reconcile_once("reconcile")
+        assert ch.health()["session_status_stable_s"] >= 120, (
+            "re-reading the same status reset the stability clock — every "
+            "stale state would then look brand new"
+        )
+
+        # A real change restarts it.
+        client.routes["GET /health"] = StubResponse(200, {
+            "session_status": "linked", "connected": True,
+            "self_e164": "+14155552671",
+        })
+        await ch._reconcile_once("reconcile")
+        assert ch.health()["session_status_stable_s"] == 0
+
+    async def test_the_reconciler_starts_with_the_channel_and_stops_with_it(self, wa):
+        """A task that outlives `stop()` keeps polling a sidecar the next
+        generation is about to replace."""
+        wa.sidecar_bundle()
+        wa.node_on_path()
+        wa.will_spawn()
+        wa.quiet_background_tasks()
+        wa.sidecar_http({
+            "GET /health": StubResponse(200, {"session_status": "linked", "connected": True}),
+        })
+        ch = wa.channel()
+        assert ch._reconcile_task is None
+
+        await finish(ch.start(), "start()", lambda: f"health={ch.health()}")
+        task = ch._reconcile_task
+        assert task is not None and not task.done()
+        assert ch.health()["reconciler_running"] is True
+
+        # Let the loop actually PARK in its wait. A task that has not run
+        # its first step yet exits on the `_stopping` check for free, so
+        # without this the case passes with no cancellation at all — and the
+        # real one is always parked, holding the channel for a whole
+        # interval (up to the backoff cap) past `stop()`.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done(), "the reconcile loop never parked"
+
+        await finish(ch.stop(), "stop()", lambda: f"task={task}")
+        assert task.done(), "stop() left the reconcile task running"
+        assert ch._reconcile_task is None
+        assert ch.health()["reconciler_running"] is False
+
+    async def test_an_attaching_sse_stream_asks_for_a_read_at_once(self, wa):
+        """The interval bounds the damage; the wake removes it. A stream
+        that has JUST attached is the moment the cache is most likely to be
+        stale, because anything emitted before it was dropped."""
+        ch = wa.channel()
+        ch._reconcile_wake = asyncio.Event()
+        assert not ch._reconcile_wake.is_set()
+        ch._wake_reconciler()
+        assert ch._reconcile_wake.is_set(), (
+            "_consume_events_forever's wake does nothing"
+        )
+        # …and it is actually called from the SSE loop, right after the
+        # stream is established. Source probe: a wake nobody fires is dead.
+        import inspect
+        src = inspect.getsource(wa.mod.BaileysWhatsAppChannel._consume_events_forever)
+        assert "_wake_reconciler()" in src, (
+            "the SSE consumer does not wake the reconciler when it attaches"
+        )
+
+    async def test_the_pairing_snapshot_carries_its_own_provenance(self, wa):
+        """The platform's downgrade rule reads `self_e164`,
+        `session_status_stable_s` and `session_status_source` off THIS body.
+        Ship it without them and the rule degrades to "never clear a link",
+        silently — the exact defect the rule exists to bound."""
+        keys = {"session_status_source", "session_status_stable_s",
+                "since_last_sidecar_read_s"}
+
+        # Served from the sidecar…
+        client = wa.sidecar_http({
+            "GET /pair/status": StubResponse(200, {
+                "session_status": "linking", "connected": False,
+                "self_e164": None, "qr_data_url": None,
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+        body = await ch.get_pairing_status()
+        assert keys <= set(body), f"missing {keys - set(body)}"
+        assert body["session_status_source"] == "pair_status"
+        assert isinstance(body["session_status_stable_s"], int)
+
+        # …and served from cache when the sidecar is down, which is when a
+        # "how old is this?" answer matters most.
+        class Dead(StubAsyncClient):
+            async def get(self, path: str, **_kw: Any) -> StubResponse:
+                raise ConnectionError("down")
+
+        ch2 = wa.channel()
+        ch2._http = Dead()
+        snap = await ch2.get_pairing_status()
+        assert keys <= set(snap), f"missing {keys - set(snap)}"
+
+    def test_get_pairing_status_is_async_and_opens_no_blocking_client(self):
+        """It runs inside a FastAPI route on the agent's event loop, and the
+        Settings modal polls it every ~1.5 s."""
+        import inspect
+        from pathlib import Path
+        from app.agent.channels.whatsapp_baileys import BaileysWhatsAppChannel
+
+        assert inspect.iscoroutinefunction(
+            BaileysWhatsAppChannel.get_pairing_status
+        ), "get_pairing_status blocks the event loop"
+        src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "channels"
+               / "whatsapp_baileys.py").read_text()
+        assert "httpx.Client(" not in src, (
+            "a synchronous httpx client is back in the adapter"
+        )
+        # And the caller awaits it — a coroutine returned to FastAPI is
+        # serialised as an empty object, not a snapshot.
+        qr = (Path(__file__).resolve().parents[1] / "app" / "api"
+              / "whatsapp_qr.py").read_text()
+        assert "await channel.get_pairing_status()" in qr
+
+
+# ── the status read is a READ (round 44, client-side follow-up) ───
+#
+# The mobile Channels panel now polls the platform's `/whatsapp/qr-status`
+# once per visit to Connectors → Channels and once per return to the
+# foreground, for EVERY user whose stored status is not `linked` — including
+# users who never set WhatsApp up. That turns this chain into a background
+# read on a hot screen, so it has to be provably inert: no channel start, no
+# sidecar spawn, no `/pair/start`, no QR minted, and a fast calm answer when
+# the sidecar is down rather than a hang behind the panel.
+
+
+class TestStatusReadIsInert:
+    async def test_a_status_read_on_an_unstarted_channel_spawns_nothing(self, wa):
+        """`wa.spawn` RAISES if the adapter tries to spawn — the channel was
+        never started, so there is no sidecar and there must be no attempt
+        to make one."""
+        ch = wa.channel(["+14155552671"])
+        snap = await ch.get_pairing_status()
+        assert snap["session_status"] == "not_linked"
+        assert snap["qr_data_url"] is None
+        assert wa.spawn.calls == [], (
+            "reading the pairing status spawned a sidecar"
+        )
+        assert ch._sidecar_proc is None
+        assert ch._event_task is None and ch._reconcile_task is None
+
+    async def test_a_status_read_never_kicks_the_pair_flow(self, wa):
+        """`/pair/start` WIPES the Baileys auth dir (sidecar.mjs
+        handlePairStart → wipeAuthDir). A poll that reached it would unpair
+        a working session, and this poll now runs unprompted."""
+        client = wa.sidecar_http({
+            "GET /pair/status": StubResponse(200, {
+                "session_status": "not_linked", "connected": False,
+                "self_e164": None, "qr_data_url": None,
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+
+        for _ in range(3):
+            await ch.get_pairing_status()
+
+        assert client.posts == [], (
+            f"the status read POSTed to the sidecar: {client.post_paths}"
+        )
+        assert client.gets == ["/pair/status"] * 3
+        assert wa.spawn.calls == []
+        assert ch.health()["session_status"] == "not_linked"
+
+    async def test_a_down_sidecar_answers_from_cache_on_a_short_leash(self, wa):
+        """A sick sidecar must cost a cached snapshot, not the shared
+        client's full budget — this poll sits behind a screen the user is
+        looking at."""
+        seen: list[Optional[float]] = []
+
+        class Slow(StubAsyncClient):
+            async def get(self, path: str, **kw: Any) -> StubResponse:
+                seen.append(kw.get("timeout"))
+                raise ConnectionError("sidecar down")
+
+        ch = wa.channel()
+        ch._http = Slow()
+        await ch._on_sidecar_event(
+            {"type": "connection_open", "self_e164": "+14155552671"}
+        )
+
+        snap = await ch.get_pairing_status()
+        assert snap["session_status"] == "linked", (
+            "a down sidecar erased a link the adapter already knew about"
+        )
+        assert snap["self_e164"] == "+14155552671"
+        assert seen == [wa.mod._PAIR_STATUS_TIMEOUT_S], (
+            f"the user-facing read is not on its own short timeout: {seen}"
+        )
+        assert wa.mod._PAIR_STATUS_TIMEOUT_S <= 3.0
+
+    async def test_the_agent_route_answers_503_without_touching_anything(self, wa):
+        """No active channel is the ordinary case for a user who never set
+        WhatsApp up. It must be a typed 503, not a start attempt."""
+        from fastapi import FastAPI, HTTPException
+        from app.api.whatsapp_qr import router
+
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        handler = {
+            r.path: r.endpoint for r in app.routes
+            if getattr(r, "path", None) and getattr(r, "endpoint", None)
+        }["/api/whatsapp/qr/status"]
+
+        wa.mod._active_channel = None
+        try:
+            await handler(_user=object())
+            assert False, "expected a 503"
+        except HTTPException as exc:
+            assert exc.status_code == 503
+        assert wa.spawn.calls == []
+        assert wa.mod._active_channel is None
+
+
+# ── a poll is a snapshot of the PAST (review F2) ──────────────────
+
+
+class TestPolledBodiesLoseToPushes:
+    async def test_an_in_flight_read_cannot_walk_back_a_newer_event(self, wa):
+        """`/health` is requested, the phone confirms, `connection_open`
+        lands, and only THEN does the answer — serialised before any of it —
+        come back saying `linking`. Applying it would un-link a session that
+        is open, and the next reconcile is 10 s away."""
+        applied: list[str] = []
+
+        class Slow(StubAsyncClient):
+            """Answers only once the test says so."""
+
+            def __init__(self, gate: asyncio.Event):
+                super().__init__()
+                self.gate = gate
+
+            async def get(self, path: str, **_kw: Any) -> StubResponse:
+                self.gets.append(path)
+                await self.gate.wait()
+                return StubResponse(200, {
+                    "session_status": "linking", "connected": False,
+                    "self_e164": None,
+                })
+
+        gate = asyncio.Event()
+        ch = wa.channel()
+        ch._http = Slow(gate)
+
+        task = asyncio.create_task(ch._reconcile_once("reconcile"))
+        for _ in range(5):
+            await asyncio.sleep(0)   # let the read start
+
+        # The event the read raced.
+        await ch._on_sidecar_event(
+            {"type": "connection_open", "self_e164": "+14155552671"}
+        )
+        assert ch.health()["session_status"] == "linked"
+
+        gate.set()
+        assert await task is True   # the read itself succeeded…
+        applied.append(ch.health()["session_status"])
+        assert applied == ["linked"], (
+            "a /health body serialised BEFORE the connection_open was "
+            "applied after it, un-linking a live session"
+        )
+        assert ch.health()["self_e164"] == "+14155552671"
+        assert ch.health()["session_status_source"] == "sse"
+
+    async def test_a_read_that_starts_after_the_event_still_applies(self, wa):
+        """ANTI-VACUITY: the guard is about ORDER, not about ignoring polls.
+        A read issued after the last push is exactly how a missed
+        `connection_open` gets recovered, and it must still work."""
+        client = wa.sidecar_http({
+            "GET /health": StubResponse(200, {
+                "session_status": "logged_out", "connected": False,
+                "self_e164": None,
+            }),
+        })
+        ch = wa.channel()
+        ch._http = client
+        await ch._on_sidecar_event(
+            {"type": "connection_open", "self_e164": "+14155552671"}
+        )
+        assert await ch._reconcile_once("reconcile") is True
+        assert ch.health()["session_status"] == "logged_out"
+
+
+# ── the wake has a floor (review F5) ──────────────────────────────
+
+
+class TestReconcileFloor:
+    async def test_back_to_back_wakes_cannot_become_a_hot_loop(self, wa):
+        """A sidecar that accepts an SSE connection and immediately EOFs
+        fires one wake per round-trip. Without a floor, "re-derive on
+        attach" turns into a read storm against the process that is
+        already sick."""
+        reads: list[float] = []
+
+        class Counting(StubAsyncClient):
+            async def get(self, path: str, **_kw: Any) -> StubResponse:
+                reads.append(asyncio.get_event_loop().time())
+                return StubResponse(200, {
+                    "session_status": "linking", "connected": False,
+                    "self_e164": None,
+                })
+
+        wa._mp.setattr(wa.mod, "_RECONCILE_INTERVAL_S", 30.0)
+        wa._mp.setattr(wa.mod, "_RECONCILE_MIN_INTERVAL_S", 0.05)
+        ch = wa.channel()
+        ch._http = Counting()
+        ch._reconcile_wake = asyncio.Event()
+        task = asyncio.create_task(ch._reconcile_forever())
+
+        # Hammer the wake the way a flapping stream would.
+        deadline = asyncio.get_event_loop().time() + 0.25
+        while asyncio.get_event_loop().time() < deadline:
+            ch._wake_reconciler()
+            await asyncio.sleep(0.005)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert reads, "the wake never produced a read at all"
+        # 0.25 s at a 0.05 s floor is at most ~6; with no floor the loop
+        # would turn over on every one of the ~50 wakes.
+        assert len(reads) <= 8, (
+            f"{len(reads)} reads from ~50 wakes in 0.25s — no floor"
+        )
+        gaps = [b - a for a, b in zip(reads, reads[1:])]
+        assert all(g >= 0.04 for g in gaps), (
+            f"two reads closer than the floor: {gaps}"
+        )

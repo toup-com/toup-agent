@@ -21,6 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import get_current_user
 from app.db import get_db, AgentConfig
 
+# D1 (2026-09-12): an agent-origin 401/403 is the PLATFORM's stale X-Agent-Key,
+# never the user's JWT. The mobile client signs the user out on ANY 401, so a
+# verbatim forward ends the session over a key blip that self-heals in ~30 s.
+from app.api.tenant_proxy import (
+    is_agent_auth_failure as _is_agent_auth_failure,
+    agent_key_stale_json_response as _agent_key_stale,
+)
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/apps", tags=["Apps Proxy"])
 
@@ -604,6 +612,8 @@ async def _proxy(
             resp = await client.delete(url, headers=headers, timeout=timeout)
         else:
             return None
+        if _is_agent_auth_failure(resp.status_code):
+            return _agent_key_stale()
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except Exception as e:
         logger.warning("Apps proxy %s %s failed: %s", method, url, e)
@@ -727,6 +737,8 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
     try:
         client = get_agent_http_client()
         resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=10.0)
+        if _is_agent_auth_failure(resp.status_code):
+            return _agent_key_stale()
         data = _rewrite_app_urls(resp.json())
         return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
@@ -863,7 +875,11 @@ async def resume_job_proxy(job_id: str, current_user=Depends(get_current_user), 
 
 @router.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+    from app.api.ws_agent_tunnel import (
+        HTTPForwardOutcomeUnknown,
+        is_agent_connected,
+        send_http_forward,
+    )
 
     if is_agent_connected(current_user.id):
         try:
@@ -872,6 +888,14 @@ async def delete_job(job_id: str, current_user=Depends(get_current_user), db: As
             )
             if result is not None:
                 return JSONResponse(content=result)
+        except HTTPForwardOutcomeUnknown:
+            return JSONResponse(
+                content={
+                    "detail": "agent request outcome unknown; not retried",
+                    "retry_safe": False,
+                },
+                status_code=502,
+            )
         except Exception:
             pass
 
@@ -1071,6 +1095,8 @@ async def preview_proxy(
         elif "javascript" in content_type and "charset" not in content_type:
             resp_content_type = content_type + "; charset=utf-8"
 
+        if _is_agent_auth_failure(resp.status_code):
+            return _agent_key_stale()
         response = StreamingResponse(
             iter([body]),
             status_code=resp.status_code,
@@ -1238,6 +1264,8 @@ async def get_app(app_id: str, current_user=Depends(get_current_user), db: Async
     try:
         client = get_agent_http_client()
         resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=30.0)
+        if _is_agent_auth_failure(resp.status_code):
+            return _agent_key_stale()
         data = _rewrite_app_urls(resp.json())
         return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
@@ -1276,7 +1304,11 @@ async def push_github(app_id: str, current_user=Depends(get_current_user), db: A
 
 @router.delete("/{app_id}")
 async def delete_app(app_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
+    from app.api.ws_agent_tunnel import (
+        HTTPForwardOutcomeUnknown,
+        is_agent_connected,
+        send_http_forward,
+    )
 
     # Try tunnel first (works for NAT'd / self-hosted agents)
     if is_agent_connected(current_user.id):
@@ -1286,6 +1318,14 @@ async def delete_app(app_id: str, current_user=Depends(get_current_user), db: As
             )
             if result is not None:
                 return JSONResponse(content=result)
+        except HTTPForwardOutcomeUnknown:
+            return JSONResponse(
+                content={
+                    "detail": "agent request outcome unknown; not retried",
+                    "retry_safe": False,
+                },
+                status_code=502,
+            )
         except Exception as e:
             logger.debug("Tunnel DELETE forward failed, falling back to HTTP: %s", e)
 

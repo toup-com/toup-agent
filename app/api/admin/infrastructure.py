@@ -303,6 +303,14 @@ async def stop_container(
     if not container:
         return {"error": "Not found"}
     c = await svc_stop(db, container.user_id)
+    if c is not None and (c.container_name or "").startswith("toup-agent-pool-"):
+        # Refused: a pool member is shared infrastructure, and a parked pool
+        # row is D-2's precondition. Releasing one is a bridge unclaim.
+        return {
+            "status": c.status,
+            "stopped": False,
+            "reason": "pool_member_not_stoppable",
+        }
     return {"status": c.status if c else "error"}
 
 

@@ -3392,6 +3392,11 @@ async def realtime_voice_ws(
     session_id: Optional[str] = Query(None),
     onboarding: bool = Query(False),
     lang: Optional[str] = Query(None),
+    # Which app opened this socket, when it is willing to say. Only ever used
+    # to decide whether a purchase URL may be shown (App Review 3.1.1); never
+    # to change what the agent does. Absent from every shipped client today —
+    # see the anti-steering block below for what that costs.
+    client: Optional[str] = Query(None),
 ):
     """WebSocket proxy to OpenAI Realtime API for ChatGPT-speed voice conversation."""
 
@@ -3498,17 +3503,69 @@ async def realtime_voice_ws(
             from app.db.database import async_session_maker as _asm
             from app.services.credit_service import credit_service, BUCKET_MESSAGE
             if getattr(settings, "credit_enforcement_enabled", False):
+                from app.services.credit_exhausted import REASON_RATE_LIMITED
+                _plan_source = None
                 async with _asm() as _db:
                     preflight = await credit_service.check_balance(
                         _db, user_id, BUCKET_MESSAGE, _Dec("0.1"),
                     )
+                    if not preflight.success:
+                        # Only on the refusal path — a healthy session must
+                        # not pay for a second balance read.
+                        _plan_source = (await credit_service.get_balance_view(
+                            _db, user_id,
+                        )).plan_source
                 if not preflight.success:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "You're out of Toup credits. Top up or upgrade your plan to keep talking.",
-                        "billing": True,
-                        "billing_url": "https://toup.ai/account?tab=billing",
-                    })
+                    if preflight.reason == REASON_RATE_LIMITED:
+                        # The unlimited rate ladder, not a balance. This
+                        # account cannot run out of anything, so the copy
+                        # names the real cause and carries no billing flag —
+                        # `billing: True` is what makes the client render a
+                        # billing surface at all (useRealtimeVoice.ts:718).
+                        _frame = {
+                            "type": "error",
+                            "message": (
+                                "You're going faster than we can serve right "
+                                "now. Give it a few seconds and try again."
+                            ),
+                        }
+                    else:
+                        _frame = {
+                            "type": "error",
+                            "message": "You're out of Toup credits. Top up or upgrade your plan to keep talking.",
+                            "billing": True,
+                        }
+                        # ANTI-STEERING (App Review 3.1.1). This used to ship
+                        # `https://toup.ai/account?tab=billing`
+                        # unconditionally, to every client.
+                        #
+                        # Two independent reasons to withhold it, and they are
+                        # NOT the same question:
+                        #
+                        #   * WHO PAYS. An Apple subscriber cannot manage or
+                        #     buy anything at that URL, so it is useless as
+                        #     well as exposed. `plan_source` answers this.
+                        #   * WHICH APP IS ASKING. 3.1.1 is about linking to an
+                        #     off-app purchase FROM INSIDE THE APP, and it
+                        #     binds hardest for a NON-subscriber — who is
+                        #     exactly the person a purchase link is aimed at.
+                        #     `plan_source` cannot answer this: a free iOS user
+                        #     reads 'free', not 'iap'.
+                        #
+                        # `client` is the honest key for the second, and no
+                        # shipped build sends it yet — so today a free iOS user
+                        # still receives the link. That gap is named here
+                        # rather than papered over: suppressing on
+                        # `plan_source == 'free'` would take the link away from
+                        # free WEB users, who are the one cohort it genuinely
+                        # helps. The app can close it in one line by appending
+                        # `client=ios` in `realtimeVoiceWsUrl`.
+                        _mobile_client = (client or "").strip().lower() in {
+                            "ios", "android", "mobile", "app",
+                        }
+                        if _plan_source != "iap" and not _mobile_client:
+                            _frame["billing_url"] = "https://toup.ai/account?tab=billing"
+                    await websocket.send_json(_frame)
                     await websocket.close(code=4402)
                     return
         except Exception:

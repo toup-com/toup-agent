@@ -33,6 +33,20 @@ import pytest
 _port = itertools.count(9900)  # managed_containers.host_port is UNIQUE
 
 
+async def _probe_row(uid: str):
+    """The sweep's durable strike/cap state for one user, or None.
+
+    It used to be a module dict; the 2026-09-12 incident is what per-process
+    safety state costs across two replicas and every redeploy (L3-11)."""
+    from app.db import async_session_maker
+    from app.db.models import AgentProbeState
+    from sqlalchemy import select
+    async with async_session_maker() as db:
+        return (await db.execute(
+            select(AgentProbeState).where(AgentProbeState.user_id == uid)
+        )).scalar_one_or_none()
+
+
 async def _seed(db, *, hosting="managed", ssh_host=None, active=True,
                 config=True, created_at=None, container=None,
                 mc_updated_at=None):
@@ -284,7 +298,6 @@ async def test_sweep_restarts_sick_agent_after_two_consecutive_5xx(monkeypatch):
         await db.commit()
 
     monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
-    ps._PROBE_STRIKES.clear()
 
     class _Resp:
         status_code = 500
@@ -307,7 +320,11 @@ async def test_sweep_restarts_sick_agent_after_two_consecutive_5xx(monkeypatch):
     s2 = await ps.reclaim_stranded_users()
     assert s2.get("sick") == 1, "second consecutive sick tick acts"
     restart.assert_awaited_once()
-    assert uid not in ps._PROBE_STRIKES, "strikes cleared after restart"
+    row = await _probe_row(uid)
+    assert row is not None and row.consecutive_failures == 0, (
+        "strikes cleared after restart"
+    )
+    assert row.restarts_in_window == 1, "the per-user hourly cap counts it"
 
 
 @pytest.mark.asyncio
@@ -329,7 +346,6 @@ async def test_sweep_mass_transport_failure_records_no_strikes(monkeypatch):
         await db.commit()
 
     monkeypatch.setattr(ps.settings, "use_container_pool", True, raising=False)
-    ps._PROBE_STRIKES.clear()
 
     class _FakeClient:
         def __init__(self, *a, **k): ...
@@ -346,7 +362,9 @@ async def test_sweep_mass_transport_failure_records_no_strikes(monkeypatch):
     await ps.reclaim_stranded_users()
 
     restart.assert_not_awaited()
-    assert not ps._PROBE_STRIKES, "transport mass-failure must not strike"
+    assert await _probe_row(uid) is None, (
+        "transport mass-failure must not strike"
+    )
 
 
 def test_reconciler_alert_does_not_claim_unverified_users_were_healed():
@@ -357,3 +375,40 @@ def test_reconciler_alert_does_not_claim_unverified_users_were_healed():
     assert "Users were healed automatically" not in src
     assert "end-user chat" in src
     assert "readiness still requires verification" in src
+
+
+@pytest.mark.asyncio
+async def test_prewarm_degrades_gracefully_on_pool_swap_refused(monkeypatch):
+    """Caller degradation for D-2 (onboarding incident 2026-09-12): when
+    `provision_container` REFUSES a pool→named swap, the prewarm background
+    task must not raise or surface a 500 — it logs, leaves the pool row/route
+    intact (the refusal happens before any mutation) and hands off to discovery
+    for IN-PLACE repair (`restart-member` / bridge re-adoption)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.services import pool_service as ps
+    from app.services import prewarm_service
+    from app.services import docker_host_service as dhs
+
+    uid = await _run_seed()  # user + AgentConfig(hosting_mode='managed')
+
+    # The cross-replica drive guards use Postgres advisory locks; bypass them
+    # so the task reaches the provision call (their behaviour is covered
+    # elsewhere).
+    monkeypatch.setattr(ps, "try_take_provision_drive", AsyncMock(return_value=True))
+    monkeypatch.setattr(ps, "try_take_claim_drive", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        dhs, "provision_container",
+        AsyncMock(side_effect=dhs.PoolMemberSwapRefused("pool member; refusing swap")),
+    )
+    discovery = MagicMock()
+    monkeypatch.setattr(ps, "ensure_discovery", discovery)
+
+    # Must NOT raise — prewarm is fire-and-forget, never a user-visible 500.
+    await prewarm_service._run_prewarm(uid)
+
+    discovery.assert_called_once()
+    _, kw = discovery.call_args
+    assert kw.get("reason") == "pool_swap_refused", (
+        "a refused swap must hand off to discovery for in-place repair, not "
+        "propagate as a failure"
+    )

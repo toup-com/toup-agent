@@ -214,6 +214,12 @@ PLATFORM_ONLY_TABLES: set[str] = {
     "credit_reservations",
     "subscription_plans",
     "apple_subscriptions",
+    # The admin override on the Unlimited entitlement (alembic 105). Same
+    # reasoning as the five above: it is a CONTROLLER of credit_balances, its
+    # only writers are the platform admin router / CLI and the Apple
+    # notification handler, and an empty copy in every tenant DB would answer
+    # "no grant" to a question the tenant must never be asked.
+    "unlimited_grants",
     # Search gateway telemetry. Platform-only by construction: the whole point
     # of the gateway is that the tenant container no longer sees the upstream
     # call, so it has nothing to write here.
@@ -298,6 +304,16 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # Templates are product content, one copy, admin-seeded.
     "automation_grants",
     "automation_templates",
+    # Leader election for the platform's fleet-wide singleton loops
+    # (2026-09-12: every infra-mutating loop ran on BOTH Railway replicas,
+    # which turned one bad mapping into 92 container restarts). The rows
+    # describe PLATFORM replicas; a tenant container has no replicas and
+    # no such loops.
+    "infra_leases",
+    # Per-tenant reconciliation-sweep safety state (strikes, restart caps,
+    # escalation). It describes PLATFORM loops probing tenants; a tenant has
+    # no sweep and must never read its own strike count.
+    "agent_probe_state",
 }
 
 SHARED_TABLES: set[str] = {
@@ -462,8 +478,10 @@ SHARED_COLUMN_AUTHORITY: dict[str, dict] = {
             "POST /auth/timezone-from-coords (platform)",
             "admin users update (platform)",
             "voice-relay NULL-fill (ws_realtime._persist_user_tz — local DB on either surface)",
+            "/admin/bind NULL-fill from the platform copy (app/api/admin_pool.py step 2b, tenant)",
+            "agent_runner._resolve_effective_tz seed (bind/phone, tenant)",
         ],
-        "sync": "voice-relay NULL-fill + boot-time Intl PATCH (added 2026-08-10)",
+        "sync": "bind payload user_timezone (platform->tenant, NULL-fill only) + voice-relay NULL-fill + boot-time Intl PATCH",
         "note": "THE 2026-08-10 defect column (#488 class): chat wrote tenant while voice read platform → 23 active "
                 "users' day computed in UTC. Tenant copy is authoritative (chat is the high-frequency writer); the "
                 "platform copy self-heals from device tz when NULL",

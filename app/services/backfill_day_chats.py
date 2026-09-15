@@ -76,8 +76,10 @@ async def run_backfill(session_maker) -> str:
       reprocess work, and we still bail out and alert after the cap so
       a genuinely broken backfill (schema bug, etc.) doesn't loop.
     """
+    from sqlalchemy import delete as sa_delete
+
     from app.db.models import User, Conversation, Message
-    from app.db.models.day_chat import DayChat, MigrationStatus
+    from app.db.models.day_chat import ContextBudgetLog, DayChat, MigrationStatus
 
     MAX_AUTO_RETRY_ATTEMPTS = 3
     RETRY_GRACE_SEC = 300  # 5 minutes
@@ -390,12 +392,58 @@ async def run_backfill(session_maker) -> str:
                         )
                     )
                 )).scalars().all()
+                # FK-SAFE. This used to be one bulk DELETE over every
+                # candidate, with no handling of `context_budget_logs` —
+                # whose day_chat_id FK has no ON DELETE clause. It raised a
+                # ForeignKeyViolation at the very END of a rebucket, after
+                # all the work, which is why the existing rebucket could not
+                # be trusted as the repair for the 2026-09-14 incident.
+                # Dependents are counted first and the CBL rows of a day that
+                # is genuinely going away are deleted BEFORE the parent — the
+                # order user_deletion.py has always used.
+                deleted = 0
+                retained = 0
+                for _dc_id in orphan_dcs:
+                    _msgs = (await db.execute(
+                        select(func.count()).select_from(Message)
+                        .where(Message.day_chat_id == _dc_id)
+                    )).scalar() or 0
+                    _convs = (await db.execute(
+                        select(func.count()).select_from(Conversation)
+                        .where(Conversation.day_chat_id == _dc_id)
+                    )).scalar() or 0
+                    if _msgs or _convs:
+                        retained += 1
+                        logger.info(
+                            "day_chat_backfill.cleanup retained day_chat=%s "
+                            "(messages=%d conversations=%d)",
+                            _dc_id[:8], _msgs, _convs,
+                        )
+                        continue
+                    try:
+                        await db.execute(
+                            sa_delete(ContextBudgetLog)
+                            .where(ContextBudgetLog.day_chat_id == _dc_id)
+                        )
+                    except Exception as _cbl_err:
+                        # No context_budget_logs table on this tenant. An
+                        # unknown dependent count is NOT zero — skip.
+                        retained += 1
+                        logger.info(
+                            "day_chat_backfill.cleanup skipped day_chat=%s "
+                            "(context_budget_logs unreadable: %r)",
+                            _dc_id[:8], _cbl_err,
+                        )
+                        await db.rollback()
+                        continue
+                    await db.execute(sa_delete(DayChat).where(DayChat.id == _dc_id))
+                    deleted += 1
                 if orphan_dcs:
-                    from sqlalchemy import delete as sa_delete
-                    await db.execute(
-                        sa_delete(DayChat).where(DayChat.id.in_(orphan_dcs))
+                    logger.info(
+                        "day_chat_backfill.cleanup orphaned_day_chats=%d "
+                        "deleted=%d retained_with_dependents=%d",
+                        len(orphan_dcs), deleted, retained,
                     )
-                    logger.info("day_chat_backfill.cleanup orphaned_day_chats=%d", len(orphan_dcs))
                 await db.commit()
 
         # ── Mark completed ──

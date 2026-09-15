@@ -168,3 +168,106 @@ def test_build_exhausted_response_uses_real_period_end_not_30_day_fallback():
         f"period_end was supplied — copy must not show fallback 30-day "
         f"countdown, got: {resp.message}"
     )
+
+
+# ── REASON_RATE_LIMITED — the UNLIMITED ladder's last resort ─────────
+#
+# This is the ONE refusal in the system that is not about money. It can only
+# fire on an account that is never denied and never charged, so every word of
+# billing copy in this module would be a lie if it reached that user — and it
+# would reach them at the worst possible moment, wearing a price tag.
+
+
+_BILLING_WORDS = ("pricing", "upgrade", "plan", "credit", "$", "limit reached",
+                  "out of", "renew", "balance", "subscription")
+
+
+def test_rate_limited_copy_has_no_billing_language():
+    """The pinned property. Not "reads nicely" — mechanically checked, because
+    the failure mode is a well-meaning edit that adds "upgrade for more" to a
+    string that already exists five lines below one that says exactly that."""
+    from app.services.credit_exhausted import (
+        REASON_RATE_LIMITED, format_message_text,
+    )
+    txt = format_message_text(
+        reason=REASON_RATE_LIMITED,
+        monthly_reset_at=_RENEW,
+        daily_reset_at=None,
+        plan_id="unlimited",
+        now=_NOW,
+        balance_after=Decimal("1000000"),
+    )
+    low = txt.lower()
+    for w in _BILLING_WORDS:
+        assert w not in low, f"rate-limited copy must not say {w!r} — got: {txt}"
+    # …and it must actually say the true thing.
+    assert "few seconds" in low and "try again" in low
+
+
+def test_rate_limited_response_carries_no_call_to_action():
+    """`cta_hidden` is the load-bearing field, not the blank strings.
+
+    Both shipped clients read `payload.cta_url || '/pricing'` and
+    `payload.cta_label || 'Upgrade plan'`, so blanking the two would RESTORE
+    the paywall button rather than remove it. The neutral pair below is the
+    fallback for a client that predates the flag.
+    """
+    from app.services.credit_exhausted import (
+        REASON_RATE_LIMITED, build_exhausted_response, response_to_http_detail,
+    )
+    resp = build_exhausted_response(
+        reason=REASON_RATE_LIMITED,
+        bucket="message",
+        balance_after=Decimal("1000000"),
+        plan_id="unlimited",
+        plan_display_name="Unlimited",
+        period_end=_RENEW,
+        now=_NOW,
+    )
+    assert resp.cta_hidden is True
+    assert resp.cta_url != "/pricing" and resp.cta_url, (
+        "an EMPTY url falls back to /pricing on both shipped clients"
+    )
+    assert "upgrade" not in resp.cta_label.lower()
+    detail = response_to_http_detail(resp)
+    assert detail["cta_hidden"] is True
+    assert detail["reason"] == "rate_limited"
+
+
+def test_every_other_reason_keeps_its_upgrade_cta():
+    """The suppression is scoped to one reason. A free user who really is out
+    of credits still gets the door to the fix — that is not a paywall, it is
+    the only useful thing to say."""
+    from app.services.credit_exhausted import (
+        REASON_DAILY_CAP_EXCEEDED, REASON_INSUFFICIENT_MESSAGE,
+        build_exhausted_response,
+    )
+    for reason in (REASON_INSUFFICIENT_MESSAGE, REASON_DAILY_CAP_EXCEEDED):
+        resp = build_exhausted_response(
+            reason=reason,
+            bucket="message",
+            balance_after=Decimal("0"),
+            plan_id="free",
+            plan_display_name="Free",
+            period_end=_RENEW,
+            user_timezone="America/Toronto",
+            has_daily_cap=True,
+            now=_NOW,
+        )
+        assert resp.cta_hidden is False
+        assert resp.cta_url == "/pricing"
+        assert resp.cta_label == "Upgrade plan"
+
+
+def test_the_reason_code_is_shared_by_both_modules():
+    """credit_service re-exports it so the two reason vocabularies stay one
+    vocabulary — the module docstring's rule."""
+    from app.services.credit_exhausted import REASON_RATE_LIMITED as A
+    from app.services.credit_service import REASON_RATE_LIMITED as B
+    assert A == B == "rate_limited"
+    # And it is NOT one of the four money reasons.
+    from app.services import credit_service as cs
+    assert A not in (cs.REASON_INSUFFICIENT_MESSAGE,
+                     cs.REASON_INSUFFICIENT_INTEGRATION,
+                     cs.REASON_DAILY_CAP_EXCEEDED,
+                     cs.REASON_EMAIL_NOT_VERIFIED)

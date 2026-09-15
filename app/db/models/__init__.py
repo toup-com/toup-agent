@@ -104,7 +104,7 @@ from .memory_v2 import (
 from .soul_config import SoulConfig
 
 # Platform (VPS, invites, billing)
-from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, SearchEvent, PlatformSetting
+from .platform import VPSPlan, VPSInstance, ManagedContainer, Invite, LLMBundleAllocation, LLMUsageRecord, LLMProxyEvent, SearchEvent, PlatformSetting, InfraLease, AgentProbeState
 
 # Product-funnel telemetry (platform-only). The event NAMES are exported
 # beside the model so a producer never has to spell one by hand.
@@ -175,6 +175,7 @@ from .live_activity import (
 from .credit import (
     SubscriptionPlan, CreditBalance, CreditLedger, CreditReservation,
     AppleSubscription,
+    UnlimitedGrant, SPONSOR_KIND_APPLE, SPONSOR_KIND_STRIPE,
     APPLE_SUB_ACTIVE, APPLE_SUB_EXPIRED, APPLE_SUB_BILLING_RETRY,
     APPLE_SUB_GRACE, APPLE_SUB_REVOKED,
     BUCKET_MESSAGE, BUCKET_INTEGRATION,
@@ -298,6 +299,7 @@ __all__ = [
     "EVENT_FORCE_QUARANTINED", "EVENT_FORCE_RELEASED",
     "SubscriptionPlan", "CreditBalance", "CreditLedger", "CreditReservation",
     "AppleSubscription",
+    "UnlimitedGrant", "SPONSOR_KIND_APPLE", "SPONSOR_KIND_STRIPE",
     "APPLE_SUB_ACTIVE", "APPLE_SUB_EXPIRED", "APPLE_SUB_BILLING_RETRY",
     "APPLE_SUB_GRACE", "APPLE_SUB_REVOKED",
     # Maintenance / support agent

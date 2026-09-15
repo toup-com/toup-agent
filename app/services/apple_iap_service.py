@@ -36,6 +36,11 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import settings
+from app.db.plan_catalog import (
+    LEGACY_SUB_PRODUCT_IDS,
+    UNLIMITED_PLAN_ID,
+    UNLIMITED_SUB_PRODUCT_ID,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,16 +56,94 @@ PRODUCT_CREDITS: dict[str, Decimal] = {
 }
 
 
-# Auto-renewable subscription products → the subscription_plans row id they map
-# to. Apple reuses the SAME plan rows Stripe uses (no new plan rows). This map
-# is intentionally DISJOINT from PRODUCT_CREDITS (consumables): a product id
-# belongs to exactly one map, and the notification handler branches on which.
+# Auto-renewable subscription products → the subscription_plans row the product
+# was SOLD AS. This map is intentionally DISJOINT from PRODUCT_CREDITS
+# (consumables): a product id belongs to exactly one map, and the notification
+# handler branches on which. It is the membership test (iap.py) and the
+# historical record of what each product is — it is NOT the entitlement answer.
+# Call :func:`plan_for_subscription` for that.
+#
+# ⚠️ THE FOUR LEGACY IDS MUST NEVER BE REMOVED FROM THIS DICT. Removing one
+#    makes that subscriber's DID_RENEW fall through to "notification for
+#    unrecognised product; ignoring" plus a 200 ack — no grant, no downgrade,
+#    no retry, no alert, and Apple never redelivers. They also stay on sale in
+#    App Store Connect forever: "remove from sale" stops RENEWALS too, and
+#    EXPIRED is in _SUB_DOWNGRADE_TYPES, so removing them downgrades the
+#    people who are still paying.
 APPLE_SUB_PRODUCT_TO_PLAN: dict[str, str] = {
     "ai.toup.app.sub.starter": "starter",
     "ai.toup.app.sub.builder": "builder",
     "ai.toup.app.sub.pro":     "pro",
     "ai.toup.app.sub.elite":   "elite",
+    UNLIMITED_SUB_PRODUCT_ID:  UNLIMITED_PLAN_ID,
 }
+
+
+def plan_for_subscription(product_id: str, sub=None) -> str:
+    """The plan a subscription ENTITLES right now — the entitlement resolver.
+
+    * The Unlimited product always entitles Unlimited.
+    * A legacy product entitles Unlimited **iff this subscription was
+      grandfathered ON THAT SAME PRODUCT** — recorded on the
+      ``apple_subscriptions`` row by ``app.scripts.grandfather_unlimited``,
+      never inferred from the product.
+    * A legacy product on a subscription that was never grandfathered, or that
+      was grandfathered on a DIFFERENT product, entitles the tier it was sold
+      as.
+
+    The product half is load-bearing, and reading only ``grandfathered_at``
+    was a live money leak. The four legacy products must stay on sale in App
+    Store Connect forever (removing one stops its renewals, and EXPIRED is in
+    _SUB_DOWNGRADE_TYPES), so Apple keeps showing all of them in the
+    customer's own Manage Subscriptions. A cross-grade inside a subscription
+    group keeps the SAME originalTransactionId, so a grandfathered Builder
+    payer who switches to Starter arrives here at the next DID_RENEW on the
+    same row with ``grandfathered_at`` still set — and, on the stamp alone,
+    kept Unlimited for CAD 9.90 permanently and unlogged. That is precisely
+    the route this column exists to close, and until now nothing read it.
+
+    A NULL ``grandfathered_product_id`` counts as a match: a row stamped by
+    hand, or before that column existed, must not be silently demoted.
+
+    Forfeiting on a product change is deliberately the answer in BOTH
+    directions, including an upgrade. The grandfather is "you keep Unlimited
+    at the price you were already paying"; a different product is a different
+    price, and the honest response to one is to hand it to a human — the
+    reconciler pages `apple-legacy-crossgrade` on exactly this row — not to
+    guess from `subscription_plans.price_cents`, which is the abandoned web
+    ladder and does not describe what Apple charges.
+
+    This is the function that stops the 2026-10-01 renewal from reverting the
+    grandfather: ``DID_RENEW`` re-derives the plan from the PRODUCT ID and
+    reapplies it, so stamping ``plan_id='unlimited'`` on the balance alone
+    would silently be undone the first time Apple renewed a legacy product.
+    The grandfathered payer's ``DID_RENEW`` resolves to ``unlimited`` here and
+    ``_apple_renew`` re-grants the Unlimited allowance instead.
+
+    Robustness property worth keeping: if this resolver ships but the
+    grandfather command has NOT run, ``grandfathered_at`` is NULL, the legacy
+    product resolves to its legacy tier, and behaviour is byte-for-byte
+    today's. The grandfather is the only thing that changes the answer.
+
+    ``sub`` is None only for a brand-new SUBSCRIBED that arrives before
+    ``/subscribe/verify`` has created the row — and a brand-new subscription
+    cannot be grandfathered, so resolving by product alone is correct there.
+    """
+    if product_id == UNLIMITED_SUB_PRODUCT_ID:
+        return UNLIMITED_PLAN_ID
+    if product_id in LEGACY_SUB_PRODUCT_IDS:
+        if sub is not None and getattr(sub, "grandfathered_at", None) is not None:
+            stamped = getattr(sub, "grandfathered_product_id", None)
+            if stamped is None or stamped == product_id:
+                return UNLIMITED_PLAN_ID
+            logger.warning(
+                "[iap] subscription %s was grandfathered on %s but now holds "
+                "%s — the grandfather does not follow a product change; "
+                "resolving to the tier it now holds",
+                getattr(sub, "original_transaction_id", "?"), stamped, product_id,
+            )
+        return APPLE_SUB_PRODUCT_TO_PLAN[product_id]
+    raise KeyError(product_id)
 
 
 _ROOT_CERTS_DIR = Path(__file__).resolve().parent / "apple_root_certs"
@@ -379,8 +462,179 @@ async def verify_subscription_transaction(
         product_id=product_id,
         environment=getattr(used_env, "value", str(used_env)),
         expires_date=ms_to_datetime(getattr(decoded, "expiresDate", None)),
+        # The CATALOGUE plan — what this product was sold as. This function
+        # never sees the apple_subscriptions row, so it cannot know whether
+        # the subscription was grandfathered. The verify route re-resolves
+        # through plan_for_subscription() once it has the row in hand.
         plan_id=APPLE_SUB_PRODUCT_TO_PLAN[product_id],
     )
+
+
+# ── Apple as the oracle: get_all_subscription_statuses ───────────────────
+#
+# Everything above is driven BY Apple (a client verify, a pushed
+# notification). This is the one call we make to ASK Apple what the truth is,
+# and it exists because the push channel has already dropped a message: the
+# Sandbox Elite row has read status='active' for 2.7 months past its expiry
+# with last_notification_uuid NULL, and DID_RENEW has never executed in
+# production. See app/services/apple_reconciler.py.
+
+
+# Apple's Status enum from get_all_subscription_statuses. Kept as raw ints
+# here so this module needs no import from app.db; the reconciler maps them
+# onto the apple_subscriptions.status mirror.
+#   1 active · 2 expired · 3 billing retry · 4 billing grace period · 5 revoked
+APPLE_STATUS_ACTIVE = 1
+APPLE_STATUS_EXPIRED = 2
+APPLE_STATUS_BILLING_RETRY = 3
+APPLE_STATUS_GRACE = 4
+APPLE_STATUS_REVOKED = 5
+
+
+@dataclass
+class AppleSubscriptionStatus:
+    """Apple's own answer for one subscription.
+
+    ``status`` is Apple's; ``expires_date`` / ``auto_renew_*`` come from the
+    signed transaction + renewal-info payloads carried alongside it, decoded
+    through the same JWS chain verification every other path uses. A field is
+    None when Apple did not send it or its payload would not decode — the
+    caller must treat None as "unknown", never as "changed to nothing".
+    """
+    original_transaction_id: str
+    environment: str
+    status: int
+    product_id: Optional[str] = None
+    expires_date: Optional[datetime] = None
+    auto_renew_status: Optional[bool] = None
+    auto_renew_product_id: Optional[str] = None
+
+
+def _fetch_subscription_statuses(environment, original_txn: str):
+    """Blocking: call get_all_subscription_statuses. None ⇒ Apple does not
+    know this transaction in this environment (the caller may try the other).
+
+    Mirrors ``_fetch_signed_transaction``'s error discipline exactly: an
+    APIException is "not here", anything else is a hard failure the caller
+    must be able to tell apart from "nothing to fix".
+    """
+    from appstoreserverlibrary.api_client import AppStoreServerAPIClient, APIException
+
+    client: AppStoreServerAPIClient = _build_api_client(environment)
+    try:
+        return client.get_all_subscription_statuses(original_txn)
+    except APIException as e:
+        logger.info(
+            "[apple-iap] get_all_subscription_statuses APIException env=%s "
+            "orig_txn=%s: %s", environment, original_txn, e,
+        )
+        return None
+    except Exception as e:  # network / TLS / unexpected
+        raise IapVerificationError(
+            f"App Store Server API call failed: {e}"
+        ) from e
+
+
+async def fetch_subscription_status(
+    original_transaction_id: str, environment_hint: str,
+) -> Optional[AppleSubscriptionStatus]:
+    """Ask Apple for the current state of one subscription.
+
+    Queries ONLY the environment it is handed. That is deliberate and differs
+    from ``verify_transaction``'s dual-env fallback: the reconciler already
+    knows which environment each mirror row belongs to, and a Production
+    lookup that silently fell back to Sandbox would let sandbox test data
+    decide a real customer's plan.
+
+    Returns None when Apple does not know the transaction there. Raises
+    :class:`IapVerificationError` on a network/API failure, so a caller can
+    tell "Apple says nothing is wrong" from "we could not ask".
+    """
+    if not iap_configured():
+        raise IapVerificationError("IAP not configured on server")
+    if not original_transaction_id:
+        raise IapVerificationError("missing original_transaction_id")
+
+    env = _env_from_hint(environment_hint)
+    resp = await asyncio.to_thread(
+        _fetch_subscription_statuses, env, original_transaction_id,
+    )
+    if resp is None:
+        return None
+
+    item = _last_transaction_for(resp, original_transaction_id)
+    if item is None:
+        logger.info(
+            "[apple-iap] no lastTransactions entry for orig_txn=%s env=%s",
+            original_transaction_id, env,
+        )
+        return None
+
+    status_val = getattr(item, "status", None)
+    status_int = getattr(status_val, "value", status_val)
+    if status_int is None:
+        logger.warning(
+            "[apple-iap] status response for orig_txn=%s carries no status",
+            original_transaction_id,
+        )
+        return None
+
+    out = AppleSubscriptionStatus(
+        original_transaction_id=original_transaction_id,
+        environment=getattr(env, "value", str(env)),
+        status=int(status_int),
+    )
+
+    # The signed payloads are optional in the response and each decodes
+    # independently. A decode failure must degrade to "unknown" for that
+    # field, never fail the whole read — Apple's STATUS is the part this
+    # reconciler cannot do without, and it is already in hand.
+    signed_txn = getattr(item, "signedTransactionInfo", None)
+    if signed_txn:
+        try:
+            txn = await asyncio.to_thread(
+                _verify_and_decode_transaction, env, signed_txn,
+            )
+            out.product_id = getattr(txn, "productId", None)
+            out.expires_date = ms_to_datetime(getattr(txn, "expiresDate", None))
+        except Exception as e:
+            logger.warning(
+                "[apple-iap] could not decode status txn for orig_txn=%s: %s",
+                original_transaction_id, e,
+            )
+
+    signed_renewal = getattr(item, "signedRenewalInfo", None)
+    if signed_renewal:
+        try:
+            info = await asyncio.to_thread(
+                _verify_and_decode_renewal_info, env, signed_renewal,
+            )
+            ars = getattr(info, "autoRenewStatus", None)
+            ars_val = getattr(ars, "value", ars)
+            if ars_val is not None:
+                out.auto_renew_status = bool(ars_val)
+            out.auto_renew_product_id = getattr(info, "autoRenewProductId", None)
+        except Exception as e:
+            logger.warning(
+                "[apple-iap] could not decode status renewal info for "
+                "orig_txn=%s: %s", original_transaction_id, e,
+            )
+    return out
+
+
+def _last_transaction_for(resp, original_transaction_id: str):
+    """Find this subscription's lastTransactions entry in a StatusResponse.
+
+    The response is grouped by subscription group and each group carries every
+    subscription in it, so a match on ``originalTransactionId`` is required —
+    taking ``data[0].lastTransactions[0]`` would read a DIFFERENT subscription
+    of the same customer whenever they hold more than one.
+    """
+    for group in (getattr(resp, "data", None) or []):
+        for item in (getattr(group, "lastTransactions", None) or []):
+            if str(getattr(item, "originalTransactionId", "")) == str(original_transaction_id):
+                return item
+    return None
 
 
 def _verify_and_decode_transaction(environment, signed_transaction: str):

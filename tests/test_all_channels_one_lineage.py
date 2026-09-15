@@ -206,3 +206,52 @@ def test_at_least_one_channel_actually_bans_something():
     assert total["app"] >= 8, (
         f"app should ban the exec family + app_builder__*, got {total['app']}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# D1 (2026-09-14): the flag this whole file describes, and the other tier
+# ──────────────────────────────────────────────────────────────────────
+#
+# Everything above exercises `tool_defs_ignoring` directly, so it proves the
+# array CAN converge — not that it DOES. The convergence only reaches a
+# running tenant through `settings.channel_converge` (agent_runner.py:2763),
+# which shipped default-False, so on 2026-09-14 voice was still on its own
+# tools lineage in production while this file was green.
+#
+# D1 flips it, together with the system-prompt tier: a neutral prompt behind a
+# forked tools array buys nothing, because the array serialises FIRST and a
+# byte of difference there starts the lineage before the prompt is even read.
+# The system-tier twin of `test_every_channel_shares_one_cache_lineage` lives
+# in tests/test_channel_neutral_prefix.py — it needs a real
+# `_build_system_prompt` (and therefore the AGENT_ONLY `identities` table), so
+# it cannot live in this file's lane.
+
+
+@pytest.mark.xfail(
+    __import__("app.config", fromlist=["Settings"]).Settings
+    .model_fields["channel_converge"].default is False,
+    reason="RED until lane B1 flips channel_converge to default True (D1)",
+    strict=True,
+)
+def test_channel_converge_is_on_by_default():
+    """A per-tenant .env is written at provision time and never picks up a
+    flag introduced later (test_prompt_diet.py:70-78), so a default-OFF flag
+    reaches no container in the fleet — the file would keep passing while
+    every tenant kept forking."""
+    from app.config import Settings
+
+    assert Settings.model_fields["channel_converge"].default is True
+
+
+def test_the_converge_kill_switch_survives_the_default():
+    from app.config import Settings
+
+    assert Settings(_env_file=None, channel_converge=False).channel_converge is False
+
+
+def test_the_runner_still_reads_the_flag_from_settings():
+    """ANTI-VACUITY for the two above: a default nobody reads is not a flag."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "agent_runner.py").read_text()
+    assert 'getattr(settings, "channel_converge"' in src

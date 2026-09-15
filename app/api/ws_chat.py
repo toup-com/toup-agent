@@ -46,6 +46,7 @@ from app.config import settings
 from app.services.credit_exhausted import (
     REASON_DAILY_CAP_EXCEEDED,
     REASON_EMAIL_NOT_VERIFIED,
+    REASON_RATE_LIMITED,
     OutOfCreditsError,
     response_to_stream_event,
 )
@@ -437,6 +438,31 @@ async def _ensure_presave_conversation(
 # The first build that speaks the thread route. Below it the app can only
 # reach an automation over this socket, so the refusal would silence it.
 AUTOMATION_THREAD_ROUTE_MIN_BUILD = 92
+
+
+def should_rebucket_on_tz_change(
+    old_tz: Optional[str], new_tz: Optional[str]
+) -> bool:
+    """Does moving from `old_tz` to `new_tz` restack the user's day chats?
+
+    The shipped gate was `old_tz and old_tz != 'UTC' and old_tz != new_tz`,
+    which skipped exactly the two transitions that matter most: a tenant
+    born with `users.timezone` NULL, and one stamped 'UTC' by a default.
+    Those are the cases that produce a day chat dated in the user's
+    FUTURE — the 2026-09-14 incident — because every row until the learn
+    was bucketed on UTC's date.
+
+    Pure and module-level so it is testable without booting the socket.
+    """
+    if not new_tz:
+        return False
+    new_tz = new_tz.strip()
+    if not new_tz:
+        return False
+    old = (old_tz or "").strip()
+    if not old or old == "UTC":
+        return True
+    return old != new_tz
 
 
 def _is_thread_route_exempt(msg: dict) -> bool:
@@ -2880,12 +2906,42 @@ async def ws_chat(
         if not user_id:
             if client_disconnected:
                 return
+            # D5 (2026-09-12): this branch and the 4503 below BOTH returned
+            # with no log line, so "the platform's key did not match" and "the
+            # client hung up" were indistinguishable in the agent's log —
+            # reconstructing the incident required inferring from a 150 ms
+            # `connection open/closed` gap plus adjacent HTTP 401s. A sha256
+            # PREFIX of presented vs expected answers it in one line and leaks
+            # nothing: equal prefixes mean the key is right and the fault is
+            # elsewhere; different ones mean the platform is holding a key for
+            # a different container.
+            import hashlib as _hashlib
+
+            def _fp(v) -> str:
+                return (
+                    _hashlib.sha256(str(v).encode("utf-8")).hexdigest()[:8]
+                    if v else "none"
+                )
+
+            logger.warning(
+                "[WS] REJECT 4001 Authentication required — presented_key=%s "
+                "expected_key=%s had_header=%s had_query_key=%s "
+                "had_subprotocol_token=%s had_query_token=%s",
+                _fp(header_agent_key or agent_key), _fp(settings.agent_api_key),
+                bool(header_agent_key), bool(agent_key),
+                bool(subprotocol_token), bool(token),
+            )
             await safe_send_close_ws(
                 websocket, code=4001, message="Authentication required",
             )
             return
 
         if not _agent_runner:
+            logger.warning(
+                "[WS] REJECT 4503 agent_starting — authenticated user=%s but "
+                "_agent_runner is not initialised yet",
+                str(user_id)[:8],
+            )
             # `code` is the client's classification hook (round N P0): the
             # app renders "your agent is restarting" copy for this class and
             # never the generic "try sending it again" — which tonight's
@@ -3323,7 +3379,9 @@ async def ws_chat(
 
                 # ── Persist timezone to User if changed ──
                 # Self-healing: frontend sends tz on every message, we persist it once.
-                # If timezone changes from one real value to another, queue a re-bucket.
+                # EVERY transition queues work — see should_rebucket_on_tz_change;
+                # NULL→real and 'UTC'→real are the ones that strand a day chat in
+                # the user's future, and they were the two the old gate skipped.
                 # Shape and resolvability were both settled at parse time, so a
                 # truthy client_tz here is a name zoneinfo can load.
                 if client_tz:
@@ -3341,55 +3399,118 @@ async def ws_chat(
                                     await _tz_db.commit()
                                     logger.info("[WS] Updated timezone for %s: %s → %s", user_id[:8], _old_tz, client_tz)
                                     # TKT-LAT-004: drop the in-process tz
-                                    # cache so the next agent turn picks
-                                    # up the new value instead of stale.
+                                    # cache so the next agent turn picks up
+                                    # the new value instead of stale. The
+                                    # tz-ONLY variant used here left the
+                                    # day-chat cache holding the PRE-FLIP
+                                    # day id for up to 300 s, so the next
+                                    # turns kept writing into the wrong day.
                                     try:
-                                        from app.agent._user_tz_cache import invalidate_cached_user_tz
-                                        invalidate_cached_user_tz(user_id)
+                                        from app.agent._user_tz_cache import (
+                                            invalidate_cached_user_tz_with_day_chat,
+                                        )
+                                        invalidate_cached_user_tz_with_day_chat(user_id)
                                     except Exception:
                                         pass
 
-                                    # Auto-rebucket if timezone changed from one real value to another
-                                    # (not just NULL → real, which is the initial backfill case)
-                                    if _old_tz and _old_tz != "UTC" and _old_tz != client_tz:
-                                        import os as _tz_os
-                                        async def _trigger_rebucket():
-                                            try:
-                                                import importlib.util as _ilu
-                                                _spec = _ilu.spec_from_file_location(
-                                                    "backfill_day_chats",
-                                                    _tz_os.path.join(_tz_os.path.dirname(_tz_os.path.dirname(__file__)), "services", "backfill_day_chats.py"),
-                                                )
-                                                _bmod = _ilu.module_from_spec(_spec)
-                                                _spec.loader.exec_module(_bmod)
+                                    if should_rebucket_on_tz_change(_old_tz, client_tz):
+                                        _real_to_real = bool(
+                                            _old_tz
+                                            and _old_tz.strip()
+                                            and _old_tz.strip() != "UTC"
+                                        )
+                                        if _real_to_real:
+                                            import os as _tz_os
 
-                                                # Reset migration status to not_started
-                                                from app.db.models.day_chat import MigrationStatus
-                                                async with _tz_sm() as _rb_db:
-                                                    ms = (await _rb_db.execute(
-                                                        select(MigrationStatus).where(
-                                                            MigrationStatus.migration_name == "day_chat_backfill"
+                                            async def _trigger_rebucket():
+                                                try:
+                                                    import importlib.util as _ilu
+                                                    _spec = _ilu.spec_from_file_location(
+                                                        "backfill_day_chats",
+                                                        _tz_os.path.join(_tz_os.path.dirname(_tz_os.path.dirname(__file__)), "services", "backfill_day_chats.py"),
+                                                    )
+                                                    _bmod = _ilu.module_from_spec(_spec)
+                                                    _spec.loader.exec_module(_bmod)
+
+                                                    # Reset migration status to not_started
+                                                    from app.db.models.day_chat import MigrationStatus
+                                                    async with _tz_sm() as _rb_db:
+                                                        ms = (await _rb_db.execute(
+                                                            select(MigrationStatus).where(
+                                                                MigrationStatus.migration_name == "day_chat_backfill"
+                                                            )
+                                                        )).scalar_one_or_none()
+                                                        if ms:
+                                                            ms.status = "not_started"
+                                                            ms.started_at = None
+                                                            ms.completed_at = None
+                                                            ms.progress_json = None
+                                                            ms.error_message = None
+                                                            await _rb_db.commit()
+
+                                                    result = await _bmod.run_backfill(_tz_sm)
+                                                    logger.info("day_chat_backfill.rebucket_completed tz_change=%s→%s result=%s", _old_tz, client_tz, result)
+                                                except Exception as _rbe:
+                                                    logger.error("day_chat_backfill.rebucket_failed error=%s", _rbe)
+
+                                            # NOTE: If the WS connection closes mid-rebucket, this task may be
+                                            # garbage-collected and MigrationStatus left in 'in_progress'.
+                                            # This is acceptable — the next agent restart resumes it via
+                                            # the standard backfill startup path (in_progress → resume).
+                                            asyncio.create_task(_trigger_rebucket())
+                                            logger.info("day_chat_backfill.rebucket_queued tz_change=%s→%s", _old_tz, client_tz)
+                                        else:
+                                            # NULL/'UTC' → real. Only the
+                                            # FUTURE-dated days are wrong
+                                            # (everything was bucketed on
+                                            # UTC's date), so the scoped
+                                            # service is the right tool —
+                                            # a full backfill would restack
+                                            # the user's entire history for
+                                            # a first-ever tz learn.
+                                            _learned_tz = client_tz
+
+                                            async def _trigger_scoped_rebucket():
+                                                try:
+                                                    from app.services.day_chat_rebucket import (
+                                                        rebucket_user_days,
+                                                    )
+                                                except Exception as _imp_err:
+                                                    # Older image: the service
+                                                    # may not exist yet.
+                                                    logger.warning(
+                                                        "[rebucket] service unavailable user=%s err=%s",
+                                                        user_id[:8], _imp_err,
+                                                    )
+                                                    return
+                                                try:
+                                                    async with _tz_sm() as _rb_db:
+                                                        _res = await rebucket_user_days(
+                                                            _rb_db, user_id, _learned_tz,
+                                                            scope="future",
                                                         )
-                                                    )).scalar_one_or_none()
-                                                    if ms:
-                                                        ms.status = "not_started"
-                                                        ms.started_at = None
-                                                        ms.completed_at = None
-                                                        ms.progress_json = None
-                                                        ms.error_message = None
-                                                        await _rb_db.commit()
+                                                    logger.info(
+                                                        "[rebucket] tz_learn user=%s tz=%s→%s result=%s",
+                                                        user_id[:8], _old_tz, _learned_tz, _res,
+                                                    )
+                                                except Exception as _rbe:
+                                                    logger.error(
+                                                        "[rebucket] tz_learn failed user=%s err=%s",
+                                                        user_id[:8], _rbe, exc_info=True,
+                                                    )
 
-                                                result = await _bmod.run_backfill(_tz_sm)
-                                                logger.info("day_chat_backfill.rebucket_completed tz_change=%s→%s result=%s", _old_tz, client_tz, result)
-                                            except Exception as _rbe:
-                                                logger.error("day_chat_backfill.rebucket_failed error=%s", _rbe)
-
-                                        # NOTE: If the WS connection closes mid-rebucket, this task may be
-                                        # garbage-collected and MigrationStatus left in 'in_progress'.
-                                        # This is acceptable — the next agent restart resumes it via
-                                        # the standard backfill startup path (in_progress → resume).
-                                        asyncio.create_task(_trigger_rebucket())
-                                        logger.info("day_chat_backfill.rebucket_queued tz_change=%s→%s", _old_tz, client_tz)
+                                            if getattr(settings, "day_chat_rebucket_enabled", True):
+                                                asyncio.create_task(_trigger_scoped_rebucket())
+                                                logger.info(
+                                                    "[rebucket] queued scope=future user=%s tz_change=%s→%s",
+                                                    user_id[:8], _old_tz, client_tz,
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    "[rebucket] DISABLED (day_chat_rebucket_enabled=0) — "
+                                                    "not queued user=%s tz_change=%s→%s",
+                                                    user_id[:8], _old_tz, client_tz,
+                                                )
                     except Exception as _tz_err:
                         logger.debug("[WS] Timezone persistence skipped: %s", _tz_err)
 
@@ -3672,12 +3793,34 @@ async def ws_chat(
                             # turn regardless of DB persistence — the structured
                             # pointer is for future history rendering, not the
                             # current turn.
+                            from app.agent.channel_util import (
+                                resolve_channel as _resolve_channel_msg,
+                            )
+                            # Every row stores its own immutable origin.
+                            # Leaving it NULL made every reader fall back to
+                            # Conversation.channel, which is mutable and is
+                            # the wrong answer the moment one Conversation is
+                            # reused across surfaces. One dict, so the
+                            # reply_to retry below inherits it.
+                            _presave_channel = _resolve_channel_msg(
+                                explicit=channel,
+                                conversation_hint=getattr(_conv, "channel", None),
+                                user_id=user_id,
+                                site="ws_presave_message",
+                            )
+                            # `unknown` is resolve_channel's default, not an
+                            # origin; stored, it would be served verbatim
+                            # where every serializer's Conversation → 'web'
+                            # fallback used to answer. NULL keeps that ladder.
+                            if _presave_channel == "unknown":
+                                _presave_channel = None
                             _msg_kwargs: dict = dict(
                                 id=(_derived_msg_id or str(_uuid.uuid4())),
                                 conversation_id=session_id,
                                 day_chat_id=_presave_dc_id,
                                 role="user",
                                 content=_original_user_text,
+                                channel=_presave_channel,
                             )
                             if reply_to_message_id:
                                 _msg_kwargs["reply_to_message_id"] = reply_to_message_id
@@ -4091,7 +4234,18 @@ async def ws_chat(
                 _fast_result = await _fast_media_check(text, user_id, broadcast_queue)
                 _fast_text = _fast_result[0] if _fast_result else None
                 _agent_text = _fast_text or text
-                # Pre-set _last_media so the inline card persists on the saved message
+                # Still set: `_handle_radio_toggle_locked` resolves a
+                # seedless toggle-on off this value, and it reads the
+                # ENDPOINT task's context, which the run task's reset
+                # cannot reach. The persistence path no longer depends on
+                # it — see the `preset_media` kwarg on run() below, which
+                # carries the card by VALUE past `_run_inner`'s own
+                # ContextVar reset.
+                # `media_expected` is NOT counted here: `_run_inner` counts
+                # the card it is about to persist (preset OR tool-set), on
+                # the same code path and lifetime as `media_persisted`. A
+                # second increment here made the persist-gap alert fire
+                # forever for every tenant who played a song.
                 if _fast_result and hasattr(_agent_runner, 'tools'):
                     _agent_runner.tools._last_media = _fast_result[1]
 
@@ -4206,6 +4360,7 @@ async def ws_chat(
                 agent_task = asyncio.create_task(_agent_runner.run(
                     user_message=_agent_text,
                     display_user_message=_display_text,
+                    preset_media=(_fast_result[1] if _fast_result else None),
                     user_id=user_id,
                     session_id=session_id,
                     channel=channel,
@@ -4756,7 +4911,19 @@ async def ws_chat(
                             # stringified exception — the exact payload, free.
                             _detail = _extract_out_of_credits_detail(str(e))
                             if _detail is not None:
-                                _credit_frame = {"type": "credit_exhausted", **_detail}
+                                # Same rule as response_to_stream_event: a
+                                # rate-limited refusal never rides the
+                                # credit_exhausted channel, because App Store
+                                # build 109 renders an unrecognised reason as
+                                # its hardest paywall. Reconstructing the frame
+                                # from the proxy's 402 body must not be the
+                                # route back in.
+                                if _detail.get("reason") == REASON_RATE_LIMITED:
+                                    _credit_frame = None
+                                else:
+                                    _credit_frame = {
+                                        "type": "credit_exhausted", **_detail,
+                                    }
                             else:
                                 # Layer 2: warm in-process state.
                                 _resp = credit_reporter.get_state().build_exhausted_response()

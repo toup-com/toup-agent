@@ -1274,6 +1274,78 @@ async def get_me(current_user=Depends(get_current_user)):
     return current_user
 
 
+# At most this many timezone pushes in flight per platform process. The
+# bridge is single-threaded (incident 2026-09-06); `update_container_env`
+# already serialises per user, this bounds the fan-out ACROSS users.
+_TZ_PUSH_GATE = asyncio.Semaphore(2)
+# Strong references: the loop keeps only a weak ref to a task, so a
+# fire-and-forget push could be collected mid-await (asyncio docs).
+_TZ_PUSH_TASKS: set = set()
+
+
+def _push_tz_to_agent(user_id: str) -> None:
+    """Best-effort: tell the user's tenant about a timezone it cannot learn
+    on its own.
+
+    `invalidate_cached_user_tz` beside each write is a no-op ACROSS THE SEAM —
+    it clears a cache in the PLATFORM process, while the tenant that buckets
+    days lives in another container entirely. `update_container_env` rebuilds
+    the bind payload (which now carries `user_timezone`) and POSTs
+    /v1/pool/refresh-config, so the tenant NULL-fills its own users row within
+    a round-trip instead of at the next unrelated config push.
+
+    Fire-and-forget: a bridge stall must never fail a profile save.
+
+    POOL tenants only, and `update_container_env(pool_only=True)` enforces
+    it a second time inside the service. For any container whose name is
+    not `toup-agent-pool-NN`, `_update_container_env` falls through to
+    `provision_container(recreate=True)` — the bridge force-removes and
+    re-runs the container. A timezone is env freshness; it is never worth
+    dropping a live WhatsApp socket and an in-flight turn, and the R40
+    incident record shows that fall-through can also bind a DIFFERENT
+    database. A named tenant learns the zone on its first WS turn, which is
+    what `scripts/push_tenant_timezones.py` already relies on.
+
+    Paced: the new mobile build PATCHes the zone on every launch, so a
+    release day can queue every tenant's bind at once against a
+    single-threaded bridge. `_TZ_PUSH_GATE` bounds the concurrency the
+    same way the ops script's `--pause-s` bounds its loop.
+    """
+
+    async def _push() -> None:
+        try:
+            from app.db.database import async_session_maker as _sm
+            from app.db.models import AgentConfig, ManagedContainer
+            from app.services.docker_host_service import update_container_env
+
+            async with _TZ_PUSH_GATE:
+                async with _sm() as _pdb:
+                    mc = (await _pdb.execute(
+                        select(ManagedContainer).where(ManagedContainer.user_id == user_id)
+                    )).scalar_one_or_none()
+                    if not mc or not (mc.container_name or "").startswith("toup-agent-pool-"):
+                        logger.info(
+                            "[auth] tz push skipped user=%s container=%s — pool tenants only",
+                            user_id[:8], getattr(mc, "container_name", None),
+                        )
+                        return
+                    cfg = (await _pdb.execute(
+                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                    )).scalar_one_or_none()
+                    if cfg:
+                        await update_container_env(_pdb, user_id, cfg, pool_only=True)
+        except Exception:
+            logger.warning("[auth] tz push to agent failed", exc_info=True)
+
+    try:
+        _t = asyncio.create_task(_push())
+        _TZ_PUSH_TASKS.add(_t)
+        _t.add_done_callback(_TZ_PUSH_TASKS.discard)
+    except RuntimeError:
+        # No running loop (sync test harness) — nothing to push to.
+        pass
+
+
 @router.patch("/profile")
 async def update_profile(
     body: UpdateProfileRequest,
@@ -1288,6 +1360,7 @@ async def update_profile(
     boot-time call is cheap and idempotent.
     """
     changed = False
+    _tz_changed = False
     if body.name is not None and body.name != current_user.name:
         current_user.name = body.name
         changed = True
@@ -1308,10 +1381,13 @@ async def update_profile(
             invalidate_cached_user_tz(current_user.id)
         except Exception:
             pass
+        _tz_changed = True
     if changed:
         current_user.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(current_user)
+    if _tz_changed:
+        _push_tz_to_agent(current_user.id)
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -1399,6 +1475,7 @@ async def timezone_from_coords(
             invalidate_cached_user_tz(current_user.id)
         except Exception:
             pass
+        _push_tz_to_agent(current_user.id)
 
     return {"timezone": tz_name}
 

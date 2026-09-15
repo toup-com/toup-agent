@@ -367,8 +367,11 @@ class AgentTunnelClient:
         # tunnel, but the running process still had no WhatsApp channel
         # spawned at boot (mode was NULL then), and `_require_active_
         # channel()` rejected the /qr/start proxy. Always re-evaluate
-        # mode on settings reload — `restart_whatsapp_channel` is a
-        # no-op when the active adapter already matches the new config.
+        # mode on settings reload. This comment used to claim the restart
+        # was a no-op when the config already matched; it never was — every
+        # config push killed and re-spawned a working Baileys session. It
+        # is true now: `_restart_whatsapp_locked` compares a config
+        # fingerprint against the registered adapter and returns early.
         try:
             import agent_main
             import asyncio
