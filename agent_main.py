@@ -19,7 +19,7 @@ import os
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response
 
 # Configure logging so agent_runner [PERF] and [AGENT] logs show in journalctl
@@ -27,6 +27,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
 )
+# Round 46 A15: this container's log is shipped to Loki and read by operators
+# and by agents. Before this line it carried a live Telegram bot token (httpx
+# logs every request URL at INFO), phone numbers, WhatsApp JIDs and user names
+# on ordinary paths. Installed here, immediately after basicConfig, so it is
+# attached to the root handler before any module logs its first line.
+from app.services.log_redaction import install_content_redaction  # noqa: E402
+
+install_content_redaction()
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -192,6 +200,11 @@ async def agent_schema_status(refresh: bool = False) -> dict:
 _PUBLIC_PATHS = frozenset({
     "/", "/agent/health", "/agent/system", "/docs", "/openapi.json", "/redoc",
     "/api/admin/bind", "/api/admin/drain", "/api/admin/status",
+    # R46 F9b. The bridge calls this with X-Pool-Admin-Token ONLY (it holds no
+    # agent key), and this middleware is an EXACT-membership test — without
+    # the entry every force-logout on a pool release answered 401 and the
+    # privacy fix was inert while logging success.
+    "/api/admin/whatsapp-logout",
 })
 
 # Routes that remain reachable in pool-lobby mode (TOUP_POOL_GENERIC=1
@@ -204,6 +217,10 @@ _LOBBY_ALLOWED = frozenset({
     "/", "/agent/health", "/agent/system",
     "/api/admin/bind", "/api/admin/drain", "/api/admin/status",
 })
+
+# Strong references for fire-and-forget lifespan tasks — `asyncio.create_task`
+# keeps only a weak one, so an unreferenced task may be collected mid-run.
+_BOOT_BACKGROUND_TASKS: set = set()
 
 
 # ── Module-level refs for hot-restart of channel bots ──────────────
@@ -367,6 +384,56 @@ async def restart_whatsapp_channel(force: bool = False, register_app=None):
             _wa_restart_waiting = max(0, _wa_restart_waiting - 1)
 
 
+def _apply_whatsapp_allowlist(existing, allowlist) -> None:
+    """Hot-apply an allowlist change to a running adapter (R46 F1).
+
+    Best-effort by construction: an adapter without `apply_allowlist` (the
+    Cloud API one, or a stale import during a rollout) simply keeps what it
+    has, which is exactly today's behaviour for that adapter.
+    """
+    fn = getattr(existing, "apply_allowlist", None)
+    if not callable(fn):
+        return
+    try:
+        if fn(list(allowlist)):
+            logging.info(
+                "[RESTART] whatsapp allowlist hot-applied size=%d (no restart)",
+                len(allowlist),
+            )
+    except Exception:
+        logging.exception("[RESTART] whatsapp allowlist hot-apply failed")
+
+
+def _wa_readiness(name: str) -> None:
+    """Publish a restart-path transition for waiters (R46 F2)."""
+    try:
+        from app.agent.channels import whatsapp_baileys as _wb
+        getattr(_wb, name)()
+    except Exception:
+        pass
+
+
+def _mark_wa_ready() -> None:
+    _wa_readiness("mark_adapter_ready")
+
+
+def _mark_wa_restarting() -> None:
+    _wa_readiness("mark_adapter_restarting")
+
+
+def _mark_wa_start_failed() -> None:
+    _wa_readiness("mark_adapter_start_failed")
+
+
+def _mark_wa_settled_if_pending() -> None:
+    try:
+        from app.agent.channels import whatsapp_baileys as _wb
+        if _wb.adapter_restart_in_flight():
+            _wb.mark_adapter_start_failed()
+    except Exception:
+        pass
+
+
 async def _restart_whatsapp_locked(force: bool = False, register_app=None):
     """The actual restart. Only ever called with `_wa_lock()` held.
 
@@ -403,9 +470,15 @@ async def _restart_whatsapp_locked(force: bool = False, register_app=None):
         s.strip() for s in (_s.whatsapp_baileys_allowlist or "").split(",")
         if s.strip()
     ]
+    # R46 F1: the allowlist is deliberately NOT in this fingerprint. It is not
+    # a socket parameter — the sidecar never sees it, only the inbound
+    # dispatch gate and health() read it — yet including it meant that seeding
+    # the user's own number at pair-code time SIGTERMed a sidecar that was
+    # mid-pairing, which is the whole ~14 s "Waking Aria and creating your
+    # code…" wait and both 503s (incident 2026-09-15 14:48:19→14:48:26).
+    # An allowlist-only change is hot-applied below instead.
     fp = (
         _wa_mode,
-        frozenset(_allowlist),
         _s.whatsapp_phone_number_id or "",
         bool(_s.whatsapp_access_token),
     )
@@ -445,6 +518,8 @@ async def _restart_whatsapp_locked(force: bool = False, register_app=None):
             and _h.get("sidecar_alive", True)
             and not _h.get("adopted_sidecar", False)
         ):
+            _apply_whatsapp_allowlist(existing, _allowlist)
+            _mark_wa_ready()
             logging.info(
                 "[RESTART] whatsapp config unchanged and adapter healthy — no-op"
             )
@@ -455,6 +530,10 @@ async def _restart_whatsapp_locked(force: bool = False, register_app=None):
             _h.get("started"), _h.get("is_current", True),
             _h.get("sidecar_alive", True), _h.get("adopted_sidecar", False),
         )
+
+    # From here the adapter is being replaced: a pair-code request that
+    # arrives now must WAIT for the new one, not meet an empty registry.
+    _mark_wa_restarting()
 
     if existing is not None:
         try:
@@ -493,9 +572,11 @@ async def _restart_whatsapp_locked(force: bool = False, register_app=None):
                     "leaving the registry slot empty",
                     _ok, _current,
                 )
+                _mark_wa_start_failed()
                 return
             ChannelRegistry.register(ch)
             _wa_config_fingerprint = fp
+            _mark_wa_ready()
             print("📱 WhatsApp channel restarted (QR-link / Baileys sidecar)")
         elif _wa_mode == "cloud_api" and _s.whatsapp_phone_number_id and _s.whatsapp_access_token:
             from app.agent.channels.whatsapp_channel import WhatsAppChannel
@@ -517,6 +598,12 @@ async def _restart_whatsapp_locked(force: bool = False, register_app=None):
             print("📱 WhatsApp channel restarted (Cloud API)")
     except Exception as e:
         logging.exception(f"[RESTART] Failed to start WhatsApp channel: {e}")
+    finally:
+        # Every exit that did not produce a routable Baileys adapter — a
+        # cloud-API tenant, an unconfigured one, a raised start — must still
+        # END the restart window, or a pair-code waiter holds its 6 s for
+        # nothing and `channels_settled` reports "starting" forever.
+        _mark_wa_settled_if_pending()
 
 
 class LobbyAndDrainMiddleware:
@@ -637,6 +724,16 @@ async def lifespan(app: FastAPI):
     global _app_start_time
     import time as _time
     _app_start_time = _time.time()
+
+    # Re-install the identifier redaction. It is first installed at import
+    # time (below basicConfig), but uvicorn configures `uvicorn`/
+    # `uvicorn.access` with its OWN handlers and `propagate=False` when it
+    # starts — after this module is imported — so the import-time pass cannot
+    # have reached them. Idempotent by construction.
+    try:
+        install_content_redaction()
+    except Exception:  # pragma: no cover - logging must never fail boot
+        logging.getLogger(__name__).debug("[redaction] re-install skipped", exc_info=True)
 
     # ── Bind-state boot restore (keyless-restart fix, 2026-07-04) ──
     # /admin/bind persists its payload to runtime.json AND mutates the
@@ -1993,6 +2090,53 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("[BG_PASSIVE] could not schedule promote task: %s", e)
 
+    # ── Loop-stall sampler (round 46) ─────────────────────────
+    # Started last, so it measures the steady state rather than boot's own
+    # (legitimately blocking) initialisation. Diagnostic only — see
+    # app/services/loop_health.py for why nothing gates on it.
+    try:
+        from app.services import loop_health as _loop_health
+        _loop_health.start()
+    except Exception as _lh_err:
+        logger.warning("[LOOP_STALL] sampler not started (non-fatal): %s", _lh_err)
+
+    # ── LLM-wire warm on the BOOT path (round 46, A1) ─────────
+    # /admin/bind warms an already-booted container when it is claimed; this
+    # covers a container that boots ALREADY bound (a restart, a blue-green
+    # promote), which would otherwise pay the SDK's once-per-process lazy
+    # work inside its owner's first message. `warm()` is idempotent, runs on
+    # a worker thread, and cannot fail a boot.
+    try:
+        async def _boot_warm_llm_wire() -> None:
+            try:
+                from app.services import runtime_identity as _ri_w
+                if not _ri_w.is_bound():
+                    return
+            except Exception:
+                return
+            try:
+                from app.services.openai_agent_service import get_openai_agent_service
+                from app.services.anthropic_service import get_anthropic_service
+
+                oai_ms = await asyncio.to_thread(get_openai_agent_service().warm)
+                ant_ms = await asyncio.to_thread(get_anthropic_service().warm)
+                logger.info(
+                    "[PERF] llm_wire_warm_ms=%d openai_ms=%d anthropic_ms=%d src=boot",
+                    int(oai_ms + ant_ms), int(oai_ms), int(ant_ms),
+                )
+            except Exception as _e:
+                logger.warning("[PERF] boot LLM wire warm failed (non-fatal): %s", _e)
+
+        # Reference held: `asyncio.create_task` keeps only a WEAK reference, so
+        # an unreferenced task can be collected mid-execution — and this one is
+        # the only producer of `llm_wire_warm` (a `turn_ready_detail`
+        # diagnostic, never a term of `serving` — D1).
+        _boot_warm_task = asyncio.create_task(_boot_warm_llm_wire())
+        _BOOT_BACKGROUND_TASKS.add(_boot_warm_task)
+        _boot_warm_task.add_done_callback(_BOOT_BACKGROUND_TASKS.discard)
+    except Exception as _warm_err:
+        logger.warning("[PERF] boot LLM wire warm not scheduled: %s", _warm_err)
+
     yield
 
     # ── Shutdown (reverse order) ──────────────────────────────
@@ -2218,6 +2362,18 @@ from app.api.ingest import router as ingest_router
 from app.api.documents import router as documents_router
 app.include_router(ingest_router, prefix=settings.api_prefix)
 app.include_router(documents_router, prefix=settings.api_prefix)
+# C6 (round 46): chat attachments upload BEFORE the turn instead of riding as
+# base64 inside the chat WS frame. Same topology as documents above — the
+# storage backend and `messages.attachments` are both here.
+from app.api.chat_attachments import (
+    AttachmentBodyLimitMiddleware,
+    router as chat_attachments_router,
+)
+app.include_router(chat_attachments_router, prefix=settings.api_prefix)
+# Before the multipart parse, not after it: fastapi calls `await
+# request.form()` ahead of the handler's dependencies, so the route's own read
+# ceiling refuses nothing an oversized body has already spooled to disk.
+app.add_middleware(AttachmentBodyLimitMiddleware)
 app.include_router(sessions_router, prefix=settings.api_prefix)
 app.include_router(day_chats_router, prefix=settings.api_prefix)
 app.include_router(chat_router, prefix=settings.api_prefix)
@@ -2383,10 +2539,185 @@ async def root():
     }
 
 
+# ── Turn readiness (round 46, C4/A9) ──────────────────────────────
+#
+# `turn_ready` KEEPS ITS MEANING (a runner exists). container_monitor
+# restarts a container on sustained `turn_ready=false`, so narrowing it
+# would turn a cold LLM wire into a fleet restart. The new, stricter
+# predicate the platform's onboarding probes read is `serving`, and its
+# parts are individually readable in `turn_ready_detail` so a probe can
+# say WHICH part is missing instead of "not ready".
+#
+# 2026-09-15: every probe in the incident answered "ready" truthfully and
+# uselessly — pool-82 was up, bound and booted, and could not serve a
+# turn for 56 s.
+_DB_PROBE_TTL_S = 5.0
+_db_probe_cache: dict = {"ok": None, "latency_ms": None, "checked_at": None, "mono": 0.0}
+
+
+async def _db_probe() -> dict:
+    """A REAL `SELECT 1` against the tenant engine, bounded and cached.
+
+    Not `db_watchdog`'s last opinion: on 2026-09-15 pool-38 served
+    `/agent/health` 200 four times during an eleven-minute total database
+    outage. Bounded at 1 s and cached for 5 s so a health poll can never
+    become the thing that holds the loop."""
+    import time as _t
+
+    now = _t.monotonic()
+    if _db_probe_cache["checked_at"] is not None and now - _db_probe_cache["mono"] < _DB_PROBE_TTL_S:
+        return {k: _db_probe_cache[k] for k in ("ok", "latency_ms", "checked_at")}
+
+    ok, latency_ms = False, None
+    t0 = _t.perf_counter()
+    try:
+        from sqlalchemy import text as _text
+        from app.db.database import async_session_maker as _sm
+
+        async def _run():
+            async with _sm() as session:
+                await session.execute(_text("SELECT 1"))
+
+        await asyncio.wait_for(_run(), timeout=1.0)
+        ok = True
+    except Exception:
+        ok = False
+    latency_ms = round((_t.perf_counter() - t0) * 1000.0, 1)
+    _db_probe_cache.update(
+        ok=ok,
+        latency_ms=latency_ms,
+        checked_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        mono=now,
+    )
+    # R46/L8: the same fact as a health_signals gauge, so container_monitor's
+    # anomaly sweep and the dashboards read it without parsing this block.
+    try:
+        from app.services import health_signals as _hs
+        _hs.set_gauge("db_reachable", 1 if ok else 0)
+    except Exception:  # noqa: BLE001 — a gauge must never fail a probe
+        pass
+    return {"ok": ok, "latency_ms": latency_ms, "checked_at": _db_probe_cache["checked_at"]}
+
+
+def _whatsapp_readiness() -> tuple:
+    """(fields, settled) from lane L1's `whatsapp_health_fields()`.
+
+    Defensive by contract: an image without the helper (the whole fleet
+    until a rollout completes) returns `(None, True)` — an ABSENT field
+    falls back to today's predicate, never to "not ready". Fail-closed
+    here would wedge onboarding for every new user on image 1cd801aacb11."""
+    try:
+        from app.agent.channels.whatsapp_baileys import whatsapp_health_fields as _wf
+
+        fields = _wf()
+        if not isinstance(fields, dict):
+            return None, True
+        return fields, bool(fields.get("settled", True))
+    except Exception:
+        return None, True
+
+
+async def _turn_readiness() -> dict:
+    """`serving` and its parts. Never raises; every unknown part is True."""
+    try:
+        from app.api import ws_chat as _ws_chat_mod
+        runner = _ws_chat_mod._agent_runner is not None
+        first_turn_done = _ws_chat_mod.turns_completed() > 0
+    except Exception:
+        runner = False
+        first_turn_done = False
+    try:
+        from app.services import runtime_identity as _ri
+        bound_user = bool(_ri.is_bound() and _ri.get_user_id())
+    except Exception:
+        bound_user = False
+    try:
+        from app.services.openai_agent_service import wire_warm as _wire_warm
+        llm_wire_warm = bool(_wire_warm())
+    except Exception:
+        llm_wire_warm = False
+    db = await _db_probe()
+    _wa_fields, channels_settled = _whatsapp_readiness()
+    try:
+        from app.services import loop_health as _lh
+        loop = _lh.snapshot()
+    except Exception:
+        loop = {"running": False, "samples": 0, "blocked_ms_max_30s": 0.0,
+                "blocked_ms_p99": 0.0, "stalls": 0, "last_stall": None}
+
+    detail = {
+        "runner": runner,
+        "db": bool(db["ok"]),
+        "bound_user": bound_user,
+        "llm_wire_warm": llm_wire_warm,
+        "channels_settled": channels_settled,
+        "first_turn_done": first_turn_done,
+        # DIAGNOSTIC. Deliberately NOT a term of `serving`: the normal
+        # distribution of loop lag on a 1.0-CPU cgroup has never been
+        # measured, and a moving-window threshold wired into a readiness
+        # gate is how a sampler becomes an outage (round 46 critic).
+        "loop_ok": True,
+    }
+    # `llm_wire_warm` and `channels_settled` are DIAGNOSTICS, never terms of
+    # `serving` (round 46 supervisor decision D1). Each has exactly one
+    # producer that can fail silently — the warm is a fire-and-forget task
+    # whose scheduler swallows, the WhatsApp settle is false for the whole of
+    # every adapter restart — and a false term pins readiness false for the
+    # life of the process for a container that answers turns perfectly well.
+    # A sidecar boot must never gate chat.
+    serving = runner and detail["db"] and bound_user
+    return {
+        "serving": serving,
+        "turn_ready_detail": detail,
+        "deps_db": db,
+        "loop": {
+            "blocked_ms_max_30s": loop.get("blocked_ms_max_30s", 0.0),
+            "blocked_ms_p99": loop.get("blocked_ms_p99", 0.0),
+            "samples": loop.get("samples", 0),
+        },
+        "whatsapp_fields": _wa_fields,
+        "channels_settled": channels_settled,
+    }
+
+
+def _health_caller_is_trusted(request) -> bool:
+    """Does this caller hold the tenant's agent key?
+
+    `/agent/health` is in `_PUBLIC_PATHS`, i.e. unauthenticated and reachable
+    by anyone at `https://agent-<prefix>.agents.toup.ai/agent/health` — the
+    repo's own runbook curls it with no credential. So its payload is two
+    tiers: liveness and coarse boot state for the bridge, the container
+    monitor and the rollout canary; everything that is ABOUT THE PERSON (the
+    linked WhatsApp number, the tenant uuid, whether they have ever completed
+    a turn, whether their database is up) only for a caller that proves it is
+    the platform. All three platform probes already send the key."""
+    if request is None:
+        return False
+    import hmac as _hmac
+
+    try:
+        provided = request.headers.get("x-agent-key") or ""
+        expected = settings.agent_api_key or ""
+        return bool(expected) and _hmac.compare_digest(provided, expected)
+    except Exception:  # pragma: no cover — a header read must never 500 health
+        return False
+
+
+# Keys of the WhatsApp health dict that are safe to serve to an anonymous
+# caller: is the channel configured, alive and in what state. Deliberately a
+# WHITELIST — `self_e164` is the leak of record, but the dict has several
+# producers and a denylist would miss the next field somebody adds.
+_PUBLIC_WA_KEYS = frozenset({
+    "configured", "enabled", "status", "mode", "qr_supported",
+    "started", "sidecar_alive", "reconciler_running", "connected",
+})
+
+
 @app.get("/agent/health")
-async def agent_health():
+async def agent_health(request: Request = None):  # type: ignore[assignment]
     import time as _time
     uptime = _time.time() - _app_start_time if _app_start_time else 0
+    _trusted = _health_caller_is_trusted(request)
     from app.services.model_resolver import default_model
 
     # WhatsApp surfaces a rich status object so an operator (and the
@@ -2564,6 +2895,24 @@ async def agent_health():
         # endpoint is unauthenticated. Full text lives behind the agent key.
         _init_error_class = (_last[-1].split(":")[0].strip() if _last else "Exception")
 
+    # Round 46 (C4). ADDITIVE ONLY — `turn_ready` above keeps its meaning.
+    try:
+        _tr = await _turn_readiness()
+    except Exception:
+        _tr = None
+    if _tr and isinstance(whatsapp_status, dict) and _tr.get("whatsapp_fields"):
+        # Merge rather than replace: the existing keys are read by the
+        # Settings UI and by container_monitor on builds that predate this.
+        whatsapp_status = {**whatsapp_status, **_tr["whatsapp_fields"]}
+
+    # Two tiers — see `_health_caller_is_trusted`. An anonymous poller of one
+    # tenant hostname used to learn that person's WhatsApp number in E.164,
+    # their tenant uuid, whether they had linked WhatsApp at all, whether they
+    # had ever completed a turn and whether their database was up.
+    _wa_public = whatsapp_status
+    if not _trusted and isinstance(whatsapp_status, dict):
+        _wa_public = {k: v for k, v in whatsapp_status.items() if k in _PUBLIC_WA_KEYS}
+
     return {
         # `status` stays LIVENESS-only: container_monitor's auto-restart
         # branches on it, and flipping it for a systemic fault (a bad image)
@@ -2588,16 +2937,73 @@ async def agent_health():
         "agent_model": default_model(),
         "embeddings": _embeddings_status,
         "boot_progress": _boot_progress,
+        # `is_bound` stays public (a boolean about the container, not about a
+        # person) because `_probe_agent_ready` and the prewarm reconciler both
+        # gate on it and a container can legitimately be probed before the
+        # platform has stored its key. The tenant UUID does not.
         "is_bound": _is_bound,
-        "bound_user_id": _bound_uid,
+        **({"bound_user_id": _bound_uid} if _trusted else {}),
         "pool_generic": _pool_generic,
         "channels": {
             "telegram": "enabled" if settings.telegram_bot_token else "disabled",
             "discord": "enabled" if settings.discord_bot_token else "disabled",
             "slack": "enabled" if settings.slack_bot_token else "disabled",
-            "whatsapp": whatsapp_status,
+            "whatsapp": _wa_public,
         },
+        **(
+            {
+                "serving": _tr["serving"],
+                "turn_ready_detail": _tr["turn_ready_detail"],
+                "channels_settled": _tr["channels_settled"],
+                "deps": {"db": _tr["deps_db"]},
+                "loop": _tr["loop"],
+            }
+            if _tr and _trusted
+            else {}
+        ),
+        # Public on purpose (D3 as amended in round 46): ints only, no ids
+        # and no text by construction (`health_signals.snapshot()`), and
+        # container_monitor reads it off the SAME unkeyed GET that feeds the
+        # liveness verdict — gating it would blind the signal alerts.
         **({"health_signals": _health_signals} if _health_signals is not None else {}),
+    }
+
+
+@app.get("/agent/turn-ready")
+async def agent_turn_ready(request: Request = None):  # type: ignore[assignment]
+    """The readiness a PROBE should ask for — behind X-Agent-Key.
+
+    `/agent/health` is unauthenticated and its `turn_ready` is pinned to its
+    old meaning for container_monitor's sake. This route answers the question
+    the platform's onboarding actually has: can this container serve a turn
+    for the user it is bound to, and if not, which part is missing.
+
+    A container that predates round 46 returns 404 here; the platform's probe
+    treats that as "fall back to today's predicate", never as "not ready" —
+    the fleet runs an older image for a full rollout cycle."""
+    # Explicit, not merely inherited from `AgentAPIKeyMiddleware`: this body
+    # names the bound user, the DB's reachability and the loop's lag, and the
+    # middleware waves every request through while `agent_api_key` is empty
+    # (a generic pool member, the monolith mount). The docstring promised the
+    # key; now the handler does.
+    if not _health_caller_is_trusted(request):
+        return Response(
+            content='{"detail":"Invalid or missing agent API key"}',
+            status_code=401,
+            media_type="application/json",
+        )
+    tr = await _turn_readiness()
+    detail = tr["turn_ready_detail"]
+    # Only the gating parts may be NAMED as the reason (D1): `llm_wire_warm`
+    # and `channels_settled` are diagnostics and must never be the answer to
+    # "why is this container not serving".
+    missing = [k for k in ("runner", "db", "bound_user") if not detail.get(k)]
+    return {
+        "serving": tr["serving"],
+        "turn_ready_detail": detail,
+        "not_ready_because": missing[0] if missing else None,
+        "deps": {"db": tr["deps_db"]},
+        "loop": tr["loop"],
     }
 
 

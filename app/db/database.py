@@ -46,14 +46,53 @@ def _build_engine(database_url: str) -> AsyncEngine:
             pool_debug.install(eng)
     except Exception as _pd_err:  # never let a diagnostic break boot
         logger.warning("[pool-leak] install failed: %s", _pd_err)
+    _register_pool_gauge(eng)
     return eng
+
+
+def _register_pool_gauge(eng: AsyncEngine) -> None:
+    """Make the bounded agent pool's occupancy visible BEFORE it 503s.
+
+    A bounded pool converts "too many connections" into a `pool_timeout` wait
+    and then a `TimeoutError`, which `_infra_errors` renders as
+    `backend_unavailable` — a saturation bug wearing an outage's clothes, with
+    nothing naming the cause. The gauge is diagnostic only (monitoring Law 1:
+    nothing gates on health_signals) and is skipped on NullPool, where the
+    number has no meaning.
+    """
+    try:
+        from sqlalchemy.pool import NullPool
+
+        pool = getattr(eng, "pool", None)
+        if pool is None or isinstance(pool, NullPool):
+            return
+        from app.services import health_signals as _hs
+
+        async def _checked_out() -> int:
+            p = getattr(eng, "pool", None)
+            try:
+                return int(p.checkedout()) + int(max(0, p.overflow()))
+            except Exception:
+                return 0
+
+        _hs.register_gauge("db_pool_checked_out", _checked_out, ttl_s=10.0)
+    except Exception as _g_err:  # a gauge may never break boot
+        logger.debug("[health_signals] pool gauge not registered: %r", _g_err)
 
 
 def _build_engine_inner(database_url: str) -> AsyncEngine:
     """Construct an AsyncEngine for the given URL using the same
     knobs as the original module-level setup. Centralized so
     `rebind_database()` builds an identical engine to the one created
-    at import."""
+    at import.
+
+    `hide_parameters=True` on every engine: SQLAlchemy's `DBAPIError.__str__`
+    appends `[SQL: INSERT INTO messages ...] [parameters: (...)]`, and the
+    parameters of a `messages` INSERT are the user's message text. Every
+    `logger.warning(f"...{err}")` around a write therefore shipped chat content
+    to Loki — observed live on an `llm_proxy_events` INSERT in the 2026-09-15
+    trail. The flag makes SQLAlchemy render `[SQL parameters hidden due to
+    hide_parameters=True]` instead; `echo`/SQL logging is unaffected."""
     if database_url.startswith("sqlite"):
         if ":memory:" in database_url:
             # In-memory databases NEED the one shared connection —
@@ -65,6 +104,7 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
                 connect_args={"check_same_thread": False},
                 poolclass=StaticPool,
                 echo=settings.sql_echo,
+                hide_parameters=True,
             )
         # R28-D: file-backed sqlite (dev agents, the e2e harnesses)
         # must NOT share one connection across the whole process. On
@@ -80,6 +120,7 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
             connect_args={"check_same_thread": False, "timeout": 30},
             poolclass=NullPool,
             echo=settings.sql_echo,
+            hide_parameters=True,
         )
     if settings.run_mode in ("platform", "agent"):
         _db_url = database_url
@@ -99,12 +140,44 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
         # under the pooler's client-connection cap (and is FEWER connections
         # than NullPool's per-request churn, not more).
         #
-        # The agent keeps NullPool: it rebinds its DB generic→tenant on
-        # /admin/bind, and a connectionless pool keeps that swap trivially clean.
+        # The agent was on NullPool for the same reason — a connectionless pool
+        # makes the generic→tenant swap on /admin/bind trivially clean. It cost
+        # the fleet the connection ceiling: 2026-09-15, pgbouncer logged 14
+        # connect/close pairs in ONE second for a single tenant, and ~111
+        # containers churning like that is why Postgres's max_connections=300
+        # was reachable at all ("remaining connection slots are reserved..."
+        # FATALs during ordinary load, and a thundering herd after every pooler
+        # restart). The agent now gets a SMALL bounded pool; identity swaps stay
+        # clean because `rebind_database` disposes the old engine and
+        # `dispose_engine()` below drops the warm connections on an
+        # identity-only /admin/bind. `agent_db_pool_size = 0` restores NullPool.
         if settings.run_mode == "platform":
             _pool_kwargs = {"pool_size": 10, "max_overflow": 10, "pool_recycle": 300}
         else:
-            _pool_kwargs = {"poolclass": NullPool}
+            _agent_pool_size = int(getattr(settings, "agent_db_pool_size", 3) or 0)
+            if _agent_pool_size <= 0:
+                _pool_kwargs = {"poolclass": NullPool}
+            else:
+                # `pool_timeout` is explicit because SQLAlchemy's default is
+                # 30 s of SILENT waiting, which `_infra_errors` then renders
+                # as a 503 `backend_unavailable` — a pool-exhaustion bug
+                # wearing an outage's clothes, with nothing naming the cause.
+                # And the headroom is paired with it: this container runs
+                # several independent background loops (routines, reminders,
+                # radio, health, memory) alongside a turn that demonstrably
+                # holds a session for tens of seconds (`phase3_save: 34505ms`,
+                # 2026-09-15), so failing fast without room to breathe would
+                # convert slow successes into errors. Steady state is still
+                # `pool_size` warm connections; overflow is opened on demand
+                # and closed on return.
+                _pool_kwargs = {
+                    "pool_size": _agent_pool_size,
+                    "max_overflow": max(6, _agent_pool_size * 3),
+                    "pool_recycle": 300,
+                    "pool_timeout": float(
+                        getattr(settings, "agent_db_pool_timeout_s", 10.0) or 10.0
+                    ),
+                }
         return create_async_engine(
             _db_url,
             echo=settings.sql_echo,
@@ -115,6 +188,7 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
                 "command_timeout": 30,
                 "server_settings": {"statement_timeout": "30000"},
             },
+            hide_parameters=True,
             **_pool_kwargs,
         )
     return create_async_engine(
@@ -123,6 +197,7 @@ def _build_engine_inner(database_url: str) -> AsyncEngine:
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
+        hide_parameters=True,
     )
 
 
@@ -179,6 +254,41 @@ def get_engine() -> AsyncEngine:
     direct import captures the engine at module-import time, which
     becomes stale after a pool→bound rebind)."""
     return _holder["engine"]
+
+
+async def dispose_engine(*, reason: str = "") -> bool:
+    """Drop every pooled connection on the LIVE engine, keeping the engine.
+
+    The agent's pool is warm from R46 (see `_build_engine_inner`), so a
+    connection opened under the PREVIOUS identity can outlive it. `/admin/bind`
+    changes the tenant WITHOUT changing DATABASE_URL (the slot's DB name is
+    deterministic), so `rebind_database` — which disposes on its own — never
+    runs for that transition and nothing else would drop those connections.
+
+    Returns True when a dispose actually ran. Safe to call unconditionally:
+    a NullPool engine (`agent_db_pool_size = 0`) holds nothing, and a failure
+    is logged, never raised — a bind must not fail because a connection
+    refused to close.
+
+    A StaticPool engine is skipped too, and not as an optimisation: for an
+    in-memory sqlite (`_build_engine_inner`'s CI/test shape and a dev agent
+    with no DATABASE_URL) the single pooled connection IS the database, so
+    disposing it drops every table. There is no stale-identity hazard there
+    either — one connection, one process, no prior tenant to leak from.
+    """
+    eng = _holder.get("engine")
+    if eng is None:
+        return False
+    pool_cls = type(getattr(eng, "pool", None)).__name__
+    if pool_cls in ("NullPool", "StaticPool"):
+        return False
+    try:
+        await eng.dispose()
+        logger.info("[database] engine pool disposed (reason=%s)", reason or "unspecified")
+        return True
+    except Exception as e:
+        logger.warning("[database] dispose_engine failed (reason=%s): %s", reason or "unspecified", e)
+        return False
 
 
 async def rebind_database(new_database_url: str) -> None:
@@ -658,6 +768,18 @@ async def init_db():
         # one shot when rendering the quoted-message card.
         "ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id VARCHAR(50)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to_message_id)",
+        # Turn identity (round 46, A12). Agent DBs have no alembic, so this
+        # self-heal path IS the migration. Both columns NULLABLE FOREVER: a
+        # null means "unknown", never "not mine" — every pre-existing row has
+        # one, and so does every row written by a container still on the
+        # previous image. The index on client_msg_id is what makes the
+        # pairing lookup cheap on a long day thread; it is deliberately NOT
+        # unique, because the user row and the assistant row of one turn
+        # share the value.
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_msg_id VARCHAR(100)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_client_msg_id ON messages (client_msg_id)",
+        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS occurred_at TIMESTAMP",
+        "CREATE INDEX IF NOT EXISTS ix_messages_occurred_at ON messages (occurred_at)",
         # Idempotent backfill: messages.channel = conversations.channel when
         # messages.channel is NULL. Safe to re-run; WHERE clause prevents
         # re-writing rows that already have a value. Rows where BOTH are

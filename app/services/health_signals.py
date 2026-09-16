@@ -55,6 +55,22 @@ KNOWN_SIGNALS: tuple[str, ...] = (
     # gauge reads the CURRENT state (zero again once repaired); this one
     # says a tenant produced such a row at all.
     "future_dated_day_chats_seen",
+    # ── Pushed gauges (set_gauge), owned by the loop/db sampler ──
+    # 1 = the last DB probe succeeded, 0 = it FAILED. Seeded to 1 so "never
+    # measured" reads as the benign default; the authoritative freshness is
+    # `deps.db.checked_at` on /agent/health, not this number. It exists
+    # because on 2026-09-15 /agent/health answered 200 for eleven minutes
+    # while every DB-backed route 500'd.
+    "db_reachable",
+    # Max event-loop lag in ms observed over the last 30 s, pushed by the
+    # loop sampler. 0 = healthy or not yet measured.
+    "loop_lag_ms_max_30s",
+    # ── Pull gauge, registered by app/db/database.py ──
+    # Connections currently checked out of the agent's BOUNDED pool (0 on
+    # NullPool, where the number has no meaning). Saturation of that pool
+    # otherwise surfaces only as a `pool_timeout` wait and then a 503
+    # `backend_unavailable`, with nothing naming the cause.
+    "db_pool_checked_out",
     # R44 — one pair per LLM CALL (not per turn; a tool turn makes several).
     # A "hit" here only means the provider read SOME cached prefix, which in
     # the 2026-09-14 sample was always exactly the tools+instructions head:
@@ -66,6 +82,11 @@ KNOWN_SIGNALS: tuple[str, ...] = (
     # A warm that never lands still counts here — read it next to
     # `cached=` on the [PERF] cache_warm line, which says whether it did.
     "llm_cache_warms",
+    # The provider refused the `allowed_tools` tool_choice shape (a 400 on
+    # `tool_choice.type`) and the runner retried the same call unrestricted.
+    # Observed on the 2026-09-15 rollout canary; a non-zero count on a tenant
+    # means intent gating is off for it and the retry cost one round-trip.
+    "llm_tool_choice_rejected",
 )
 
 _LOCK = threading.Lock()
@@ -124,8 +145,10 @@ def reset_for_tests() -> None:
         # at import time by the route that owns it, and a test that resets the
         # counters between cases must not silently lose the gauge for the rest
         # of the process.
-        for g in _GAUGES.values():
-            g["value"] = 0
+        for name, g in _GAUGES.items():
+            # A pushed gauge whose 0 MEANS something (db_reachable = "the last
+            # probe failed") must come back to its seed, not to the alarm.
+            g["value"] = _GAUGE_SEEDS.get(name, 0)
             g["at"] = NEVER_MEASURED
 
 
@@ -153,6 +176,41 @@ def register_gauge(
         }
 
 
+def set_gauge(name: str, value: int) -> None:
+    """Record a value that was MEASURED ELSEWHERE. Never raises.
+
+    For a sampler that already owns the measurement (the event-loop lag
+    probe, the cached DB reachability probe) — `register_gauge` would make
+    this module pull, and both of those must be pushed on the sampler's own
+    cadence, never on a health request. A pushed gauge has no `fn` and an
+    infinite TTL, so `refresh_gauges()` never considers it due.
+    """
+    try:
+        with _LOCK:
+            prev = _GAUGES.get(name)
+            if prev is not None and prev.get("fn") is not None:
+                # A pull gauge already owns this name; don't silently convert
+                # it into a push gauge and strip its refresher.
+                prev["value"] = int(value)
+                return
+            _GAUGES[name] = {
+                "fn": None,
+                "ttl": float("inf"),
+                "value": int(value),
+                "at": time.monotonic(),
+            }
+    except Exception:  # pragma: no cover - defensive; a gauge may never break a caller
+        pass
+
+
+# `db_reachable` means "the last probe FAILED" only when it is 0, so it is
+# seeded truthfully before the sampler's first tick (see KNOWN_SIGNALS), and
+# `reset_for_tests()` restores the seed rather than the alarm.
+_GAUGE_SEEDS: Dict[str, int] = {"db_reachable": 1}
+for _n, _v in _GAUGE_SEEDS.items():
+    set_gauge(_n, _v)
+
+
 def gauge_due(name: str) -> bool:
     """True when ``name``'s cached value has aged past its TTL."""
     with _LOCK:
@@ -177,6 +235,8 @@ async def refresh_gauges(*, only: Optional[str] = None, force: bool = False) -> 
         now = time.monotonic()
         for n in names:
             g = _GAUGES.get(n)
+            if g and g.get("fn") is None:
+                continue  # pushed gauge (set_gauge) — nothing to pull, even under force
             if g and (force or (now - g["at"]) >= g["ttl"]):
                 due.append((n, g["fn"]))
                 g["at"] = now  # claim it before awaiting — one refresh at a time

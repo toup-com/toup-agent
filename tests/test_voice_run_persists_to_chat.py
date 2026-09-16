@@ -191,10 +191,12 @@ def test_media_and_tool_events_can_ride_the_same_row():
     assert params is None
 
 
-def test_no_tool_events_leaves_the_payload_exactly_as_it_was():
+def test_no_tool_events_leaves_the_body_exactly_as_it_was():
     body, params = _message_payload("user", "hello")
     assert "tool_events" not in body
-    assert params == {"role": "user", "content": "hello"}
+    assert body == {"role": "user", "content": "hello"}
+    # R46 P0: never a query form. See test_voice_no_transcript_in_url.py.
+    assert params is None
 
 
 # ── The agent's side ──────────────────────────────────────────────────────

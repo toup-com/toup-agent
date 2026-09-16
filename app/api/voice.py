@@ -94,7 +94,13 @@ async def transcribe_audio(
         text = await transcribe_voice(tmp_path, language=language, api_key=user_key)
         if text.startswith("ERROR:"):
             raise HTTPException(status_code=400, detail=text)
-        return {"text": text}
+        # `empty` is ADDITIVE and is the machine-readable half of the answer.
+        # Whisper hearing nothing used to be reported as the literal string
+        # "(empty transcription)" in `text`, which a client cannot tell from
+        # speech — round 46, incident 3: it was appended to a user's sentence
+        # in the composer. Old clients read `text` and now get "" (falsy)
+        # instead of a sentence; new ones read `empty`.
+        return {"text": text, "empty": not text}
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)

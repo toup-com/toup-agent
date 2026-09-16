@@ -10,8 +10,8 @@ Each session maintains:
 """
 
 import logging
-from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
@@ -637,7 +637,11 @@ async def get_session_messages(
         # (created_at, id) — the tiebreaker `day_context_loader` already has.
         # Without it two rows sharing a timestamp come back in a different
         # order on two fetches.
-        .order_by(Message.created_at.asc(), Message.id.asc())
+        # COALESCE(occurred_at, created_at) — see day_chats.py (round 46, A12).
+        .order_by(
+            func.coalesce(Message.occurred_at, Message.created_at).asc(),
+            Message.id.asc(),
+        )
         .offset(offset)
         .limit(limit)
     )
@@ -701,10 +705,62 @@ def _clean_tool_events(events) -> Optional[list]:
     return out or None
 
 
-def _build_metadata(media, tool_events) -> Optional[str]:
+# The fields an attachment dict may carry on the way IN. `Message.attachments`
+# had only server-controlled writers until C8 opened it to a request body, and
+# one of its fields is a capability: `files.py` reads `storage_path` back and
+# streams whatever object key it names (files.py `_load_attachment` →
+# `download_file`), checking only that the caller owns the parent Conversation.
+# Sibling untrusted input in this file is allowlisted for exactly this reason
+# (`_TOOL_EVENT_KEYS`); this is the same rule for the same class of field.
+_ATTACHMENT_KEYS = {
+    "id", "attachment_id", "filename", "mime_type", "size_bytes", "created_at",
+    "width", "height", "has_thumb", "kind", "role", "intent", "ingest",
+    # Deliberately last and deliberately conditional — see `_clean_attachments`.
+    "storage_path",
+}
+# A13: MAX_ATTACHMENTS_PER_TURN.
+_ATTACHMENTS_MAX = 8
+
+
+def _clean_attachments(atts, *, user_id: str, trusted: bool) -> Optional[list]:
+    """Key-allowlist the request body's attachment dicts.
+
+    `trusted` is "this request authenticated with the agent key", i.e. it came
+    from the platform voice relay, which is the only intended producer. An
+    ordinary JWT caller keeps every descriptive field and loses `storage_path`:
+    naming an arbitrary object key under the workspace would otherwise mint
+    itself a download of a file it never produced — including, on a recycled
+    pool slot, one a previous tenant left behind.
+
+    Even for the relay the key must stay inside the user's own scope
+    (`doc_generators._persist` writes `{user_id}/{att_id}_{filename}`), because
+    the relay forwards what the agent returned and a compromised or confused
+    producer is exactly what a capability field must survive.
+    """
+    if not isinstance(atts, list) or not atts:
+        return None
+    out = []
+    for a in atts[:_ATTACHMENTS_MAX]:
+        if not isinstance(a, dict):
+            continue
+        clean = {k: v for k, v in a.items() if k in _ATTACHMENT_KEYS}
+        key = clean.get("storage_path")
+        if key is not None:
+            ok = (
+                trusted and isinstance(key, str) and key
+                and not key.startswith("/") and ".." not in key
+                and key.split("/", 1)[0] in (user_id, "shared")
+            )
+            if not ok:
+                clean.pop("storage_path", None)
+        out.append(clean)
+    return out or None
+
+
+def _build_metadata(media, tool_events, app_artifact=None) -> Optional[str]:
     """The message's metadata_json, in AgentRunner._save_messages' shape.
 
-    One writer for both keys: they used to be mutually exclusive here (media
+    One writer for every key: they used to be mutually exclusive here (media
     replaced the whole blob), so a voice turn that played a song AND used a
     tool could only ever persist one of them.
     """
@@ -713,6 +769,9 @@ def _build_metadata(media, tool_events) -> Optional[str]:
         meta["media"] = media
     if tool_events:
         meta["tool_events"] = tool_events
+    if app_artifact:
+        # Same key AgentRunner._save_messages writes; the clients read only it.
+        meta["app_artifact"] = app_artifact
     return json.dumps(meta) if meta else None
 
 
@@ -720,10 +779,7 @@ def _build_metadata(media, tool_events) -> Optional[str]:
 async def create_session_message(
     session_id: str,
     body: Optional[SessionMessageCreate] = None,
-    role: str = "user",
-    content: str = "",
-    model_used: Optional[str] = None,
-    day_chat_id: Optional[str] = None,
+    request: Request = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -733,15 +789,44 @@ async def create_session_message(
     Used by the platform voice route to persist voice messages
     on the user's VPS database (not platform DB).
 
-    Accepts the fields either as a JSON body or as query parameters. The
-    query form is what shipped originally; the body was added because voice
-    transcripts are too long (and too often non-Latin) to survive a URL. Body
-    wins when both are present.
+    **BODY ONLY.** `role`/`content`/`model_used`/`day_chat_id` used to be
+    declared here as bare scalars with defaults, i.e. as QUERY PARAMETERS,
+    with the body merely winning when both were present. That left the
+    transcript leak open on the RECEIVING end after the sender was fixed: any
+    caller still using the old form puts the user's spoken sentence into the
+    request line, which uvicorn logs and the fleet ships to Loki (observed
+    2026-09-15, fifteen such lines inside one four-minute window). It also made
+    the `role` pattern on `SessionMessageCreate` unenforceable, because an
+    unvalidated query value won whenever the body omitted the field. There is
+    no in-tree producer of the query form, and an out-of-tree one now gets a
+    loud 400 instead of a silent leak.
     """
     import uuid as _uuid
 
+    role = "user"
+    content = ""
+    model_used = None
+    day_chat_id = None
     media = None
     tool_events = None
+    attachments = None
+    app_artifact = None
+    client_msg_id = None
+    occurred_at = None
+    # "Authenticated with the agent key", i.e. from the platform voice relay —
+    # the only intended producer of `attachments`. See `_clean_attachments`.
+    _trusted = False
+    if request is not None:
+        try:
+            import secrets as _secrets
+            from app.config import settings as _cfg
+            _key = request.headers.get("x-agent-key") or ""
+            _trusted = bool(
+                _cfg.agent_api_key
+                and _secrets.compare_digest(_key, _cfg.agent_api_key)
+            )
+        except Exception:  # noqa: BLE001 — auth already passed; this only widens
+            _trusted = False
     if body is not None:
         role = body.role or role
         content = body.content or content
@@ -749,6 +834,21 @@ async def create_session_message(
         day_chat_id = body.day_chat_id or day_chat_id
         media = body.media or None
         tool_events = _clean_tool_events(body.tool_events)
+        attachments = _clean_attachments(
+            body.attachments, user_id=current_user.id, trusted=_trusted,
+        )
+        app_artifact = body.app_artifact or None
+        client_msg_id = (body.client_msg_id or None)
+        occurred_at = body.occurred_at
+
+    # The pydantic pattern is only a gate if nothing can route round it. `role`
+    # is half of the UPSERT key and is stamped on the live frame; an arbitrary
+    # string here is a role the clients have no rendering path for.
+    if role not in ("user", "assistant"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid role",
+        )
 
     # Verify session ownership
     session_query = select(Conversation).where(
@@ -778,20 +878,103 @@ async def create_session_message(
     # voice messages into yesterday's day chat until UTC midnight. An
     # explicit day_chat_id param still wins (caller intent); the session's
     # stamp is only the degraded-path fallback.
-    _day_chat_id = day_chat_id
-    if not _day_chat_id:
-        from app.db.message_helpers import resolve_day_chat_id_for_now
-        _day_chat_id = await resolve_day_chat_id_for_now(
-            db, current_user.id,
-            tz_override=getattr(current_user, 'timezone', None),
-        )
-    if not _day_chat_id:
-        _day_chat_id = session.day_chat_id
+    #
+    # A closure because it has to be RE-RUNNABLE. `get_or_create_day_chat`
+    # INSERTs the DayChat and only `flush()`es it — no commit — so every
+    # `db.rollback()` in the degradation paths below destroys a row the
+    # Message's `day_chat_id` FOREIGN KEY still points at. The follow-up commit
+    # then raises a FK violation that neither handler expects, turning the
+    # designed graceful degradation into a 500 and losing the voice turn. The
+    # resolver is idempotent and self-heals its own id cache when the row it
+    # remembers is gone, so re-resolving after a rollback is the whole fix.
+    # Read off the ORM row ONCE, here, while it is still loaded: `rollback()`
+    # expires every instance in the session, and an expired attribute on an
+    # AsyncSession raises MissingGreenlet rather than lazy-loading. A closure
+    # that touched `current_user.timezone` after a rollback would 500 on the
+    # very path written to degrade.
+    _owner_id = current_user.id
+    _owner_tz = getattr(current_user, 'timezone', None)
+
+    async def _resolve_day():
+        _d = day_chat_id
+        if not _d:
+            from app.db.message_helpers import resolve_day_chat_id_for_now
+            _d = await resolve_day_chat_id_for_now(
+                db, _owner_id, tz_override=_owner_tz,
+            )
+        if not _d and session is not None:
+            _d = session.day_chat_id
+        return _d
+
+    _day_chat_id = await _resolve_day()
     # Backfill the session's day_chat_id if it was missing
     if _day_chat_id and not session.day_chat_id:
         session.day_chat_id = _day_chat_id
 
-    msg = Message(
+    # Exactly-once (R46 C1): a persist that is retried — a relay reconnect, a
+    # re-delivered provider event — must land on the SAME row rather than a
+    # second copy of the same utterance. The key is the caller's; with none, a
+    # plain insert, which is what every pre-R46 caller gets.
+    # The mapped attribute can also be absent outright when this platform build
+    # is newer than the ORM it is running against (a mixed rollout), so the
+    # identity fields are probed on the class, not assumed.
+    _has_cmid = hasattr(Message, "client_msg_id")
+    _has_occurred = hasattr(Message, "occurred_at")
+    existing = None
+    if client_msg_id and _has_cmid:
+        try:
+            existing = (await db.execute(select(Message).where(and_(
+                Message.conversation_id == session_id,
+                Message.client_msg_id == client_msg_id,
+                # ROLE is part of the key. `client_msg_id` is explicitly NOT
+                # unique (db/models/conversation.py): a chat turn stamps the
+                # same value on its user row AND its assistant row. Keyed on the
+                # pair alone, the second POST of such a turn would overwrite the
+                # first row's role and content instead of appending — losing the
+                # user's message. Ordered so `.first()` is deterministic if a
+                # duplicate pair already exists from before this guard.
+                Message.role == role,
+            )).order_by(Message.created_at.asc(), Message.id.asc()))).scalars().first()
+        except Exception:
+            # The column has not reached this tenant DB yet (agent DBs self-heal
+            # their schema, they do not migrate). Degrade to an insert; the
+            # defensive retry below drops the field from the INSERT too.
+            await db.rollback()
+            existing = None
+            # rollback() EXPIRES every instance in the session, and the next
+            # statements read `session.message_count` / `session.channel` — an
+            # expired attribute on an AsyncSession raises MissingGreenlet, so
+            # this degradation path 500'd instead of degrading. Reload the row
+            # the way ws_chat.py does after its own rollback, and re-apply the
+            # day_chat_id backfill the rollback undid.
+            session = await db.get(Conversation, session_id)
+            if session is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Session not found",
+                )
+            # The rollback also discarded the DayChat the resolver had just
+            # INSERTed-and-flushed, and `_day_chat_id` still names it. Inserting
+            # the Message against that id is a dangling FK.
+            _day_chat_id = await _resolve_day()
+            if _day_chat_id and not session.day_chat_id:
+                session.day_chat_id = _day_chat_id
+
+    _occurred = occurred_at
+    if _occurred is not None and _occurred.tzinfo is not None:
+        # Message.created_at/occurred_at are naive UTC everywhere else.
+        _occurred = _occurred.astimezone(timezone.utc).replace(tzinfo=None)
+    if _occurred is not None:
+        # Unvalidated client input that drives the thread's sort key
+        # (COALESCE(occurred_at, created_at)). A far-future stamp pins a row to
+        # the bottom of the day forever. Out of a day's reach in either
+        # direction it is not a stamp, it is noise — and C1 already defines
+        # null as "unknown", which sorts on created_at.
+        _skew = abs((datetime.utcnow() - _occurred).total_seconds())
+        if _skew > 86400:
+            _occurred = None
+
+    _msg_kwargs = dict(
         id=str(_uuid.uuid4()),
         conversation_id=session_id,
         role=role,
@@ -806,15 +989,83 @@ async def create_session_message(
         # chat-started one does, and a voice RUN gets the same steps, actions
         # and sources a typed run does (`day_chats._serialize_tool_events`
         # reads both through one function).
-        metadata_json=_build_metadata(media, tool_events),
+        metadata_json=_build_metadata(media, tool_events, app_artifact),
     )
-    db.add(msg)
+    if attachments:
+        # The COLUMN, not metadata_json — GET /api/files/{message_id}/{aid}
+        # authorizes against it and every history serializer already reads it.
+        _msg_kwargs["attachments"] = attachments
+    _identity_kwargs = {}
+    if client_msg_id and _has_cmid:
+        _identity_kwargs["client_msg_id"] = client_msg_id
+    if _occurred is not None and _has_occurred:
+        _identity_kwargs["occurred_at"] = _occurred
 
-    session.message_count = (session.message_count or 0) + 1
-    session.updated_at = datetime.utcnow()
-
-    await db.commit()
-    await db.refresh(msg)
+    if existing is not None:
+        msg = existing
+        for _k, _v in _msg_kwargs.items():
+            if _k == "id":
+                continue
+            if _k == "metadata_json" and _v is None:
+                # Degrade the way `attachments` does, not the opposite way. A
+                # replayed assistant persist after a relay reconnect carries no
+                # media and no tool_events by construction (both are per-socket
+                # state), so an unconditional write NULLed the media card and
+                # the run rail off a row that already had them.
+                continue
+            setattr(msg, _k, _v)
+        if _occurred is not None and _has_occurred:
+            msg.occurred_at = _occurred
+        session.updated_at = datetime.utcnow()
+        await db.commit()
+        await db.refresh(msg)
+    else:
+        msg = Message(**_msg_kwargs, **_identity_kwargs)
+        db.add(msg)
+        session.message_count = (session.message_count or 0) + 1
+        session.updated_at = datetime.utcnow()
+        try:
+            await db.commit()
+        except Exception as _commit_err:
+            # Same defensive retry ws_chat runs for reply_to_message_id: a
+            # tenant whose ALTER has not run yet rejects the INSERT with
+            # "column client_msg_id of relation messages does not exist".
+            # Losing the identity fields degrades ordering; losing the
+            # transcript loses the turn.
+            _err = str(_commit_err).lower()
+            if _identity_kwargs and any(k in _err for k in _identity_kwargs):
+                logger.warning(
+                    "[sessions] message identity columns missing on this tenant; "
+                    "persisting without client_msg_id/occurred_at",
+                )
+                await db.rollback()
+                # Same trap as the lookup's rollback above: the rollback expires
+                # `session`, and the retry reads session.message_count two lines
+                # down — MissingGreenlet, a 500 where a degraded insert was
+                # intended. Reload, and re-apply the backfill the rollback undid.
+                session = await db.get(Conversation, session_id)
+                if session is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Session not found",
+                    )
+                # …and the DayChat the resolver INSERTed-and-flushed went with
+                # it, so `_msg_kwargs["day_chat_id"]` names a row that no longer
+                # exists. Re-resolve BEFORE rebuilding the Message or the retry
+                # trades a missing-column error for a foreign-key one.
+                _day_chat_id = await _resolve_day()
+                _msg_kwargs["day_chat_id"] = _day_chat_id
+                if _day_chat_id and not session.day_chat_id:
+                    session.day_chat_id = _day_chat_id
+                msg = Message(**_msg_kwargs)
+                db.add(msg)
+                session.message_count = (session.message_count or 0) + 1
+                session.updated_at = datetime.utcnow()
+                db.add(session)
+                await db.commit()
+            else:
+                raise
+        await db.refresh(msg)
 
     # Hand the row to any open chat socket live, WITH its media. Voice rows
     # used to reach the phone only on the next resync (as plain text until
@@ -823,29 +1074,23 @@ async def create_session_message(
     # never be on the persist path.
     try:
         from app.api.ws_chat import broadcast_to_user
-        _frame = {
-            "type": "message",
-            "id": msg.id,
-            "role": msg.role,
-            # LIVE delivery gets the same guard the history readers get.
-            # This body arrives from the platform relay rather than the
-            # agent runner, and a frame is the one message surface that
-            # bypasses every serializer — leaving it raw would have kept
-            # exactly one door open on the way out (see message_cards.py).
-            "content": public_text(msg.role, msg.content),
-            "created_at": (msg.created_at.isoformat() + "Z")
-            if getattr(msg, "created_at", None) else datetime.utcnow().isoformat() + "Z",
-            "channel": session.channel,
-        }
-        if _day_chat_id:
-            _frame["day_chat_id"] = _day_chat_id
-        if media:
-            _frame["media"] = media
-        if tool_events:
-            # Live delivery carries the run too, or an open thread shows the
-            # voice turn as a bare bubble until the next resync and then
-            # silently grows a run card under the reader.
-            _frame["tool_events"] = tool_events
+        from app.api.message_frames import message_frame
+        from app.api.day_chats import _serialize_attachments
+        _frame = message_frame(
+            msg,
+            channel=session.channel,
+            day_chat_id=_day_chat_id,
+            media=media,
+            tool_events=tool_events,
+            # From the COMMITTED row, not from the request body: the wire form
+            # of an attachment is message-scoped (download_url / preview_url /
+            # thumb_url / kind) and the body carries none of it. Handing the raw
+            # dicts to the client rendered a file produced during a voice turn
+            # as a dead card until the next history refetch — the sibling writer
+            # (voice_tasks._persist_message) has always passed enriched dicts.
+            attachments=_serialize_attachments(msg) if attachments else None,
+            app_artifact=app_artifact,
+        )
         import asyncio as _asyncio
         _asyncio.create_task(broadcast_to_user(current_user.id, _frame))
     except Exception:
@@ -1023,6 +1268,14 @@ def _message_to_response(
         ),
         reply_to_message_id=getattr(message, "reply_to_message_id", None),
         reply_to=(reply_targets or {}).get(message.id),
+        # Turn identity (round 46, C1). Same parity rule as every neighbour
+        # above: the clients fall back from /api/day-chats to these session
+        # routes, and a field emitted by only one serializer vanishes on the
+        # fallback — here that would mean the thread silently losing the
+        # ability to pair its own optimistic row and going back to matching
+        # on byte-equal content. NULL is UNKNOWN, never "not mine".
+        client_msg_id=getattr(message, "client_msg_id", None),
+        occurred_at=getattr(message, "occurred_at", None),
     )
 
     # Enrich job card messages with current BuildJob status. The projection

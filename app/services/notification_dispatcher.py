@@ -651,11 +651,25 @@ async def _dispatch_row(db, row_id: str, now: datetime) -> str:
         # confirmation), and a loud Telegram/WhatsApp copy would
         # contradict it for channel-linked users with no push devices.
         and not (row.data_json or {}).get("silent")
+        # Round 46: the fallback's question was "could push reach a device?",
+        # not "has the user seen this?". Those come apart in exactly the
+        # normal state of a phone seconds after onboarding — no push token
+        # registered yet — so on 2026-09-15 an answer the user was reading in
+        # the app was ALSO delivered to their WhatsApp as a notification.
+        # `delivered_in_app` is set by the producer (ws_chat's answer push)
+        # and only when the `done` frame or the late `message` actually
+        # reached a live socket, so it is a fact about delivery, not intent.
+        and not (row.data_json or {}).get("delivered_in_app")
     ):
         fallback = await _request_agent_channel_delivery(db, row)
         channels["agent_fallback"] = fallback
         if fallback.get("status") == "ok":
             delivered = True
+    elif (row.data_json or {}).get("delivered_in_app"):
+        # Record WHY, so a row that never went out-of-band is not
+        # indistinguishable from one whose fallback silently failed.
+        channels["ws"] = {"status": "ok", "reason": "delivered_in_app"}
+        delivered = True
 
     if delivered or la_delivered:
         new_status = NQ_SENT_PENDING_RECEIPT if has_tickets else NQ_SENT

@@ -497,8 +497,10 @@ def test_a_header_that_will_not_parse_is_not_fatal():
     """Best-effort by design — a picture is worth delivering even when Pillow
     cannot read its header."""
     import app.agent.doc_generators as dg
-    assert dg._image_dimensions(b"not an image at all", "image/png") == (None, None)
-    assert dg._image_dimensions(b"", "image/jpeg") == (None, None)
+    # Round 46 (C7): a third element, the PIL format name, so `_persist` can
+    # correct a mime the caller hardcoded. Still never raises.
+    assert dg._image_dimensions(b"not an image at all", "image/png") == (None, None, None)
+    assert dg._image_dimensions(b"", "image/jpeg") == (None, None, None)
 
 
 def test_the_live_ws_frame_names_width_and_height():

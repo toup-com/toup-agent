@@ -32,6 +32,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 import sys
 from typing import Dict, List, Optional
@@ -42,6 +43,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy import select
 
+from app.api._fault_codes import (
+    AGENT_DB_UNAVAILABLE,
+    AGENT_INTERNAL,
+    WsInfraUnavailable,
+    is_infra_error,
+)
 from app.api.message_cards import job_marker_content as _job_marker
 from app.config import settings
 from app.services.credit_exhausted import (
@@ -784,6 +791,79 @@ async def _stored_user_tz(user_id: str):
         return exc
 
 
+# ── The accept→register frame-loss window (round 46) ─────────────────
+# A socket that has been ACCEPTED but not yet AUTHENTICATED has no broadcast
+# queue, and every frame broadcast in that window is dropped with no trace
+# but a `queues=N sent=N` count that looks correct. On 2026-09-15 the window
+# was 1.6 s wide on pool-82 (accept 14:50:29.216, "Authenticated"
+# 14:50:30.804) and a [BROADCAST] landed inside it at 14:50:29.897.
+#
+# Only TERMINAL, client-keyed frames are buffered. `turn_active`/`turn_status`
+# are deliberately excluded: the handler re-announces the live turn at
+# registration from the registry, and replaying a stale status would repaint
+# a finished turn as running — the opposite of the bug being fixed. Every
+# replayed frame is stamped `replay: true` so a client that already has the
+# row can drop it rather than render a duplicate.
+# `done` is deliberately NOT here: every shipped client settles on a `done`
+# without checking whose turn it belongs to, so replaying one into a socket
+# that has since started a DIFFERENT turn ends that turn with this one's text.
+# Nothing broadcasts a `done` any more either (see the late-answer lane).
+# `error` is out for the same reason, one step further: a fault is a property
+# of the SOCKET it happened on, never something to hand a socket that was not
+# there. The new client's `case 'error'` else-branch calls `onError` and
+# settles, so a replayed one would end a freshly-sent turn with a stranger's
+# failure. Nothing broadcasts one today, which is exactly when to remove it.
+_REPLAYABLE_TYPES = frozenset({"message", "turn_ended", "attachment"})
+
+# `messages.client_msg_id` is VARCHAR(100). The wire value is client-controlled
+# and now rides two INSERTs and a receipt lookup, so it is bounded once at the
+# dispatch head rather than surfacing as a DataError inside a save.
+_MAX_CLIENT_MSG_ID_LEN = 100
+_REPLAY_WINDOW_S = 15.0
+_REPLAY_MAX_PER_USER = 16
+_recent_broadcasts: Dict[str, deque] = {}
+
+
+def _remember_broadcast(user_id: str, event: dict) -> None:
+    if event.get("type") not in _REPLAYABLE_TYPES:
+        return
+    ring = _recent_broadcasts.get(user_id)
+    if ring is None:
+        ring = deque(maxlen=_REPLAY_MAX_PER_USER)
+        _recent_broadcasts[user_id] = ring
+    now = time.monotonic()
+    # Evict by AGE as well as by count. `_replay_missed` will not serve an
+    # entry older than the window, so anything past it is dead weight — and
+    # these entries are whole message BODIES. A user with no live queue (the
+    # ring is only dropped when the last one unregisters) otherwise kept up to
+    # 16 of them resident for the life of the process.
+    while ring and now - ring[0][0] > _REPLAY_WINDOW_S:
+        ring.popleft()
+    ring.append((now, event))
+
+
+def _replay_missed(user_id: str, queue: asyncio.Queue, since: Optional[float]) -> int:
+    """Hand a just-registered queue the terminal frames broadcast while it had
+    none. `since` is the socket's accept time (monotonic); without one there
+    is nothing to bound the replay to and we send nothing."""
+    if since is None:
+        return 0
+    ring = _recent_broadcasts.get(user_id)
+    if not ring:
+        return 0
+    now = time.monotonic()
+    n = 0
+    for ts, event in list(ring):
+        if ts < since or now - ts > _REPLAY_WINDOW_S:
+            continue
+        try:
+            queue.put_nowait({**event, "replay": True})
+            n += 1
+        except asyncio.QueueFull:
+            break
+    return n
+
+
 async def broadcast_to_user(
     user_id: str, event: dict, exclude: Optional[asyncio.Queue] = None,
 ) -> int:
@@ -806,15 +886,24 @@ async def broadcast_to_user(
         except asyncio.QueueFull:
             logger.warning(f"[BROADCAST] Queue full for user {user_id}, dropping event type={event.get('type')}")
     etype = event.get("type", "?")
+    _remember_broadcast(user_id, event)
     print(f"[BROADCAST] user={user_id[:8]} type={etype} queues={len(queues)} sent={sent}", flush=True)
     return sent
 
 
-def _register_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
-    """Register a queue for a user's WebSocket connection."""
+def _register_ws_queue(
+    user_id: str, queue: asyncio.Queue, accepted_at: Optional[float] = None,
+) -> int:
+    """Register a queue for a user's WebSocket connection.
+
+    `accepted_at` is this socket's accept time (`time.monotonic()`); when
+    given, terminal frames broadcast between accept and this call are
+    replayed into the queue. Optional so every other caller is unchanged and
+    replays nothing."""
     if user_id not in _user_ws_queues:
         _user_ws_queues[user_id] = []
     _user_ws_queues[user_id].append(queue)
+    return _replay_missed(user_id, queue, accepted_at)
 
 
 def _unregister_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
@@ -826,6 +915,7 @@ def _unregister_ws_queue(user_id: str, queue: asyncio.Queue) -> None:
         pass
     if not queues:
         _user_ws_queues.pop(user_id, None)
+        _recent_broadcasts.pop(user_id, None)
 
 
 # ── In-flight turn registry (2026-07-23) ─────────────────────────────
@@ -905,12 +995,14 @@ def _set_active_turn(user_id: str, **fields) -> None:
 def _clear_active_turn(user_id: str, mission_id: Optional[str] = None) -> None:
     """Drop the entry. `mission_id` guards against a finished turn clearing a
     NEWER turn's entry (the user sent again while the old one was wrapping up)."""
+    global _turns_completed
     entry = _active_turns.get(user_id)
     if entry is None:
         return
     if mission_id and entry.get("mission_id") != mission_id:
         return
     _active_turns.pop(user_id, None)
+    _turns_completed += 1
 
 
 def _get_active_turn(user_id: str) -> Optional[dict]:
@@ -925,6 +1017,18 @@ def _get_active_turn(user_id: str) -> Optional[dict]:
         _active_turns.pop(user_id, None)
         return None
     return entry
+
+
+# Round 46 (C4): how many turns this PROCESS has finished. `/agent/health`
+# reports `turn_ready_detail.first_turn_done` from it — a container that has
+# never completed a turn is exactly the one whose once-per-process lazy work
+# (SDK imports, pydantic core schemas, prompt cache) is still unpaid, and on
+# 2026-09-15 that container was handed a brand-new user. A count, never an id.
+_turns_completed: int = 0
+
+
+def turns_completed() -> int:
+    return _turns_completed
 
 
 def active_turn_count() -> int:
@@ -959,8 +1063,168 @@ def _turn_frame(kind: str, entry: dict, **extra) -> dict:
     # already holds instead of adding a second unpaired row by tool NAME.
     if entry.get("call_id"):
         frame["call_id"] = entry.get("call_id")
+    # Round 46 (C1): the turn's IDENTITY on every turn frame. The client
+    # cannot settle a turn it cannot name — `done` carried `client_msg_id`
+    # and nothing else did, so `turn_ended` (the authoritative "this turn is
+    # over" for a socket-less turn) arrived unpairable and was discarded.
+    if entry.get("client_msg_id"):
+        frame["client_msg_id"] = entry.get("client_msg_id")
     frame.update(extra)
     return frame
+
+
+def _turn_running(user_id: str, client_msg_id: Optional[str]) -> tuple:
+    """`(running, mission_id)` for a turn the client is asking about.
+
+    Identity-matched: a DIFFERENT turn being in flight is not evidence about
+    THIS one. Returns `(False, None)` when nothing matches."""
+    entry = _get_active_turn(user_id)
+    if not entry:
+        return False, None
+    if client_msg_id and entry.get("client_msg_id") not in (None, client_msg_id):
+        return False, None
+    return True, entry.get("mission_id")
+
+
+async def _answered_message_id(user_id: str, client_msg_id: Optional[str]) -> Optional[str]:
+    """The id of the assistant row carrying this turn's `client_msg_id`, or None.
+
+    Scoped to the CALLER through the conversation: `client_msg_id` is fully
+    client-controlled and `messages` has no user_id column, so an unjoined
+    lookup answers about any row in the database that happens to carry the id.
+    One implementation, because `_turn_receipt` and `_duplicate_ack` are
+    answering the same question and must not drift."""
+    if not client_msg_id:
+        return None
+    from app.db.database import async_session_maker as _sm_a
+    from app.db.models import Conversation as _Conv_a, Message as _Msg_a
+
+    async with _sm_a() as _db_a:
+        row = (await _db_a.execute(
+            select(_Msg_a)
+            .join(_Conv_a, _Conv_a.id == _Msg_a.conversation_id)
+            .where(_Conv_a.user_id == user_id)
+            .where(_Msg_a.client_msg_id == client_msg_id)
+            .where(_Msg_a.role == "assistant")
+            .order_by(_Msg_a.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+    return row.id if row is not None else None
+
+
+async def _duplicate_ack(user_id: str, client_msg_id: Optional[str], session_id, **extra) -> dict:
+    """The `user_message_persisted{duplicate:true}` frame.
+
+    Round 46: this ack used to say only "I have seen this id", which proves
+    liveness and settles NOTHING — it disarmed the client's 12 s silent grace
+    AND its abnormal-close resend while leaving the turn pending, so the
+    waking row and the stop control sat over a delivered answer for ~22 s on
+    2026-09-15. `running` answers the question the client actually has: is
+    the turn I am waiting on still being worked on somewhere, or is it
+    already finished (and its answer already in my history)?
+
+    `running: false` is only ever sent when it can be PROVED. `_turn_running`
+    answers False in two different situations — nothing in the registry, and an
+    entry belonging to a DIFFERENT turn (the registry holds one entry per user
+    and `_set_active_turn` REPLACES it, so a second turn erases the first's) —
+    and only one of them means "finished". The client treats `running: false`
+    as "your answer is in history": it calls `onDropped` and settles the turn
+    on the spot, so guessing it ends a turn that has not started. With no proof
+    the key is OMITTED, and the client falls back to `resume`/`turn_receipt`."""
+    running, mission_id = _turn_running(user_id, client_msg_id)
+    frame = {
+        "type": "user_message_persisted",
+        "client_msg_id": client_msg_id,
+        "session_id": session_id,
+        "duplicate": True,
+    }
+    if running:
+        frame["running"] = True
+        frame["mission_id"] = mission_id
+    else:
+        try:
+            if await _answered_message_id(user_id, client_msg_id):
+                frame["running"] = False
+                frame["mission_id"] = None
+        except Exception as exc:  # noqa: BLE001 — unprovable is not false
+            logger.info(
+                "[WS] duplicate ack could not prove completion (%s) — omitting `running`",
+                type(exc).__name__,
+            )
+    frame.update(extra)
+    return frame
+
+
+async def _turn_receipt(user_id: str, client_msg_id: str) -> dict:
+    """Answer a client's `{type:'resume', client_msg_id}` (C2).
+
+    The durable half of the turn contract. A client that reconnects with a
+    pending turn has exactly one question — "did my message get answered?" —
+    and before this the only mechanisms were a 12 s silence heuristic and a
+    wall-clock deadline. Both are guesses; the exactly-once ledger and the
+    in-process registry between them KNOW.
+
+    `status`:
+      * `running`   — the registry has this turn in flight right now
+      * `completed` — the ledger claimed it and an assistant row exists
+      * `failed`    — the ledger claimed it and no assistant row followed
+      * `unknown`   — never seen here (a different process, or never arrived)
+
+    `unknown` is honest and is the client's cue to fall back to today's
+    behaviour, never to give up: this process may simply not be the one that
+    ran the turn.
+    """
+    receipt: dict = {
+        "type": "turn_receipt",
+        "client_msg_id": client_msg_id,
+        "status": "unknown",
+    }
+    running, mission_id = _turn_running(user_id, client_msg_id)
+    if running:
+        receipt["status"] = "running"
+        receipt["mission_id"] = mission_id
+        return receipt
+
+    try:
+        import uuid as _uuid_r
+        from app.db.database import async_session_maker as _sm_r
+        from app.db.models import ProcessedMessage as _PM, Message as _Msg
+
+        _pm_id = str(_uuid_r.uuid5(
+            _uuid_r.NAMESPACE_OID, f"toup-msg:{user_id}:{client_msg_id}",
+        ))
+        async with _sm_r() as _db_r:
+            claimed = (await _db_r.execute(
+                select(_PM).where(_PM.id == _pm_id)
+            )).scalar_one_or_none()
+            if claimed is None:
+                return receipt  # unknown
+        # The assistant row of this turn, if one was written. Both rows of a
+        # turn carry the same client_msg_id (A12). Scoped to the caller — see
+        # `_answered_message_id`, which `_duplicate_ack` shares.
+        answer_id = await _answered_message_id(user_id, client_msg_id)
+        if answer_id is not None:
+            receipt["status"] = "completed"
+            receipt["message_id"] = answer_id
+        else:
+            # Claimed, not running, no answer row carrying this id. That is
+            # ALSO exactly what a turn answered before this image shipped
+            # looks like, so it is not evidence of failure — `unknown` with a
+            # code, and the client pulls its history. `failed` stays in the
+            # vocabulary for a producer that can actually prove a failure;
+            # nothing in this round emits it, and guessing it would tell a
+            # user their answered message failed.
+            receipt["status"] = "unknown"
+            receipt["code"] = "no_answer_persisted"
+    except Exception as exc:  # noqa: BLE001
+        # A receipt we cannot prove is `unknown`, never `failed`: telling a
+        # client its turn failed because our DB is down is the 2026-09-15
+        # "check your internet" defect in a different costume.
+        logger.info("[WS] turn_receipt lookup failed (%s) — answering unknown",
+                    type(exc).__name__)
+        receipt["status"] = "unknown"
+        receipt["code"] = "lookup_failed"
+    return receipt
 
 
 # ── Onboarding prompt ────────────────────────────────────────────────
@@ -1176,7 +1440,14 @@ async def _detect_and_create_task(
             "job_id": job_id,
             "title": title,
         })
-        logger.info(f"[TASK] Detected task intent, created agent_task job {job_id[:8]}: {title}")
+        # `title` is the first 60 characters of the user's own message. The
+        # container trail ships to Loki and is retained for days, so the line
+        # carries its LENGTH, the same shape the [FAST-MEDIA] line one
+        # function away already uses.
+        logger.info(
+            "[TASK] Detected task intent, created agent_task job %s title_len=%d",
+            job_id[:8], len(title),
+        )
         return job_id
     except Exception as e:
         logger.warning(f"[TASK] Failed to create task job: {e}")
@@ -1200,7 +1471,11 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
     if not query or len(query) < 2 or len(query) > 200:
         return None
 
-    logger.info("[FAST-MEDIA] Detected play request: %r → query=%r", text, query)
+    # The user's whole chat message and the title they asked for used to be
+    # logged verbatim here, on a path that fires for every ordinary "play …".
+    # Lengths tell a truncation from a parse failure; the content was never
+    # the diagnostic.
+    logger.info("[FAST-MEDIA] Detected play request: text_len=%d query_len=%d", len(text), len(query))
 
     try:
         import httpx
@@ -1232,11 +1507,12 @@ async def _fast_media_check(text: str, user_id: str, broadcast_queue: asyncio.Qu
                 # to the agent's own resolver ladder (yt-dlp always returns real
                 # metadata) by declining the fast path.
                 logger.warning(
-                    "[FAST-MEDIA] no titled result for %r — deferring to play_media", query,
+                    "[FAST-MEDIA] no titled result (query_len=%d) — deferring to play_media",
+                    len(query),
                 )
                 return None
         if not video_id:
-            logger.warning("[FAST-MEDIA] No video found for: %s", query)
+            logger.warning("[FAST-MEDIA] No video found (query_len=%d)", len(query))
             return None
 
         # Which surface did they ask for? This path handles most typed "play …"
@@ -2985,8 +3261,50 @@ def set_ws_refs(agent_runner, skill_loader=None):
     _skill_loader = skill_loader
 
 
+async def _ensure_stub_user(user_id: str) -> str:
+    """Lazily create the agent-mode stub user row. Returns 'ok' or
+    'infra_down'.
+
+    One function, not the two byte-identical inline copies it replaces (the
+    agent-key path and the session-token path). Round 46 incident 3: the
+    agent-key copy sat ABOVE the handler's own `try:`, so when PgBouncer died
+    its `ConnectionRefusedError` escaped the handler entirely, uvicorn closed
+    the transport with no close frame, and the one failure the agent could
+    not report is the one that happened."""
+    try:
+        from app.db.database import async_session_maker as _sm
+        from app.db.models import User
+        from app.services.auth_service import get_user_by_id
+
+        async with _sm() as _db:
+            u = await get_user_by_id(_db, user_id)
+            if not u:
+                u = User(
+                    id=user_id,
+                    email=f"{user_id[:8]}@agent.local",
+                    hashed_password="",
+                    name="Agent Owner",
+                )
+                _db.add(u)
+                await _db.commit()
+        return "ok"
+    except Exception as e:  # noqa: BLE001 — classified, then reported
+        if is_infra_error(e):
+            logger.warning("[WS] stub-user create: infrastructure unavailable (%s)", type(e).__name__)
+            return "infra_down"
+        logger.warning("[WS] stub-user create failed: %s", type(e).__name__)
+        return "ok"
+
+
 async def _authenticate_ws(token: str) -> Optional[str]:
-    """Validate a JWT token and return the user_id, or None."""
+    """Validate a JWT token and return the user_id, or None.
+
+    Raises `WsInfraUnavailable` when the lookup could not be performed at
+    all. "I could not check" is not "you are not who you say you are", and
+    conflating them cost eleven minutes of silent retries in incident 3:
+    this function's `except Exception: return None` turned a dead database
+    into close 4001, which ws_chat_proxy maps to 4503 ("agent starting"),
+    which the app answers by re-sending."""
     try:
         from app.services import decode_access_token, get_user_by_id
         from app.db.database import async_session_maker
@@ -3001,6 +3319,9 @@ async def _authenticate_ws(token: str) -> Optional[str]:
                 return user.id
         return None
     except Exception as e:
+        if is_infra_error(e):
+            logger.warning("[WS] auth lookup unavailable: %s", type(e).__name__)
+            raise WsInfraUnavailable(detail=type(e).__name__) from e
         logger.warning(f"WS auth failed: {e}")
         return None
 
@@ -3055,23 +3376,8 @@ async def _authenticate_ws_session_token(token: str) -> Optional[str]:
         )
         return None
     # Lazy-create the user row (mirrors the X-Agent-Key path).
-    try:
-        from app.db.database import async_session_maker as _sm
-        from app.db.models import User
-        async with _sm() as _db:
-            from app.services.auth_service import get_user_by_id
-            u = await get_user_by_id(_db, user_id)
-            if not u:
-                u = User(
-                    id=user_id,
-                    email=f"{user_id[:8]}@agent.local",
-                    hashed_password="",
-                    name="Agent Owner",
-                )
-                _db.add(u)
-                await _db.commit()
-    except Exception as e:
-        logger.warning("[WS] session-token user-row create failed: %s", e)
+    if await _ensure_stub_user(user_id) == "infra_down":
+        raise WsInfraUnavailable(detail="stub_user")
     return user_id
 
 
@@ -3097,60 +3403,82 @@ async def ws_chat(
         log_deprecated_query_token,
         log_deprecated_agent_key_url,
         safe_send_close_ws,
+        safe_send_fault_ws,
     )
     # Headers are populated from the upgrade request; available before
     # or after accept (we read after, for readability).
     header_agent_key = websocket.headers.get("x-agent-key") or ""
     subprotocol_token = await accept_with_subprotocol_auth(websocket)
+    # Round 46: the accept→register window. Everything broadcast between here
+    # and `_register_ws_queue` below has nowhere to go; this timestamp is what
+    # lets the registration replay it.
+    _accepted_at = time.monotonic()
     user_id: Optional[str] = None
 
-    # Try agent_key auth first (platform proxy mode).
-    # 1. X-Agent-Key header (preferred — no URL leak).
-    # 2. ?agent_key= query (deprecated — fires marker on use).
-    matched_agent_key: Optional[str] = None
-    if header_agent_key and settings.agent_api_key and header_agent_key == settings.agent_api_key:
-        matched_agent_key = header_agent_key
-    elif agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
-        log_deprecated_agent_key_url("/api/ws/chat")
-        matched_agent_key = agent_key
+    # The auth ladder runs ABOVE the handler's own try/except, which is how
+    # incident 3 (2026-09-15) escaped as a bare transport close: PgBouncer
+    # died, the stub-user lookup raised ConnectionRefusedError here, uvicorn
+    # closed the socket with no close frame, the proxy laundered the
+    # resulting 1006 into 1000, and the app told the user to check her
+    # internet. An infrastructure fault is now ANSWERED — a coded frame plus
+    # close 4505 — and is never confused with "not authenticated" (4001,
+    # which the proxy maps to 4503 "agent starting" ⇒ silent re-sends).
+    try:
+        # Try agent_key auth first (platform proxy mode).
+        # 1. X-Agent-Key header (preferred — no URL leak).
+        # 2. ?agent_key= query (deprecated — fires marker on use).
+        matched_agent_key: Optional[str] = None
+        if header_agent_key and settings.agent_api_key and header_agent_key == settings.agent_api_key:
+            matched_agent_key = header_agent_key
+        elif agent_key and settings.agent_api_key and agent_key == settings.agent_api_key:
+            log_deprecated_agent_key_url("/api/ws/chat")
+            matched_agent_key = agent_key
 
-    if matched_agent_key:
-        user_id = settings.user_id
-        if user_id:
-            # Ensure stub user exists (same as auth.py agent mode)
-            from app.db.database import async_session_maker as _sm
-            from app.db.models import User
-            async with _sm() as _db:
-                from app.services.auth_service import get_user_by_id
-                u = await get_user_by_id(_db, user_id)
-                if not u:
-                    u = User(id=user_id, email=f"{user_id[:8]}@agent.local", hashed_password="", name="Agent Owner")
-                    _db.add(u)
-                    await _db.commit()
+        if matched_agent_key:
+            user_id = settings.user_id
+            if user_id:
+                # Ensure stub user exists (same as auth.py agent mode).
+                if await _ensure_stub_user(user_id) == "infra_down":
+                    raise WsInfraUnavailable(detail="stub_user")
 
-    # Try direct-to-agent session token (signed with this agent's
-    # X-Agent-Key, issued by platform's /api/auth/agent-session-token).
-    # Tried BEFORE the platform-JWT path because session tokens carry
-    # `aud=toup-agent-session` which the regular JWT path would reject —
-    # cheaper to try the right path first.
-    if not user_id and subprotocol_token:
-        user_id = await _authenticate_ws_session_token(subprotocol_token)
+        # Try direct-to-agent session token (signed with this agent's
+        # X-Agent-Key, issued by platform's /api/auth/agent-session-token).
+        # Tried BEFORE the platform-JWT path because session tokens carry
+        # `aud=toup-agent-session` which the regular JWT path would reject —
+        # cheaper to try the right path first.
+        if not user_id and subprotocol_token:
+            user_id = await _authenticate_ws_session_token(subprotocol_token)
 
-    # Try subprotocol JWT auth (ST-2 — header-based, no URL leak)
-    if not user_id and subprotocol_token:
-        user_id = await _authenticate_ws(subprotocol_token)
+        # Try subprotocol JWT auth (ST-2 — header-based, no URL leak)
+        if not user_id and subprotocol_token:
+            user_id = await _authenticate_ws(subprotocol_token)
 
-    # Try ?token= session token (signed with agent_api_key, aud=toup-agent-session).
-    # The Chrome extension's sidepanel chat-ws connects via query string with
-    # such a token — the path needs to recognize it BEFORE falling through to
-    # the platform-JWT decoder which uses a different secret.
-    if not user_id and token:
-        user_id = await _authenticate_ws_session_token(token)
+        # Try ?token= session token (signed with agent_api_key, aud=toup-agent-session).
+        # The Chrome extension's sidepanel chat-ws connects via query string with
+        # such a token — the path needs to recognize it BEFORE falling through to
+        # the platform-JWT decoder which uses a different secret.
+        if not user_id and token:
+            user_id = await _authenticate_ws_session_token(token)
 
-    # Try ?token= platform JWT (deprecated bake-window fallback)
-    if not user_id and token:
-        log_deprecated_query_token("/api/ws/chat (agent)")
-        user_id = await _authenticate_ws(token)
+        # Try ?token= platform JWT (deprecated bake-window fallback)
+        if not user_id and token:
+            log_deprecated_query_token("/api/ws/chat (agent)")
+            user_id = await _authenticate_ws(token)
+    except WsInfraUnavailable as _iu:
+        logger.warning(
+            "[WS] REJECT 4505 %s — auth path could not reach its dependency (%s)",
+            AGENT_DB_UNAVAILABLE, getattr(_iu, "detail", None) or "?",
+        )
+        await safe_send_fault_ws(websocket, AGENT_DB_UNAVAILABLE, detail=getattr(_iu, "detail", None))
+        return
+    except Exception as _ae:  # noqa: BLE001 — never a bare transport close
+        if is_infra_error(_ae):
+            logger.warning("[WS] REJECT 4505 %s — %s", AGENT_DB_UNAVAILABLE, type(_ae).__name__)
+            await safe_send_fault_ws(websocket, AGENT_DB_UNAVAILABLE, detail=type(_ae).__name__)
+        else:
+            logger.exception("[WS] REJECT 4507 agent_internal in auth ladder")
+            await safe_send_fault_ws(websocket, AGENT_INTERNAL, detail=type(_ae).__name__)
+        return
 
     try:
         # If still not authenticated, expect first-frame auth message.
@@ -3241,7 +3569,12 @@ async def ws_chat(
 
         # Register broadcast queue for this connection
         broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-        _register_ws_queue(user_id, broadcast_queue)
+        _replayed = _register_ws_queue(user_id, broadcast_queue, _accepted_at)
+        if _replayed:
+            logger.info(
+                "[WS] replayed %d frame(s) broadcast during the accept->auth "
+                "window for %s", _replayed, user_id[:8],
+            )
         # Last turn id THIS connection registered — the connection-level
         # backstop for the in-flight registry (see the finally below). A turn
         # that loses its client keeps running inside this handler, so by the
@@ -3400,6 +3733,45 @@ async def ws_chat(
                                 "type": "turn_ended",
                                 "mission_id": msg.get("mission_id"),
                             })
+                    except Exception:  # noqa: BLE001
+                        pass
+                    continue
+
+                # ── "Did THIS message of mine get answered?" (round 46, C2) ──
+                # `turn_probe` above answers about the user's CURRENT turn,
+                # whichever it is; it cannot answer about a specific message,
+                # and it reports `turn_ended` for a turn that ended before the
+                # client ever reconnected — which is the case the app spent
+                # 22 s guessing at on 2026-09-15, first with a 12 s silence
+                # heuristic and then with a wall clock. `resume` is named: the
+                # answer is read from the durable exactly-once ledger and the
+                # in-process registry, and `unknown` is a real answer meaning
+                # "not from this process — use your history".
+                if msg_type == "resume":
+                    _resume_cmid = msg.get("client_msg_id")
+                    # Bounded like the `message` branch below, and for the
+                    # same reason: the value is fully client-controlled and
+                    # goes straight into a query against a VARCHAR(100)
+                    # column. Over-long or non-string is treated as ABSENT,
+                    # which the branch already answers honestly.
+                    if _resume_cmid is not None and (
+                        not isinstance(_resume_cmid, str)
+                        or len(_resume_cmid) > _MAX_CLIENT_MSG_ID_LEN
+                    ):
+                        _resume_cmid = None
+                    if not _resume_cmid:
+                        try:
+                            await websocket.send_json({
+                                "type": "turn_receipt", "client_msg_id": None,
+                                "status": "unknown", "code": "no_client_msg_id",
+                            })
+                        except Exception:  # noqa: BLE001
+                            pass
+                        continue
+                    try:
+                        await websocket.send_json(
+                            await _turn_receipt(user_id, str(_resume_cmid))
+                        )
                     except Exception:  # noqa: BLE001
                         pass
                     continue
@@ -3933,6 +4305,21 @@ async def ws_chat(
                 # idempotency and spawn a second agent turn. Same agent process
                 # handles the reconnect, so an in-process guard is sufficient.
                 _client_msg_id_top = msg.get("client_msg_id")
+                # Bounded HERE, once, rather than surfacing as a DataError on
+                # the INSERT: `messages.client_msg_id` is VARCHAR(100), the
+                # value is fully client-controlled, and it now rides two
+                # inserts and a receipt lookup. Over-long => treated as absent
+                # (the pre-identity path), never as a failed turn.
+                if _client_msg_id_top is not None and (
+                    not isinstance(_client_msg_id_top, str)
+                    or len(_client_msg_id_top) > _MAX_CLIENT_MSG_ID_LEN
+                ):
+                    logger.info(
+                        "[WS] client_msg_id rejected (len=%s) — turn proceeds without identity",
+                        len(_client_msg_id_top) if isinstance(_client_msg_id_top, str) else "n/a",
+                    )
+                    _client_msg_id_top = None
+                    msg.pop("client_msg_id", None)
                 if _client_msg_id_top and not _is_system_action:
                     if _dedup_seen_client_msg(f"{user_id}:{_client_msg_id_top}"):
                         logger.info(
@@ -3940,12 +4327,9 @@ async def ws_chat(
                             _client_msg_id_top, session_id, user_id[:8],
                         )
                         try:
-                            await websocket.send_json({
-                                "type": "user_message_persisted",
-                                "client_msg_id": _client_msg_id_top,
-                                "session_id": session_id,
-                                "duplicate": True,
-                            })
+                            await websocket.send_json(await _duplicate_ack(
+                                user_id, _client_msg_id_top, session_id,
+                            ))
                         except Exception:
                             pass
                         continue
@@ -4019,12 +4403,9 @@ async def ws_chat(
                             _client_msg_id_top, session_id, user_id[:8],
                         )
                         try:
-                            await websocket.send_json({
-                                "type": "user_message_persisted",
-                                "client_msg_id": _client_msg_id_top,
-                                "session_id": session_id,
-                                "duplicate": True,
-                            })
+                            await websocket.send_json(await _duplicate_ack(
+                                user_id, _client_msg_id_top, session_id,
+                            ))
                         except Exception:
                             pass
                         continue
@@ -4068,6 +4449,9 @@ async def ws_chat(
                     stage="thinking",
                     tool=None,
                     started_at=_turn_received_ts,
+                    # Round 46 (C1): the registry is what `turn_receipt` and
+                    # every turn frame read the identity from.
+                    client_msg_id=_client_msg_id_top,
                 )
                 _conn_turn_mission = _turn_mission_id
                 try:
@@ -4075,6 +4459,7 @@ async def ws_chat(
                         "type": "status", "stage": "received",
                         "mission_id": _turn_mission_id,
                         "title": _turn_title,
+                        "client_msg_id": _client_msg_id_top,
                     })
                 except Exception:
                     pass
@@ -4128,14 +4513,11 @@ async def ws_chat(
                                     # optimistic id and clears its pending
                                     # queue.
                                     try:
-                                        await websocket.send_json({
-                                            "type": "user_message_persisted",
-                                            "client_msg_id": _client_msg_id,
-                                            "server_msg_id": _persisted_user_msg_id,
-                                            "day_chat_id": _persisted_day_chat_id,
-                                            "session_id": session_id,
-                                            "duplicate": True,
-                                        })
+                                        await websocket.send_json(await _duplicate_ack(
+                                            user_id, _client_msg_id, session_id,
+                                            server_msg_id=_persisted_user_msg_id,
+                                            day_chat_id=_persisted_day_chat_id,
+                                        ))
                                     except Exception:
                                         pass
                                     # Skip the LLM call: a previous handler
@@ -4195,6 +4577,16 @@ async def ws_chat(
                             )
                             if reply_to_message_id:
                                 _msg_kwargs["reply_to_message_id"] = reply_to_message_id
+                            # Turn identity (round 46, A12). Same omit-when-
+                            # absent discipline as reply_to_message_id above,
+                            # and the same commit retry below: a tenant whose
+                            # ALTER has not run yet must still be able to save
+                            # a message.
+                            if _client_msg_id:
+                                _msg_kwargs["client_msg_id"] = _client_msg_id
+                            _msg_kwargs["occurred_at"] = __import__('datetime').datetime.utcfromtimestamp(
+                                _turn_received_ts
+                            )
                             _new_msg = DbMessage(**_msg_kwargs)
                             _presave_db.add(_new_msg)
                             # Update conversation timestamp
@@ -4211,14 +4603,23 @@ async def ws_chat(
                                 # pointer column and retry — the in-memory
                                 # preamble still threads the current turn.
                                 _err_text = str(_commit_err).lower()
-                                if (
-                                    reply_to_message_id
-                                    and "reply_to_message_id" in _err_text
-                                ):
+                                # Round 46: the retry is no longer about ONE
+                                # column. Three optional columns ride this
+                                # INSERT and any of them can be missing on a
+                                # tenant whose self-heal ALTER has not run —
+                                # dropping only the one the error names keeps
+                                # the others when they do exist.
+                                _missing_cols = [
+                                    c for c in
+                                    ("reply_to_message_id", "client_msg_id", "occurred_at")
+                                    if c in _msg_kwargs and c in _err_text
+                                ]
+                                if _missing_cols:
                                     logger.warning(
-                                        "[WS] reply_to_message_id column missing on this tenant; "
-                                        "saving user message without the structured pointer. "
-                                        "Run init_db / migration 049 to enable persistence.",
+                                        "[WS] column(s) %s missing on this tenant; saving the "
+                                        "user message without them. Run init_db to enable "
+                                        "persistence.",
+                                        ",".join(_missing_cols),
                                     )
                                     await _presave_db.rollback()
                                     # The rollback also undid the conversation
@@ -4229,7 +4630,8 @@ async def ws_chat(
                                         _presave_db, user_id, session_id, channel,
                                         client_tz=client_tz, day_chat=_dc_once,
                                     )
-                                    _msg_kwargs.pop("reply_to_message_id", None)
+                                    for _c in _missing_cols:
+                                        _msg_kwargs.pop(_c, None)
                                     _new_msg = DbMessage(**_msg_kwargs)
                                     _presave_db.add(_new_msg)
                                     if _conv:
@@ -4270,7 +4672,17 @@ async def ws_chat(
                             _pnc, user_id[:8], session_id,
                         )
                     except Exception as _pse:
-                        logger.warning(f"[WS] Failed to pre-save user message: {_pse}")
+                        # Type only. Formatting the exception itself prints
+                        # SQLAlchemy's `[SQL: INSERT INTO messages ...]
+                        # [parameters: (...)]`, and those parameters ARE the
+                        # user's message text. `hide_parameters=True` on the
+                        # engines is the structural fix; this is the second
+                        # wall, because the same f-string pattern is how the
+                        # class keeps coming back.
+                        logger.warning(
+                            "[WS] Failed to pre-save user message: %s",
+                            type(_pse).__name__,
+                        )
                     finally:
                         _pt.end("presave")
 
@@ -4376,12 +4788,9 @@ async def ws_chat(
                     fallback on narrow viewports) and attach the file reference to
                     the currently-streaming assistant message.
                     """
+                    from app.agent.artifact_kinds import kind_for_mime, preview_policy
                     mime = att.get("mime_type", "")
                     aid = att.get("id", "")
-                    preview_mimes = {
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    }
                     payload = {
                         "type": "attachment",
                         "message_id": message_id,
@@ -4390,8 +4799,20 @@ async def ws_chat(
                         "mime_type": mime,
                         "size_bytes": att.get("size_bytes", 0),
                         "download_url": f"{settings.api_prefix}/files/{message_id}/{aid}",
+                        # C9: format is a field now. `kind` is the closed
+                        # taxonomy every client shares; `role` says whether a
+                        # client should draw a card for this at all (a browser
+                        # screenshot is evidence, not a deliverable). Both are
+                        # optional on the wire — an app build older than round
+                        # 46 ignores them and derives the kind from the MIME.
+                        "kind": att.get("kind") or kind_for_mime(mime, att.get("filename")),
+                        "role": att.get("role") or "final",
                     }
-                    if mime in preview_mimes or mime == "application/pdf" or mime.startswith("image/"):
+                    # ONE preview policy (artifact_kinds.preview_policy). This
+                    # was the third of three drifted copies of the same set and
+                    # all three omitted PPTX, which files.py has always been
+                    # able to render and _prewarm_preview already pays for.
+                    if preview_policy(mime) != "none":
                         payload["preview_url"] = f"{settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
                     # Intrinsic pixels for an image, so the card can lay out at
                     # the picture's own shape on FIRST paint instead of guessing
@@ -4473,6 +4894,9 @@ async def ws_chat(
                             "type": "status", "stage": stage,
                             "mission_id": _turn_mission_id,
                             "title": _turn_title,
+                            # C1: every turn frame names its turn, not only
+                            # the `received` ack.
+                            "client_msg_id": _client_msg_id_top,
                         })
                     except Exception:
                         pass
@@ -4556,57 +4980,203 @@ async def ws_chat(
                                 "job_name": _jnm_m.group(1) if _jnm_m else "App Build",
                             })
 
-                # Handle media attachments (images/files from frontend)
-                _media_paths = []
+                # ── Inbound attachments ──────────────────────────────────
+                # Round 46 (C6). Two paths, one shape. `attachment_ids` is the
+                # uploaded path: the bytes already reached the tenant's storage
+                # before the user pressed send, already sniffed, already
+                # downscaled, already extracted — so the turn pays none of it.
+                # `media` is the LEGACY in-frame path and stays accepted
+                # forever (app builds 123–126 and the web client send it),
+                # bounded by LEGACY_MAX_FRAME_MEDIA_BYTES.
+                #
+                # What this replaces, item by item: a `[:5]` that dropped the
+                # 6th file with no log line at all, a silent `continue` on an
+                # empty payload, a decode on the event loop of a 1.00-CPU
+                # container, an `except` that logged a warning the user never
+                # saw, an ASYMMETRIC persist failure (the model saw an image
+                # that history then lost), and one `tempfile.mkdtemp()` per
+                # attachment that was NEVER removed for the life of the
+                # container. The temp dirs are gone by construction: nothing on
+                # this path writes an unmanaged file any more.
+                # Stays, and stays EMPTY on this path. `media_paths` is how
+                # every OTHER channel (Telegram, WhatsApp, the BaseChannel
+                # adapters) hands the runner a file, and run() still accepts
+                # it; ws_chat no longer writes one because nothing here puts an
+                # unmanaged file on disk any more.
+                _media_paths: list = []
                 # Persisted pointers → user Message.attachments so inbound images
                 # survive reload / show in history / other devices, and are a
                 # reusable source for the edit_image tool.
                 _inbound_attachments: list = []
+                # One record per accepted item, in AUTHORING ORDER. `media_ids`
+                # is derived from it positionally (C7, L6's spec): a persist
+                # failure must never shift every later id by one, because a
+                # MISLABELLED image is worse than an unlabelled one.
+                _attachment_records: list = []
+                # `_record_indices[i]` is the position `_attachment_records[i]`
+                # had in what the CLIENT sent. The ingest report is numbered
+                # from this, not from the accepted list: the app maps a status
+                # onto `sent[item.index]`, so one rejected file used to paint
+                # every later file's status onto the wrong row.
+                _record_indices: list = []
+                _rejected_atts: list = []
+                _ingest_report: list = []
+                _att_ids = msg.get("attachment_ids")
                 _media_items = msg.get("media", [])
-                if _media_items and isinstance(_media_items, list):
+
+                if _att_ids and isinstance(_att_ids, list):
                     _pt.start("attach")
-                    import tempfile, base64 as _b64, os as _os
-                    from app.agent.doc_generators import _persist as _persist_att
-                    for _mi in _media_items[:5]:  # Max 5 attachments
-                        try:
-                            _mtype = _mi.get("type", "image/png")
-                            _mdata = _mi.get("data", "")
-                            _mname = _mi.get("name", "")
-                            if not _mdata:
-                                continue
-                            # Prefer extension from filename, fall back to MIME mapping
-                            _ext = ""
-                            if _mname:
-                                _ext = _os.path.splitext(_mname.lower())[1]
-                            if not _ext:
-                                _ext = {
-                                    "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
-                                    "image/webp": ".webp", "application/pdf": ".pdf",
-                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-                                    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
-                                    "application/zip": ".zip",
-                                    "application/x-zip-compressed": ".zip",
-                                }.get(_mtype, ".bin")
-                            # Write to temp dir with original filename so agent runner sees the real name
-                            _tmpdir = tempfile.mkdtemp(prefix="toup_media_")
-                            _fname = _mname or f"attachment{_ext}"
-                            # Sanitize filename (keep only the basename, no path traversal)
-                            _fname = _os.path.basename(_fname)
-                            _fpath = _os.path.join(_tmpdir, _fname)
-                            _raw = _b64.b64decode(_mdata)
-                            with open(_fpath, "wb") as _wf:
-                                _wf.write(_raw)
-                            _media_paths.append(_fpath)
-                            # Persist to the storage backend + record a pointer.
-                            # Best-effort: a storage hiccup must not drop the turn.
-                            try:
-                                _att = await _persist_att(_raw, _fname, _mtype, user_id)
-                                _inbound_attachments.append(_att.to_dict())
-                            except Exception as _pe:
-                                logger.warning("[WS] Failed to persist inbound attachment: %s", _pe)
-                        except Exception as _me:
-                            logger.warning("[WS] Failed to process media attachment: %s", _me)
+                    from app.api.chat_attachments import (
+                        build_turn_record,
+                        plan_uploaded_attachments,
+                    )
+                    # The count cap, the per-turn byte budget (declared in the
+                    # table and once enforced only by the two CLIENTS — which is
+                    # exactly the trust the table's own docstring says a WS
+                    # frame does not get) and the wire indices are one pure
+                    # decision, tested behaviourally in
+                    # tests/test_attachment_turn_plan.py. One thread hop for the
+                    # whole pass instead of one per item.
+                    _recs, _record_indices, _rej = await asyncio.to_thread(
+                        plan_uploaded_attachments,
+                        _att_ids,
+                        lambda _a: build_turn_record(user_id, _a),
+                    )
+                    _attachment_records.extend(_recs)
+                    _rejected_atts.extend(_rej)
+                    for _rec in _recs:
+                        _att_dict = _rec.get("attachment")
+                        if _att_dict:
+                            _att_dict = dict(_att_dict)
+                            _att_dict["ingest"] = {
+                                "status": _rec.get("status") or "ok",
+                                **({"reason": _rec["reason"]} if _rec.get("reason") else {}),
+                            }
+                            _inbound_attachments.append(_att_dict)
                     _pt.end("attach")
+
+                elif _media_items and isinstance(_media_items, list):
+                    _pt.start("attach")
+                    import base64 as _b64
+                    from app.agent.attachment_ingest import ingest_one, record_from_ingested
+                    from app.agent.attachment_limits import (
+                        LEGACY_MAX_FRAME_MEDIA_BYTES,
+                        MAX_ATTACHMENTS_PER_TURN,
+                    )
+                    from app.agent.doc_generators import _persist as _persist_att
+                    _legacy_budget = LEGACY_MAX_FRAME_MEDIA_BYTES
+                    for _idx, _mi in enumerate(_media_items):
+                        _mname = (_mi.get("name") or "attachment").split("/")[-1].split("\\")[-1]
+                        _mdata = _mi.get("data", "")
+                        if not _mdata:
+                            _rejected_atts.append(
+                                {"index": _idx, "name": _mname, "reason": "empty"})
+                            continue
+                        if len(_attachment_records) >= MAX_ATTACHMENTS_PER_TURN:
+                            _rejected_atts.append({
+                                "index": _idx, "name": _mname,
+                                "reason": "attachment_count_exceeded",
+                            })
+                            continue
+                        if len(_mdata) > _legacy_budget:
+                            # The frame itself is the cap here: these bytes are
+                            # already in memory on a 768 MiB container, and
+                            # before this gate the only ceiling was uvicorn's
+                            # 16 MiB frame — whose breach closed the socket and
+                            # reached the user as "check your internet".
+                            _rejected_atts.append({
+                                "index": _idx, "name": _mname,
+                                "reason": "attachment_total_too_large",
+                            })
+                            continue
+                        _legacy_budget -= len(_mdata)
+                        try:
+                            _raw = await asyncio.to_thread(_b64.b64decode, _mdata)
+                        except Exception:
+                            _rejected_atts.append(
+                                {"index": _idx, "name": _mname, "reason": "unreadable"})
+                            continue
+                        _ing = await asyncio.to_thread(
+                            ingest_one, _raw, _mname, _mi.get("type")
+                        )
+                        _rec = record_from_ingested(_ing)
+                        _att_dict = None
+                        try:
+                            _att = await _persist_att(_raw, _ing.name, _ing.mime, user_id, role="source")
+                            _att_dict = _att.to_dict()
+                            _rec["attachment_id"] = _att.id
+                            _rec["attachment"] = _att_dict
+                        except Exception:
+                            # ASYMMETRY was the bug: the model saw an image that
+                            # history lost. The record still goes to the model,
+                            # and the status says the file was not stored.
+                            logger.warning("[WS] inbound attachment not persisted kind=%s", _ing.kind)
+                        _attachment_records.append(_rec)
+                        _record_indices.append(_idx)
+                        if _att_dict:
+                            _att_dict = dict(_att_dict)
+                            _att_dict["ingest"] = _ing.to_record()
+                            _inbound_attachments.append(_att_dict)
+                    _pt.end("attach")
+
+                if _attachment_records or _rejected_atts:
+                    for _i, _r in enumerate(_attachment_records):
+                        _ingest_report.append({
+                            "index": _record_indices[_i] if _i < len(_record_indices) else _i,
+                            "name": _r.get("name") or "",
+                            "status": _r.get("status") or "ok",
+                            **({"reason": _r["reason"]} if _r.get("reason") else {}),
+                        })
+                    for _rj in _rejected_atts:
+                        _ingest_report.append({
+                            # The row the user attached it to, never -1: the app
+                            # reads `sent[item.index]`, and `sent[-1]` is
+                            # undefined — a refusal nobody is told about.
+                            "index": int(_rj.get("index", -1)),
+                            "name": _rj.get("name") or "",
+                            "status": "rejected",
+                            "reason": _rj.get("reason") or "attachment_unsupported",
+                        })
+                    try:
+                        # Additive frame: a client that does not know it ignores
+                        # it, and the same statuses are written durably below.
+                        await websocket.send_json({
+                            "type": "attachments_ingested",
+                            "items": _ingest_report,
+                        })
+                    except Exception:
+                        pass
+                if _rejected_atts:
+                    try:
+                        # NOT the fault vocabulary. `fault_frame()` builds
+                        # `{type:'error', code}`, and BOTH clients treat any
+                        # error frame whose code they do not know as a TERMINAL
+                        # turn failure (app api.ts: `opts.onError` +
+                        # `_settleTurn('error')`), so a PARTIAL rejection wrote
+                        # an error bubble, settled the turn and tore the socket
+                        # down while this server kept running the turn — on the
+                        # installed base (document picker `type:'*/*'`) for any
+                        # file outside the new allowlist. Its own type, which an
+                        # old client ignores. ATTACHMENT_REJECTED/4508 stays
+                        # reserved for a turn we actually refuse.
+                        await websocket.send_json({
+                            "type": "attachments_rejected",
+                            "code": "attachment_rejected",
+                            "rejected": [
+                                {"index": int(_rj.get("index", -1)),
+                                 "name": _rj.get("name") or "",
+                                 "reason": _rj.get("reason")}
+                                for _rj in _rejected_atts
+                            ],
+                        })
+                    except Exception:
+                        pass
+                    # Deliberately NOT a close: the durable ledger has already
+                    # claimed this client_msg_id, so a turn refused here could
+                    # never be retried — the resend would be dropped as a
+                    # duplicate and the user would watch nothing happen. The
+                    # turn runs with what was accepted, and both the frame above
+                    # and the model's own manifest name what was not.
 
                 # If the user message was already presaved (existing session),
                 # back-fill its attachments now that inbound media is persisted.
@@ -4775,6 +5345,19 @@ async def ws_chat(
                 # bug the ContextVar exists to help fix.
                 _dc_ctx_token = CURRENT_TURN_DAY_CHAT_ID.set(_persisted_day_chat_id)
 
+                # C6: `att` counts what was PERSISTED; these count what the
+                # model was actually given and what the user was refused.
+                # Before round 46 the three were indistinguishable and a
+                # dropped file left no trace anywhere. Computed here, as
+                # plain locals, so the emit call below is one flat argument
+                # list: test_ws_pre_turn_instrumentation reads that call as
+                # ending on its closing paren and nothing may sit between
+                # the emit and the run task.
+                _att_ok = sum(
+                    1 for _r in _attachment_records
+                    if (_r.get("status") or "ok") in ("ok", "truncated")
+                )
+                _att_fail = len(_attachment_records) - _att_ok
                 # The pre-turn block ends HERE — the next statement hands the
                 # turn to the agent. One line, key=value, always emitted.
                 _pt.ms["_total"] = _pt.elapsed_ms()
@@ -4790,6 +5373,10 @@ async def ws_chat(
                     fast=int(bool(_fast_result)),
                     text_len=len(_agent_text or ""),
                     att=len(_inbound_attachments),
+                    att_ok=_att_ok,
+                    att_fail=_att_fail,
+                    att_rej=len(_rejected_atts),
+                    att_up=int(bool(_att_ids)),
                 )
 
                 agent_task = asyncio.create_task(_agent_runner.run(
@@ -4811,10 +5398,16 @@ async def ws_chat(
                     save_user_message=not is_onboarding_msg and not _user_msg_presaved and not _is_system_action,
                     media_paths=_media_paths if _media_paths else None,
                     inbound_attachments=_inbound_attachments if _inbound_attachments else None,
+                    attachment_records=_attachment_records if _attachment_records else None,
                     client_tz=client_tz,
                     app_id=app_id_from_msg,
                     force_new_session=force_new_session,
                     received_at=_turn_received_ts,
+                    # Round 46 (A12): both persisted rows of this turn carry
+                    # the client's id, so the thread can pair its own
+                    # optimistic bubble by identity instead of by byte-equal
+                    # content within 10 s.
+                    client_msg_id=_client_msg_id_top,
                 ))
                 # The run task has copied the context; this handler must not
                 # keep carrying the value (see the set above).
@@ -5085,6 +5678,10 @@ async def ws_chat(
                     if _pending_job_cards:
                         _done_payload["build_jobs"] = list(_pending_job_cards)
                     _done_delivered = await _safe_send(_done_payload)
+                    # How many OTHER live sockets of this user received the
+                    # late answer. Initialised here because the push payload
+                    # below reads it whether or not the late lane ran.
+                    _late_sent = 0
 
                     # The asking socket is gone — but the user may already be
                     # back on a NEW one (the phone reconnects on every
@@ -5094,6 +5691,16 @@ async def ws_chat(
                     # of waiting for the next refetch.
                     if not _done_delivered and (response.text or "").strip():
                         try:
+                            # Round 46 (C1): the one frame sent BECAUSE the
+                            # asking socket is gone was the one frame with no
+                            # identity on it — no client_msg_id, no channel,
+                            # no session — and no `done` ever followed it. So
+                            # a reconnected client received its answer and
+                            # could not tell that it WAS its answer: on
+                            # 2026-09-15 the waking row and the stop control
+                            # sat over a delivered reply for ~22 s until a
+                            # silence timer gave up. Identity on this frame,
+                            # plus `turn_ended` below, make it a real ending.
                             _late_frame = {
                                 "type": "message",
                                 "id": (
@@ -5103,12 +5710,33 @@ async def ws_chat(
                                 "role": "assistant",
                                 "content": response.text,
                                 "created_at": datetime.utcnow().isoformat() + "Z",
+                                "client_msg_id": _client_msg_id_top,
+                                "channel": channel,
+                                "session_id": response.session_id,
+                                "asst_message_id": getattr(
+                                    response, "asst_message_id", None),
+                                "late": True,
                             }
                             if getattr(response, "day_chat_id", None):
                                 _late_frame["day_chat_id"] = response.day_chat_id
                             _late_sent = await broadcast_to_user(
                                 user_id, _late_frame, exclude=broadcast_queue,
                             )
+                            # NO mirrored `done` here. `done` is the one
+                            # terminal frame every shipped client settles
+                            # UNCONDITIONALLY — builds 123-126 and this
+                            # round's build alike run `case 'done': onDone();
+                            # _settleTurn()` with no identity check — so a
+                            # `done` broadcast to the user's OTHER sockets
+                            # ends whatever different turn is in flight there
+                            # and renders this turn's text into it (long turn
+                            # A loses its socket, the user foregrounds and
+                            # sends B, A finishes, B is answered with A's
+                            # reply). The authoritative end-of-turn for a
+                            # socket-less turn is the `turn_ended` broadcast
+                            # in this run's `finally`, which carries
+                            # client_msg_id and which the round-46 client
+                            # settles BY IDENTITY.
                             logger.info(
                                 "[WS] late answer delivered to %d reconnected socket(s) user=%s",
                                 _late_sent, user_id[:8],
@@ -5141,6 +5769,18 @@ async def ws_chat(
                             # 5 min, not 15 — a lingering finished card
                             # hogs the island and hides live countdowns.
                             "dismiss_after_s": 300,
+                            # Round 46: the fact the producer has and used to
+                            # throw away. The row is still QUEUED
+                            # unconditionally (it drives the Live Activity /
+                            # card lane); this gates only the out-of-band
+                            # Telegram/WhatsApp fan-out in
+                            # notification_dispatcher, whose precondition was
+                            # "could push reach a device?" rather than "has
+                            # the user seen this?". On 2026-09-15 the user
+                            # read the answer in the app and it was ALSO sent
+                            # to their WhatsApp, because their brand-new phone
+                            # had not registered a push token yet.
+                            "delivered_in_app": bool(_done_delivered or _late_sent),
                         }
                         if response.session_id:
                             _answer_data["session_id"] = response.session_id
@@ -5396,6 +6036,10 @@ async def ws_chat(
                         await broadcast_to_user(user_id, {
                             "type": "turn_ended",
                             "mission_id": _turn_mission_id,
+                            # Round 46 (C1): the authoritative end-of-turn for
+                            # a socket-less turn was unpairable, so the client
+                            # dropped it and fell back to a silence timer.
+                            "client_msg_id": _client_msg_id_top,
                         }, exclude=broadcast_queue)
                     except Exception:  # noqa: BLE001
                         pass
@@ -5422,10 +6066,19 @@ async def ws_chat(
 
     except WebSocketDisconnect:
         logger.info(f"[WS] Disconnected: {user_id}")
+    except WsInfraUnavailable as _iu:
+        # The first-frame auth path, and anything below it that classifies
+        # its own dependency failure. Answered, never re-raised: an escape
+        # from here is uvicorn's bare transport close (incident 3).
+        logger.warning("[WS] %s — %s", AGENT_DB_UNAVAILABLE, getattr(_iu, "detail", None) or "?")
+        await safe_send_fault_ws(websocket, AGENT_DB_UNAVAILABLE, detail=getattr(_iu, "detail", None))
     except Exception as e:
         logger.exception(f"[WS] Unexpected error: {e}")
-        try:
-            await websocket.send_json({"type": "error", "message": str(e)})
-            await websocket.close(code=4500)
-        except Exception:
-            pass
+        # `str(e)` used to go on the wire: a DB error carries the statement
+        # and its bound parameters, i.e. the user's own message. The class
+        # name is the whole diagnostic the client needs; the traceback above
+        # keeps the rest, server-side.
+        if is_infra_error(e):
+            await safe_send_fault_ws(websocket, AGENT_DB_UNAVAILABLE, detail=type(e).__name__)
+        else:
+            await safe_send_fault_ws(websocket, AGENT_INTERNAL, detail=type(e).__name__)

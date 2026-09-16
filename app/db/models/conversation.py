@@ -178,6 +178,36 @@ class Message(Base):
         String(50), nullable=True, index=True
     )
 
+    # The client message id of the TURN this row belongs to — stamped on the
+    # USER row and on the ASSISTANT row of the same turn, so a client can pair
+    # with either. Not unique: two rows share it by design.
+    #
+    # Round 46 (A12/C1). Before this, the ONLY durable record of a
+    # client_msg_id was `ProcessedMessage` (below), a dedup ledger that is
+    # never served — so the app's only way to recognise its own message was
+    # role + byte-equal content + a ±10 s window. On 2026-09-15 a WhatsApp
+    # "Hi" and an in-app "Hi" a minute apart were legal twins: the optimistic
+    # bubble was adopted by the WhatsApp row, then orphaned by the next
+    # resync, and the user watched their message disappear and reappear.
+    #
+    # NULL means UNKNOWN, never "not mine": every pre-existing row is null,
+    # and so is every row written by a container still on the previous image
+    # for as long as a rollout takes. A reader that treats null as "not mine"
+    # orphans them all.
+    client_msg_id: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True
+    )
+
+    # When the event happened on the producing surface, as opposed to
+    # `created_at`, which is when the row was WRITTEN. A voice utterance and a
+    # WhatsApp message can both be persisted long after they occurred, and
+    # sorting a day thread by write time puts them in the wrong place. Naive
+    # UTC, same convention as `created_at`. NULL ⇒ unknown; every reader sorts
+    # by `COALESCE(occurred_at, created_at), id`.
+    occurred_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True
+    )
+
     # Rich content metadata (JSON): media cards, tool results, etc.
     metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

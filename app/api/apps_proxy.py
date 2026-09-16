@@ -742,8 +742,16 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
         data = _rewrite_app_urls(resp.json())
         return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
+        # NOT []. An unreachable agent is not an empty workspace — the same
+        # degrade on `GET /jobs/` below showed the founder an empty board
+        # during live ticks (2026-07-16), and on 2026-09-15 `GET /api/routines`
+        # answered 200 [] through an eleven-minute database outage. "No agent
+        # configured" above stays [] because that one is true.
         logger.warning("Apps proxy list failed: %s", e)
-        return JSONResponse(content=[])  # Return empty list, not 502
+        return JSONResponse(
+            content={"code": "backend_unavailable", "detail": "agent unreachable"},
+            status_code=503,
+        )
 
 
 @router.get("/jobs/")

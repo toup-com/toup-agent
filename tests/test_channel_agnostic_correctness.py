@@ -41,7 +41,11 @@ def test_image_gating_reads_media_paths_with_the_same_classifier_as_vision():
         "Telegram/WhatsApp images regress to 'can't edit this image'"
     )
 
-    media_src = inspect.getsource(AgentRunner._build_media_content)
+    # Round 46 renamed `_build_media_content` to `_build_attachment_blocks` and
+    # moved the path→record step into `_attachment_records_from_paths`. The
+    # invariant is unchanged: whatever decides "is this an image" for the VISION
+    # path must be the same call the gate above makes.
+    media_src = inspect.getsource(AgentRunner._attachment_records_from_paths)
     assert "guess_type" in media_src, (
         "vision path stopped using mimetypes.guess_type; if this moves, move "
         "the gating classifier with it"

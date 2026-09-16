@@ -511,3 +511,68 @@ async def test_late_accepted_interrupted_announcement_does_not_block_next_result
     finally:
         await relay.close()
         await coordinator.close()
+
+
+# ── The day scope has a PRODUCER, and it is sync() ─────────────────────────
+# `_in_scope` was covered by hand-setting `relay._scope`, so the two lines in
+# `sync()` that actually populate it were executed by nothing: deleting them
+# left every test in this file and in test_voice_task_session_rebind.py green
+# while `control()` went back to answering "This task is not available in this
+# conversation" for work the user started two minutes ago (Incident 3).
+
+async def test_sync_ingests_the_scope_key_and_widens_to_the_day(harness):
+    relay, _, _state = harness
+    foreign = task(session_id="a-previous-socket", scope_key="day-1")
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("voice-tasks") and method == "GET":
+            return {"tasks": [foreign], "scope_key": "day-1"}
+        return None
+
+    relay.request = _request
+    assert relay._scope is None
+    await relay.sync()
+
+    assert relay._scope == "day-1", "nothing executed the ingestion"
+    assert "work" in relay.tasks, (
+        "a task started on an earlier socket of the same day was filtered out"
+    )
+
+
+async def test_without_a_scope_key_the_session_check_is_still_the_floor(harness):
+    """An agent image that sends no `scope_key` must behave exactly as today —
+    which is also what proves the widening above is doing the work."""
+    relay, _, _state = harness
+    foreign = task(session_id="a-previous-socket")
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("voice-tasks") and method == "GET":
+            return {"tasks": [foreign]}
+        return None
+
+    relay.request = _request
+    await relay.sync()
+
+    assert relay._scope is None
+    assert relay.tasks == {}, "a foreign session's task must not leak in"
+
+
+async def test_control_reaches_a_task_from_an_earlier_socket_of_the_same_day(harness):
+    """The user-visible half of Incident 3."""
+    relay, _, _state = harness
+    foreign = task(session_id="a-previous-socket", scope_key="day-1")
+
+    async def _request(method, path, **kwargs):
+        if path.endswith("voice-tasks") and method == "GET":
+            return {"tasks": [foreign], "scope_key": "day-1"}
+        return copy.deepcopy(foreign)
+
+    relay.request = _request
+    assert "not available in this conversation" in await relay.control(
+        action="status", task_id="work", request_id="c1",
+    ), "before the first sync the relay knows no day — the floor holds"
+
+    await relay.sync()
+    out = await relay.control(action="status", task_id="work", request_id="c1")
+    assert "not available" not in out
+    assert json.loads(out)["task_id"] == "work"

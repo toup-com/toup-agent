@@ -52,7 +52,7 @@ async def test_a_healthy_session_records_open_and_turn_outcomes(relay, monkeypat
     from app.api import ws_realtime as rt
     from app.api.ws_realtime import voice_counter_snapshot
 
-    async def _think(user_id, task, session_id, relay=None):
+    async def _think(user_id, task, session_id, relay=None, out=None):
         return ("Found it.", "gpt-5.6-terra")
     monkeypatch.setattr(rt, "_think", _think)
 

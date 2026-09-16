@@ -164,6 +164,14 @@ class ChatResponse(BaseModel):
     model: str = ""
     tool_calls: int = 0
     processing_time_ms: int = 0
+    # What the turn PRODUCED. On a `save=False` turn (every voice turn) nothing
+    # downstream writes a Message row, so without these two the generated file
+    # and the presented app existed only in storage — no row for
+    # GET /api/files/{message_id}/{aid} to authorize against, and no card on
+    # any surface. Optional and empty by default: an older relay ignores them,
+    # an older agent image never sends them.
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    app_artifact: Optional[Dict[str, Any]] = None
 
 
 class SessionSummary(BaseModel):
@@ -290,7 +298,9 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
     if settings.run_mode != "agent":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     agent_key = request.headers.get("X-Agent-Key", "")
-    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
     if not _agent_runner:
         raise HTTPException(status_code=503, detail="Agent not available")
@@ -378,7 +388,9 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
 
     # X-Agent-Key auth — same primitive as agent.py:437.
     agent_key = request.headers.get("X-Agent-Key", "")
-    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
 
     if not _agent_runner:
@@ -425,6 +437,12 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
             model=_resp_model,
             tool_calls=len(response.tool_calls),
             processing_time_ms=response.processing_time_ms,
+            # Read off `persisted` rather than out of the runner's tool state:
+            # `persisted` is the documented echo of what this turn wrote — or,
+            # when the caller owns persistence, of what it must write — and the
+            # tool list has already been drained by the time we get here.
+            attachments=list((response.persisted or {}).get("attachments") or []),
+            app_artifact=(response.persisted or {}).get("app_artifact") or None,
         )
     except Exception as e:
         logger.exception(f"Internal agent-turn error for user {user_id}")
@@ -477,7 +495,9 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
 
     # X-Agent-Key auth — same primitive as agent.py:437.
     agent_key = request.headers.get("X-Agent-Key", "")
-    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
 
     user_id = settings.user_id
@@ -560,7 +580,9 @@ async def internal_curate_turn(req: CurateTurnRequest, request: Request):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
     agent_key = request.headers.get("X-Agent-Key", "")
-    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
 
     user_id = settings.user_id
@@ -861,7 +883,9 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
     if settings.run_mode != "agent":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     agent_key = request.headers.get("X-Agent-Key", "")
-    if not settings.agent_api_key or agent_key != settings.agent_api_key:
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
     if not _agent_runner:
         raise HTTPException(status_code=503, detail="Agent not available")
@@ -1003,6 +1027,14 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                 "model": _m,
                 "tool_calls": len(response.tool_calls),
                 "processing_time_ms": response.processing_time_ms,
+                # Same two fields the blocking sibling returns, for the same
+                # reason: this is the path voice actually takes, so omitting
+                # them here would leave the defect fully live. Keys are present
+                # only when non-empty, so an older relay's parse is unchanged.
+                **({"attachments": list((response.persisted or {}).get("attachments") or [])}
+                   if (response.persisted or {}).get("attachments") else {}),
+                **({"app_artifact": (response.persisted or {})["app_artifact"]}
+                   if (response.persisted or {}).get("app_artifact") else {}),
             })
             if budget["dropped"]:
                 logger.warning("[VSTREAM] dropped %d frames (queue full)", budget["dropped"])

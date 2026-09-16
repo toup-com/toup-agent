@@ -127,9 +127,17 @@ async def test_an_agent_that_answers_not_ready_is_not_ready(monkeypatch):
     }))
     out = await _call_ready(uid)
     assert out["ready"] is False
-    assert out["probe"] == {
+    # The probe block is ADDITIVE (round 46 gained `serving` and
+    # `not_ready_because`), so this is a subset test rather than an equality
+    # one — an equality test here turns every future additive field into a
+    # false failure, which is how a contract designed to grow ends up frozen.
+    assert out["probe"].items() >= {
         "reachable": True, "boot_phase": "loading_skills", "boot_progress": 60,
-    }
+    }.items()
+    # …and the new fields say what is missing without inventing readiness: this
+    # image reports no `serving`, so it stays None rather than becoming False.
+    assert out["probe"]["serving"] is None
+    assert out["probe"]["not_ready_because"] == "boot_loading_skills"
 
 
 @pytest.mark.asyncio
@@ -373,3 +381,137 @@ def test_the_miss_log_never_carries_a_credential():
     assert "X-Agent-Key" not in body
     # It logs the HOST, not the full URL (which can carry a query string).
     assert "netloc" in body
+
+
+# ── test-connection EXECUTES the shared predicate ─────────────────────
+#
+# The incident being fixed is "two probes with two copies of the rule". Every
+# case above sends a body whose verdict is identical under the old inline
+# `boot.get("ready", True)` and under the shared predicate, so reintroducing
+# the inline rule would leave the whole round green. These two disagree.
+
+
+@pytest.mark.asyncio
+async def test_test_connection_refuses_a_container_bound_to_someone_else(monkeypatch):
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"ready": True, "phase": "ready", "percent": 100},
+        "is_bound": True,
+        "bound_user_id": "00000000-0000-4000-8000-0000000000ff",
+    }))
+    out = await _call_test_connection(uid)
+    assert out["turn_ready"] is False, out
+    assert out["boot_ready"] is False, out
+    assert out["not_ready_because"] == "not_bound", out
+
+
+@pytest.mark.asyncio
+async def test_no_runner_refuses_the_TURN_but_not_the_BOOT(monkeypatch):
+    """The split that matters for compatibility. `turn_ready` is the strict
+    predicate the round-46 onboarding gates on. `boot_ready` keeps the meaning
+    the DEPLOYED web client gives it (frontend/src/App.tsx keys the tunnel
+    indicator and the "waking up" banner on it): under the strict rule a
+    healthy, answering agent reads as disconnected on every 5 s `deps.db`
+    blip.
+
+    `runner` is the term used here rather than `llm_wire_warm`: D1 demoted the
+    warm (and `channels_settled`) to diagnostics, because each has a single
+    producer that can fail silently and would then refuse forever."""
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"ready": True, "phase": "ready", "percent": 100},
+        "is_bound": True,
+        "turn_ready_detail": {
+            "runner": False, "db": True, "bound_user": True,
+            "llm_wire_warm": True, "channels_settled": True,
+        },
+    }))
+    out = await _call_test_connection(uid)
+    assert out["turn_ready"] is False, out
+    assert out["not_ready_because"] == "runner", out
+    assert out["boot_ready"] is True, out
+
+
+@pytest.mark.asyncio
+async def test_a_missing_boot_ready_field_is_no_longer_read_as_ready(monkeypatch):
+    """The old inline rule was `boot.get("ready", True)` — a container whose
+    boot_progress exists but says nothing reported ready."""
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"phase": "embeddings", "percent": 25},
+    }))
+    out = await _call_test_connection(uid)
+    assert out["boot_ready"] is False, out
+    assert out["turn_ready"] is False, out
+
+
+# ── the two probes execute ONE predicate ──────────────────────────────
+#
+# The incident being fixed is "two probes with two copies of the rule". Every
+# case above sends a body whose verdict is identical under the old inline
+# `boot.get("ready", True)` and under `agent_turn_readiness`, so reintroducing
+# the old rule would leave them all green. These two disagree.
+
+
+@pytest.mark.asyncio
+async def test_a_container_bound_to_SOMEONE_ELSE_is_not_ready(monkeypatch):
+    """A generic pool member is booted, healthy — and not this user's. The old
+    rule read `boot_progress` alone and answered ready."""
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"ready": True, "phase": "ready", "percent": 100},
+        "is_bound": True,
+        "bound_user_id": "00000000-0000-4000-8000-0000000000ff",
+    }))
+    out = await _call_test_connection(uid)
+    assert out["reachable"] is True
+    assert out["turn_ready"] is False
+    assert out["not_ready_because"] == "not_bound"
+    assert out["boot_ready"] is False, (
+        "not_bound is the one strict reason that must also fail boot_ready — "
+        "build 123 and the web client key their waking UI on it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_booted_container_whose_DB_is_down_cannot_serve_a_turn(monkeypatch):
+    """The other direction, and the one that proves `boot_ready` kept its own
+    meaning: the container finished booting (so `boot_ready` is true and the
+    deployed web client does not flip to "waking up"), and it still cannot
+    answer, so the round-46 clients read `turn_ready`."""
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"ready": True, "phase": "ready", "percent": 100},
+        "is_bound": True,
+        "bound_user_id": None,
+        "serving": False,
+        "turn_ready_detail": {
+            "runner": True, "db": False, "bound_user": True,
+            "llm_wire_warm": True, "channels_settled": True,
+        },
+    }))
+    out = await _call_test_connection(uid)
+    assert out["boot_ready"] is True, "boot_ready must keep its BOOT meaning"
+    assert out["turn_ready"] is False
+    assert out["not_ready_because"] == "db"
+    assert out["serving"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_cold_wire_or_a_restarting_sidecar_never_refuses(monkeypatch):
+    """D1. Both have a single producer that can fail silently; neither may
+    hold onboarding at "warming up" for a container that answers turns."""
+    uid = await _seed(status="running")
+    _install_health(monkeypatch, _Resp(200, {
+        "boot_progress": {"ready": True, "phase": "ready", "percent": 100},
+        "is_bound": True,
+        "bound_user_id": None,
+        "turn_ready_detail": {
+            "runner": True, "db": True, "bound_user": True,
+            "llm_wire_warm": False, "channels_settled": False,
+        },
+    }))
+    out = await _call_test_connection(uid)
+    assert out["turn_ready"] is True, out
+    assert out["not_ready_because"] is None
+    assert out["boot_ready"] is True

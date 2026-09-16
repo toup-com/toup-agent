@@ -53,6 +53,12 @@ ELEVENLABS_DEFAULT_VOICES = {
 # Transcription (Whisper)
 # ──────────────────────────────────────────────────────────────
 
+def _text_fingerprint(text: str) -> str:
+    """8 hex of sha256 — tells two transcripts apart, identifies neither."""
+    import hashlib
+
+    return hashlib.sha256((text or "").encode("utf-8", "ignore")).hexdigest()[:8]
+
 async def transcribe_voice(file_path: str, language: Optional[str] = None, api_key: Optional[str] = None) -> str:
     """Transcribe audio using OpenAI Whisper API."""
     api_key = api_key or settings.openai_api_key
@@ -95,8 +101,20 @@ async def transcribe_voice(file_path: str, language: Optional[str] = None, api_k
 
         result = resp.json()
         text = result.get("text", "").strip()
-        logger.info(f"[AGENT] Transcription result ({len(text)} chars): {text[:100]}")
-        return text or "(empty transcription)"
+        # Round 46, incident 3: this line wrote up to 100 characters of the
+        # user's speech to a log shipped to Loki. A length and a hash tell two
+        # transcriptions apart — which is the entire debugging use — and
+        # identify nobody.
+        logger.info(
+            "[AGENT] Transcription result: chars=%d h=%s",
+            len(text), _text_fingerprint(text),
+        )
+        # Return the empty string, never a sentinel. "(empty transcription)"
+        # was a status smuggled down the CONTENT channel: indistinguishable
+        # from speech, so every consumer had to know the magic string, and the
+        # one that did not (useDictation) appended it to a Persian sentence in
+        # the user's composer. The route reports emptiness in its own field.
+        return text
 
     except httpx.HTTPStatusError as exc:
         logger.error(f"[AGENT] Whisper API error: {exc.response.status_code}")

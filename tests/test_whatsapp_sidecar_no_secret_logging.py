@@ -105,3 +105,65 @@ def test_redact_values_keeps_shape_and_drops_content():
     )
     assert parsed["fromMe"] is False, "booleans are safe and stay readable"
     assert parsed["participantPn"].startswith("str("), parsed
+
+
+# ── fix lane A (R46): the masking must survive one more level ─────────
+
+
+def _mask_fields_harness(payload_js: str) -> dict:
+    """Run the SHIPPED `maskFields` (and the helpers it calls) under node."""
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        import pytest
+
+        pytest.skip("node not available")
+
+    src = _src()
+    start = src.index("const _ID_KEYS = new Set([")
+    end = src.index("function maskFields(")
+    tail = re.search(r"function maskFields\(.*?\n\}", src[end:], re.S)
+    assert tail, "maskFields() not found in the sidecar"
+    block = src[start:end] + tail.group(0)
+
+    script = (
+        "const {createHash} = require('crypto');\n"
+        + block
+        + f"\nconsole.log(JSON.stringify(maskFields({payload_js})));"
+    )
+    out = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode == 0, out.stderr[:400]
+    return json.loads(out.stdout.strip())
+
+
+def test_a_nested_identifier_is_masked_too():
+    """`maskFields` used to mask top-level strings and `_ID_KEYS` scalars only,
+    so `{ meta: { jid } }` reached pino verbatim. The masking lives in the log
+    helpers precisely because a NEW call site is where the next leak comes
+    from — and a nested payload is exactly such a call site."""
+    got = _mask_fields_harness(
+        "{stage:'x', meta:{jid:'15551234567@s.whatsapp.net', "
+        "note:'code for +15551234567'}, peers:[{phone:'+15551234567'}]}"
+    )
+    flat = repr(got)
+    assert "15551234567@s.whatsapp.net" not in flat, flat
+    assert "+15551234567" not in flat, flat
+    assert got["stage"] == "x", "non-identifier values must stay readable"
+    assert isinstance(got["meta"], dict) and set(got["meta"]) == {"jid", "note"}, (
+        "the SHAPE is the diagnostic — key names must survive"
+    )
+
+
+def test_the_walk_is_bounded():
+    """A Baileys payload may not become the cost of one log line."""
+    deep = "{a:{b:{c:{d:{jid:'15551234567@s.whatsapp.net'}}}}}"
+    got = _mask_fields_harness(deep)
+    leaf = got["a"]["b"]["c"]["d"]
+    assert isinstance(leaf, str) and leaf.startswith("object("), (
+        f"the walk did not stop at the depth cap: {got}"
+    )

@@ -221,7 +221,23 @@ async def test_force_restarts_regardless_of_the_fingerprint(wa_restart):
 
 
 @pytest.mark.asyncio
-async def test_a_changed_allowlist_changes_the_fingerprint(wa_restart, monkeypatch):
+async def test_a_changed_allowlist_is_hot_applied_and_does_not_restart(
+    wa_restart, monkeypatch,
+):
+    """REVERSED by R46 F1 (2026-09-15), deliberately.
+
+    This case used to assert that an allowlist change RESTARTS the channel.
+    That is exactly the incident: the platform seeds the user's own number into
+    the allowlist before minting a pairing code, the push reached the agent as
+    a config change, and the fingerprint containing `frozenset(_allowlist)`
+    SIGTERMed a sidecar that was mid-pairing — 14 s of "Waking Aria and
+    creating your code…" and two 503s (toup-agent-pool-82, 14:48:19→14:48:26).
+
+    The allowlist is not a socket parameter: the sidecar never sees it, and
+    only the inbound dispatch gate and `health()` read it. It is now applied in
+    place. `test_whatsapp_allowlist_hot_apply.py` holds the rest of the claim,
+    including the source probe that says WHY an in-place apply is safe.
+    """
     from app.config import settings
     import agent_main as am
 
@@ -229,10 +245,12 @@ async def test_a_changed_allowlist_changes_the_fingerprint(wa_restart, monkeypat
         pytest.skip("config fingerprint not landed yet — lane B2 (D8)")
 
     await wa_restart()
-    n_start = len(_SpyAdapter.started)
+    n_start, n_stop = len(_SpyAdapter.started), len(_SpyAdapter.stopped)
     monkeypatch.setattr(settings, "whatsapp_baileys_allowlist", "+14155559999", raising=False)
     await wa_restart()
-    assert len(_SpyAdapter.started) == n_start + 1
+    assert (len(_SpyAdapter.started), len(_SpyAdapter.stopped)) == (n_start, n_stop), (
+        "an allowlist change restarted the WhatsApp channel again"
+    )
 
 
 @pytest.mark.xfail(not _d8_landed(),
@@ -427,8 +445,12 @@ def test_health_started_means_the_sse_task_is_alive():
 
     src = (Path(__file__).resolve().parents[1] / "app" / "agent" / "channels"
            / "whatsapp_baileys.py").read_text()
-    # The dict KEY, not the comment above it that quotes the word.
-    idx = src.find('"started":')
+    # The dict KEY inside `health()` — not the comment above it that quotes the
+    # word, and not the `channels.whatsapp` block R46 added at module level,
+    # which reports `started` by READING health() rather than by deriving it.
+    hstart = src.find("    def health(self) -> dict:")
+    assert hstart != -1, "health() not found"
+    idx = src.find('"started":', hstart)
     assert idx != -1, "health() shape not found"
     window = src[idx:idx + 300]
     assert ("_event_task" in window or "_sse_task" in window) and "done()" in window, (

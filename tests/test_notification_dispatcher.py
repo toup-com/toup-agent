@@ -402,3 +402,84 @@ async def test_silent_row_with_only_skips_suppresses_instead_of_retrying():
         )).scalars().one()
         assert row.status == NQ_SUPPRESSED
         assert row.channels_json["policy"]["suppressed"] == "silent_undeliverable"
+
+
+# ── Round 46: an answer the user already read must not also be pushed ──
+#
+# 2026-09-15: the in-app answer that finally landed at 14:50:44 was ALSO
+# delivered to the user's WhatsApp at 14:50:53 as a notification. The
+# fallback's question was "could push reach a device?", not "has the user
+# seen this?" — and those come apart in exactly the normal state of a phone
+# seconds after onboarding, where no push token is registered yet.
+#
+# These two drive the REAL dispatcher over REAL rows. The whole feature can
+# be inert while a source-grep of the gate text still passes: the value could
+# never reach `data_json` at all (`AgentNotifyRequest` rejects non-scalars),
+# or a second call site could reach `_request_agent_channel_delivery` around
+# the gate.
+
+
+@pytest.mark.asyncio
+async def test_an_answer_already_delivered_in_app_is_not_pushed_out_of_band(monkeypatch):
+    calls = []
+
+    async def _never(db, row):
+        calls.append(row.id)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", _never)
+
+    user_id = await _mk_user(tz="UTC")
+    row_id = await _enqueue(user_id, data_json={"delivered_in_app": True})
+
+    await nd.run_notification_dispatch()
+
+    row = await _row(row_id)
+    assert calls == [], "the out-of-band fallback ran for an answer already read in-app"
+    assert row.status == NQ_SENT, row.status
+    assert "agent_fallback" not in row.channels_json, row.channels_json
+    # Recorded WHY, so a row that never went out-of-band is distinguishable
+    # from one whose fallback silently failed.
+    assert row.channels_json["ws"] == {"status": "ok", "reason": "delivered_in_app"}
+
+
+@pytest.mark.asyncio
+async def test_the_same_row_without_the_flag_still_falls_back(monkeypatch):
+    """The control. Without it the test above is satisfied by a dispatcher
+    that never falls back at all."""
+    calls = []
+
+    async def _ok(db, row):
+        calls.append(row.id)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(nd, "_request_agent_channel_delivery", _ok)
+
+    user_id = await _mk_user(tz="UTC")
+    row_id = await _enqueue(user_id)
+
+    await nd.run_notification_dispatch()
+
+    row = await _row(row_id)
+    assert calls == [row_id], "the out-of-band fallback did not run"
+    assert row.status == NQ_SENT
+    assert row.channels_json["agent_fallback"]["status"] == "ok"
+
+
+def test_the_flag_survives_the_agent_to_platform_hop():
+    """`data_json` is validated on ingest: every value must be a SCALAR. A
+    `delivered_in_app` written as a dict would be rejected at the door and the
+    dispatcher would never see it — while a regex over the gate's source
+    still matched."""
+    from app.api.agent_notify import AgentNotifyRequest
+
+    base = dict(
+        user_id="00000000-0000-4000-8000-000000000001",
+        idempotency_key="idem-000000001",
+        event_kind="mission_completed", title="t", body="b",
+    )
+    ok = AgentNotifyRequest(**base, data={"delivered_in_app": True})
+    assert ok.data["delivered_in_app"] is True
+
+    with pytest.raises(Exception):
+        AgentNotifyRequest(**base, data={"delivered_in_app": {"ws": True}})

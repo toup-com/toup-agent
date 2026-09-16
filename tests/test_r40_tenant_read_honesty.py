@@ -118,10 +118,13 @@ _TP_SRC = (BACKEND_DIR / "app/api/tenant_proxy.py").read_text(encoding="utf-8")
 # ── A fake agent HTTP client ─────────────────────────────────────────────
 
 class _Resp:
-    def __init__(self, status: int, payload=None, text: str = ""):
+    def __init__(self, status: int, payload=None, text: str = "", headers=None):
         self.status_code = status
         self._payload = payload
         self.text = text
+        # The 4xx path forwards the agent's typed `X-Toup-Reason` /
+        # `Retry-After` (round 46); an httpx response always has headers.
+        self.headers = dict(headers or {})
 
     def json(self):
         return self._payload

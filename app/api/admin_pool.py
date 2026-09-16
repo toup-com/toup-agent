@@ -27,6 +27,11 @@ from app.services import drain_state, runtime_identity
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+# Strong references for fire-and-forget tasks. `asyncio.create_task` keeps only
+# a WEAK reference, so a task nobody holds can be garbage-collected while it is
+# still running.
+_BACKGROUND_TASKS: set = set()
+
 
 POOL_ADMIN_TOKEN_ENV = "POOL_ADMIN_TOKEN"
 
@@ -233,6 +238,15 @@ async def admin_bind(
             logger.exception("[admin/bind] runtime.json write failed")
             raise HTTPException(status_code=500, detail=f"Runtime write failed: {e}") from e
 
+        # Bounded agent pool (R46/L8): connections opened under the PREVIOUS
+        # identity must not serve the new tenant. No-op on NullPool; never
+        # fails the bind.
+        try:
+            from app.db.database import dispose_engine
+            await dispose_engine(reason="admin_bind")
+        except Exception as _de:  # noqa: BLE001
+            logger.warning("[admin/bind] engine dispose skipped: %s", type(_de).__name__)
+
     # 2b. Ensure owner user row exists in the (now-bound) DB with the
     #     real name + email. Without `user_name`/`user_email` in the
     #     bind payload (legacy callers), falls back to the stub values
@@ -279,9 +293,12 @@ async def admin_bind(
                     timezone=_bind_tz or None,
                 ))
                 await _udb.commit()
+                # The user's real name used to be written here verbatim
+                # (round 46 A15). Whether a name ARRIVED is the operational
+                # question; which name it was is not.
                 logger.info(
-                    "[admin/bind] Owner user row created for %s (name=%r)",
-                    user_id[:8], real_user_name,
+                    "[admin/bind] Owner user row created for %s (name=%s)",
+                    user_id[:8], "set" if real_user_name else "none",
                 )
             else:
                 # Backfill the real values if the row was previously
@@ -303,8 +320,8 @@ async def admin_bind(
                 if changed:
                     await _udb.commit()
                     logger.info(
-                        "[admin/bind] Owner user row backfilled for %s (name=%r)",
-                        user_id[:8], real_user_name,
+                        "[admin/bind] Owner user row backfilled for %s (name=%s)",
+                        user_id[:8], "set" if real_user_name else "none",
                     )
         if _bind_tz:
             # A tz change can move the user's local_date, so the (user_id,
@@ -415,6 +432,47 @@ async def admin_bind(
     except Exception as e:
         logger.warning("[admin/bind] LLM key refresh failed (non-fatal): %s", e)
 
+    # 2c-1. Warm the LLM WIRE (round 46, A1). The refresh above deliberately
+    #     defers the client rebuild to "the next chat call" — and on a freshly
+    #     claimed container that call is the user's FIRST MESSAGE. On pool-82
+    #     (2026-09-15) the rebuild landed 111 s after the key refresh, inside
+    #     the turn, and `[OPENAI] Client rebuilt` is the last line before a
+    #     9.47 s whole-process freeze.
+    #
+    #     The SDK's once-per-process lazy work is what runs there: the
+    #     `client.responses` resource import (134-141 ms measured) and the
+    #     first pydantic parse of a `response.completed` (202-214 ms, ~400x
+    #     its warm cost — core-schema construction). Both hold the import
+    #     lock / GIL, so they must be paid on a WORKER THREAD, and a bind
+    #     must never wait for or fail on them.
+    try:
+        import asyncio as _asyncio
+
+        async def _warm_llm_wire() -> None:
+            try:
+                from app.services.openai_agent_service import get_openai_agent_service
+                from app.services.anthropic_service import get_anthropic_service
+
+                oai_ms = await _asyncio.to_thread(get_openai_agent_service().warm)
+                ant_ms = await _asyncio.to_thread(get_anthropic_service().warm)
+                logger.info(
+                    "[PERF] llm_wire_warm_ms=%d openai_ms=%d anthropic_ms=%d",
+                    int(oai_ms + ant_ms), int(oai_ms), int(ant_ms),
+                )
+            except Exception as _e:
+                logger.warning("[admin/bind] LLM wire warm failed (non-fatal): %s", _e)
+
+        # Keep a reference: asyncio documents a task with no strong reference
+        # as collectable MID-EXECUTION, and this task is the only producer of
+        # `llm_wire_warm` (a `turn_ready_detail` diagnostic — never a term of
+        # `serving`, D1) and the only thing paying the SDK's lazy work off the
+        # first turn.
+        _warm_task = _asyncio.get_running_loop().create_task(_warm_llm_wire())
+        _BACKGROUND_TASKS.add(_warm_task)
+        _warm_task.add_done_callback(_BACKGROUND_TASKS.discard)
+    except Exception as e:
+        logger.warning("[admin/bind] LLM wire warm not scheduled (non-fatal): %s", e)
+
     # 2c-2. Reset the embedding-provider cache. The agent_main boot
     #     pre-load resolved the embedding provider while this container
     #     was still in LOBBY mode (llm_mode="manual", no toup_token), so
@@ -519,6 +577,45 @@ async def admin_drain(
 
     drain_state.set_draining(timeout_s)
     return {"ok": True, **drain_state.status(), "timeout_s": timeout_s}
+
+
+# ── /admin/whatsapp-logout ─────────────────────────────────────────
+
+
+@router.post("/whatsapp-logout")
+async def admin_whatsapp_logout(
+    x_pool_admin_token: Optional[str] = Header(None, alias="X-Pool-Admin-Token"),
+) -> Dict[str, Any]:
+    """Log the tenant's WhatsApp device out and wipe the on-disk session.
+
+    R46 F9. The bridge needs this on a USER RELEASE — deleting a Toup account
+    used to leave the linked device sitting in the user's WhatsApp forever,
+    and the pool's workspace save/restore is a `docker cp` MERGE, so
+    `.whatsapp_auth` could reach the next tenant of the slot. The capability
+    already existed (`force_logout` → sidecar `/pair/logout` → `sock.logout()`
+    + `wipeAuthDir()`); its only caller was the user's own "Disconnect"
+    button, which nothing calls on deletion.
+
+    Pool-admin token, not a user JWT: the bridge has no JWT, and by the time
+    a slot is released the user may already be gone. Idempotent — an agent
+    with no WhatsApp adapter reports `logged_out: false` and 200, because a
+    teardown must never fail on a channel that was never up.
+    """
+    _check_admin_token(x_pool_admin_token)
+    try:
+        from app.agent.channels.whatsapp_baileys import get_active_baileys_channel
+        channel = get_active_baileys_channel()
+    except Exception:
+        channel = None
+    if channel is None:
+        return {"ok": True, "logged_out": False, "reason": "no_active_channel"}
+    try:
+        await channel.force_logout()
+    except Exception as exc:
+        logger.warning("[admin] whatsapp logout failed: %s", type(exc).__name__)
+        return {"ok": False, "logged_out": False, "reason": "logout_failed"}
+    logger.info("[admin] whatsapp logged out on release")
+    return {"ok": True, "logged_out": True}
 
 
 # ── /admin/status ──────────────────────────────────────────────────

@@ -1802,12 +1802,22 @@ def thumbnails_root() -> str:
 
 
 def file_entry(f: UserFile, path: str, *, api_prefix: str = "/api") -> dict:
+    from app.agent.artifact_kinds import kind_for_mime, preview_policy
+
     kind = kind_of_row(f)
     entry = {
         "id": f.id,
         "name": f.name,
         "ext": ext_of(f.name),
         "kind": kind,
+        # C9 (round 46): `kind` above is the LIBRARY's own coarse vocabulary
+        # (image/audio/video/document/app/other) and the Files screen is built
+        # on it — it stays. These two are the artifact taxonomy the chat
+        # attachment card, the WS frame and the REST history now share, so one
+        # file described on two surfaces describes itself the same way.
+        # Additive: every existing consumer ignores them.
+        "artifact_kind": kind_for_mime(f.mime_type or "", f.name or ""),
+        "preview_policy": preview_policy(f.mime_type or ""),
         "mime": f.mime_type,
         "size": int(f.size_bytes or 0),
         "size_label": human_size(f.size_bytes or 0),

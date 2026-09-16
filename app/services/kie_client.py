@@ -21,13 +21,25 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import httpx
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+#: How many pictures one render may draw from. `image_input` has always been a
+#: JSON array here and we always put exactly one URL in it; Nano Banana Pro's
+#: published image-to-image schema documents up to 8 entries
+#: (docs.kie.ai/market/google/pro-image-to-image). NOT probed against the live
+#: endpoint — see the round-46 report. The cap is enforced here so an overflow
+#: is a clean KieError before any billable createTask, rather than a provider
+#: 4xx after the upload spend.
+KIE_MAX_IMAGE_INPUT = 8
+
+#: One source picture: (bytes, mime).
+ImageSource = tuple[bytes, str]
 
 # Cloudflare on Kie's hosts rejects the default httpx UA (error 1010).
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -82,14 +94,22 @@ def _headers(json_body: bool = True) -> dict[str, str]:
     return h
 
 
-async def _upload_source(client: httpx.AsyncClient, image_bytes: bytes, mime: str) -> str:
-    """Upload source bytes to Kie's file host; return a public downloadUrl."""
+async def _upload_source(client: httpx.AsyncClient, image_bytes: bytes, mime: str,
+                         index: int = 0) -> str:
+    """Upload source bytes to Kie's file host; return a public downloadUrl.
+
+    ``index`` only suffixes the remote filename for the 2nd..Nth source of a
+    multi-reference edit, so the single-source call is byte-identical to what
+    shipped before references existed and two references in one render can
+    never be handed the same remote name.
+    """
     b64 = base64.b64encode(image_bytes).decode()
     ext = "png" if "png" in mime else ("jpg" if ("jpeg" in mime or "jpg" in mime) else "png")
+    name = f"src.{ext}" if index <= 0 else f"src_{index}.{ext}"
     body = {
         "base64Data": f"data:{mime};base64,{b64}",
         "uploadPath": "images/toup-edit",
-        "fileName": f"src.{ext}",
+        "fileName": name,
     }
     url = f"{settings.kie_upload_base.rstrip('/')}/api/file-base64-upload"
     r = await client.post(url, json=body, headers=_headers())
@@ -100,6 +120,68 @@ async def _upload_source(client: httpx.AsyncClient, image_bytes: bytes, mime: st
     if not dl:
         raise KieError(f"kie upload returned no downloadUrl: {r.text[:200]}")
     return dl
+
+
+def _coerce_sources(
+    sources: Optional[Sequence[ImageSource]],
+    image_bytes: Optional[bytes],
+    mime: str,
+) -> list[ImageSource]:
+    """One list of (bytes, mime), from either the new plural arg or the old scalar.
+
+    The FIRST entry is the base — the picture whose framing the render keeps.
+    Raises KieError above `KIE_MAX_IMAGE_INPUT` so an overflow costs nothing.
+    """
+    out: list[ImageSource] = []
+    if sources:
+        for item in sources:
+            if not item:
+                continue
+            data, m = item[0], (item[1] if len(item) > 1 else "image/png")
+            if data:
+                out.append((data, m or "image/png"))
+    elif image_bytes:
+        out.append((image_bytes, mime or "image/png"))
+    if len(out) > KIE_MAX_IMAGE_INPUT:
+        raise KieError(
+            f"too many source images ({len(out)}); this renderer accepts at "
+            f"most {KIE_MAX_IMAGE_INPUT} (1 base + "
+            f"{KIE_MAX_IMAGE_INPUT - 1} references)"
+        )
+    return out
+
+
+def _aspect_of(image_bytes: bytes) -> str:
+    """Nearest supported aspect for these bytes; 1:1 when they will not decode.
+
+    Read from the BASE image only. A portrait subject composited into a
+    landscape scene must come out portrait — the base is the picture being
+    transformed, the references are material it draws from.
+    """
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            return _nearest_aspect(im.width, im.height)
+    except Exception:
+        logger.debug("kie edit: could not read source dims, defaulting aspect 1:1",
+                     exc_info=True)
+        return "1:1"
+
+
+async def _upload_sources(client: httpx.AsyncClient,
+                          srcs: Sequence[ImageSource]) -> list[str]:
+    """Upload every source concurrently; return downloadUrls IN THE ORDER GIVEN.
+
+    Order is the contract: `image_input[0]` is the base and the manifest the
+    prompt carries numbers the pictures the same way. `asyncio.gather` preserves
+    argument order, and one failed upload raises before any createTask spend.
+    """
+    if not srcs:
+        return []
+    return list(await asyncio.gather(*[
+        _upload_source(client, data, m, i) for i, (data, m) in enumerate(srcs)
+    ]))
 
 
 async def _create_task(client: httpx.AsyncClient, model: str, inp: dict[str, Any]) -> str:
@@ -183,24 +265,28 @@ async def generate(prompt: str, size: Optional[str] = None) -> KieResult:
     return await _run(settings.kie_image_model, inp)
 
 
-async def edit(prompt: str, image_bytes: bytes, mime: str = "image/png") -> KieResult:
-    """Edit a user photo with Nano Banana Pro, preserving its framing."""
-    aspect = "1:1"
-    try:
-        import io
-        from PIL import Image
-        with Image.open(io.BytesIO(image_bytes)) as im:
-            aspect = _nearest_aspect(im.width, im.height)
-    except Exception:
-        logger.debug("kie edit: could not read source dims, defaulting aspect 1:1", exc_info=True)
+async def edit(prompt: str, image_bytes: Optional[bytes] = None,
+               mime: str = "image/png", *,
+               sources: Optional[Sequence[ImageSource]] = None) -> KieResult:
+    """Edit with Nano Banana Pro from 1..8 source pictures.
+
+    ``sources[0]`` is the BASE (its framing is preserved); the rest are
+    references the render may draw from. The scalar ``image_bytes``/``mime``
+    form is the single-source shorthand and stays supported for every caller
+    that predates references.
+    """
+    srcs = _coerce_sources(sources, image_bytes, mime)
+    if not srcs:
+        raise KieError("edit mode requires at least one source image")
+    aspect = _aspect_of(srcs[0][0])
     timeout = httpx.Timeout(float(settings.kie_timeout_s), connect=15.0)
     if not settings.kie_api_key:
         raise KieError("kie_api_key not configured")
     async with httpx.AsyncClient(timeout=timeout) as client:
-        src_url = await _upload_source(client, image_bytes, mime)
+        src_urls = await _upload_sources(client, srcs)
         inp = {
             "prompt": prompt,
-            "image_input": [src_url],
+            "image_input": src_urls,
             "aspect_ratio": aspect,
             "image_size": settings.kie_image_size,
             "output_format": settings.kie_output_format,
@@ -229,28 +315,27 @@ async def edit(prompt: str, image_bytes: bytes, mime: str = "image/png") -> KieR
 
 async def start_task(mode: str, prompt: str, *, size: Optional[str] = None,
                      image_bytes: Optional[bytes] = None,
-                     mime: str = "image/png") -> str:
-    """Create a Kie job and return its taskId. Does NOT wait for the render."""
+                     mime: str = "image/png",
+                     sources: Optional[Sequence[ImageSource]] = None) -> str:
+    """Create a Kie job and return its taskId. Does NOT wait for the render.
+
+    On ``mode == "edit"`` the job draws from 1..8 pictures: ``sources[0]`` is
+    the base, the rest are references. The uploads run concurrently, so N
+    sources cost roughly one upload of wall time, not N.
+    """
     if not settings.kie_api_key:
         raise KieError("kie_api_key not configured")
     timeout = httpx.Timeout(60.0, connect=15.0)  # upload+create only, never the render
     async with httpx.AsyncClient(timeout=timeout) as client:
         if mode == "edit":
-            if not image_bytes:
+            srcs = _coerce_sources(sources, image_bytes, mime)
+            if not srcs:
                 raise KieError("edit mode requires image_bytes")
-            aspect = "1:1"
-            try:
-                import io
-                from PIL import Image
-                with Image.open(io.BytesIO(image_bytes)) as im:
-                    aspect = _nearest_aspect(im.width, im.height)
-            except Exception:
-                logger.debug("kie edit: could not read source dims, defaulting 1:1",
-                             exc_info=True)
-            src_url = await _upload_source(client, image_bytes, mime)
+            aspect = _aspect_of(srcs[0][0])
+            src_urls = await _upload_sources(client, srcs)
             inp = {
                 "prompt": prompt,
-                "image_input": [src_url],
+                "image_input": src_urls,
                 "aspect_ratio": aspect,
                 "image_size": settings.kie_image_size,
                 "output_format": settings.kie_output_format,

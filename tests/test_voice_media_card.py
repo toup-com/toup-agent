@@ -38,13 +38,22 @@ def test_message_payload_carries_media_in_the_body():
     )
 
 
-def test_message_payload_without_media_keeps_the_query_shim():
-    """The compatibility shim for older agent images must not regress."""
+def test_message_payload_never_puts_content_in_the_query(monkeypatch):
+    """R46 P0: the transcript may never reach the request line.
+
+    The query shim used to carry role+content for agent images that predate the
+    body-aware route — and uvicorn logs the request line, so every voice turn
+    wrote the user's sentence, percent-encoded but perfectly readable, into the
+    fleet access log. Fifteen such lines were observed in one four-minute window
+    on 2026-09-15. The shim is gone; its failure mode is now loud (the caller
+    logs LOST … at ERROR) rather than a silent privacy leak.
+    """
     from app.api.ws_realtime import _message_payload
 
-    body, params = _message_payload("assistant", "Short reply.", "gpt-realtime")
-    assert "media" not in body
-    assert params is not None and params["content"] == "Short reply."
+    for content in ("Short reply.", "سلام" * 4000, ""):
+        body, params = _message_payload("assistant", content, "gpt-realtime")
+        assert params is None
+        assert body["content"] == content
 
 
 @pytest.mark.asyncio
@@ -182,8 +191,10 @@ def test_create_session_message_writes_metadata_json():
     assert stored == {"media": {"type": "youtube"}}
 
     # And the route must actually use that writer for the message it builds.
+    # (R46: `app_artifact` joined the same blob; the property is still that ONE
+    # writer composes it, not the spelling of the line that calls it.)
     src = inspect.getsource(sessions.create_session_message)
-    assert "metadata_json=_build_metadata(media, tool_events)" in src
+    assert "metadata_json=_build_metadata(media, tool_events" in src
 
 
 # ── Never guess an artist ───────────────────────────────────────────────

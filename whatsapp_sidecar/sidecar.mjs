@@ -49,6 +49,7 @@ import QRCode from 'qrcode';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 // ── Config ──────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.WHATSAPP_SIDECAR_PORT || '8002', 10);
@@ -92,7 +93,84 @@ const LOG_LEVEL = process.env.WHATSAPP_LOG_LEVEL || 'info';
 // ── Logger ──────────────────────────────────────────────────────────
 // Pino → stderr so the parent Python process captures it via journalctl.
 const logger = pino({ level: LOG_LEVEL }, pino.destination(2));
-const log = (msg, fields = {}) => logger.info(fields, msg);
+
+// ── Identifier masking (round 46 A15) ───────────────────────────────
+//
+// These lines land in the container's journal and are shipped to Loki,
+// read by operators and by agents. Before this, ordinary paths wrote
+// subscriber phone numbers in E.164 (`phone_to_jid.updated_from_inbound`),
+// WhatsApp JIDs and LIDs (`inbound.skipped_foreign_fromme`) and the
+// user's chosen agent display name (`handleSend`). None of those are the
+// diagnostic; the SHAPE and the STABILITY of an identifier are, which is
+// what a hash preserves. Applied in the three log helpers rather than at
+// each call site, because a new call site is exactly where the next leak
+// would be — and `redactValues` below already proved the principle for
+// message metadata.
+const _ID_KEYS = new Set([
+  'phone', 'phones', 'jid', 'remoteJid', 'to', 'from', 'sender', 'participant',
+  'participantPn', 'selfJid', 'selfLid', 'lid', 'displayName', 'pushName',
+  'previous', 'number', 'msisdn', 'allowlist', 'self',
+  'display_name', 'self_e164', 'from_e164', 'remote_e164', 'to_e164', 'target',
+]);
+const _JID_RE = /\b([0-9][0-9\-.:]{4,24})@(s\.whatsapp\.net|lid|g\.us|c\.us)\b/;
+const _E164_RE = /\+(\d)(\d{5,12})(\d{2})\b/;
+const _hash8 = (s) => createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
+
+function maskIdString(s) {
+  return String(s)
+    .replace(new RegExp(_JID_RE, 'g'), (_m, local, dom) => `jid:${_hash8(local)}@${dom}`)
+    .replace(new RegExp(_E164_RE, 'g'), (_m, a, _b, c) => `+${a}***${c}`);
+}
+
+function maskIdValue(v) {
+  const s = String(v ?? '');
+  if (!s) return s;
+  if (_JID_RE.test(s)) return maskIdString(s);
+  const digits = s.replace(/[^0-9]/g, '');
+  // A phone number with or without its `+`: keep the length and the last
+  // two digits, which is enough to tell two test numbers apart in a trail.
+  if (digits.length >= 6 && digits.length / s.length > 0.6) {
+    return `num:***${digits.slice(-2)}(${digits.length})`;
+  }
+  return `h:${_hash8(s)}`;
+}
+
+// How deep `maskFields` walks. The masking lives in the log helpers rather
+// than at each call site precisely because a NEW call site is where the next
+// leak comes from — and a nested payload (`{ meta: { jid } }`) passed through
+// verbatim defeats exactly that. Capped so a large Baileys object can never
+// become the cost of one log line; below the cap the value is described, not
+// reproduced.
+const _MASK_MAX_DEPTH = 3;
+
+function maskFields(fields, depth = 0) {
+  const out = {};
+  for (const [k, v] of Object.entries(fields || {})) {
+    if (v === null || v === undefined) { out[k] = v; continue; }
+    if (_ID_KEYS.has(k)) {
+      out[k] = Array.isArray(v) ? `array(${v.length})` : maskIdValue(v);
+    } else if (typeof v === 'string') {
+      out[k] = maskIdString(v);
+    } else if (Array.isArray(v)) {
+      out[k] = depth >= _MASK_MAX_DEPTH
+        ? `array(${v.length})`
+        : v.map((el) => (
+          el && typeof el === 'object'
+            ? maskFields(el, depth + 1)
+            : (typeof el === 'string' ? maskIdString(el) : el)
+        ));
+    } else if (typeof v === 'object') {
+      out[k] = depth >= _MASK_MAX_DEPTH
+        ? `object(${Object.keys(v).length})`
+        : maskFields(v, depth + 1);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+const log = (msg, fields = {}) => logger.info(maskFields(fields), maskIdString(msg));
 
 /**
  * Describe an object's values without reproducing them.
@@ -117,8 +195,8 @@ function redactValues(obj) {
   }
   return out;
 }
-const warn = (msg, fields = {}) => logger.warn(fields, msg);
-const error = (msg, fields = {}) => logger.error(fields, msg);
+const warn = (msg, fields = {}) => logger.warn(maskFields(fields), maskIdString(msg));
+const error = (msg, fields = {}) => logger.error(maskFields(fields), maskIdString(msg));
 
 // ── State ───────────────────────────────────────────────────────────
 let sock = null;                         // current Baileys socket
@@ -165,6 +243,22 @@ let pairingTimer = null;
 // code at login — pollers must still see it as a pairing failure even though
 // the mint-window guard is already off.
 let postPairProbation = false;
+// R46 F8 — pairing-code idempotency. Every /pair/code call tears the socket
+// down and wipes the auth dir, so a RETRY that races a successful mint burns
+// the very code the user is at that moment typing, and re-pairing lands in
+// WhatsApp's 30–60 minute rate limiter. A caller-supplied key makes a retry a
+// replay: same code, no teardown. Scoped to the live pairing window
+// (`pairingInProgress`) and additionally capped below the 150 s pairingTimer,
+// so a replayed code can never outlive the mint it names.
+const PAIR_CODE_IDEM_TTL_MS = 120000;
+let lastPairCodeKey = null;
+let lastPairCodeValue = null;
+let lastPairCodeAt = 0;
+// The NUMBER the cached/in-flight code was minted for. An idempotency key
+// names a REQUEST, not a caller: replaying a key against a different phone
+// would hand back a code bound to the number the user had just corrected.
+let lastPairCodeDigits = null;
+let pairCodeInFlight = null;   // { key, digits, promise }
 // Monotonic socket generation. Every path that installs a new socket claims
 // `++sockGen` BEFORE its async createSocket() and re-checks before assigning;
 // a stale installer discards its socket instead of overwriting a newer one.
@@ -863,6 +957,62 @@ async function handlePairCode(req, res) {
     sendJson(res, 400, { ok: false, error: 'phone (E.164 digits) required' });
     return;
   }
+  const idemKey = (
+    payload.idempotency_key || req.headers['idempotency-key'] || ''
+  ).toString().slice(0, 128);
+  if (idemKey) {
+    if (
+      lastPairCodeKey === idemKey
+      && lastPairCodeDigits === digits
+      && lastPairCodeValue
+      && pairingInProgress
+      && (Date.now() - lastPairCodeAt) < PAIR_CODE_IDEM_TTL_MS
+    ) {
+      log('pair.code_replayed');
+      sendJson(res, 200, { ok: true, ...lastPairCodeValue, idempotent_replay: true });
+      return;
+    }
+    if (
+      pairCodeInFlight
+      && pairCodeInFlight.key === idemKey
+      && pairCodeInFlight.digits === digits
+    ) {
+      // A retry that arrived while the first mint is still in flight must
+      // NOT start a second one — that is the socket race this guard exists
+      // for. Ride the first mint's result.
+      try {
+        const v = await pairCodeInFlight.promise;
+        sendJson(res, 200, { ok: true, ...v, idempotent_replay: true });
+      } catch (e) {
+        error('pair.code_failed', { err: String(e) });
+        sendJson(res, 500, { ok: false, error: String(e) });
+      }
+      return;
+    }
+  }
+  const mint = mintPairCode(digits);
+  if (idemKey) pairCodeInFlight = { key: idemKey, digits, promise: mint };
+  try {
+    const value = await mint;
+    if (idemKey) {
+      lastPairCodeKey = idemKey;
+      lastPairCodeDigits = digits;
+      lastPairCodeValue = value;
+      lastPairCodeAt = Date.now();
+    }
+    sendJson(res, 200, { ok: true, ...value });
+  } catch (e) {
+    error('pair.code_failed', { err: String(e) });
+    sendJson(res, 500, { ok: false, error: String(e) });
+  } finally {
+    if (pairCodeInFlight && pairCodeInFlight.key === idemKey) pairCodeInFlight = null;
+  }
+}
+
+// The actual mint: teardown, pairing window, socket, code. Split out of
+// `handlePairCode` so an idempotent retry can await THIS promise instead of
+// starting a second teardown (R46 F8).
+async function mintPairCode(digits) {
   // Tear down any previous socket BEFORE opening the pairing window.
   // Baileys end() emits connection.update close SYNCHRONOUSLY; with the
   // guard already armed, that intentional close used to trip the
@@ -911,14 +1061,13 @@ async function handlePairCode(req, res) {
     // QR in code-mode — it's purely the readiness trigger.)
     const code = await requestPairingCodeWhenReady(s, digits);
     log('pair.code_minted', { phone_digits_len: digits.length, code_len: (code || '').length });
-    sendJson(res, 200, { ok: true, pairing_code: code, phone: `+${digits}` });
+    return { pairing_code: code, phone: `+${digits}` };
   } catch (e) {
     // The window must not outlive a failed mint — a lingering guard would
     // misclassify later closes (incl. a fallback QR flow's) as pairing aborts.
     pairingInProgress = false;
     if (pairingTimer) { clearTimeout(pairingTimer); pairingTimer = null; }
-    error('pair.code_failed', { err: String(e) });
-    sendJson(res, 500, { ok: false, error: String(e) });
+    throw e;
   }
 }
 

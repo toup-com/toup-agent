@@ -41,6 +41,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -90,6 +91,21 @@ def envelope_off(monkeypatch):
         monkeypatch.setattr(settings, "channel_envelope", False)
 
 
+#: The Runtime Context carries today's DATE, built from the live clock
+#: (`prefix_stability.py`: `now_local.strftime('%A, %B %d, %Y')`). Hashing the
+#: prompt with that line in it makes every golden — 22 shas and 7 full-text
+#: diffs — turn red at midnight UTC for a reason that has nothing to do with the
+#: prompt, on the very guard a deliberate prompt change is certified against.
+#: The date is normalised out on BOTH sides instead; a golden must not contain a
+#: calendar date.
+_DATE_LINE_RE = re.compile(r"^- Today's date: .*$", re.M)
+_FROZEN_DATE = "- Today's date: <FROZEN>"
+
+
+def _freeze(prompt: str) -> str:
+    return _DATE_LINE_RE.sub(_FROZEN_DATE, prompt)
+
+
 async def _prompts(channels):
     """The REAL `_build_system_prompt`, per channel, for one user.
 
@@ -118,10 +134,10 @@ async def _prompts(channels):
     out: dict[str, str] = {}
     for ch in channels:
         async with async_session_maker() as db:
-            out[ch] = await runner._build_system_prompt(
+            out[ch] = _freeze(await runner._build_system_prompt(
                 db=db, user_id=uid, user_message="hi", channel=ch,
                 client_tz="UTC", turn_context_out={},
-            )
+            ))
     return out
 
 
@@ -231,6 +247,36 @@ async def test_flag_off_full_text_matches_for_the_representative_channels(envelo
                 fromfile=f"golden/{ch}", tofile=f"now/{ch}", lineterm="", n=2,
             ))[:60])
             pytest.fail(f"flag-off prompt for {ch!r} drifted:\n{diff}")
+
+
+_CALENDAR_DATE_RE = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|"
+    r"November|December) \d{1,2}, \d{4}\b"
+)
+
+
+def test_no_golden_contains_a_calendar_date():
+    """The rot this guard cannot afford: a golden captured with the live clock
+    in it goes red the next day, on the one guard a deliberate prompt change is
+    certified against — and the redness says "the prompt moved", which is a lie.
+
+    R44 (#749) moved the date out of the head entirely — the Runtime Context
+    now says the date arrives in <turn_context> — so the assertion is on the
+    ABSENCE of a calendar date, with `_freeze()` kept as the belt for a build
+    that puts a `- Today's date: …` line back (it would land as <FROZEN>).
+    """
+    for path in sorted(_GOLDENS.glob("*.txt")):
+        text = path.read_text()
+        assert not _CALENDAR_DATE_RE.search(text), (
+            f"{path.name}: a calendar date is baked into the golden — it will "
+            "go red tomorrow for a reason unrelated to the prompt"
+        )
+        dated = [l for l in text.splitlines() if l.startswith("- Today's date:")]
+        assert dated in ([], [_FROZEN_DATE]), f"{path.name}: {dated}"
+        assert "Today's date" in text, (
+            f"{path.name}: the Runtime Context no longer tells the model where "
+            "the date comes from"
+        )
 
 
 def test_the_goldens_name_the_build_they_came_from(goldens):

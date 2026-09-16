@@ -423,7 +423,14 @@ def test_debt_is_not_growing_silently():
     # test_agent_health_signals.py probes /agent/health, which reads the tenant
     # DB. ROUTING entries, all three RUN in the agent-mode step (42/42, 7/7,
     # 14/14 there; 'no such table' in the sweep).
-    CEILING = 105
+    # Round 46 (+): the incident round added agent-mode ROUTING entries across
+    # several lanes — tests that RUN in the agent-mode step and are listed here
+    # only because the platform sweep cannot create AGENT_ONLY tables. L8's is
+    # test_routines_list_honesty.py (routines/build_jobs), which proves
+    # GET /api/routines answers 503 instead of the 200 [] it returned through
+    # the 2026-09-15 pgbouncer outage. Raised deliberately, with headroom for
+    # the lanes still landing in this round; it may only shrink after.
+    CEILING = 115
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

@@ -103,6 +103,11 @@ FAMILIES: Dict[str, _Family] = {
                 "generate_markdown",
                 "convert_document",
                 "generate_html_to_pdf",
+                # Round 46: same family, same entitlement — a tenant who
+                # switched document generation off must not keep a back door
+                # to the same capability under a different tool name.
+                "generate_data_file",
+                "generate_audio",
             ),
         ),
         _Family(

@@ -119,6 +119,9 @@ _RECONCILE_MAX_BACKOFF_S = 60.0
 # that accepts and closes could otherwise drive back-to-back /health reads
 # for as long as it stays sick. No two reconcile reads closer than this.
 _RECONCILE_MIN_INTERVAL_S = 1.0
+# The link announcement (R46 F4b) is a courtesy to the platform, never a
+# dependency of the link itself: short budget, failures logged and dropped.
+_LINK_ANNOUNCE_TIMEOUT_S = 5.0
 
 
 def _resolve_sidecar_dir() -> Path:
@@ -168,6 +171,215 @@ def bump_generation() -> int:
     return _generation
 
 
+# ── Adapter readiness (R46 F2) ────────────────────────────────
+#
+# The pairing-code route used to answer 503 the instant the registry slot was
+# empty, which turned a 2.6 s internal restart into a user-visible failure the
+# app papered over with a blind 1800 ms retry loop (incident 2026-09-15,
+# 14:48:20.990 and 14:48:23.367). The restart path now PUBLISHES its progress
+# and the route awaits it — an event, not a poll. `_adapter_ready` is the
+# truth; the Event is only the wakeup, recreated when the running loop changes
+# so a module imported across test loops cannot attach a future to a dead one.
+_adapter_ready: bool = False
+_restart_in_flight: bool = False
+_ready_event: Optional[asyncio.Event] = None
+_ready_event_loop: Any = None
+# When the current restart window opened, and whether this process has ever
+# seen a LINKED session. Both exist only to keep `whatsapp_health_fields()
+# ['settled']` — which is ANDed into the global `serving` predicate the
+# onboarding probes read — from reporting "not ready" for WhatsApp-only work.
+# See `channels_settled()`.
+_restart_started_at: float = 0.0
+_ever_linked: bool = False
+# A restart that outlives the sidecar's own boot budget by this much is a
+# wedge, not a transition, and may not pin `serving=False` for the life of
+# the process (a `_teardown()` that hangs on a task ignoring cancellation).
+_SETTLE_GRACE_S = 30.0
+
+
+def _ready_ev() -> asyncio.Event:
+    global _ready_event, _ready_event_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _ready_event is None or (loop is not None and _ready_event_loop is not loop):
+        _ready_event = asyncio.Event()
+        _ready_event_loop = loop
+        if _adapter_ready:
+            _ready_event.set()
+    return _ready_event
+
+
+def mark_adapter_restarting() -> None:
+    """The restart path is about to stop/replace the adapter."""
+    global _adapter_ready, _restart_in_flight, _restart_started_at
+    _adapter_ready = False
+    _restart_in_flight = True
+    _restart_started_at = time.monotonic()
+    try:
+        _ready_ev().clear()
+    except Exception:
+        pass
+
+
+def mark_session_linked() -> None:
+    """This process has observed a linked WhatsApp session.
+
+    The only consumer is `channels_settled()`: a tenant who has never linked
+    cannot be waiting on a WhatsApp restart, so their restart must not fail
+    the global readiness predicate.
+    """
+    global _ever_linked
+    _ever_linked = True
+
+
+def channels_settled() -> bool:
+    """Is the WhatsApp channel in a state a READINESS probe may act on?
+
+    NOT the same question as `adapter_restart_in_flight()`, which is what a
+    pairing-code waiter awaits. This one is ANDed into `serving` in
+    `agent_main`, and `agent_setup.agent_turn_readiness` refuses a container
+    whose `channels_settled` is False — so a WhatsApp-only transition here
+    becomes "this agent cannot serve a chat turn".
+
+    That is how the round-46 readiness work regressed onboarding: `/admin/bind`
+    wakes every lazy channel, `_wa_mode` defaults to `qr_link` whenever no
+    cloud creds exist, so EVERY new signup spawns a Baileys sidecar and spends
+    up to `_SIDECAR_BOOT_TIMEOUT_S` inside a restart window — on a container
+    that can serve a chat turn throughout. Two ways out, both applied:
+
+      * a process that has never seen a linked session has nothing to settle;
+      * a restart that outruns the sidecar boot budget is a wedge, not a
+        transition, and stops counting.
+    """
+    if not _restart_in_flight:
+        return True
+    if not _ever_linked:
+        return True
+    return (time.monotonic() - _restart_started_at) > (
+        _SIDECAR_BOOT_TIMEOUT_S + _SETTLE_GRACE_S
+    )
+
+
+def mark_adapter_ready() -> None:
+    """A started adapter is registered and routable."""
+    global _adapter_ready, _restart_in_flight
+    _adapter_ready = True
+    _restart_in_flight = False
+    try:
+        _ready_ev().set()
+    except Exception:
+        pass
+
+
+def mark_adapter_start_failed() -> None:
+    """The restart path finished WITHOUT an adapter (bad mode, failed start).
+
+    Waiters ARE woken (R46 decision D1). They must not adopt an empty registry
+    — and they don't: `await_active_baileys_channel` re-reads the registry and
+    returns None the moment the restart stops being in flight. Waking them is
+    what turns "the answer is already known" into a typed 503 now instead of
+    after the full 6 s budget, and that budget sits inside a platform request
+    the user is watching. The in-flight bit clears first so the waiter sees the
+    settled state, not the transition.
+    """
+    global _adapter_ready, _restart_in_flight
+    _adapter_ready = False
+    _restart_in_flight = False
+    try:
+        _ready_ev().set()
+    except Exception:
+        pass
+
+
+def adapter_restart_in_flight() -> bool:
+    return _restart_in_flight
+
+
+async def await_active_baileys_channel(
+    budget_s: float,
+) -> Optional["BaileysWhatsAppChannel"]:
+    """The live adapter, waiting up to `budget_s` for a restart to finish.
+
+    Returns None on timeout — the caller turns that into a typed 503 with a
+    retry hint, which is strictly more information than today's instant 503.
+    """
+    channel = get_active_baileys_channel()
+    # The fast path asks "is anyone REPLACING it", not "did someone tell me it
+    # is ready". A live adapter registered by a path that never published a
+    # mark — a test double, a future boot path — must be returned at once:
+    # failing closed against a working channel is the defect class this whole
+    # fix exists to remove, not a stricter version of the fix.
+    if channel is not None and not _restart_in_flight:
+        return channel
+    if budget_s <= 0:
+        return channel
+    ev = _ready_ev()
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + budget_s
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return None
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return None
+        channel = get_active_baileys_channel()
+        if channel is not None:
+            return channel
+        if not _restart_in_flight:
+            # The restart gave up (`mark_adapter_start_failed`). The answer is
+            # settled, so sitting out the rest of the budget only delays a 503
+            # the caller could already have.
+            return None
+        # Set with no channel behind it: keep waiting inside the budget
+        # rather than spin.
+        ev.clear()
+
+
+def whatsapp_health_fields() -> dict:
+    """The `channels.whatsapp` block of `/agent/health` (R46 F5).
+
+    Lives here, not in the health route, so the WhatsApp facts have one
+    producer. Never raises — a health payload may not fail on a channel.
+    """
+    channel = get_active_baileys_channel()
+    settled = channels_settled()
+    if channel is None:
+        return {
+            "registered": False,
+            "started": False,
+            "sidecar_alive": False,
+            "adopted_sidecar": False,
+            "allowlist_size": 0,
+            "allowlist_applied_at": None,
+            "session_status": "unknown",
+            "mode": None,
+            "settled": settled,
+        }
+    try:
+        h = channel.health()
+    except Exception:
+        h = {}
+    try:
+        registered = bool(channel.is_current())
+    except Exception:
+        registered = False
+    return {
+        "registered": registered,
+        "started": bool(h.get("started")),
+        "sidecar_alive": bool(h.get("sidecar_alive")),
+        "adopted_sidecar": bool(h.get("adopted_sidecar")),
+        "allowlist_size": int(h.get("allowed_numbers_count") or 0),
+        "allowlist_applied_at": h.get("allowlist_applied_at"),
+        "session_status": h.get("session_status") or "unknown",
+        "mode": h.get("mode"),
+        "settled": settled,
+    }
+
+
 def _signal(name: str) -> None:
     """Best-effort process-lifetime counter. The module is absent on older
     images, and a health counter may never break a WhatsApp turn."""
@@ -193,6 +405,10 @@ class BaileysWhatsAppChannel(BaseChannel):
             for normalised in [_normalize_e164(raw)]
             if normalised
         }
+        # When the allowlist last changed, epoch seconds. Reported on
+        # /agent/health so a hot-apply (R46 F1) is observable without a
+        # restart to point at.
+        self._allowlist_applied_at: float = time.time()
         # Sidecar lifecycle
         self._sidecar_proc: Optional[asyncio.subprocess.Process] = None
         self._event_task: Optional[asyncio.Task] = None
@@ -231,6 +447,9 @@ class BaileysWhatsAppChannel(BaseChannel):
         self._last_send_at: Optional[datetime] = None
         self._last_send_error: Optional[dict] = None
         self._sidecar_booted_at: Optional[datetime] = None
+        # (session_status, self_e164) of the last link announced to the
+        # platform — an SSE re-attach replays `connection_open`.
+        self._last_link_announced: Optional[tuple] = None
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -246,6 +465,33 @@ class BaileysWhatsAppChannel(BaseChannel):
         if self._stopping:
             return False
         return self._generation == 0 or self._generation == current_generation()
+
+    def apply_allowlist(self, numbers: Optional[list[str]]) -> bool:
+        """Swap the inbound allowlist in place. Returns True when it changed.
+
+        R46 F1. The allowlist is NOT a socket parameter: it is read only by
+        the inbound dispatch gate (`_handle_inbound_message`) and reported by
+        `health()`; the sidecar never sees it. Restarting the adapter to apply
+        one therefore SIGTERMed a sidecar that was mid-pairing and cost the
+        user ~14 s and two 503s (incident 2026-09-15 14:48:19→14:48:26). If a
+        future consumer ever reads `allowed_numbers` at socket-construction
+        time this must go back to being a restart — `test_whatsapp_allowlist_
+        hot_apply.py` probes the source for exactly that.
+        """
+        new = {
+            normalised
+            for raw in (numbers or [])
+            for normalised in [_normalize_e164(raw)]
+            if normalised
+        }
+        if new == self.allowed_numbers:
+            return False
+        self.allowed_numbers = new
+        self._allowlist_applied_at = time.time()
+        logger.info(
+            "[WHATSAPP-BAILEYS] allowlist.applied size=%d (no restart)", len(new),
+        )
+        return True
 
     async def start(self) -> bool:
         """Spawn the sidecar + open the inbound event stream.
@@ -605,6 +851,55 @@ class BaileysWhatsAppChannel(BaseChannel):
         # Unknown event types — log at debug, don't fail.
         logger.debug("[WHATSAPP-BAILEYS] event.unknown_type type=%s", kind)
 
+    # ── Link announcement (R46 F4b) ────────────────────────────
+
+    def _announce_link(self) -> None:
+        """Tell the platform the session just linked. Best-effort, no await.
+
+        The sidecar witnessed the link at 14:48:57.9 and the platform learned
+        of it at 14:49:18.7 — only because a backgrounded phone happened to
+        resume polling (incident 2026-09-15). The agent already knows; nothing
+        told anyone. Deduped per (status, self) so an SSE re-attach that
+        replays `connection_open` does not re-POST.
+        """
+        key = (self._session_status, self._self_e164 or "")
+        if key == self._last_link_announced:
+            return
+        self._last_link_announced = key
+        try:
+            from app.services.background_tasks import spawn as _spawn_bg
+            _spawn_bg(self._post_link_announce(), name="wa-link-announce")
+        except Exception:
+            logger.debug("[WHATSAPP-BAILEYS] link.announce_spawn_failed")
+
+    async def _post_link_announce(self) -> None:
+        from app.config import settings as _s
+
+        base = (getattr(_s, "platform_api_url", "") or "").strip().rstrip("/")
+        key = (getattr(_s, "agent_api_key", "") or "").strip()
+        if not base or not key:
+            return
+        url = f"{base}/agent-setup/internal/whatsapp-link"
+        body = {
+            "session_status": self._session_status,
+            "self_e164": self._self_e164,
+            "at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_LINK_ANNOUNCE_TIMEOUT_S) as client:
+                resp = await client.post(url, json=body, headers={"X-Agent-Key": key})
+            # A platform that has not deployed the route yet answers 404; the
+            # client's poll remains the backstop, so this is a log line and
+            # nothing more (fleet-lag rule, OWNERSHIP C5).
+            logger.info(
+                "[WHATSAPP-BAILEYS] link.announced status=%s http=%s",
+                self._session_status, resp.status_code,
+            )
+        except Exception as exc:
+            logger.info(
+                "[WHATSAPP-BAILEYS] link.announce_failed err=%s", type(exc).__name__,
+            )
+
     # ── Sidecar state reconciliation ───────────────────────────
 
     def _wake_reconciler(self) -> None:
@@ -649,6 +944,11 @@ class BaileysWhatsAppChannel(BaseChannel):
         status = body.get("session_status")
         if status:
             self._session_status = str(status)
+        if self._session_status == "linked":
+            # Module-level, not per-instance: `channels_settled()` is read
+            # while the adapter is unregistered (mid-restart), when there is
+            # no instance left to ask.
+            mark_session_linked()
         self._connected = bool(body.get("connected"))
         self._self_e164 = body.get("self_e164")
 
@@ -678,6 +978,11 @@ class BaileysWhatsAppChannel(BaseChannel):
                 # — the stream was not attached when the sidecar emitted it.
                 # Diagnostic only; nothing may gate on a health signal.
                 _signal("wa_status_reconciled")
+            if self._session_status == "linked" and self._self_e164:
+                # Announced from the ONE write path, not from the SSE branch:
+                # a link the stream missed is discovered by the reconciler,
+                # and that one is the one nobody would otherwise hear about.
+                self._announce_link()
 
     async def _reconcile_once(self, source: str) -> bool:
         """One ``/health`` read applied to the cache. Never raises.
@@ -1061,7 +1366,9 @@ class BaileysWhatsAppChannel(BaseChannel):
         except Exception:
             logger.exception("[WHATSAPP-BAILEYS] pair_start.failed")
 
-    async def request_pairing_code(self, phone: str) -> str:
+    async def request_pairing_code(
+        self, phone: str, idempotency_key: Optional[str] = None,
+    ) -> str:
         """Mint an 8-character pairing code for single-device WhatsApp
         linking (no QR). The user enters the returned code in their own
         WhatsApp app under Linked Devices → "Link with phone number
@@ -1075,7 +1382,14 @@ class BaileysWhatsAppChannel(BaseChannel):
         """
         if self._http is None:
             raise RuntimeError("Baileys sidecar HTTP client not initialised")
-        resp = await self._http.post("/pair/code", json={"phone": phone})
+        # R46 F8: a retry that races a successful mint used to wipe the auth
+        # dir and open a second socket, burning the code the user was at that
+        # moment typing. The key is forwarded verbatim; a sidecar that does
+        # not know it ignores an unknown body field (old-image tolerance).
+        body_out: dict = {"phone": phone}
+        if idempotency_key:
+            body_out["idempotency_key"] = idempotency_key
+        resp = await self._http.post("/pair/code", json=body_out)
         resp.raise_for_status()
         body = resp.json()
         if not body.get("ok"):
@@ -1154,6 +1468,7 @@ class BaileysWhatsAppChannel(BaseChannel):
             "connected": self._connected,
             "self_e164": self._self_e164,
             "allowed_numbers_count": len(self.allowed_numbers),
+            "allowlist_applied_at": self._allowlist_applied_at,
             "inbound_count": self._inbound_count,
             "last_inbound_at": (
                 self._last_inbound_at.isoformat() + "Z"

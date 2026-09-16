@@ -187,14 +187,39 @@ from app.config import settings
 # picture it is editing.
 #
 # Cost accepted a seventh time: one more prompt-cache re-warm per tenant.
+#
+# MOVED AN EIGHTH TIME, DELIBERATELY, 2026-09-15 (was 31c014773f84…e035d92ba2, 61).
+# Round 46, decision A10 — ONE lineage bump for the whole round's schema work,
+# landed together so there is exactly one `tools_array_changed` event:
+#   • TWO TOOLS ADDED (61 → 63), both closing a hole the product already
+#     implied. `generate_data_file(content, filename, format)` gives CSV /
+#     JSON / plain text / code a producer — `csv` had been in the turn-1 gate
+#     that unlocks this whole family since that gate was written, with nothing
+#     behind it, so "export this as CSV" opened the export tools and the honest
+#     answer was not among them. `generate_audio(text, voice)` persists
+#     synthesised speech, which `tts` used to upload to Telegram and then
+#     `os.unlink` in a `finally` — audio output was impossible on the app, the
+#     web, WhatsApp and voice while `tts` stayed in the wire array on all of
+#     them.
+#   • `edit_image` / `analyze_image` gain `references` (round 46, C7).
+#   • `tts` / `send_file` / `send_photo` descriptions no longer say "via
+#     Telegram": all three work on every channel now.
+#
+# This one had to be a wire change for the same reason `memory_read_file` was:
+# no description can substitute for a tool that does not exist. The model
+# cannot deliver a CSV it has no tool to write.
+#
+# Cost accepted an eighth time: one more prompt-cache re-warm per tenant, for
+# the whole round rather than once per lane.
 MAIN_CORE_TOOLS_SHA256 = (
-    "31c014773f8467bc3b1425c1470aa794fa297a248793d083906b83e035d92ba2"
+    "17e2267329c54ada53c88e95a23213b0ac197752299782146f3bcd952609c119"
 )
-MAIN_CORE_TOOLS_COUNT = 61
+MAIN_CORE_TOOLS_COUNT = 63
 
 DOC_TOOL_NAMES = {
     "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",
     "generate_markdown", "convert_document", "generate_html_to_pdf",
+    "generate_data_file", "generate_audio",
 }
 
 
@@ -425,8 +450,12 @@ def test_withheld_doc_generation_costs_the_measured_token_delta():
     _entitle("app_builder,toup")
     gated = wire_tok(_runner()._core_tool_defs)
     delta = full - gated
-    assert 1_000 <= delta <= 1_350, (
-        f"doc_generation wire cost moved: {delta} tok (measured 1,160)"
+    # 1,160 tok on 2026-08-06 with seven tools; round 46 added
+    # generate_data_file (a four-property schema with a long `content`
+    # description, because the model has to be told that a CSV may be rows OR
+    # text) and generate_audio, measured together at 1,881.
+    assert 1_000 <= delta <= 2_100, (
+        f"doc_generation wire cost moved: {delta} tok (measured 1,881)"
     )
     # And navigation is NOT part of that delta.
     assert wire_tok(get_navigation_tools()) > 300

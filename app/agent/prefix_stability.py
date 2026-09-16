@@ -114,6 +114,55 @@ def build_allowed_tools_choice(
     }
 
 
+def is_tool_choice_rejection(err: BaseException) -> bool:
+    """True when the provider refused the REQUEST SHAPE of ``tool_choice`` —
+    a deterministic 400 the ordinary retry ladder can never get past.
+
+    Observed live 2026-09-15 on the rollout canary (image ae6365a5f358,
+    gpt-5.6-terra, Responses wire): ``Invalid value: 'allowed_tools'`` with
+    ``param: tool_choice.type`` / ``code: invalid_value``, three times, then a
+    silent fall-back to gpt-4o over the chat wire that took three minutes and
+    answered two tokens. The restriction is an optimisation (intent gating
+    that rides outside the cached prefix); the tool policy itself is enforced
+    at execute time, so a call without it is safe and the model is unchanged.
+
+    Reads the SDK error's structured body first — the platform proxy wraps
+    OpenAI's JSON as a string under ``detail`` — and falls back to the text.
+    A context overflow, a rate limit, a 5xx or a 400 about anything else is
+    NOT a tool_choice rejection.
+    """
+    status = getattr(err, "status_code", None)
+    if status is not None and int(status) != 400:
+        return False
+    body = getattr(err, "body", None)
+    err_obj: Any = None
+    try:
+        if isinstance(body, dict):
+            inner = body.get("detail", body)
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except ValueError:
+                    inner = None
+            if isinstance(inner, dict):
+                err_obj = inner.get("error", inner)
+    except Exception:  # noqa: BLE001 — the fallback below still answers
+        err_obj = None
+    if isinstance(err_obj, dict):
+        param = str(err_obj.get("param") or "")
+        code = str(err_obj.get("code") or "")
+        msg = str(err_obj.get("message") or "")
+        if param.startswith("tool_choice"):
+            return True
+        if "tool_choice" in msg and code in ("invalid_value", "invalid_type", "unknown_parameter"):
+            return True
+        return False
+    text = str(err)
+    if status is None and " 400" not in text and "400 " not in text:
+        return False
+    return ("tool_choice" in text) and ("Invalid value" in text or "invalid_value" in text)
+
+
 def render_time_lines(
     now_local: datetime,
     tz_name: str,

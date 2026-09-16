@@ -217,6 +217,13 @@ def bridge(tmp_path_factory):
         daemon=True,
     ).start()
 
+    # A spawn now TCP-probes the pooler before it runs `create_tenant_db`
+    # (R46: that helper rewrites the shared pgbouncer auth file and reloads
+    # the pooler; signalling a dead one is how the fleet went down on
+    # 2026-09-15). There is no pgbouncer in this harness, so point the probe
+    # at the fake agent's listener — a real connect, no protocol assumed.
+    mod.POOLER_PORT = agent_port
+
     from fastapi import FastAPI
     app = FastAPI()
     loop_box: dict = {}
@@ -707,8 +714,11 @@ def test_health_stays_fast_during_a_full_fleet_tick(bridge, monkeypatch):
 
 
 def _assigning(bridge, mod, slot, age_s, *, with_bind=True, user="u-stuck"):
+    # 8 lowercase hex: `post_claim` validates the shape the platform's only
+    # producer (`str(user_id)[:8]`) can make, so a fixture prefix that could
+    # never come from a real claim is now refused at the boundary (R46 D24).
     m = _member(slot, bridge.agent_port, mod.STATE_ASSIGNING,
-                assigned_prefix=f"pfx{slot}", assigned_user_id=user)
+                assigned_prefix=f"deadbee{slot[-1]}", assigned_user_id=user)
     m["state_changed_at"] = int(time.time()) - age_s
     mod._save_members([m])
     mod._save_state({"current_image_tag": "ghcr.io/toup-com/toup-agent:aaaaaaaaaaaa"})
@@ -735,7 +745,7 @@ def test_an_idempotent_claim_promotes_a_slot_left_assigning(bridge):
 
     req = urllib.request.Request(
         f"http://127.0.0.1:{bridge.port}/v1/pool/claim",
-        data=json.dumps({"user_id": "u-stuck", "prefix": "pfxs1",
+        data=json.dumps({"user_id": "u-stuck", "prefix": "deadbee1",
                          "agent_api_key": "k-s1"}).encode(),
         headers={"Content-Type": "application/json"})
     body = json.loads(urllib.request.urlopen(req, timeout=120).read())

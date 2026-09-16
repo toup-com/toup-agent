@@ -44,6 +44,17 @@ weasyprint==61.2
 # Media
 pillow>=11.1.0
 pillow-heif>=0.16.0  # decode HEIC/HEIF (iPhone) for edit_image source normalization
+# pypdfium2: render a SCANNED pdf's pages as images for the vision model
+# (attachment_ingest.rasterize_pdf). There is no OCR in this image and none is
+# wanted — the same turn already hands every photo to a model that reads text
+# out of pictures; a scanned PDF was the one source we refused to show it.
+# Self-contained wheel, no system libs.
+pypdfium2>=4.30.0
+# python-magic: sniff the REAL type of an inbound attachment. libmagic1 is
+# already installed in Dockerfile.agent. The import is optional at runtime —
+# attachment_ingest falls back to magic-byte signatures — so a platform image
+# without libmagic still classifies correctly.
+python-magic==0.4.27
 
 # Auth & Security
 python-jose[cryptography]==3.3.0

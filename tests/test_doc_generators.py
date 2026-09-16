@@ -202,10 +202,17 @@ def test_doc_generation_tools_schema_count_and_names():
     # down with the exporters; it now lives in get_navigation_tools() and
     # ships unconditionally. Pinned in
     # tests/test_tool_family_entitlements.py.
+    #
+    # Round 46 (C9) added the last two. `csv` had been advertised by the
+    # turn-1 gate that unlocks this whole block since that gate was written,
+    # with no CSV generator behind it, and `tts` synthesised audio and then
+    # unlinked it — so both formats were reachable in the prompt and
+    # unreachable in fact. Adding tools moves the provider prompt-cache
+    # lineage once; that was a scheduled cost (round 46, A10).
     assert names == {
         "generate_pdf", "generate_docx", "generate_xlsx",
         "generate_pptx", "generate_markdown", "generate_html_to_pdf",
-        "convert_document",
+        "convert_document", "generate_data_file", "generate_audio",
     }
     assert "navigate_to" not in names
     # Each tool has required input schema

@@ -280,6 +280,162 @@ async def _cache_session(
     cache[(channel_type.value, chat_id)] = (day_chat_id or "", session_id)
 
 
+async def _deliver_attachments(
+    channel: BaseChannel,
+    chat_id: str,
+    attachments: list,
+    chat_label: str,
+) -> list:
+    """Send this turn's generated files on the channel the turn came in on.
+
+    Round 46, C3: a document generated during a WhatsApp / Discord / Slack
+    turn was NEVER delivered on that channel. It was persisted on the Message
+    row and echoed to the app/web sockets, so the user on WhatsApp received a
+    reply that CLAIMED a file which never arrived. Telegram, Discord, Slack and
+    the legacy Cloud-API WhatsApp adapter implement ``send_photo``/
+    ``send_file``; ``BaseChannel``'s defaults only log. The capability check
+    below is what keeps an adapter without them (the live Baileys WhatsApp one)
+    from reporting a delivery it did not make.
+
+    Returns the filenames that could not be delivered, so the caller can say
+    so instead of leaving the claim standing. A delivery failure never fails
+    a turn that already happened: the file is in the thread and in the user's
+    Files either way (the same rule channel_echo states for live delivery).
+    """
+    from app.agent.artifact_kinds import (
+        ArtifactKind, NON_DELIVERED_ROLES, channel_size_limit, kind_for_mime,
+    )
+    from app.agent.channels.base import BaseChannel
+    from app.services.file_storage import get_storage_backend
+
+    undelivered: list = []
+    if not attachments:
+        return undelivered
+    ch = channel.channel_type.value
+    # An adapter that never overrode `send_photo`/`send_file` inherits
+    # BaseChannel's default, which LOGS A WARNING AND RETURNS — it does not
+    # raise, so the `except` below never fires, `undelivered` stays empty and
+    # the honest notice never runs. `BaileysWhatsAppChannel` (the live qr_link
+    # adapter) implements neither: on the founder's own channel every generated
+    # file was reported `sent=N failed=0` and arrived nowhere. A capability the
+    # adapter does not have is a delivery FAILURE, named to the user.
+    _can_photo = type(channel).send_photo is not BaseChannel.send_photo
+    _can_file = type(channel).send_file is not BaseChannel.send_file
+    backend = get_storage_backend()
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        # A derivative has no card of its own and no delivery of its own, and
+        # neither has EVIDENCE: a browser screenshot (role='source') is not the
+        # answer and must never be pushed to a third-party messenger.
+        if (att.get("role") or "final") in NON_DELIVERED_ROLES:
+            continue
+        name = att.get("filename") or "file"
+        mime = att.get("mime_type") or ""
+        key = att.get("storage_path") or ""
+        size = int(att.get("size_bytes") or 0)
+        limit = channel_size_limit(ch, mime, name)
+        if not key or (limit and size > limit):
+            undelivered.append(name)
+            continue
+        try:
+            path = backend.path(key)
+        except Exception:
+            undelivered.append(name)
+            continue
+        is_image = (att.get("kind") or kind_for_mime(mime, name)) == ArtifactKind.IMAGE
+        if not (_can_photo if is_image else _can_file):
+            undelivered.append(name)
+            continue
+        try:
+            if is_image:
+                await channel.send_photo(chat_id, path)
+            else:
+                await channel.send_file(chat_id, path)
+        except Exception as exc:
+            # No traceback: the exception from a storage read renders the full
+            # per-user workspace path, i.e. the user id and the filename, into
+            # the shipped trail.
+            logger.warning(
+                "channel.attachment_send_failed channel=%s chat=%s kind=%s size=%d err=%s",
+                ch, chat_label, att.get("kind") or kind_for_mime(mime, name), size,
+                type(exc).__name__,
+            )
+            undelivered.append(name)
+    return undelivered
+
+
+async def deliver_bot_attachments(bot, chat_id, attachments: list) -> None:
+    """The same delivery step for a raw bot client (Telegram), which never goes
+    through a `BaseChannel` adapter.
+
+    Here rather than in `telegram_bot.py` for two reasons: the decisions are the
+    ones `_deliver_attachments` makes and a second copy of them drifts, and the
+    CI test image deliberately leaves `python-telegram-bot` out — so a delivery
+    path reachable only through that import can never be driven by a test, which
+    is how "the reply claimed a file that never arrived" survived a green suite.
+
+    Failure is never fatal and never silent: the closing line names how many
+    could not be sent and where they still are.
+    """
+    from app.agent.artifact_kinds import (
+        ArtifactKind, NON_DELIVERED_ROLES, channel_size_limit, kind_for_mime,
+    )
+    from app.services.file_storage import get_storage_backend
+
+    atts = [a for a in (attachments or []) if isinstance(a, dict)]
+    if not atts or bot is None:
+        return
+    backend = get_storage_backend()
+    failed = 0
+    for att in atts:
+        # Derivatives and evidence (a browser screenshot is role='source') are
+        # never pushed off-platform — only the turn's answer is.
+        if (att.get("role") or "final") in NON_DELIVERED_ROLES:
+            continue
+        name = att.get("filename") or "file"
+        mime = att.get("mime_type") or ""
+        key = att.get("storage_path") or ""
+        size = int(att.get("size_bytes") or 0)
+        limit = channel_size_limit("telegram", mime, name)
+        if not key or (limit and size > limit):
+            failed += 1
+            continue
+        kind = att.get("kind") or kind_for_mime(mime, name)
+        try:
+            path = backend.path(key)
+            with open(path, "rb") as f:
+                if kind == ArtifactKind.IMAGE:
+                    await bot.send_photo(chat_id=chat_id, photo=f)
+                elif kind == ArtifactKind.AUDIO:
+                    # A voice note plays; the same bytes as a document are a
+                    # download, which is not what `generate_audio` is for.
+                    await bot.send_voice(chat_id=chat_id, voice=f)
+                else:
+                    await bot.send_document(chat_id=chat_id, document=f, filename=name)
+        except Exception as exc:
+            # No traceback: an OSError from `open(backend.path(key))` renders as
+            # the full workspace path — user id AND filename — into the trail
+            # that ships to Loki.
+            logger.warning(
+                "[TG] attachment send failed kind=%s size=%d err=%s",
+                kind, size, type(exc).__name__,
+            )
+            failed += 1
+    if failed:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=("I couldn't send that file here — it's in your Files in "
+                      "the Toup app." if failed == 1 else
+                      f"I couldn't send {failed} of those files here — they're "
+                      "in your Files in the Toup app."),
+            )
+        except Exception as _notice_exc:
+            logger.warning("[TG] attachment notice failed err=%s",
+                           type(_notice_exc).__name__)
+
+
 def make_channel_handler(
     *,
     channel: BaseChannel,
@@ -460,7 +616,9 @@ def make_channel_handler(
             )
 
         reply_text = (response.text or "").strip()
-        if not reply_text:
+        _attachments = [a for a in (_persisted.get("attachments") or [])
+                        if isinstance(a, dict)]
+        if not reply_text and not _attachments:
             logger.info(
                 "channel.empty_reply channel=%s chat=%s session=%s",
                 channel_type.value,
@@ -472,15 +630,48 @@ def make_channel_handler(
         # 7. Deliver. Per-channel chunking / format conversion lives
         # inside each adapter's send_text — keep this file channel-
         # agnostic.
-        try:
-            await channel.send_text(chat_id, reply_text)
-        except Exception:
-            logger.exception(
-                "channel.send_failed channel=%s chat=%s",
-                channel_type.value,
-                chat_label,
+        if reply_text:
+            try:
+                await channel.send_text(chat_id, reply_text)
+            except Exception:
+                logger.exception(
+                    "channel.send_failed channel=%s chat=%s",
+                    channel_type.value,
+                    chat_label,
+                )
+                return
+
+        # 7b. The files this turn produced, on THIS channel (round 46, C3).
+        # After the text, because the text is the answer and the file is the
+        # thing the answer is about.
+        if _attachments:
+            _undelivered = await _deliver_attachments(
+                channel, chat_id, _attachments, chat_label)
+            logger.info(
+                "channel.attachments channel=%s chat=%s sent=%d failed=%d",
+                channel_type.value, chat_label,
+                len(_attachments) - len(_undelivered), len(_undelivered),
             )
-            return
+            if _undelivered:
+                # Honest, not silent: the reply has already claimed a file.
+                # The file IS in their Files and in the app — that sentence is
+                # true on every channel and is the whole of what we can offer.
+                try:
+                    await channel.send_text(
+                        chat_id,
+                        ("I couldn't send that file here — it's in your Files "
+                         "in the Toup app." if len(_undelivered) == 1 else
+                         f"I couldn't send {len(_undelivered)} of those files "
+                         "here — they're in your Files in the Toup app."),
+                    )
+                except Exception as _notice_exc:
+                    # No traceback on an attachment path: the frames carry the
+                    # per-user workspace path and the filename into the shipped
+                    # trail (round 46 privacy rule).
+                    logger.warning(
+                        "channel.attachment_notice_failed channel=%s chat=%s err=%s",
+                        channel_type.value, chat_label, type(_notice_exc).__name__,
+                    )
 
         logger.info(
             "channel.run_ok channel=%s chat=%s session=%s tokens=%d tools=%d ms=%d",

@@ -39,6 +39,8 @@ def _utc_iso(v: Optional[datetime]) -> Optional[str]:
 from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 
+from app.api import _infra_errors as _infra
+
 
 router = APIRouter(prefix="/routines", tags=["routines"])
 logger = logging.getLogger(__name__)
@@ -847,10 +849,15 @@ async def list_routines():
                         getattr(r, "id", "?"), type(e).__name__, str(e)[:200],
                     )
     except Exception as e:
-        # Catastrophic: model column drift, DB unreachable, etc. Return
-        # an empty list with a server-side log instead of bricking the
-        # dashboard Routines panel for everyone. /_runner_status is the
-        # operational source of truth for "is the runner alive" anyway.
+        # "DB unreachable" used to land here and return []. 2026-09-15
+        # 15:08:19.140Z this endpoint answered 200 with an empty list while
+        # pgbouncer was dead and every DB access raised ConnectionRefusedError
+        # — an eleven-minute outage rendered to the user as "you have no
+        # routines". Infrastructure now says so (503 backend_unavailable);
+        # schema drift keeps the old degrade, because one stale column must
+        # not take the whole panel offline. Per-row failures are handled by
+        # the inner except above and still degrade.
+        _infra.raise_if_infrastructure(e)
         logger.exception(
             "list_routines: catastrophic failure (returning []): %s: %s",
             type(e).__name__, str(e)[:200],

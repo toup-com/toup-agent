@@ -33,6 +33,10 @@ class _FakeResponse:
     model = "gpt-5.5"
     tool_calls = [{"name": "gmail.search"}, {"name": "web.search"}]
     processing_time_ms = 1234
+    # R46 C8: the route reads this to answer with what a save=False turn
+    # produced. A fake that no longer matches its subject fails the route it is
+    # meant to exercise — keep it in step with `AgentResponse`.
+    persisted: dict = {}
 
 
 class _FakeRunner:

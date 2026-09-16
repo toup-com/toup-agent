@@ -532,10 +532,12 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "send_file",
             "description": (
-                "Send a file from the workspace to the user via Telegram. "
-                "Use this after creating a file (e.g. .docx, .pdf, .csv, .zip) "
-                "that the user asked for. The file must exist on disk first — "
-                "create it with write_file or exec, then send it with this tool."
+                "Attach a file from the workspace to your reply, on whatever "
+                "channel this conversation is on. Use it after creating a file "
+                "(e.g. .docx, .pdf, .csv, .zip) that the user asked for. The "
+                "file must exist on disk first — create it with write_file or "
+                "exec, then attach it with this tool. Files you made with a "
+                "generate_* tool are attached already; do not attach them twice."
             ),
             "input_schema": {
                 "type": "object",
@@ -558,9 +560,11 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "send_photo",
             "description": (
-                "Send an image/photo from the workspace to the user via Telegram. "
-                "Use this after creating or downloading an image file. "
-                "Supports .jpg, .png, .gif, .webp formats."
+                "Attach an image/photo from the workspace to your reply, on "
+                "whatever channel this conversation is on. Use it after "
+                "creating or downloading an image file. Supports .jpg, .png, "
+                ".gif, .webp. Images you made with generate_image/edit_image "
+                "are attached already; do not attach them twice."
             ),
             "input_schema": {
                 "type": "object",
@@ -586,7 +590,11 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "Analyze an image (describe it, extract text/OCR, answer questions about it). "
                 "Accepts an image URL or a workspace file path. "
                 "Use when you need to describe, extract text (OCR), or answer questions about an image "
-                "that the user referenced by URL or that you downloaded/created."
+                "that the user referenced by URL or that you downloaded/created. "
+                "To compare or read SEVERAL pictures together, put the extra "
+                "ones in `references` with the `image_id` each one was labelled "
+                "with — every picture in this conversation is labelled "
+                "`[image i of N — image_id <id>, <filename>]` where you can see it."
             ),
             "input_schema": {
                 "type": "object",
@@ -598,6 +606,30 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     "question": {
                         "type": "string",
                         "description": "What to analyze/look for in the image (default: 'Describe this image in detail').",
+                    },
+                    "references": {
+                        "type": "array",
+                        "maxItems": 7,
+                        "description": (
+                            "Optional. Additional pictures to look at ALONGSIDE "
+                            "`image`, in the order they should be considered. "
+                            "Use this to compare, match or read across pictures "
+                            "instead of calling this tool once per picture."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "image_id": {
+                                    "type": "string",
+                                    "description": "The `image_id` of the picture, from its label or from a tool result.",
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": "What this picture is, in the words a person would use (e.g. 'the receipt from Tuesday').",
+                                },
+                            },
+                            "required": ["image_id"],
+                        },
                     },
                 },
                 "required": ["image"],
@@ -680,6 +712,22 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                 "If the user references a picture from earlier in this chat, just "
                 "CALL this tool — do NOT ask them to re-upload; only ask if it "
                 "returns an error saying there is no image in this conversation. "
+                "SEVERAL PICTURES: this renders from up to 8 pictures at once. "
+                "`source_image_id` is the BASE — the picture being transformed, "
+                "whose framing and subject are kept. Every OTHER picture the "
+                "render should draw from goes in `references`, each with a "
+                "`role` written as a noun phrase a person would say ('the man "
+                "whose face and body should be used', 'the room this should "
+                "happen in', 'the jacket to put on him'). Every picture in this "
+                "conversation is labelled `[image i of N — image_id <id>, "
+                "<filename>]` where you can see it, so use those ids. "
+                "When this message carries MORE THAN ONE picture you must name "
+                "the base explicitly — calling this with neither "
+                "`source_image_id` nor `image` returns an error listing them "
+                "rather than guessing. If, after reading that list, you still "
+                "genuinely cannot tell which picture is which, ask the user ONE "
+                "short question naming the pictures — never more than one, and "
+                "never when the roles are obvious from what they said. "
                 "The result is delivered inline and saved to the workspace. "
                 "Do NOT use this to create a picture from scratch (that's "
                 "generate_image) or to merely describe one (that's analyze_image). "
@@ -715,6 +763,42 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                             "edit. Use only for a file that is not a chat "
                             "attachment; otherwise prefer source_image_id."
                         ),
+                    },
+                    "references": {
+                        "type": "array",
+                        "maxItems": 7,
+                        "description": (
+                            "Optional. The OTHER pictures this render should draw "
+                            "from, in the order they matter. The base stays "
+                            "`source_image_id`; these are additional material — a "
+                            "person's face, a garment, a room, a style. Name what "
+                            "each one is for in `role`, or the renderer has to "
+                            "guess which picture is the person and which is the "
+                            "place."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "image_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "The `image_id` of this reference, from its "
+                                        "`[image i of N — image_id …]` label or from "
+                                        "a generate_image / edit_image result."
+                                    ),
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": (
+                                        "What this picture is FOR, as a noun phrase a "
+                                        "person would say: 'the man whose face and "
+                                        "body should be used', 'the room this should "
+                                        "happen in', 'the jacket to put on him'."
+                                    ),
+                                },
+                            },
+                            "required": ["image_id"],
+                        },
                     },
                     "size": {
                         "type": "string",
@@ -841,10 +925,11 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "name": "tts",
             "description": (
-                "Convert text to speech and send as a voice message in Telegram. "
-                "Use when the user asks to read something aloud, wants a voice reply, "
-                "or you think audio would be better than text (e.g. pronunciation, language learning). "
-                "Supports multiple voices and speed control."
+                "Convert text to speech and attach the audio to your reply, on "
+                "whatever channel this conversation is on. Use when the user "
+                "asks to read something aloud, wants a voice reply, or audio "
+                "would be better than text (pronunciation, language learning). "
+                "Identical to generate_audio — either name reaches the same tool."
             ),
             "input_schema": {
                 "type": "object",
@@ -1980,6 +2065,80 @@ def get_doc_generation_tools() -> List[Dict[str, Any]]:
                     "filename": {"type": "string"},
                 },
                 "required": ["html", "filename"],
+            },
+        },
+        # Round 46: `csv` had been in the turn-1 gate that unlocks this whole
+        # list since that gate was written, with no CSV generator behind it —
+        # so "export this as CSV" opened the export tools and the honest
+        # answer was not among them. Same for plain text, JSON and code.
+        {
+            "name": "generate_data_file",
+            "description": (
+                "Produce a CSV, JSON, plain-text or source-code file and attach "
+                "it to your reply. Use this when the user names one of those "
+                "formats — a CSV request is not answered by a spreadsheet, and "
+                "a JSON request is not answered by a code block in chat. For a "
+                "PDF/Word/Excel/PowerPoint/Markdown file use the matching "
+                "generate_* tool instead."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "description": (
+                            "The file's content. For 'csv': either the CSV text "
+                            "itself, or a list of row objects (keys become the "
+                            "header), or a list of lists. For 'json': the object "
+                            "or array itself (a JSON string is parsed and "
+                            "re-formatted). For 'txt'/'code': the text."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": (
+                            "Descriptive filename, e.g. 'march-expenses.csv'. A "
+                            "placeholder like 'x' or 'file' is replaced."
+                        ),
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["csv", "json", "txt", "code"],
+                        "description": "Which of the four to write.",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": (
+                            "For format='code' only: the language, e.g. 'python'. "
+                            "Decides the extension when the filename has none."
+                        ),
+                    },
+                },
+                "required": ["content", "filename", "format"],
+            },
+        },
+        {
+            "name": "generate_audio",
+            "description": (
+                "Speak text aloud and attach the audio to your reply, on any "
+                "channel. Use when the user asks you to read something to them, "
+                "wants a voice note, or asks for an mp3/audio version. There is "
+                "no video generator — if the user asks for a video, say so "
+                "plainly and offer images, a slide deck or narrated audio."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The text to speak (max 4096 chars)."},
+                    "voice": {
+                        "type": "string",
+                        "enum": ["alloy", "ash", "ballad", "coral", "echo", "fable",
+                                 "nova", "onyx", "sage", "shimmer"],
+                        "description": "Voice to use (default: nova).",
+                    },
+                    "speed": {"type": "number", "description": "Playback speed 0.25–4.0 (default 1.0)."},
+                    "filename": {"type": "string", "description": "Optional descriptive filename."},
+                },
+                "required": ["text"],
             },
         },
     ]

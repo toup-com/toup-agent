@@ -152,6 +152,55 @@ class DeletionReceipt:
 # ── Public entry point ──────────────────────────────────────────────────
 
 
+async def _whatsapp_logout_best_effort(db: AsyncSession, user_id: str) -> bool:
+    """Force-logout the tenant's WhatsApp device before the agent is destroyed.
+
+    Returns True only when the agent acknowledged. Every failure path — no
+    agent row, no WhatsApp configured, unreachable agent, non-2xx — is logged
+    and swallowed: this is a courtesy to the user's phone, never a gate on
+    their deletion (R46 F9a).
+    """
+    try:
+        import httpx
+        from sqlalchemy import select as _select
+        from app.db import AgentConfig
+
+        row = (await db.execute(
+            _select(
+                AgentConfig.agent_url,
+                AgentConfig.agent_api_key,
+            ).where(AgentConfig.user_id == user_id)
+        )).first()
+        if not row or not row.agent_url or not row.agent_api_key:
+            return False
+        # No `whatsapp_session_status` gate of any kind. That column is written
+        # only by best-effort paths (the qr-status poll's detached task, which
+        # `_wa_poll_may_persist` can refuse outright, inside a swallowing
+        # except), so the users whose link never persisted read as NULL or as a
+        # stale `not_linked` — and a NAMED-container tenant has no pool-release
+        # backstop, making this the only route to a logout. Asking is cheap and
+        # idempotent: `/api/whatsapp/qr/logout` answers 503 in microseconds when
+        # no adapter exists. Reading a best-effort column as proof is what left
+        # a deleted account's device inside the founder's WhatsApp (R46 F9a).
+        url = f"{row.agent_url.rstrip('/')}/api/whatsapp/qr/logout"
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.post(
+                url, headers={"X-Agent-Key": row.agent_api_key},
+            )
+        ok = 200 <= resp.status_code < 300
+        logger.info(
+            "[DELETE-USER] WhatsApp logout for %s http=%s",
+            user_id[:8], resp.status_code,
+        )
+        return ok
+    except Exception as e:
+        logger.warning(
+            "[DELETE-USER] WhatsApp logout for %s failed (continuing): %s",
+            user_id[:8], type(e).__name__,
+        )
+        return False
+
+
 async def delete_user_completely(
     db: AsyncSession,
     user,
@@ -277,6 +326,16 @@ async def delete_user_completely(
             openai_archived=None,
         )
         raise DeletionAbortedError(DeletionStep.STRIPE, str(e))
+
+    # ── WhatsApp: log the linked device out (BEST-EFFORT) ──────────────
+    # R46 F9a. Deleting a Toup account used to leave the agent sitting in the
+    # user's own WhatsApp → Linked Devices forever: nothing in the product
+    # logged the device out on deletion, and the only caller of the capability
+    # was the user's own "Disconnect" button. This must run BEFORE the
+    # container teardown below — after it there is no agent to ask — and it
+    # must never block the deletion: a user who asked to be deleted is deleted
+    # whether or not their phone can be reached.
+    await _whatsapp_logout_best_effort(db, user_id)
 
     # ── Container teardown via bridge (HARD-FAIL) ──────────────────────
     # Hands off to the bridge: docker rm + network rm + tenant DB drop +

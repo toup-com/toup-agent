@@ -291,8 +291,12 @@ def test_the_retry_branch_re_establishes_the_conversation_after_its_rollback():
     from app.api import ws_chat
 
     src = inspect.getsource(ws_chat.ws_chat)
-    at = src.find("_msg_kwargs.pop(\"reply_to_message_id\", None)")
+    # Round 46: the retry drops whichever of the three optional columns the
+    # tenant is missing (reply_to_message_id / client_msg_id / occurred_at),
+    # so the anchor is the pop LOOP rather than the single-column pop.
+    at = src.find("for _c in _missing_cols:")
     assert at > 0
+    assert "_msg_kwargs.pop(_c, None)" in src[at:at + 200]
     before = src[max(0, at - 900):at]
     assert "_presave_db.rollback()" in before
     assert "_ensure_presave_conversation(" in before

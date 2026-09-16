@@ -94,6 +94,27 @@ class Settings(BaseSettings):
     # one tenant while reproducing — not something to leave running.
     pool_leak_debug: bool = False
 
+    # Size of the agent's warm DB pool (run_mode == "agent" only).
+    # 0 means NullPool — the pre-R46 behaviour, kept as the rollback switch.
+    # 2026-09-15: with NullPool every agent DB session was a fresh
+    # TCP+SCRAM handshake through the shared pgbouncer (14 connect/close pairs
+    # in one second for ONE tenant), and ~111 containers doing that is what
+    # made Postgres's max_connections=300 reachable at all. Overflow is
+    # `max(6, 3 * this)`, opened on demand and closed on return, so the WARM
+    # footprint per slot stays at this value.
+    #
+    # DEFAULT 0 THIS ROUND, deliberately: warm connections multiply by ~111
+    # containers, so the switch is only safe once the host step in
+    # `bridge/INSTALL.md` ("PgBouncer host hardening" — max_client_conn /
+    # max_db_connections) has been verified. Enable per slot with
+    # AGENT_DB_POOL_SIZE, not fleet-wide in one move.
+    agent_db_pool_size: int = 0
+
+    # How long an agent DB checkout may wait for a free connection before it
+    # fails. Explicit because SQLAlchemy's default is 30 s of silent waiting,
+    # which `_infra_errors` renders as a 503 with nothing naming the cause.
+    agent_db_pool_timeout_s: float = 10.0
+
     # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
     # Anything other than "production" treats the deployment as non-prod and
     # forbids live Stripe keys. Set via ENVIRONMENT env var.
@@ -2486,10 +2507,23 @@ class Settings(BaseSettings):
     # already been committed. Beyond this budget the sync is handed to a
     # background retry and the response says `sync_deferred: true`.
     agent_setup_sync_timeout_s: int = 8
+    # R46: the event-loop stall sampler (app/services/loop_health.py). It reads
+    # settings first, then env, then these defaults — tunable per tenant without
+    # a code change. A stall longer than `loop_stall_warn_s` captures stacks
+    # (module:lineno only) and logs ONE `[LOOP_STALL]` line, at most once per
+    # `loop_stall_report_interval_s`.
+    loop_stall_warn_s: float = 2.0
+    loop_stall_report_interval_s: float = 30.0
     # Same reasoning for the fail-closed identity write-through (agent_name /
     # agent_color must reach the tenant). Still fail-closed — it just fails
     # inside the client's budget instead of outside it.
     agent_setup_identity_sync_budget_s: float = 10.0
+    # R46 F3 rollback lever: when True the pairing-code route goes back to
+    # AWAITING the allowlist env push before asking the agent for a code. That
+    # await was ~8 s of the 14 s "Waking Aria and creating your code…" and it
+    # only ever existed because the allowlist used to restart the channel
+    # (removed in F1). Leave it False.
+    whatsapp_pair_code_sync_push: bool = False
 
     # ── Audio stream proxy (Phase 1, /api/media/{id}/audio_stream) ─
     # Per-tenant concurrent stream cap, enforced PER-REPLICA via an

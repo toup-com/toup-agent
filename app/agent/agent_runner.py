@@ -18,6 +18,7 @@ Features:
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,7 @@ from app.agent.channel_annotations import (
 )
 from app.agent.prefix_stability import (
     build_allowed_tools_choice,
+    is_tool_choice_rejection,
     build_turn_context_message,
     render_time_lines,
     strip_tools_for_channel,
@@ -1665,6 +1667,15 @@ class AgentRunner:
         on_step_event: Optional[OnStepEvent] = None,
         media_paths: Optional[List[str]] = None,
         inbound_attachments: Optional[List[Dict[str, Any]]] = None,
+        # C6/C7 (round 46). `attachment_records` is the ingested form of this
+        # turn's attachments — already classified, already downscaled, already
+        # off the event loop — used by the upload path and by ws_chat's legacy
+        # in-frame path so no temp file outlives the handler. `media_ids` is
+        # positionally aligned with `media_paths` so each image can be labelled
+        # with the id `edit_image.references[]` takes. Both optional: an older
+        # caller passes neither and behaves exactly as before.
+        attachment_records: Optional[List[Dict[str, Any]]] = None,
+        media_ids: Optional[List[Optional[str]]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         model_override: Optional[str] = None,
         thinking_budget: int = 0,
@@ -1705,6 +1716,12 @@ class AgentRunner:
         # receipt stamp is the honest base for request-anchored offsets
         # (routines__remind); absent → run() entry, as before.
         received_at: Optional[float] = None,
+        # The client's id for the message that STARTED this turn. Stamped on
+        # both persisted rows by `_save_messages` (round 46, A12) so a client
+        # can recognise its own message by identity. None on every producer
+        # that has no such id (routines, channels, sub-agents) — and null
+        # means UNKNOWN to every reader, never "not mine".
+        client_msg_id: Optional[str] = None,
         # R37: connector ids whose tools may ride this turn's wire array.
         # None = all (every caller but the automation thread). See
         # `scope_connector_tools` for why the thread must scope.
@@ -1901,6 +1918,16 @@ class AgentRunner:
             _has_inbound_image = any(
                 (_mt.guess_type(p)[0] or "").startswith("image/")
                 for p in media_paths
+            )
+        # C6: the upload path carries no media_path and may carry no persisted
+        # attachment either (a storage hiccup), so the RECORD is the third view
+        # of the same question. Without this an uploaded photo showed the model
+        # a picture while edit_image stayed ungated — the exact regression the
+        # media_paths branch above exists to prevent.
+        if not _has_inbound_image and attachment_records:
+            _has_inbound_image = any(
+                (r or {}).get("kind") == "image" or (r or {}).get("page_images_b64")
+                for r in attachment_records
             )
         if _has_inbound_image:
             query_intent = with_inbound_image(query_intent)
@@ -2584,8 +2611,26 @@ class AgentRunner:
                 logger.info("[AGENT] source_conflict_rules injected user=%s", user_id[:8])
         except Exception:  # noqa: BLE001 — a rules gate must never break a turn
             logger.debug("[AGENT] source_conflict gate failed", exc_info=True)
-        if media_paths:
-            content_blocks = self._build_media_content(user_message, media_paths)
+        if media_paths or attachment_records:
+            _recs = attachment_records
+            if _recs is None and media_paths:
+                # Every non-WS channel (Telegram, WhatsApp, Slack, Discord)
+                # arrives here with paths and no records, and the ingest behind
+                # them reads the file, sniffs it, downscales with PIL and
+                # rasterizes up to 20 PDF pages — seconds of a blocked loop on a
+                # 1.00-CPU container, the very signature `loop_health` exists to
+                # hunt. attachment_ingest's own docstring says callers run it
+                # with `asyncio.to_thread`; the ws_chat callers do, this one did
+                # not. The block assembly itself is pure and stays on the loop.
+                _recs = await asyncio.to_thread(
+                    self._attachment_records_from_paths, media_paths, media_ids
+                )
+            content_blocks = self._build_attachment_blocks(
+                user_message,
+                media_paths,
+                media_ids=media_ids,
+                records=_recs,
+            )
             messages.append({"role": "user", "content": content_blocks})
         else:
             messages.append({"role": "user", "content": user_message})
@@ -2805,7 +2850,8 @@ class AgentRunner:
             routing_decision = classify_request(
                 user_message=user_message,
                 conversation_history=messages[:-1],
-                has_media=bool(media_paths),
+                # C6: an uploaded attachment arrives as a record, not a path.
+                has_media=bool(media_paths or attachment_records),
                 preferred_provider=preferred,
             )
             active_model = routing_decision.model
@@ -3073,6 +3119,11 @@ class AgentRunner:
         # parameter, so the kwarg is withheld entirely on that path rather
         # than passed as None.
         from app.config import reasoning_effort_for_intent
+        # Once a provider has refused the `allowed_tools` restriction for this
+        # run, no later attempt or iteration sends it again — the policy is
+        # enforced at execute time either way (see `is_tool_choice_rejection`).
+        _tool_choice_restriction_rejected = False
+        _tool_choice: Any = None
         _reasoning_effort = reasoning_effort_for_intent(
             getattr(query_intent, "category", None)
         )
@@ -3271,6 +3322,7 @@ class AgentRunner:
                         and iteration == 0
                         and _allowed_tool_names
                         and not _is_claude_model(active_model)
+                        and not _tool_choice_restriction_rejected
                     ):
                         _tool_choice = build_allowed_tools_choice(
                             _allowed_tool_names,
@@ -3511,6 +3563,35 @@ class AgentRunner:
                             break  # exit retry loop, exit iteration loop below
                     except ImportError:
                         pass
+
+                    # 2026-09-15 (rollout canary): the provider refused the
+                    # `allowed_tools` tool_choice SHAPE — `Invalid value:
+                    # 'allowed_tools'` on `tool_choice.type` — and the ladder
+                    # below re-sent the identical request twice more, then fell
+                    # back to gpt-4o on the chat wire: three minutes, two output
+                    # tokens. The restriction is intent gating that rides
+                    # outside the cached prefix; the tool policy is enforced at
+                    # execute time regardless. So: same model, same messages,
+                    # no restriction, right away.
+                    if (
+                        isinstance(_tool_choice, dict)
+                        and not _tool_choice_restriction_rejected
+                        and attempt < MAX_RETRIES
+                        and is_tool_choice_rejection(e)
+                    ):
+                        _tool_choice_restriction_rejected = True
+                        logger.warning(
+                            "[AGENT] provider rejected the allowed_tools tool_choice on %s "
+                            "(%s) — retrying the same call unrestricted; the tool policy "
+                            "stays enforced at execute time",
+                            active_model, type(e).__name__,
+                        )
+                        try:
+                            from app.services import health_signals as _hs_tc
+                            _hs_tc.incr("llm_tool_choice_rejected")
+                        except Exception:  # noqa: BLE001 — a counter never costs a turn
+                            pass
+                        continue
 
                     # A8-2: context overflow is a DETERMINISTIC 400 —
                     # retrying the identical payload can never succeed, and
@@ -4462,6 +4543,8 @@ class AgentRunner:
                     tool_event_records=tool_event_records,
                     presented_app_slug=_presented_apps[-1] if _presented_apps else None,
                     media_meta_override=_effective_media,
+                    client_msg_id=client_msg_id,
+                    occurred_at=received_at,
                 )
                 await db.commit()
             _note_turn_persisted(_persisted)
@@ -4474,6 +4557,33 @@ class AgentRunner:
                 "profile=%s) — caller owns persistence",
                 _profile_name_for_log(prompt_profile),
             )
+            # …but what the turn PRODUCED is not the caller's to guess. The
+            # attachment drain and the presented-app stamp both live inside
+            # `_save_messages`, so a voice turn (always save=False) generated a
+            # PDF into storage with no Message row for
+            # `GET /api/files/{message_id}/{aid}` to authorize against, and a
+            # `present_app` made during a call was unreachable — the file
+            # existed and nothing in the product could reach it. `persisted` is
+            # already documented as the echo a caller that owns persistence
+            # builds its own rows from; this fills it instead of leaving it
+            # empty. The drain is a MOVE (the list is cleared) so the next turn
+            # on this runner cannot re-deliver the same files.
+            _pending_atts_unsaved = list(self.tools.pending_attachments)
+            self.tools.pending_attachments = []
+            if _pending_atts_unsaved:
+                _persisted["attachments"] = _pending_atts_unsaved
+            if _presented_apps:
+                _art_unsaved: Dict[str, Any] = {"slug": _presented_apps[-1]}
+                try:
+                    from app.agent.skills.builtins.app_html import steps as _app_steps
+                    _art_unsaved = (
+                        _app_steps.artifact_payload(_presented_apps[-1]) or _art_unsaved
+                    )
+                except Exception:  # noqa: BLE001
+                    # Same trade _save_messages makes: an unreadable manifest
+                    # costs the revision, never the card.
+                    logger.debug("[app_html] artifact payload lookup failed", exc_info=True)
+                _persisted["app_artifact"] = _art_unsaved
 
         # ── Phase 3b: Background tasks (the memory curator) ──
         # Slow (one LLM call) — run in background so the response returns
@@ -4724,7 +4834,17 @@ class AgentRunner:
                 logger.warning("[AGENT] Summarizer scheduling failed (non-fatal): %s", _sum_err)
 
         elapsed = int((time.time() - start) * 1000)
-        logger.info(f"[AGENT] Response: {final_text[:100]}...")
+        # PRIVACY (round 46, A15): this logged the first 100 characters of the
+        # assistant's answer on EVERY turn, into a container trail that is
+        # shipped to Loki — the agent's reply is the user's own content and it
+        # has no business leaving the process. Length plus a short digest is
+        # everything the line was ever read for (did we answer, and is this
+        # the same answer as the one below).
+        logger.info(
+            "[AGENT] Response: len=%d sha=%s",
+            len(final_text or ""),
+            hashlib.sha256((final_text or "").encode("utf-8", "replace")).hexdigest()[:12],
+        )
         logger.info(
             f"[PERF] agent_run_total: {elapsed}ms | intent={query_intent.category} "
             f"| tools_sent={len(current_tools)} | in={total_input} out={total_output} "
@@ -5942,14 +6062,21 @@ class AgentRunner:
             "### Documents\n"
             "You can produce PDF (`generate_pdf`), Word "
             "(`generate_docx`), Excel (`generate_xlsx`), PowerPoint "
-            "(`generate_pptx`), or Markdown (`generate_markdown`). Use "
+            "(`generate_pptx`), Markdown (`generate_markdown`), CSV / "
+            "JSON / plain text / code (`generate_data_file`), images "
+            "(`generate_image`) and spoken audio (`generate_audio`). "
+            "If the user names a Google app instead ('a Google Doc', "
+            "'a Google Sheet', 'in my Drive'), use `docs__create` / "
+            "`sheets__create_spreadsheet` / `drive__create_doc` — a "
+            "generated .docx is not a Google Doc and never reaches their "
+            "Drive. There is no video generator — if the user asks for a "
+            "video, say so plainly and offer one of the above. Use "
             "these when the user wants something to **keep, share, or "
-            "edit** — not for inline conversational answers. These land "
-            "in the chat as files. If the user names a Google app "
-            "instead ('a Google Doc', 'a Google Sheet', 'in my Drive'), "
-            "use `docs__create` / `sheets__create_spreadsheet` / "
-            "`drive__create_doc` — a generated .docx is not a Google "
-            "Doc and never reaches their Drive.\n\n"
+            "edit** — not for inline conversational answers. These are saved "
+            "to the user's Files and appear in the app and on the web; most "
+            "messaging channels also receive the file itself. Never promise "
+            "which surface it will arrive on — say it is ready and where it is "
+            "kept.\n\n"
             "### Jobs & schedules\n"
             + ("" if _voice_now else
                "Multi-step work → `create_job` in the same response as the "
@@ -6502,15 +6629,23 @@ class AgentRunner:
                 "- `generate_pptx` — slide decks. Use for briefings or presentations.\n"
                 "- `generate_markdown` — plain text the user will import elsewhere (Obsidian, "
                 "Notion, docs sites).\n"
+                "- `generate_data_file` — CSV, JSON, plain text or a code file. A CSV request "
+                "is NOT answered with a spreadsheet and a JSON request is NOT answered with a "
+                "code block in chat.\n"
+                "- `generate_audio` — speak text aloud and attach it. Use it when the user asks "
+                "you to read something to them or wants a voice note. There is NO video "
+                "generator anywhere in this product: if the user asks for a video, say plainly "
+                "that you cannot make one and offer images, a deck, or narrated audio.\n"
                 "- `convert_document` — convert an EXISTING generated DOCX/PPTX to PDF "
                 "(faithful layout-preserving conversion via LibreOffice). Use this when "
                 "the user asks to \"make it a PDF\" / \"convert to PDF\" on a file you "
                 "just generated — do NOT call generate_pdf for that, it builds a fresh "
                 "PDF from scratch and loses the original layout.\n\n"
                 "Use descriptive filenames (e.g., `march-expenses.xlsx`, not `file.xlsx`).\n\n"
-                "After the tool call, give a brief one-sentence confirmation. The file appears "
-                "in the document pane — don't repeat its contents back in markdown; the pane "
-                "is enough.\n\n"
+                "After the tool call, give a brief one-sentence confirmation. The file is "
+                "attached to your reply and the user has it — don't repeat its contents back "
+                "in markdown, and don't describe where it appears: the surface differs by "
+                "channel and you cannot see it.\n\n"
                 "Do NOT generate a document when the user is asking a conversational question "
                 "(\"what's the difference between X and Y?\", \"explain Z\"). Plain markdown "
                 "answers belong in chat. Files are for artifacts the user will keep.\n\n"
@@ -6522,7 +6657,7 @@ class AgentRunner:
                 "    \"headers\": [\"Date\", \"Category\", \"Amount\"],\n"
                 "    \"rows\": [[\"2026-03-01\", \"Groceries\", 87.40], ...]\n"
                 "  }])\n"
-                "→ in chat: \"Done — March expenses are in the pane. Total: $1,243.70 across 23 entries.\"\n\n"
+                "→ in chat: \"Done — March expenses are attached. Total: $1,243.70 across 23 entries.\"\n\n"
                 "User: \"Write me a one-page project brief on the app rebuild, PDF please.\"\n"
                 "→ generate_pdf(filename=\"app-rebuild-brief.pdf\", title=\"App Rebuild — Brief\",\n"
                 "    cover_page=True, content=[\n"
@@ -6531,7 +6666,7 @@ class AgentRunner:
                 "      {\"type\": \"heading\", \"level\": 1, \"text\": \"Timeline\"},\n"
                 "      {\"type\": \"table\", \"headers\": [\"Phase\", \"End date\"], \"rows\": [...]},\n"
                 "    ])\n"
-                "→ in chat: \"Brief is ready in the pane.\"\n\n"
+                "→ in chat: \"Brief is attached.\"\n\n"
                 "User: \"Can you help me understand the difference between a linked list and an array?\"\n"
                 "→ do NOT generate a file. This is a conversational explanation. Answer in markdown."
             )
@@ -6540,6 +6675,34 @@ class AgentRunner:
             # Flag-off keeps the legacy literal above byte-identical.
             if _prompt_diet_enabled():
                 section_parts["doc_generation"] = _DOC_GENERATION_DIET
+
+        # ── 5a-bis. The format this turn actually named (round 46, C9) ──
+        # ~30 tokens, and ONLY on a turn whose message names a format. The
+        # standing guide above says which tool makes which file; it cannot say
+        # which one THIS user asked for, and the repo's own record
+        # (query_intent.py:109-114) is that a constrained decode snaps to
+        # whatever comes first in wire order when the prompt asks for
+        # something the array does not obviously offer. It also carries the
+        # only truthful answer to a video request, which is that there is no
+        # producer for one (A14).
+        #
+        # It goes into <turn_context>, not into the system prompt: that block
+        # is the designated per-turn slot and sits AFTER history, so a
+        # turn-conditional section cannot move the cached prefix for the
+        # tenant's every other turn. With the stable layout off there is no
+        # such slot and no prefix to protect, so it rides the section instead.
+        try:
+            from app.agent.format_intent import requested_format_section
+            _fmt_section = requested_format_section(user_message, channel=channel or "app")
+        except Exception:
+            _fmt_section = ""
+        if _fmt_section:
+            if turn_context_out is not None:
+                turn_context_out["requested_format"] = _fmt_section
+            else:
+                section_parts["doc_generation"] = (
+                    section_parts.get("doc_generation", "") + "\n\n" + _fmt_section
+                ).strip()
 
         # ── 5b-voice. Media Playback (live voice) ────────────────────────────
         # Voice turns arrive here through the realtime relay's `think` tool with
@@ -7401,6 +7564,14 @@ class AgentRunner:
         # value merged over any channel preset). None => fall back to the
         # executor read below, for callers that have not been updated.
         media_meta_override: Optional[Dict[str, Any]] = None,
+        # Turn identity (round 46, A12). `client_msg_id` is stamped on BOTH
+        # rows of the turn; `occurred_at` on the USER row only — it is the
+        # turn's receipt time, and giving the answer the same sort key makes
+        # the day thread's tie-break decide which came first.
+        # `occurred_at` is epoch seconds (the channel's receipt stamp), not a
+        # datetime, because that is what every caller already has.
+        client_msg_id: Optional[str] = None,
+        occurred_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Persist the turn and return what was written.
 
@@ -7455,6 +7626,28 @@ class AgentRunner:
             site="message_insert",
         )
 
+        # Turn identity, resolved once for both rows. Kept out of the kwargs
+        # dicts until the end so the commit-retry below can drop them as a
+        # unit on a tenant whose self-heal ALTER has not run yet.
+        _identity_kwargs: Dict[str, Any] = {}
+        if client_msg_id:
+            _identity_kwargs["client_msg_id"] = client_msg_id
+        # `occurred_at` is the TURN's receipt time — it belongs to the user's
+        # message and to nothing else. Stamped on the assistant row too, both
+        # rows of one turn carry the identical sort key and the day-chat
+        # ORDER BY `COALESCE(occurred_at, created_at), id` then tie-breaks on a
+        # random uuid: the answer renders above the question about half the
+        # time. Leaving it NULL on the assistant row lets COALESCE fall back to
+        # its own (strictly later) created_at, which is the correct order.
+        _user_identity_kwargs: Dict[str, Any] = dict(_identity_kwargs)
+        if occurred_at:
+            try:
+                _user_identity_kwargs["occurred_at"] = datetime.utcfromtimestamp(
+                    float(occurred_at)
+                )
+            except Exception:  # noqa: BLE001 — a bad stamp must not cost the turn
+                pass
+
         if save_user_message:
             _user_msg_kwargs = dict(
                 conversation_id=session_id,
@@ -7462,6 +7655,7 @@ class AgentRunner:
                 role="user",
                 content=user_message,
                 channel=_msg_channel,
+                **_user_identity_kwargs,
             )
             # Persist inbound user attachments (images/files) onto the user
             # row so they survive reload + appear in day-chat history and on
@@ -7515,6 +7709,30 @@ class AgentRunner:
         _pending_atts = list(self.tools.pending_attachments)
         self.tools.pending_attachments = []
 
+        # [FORMAT] (round 46, C9 — L7's spec): nothing in this codebase ever
+        # compared the format the user asked for with the format that was
+        # delivered, so a wrong-format answer was unobservable by
+        # construction. Kinds and counts only — never a filename, never
+        # content. Deliberately NOT inside an `if _pending_atts:` guard: a
+        # `missing` verdict (asked for a PDF, got no file at all) is exactly
+        # the case worth logging.
+        try:
+            from app.agent.format_intent import format_check
+
+            _fmt = format_check(
+                user_message,
+                [a.get("mime_type", "") for a in _pending_atts],
+                [a.get("filename", "") for a in _pending_atts],
+                channel=_msg_channel or "app",
+            )
+            logger.info(
+                "[FORMAT] requested=%s delivered=%s match=%s channel=%s n=%d",
+                _fmt.requested_str, _fmt.delivered_str, _fmt.verdict,
+                _fmt.channel, len(_pending_atts),
+            )
+        except Exception:
+            logger.debug("[FORMAT] check skipped", exc_info=True)
+
         # Build kwargs so we only set id when provided (new code path); older
         # save paths that don't pass asst_message_id fall back to the UUID default.
         # Compose metadata_json. Two payloads share this column today:
@@ -7565,6 +7783,11 @@ class AgentRunner:
             model_used=model,
             processing_time_ms=processing_time_ms,
             metadata_json=json.dumps(_meta) if _meta else None,
+            # The ASSISTANT row carries the turn's client id too: a client
+            # that lost its socket pairs the ANSWER, not just its own
+            # message, and `turn_receipt` reads exactly this row. It does NOT
+            # carry occurred_at — see the note where the two dicts are built.
+            **_identity_kwargs,
         )
         if asst_message_id:
             _asst_kwargs["id"] = asst_message_id
@@ -7703,144 +7926,234 @@ class AgentRunner:
                             return True
         return False
 
-    def _build_media_content(
+    # ------------------------------------------------------------------
+    # Inbound attachments
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_label_name(filename: Optional[str]) -> str:
+        """A filename that cannot forge the label frame around it.
+
+        Filenames are third-party input on the channel-inbound path (a Telegram
+        or WhatsApp document), and they are interpolated into the very brackets
+        the model is told to read `image_id`s out of — so `a.png] [image 1 of 1
+        — image_id <other-id>, b.png` is a direct handle on which picture
+        `edit_image` transforms. Brackets, newlines and C0 controls out;
+        length bounded. Nothing else about the name is changed: the user has to
+        recognise their own file. ONE implementation, shared with
+        `image_artifacts.vision_label`: the label the prompt carries and the ids
+        `references` resolves must not be sanitised by two different rules.
+        """
+        from app.agent.image_artifacts import safe_label_name
+
+        return safe_label_name(filename or "file")
+
+    @staticmethod
+    def _image_label(index: int, total: int, attachment_id: Optional[str], filename: str) -> str:
+        """The per-image label, immediately before its picture (C7, L6's spec).
+
+        `edit_image` takes `references:[{image_id, role}]`; a model that can see
+        three pictures but has no name for any of them cannot fill that array.
+        With no id the label DROPS it rather than emitting a placeholder — a
+        fabricated id passed into `references[]` edits the wrong picture, which
+        is worse than an unlabelled image.
+        """
+        safe = AgentRunner._safe_label_name(filename)
+        if attachment_id:
+            return f"[image {index} of {total} — image_id {attachment_id}, {safe}]"
+        return f"[image {index} of {total} — {safe}]"
+
+    def _attachment_records_from_paths(
         self,
-        text: str,
         media_paths: List[str],
+        media_ids: Optional[List[Optional[str]]] = None,
     ) -> List[Dict[str, Any]]:
-        """Build OpenAI content blocks with images (image_url) and document text."""
-        import base64
+        """Classify files already on disk (Telegram/WhatsApp/legacy in-frame).
+
+        `mimetypes.guess_type` stays the first classifier here because the
+        inbound-image TOOL GATE in `_run_inner` uses it — the two views of "is
+        this an image" must not drift (test_channel_agnostic_correctness).
+        The bytes are then sniffed, because a picker's extension lies.
+        """
         import mimetypes
 
-        blocks: List[Dict[str, Any]] = []
-        doc_texts: List[str] = []
+        from app.agent.attachment_ingest import ingest_path, record_from_ingested
 
-        # Extensions that should be extracted as text via document parsers
-        _DOC_EXTENSIONS = {'.pdf', '.docx', '.pptx', '.zip', '.txt', '.md', '.json', '.yaml', '.yml', '.csv'}
+        records: List[Dict[str, Any]] = []
+        for i, path in enumerate(media_paths or []):
+            declared, _ = mimetypes.guess_type(path)
+            ing = ingest_path(path, declared)
+            rec = record_from_ingested(ing)
+            rec["attachment_id"] = (media_ids[i] if media_ids and i < len(media_ids) else None)
+            rec["path"] = path
+            records.append(rec)
+        return records
 
-        for path in media_paths:
-            mime, _ = mimetypes.guess_type(path)
-            ext = os.path.splitext(path.lower())[1]
+    def _build_attachment_blocks(
+        self,
+        text: str,
+        media_paths: Optional[List[str]] = None,
+        media_ids: Optional[List[Optional[str]]] = None,
+        records: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Content blocks for a turn that carries attachments.
 
-            if mime and mime.startswith("image/"):
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read()
-                    data = base64.standard_b64encode(raw).decode("ascii")
-                    logger.info(f"[AGENT] Image loaded: {path} ({len(raw)} bytes, {mime}, base64={len(data)} chars)")
-                    blocks.append({
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime};base64,{data}",
-                            "detail": "auto",
-                        },
+        The shape is the fix, not the parser. Before round 46 every image was
+        anonymous (`image_url` with no name and no id), every document was
+        flattened into ONE trailing text blob behind every image, and the
+        user's own instruction sat above thousands of tokens of extracted text.
+        "Make one résumé out of these three" could not be relied on: the model
+        had no handle for source 2 and no guarantee the order it saw was the
+        order the user picked.
+
+        Now: a MANIFEST first, then each item in AUTHORING ORDER behind its own
+        label, then the user's text LAST as the anchor. An item that could not
+        be read is still named, with what to tell the user — a file that
+        vanishes silently is the defect this replaces.
+
+        `media_ids` is positionally aligned with `media_paths` (C7, L6's spec);
+        a short or absent list simply means "no id", never an exception — an
+        agent image older than round 46 calls this without one.
+        """
+        from app.agent.attachment_ingest import (
+            MODEL_GUIDANCE,
+            STATUS_OK,
+            STATUS_TRUNCATED,
+            STATUS_UNREADABLE,
+        )
+        from app.agent.attachment_limits import (
+            MAX_EXTRACTED_CHARS_PER_TURN,
+            MAX_MODEL_IMAGES_PER_TURN,
+        )
+
+        recs = records if records is not None else self._attachment_records_from_paths(
+            media_paths or [], media_ids
+        )
+        if not recs:
+            return [{"type": "text", "text": text or ""}]
+
+        # Page rasters of one scanned PDF count as that many images to the model,
+        # so "image i of n" is never a lie about what the model can see.
+        _image_supply = sum(
+            (len(r.get("page_images_b64") or []) if r.get("page_images_b64") else (1 if r.get("image_b64") else 0))
+            for r in recs
+        )
+        # MAX_ATTACHMENTS_PER_TURN counts FILES; eight scanned PDFs legitimately
+        # produce 160 rasterized pages, ~176k image tokens in one request. The
+        # overflow is NAMED rather than dropped.
+        image_total = min(_image_supply, MAX_MODEL_IMAGES_PER_TURN)
+        images_left = image_total
+
+        manifest: List[str] = []
+        body: List[Dict[str, Any]] = []
+        img_i = 0
+        chars_left = MAX_EXTRACTED_CHARS_PER_TURN
+
+        for idx, r in enumerate(recs, 1):
+            # Sanitised once, here: every manifest line and every label below is
+            # a bracketed frame the model reads ids out of, and a filename is
+            # third-party input on the channel-inbound path.
+            name = self._safe_label_name(r.get("name"))
+            status = r.get("status") or STATUS_OK
+            att_id = r.get("attachment_id")
+            kind = r.get("kind")
+
+            if r.get("image_b64"):
+                if images_left <= 0:
+                    manifest.append(f"[{idx}] {name} — NOT SHOWN (too many images this turn)")
+                    body.append({
+                        "type": "text",
+                        "text": (f"[{idx}] {name} — this turn already carries "
+                                 f"{image_total} images, the most that can be read at "
+                                 f"once. Tell the user this one was not looked at."),
                     })
-                except Exception as e:
-                    logger.warning(f"Failed to read image {path}: {e}")
+                    continue
+                images_left -= 1
+                img_i += 1
+                manifest.append(f"[{idx}] {name} (image {img_i} of {image_total})")
+                body.append({"type": "text", "text": self._image_label(img_i, image_total, att_id, name)})
+                body.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{r.get('image_mime') or r.get('mime')};base64,{r['image_b64']}",
+                        "detail": "auto",
+                    },
+                })
+                continue
 
-            elif ext in _DOC_EXTENSIONS:
-                fname = os.path.basename(path)
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read()
-                    extracted = self._extract_document_text(raw, fname, ext)
-                    if extracted:
-                        doc_texts.append(f"[Attached document: {fname}]\n{extracted}")
-                        logger.info(f"[AGENT] Document extracted: {path} ({len(raw)} bytes, {len(extracted)} chars text)")
-                    else:
-                        doc_texts.append(f"[Attached document: {fname} — could not extract text (unsupported or empty)]")
-                        logger.warning(f"[AGENT] Document extraction returned empty for {path}")
-                except Exception as e:
-                    doc_texts.append(f"[Attached document: {fname} — extraction failed: {e}]")
-                    logger.warning(f"Failed to extract document {path}: {e}")
+            if r.get("page_images_b64"):
+                _all_pages = r["page_images_b64"]
+                pages = _all_pages[: max(0, images_left)]
+                images_left -= len(pages)
+                if not pages:
+                    manifest.append(f"[{idx}] {name} — NOT SHOWN (too many images this turn)")
+                    body.append({
+                        "type": "text",
+                        "text": (f"[{idx}] {name} — a scanned document that could not be "
+                                 f"shown: this turn already carries {image_total} images, "
+                                 f"the most that can be read at once. Tell the user."),
+                    })
+                    continue
+                manifest.append(
+                    f"[{idx}] {name} (scanned document, {len(pages)} page images)"
+                )
+                note = (
+                    f"[{idx}] {name} — scanned PDF with almost no text layer; its first "
+                    f"{len(pages)} page(s) follow as images. Read them as the document."
+                )
+                if r.get("truncated") or len(pages) < len(_all_pages):
+                    note += " Later pages were not included."
+                # Whatever text there WAS still goes in. A short text layer is
+                # the reason this file was rasterized, not a reason to throw it
+                # away — a header or a footer is often the only machine-readable
+                # thing in a scan and it is free.
+                if r.get("text"):
+                    chunk = r["text"][: max(0, chars_left)]
+                    chars_left -= len(chunk)
+                    if chunk:
+                        note += f"\nText layer: {chunk}"
+                body.append({"type": "text", "text": note})
+                for p in pages:
+                    img_i += 1
+                    body.append({"type": "text", "text": self._image_label(img_i, image_total, att_id, name)})
+                    body.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/webp;base64,{p}", "detail": "auto"},
+                    })
+                continue
+
+            label = f"[{idx}] {name} — {kind or 'file'}"
+            if r.get("page_count"):
+                label += f", {r['page_count']} pages"
+            if status in (STATUS_OK, STATUS_TRUNCATED) and r.get("text"):
+                chunk = r["text"]
+                if len(chunk) > chars_left:
+                    chunk = chunk[: max(0, chars_left)]
+                    r = dict(r)
+                    r["truncated"] = True
+                chars_left -= len(chunk)
+                if r.get("truncated"):
+                    label += ", TRUNCATED"
+                manifest.append(f"[{idx}] {name} ({kind or 'file'})")
+                body.append({"type": "text", "text": f"{label}\n{chunk}"})
             else:
-                # Unknown extension — still tell the agent a file was attached
-                fname = os.path.basename(path)
-                doc_texts.append(f"[Attached file: {fname} — unsupported format, contents not available]")
-                logger.warning(f"[AGENT] Unsupported media: {path} (mime={mime}, ext={ext})")
+                guidance = MODEL_GUIDANCE.get(status, MODEL_GUIDANCE[STATUS_UNREADABLE])
+                manifest.append(f"[{idx}] {name} — COULD NOT BE READ ({status})")
+                body.append({
+                    "type": "text",
+                    "text": f"{label} — COULD NOT BE READ ({status}). {guidance}",
+                })
 
-        # Combine user text with any extracted document content
-        combined_text = text or ""
-        if doc_texts:
-            combined_text = combined_text + "\n\n" + "\n\n".join(doc_texts) if combined_text else "\n\n".join(doc_texts)
-
-        if combined_text:
-            blocks.append({"type": "text", "text": combined_text})
-
-        return blocks if blocks else [{"type": "text", "text": text or ""}]
-
-    def _extract_document_text(self, content: bytes, filename: str, ext: str) -> Optional[str]:
-        """Synchronously extract text from a document file for inline chat context."""
-        import io as _io
-
-        try:
-            if ext == '.pdf':
-                from pypdf import PdfReader
-                reader = PdfReader(_io.BytesIO(content))
-                return "\n\n".join(page.extract_text() or "" for page in reader.pages).strip()
-
-            elif ext == '.docx':
-                from docx import Document as DocxDocument
-                doc = DocxDocument(_io.BytesIO(content))
-                return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-            elif ext == '.pptx':
-                from pptx import Presentation as PptxPresentation
-                prs = PptxPresentation(_io.BytesIO(content))
-                parts = []
-                for i, slide in enumerate(prs.slides, 1):
-                    slide_parts = [f"--- Slide {i} ---"]
-                    for shape in slide.shapes:
-                        if shape.has_text_frame:
-                            t = shape.text_frame.text.strip()
-                            if t:
-                                slide_parts.append(t)
-                        if shape.has_table:
-                            for row in shape.table.rows:
-                                row_text = " | ".join(cell.text.strip() for cell in row.cells)
-                                if row_text.strip(" |"):
-                                    slide_parts.append(row_text)
-                    if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
-                        notes = slide.notes_slide.notes_text_frame.text.strip()
-                        if notes:
-                            slide_parts.append(f"[Speaker Notes] {notes}")
-                    parts.append("\n".join(slide_parts))
-                return "\n\n".join(parts)
-
-            elif ext == '.zip':
-                import zipfile
-                if not zipfile.is_zipfile(_io.BytesIO(content)):
-                    return "[Invalid ZIP file]"
-                zf = zipfile.ZipFile(_io.BytesIO(content))
-                parts = []
-                for i, info in enumerate(zf.infolist()):
-                    if info.is_dir() or i >= 50:
-                        continue
-                    inner_ext = os.path.splitext(info.filename.lower())[1]
-                    if inner_ext in {'.txt', '.md', '.json', '.csv', '.yaml', '.yml', '.py', '.js', '.ts'}:
-                        try:
-                            raw = zf.read(info)
-                            parts.append(f"=== {info.filename} ===\n{raw.decode('utf-8', errors='replace')}")
-                        except Exception:
-                            pass
-                    elif inner_ext in {'.pdf', '.docx', '.pptx'}:
-                        try:
-                            raw = zf.read(info)
-                            inner_text = self._extract_document_text(raw, info.filename, inner_ext)
-                            if inner_text:
-                                parts.append(f"=== {info.filename} ===\n{inner_text}")
-                        except Exception:
-                            pass
-                zf.close()
-                return "\n\n".join(parts) if parts else "[Empty or no supported files in ZIP]"
-
-            else:
-                # Plain text types (.txt, .md, .json, .csv, .yaml, .yml)
-                return content.decode("utf-8", errors="replace").strip()
-
-        except Exception as e:
-            logger.warning(f"[AGENT] Document extraction failed for {filename}: {e}")
-            return None
+        head = "The user attached {} file{}: {}".format(
+            len(recs), "" if len(recs) == 1 else "s", "; ".join(manifest)
+        )
+        blocks: List[Dict[str, Any]] = [{"type": "text", "text": head}]
+        blocks.extend(body)
+        # The instruction is the ANCHOR and goes LAST: above the sources it was
+        # buried under whatever the documents happened to contain.
+        if text:
+            blocks.append({"type": "text", "text": text})
+        return blocks
 
     # ------------------------------------------------------------------
     # Error logging

@@ -100,22 +100,24 @@ router = APIRouter(prefix="/day-chats", tags=["Day Chats"], route_class=_Counted
 _MISSING_TABLE_ERRORS: tuple = (ProgrammingError, OperationalError)
 
 
-_PREVIEW_MIMES = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-}
-
-
 def _attachment_urls(message_id: str, att: dict) -> dict:
     """Compute download_url and (when applicable) preview_url for a stored
     attachment. Mirrors the live WS event payload built by ws_chat.py so
     REST-loaded history renders identically to live messages."""
     from app.config import settings as _settings
+    from app.agent.artifact_kinds import kind_for_mime, preview_policy
     aid = att.get("id", "")
     mime = att.get("mime_type", "")
-    out = {"download_url": f"{_settings.api_prefix}/files/{message_id}/{aid}"}
-    if mime in _PREVIEW_MIMES or mime.startswith("image/"):
+    out = {
+        "download_url": f"{_settings.api_prefix}/files/{message_id}/{aid}",
+        # C9: the same two fields the live frame carries, so a thread read
+        # from history and a thread watched live describe the file identically.
+        "kind": att.get("kind") or kind_for_mime(mime, att.get("filename")),
+        "role": att.get("role") or "final",
+    }
+    # ONE preview policy — this local set was one of three that had drifted,
+    # and all three omitted PPTX (artifact_kinds.preview_policy).
+    if preview_policy(mime) != "none":
         out["preview_url"] = f"{_settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
     # Reload path: the same inline derivative the live frame advertises, so a
     # thread opened from history is not slower than one watched live.
@@ -1007,7 +1009,15 @@ async def get_day_chat_messages(
             # same-millisecond assistant row, or two channels' rows) came back
             # in a different order on two fetches, and in a different order
             # than the model saw.
-            .order_by(Message.created_at.asc(), Message.id.asc())
+            # COALESCE(occurred_at, created_at) (round 46, A12): a voice or
+            # WhatsApp row can be WRITTEN long after it happened, and sorting a
+            # day thread by write time puts it in the wrong place. Null
+            # occurred_at is every existing row, so this is today's order
+            # exactly until a writer starts stamping it.
+            .order_by(
+                func.coalesce(Message.occurred_at, Message.created_at).asc(),
+                Message.id.asc(),
+            )
             .limit(limit)
         )
         messages = msgs_result.scalars().all()
@@ -1044,6 +1054,14 @@ async def get_day_chat_messages(
                 "tool_events": _serialize_tool_events(m),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
+                # Turn identity (round 46, C1). NULL on every pre-existing row and
+                # on every row written by a container still on the previous image
+                # — the client treats null as UNKNOWN and falls back to its
+                # (role, content, channel, +-10 s) pairing, never to "not mine".
+                "client_msg_id": getattr(m, "client_msg_id", None),
+                "occurred_at": (
+                    m.occurred_at.isoformat() if getattr(m, "occurred_at", None) else None
+                ),
                 **job_card_fields(m, build_jobs),
             }
             for m in messages
@@ -1095,7 +1113,15 @@ async def get_day_chat_messages(
             # same-millisecond assistant row, or two channels' rows) came back
             # in a different order on two fetches, and in a different order
             # than the model saw.
-            .order_by(Message.created_at.asc(), Message.id.asc())
+            # COALESCE(occurred_at, created_at) (round 46, A12): a voice or
+            # WhatsApp row can be WRITTEN long after it happened, and sorting a
+            # day thread by write time puts it in the wrong place. Null
+            # occurred_at is every existing row, so this is today's order
+            # exactly until a writer starts stamping it.
+            .order_by(
+                func.coalesce(Message.occurred_at, Message.created_at).asc(),
+                Message.id.asc(),
+            )
             .limit(limit)
         )
         rows = msgs_result.all()
@@ -1142,6 +1168,14 @@ async def get_day_chat_messages(
             "tool_events": _serialize_tool_events(msg),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
+            # Turn identity (round 46, C1). NULL on every pre-existing row and
+            # on every row written by a container still on the previous image
+            # — the client treats null as UNKNOWN and falls back to its
+            # (role, content, channel, +-10 s) pairing, never to "not mine".
+            "client_msg_id": getattr(msg, "client_msg_id", None),
+            "occurred_at": (
+                msg.occurred_at.isoformat() if getattr(msg, "occurred_at", None) else None
+            ),
             **job_card_fields(msg, build_jobs),
         }
         for msg, channel in rows

@@ -10,6 +10,7 @@ Provides:
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, List, Dict, Any, Optional, Union
 
@@ -212,13 +213,28 @@ class AnthropicService:
         self.is_oauth = False
         self.default_model = settings.anthropic_model
         self.default_max_tokens = settings.anthropic_max_tokens
+        # `warm()` reaches `_ensure_client` from a worker thread (round 46);
+        # everything else reaches it from the loop. See `_ensure_client`.
+        import threading as _threading
+        self._client_lock = _threading.RLock()
         self._ensure_client()
 
     def _ensure_client(self):
-        """Rebuild the Anthropic client if the API key has changed."""
+        """Rebuild the Anthropic client if the API key has changed.
+
+        Locked, and the version stamp is written LAST — same reason as
+        `OpenAIAgentService._ensure_client`: `warm()` now calls this off the
+        loop, and stamping the new version before the new client is assigned
+        lets a concurrent turn early-return onto the PRE-BIND client."""
         if self._key_version == self._keys.version and self.client is not None:
             return
-        self._key_version = self._keys.version
+        with self._client_lock:
+            self._ensure_client_locked()
+
+    def _ensure_client_locked(self):
+        if self._key_version == self._keys.version and self.client is not None:
+            return
+        version = self._keys.version
 
         from app.services.bundle_client import make_anthropic_client
 
@@ -236,6 +252,7 @@ class AnthropicService:
         # masked the cause as a generic "Incorrect API key provided: missing"
         # 401 from Anthropic.
         self.client = make_anthropic_client(byok_key=api_key or None)
+        self._key_version = version
         if self.client is None:
             logger.warning(
                 "Anthropic client could not be built (no key, not in bundle mode)"
@@ -243,7 +260,29 @@ class AnthropicService:
             return
         logger.info("[ANTHROPIC] Client rebuilt (mode=%s, oauth=%s, v%d)",
                     settings.llm_mode, self.is_oauth, self._key_version)
-    
+
+    def warm(self) -> float:
+        """Mirror of `OpenAIAgentService.warm()` (round 46, A1): touch the
+        lazily-imported resource namespace so the SDK's once-per-process
+        import is paid off the loop rather than inside the user's first
+        turn. Returns milliseconds. Never raises — a warm that can fail a
+        bind is worse than a cold wire.
+
+        The Anthropic SDK has no equivalent of the Responses stream union,
+        so there is no second half to warm here; the measured cost that
+        motivated this is on the OpenAI wire (see that docstring)."""
+        t0 = time.perf_counter()
+        try:
+            self._ensure_client()
+            if self.client is None:
+                return 0.0
+            _ = self.client.messages
+        except Exception:
+            logger.debug("[ANTHROPIC] warm skipped", exc_info=True)
+            return 0.0
+        return (time.perf_counter() - t0) * 1000.0
+
+
     def _prepare_system(self, system: str) -> any:
         """
         Prepare system prompt.

@@ -24,7 +24,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List, Sequence, Set, Tuple
 
 import httpx
 
@@ -337,6 +337,35 @@ class _KieModerationRefused(Exception):
     it sent the founder round in circles re-wording a request that could never
     succeed. On this exception the caller surfaces the honest reason and does NOT
     fall back."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+#: Consecutive poll answers we may lose before we stop asking about a render
+#: that is already running (and already held against the user's credits). Six
+#: at the ~2.5 s poll interval is ~15 s of a sick hop — long enough to ride out
+#: a platform redeploy, short enough that the tool does not sit on the user's
+#: whole job deadline for a render nobody can reach. A module constant rather
+#: than a setting: it is a property of this retry loop, and config.py belongs
+#: to another lane this round.
+_KIE_POLL_TRANSIENT_RETRIES = 6
+
+
+class _KieRenderUnresolved(Exception):
+    """The render was STARTED and we lost track of it — never fall back.
+
+    A Kie job that was created is a job that will be billed: the platform takes
+    a credit hold at `/kie/image/start` precisely so an abandoned render still
+    stays paid for. So "the poll stopped answering" and "the render failed" are
+    opposite facts with opposite remedies. Falling back to OpenAI on the first
+    one buys a SECOND billed picture for one request — which is what a single
+    transient non-200 on one poll used to do.
+
+    Raised only after the transient-retry budget is spent, or when the job
+    deadline passes with the render still live. The caller must surface it and
+    stop."""
 
     def __init__(self, message: str):
         super().__init__(message)
@@ -3202,7 +3231,7 @@ class ToolExecutor:
         except asyncio.TimeoutError:
             return f"ERROR: TIMEOUT after {timeout}s"
 
-        return self._format_browser_action(data)
+        return await self._format_browser_action(data)
 
     async def _tool_browser_screenshot(self, inp: Dict[str, Any]) -> str:
         from app.agent import extension_bridge
@@ -3227,15 +3256,51 @@ class ToolExecutor:
         w = data.get("width"); h = data.get("height")
         q = data.get("quality")
         b64 = data.get("image_b64") or ""
-        # Keep the textual envelope short and put the base64 on a fenced
-        # line so the agent can detect / forward it without ambiguity.
+        line = await self._attach_screenshot(b64, w, h, q)
+        return line or f"screenshot ({w}x{h}, jpeg q={q}) — capture returned no image"
+
+    async def _attach_screenshot(self, b64: str, w: Any, h: Any, q: Any) -> str:
+        """Persist a browser screenshot as a `role='source'` attachment and
+        return the one-line envelope the model sees.
+
+        Until round 46 both producers returned the raw base64 inside a
+        ```jpeg-b64 fence and NOTHING in the repo consumed it: it was never
+        persisted, never turned into an image block, never attached. So the
+        user saw nothing, and the turn paid for the whole base64 in input
+        tokens on every subsequent iteration. `source` is the role because a
+        screenshot is evidence the model looked at, not the deliverable — the
+        client lists it, it is not the answer.
+        """
+        if not b64:
+            return ""
+        try:
+            import base64 as _b64
+            from app.agent.doc_generators import _persist
+            raw = _b64.b64decode(b64)
+        except Exception:
+            logger.debug("browser screenshot: undecodable image", exc_info=True)
+            return ""
+        if not raw:
+            return ""
+        try:
+            att = await _persist(
+                raw,
+                f"screenshot-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.jpg",
+                "image/jpeg",
+                self._current_user_id or self._user_scope(),
+            )
+        except Exception as exc:
+            # No traceback: `_persist` failures carry the storage key, i.e. the
+            # per-user workspace path, into the shipped trail.
+            logger.warning("browser screenshot persist failed err=%s", type(exc).__name__)
+            return ""
+        await self._register_attachment(att, role="source")
         return (
-            f"screenshot ({w}x{h}, jpeg q={q}, {len(b64)} chars b64)\n"
-            f"```jpeg-b64\n{b64}\n```"
+            f"screenshot ({w}x{h}, jpeg q={q}) attached as image_id {att.id} — "
+            f"it is on screen for the user; reference it by id, never by base64."
         )
 
-    @staticmethod
-    def _format_browser_action(data: Dict[str, Any]) -> str:
+    async def _format_browser_action(self, data: Dict[str, Any]) -> str:
         kind = data.get("kind") or "action"
         outcome = data.get("outcome") or {}
         ts = data.get("tab_state") or {}
@@ -3255,85 +3320,123 @@ class ToolExecutor:
             lines.append("```")
         if data.get("screenshot"):
             meta = data.get("screenshot_meta") or {}
-            lines.append(f"screenshot: {meta.get('w')}x{meta.get('h')} jpeg q={meta.get('quality')}")
-            lines.append("```jpeg-b64")
-            lines.append(data["screenshot"])
-            lines.append("```")
+            envelope = await self._attach_screenshot(
+                data["screenshot"], meta.get("w"), meta.get("h"), meta.get("quality"))
+            lines.append(envelope or
+                         f"screenshot: {meta.get('w')}x{meta.get('h')} (not attachable)")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # 9. send_file — send a document to the user via Telegram
+    # 9/10. send_file + send_photo — deliver a workspace file to the user
+    #
+    # Both were Telegram-only (`if not self.telegram_bot or not chat_id:
+    # return "ERROR: …"`) even though every BaseChannel adapter implements
+    # send_file/send_photo (channels/base.py:131,135) — so on WhatsApp,
+    # Slack, Discord, the app, the web and voice the tool stayed in the wire
+    # array and could only fail. Round 46: both now ATTACH, which is the one
+    # verb that means the same thing on every surface. Delivery happens once,
+    # at the end of the turn, from the surface that owns the conversation:
+    # the app/web read the `attachment` frame, the channel handler walks the
+    # same list through that channel's own send_photo/send_file. One list,
+    # one delivery point per channel, so the thread copy and the channel copy
+    # can never diverge.
     # ------------------------------------------------------------------
+    async def _attach_workspace_file(self, inp: Dict[str, Any], *,
+                                     want_image: bool) -> str:
+        from app.agent.artifact_kinds import (
+            ArtifactKind, kind_for_mime, mime_for_filename,
+        )
+        from app.agent.doc_generators import _persist
+
+        raw = (inp.get("path") or "").strip()
+        if not raw:
+            return "ERROR: path is required"
+        try:
+            path = self._resolve_path(raw)
+        except PermissionError as exc:
+            return f"ERROR: {exc}"
+        if not os.path.isfile(path):
+            return f"ERROR: File not found: {raw}"
+
+        name = os.path.basename(path)
+        mime = mime_for_filename(name)
+        kind = kind_for_mime(mime, name)
+        if want_image and kind != ArtifactKind.IMAGE:
+            return (f"ERROR: {name} is not an image ({mime}). Use send_file for "
+                    f"anything that is not a picture.")
+
+        size = os.path.getsize(path)
+        # The in-frame ceiling for an artifact the user will be handed. Larger
+        # files stay in the workspace and the model should say where they are
+        # rather than promise an attachment that cannot be carried.
+        _MAX = 50 * 1024 * 1024
+        if size > _MAX:
+            return (f"ERROR: {name} is {size // (1024 * 1024)} MB — too large to "
+                    f"attach (limit {_MAX // (1024 * 1024)} MB). Tell the user it "
+                    f"is in their Files instead.")
+        if size <= 0:
+            return f"ERROR: {name} is empty (0 bytes) — nothing was attached."
+
+        try:
+            # Up to 50 MB read off disk: on the loop this is the same starvation
+            # signature the inbound path was moved off it for.
+            from pathlib import Path as _Path
+            data = await asyncio.to_thread(_Path(path).read_bytes)
+            att = await _persist(data, name, mime,
+                                 self._current_user_id or self._user_scope())
+        except Exception as exc:
+            # Neither the trail nor the MODEL gets the exception text: it renders
+            # the per-user workspace path, and a stack string in the context is
+            # both a leak and a lie about what the file is.
+            logger.warning("send_file/send_photo persist failed err=%s", type(exc).__name__)
+            return f"ERROR: Could not attach {name}; nothing was sent."
+
+        caption = (inp.get("caption") or "").strip()
+        summary = await self._register_attachment(att)
+        if summary.startswith("ERROR:"):
+            return summary
+        return (f"Attached {name} ({size} bytes, {mime}) to your reply"
+                + (f" with caption {caption!r}." if caption else ".")
+                + " It is saved to their Files and shown in the app; most"
+                + " messaging channels also receive the file itself. Do not"
+                + " promise a particular surface.")
+
     async def _tool_send_file(self, inp: Dict[str, Any]) -> str:
-        path = self._resolve_path(inp.get("path", ""))
-        caption = inp.get("caption", None)
+        return await self._attach_workspace_file(inp, want_image=False)
 
-        if not os.path.isfile(path):
-            return f"ERROR: File not found: {path}"
-
-        chat_id = await self._resolve_chat_id()
-        if not self.telegram_bot or not chat_id:
-            return "ERROR: Telegram bot not available or no active chat"
-
-        try:
-            file_size = os.path.getsize(path)
-            if file_size > 50 * 1024 * 1024:  # Telegram 50MB limit
-                return f"ERROR: File too large ({file_size} bytes). Telegram limit is 50MB."
-
-            bot = self.telegram_bot.app.bot
-            with open(path, "rb") as f:
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=os.path.basename(path),
-                    caption=caption,
-                )
-            fname = os.path.basename(path)
-            return f"File sent to user: {fname} ({file_size} bytes)"
-        except Exception as exc:
-            logger.exception("send_file failed")
-            return f"ERROR: Failed to send file: {exc}"
-
-    # ------------------------------------------------------------------
-    # 10. send_photo — send an image to the user via Telegram
-    # ------------------------------------------------------------------
     async def _tool_send_photo(self, inp: Dict[str, Any]) -> str:
-        path = self._resolve_path(inp.get("path", ""))
-        caption = inp.get("caption", None)
-
-        if not os.path.isfile(path):
-            return f"ERROR: File not found: {path}"
-
-        chat_id = await self._resolve_chat_id()
-        if not self.telegram_bot or not chat_id:
-            return "ERROR: Telegram bot not available or no active chat"
-
-        try:
-            bot = self.telegram_bot.app.bot
-            with open(path, "rb") as f:
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=f,
-                    caption=caption,
-                )
-            return f"Photo sent to user: {os.path.basename(path)}"
-        except Exception as exc:
-            logger.exception("send_photo failed")
-            return f"ERROR: Failed to send photo: {exc}"
+        return await self._attach_workspace_file(inp, want_image=True)
 
     # ------------------------------------------------------------------
     # 10b. generate_* — produce formatted documents
     # ------------------------------------------------------------------
-    async def _register_attachment(self, att) -> str:
+    async def _register_attachment(self, att, *, role: Optional[str] = None,
+                                   intent: Optional[str] = None) -> str:
         """Append an Attachment to pending_attachments and return a summary string.
 
-        The summary names the REAL workspace-relative location
-        (generated/{storage_path}) so the model's confirmation matches
-        where the file actually is — the doc_generation eval flake
-        (canary 533354ce, 2026-07-28) was the agent describing a path
-        that didn't match the on-disk placement.
+        The summary names the path the file is ACTUALLY at, as the storage
+        backend reports it. It used to say ``generated/{storage_path}``, which
+        was relative to the workspace ROOT — but with ``workspace_per_user``
+        (the default) the model's own workspace is ``<root>/<user_id>/``, so
+        the string resolved to ``<root>/<uid>/generated/<uid>/…`` and named a
+        file that is not there. A path the model cannot read back is the
+        opposite of what that string exists for (round 46, C13).
         """
         d = att.to_dict() if hasattr(att, "to_dict") else dict(att)
+        # Format is a field now (C9). Callers that know better pass `role`
+        # (a browser screenshot is evidence, not a deliverable) and `intent`
+        # (the kind the user asked for, when it is not the kind produced).
+        try:
+            from app.agent.artifact_kinds import kind_for_mime
+            if not d.get("kind"):
+                d["kind"] = kind_for_mime(d.get("mime_type"), d.get("filename"))
+        except Exception:
+            pass
+        if role:
+            d["role"] = role
+        d.setdefault("role", "final")
+        if intent:
+            d["intent"] = intent
         # Never attach a failed/empty artifact. The generators refuse empty
         # CONTENT before persisting (EmptyDocumentError); this is the last
         # line for every other path that reaches here (convert_document,
@@ -3355,12 +3458,28 @@ class ToolExecutor:
                 f"in chat."
             )
         self.pending_attachments.append(d)
+        where = self._attachment_disk_path(d.get("storage_path", ""))
         return (
-            f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']}) "
-            f"at workspace path generated/{d['storage_path']}. "
-            f"File will appear in the document pane; agent_runner will emit the "
-            f"attachment event after this tool call completes."
+            f"Generated {d['filename']} ({d['size_bytes']} bytes, {d['mime_type']})"
+            + (f" at {where}." if where else ".")
+            + " It is attached to your reply and the user has it — don't repeat "
+            "its contents back in chat."
         )
+
+    @staticmethod
+    def _attachment_disk_path(storage_path: str) -> str:
+        """Absolute path of a persisted attachment, or "" when the backend has
+        none (the S3 stub raises). ``/app/workspace`` is inside the file tools'
+        allow-list, so an absolute path here is one `read_file`/`send_file` can
+        actually open — a workspace-RELATIVE one is not, because the model's
+        cwd is the per-user subdirectory and storage writes above it."""
+        if not storage_path:
+            return ""
+        try:
+            from app.services.file_storage import get_storage_backend
+            return get_storage_backend().path(storage_path)
+        except Exception:
+            return ""
 
     def _user_scope(self) -> str:
         return getattr(self, "_user_id", "") or "shared"
@@ -3643,6 +3762,91 @@ class ToolExecutor:
                 "image_url": {"url": f"data:{mime};base64,{data}"},
             }
 
+        # References: the other pictures to look at ALONGSIDE `image`. Without
+        # these, comparing two pictures meant two calls and two answers the
+        # model then had to reconcile from memory — which is where "they don't
+        # match" comes from when they do. Each one is labelled so the answer can
+        # name it back.
+        _extra_blocks: List[Dict[str, Any]] = []
+        _refs_raw = inp.get("references") or []
+        if isinstance(_refs_raw, dict):
+            _refs_raw = [_refs_raw]
+        if _refs_raw:
+            from app.agent.image_artifacts import resolve_many
+            _ids, _roles = [], []
+            for _item in _refs_raw:
+                if isinstance(_item, str):
+                    _rid, _role = _item.strip(), ""
+                elif isinstance(_item, dict):
+                    _rid = str(_item.get("image_id") or _item.get("id") or "").strip()
+                    _role = str(_item.get("role") or "").strip()
+                else:
+                    return "ERROR: each entry in 'references' must be an object with an image_id."
+                if _rid:
+                    _ids.append(_rid)
+                    _roles.append(_role)
+            if _ids:
+                _arts, _missing = await resolve_many(
+                    _ids,
+                    conversation_id=_SESSION_ID_CTX.get(),
+                    user_id=self._current_user_id,
+                    pending_attachments=self.pending_attachments,
+                    inbound_media=self._inbound_media,
+                )
+                if _missing:
+                    return ("ERROR: No image with id " + ", ".join(_missing)
+                            + " in this conversation. Use the ids exactly as "
+                            "they were labelled; nothing was analysed.")
+                from app.agent.attachment_ingest import downscale_image
+                from app.agent.attachment_limits import (
+                    MAX_TOTAL_BYTES_PER_TURN, MODEL_IMAGE_LONG_EDGE,
+                )
+                _ref_budget = MAX_TOTAL_BYTES_PER_TURN
+                for _i, (_art, _role) in enumerate(zip(_arts, _roles), start=1):
+                    try:
+                        from app.services.file_storage import get_storage_backend
+
+                        def _load(_p=_art.storage_path, _m=_art.mime_type):
+                            with get_storage_backend().open(_p) as _rf:
+                                _raw = _rf.read()
+                            # Every reference at its ORIGINAL stored size was up
+                            # to 7 x 15 MB base64'd into one request body from a
+                            # 768 MiB container. `edit_image` normalises each of
+                            # its sources; this one did not — and the read was
+                            # on the event loop besides.
+                            return downscale_image(_raw, _m, MODEL_IMAGE_LONG_EDGE)
+
+                        _rbytes, _rmime = await asyncio.to_thread(_load)
+                        _rdata = base64.b64encode(_rbytes).decode("utf-8")
+                        _ref_budget -= len(_rdata)
+                        if _ref_budget < 0:
+                            return ("ERROR: Those reference images are too large "
+                                    "to look at together; nothing was analysed. "
+                                    "Ask about fewer of them at once.")
+                    except Exception as exc:
+                        # The exception text renders the per-user workspace path
+                        # (or an S3 endpoint/bucket) into the MODEL's context and
+                        # from there into the user's answer. Stable sentence only.
+                        logger.warning(
+                            "analyze_image: reference load failed err=%s", type(exc).__name__)
+                        return (f"ERROR: Reference image {_art.id} could not be "
+                                f"loaded; nothing was analysed.")
+                    # Both halves through `safe_label_name`: this is the bracketed
+                    # frame the model reads image_ids out of, the filename is
+                    # third-party input on the channel-inbound path, and `role`
+                    # is model-authored free text that lands inside the same
+                    # brackets.
+                    from app.agent.image_artifacts import safe_label_name
+                    _label = (f"[reference {_i} — image_id {_art.id}, "
+                              f"{safe_label_name(_art.filename)}]")
+                    if _role:
+                        _label += f" {safe_label_name(_role)}"
+                    _extra_blocks.append({"type": "text", "text": _label})
+                    _extra_blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{_rmime};base64,{_rdata}"},
+                    })
+
         # ONE client factory for both bundle (→ platform LLM proxy, which
         # meters + governs the call) and manual/BYO (→ api.openai.com direct).
         # See bundle_client.make_openai_client. Previously this POSTed raw to
@@ -3667,7 +3871,7 @@ class ToolExecutor:
                         "content": [
                             {"type": "text", "text": question},
                             image_content,
-                        ],
+                        ] + _extra_blocks,
                     }
                 ],
                 max_tokens=1024,
@@ -3696,19 +3900,53 @@ class ToolExecutor:
             "content_policy", "content policy", "image_generation_user_error",
         ))
 
+    @staticmethod
+    def _kie_poll_is_transient(response) -> bool:
+        """Is this poll response a lost question, or a verdict on the render?
+
+        A verdict is terminal even when it is a 5xx: the platform answers a
+        genuine provider failure with 502 ``{code: "kie_failed"}`` and refunds
+        the hold it took at /start, so falling back after one of those costs
+        the user exactly one picture. Everything else in the 5xx family — a
+        gateway, a redeploy, a pooler blip — is the hop failing, not the
+        render, and retrying is the only answer that does not double-bill.
+        """
+        code = getattr(response, "status_code", 0)
+        if code == 429:
+            return False      # quota — handled after the loop, never retried
+        if code in (408, 409, 425):
+            return True
+        if 500 <= code < 600:
+            try:
+                detail = (response.json() or {}).get("detail") or {}
+            except Exception:
+                return True   # no JSON body at all ⇒ a gateway, not the platform
+            return not (isinstance(detail, dict) and detail.get("code") == "kie_failed")
+        return False
+
     async def _call_kie_image(self, mode: str, prompt: str, *, size: Optional[str] = None,
                               image_bytes: Optional[bytes] = None,
-                              image_mime: str = "image/png") -> Optional[bytes]:
+                              image_mime: str = "image/png",
+                              sources: Optional[Sequence[Tuple[bytes, str]]] = None,
+                              ) -> Optional[bytes]:
         """Ask the platform's Kie proxy (Nano Banana Pro) for an image.
 
         The one shared Kie key lives on the platform, so the agent posts here
         with its toup_token (same auth as the bundle OpenAI proxy). Returns the
         image bytes on success. Raises _KieQuotaExceeded on the free-tier cap
-        (caller surfaces it, no fallback). Raises RuntimeError on a Kie/technical
-        failure (caller falls back to OpenAI). Returns None when the platform
-        isn't reachable (BYO/manual with no toup_token) → caller uses OpenAI.
+        (caller surfaces it, no fallback). Raises _KieRenderUnresolved when a
+        started render stopped answering (caller must NOT fall back — see the
+        class). Raises RuntimeError on a Kie/technical failure (caller falls
+        back to OpenAI). Returns None when the platform isn't reachable
+        (BYO/manual with no toup_token) → caller uses OpenAI.
+
+        ``sources`` is 1..8 ``(bytes, mime)`` pairs; ``sources[0]`` is the base
+        and the rest are references. The scalar ``image_bytes``/``image_mime``
+        pair is still sent for the base so a platform that predates
+        ``images_b64`` renders the same single-source edit it always did.
         """
         import base64 as _b64
+        import uuid as _uuid4
         base = (getattr(settings, "platform_api_url", "") or "").rstrip("/")
         token = (getattr(settings, "toup_token", "") or "").strip()
         if not base or not token:
@@ -3716,9 +3954,22 @@ class ToolExecutor:
         payload: Dict[str, Any] = {"mode": mode, "prompt": prompt}
         if size:
             payload["size"] = size
-        if mode == "edit" and image_bytes is not None:
-            payload["image_b64"] = _b64.b64encode(image_bytes).decode()
-            payload["image_mime"] = image_mime
+        _srcs: List[Tuple[bytes, str]] = []
+        if mode == "edit":
+            if sources:
+                _srcs = [(b, m or "image/png") for (b, m) in sources if b]
+            elif image_bytes is not None:
+                _srcs = [(image_bytes, image_mime)]
+        if _srcs:
+            payload["image_b64"] = _b64.b64encode(_srcs[0][0]).decode()
+            payload["image_mime"] = _srcs[0][1]
+            payload["images_b64"] = [
+                {"b64": _b64.b64encode(b).decode(), "mime": m} for b, m in _srcs
+            ]
+        # One key for this logical render, minted once per tool call: a retry of
+        # /start under the same key returns the SAME Kie task instead of paying
+        # for a second one. Old platforms ignore it.
+        payload["idempotency_key"] = _uuid4.uuid4().hex
         # START + POLL rather than one long request. Kie renders take anywhere
         # from ~25s to ~400s; a single synchronous call either abandons a job the
         # user already paid for or outlives what the HTTP hop tolerates. Each
@@ -3740,20 +3991,48 @@ class ToolExecutor:
                     _clock = asyncio.get_running_loop().time
                     deadline = _clock() + job_deadline
                     poll_body = {"task_id": task_id, "reservation_id": reservation_id}
+                    # A poll is a QUESTION about a render that is already
+                    # running and already held against the user's credits. A
+                    # non-answer to that question is not an answer of "it
+                    # failed": the old `break` on any non-200 abandoned the Kie
+                    # job on one flaky hop, fell through to the OpenAI edit
+                    # path, and billed the user a second picture for one
+                    # request. Only a TERMINAL verdict leaves this loop.
+                    _transient = 0
+                    _max_transient = _KIE_POLL_TRANSIENT_RETRIES
                     while _clock() < deadline:
                         await asyncio.sleep(interval)
-                        r = await client.post(f"{base}/llm/kie/image/poll",
-                                              json=poll_body, headers=hdrs)
-                        if r.status_code != 200:
-                            break  # fall through to the shared error handling below
-                        if (r.json() or {}).get("status") == "pending":
+                        try:
+                            r = await client.post(f"{base}/llm/kie/image/poll",
+                                                  json=poll_body, headers=hdrs)
+                        except Exception as _pe:
+                            _transient += 1
+                            if _transient > _max_transient:
+                                raise _KieRenderUnresolved(
+                                    "lost contact with the image service while "
+                                    f"the picture was rendering ({_pe.__class__.__name__})")
                             continue
-                        break
+                        if r.status_code == 200:
+                            _transient = 0
+                            if (r.json() or {}).get("status") == "pending":
+                                continue
+                            break
+                        if self._kie_poll_is_transient(r):
+                            _transient += 1
+                            if _transient > _max_transient:
+                                raise _KieRenderUnresolved(
+                                    "the image service stopped answering while "
+                                    f"the picture was rendering (HTTP {r.status_code})")
+                            continue
+                        break  # terminal → shared error handling below
                     else:
-                        raise RuntimeError(
-                            f"kie job still rendering after {job_deadline:.0f}s "
-                            f"(task {task_id})")
-        except (_KieQuotaExceeded, _KieModerationRefused):
+                        # The render is still LIVE and already held against the
+                        # user's credits, so a fallback render here is a second
+                        # charge for one request.
+                        raise _KieRenderUnresolved(
+                            f"the picture was still rendering after "
+                            f"{job_deadline:.0f}s")
+        except (_KieQuotaExceeded, _KieModerationRefused, _KieRenderUnresolved):
             raise
         except RuntimeError:
             raise
@@ -3795,8 +4074,12 @@ class ToolExecutor:
         The id comes back because it is the handle a follow-up edit needs: it
         is minted here, it is what the tool result must name, and there is no
         second place to look it up from before the turn is saved."""
-        from app.agent.doc_generators import _persist
+        from app.agent.doc_generators import _persist, sniff_image
         uid = self._current_user_id or ""
+        # C7: `mime` arrives hardcoded "image/png" from every caller. The bytes
+        # are the only honest source, and the extension has to follow them or
+        # the file is named for a format it is not.
+        mime, filename = sniff_image(img_bytes, filename, mime)
         att = await _persist(img_bytes, filename, mime, uid or self._user_scope())
         try:
             with open(self._resolve_path(filename), "wb") as f:
@@ -3954,7 +4237,8 @@ class ToolExecutor:
 
     @staticmethod
     def _image_result_block(*, attachment_id: str, source_line: str,
-                            verdict, operation: str, summary: str) -> str:
+                            verdict, operation: str, summary: str,
+                            references: Sequence[str] = ()) -> str:
         """The model-facing tail every image tool now returns.
 
         Order is deliberate: the id first (a follow-up edit needs it and must
@@ -3966,6 +4250,11 @@ class ToolExecutor:
         parts = [f"image_id: {attachment_id} — pass this as source_image_id to edit THIS picture."]
         if source_line:
             parts.append(f"source: {source_line}")
+        # Which other pictures went in. A reference that was resolved but never
+        # reached the renderer would otherwise be invisible in the result and
+        # only visible in the picture — after it has been paid for.
+        if references:
+            parts.append("references used: " + "; ".join(references))
         parts.append(render_for_model(verdict, operation=operation).lstrip("\n"))
         parts.append(summary)
         return "\n".join(p for p in parts if p)
@@ -4024,12 +4313,15 @@ class ToolExecutor:
 
         import base64
         import uuid as _uuid
-        from app.agent.doc_generators import _safe_filename, _persist
+        from app.agent.doc_generators import _derive_filename, _first_words, _persist, sniff_image
 
+        # C7 (round 46): this passed a DOTLESS "png", so `sunset` became
+        # `sunsetpng.png` and a requested `.jpg` was forced to `.png`; and it
+        # skipped the placeholder-stem protection every document generator
+        # has, so `filename="x"` shipped as `x.png`. The real extension is
+        # settled against the returned BYTES at persist time.
         raw_name = (inp.get("filename") or "").strip() or f"image_{_uuid.uuid4().hex[:8]}.png"
-        filename = _safe_filename(raw_name, "png")
-        if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            filename = f"{filename}.png"
+        filename = _derive_filename(raw_name, ".png", hints=(_first_words(request or prompt),))
 
         # ── Ground, then construct ─────────────────────────────────────
         # A renderer never says "I don't know what that looks like"; it draws
@@ -4054,6 +4346,18 @@ class ToolExecutor:
                 _kb = await self._call_kie_image("generate", prompt, size=size)
             except _KieQuotaExceeded as q:
                 return f"ERROR: {q.message}"
+            except _KieRenderUnresolved as unresolved:
+                # The render was STARTED and is held against the user's
+                # credits; the OpenAI fallback below would be a second charge
+                # for one request (the same rule edit_image applies).
+                return (
+                    "ERROR: The picture was already being made when the image "
+                    f"service stopped answering ({unresolved.message}). It has "
+                    "NOT been abandoned and it may still arrive. Do not retry "
+                    "this generation automatically — a retry starts a second "
+                    "render and the user is charged twice. Tell them what "
+                    "happened and ask whether to try again."
+                )
             except _KieModerationRefused:
                 # Policy refusal — OpenAI declines the same class of request, so
                 # don't spend another ~30-60s and a paid attempt to be told no twice.
@@ -4149,10 +4453,13 @@ class ToolExecutor:
         # Persist as an attachment (delivered inline to web/mobile via the
         # on_attachment WS event) using the same pipeline as generate_pdf/etc.
         try:
-            att = await _persist(img_bytes, filename, "image/png", uid or self._user_scope())
+            _mime, filename = sniff_image(img_bytes, filename)   # C7
+            att = await _persist(img_bytes, filename, _mime, uid or self._user_scope())
         except Exception as exc:
-            logger.exception("generate_image persist failed")
-            return f"ERROR: Could not save the generated image: {exc}"
+            # The exception renders the per-user storage path; it belongs in
+            # neither the trail nor the model's context.
+            logger.warning("generate_image persist failed err=%s", type(exc).__name__)
+            return "ERROR: The generated image could not be saved; nothing was attached."
         # Also drop a copy into the workspace so the model can send_photo it or
         # reference it in later tool calls. Best-effort.
         try:
@@ -4235,8 +4542,11 @@ class ToolExecutor:
         """Call OpenAI images.edit for `model`; return base64 PNG string.
 
         `image_file` is a (filename, bytes, mime) tuple the SDK forwards as
-        multipart. gpt-image-1 is the only model with a high-quality edits
-        endpoint (dall-e-3 has none), and it always returns b64_json.
+        multipart — or a LIST of them for a multi-reference edit, which
+        gpt-image-1 accepts and the platform proxy already relays (it collects
+        both `image` and `image[]` from the form). gpt-image-1 is the only
+        model with a high-quality edits endpoint (dall-e-3 has none), and it
+        always returns b64_json.
         """
         timeout = getattr(settings, "image_gen_timeout_s", 180.0)
         result = await client.images.edit(
@@ -4308,9 +4618,11 @@ class ToolExecutor:
 
         import base64
         import uuid as _uuid
-        from app.agent.doc_generators import _safe_filename, _persist
+        from app.agent.doc_generators import _derive_filename, _first_words, _persist, sniff_image
         from app.agent.image_artifacts import (
-            choices_hint, resolve_by_id, resolve_implicit, thread_images,
+            build_reference_manifest, choices_hint, inventory_for_model,
+            resolve_by_id, resolve_implicit, resolve_many, thread_images,
+            turn_image_count,
         )
 
         _EXT_MIME = {
@@ -4330,6 +4642,34 @@ class ToolExecutor:
         source_line = ""
         _img_arg = (inp.get("image") or "").strip()
         _img_id = (inp.get("source_image_id") or inp.get("image_id") or "").strip()
+
+        # ── The ONE clarification rule ──────────────────────────────────
+        # More than one picture arrived with this message and the call named
+        # none of them. The implicit resolver would pick the LAST one attached
+        # (image_artifacts.turn_artifacts walks inbound media reversed) — so
+        # "here's me, here's the beach, put me there" edited the BEACH and used
+        # the person as decoration. There is no safe guess to make here, and
+        # the cheap correction is a free tool round-trip, not a question to the
+        # user: this error hands the model the inventory it was never shown and
+        # asks it to call again with roles. It costs zero renders and zero
+        # charges, which is why it is a refusal rather than a coin flip.
+        _turn_images = turn_image_count(self._inbound_media)
+        if _turn_images > 1 and not _img_id and not _img_arg:
+            _inv = inventory_for_model(self._inbound_media)
+            return (
+                f"ERROR: This message carries {_turn_images} pictures, so which "
+                "one is being edited is ambiguous — name it instead of letting "
+                "this guess.\n"
+                + (_inv + "\n" if _inv else "")
+                + "Call edit_image again with `source_image_id` set to the "
+                "picture being TRANSFORMED (its framing and subject are kept), "
+                "and every other picture in `references` as "
+                "{image_id, role}, where role says what that picture is for in "
+                "plain words ('the man whose face and body should be used', "
+                "'the room this should happen in'). If you genuinely cannot "
+                "tell which is which from what the user said, ask them ONE "
+                "short question naming the pictures — once, not repeatedly."
+            )
 
         if _img_id:
             src_art = await resolve_by_id(
@@ -4380,7 +4720,9 @@ class ToolExecutor:
                     src_name = os.path.basename(_p)
                     src_mime = _EXT_MIME.get(os.path.splitext(src_name)[1].lower(), "image/png")
             except Exception as exc:
-                return f"ERROR: Could not read the image to edit ({_img_arg}): {exc}"
+                logger.warning(
+                    "edit_image: named source unreadable err=%s", type(exc).__name__)
+                return "ERROR: That file could not be read; nothing was edited."
         else:
             # "it" / "the image" / "that pic" — the newest image in THIS
             # conversation, whoever put it there. Not "the user's newest upload
@@ -4406,8 +4748,9 @@ class ToolExecutor:
                 src_name = src_art.filename
                 src_mime = src_art.mime_type
             except Exception as exc:
-                logger.exception("edit_image: failed to load source image")
-                return f"ERROR: Could not load the image to edit: {exc}"
+                logger.warning(
+                    "edit_image: failed to load source image err=%s", type(exc).__name__)
+                return "ERROR: The image to edit could not be loaded; nothing was edited."
             source_line = f"{src_art.describe()}, image_id {src_art.id}"
             logger.info("[IMAGE] edit source: origin=%s scope=%s id=%s",
                         src_art.origin, src_art.turn_scope, src_art.id[:8])
@@ -4420,6 +4763,122 @@ class ToolExecutor:
         # Normalize to a format gpt-image-1 /images/edits accepts so a source we
         # successfully FOUND doesn't then fail at OpenAI on its declared type.
         src_bytes, src_name, src_mime = self._normalize_edit_source(src_bytes, src_name, src_mime)
+
+        # ── References: the OTHER pictures this render draws from ───────
+        # The base above is the picture being transformed. Everything here is
+        # material — a face, a garment, a room — and each one carries a role,
+        # because an ordered array of URLs tells the renderer nothing about
+        # which picture is the person and which is the place.
+        _refs_raw = inp.get("references") or []
+        if isinstance(_refs_raw, dict):          # a model may send one object
+            _refs_raw = [_refs_raw]
+        if not isinstance(_refs_raw, list):
+            return ("ERROR: 'references' must be a list of "
+                    "{image_id, role} objects.")
+        _ref_ids: List[str] = []
+        _ref_roles: List[str] = []
+        for _item in _refs_raw:
+            if isinstance(_item, str):
+                _rid, _role = _item.strip(), ""
+            elif isinstance(_item, dict):
+                _rid = str(_item.get("image_id") or _item.get("id") or "").strip()
+                _role = str(_item.get("role") or "").strip()
+            else:
+                return ("ERROR: each entry in 'references' must be an object "
+                        "with an image_id and a role.")
+            if not _rid:
+                return ("ERROR: every reference needs an `image_id`. Each "
+                        "picture in this conversation is labelled "
+                        "`[image i of N — image_id <id>, <filename>]`; use "
+                        "those ids.")
+            if _rid.lower() == (_img_id or "").lower():
+                return (f"ERROR: image_id {_rid} is already the base "
+                        "(`source_image_id`) — a picture cannot also be one of "
+                        "its own references. Remove it from `references`, or "
+                        "make a different picture the base.")
+            _ref_ids.append(_rid)
+            _ref_roles.append(_role)
+
+        _ref_arts: List[Any] = []
+        if _ref_ids:
+            from app.services.kie_client import KIE_MAX_IMAGE_INPUT
+            if 1 + len(_ref_ids) > KIE_MAX_IMAGE_INPUT:
+                return (f"ERROR: too many pictures — one render takes the base "
+                        f"plus at most {KIE_MAX_IMAGE_INPUT - 1} references, "
+                        f"and this call passed {len(_ref_ids)}. Drop the ones "
+                        "that matter least and try again.")
+            _ref_arts, _missing = await resolve_many(
+                _ref_ids,
+                conversation_id=_SESSION_ID_CTX.get(),
+                user_id=self._current_user_id,
+                pending_attachments=self.pending_attachments,
+                inbound_media=self._inbound_media,
+            )
+            if _missing:
+                # A dropped reference is invisible in the result and visible in
+                # the picture — the user gets a render that silently left one
+                # of their photos out, and pays for it. Refuse before spending.
+                _all = await thread_images(
+                    conversation_id=_SESSION_ID_CTX.get(),
+                    user_id=self._current_user_id,
+                )
+                _hint = choices_hint(_all)
+                return (
+                    "ERROR: No image with id "
+                    + ", ".join(_missing)
+                    + " in this conversation. Nothing was rendered. Use the "
+                    "ids exactly as they were labelled — do not invent or "
+                    "abbreviate them, and do not substitute a different "
+                    "picture."
+                    + (f"\n{_hint}" if _hint else "")
+                )
+
+        # Load each reference's bytes through the same normalisation the base
+        # went through; a reference we cannot read is an error, not a silently
+        # shorter array.
+        _ref_sources: List[Tuple[bytes, str]] = []
+        _ref_pairs: List[Tuple[Any, str]] = []
+        for _art, _role in zip(_ref_arts, _ref_roles):
+            try:
+                from app.services.file_storage import get_storage_backend
+
+                def _read(_p=_art.storage_path):
+                    # Off the loop: up to 7 x 15 MB read plus a PIL normalise on
+                    # a 1.00-CPU container is the starvation signature the
+                    # inbound path was moved off it for.
+                    with get_storage_backend().open(_p) as _rf:
+                        return _rf.read()
+
+                _rb = await asyncio.to_thread(_read)
+            except Exception as exc:
+                # Stable sentence: the exception text renders the per-user
+                # workspace path into the model's context and the user's answer.
+                logger.warning(
+                    "edit_image: failed to load reference image err=%s", type(exc).__name__)
+                return (f"ERROR: Reference image {_art.id} could not be loaded; "
+                        f"nothing was edited.")
+            _rb, _rn, _rm = await asyncio.to_thread(
+                self._normalize_edit_source, _rb, _art.filename, _art.mime_type)
+            _ref_sources.append((_rb, _rm))
+            _ref_pairs.append((_art, _role))
+        _manifest = build_reference_manifest(src_art, _ref_pairs)
+        _ref_lines = [
+            f"{a.filename} (image_id {a.id})" + (f" as {r}" if r else "")
+            for a, r in _ref_pairs
+        ]
+        if _ref_sources:
+            # The scope split is the measurement, not decoration: every
+            # reference is UPLOADED to a third-party public file host before
+            # the render starts, and `resolve_many` resolves against the whole
+            # thread — so a reference the model chose from days ago widens that
+            # egress beyond the picture the user pointed at. Counts and id
+            # PREFIXES only; never a filename.
+            _from_turn = sum(1 for a, _ in _ref_pairs
+                             if getattr(a, "turn_scope", "") == "this_turn")
+            logger.info("[IMAGE] edit references: n=%d turn=%d thread=%d ids=%s",
+                        len(_ref_sources), _from_turn,
+                        len(_ref_pairs) - _from_turn,
+                        ",".join(a.id[:8] for a, _ in _ref_pairs))
 
         # ── Look at the source, look things up, then write the prompt ───
         # These two are independent and both sit on a path a person is waiting
@@ -4450,11 +4909,20 @@ class ToolExecutor:
         if not _ok:
             return f"ERROR: {_refusal}"
         _suffix = realism_suffix(_scene_changed, source_medium=_medium)
+        # The manifest is prepended to the RENDER prompt, after the spec is
+        # written — not before it. `build_image_spec` runs an LLM over the
+        # instruction, and a paraphrase of "Image 2 is a reference: the room"
+        # is not a numbering the renderer can trust. Prepending here keeps the
+        # numbering byte-exact and identical to `image_input`'s order, and
+        # leaves the single-source prompt EXACTLY what it was before
+        # references existed (`_manifest` is "" with no references).
+        _render_prompt = (f"{_manifest}\n\n{prompt}{_suffix}"
+                          if _manifest else prompt + _suffix)
+        _sources: List[Tuple[bytes, str]] = [(src_bytes, src_mime)] + _ref_sources
 
+        # C7 (round 46): see the identical block in generate_image.
         raw_name = (inp.get("filename") or "").strip() or f"edited_{_uuid.uuid4().hex[:8]}.png"
-        filename = _safe_filename(raw_name, "png")
-        if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            filename = f"{filename}.png"
+        filename = _derive_filename(raw_name, ".png", hints=(_first_words(prompt),))
 
         # PRIMARY: Nano Banana (Kie) edit — highest-quality natural result,
         # framing preserved. Charging + free cap platform-side; quota → upgrade
@@ -4462,10 +4930,23 @@ class ToolExecutor:
         if (getattr(settings, "image_provider", "openai") or "").strip().lower() == "kie":
             try:
                 _kb = await self._call_kie_image(
-                    "edit", prompt + _suffix,
-                    image_bytes=src_bytes, image_mime=src_mime)
+                    "edit", _render_prompt,
+                    image_bytes=src_bytes, image_mime=src_mime,
+                    sources=_sources)
             except _KieQuotaExceeded as q:
                 return f"ERROR: {q.message}"
+            except _KieRenderUnresolved as unresolved:
+                # The render was STARTED. It is held against the user's credits
+                # and may still land. A fallback render here is a second charge
+                # for one request, so stop and say so honestly.
+                return (
+                    "ERROR: The picture was already being made when the image "
+                    f"service stopped answering ({unresolved.message}). It has "
+                    "NOT been abandoned and it may still arrive. Do not retry "
+                    "this edit automatically — a retry starts a second render "
+                    "and the user is charged twice. Tell them what happened and "
+                    "ask whether to try again."
+                )
             except _KieModerationRefused:
                 # Policy refusal on the IMAGE, not the phrasing. OpenAI's edit
                 # endpoint declines the same class of request, so stop here
@@ -4496,6 +4977,7 @@ class ToolExecutor:
                         verdict=_verdict,
                         operation="edit",
                         summary=summary,
+                        references=_ref_lines,
                     ),
                     display=self._image_display(
                         "Edited", filename, grounded=_grounded, verdict=_verdict,
@@ -4518,9 +5000,17 @@ class ToolExecutor:
         # endpoint). gpt-image-1 works through both the bundle proxy and direct.
         fallback = getattr(settings, "image_gen_fallback_model", "gpt-image-1") or ""
         edit_fallback = fallback if (fallback != model and fallback.lower().startswith("gpt-image")) else ""
-        image_file = (src_name, src_bytes, src_mime)
+        # gpt-image-1's /images/edits takes a LIST for `image` (and the
+        # platform proxy already forwards `image[]` — llm_proxy collects both
+        # `image` and `image[]` from the form). Keep the bare tuple when there
+        # is exactly one source so the single-image call is unchanged.
+        _oai_files = [(src_name, src_bytes, src_mime)] + [
+            (f"reference_{i}.png", b, m)
+            for i, (b, m) in enumerate(_ref_sources, start=1)
+        ]
+        image_file = _oai_files if len(_oai_files) > 1 else _oai_files[0]
         # Steer away from the plastic "AI" look and preserve the untouched parts.
-        edit_prompt = prompt + _suffix
+        edit_prompt = _render_prompt
         used_model = model
         try:
             b64 = await self._openai_edit_image(client, model, image_file, edit_prompt, size, quality)
@@ -4556,10 +5046,11 @@ class ToolExecutor:
 
         uid = self._current_user_id or ""
         try:
-            att = await _persist(img_bytes, filename, "image/png", uid or self._user_scope())
+            _mime, filename = sniff_image(img_bytes, filename)   # C7
+            att = await _persist(img_bytes, filename, _mime, uid or self._user_scope())
         except Exception as exc:
-            logger.exception("edit_image persist failed")
-            return f"ERROR: Could not save the edited image: {exc}"
+            logger.warning("edit_image persist failed err=%s", type(exc).__name__)
+            return "ERROR: The edited image could not be saved; nothing was attached."
         # Workspace copy so the model can send_photo it / re-reference it. Best-effort.
         try:
             ws_path = self._resolve_path(filename)
@@ -4600,6 +5091,7 @@ class ToolExecutor:
                 verdict=verdict,
                 operation="edit",
                 summary=summary,
+                references=_ref_lines,
             ),
             display=self._image_display(
                 "Edited", filename, grounded=_grounded, verdict=verdict,
@@ -4929,50 +5421,121 @@ class ToolExecutor:
     # 15. tts — text-to-speech voice message
     # ------------------------------------------------------------------
     async def _tool_tts(self, inp: Dict[str, Any]) -> str:
-        text = inp.get("text", "").strip()
+        """Synthesise speech and ATTACH it. `generate_audio` is the same body.
+
+        Until round 46 this tool refused unless there was an active Telegram
+        chat, and its `finally:` unlinked the temp file it had just uploaded —
+        so the audio existed for the duration of one Telegram request and
+        audio output was impossible on the app, the web, WhatsApp and voice,
+        while `tts` stayed in the wire array on every one of them. Persisting
+        FIRST is what makes it a real artifact: it lands in the thread, in the
+        file library, and in whatever the channel's own delivery step can
+        carry.
+        """
+        text = (inp.get("text") or "").strip()
         if not text:
             return "ERROR: 'text' is required"
 
-        chat_id = self._chat_id
-        if not chat_id:
-            return "ERROR: No active Telegram chat — TTS only works via Telegram"
-
-        if not self.telegram_bot or not self.telegram_bot.app:
-            return "ERROR: Telegram bot not available"
-
         voice = inp.get("voice", "nova")
-        speed = float(inp.get("speed", 1.0))
+        try:
+            speed = float(inp.get("speed", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
         instructions = inp.get("instructions", None)
 
         from app.agent.tts_providers import synthesize_speech_multi
 
-        provider = inp.get("provider", None)
         audio_path = await synthesize_speech_multi(
             text=text,
-            provider=provider,
+            provider=inp.get("provider", None),
             voice=voice,
             speed=speed,
             instructions=instructions,
             user_id=self._current_user_id,
         )
-
         if audio_path.startswith("ERROR:"):
             return audio_path
 
         try:
-            bot = self.telegram_bot.app.bot
-            with open(audio_path, "rb") as audio_file:
-                await bot.send_voice(chat_id=chat_id, voice=audio_file)
-            return f"Voice message sent ({len(text)} chars, voice={voice})"
-        except Exception as e:
-            logger.exception("[TTS] Failed to send voice message")
-            return f"ERROR: Failed to send voice: {e}"
+            with open(audio_path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return f"ERROR: Could not read synthesised audio: {e}"
         finally:
-            # Clean up temp file
             try:
                 os.unlink(audio_path)
             except OSError:
                 pass
+
+        from app.agent.artifact_kinds import mime_for_filename
+        from app.agent.doc_generators import gen_audio, EmptyDocumentError
+
+        mime = mime_for_filename(audio_path)
+        if not mime.startswith("audio/"):
+            mime = "audio/mpeg"
+        try:
+            att = await gen_audio(
+                data,
+                (inp.get("filename") or "").strip(),
+                user_scope=self._current_user_id or self._user_scope(),
+                mime_type=mime,
+                title=text[:60],
+            )
+        except EmptyDocumentError as exc:
+            return f"ERROR: {exc}"
+        except Exception as exc:
+            logger.warning("[TTS] persist failed err=%s", type(exc).__name__)
+            return "ERROR: Could not save the audio; nothing was attached."
+
+        summary = await self._register_attachment(att, intent="audio")
+        if summary.startswith("ERROR:"):
+            return summary
+        return (f"Spoken audio attached ({len(text)} chars, voice={voice}). "
+                f"The user can play it in the conversation.")
+
+    async def _tool_generate_audio(self, inp: Dict[str, Any]) -> str:
+        """`generate_audio` — the format-named entry point onto the same body,
+        so a user asking to "read it to me" and a user asking for "an mp3" reach
+        one implementation."""
+        return await self._tool_tts(inp)
+
+    async def _tool_generate_data_file(self, inp: Dict[str, Any]) -> str:
+        """CSV / JSON / plain text / source code, through the same `_persist`
+        every other generator uses.
+
+        `csv` has been in the turn-1 gate that unlocks the export tools since
+        that gate was written, with no CSV generator behind it — so "export
+        this as CSV" opened the tool set and the honest answer was not in it
+        (round 46, C9).
+        """
+        from app.agent.doc_generators import (
+            gen_csv, gen_json, gen_text, gen_code, EmptyDocumentError,
+        )
+
+        fmt = (inp.get("format") or "").strip().lower()
+        content = inp.get("content")
+        filename = (inp.get("filename") or "").strip()
+        scope = self._current_user_id or self._user_scope()
+        try:
+            if fmt == "csv":
+                att = await gen_csv(content, filename, user_scope=scope)
+            elif fmt == "json":
+                att = await gen_json(content, filename, user_scope=scope)
+            elif fmt in ("txt", "text"):
+                att = await gen_text(content, filename, user_scope=scope)
+            elif fmt == "code":
+                att = await gen_code(content, filename, user_scope=scope,
+                                     language=inp.get("language"))
+            else:
+                return ("ERROR: format must be one of csv, json, txt, code. For a "
+                        "PDF/Word/Excel/PowerPoint/Markdown file use the "
+                        "generate_pdf / generate_docx / generate_xlsx / "
+                        "generate_pptx / generate_markdown tool instead.")
+        except EmptyDocumentError as exc:
+            return f"ERROR: {exc}"
+        except Exception as exc:
+            return self._docgen_error("generate_data_file", exc)
+        return await self._register_attachment(att)
 
     # ------------------------------------------------------------------
     # 16. sessions_list — list conversation sessions

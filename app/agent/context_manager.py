@@ -155,6 +155,59 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
 
 
+#: Fallback when a block carries no dimensions and no data URI to measure.
+#: 1500 rather than 300: a phone photo at the 1280 px long edge this codebase
+#: now sends measures ~1.1k tokens by the tiling rule below, and the compaction
+#: trigger reads this number — under-counting it by 5x is how an image-heavy
+#: thread sails past the window it was supposed to be compacted for.
+_IMAGE_TOKENS_FALLBACK = 1500
+_IMAGE_TILE_PX = 512
+_IMAGE_TOKENS_PER_TILE = 170
+_IMAGE_TOKENS_BASE = 85
+
+
+def estimate_image_tokens(block: Dict[str, Any]) -> int:
+    """Tokens for one ``image_url`` block, from its PIXELS.
+
+    The flat 300 this replaces could not scale with resolution at all, which
+    is the one property an image's cost actually has. This is the published
+    OpenAI tiling rule (85 base + 170 per 512 px tile after the long edge is
+    fitted to 1536/768); Anthropic's own w*h/750 lands within a factor of ~1.4
+    of it, so one estimate serves both routers.
+
+    Dimensions come from the block when a caller stamped them, else from the
+    base64 length (~0.75 bytes/char ⇒ a rough pixel count at 8:1 compression),
+    else the fallback.
+    """
+    w = block.get("width")
+    h = block.get("height")
+    try:
+        w = int(w) if w else 0
+        h = int(h) if h else 0
+    except Exception:
+        w = h = 0
+    if not (w > 0 and h > 0):
+        url = (block.get("image_url") or {}).get("url") if isinstance(block.get("image_url"), dict) else None
+        if isinstance(url, str) and ";base64," in url:
+            raw_bytes = int(len(url.split(";base64,", 1)[1]) * 0.75)
+            # A compressed photo runs ~8:1 over RGB; the square root turns an
+            # area estimate back into a long edge for the tiling rule.
+            px = max(1, raw_bytes * 8 // 3)
+            side = int(px ** 0.5)
+            w = h = max(1, min(side, 1536))
+        else:
+            return _IMAGE_TOKENS_FALLBACK
+    longest, shortest = max(w, h), min(w, h)
+    if longest > 1536:
+        scale = 1536 / longest
+        longest, shortest = 1536, int(shortest * scale)
+    if shortest > 768:
+        scale = 768 / shortest
+        shortest, longest = 768, int(longest * scale)
+    tiles = -(-longest // _IMAGE_TILE_PX) * -(-max(1, shortest) // _IMAGE_TILE_PX)
+    return _IMAGE_TOKENS_BASE + _IMAGE_TOKENS_PER_TILE * max(1, tiles)
+
+
 def estimate_message_tokens(msg: Dict[str, Any]) -> int:
     """Estimate tokens for a single message (any format)."""
     content = msg.get("content", "")
@@ -172,7 +225,7 @@ def estimate_message_tokens(msg: Dict[str, Any]) -> int:
                 elif block.get("type") in ("tool_use", "tool_result"):
                     total += estimate_tokens(json.dumps(block, default=str))
                 elif block.get("type") == "image_url":
-                    total += 300  # rough estimate for image token cost
+                    total += estimate_image_tokens(block)
                 else:
                     total += estimate_tokens(json.dumps(block, default=str))
             elif isinstance(block, str):

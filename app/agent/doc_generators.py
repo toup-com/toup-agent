@@ -83,13 +83,34 @@ class Attachment:
     width: Optional[int] = None
     height: Optional[int] = None
     has_thumb: bool = False
+    # Round 46 (C9): format was never a field. `kind` is the closed taxonomy
+    # every client and serializer now shares (artifact_kinds.ArtifactKind);
+    # `role` says whether this file is the deliverable, evidence the model
+    # looked at, or a derivative no client should draw a second card for; and
+    # `intent` records the format the user ASKED for when it differs, so a
+    # mismatch is legible on the row itself and not only in the log line.
+    # All three ride the existing Message.attachments JSON column — no
+    # migration, and an old row simply answers None, exactly as width/height
+    # already do.
+    kind: Optional[str] = None
+    role: str = "final"
+    intent: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 def _safe_filename(name: str, default_ext: str) -> str:
-    """Strip directory traversal and ensure the requested extension."""
+    """Strip directory traversal and ensure the requested extension.
+
+    ``default_ext`` must be DOTTED. It is compared with ``endswith`` and then
+    concatenated, so a dotless ``"png"`` turned ``sunset`` into ``sunsetpng.png``
+    and accepted ``x.png`` only by accident — which is exactly what both image
+    call sites passed until round 46 (C7). A dotless extension is always a
+    caller bug, never a thing to paper over.
+    """
+    if not default_ext.startswith("."):
+        raise ValueError(f"_safe_filename: default_ext must be dotted, got {default_ext!r}")
     # Normalize Windows-style separators BEFORE basename — on POSIX,
     # os.path.basename("..\\..\\etc\\x") returns the whole string, which
     # would otherwise survive into the storage key as a literal filename.
@@ -227,6 +248,31 @@ def _derive_filename(
     return f"document-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}{default_ext}"
 
 
+def sniff_image(data: bytes, filename: str, fallback_mime: str = "image/png"):
+    """``(mime, filename)`` corrected against the actual BYTES.
+
+    Every image call site hardcoded ``"image/png"`` regardless of what the
+    provider returned, and passed a DOTLESS ``"png"`` to ``_safe_filename`` —
+    so ``sunset`` shipped as ``sunsetpng.png``, a requested ``.jpg`` was forced
+    to ``.png``, and a JPEG body carried a false MIME on the wire and on disk
+    (round 46, C7). Header-only: Pillow is lazy, so ``.format`` never decodes
+    the pixels. Best-effort — an image whose header will not parse is still an
+    image worth delivering under the caller's guess.
+    """
+    from app.agent.artifact_kinds import canonical_filename, mime_for_pil_format
+
+    mime = fallback_mime
+    try:
+        from PIL import Image as _PILImage  # already a dependency (HEIC decode)
+        with _PILImage.open(io.BytesIO(data)) as im:
+            sniffed = mime_for_pil_format(im.format)
+        if sniffed:
+            mime = sniffed
+    except Exception:
+        logger.debug("attachment: could not sniff image format", exc_info=True)
+    return mime, canonical_filename(filename, mime)
+
+
 # ── Empty-content detection ──────────────────────────────────────
 
 
@@ -281,8 +327,10 @@ def _html_text(html: str) -> str:
     return _HTML_TAG_RE.sub(" ", html or "").strip()
 
 
-def _image_dimensions(data: bytes, mime_type: str) -> tuple[Optional[int], Optional[int]]:
-    """Intrinsic (width, height) for image bytes, or (None, None).
+def _image_dimensions(
+    data: bytes, mime_type: str
+) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """Intrinsic (width, height, PIL format name) for image bytes, else Nones.
 
     Reads the HEADER only — Pillow is lazy, so `.size` never decodes the pixels.
     Deliberately lives in `_persist` rather than in the image tools: EVERY image
@@ -292,15 +340,16 @@ def _image_dimensions(data: bytes, mime_type: str) -> tuple[Optional[int], Optio
     design — a picture is worth delivering even when its header will not parse.
     """
     if not (mime_type or "").startswith("image/"):
-        return None, None
+        return None, None, None
     try:
         from PIL import Image as _PILImage  # already a dependency (HEIC decode)
         with _PILImage.open(io.BytesIO(data)) as im:
             w, h = im.size
-        return (int(w), int(h)) if w > 0 and h > 0 else (None, None)
+            fmt = im.format
+        return (int(w), int(h), fmt) if w > 0 and h > 0 else (None, None, fmt)
     except Exception:
         logger.debug("attachment: could not read image dimensions", exc_info=True)
-        return None, None
+        return None, None, None
 
 
 
@@ -320,21 +369,35 @@ def thumb_key(key: str) -> str:
     return f"{key}.thumb.webp"
 
 
-async def _write_thumbnail(data: bytes, key: str, mime_type: str) -> bool:
-    """Best-effort inline derivative. Returns whether one was written.
+def _render_thumbnail(data: bytes, mime_type: str) -> Optional[bytes]:
+    """The resize itself — synchronous, CPU-bound, run on a thread.
 
-    Never raises: an image that cannot be resized is still an image worth
-    delivering, and the client falls back to the original.
+    Round 46: this ran inline on the event loop of a 1.00-CPU container, once
+    per inbound image, which is the same starvation signature as the incident-2
+    WS-accept delay. Never raises: an image that cannot be resized is still an
+    image worth delivering, and the client falls back to the original.
     """
     if not (mime_type or "").startswith("image/"):
-        return False
+        return None
     try:
         from PIL import Image as _PILImage
+        from app.agent.attachment_limits import MAX_DECODED_IMAGE_PIXELS
+
+        # Same rule as `attachment_ingest.downscale_image`: `open()` reads the
+        # header, `load()` allocates the pixels, and the declared size is
+        # untrusted input. Pillow's default only WARNS up to 2x MAX_IMAGE_PIXELS,
+        # so a small PNG claiming 9000x9000 decodes to ~324 MB with no error
+        # inside a 768 MiB container.
+        _PILImage.MAX_IMAGE_PIXELS = MAX_DECODED_IMAGE_PIXELS
         with _PILImage.open(io.BytesIO(data)) as im:
+            _w, _h = im.size
+            if _w * _h > MAX_DECODED_IMAGE_PIXELS:
+                logger.warning("attachment: derivative skipped px=%d", int(_w) * int(_h))
+                return None
             im.load()
             if max(im.size) <= _THUMB_LONG_EDGE and len(data) < 400_000:
                 # Already small enough that a second copy buys nothing.
-                return False
+                return None
             if im.mode not in ("RGB", "RGBA"):
                 im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
             im.thumbnail((_THUMB_LONG_EDGE, _THUMB_LONG_EDGE), _PILImage.LANCZOS)
@@ -342,23 +405,75 @@ async def _write_thumbnail(data: bytes, key: str, mime_type: str) -> bool:
             im.save(buf, format="WEBP", quality=_THUMB_QUALITY, method=4)
             out = buf.getvalue()
         if not out or len(out) >= len(data):
-            return False   # a derivative that is not smaller is not a derivative
+            return None   # a derivative that is not smaller is not a derivative
+        return out
+    except Exception:
+        logger.debug("attachment: could not write inline derivative", exc_info=True)
+        return None
+
+
+async def _write_thumbnail(data: bytes, key: str, mime_type: str) -> bool:
+    """Best-effort inline derivative. Returns whether one was written."""
+    # Cheap check first: a document has no derivative, and paying a thread hop
+    # (and the await point that comes with it) for every generated PDF is both
+    # waste and a behaviour change — the await lets the preview prewarm task
+    # complete before `_persist` returns.
+    if not (mime_type or "").startswith("image/"):
+        return False
+    out = await asyncio.to_thread(_render_thumbnail, data, mime_type)
+    if not out:
+        return False
+    try:
         await get_storage_backend().put(thumb_key(key), out)
         return True
     except Exception:
-        logger.debug("attachment: could not write inline derivative", exc_info=True)
+        logger.debug("attachment: could not store inline derivative", exc_info=True)
         return False
 
 
-async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) -> Attachment:
+async def _persist(
+    data: bytes,
+    filename: str,
+    mime_type: str,
+    user_scope: str,
+    *,
+    role: str = "final",
+    intent: Optional[str] = None,
+) -> Attachment:
     """Write bytes to storage under {user_scope}/{uuid}_{filename} and return an Attachment."""
     att_id = uuid.uuid4().hex
+    # Header read is Pillow-lazy but still decodes enough to cost milliseconds
+    # on a throttled container; it is also what tells us the file's REAL type.
+    # Only images pay the thread hop — for everything else the call is an
+    # immediate `return None, None, None`.
+    if (mime_type or "").startswith("image/"):
+        width, height, sniffed = await asyncio.to_thread(_image_dimensions, data, mime_type)
+    else:
+        width, height, sniffed = None, None, None
+    # C7 (round 46): every image call site hardcoded "image/png" regardless of
+    # what the provider actually returned, so a JPEG shipped as .png with a
+    # false MIME on the wire and on disk. The bytes are the only honest source,
+    # and this runs BEFORE the storage key is built so the key carries the
+    # corrected name.
+    if sniffed:
+        try:
+            from app.agent.artifact_kinds import canonical_filename, mime_for_pil_format
+            true_mime = mime_for_pil_format(sniffed)
+            if true_mime and true_mime != mime_type:
+                mime_type = true_mime
+            filename = canonical_filename(filename, mime_type)
+        except Exception:
+            logger.debug("attachment: could not canonicalise filename", exc_info=True)
     key = f"{user_scope}/{att_id}_{filename}" if user_scope else f"{att_id}_{filename}"
     backend = get_storage_backend()
     await backend.put(key, data)
     _prewarm_preview(key, mime_type)
-    width, height = _image_dimensions(data, mime_type)
     has_thumb = await _write_thumbnail(data, key, mime_type)
+    try:
+        from app.agent.artifact_kinds import kind_for_mime
+        _kind = kind_for_mime(mime_type, filename)
+    except Exception:
+        _kind = None
     return Attachment(
         id=att_id,
         filename=filename,
@@ -369,6 +484,9 @@ async def _persist(data: bytes, filename: str, mime_type: str, user_scope: str) 
         width=width,
         height=height,
         has_thumb=has_thumb,
+        kind=_kind,
+        role=role,
+        intent=intent,
     )
 
 
@@ -695,6 +813,155 @@ async def gen_markdown(content: str, filename: str, *, user_scope: str) -> Attac
     )
     data = text.encode("utf-8")
     return await _persist(data, filename, MIME_MD, user_scope)
+
+
+# ── Data + text files (round 46) ──────────────────────────────────
+# The deliverable set used to be whatever happened to call _persist: PDF,
+# DOCX, XLSX, PPTX, Markdown and images. `csv` was already advertised by the
+# turn-1 gate that unlocks the export tools (query_intent) with nothing behind
+# it, so "export this as CSV" opened the tool set and the honest answer was not
+# in it. These four go through the same _persist as every other generator, so
+# they inherit the storage key, the attachment id, the library listing and the
+# preview policy for free.
+
+_LANG_EXT = {
+    "python": ".py", "py": ".py", "javascript": ".js", "js": ".js",
+    "typescript": ".ts", "ts": ".ts", "bash": ".sh", "sh": ".sh",
+    "shell": ".sh", "ruby": ".rb", "go": ".go", "rust": ".rs",
+    "java": ".java", "kotlin": ".kt", "swift": ".swift", "c": ".c",
+    "cpp": ".cpp", "csharp": ".cs", "php": ".php", "sql": ".sql",
+    "yaml": ".yaml", "yml": ".yaml", "toml": ".toml", "html": ".html",
+    "css": ".css", "json": ".json", "xml": ".xml", "r": ".r", "lua": ".lua",
+}
+
+
+def _rows_to_csv(content: Any) -> str:
+    """CSV text from a string (passed through), a list of dicts (keys of the
+    first row become the header, in order), or a list of lists."""
+    import csv as _csv
+
+    if isinstance(content, str):
+        return content
+    rows = content if isinstance(content, list) else []
+    if not rows:
+        return ""
+    buf = io.StringIO()
+    if isinstance(rows[0], dict):
+        # Union of keys in first-seen order: a ragged list of dicts must not
+        # silently drop the columns that only later rows carry.
+        header: List[str] = []
+        for r in rows:
+            if isinstance(r, dict):
+                for k in r.keys():
+                    if k not in header:
+                        header.append(k)
+        w = _csv.DictWriter(buf, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            if isinstance(r, dict):
+                w.writerow({k: r.get(k, "") for k in header})
+    else:
+        w = _csv.writer(buf)
+        for r in rows:
+            w.writerow(list(r) if isinstance(r, (list, tuple)) else [r])
+    return buf.getvalue()
+
+
+async def gen_csv(content: Any, filename: str, *, user_scope: str,
+                  title: Optional[str] = None) -> Attachment:
+    from app.agent.artifact_kinds import MIME_CSV
+
+    text = _rows_to_csv(content)
+    if not text.strip():
+        raise EmptyDocumentError("generate_data_file", "content")
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    filename = _derive_filename(filename, ".csv", title=title,
+                                hints=(_first_words(first_line),))
+    return await _persist(text.encode("utf-8"), filename, MIME_CSV, user_scope)
+
+
+async def gen_json(content: Any, filename: str, *, user_scope: str,
+                   title: Optional[str] = None) -> Attachment:
+    """Pretty-printed JSON. A STRING is parsed first and re-serialized: the
+    model hands back JSON-in-a-string constantly, and shipping an unparsed
+    string as application/json is how a client gets a file it cannot read."""
+    import json as _json
+    from app.agent.artifact_kinds import MIME_JSON
+
+    payload = content
+    if isinstance(content, str):
+        s = content.strip()
+        if not s:
+            raise EmptyDocumentError("generate_data_file", "content")
+        try:
+            payload = _json.loads(s)
+        except ValueError as e:
+            raise EmptyDocumentError("generate_data_file", f"valid JSON content ({e})")
+    if payload is None or (isinstance(payload, (list, dict, str)) and not payload):
+        raise EmptyDocumentError("generate_data_file", "content")
+    text = _json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+    filename = _derive_filename(filename, ".json", title=title,
+                                hints=(_first_words(text),))
+    return await _persist(text.encode("utf-8"), filename, MIME_JSON, user_scope)
+
+
+async def gen_text(content: Any, filename: str, *, user_scope: str,
+                   title: Optional[str] = None) -> Attachment:
+    from app.agent.artifact_kinds import MIME_TXT
+
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
+    if not text.strip():
+        raise EmptyDocumentError("generate_data_file", "content")
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    filename = _derive_filename(filename, ".txt", title=title,
+                                hints=(_first_words(first_line),))
+    return await _persist(text.encode("utf-8"), filename, MIME_TXT, user_scope)
+
+
+async def gen_code(content: Any, filename: str, *, user_scope: str,
+                   language: Optional[str] = None,
+                   title: Optional[str] = None) -> Attachment:
+    """A source file. The extension comes from the caller's filename when it
+    already has a code extension, else from ``language``, else ``.txt`` — the
+    extension is what makes the mobile reader syntax-colour it, since every
+    storage backend serves source as text/plain."""
+    from app.agent.artifact_kinds import MIME_TXT, _CODE_EXTS, _EXT_MIME
+
+    text = content if isinstance(content, str) else ("" if content is None else str(content))
+    if not text.strip():
+        raise EmptyDocumentError("generate_data_file", "content")
+    given_ext = os.path.splitext((filename or "").strip())[1].lower()
+    ext = given_ext if given_ext in _CODE_EXTS else _LANG_EXT.get(
+        (language or "").strip().lower(), ".txt")
+    first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    filename = _derive_filename(filename, ext, title=title,
+                                hints=(_first_words(first_line),))
+    # text/plain for anything without a better registered type: the reader
+    # keys off the EXTENSION (artifact_kinds.kind_for_mime) precisely because
+    # this MIME is uninformative for source.
+    return await _persist(text.encode("utf-8"), filename,
+                          _EXT_MIME.get(ext, MIME_TXT), user_scope)
+
+
+# ── Audio (round 46) ──────────────────────────────────────────────
+
+async def gen_audio(data: bytes, filename: str, *, user_scope: str,
+                    mime_type: str = "audio/mpeg",
+                    title: Optional[str] = None) -> Attachment:
+    """Persist synthesised speech as a real attachment.
+
+    Until round 46 the `tts` tool wrote a temp file, uploaded it to Telegram
+    and then `os.unlink`ed it in a `finally` — so audio output was impossible
+    on the app, the web, WhatsApp and voice, while the tool stayed in the wire
+    array on every one of them.
+    """
+    from app.agent.artifact_kinds import ext_for_mime
+
+    if not data:
+        raise EmptyDocumentError("generate_audio", "audio data")
+    ext = ext_for_mime(mime_type, filename) or ".mp3"
+    filename = _derive_filename(filename, ext, title=title)
+    return await _persist(data, filename, mime_type, user_scope)
 
 
 # ── HTML → PDF via weasyprint (agent-side only) ───────────────────

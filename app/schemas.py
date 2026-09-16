@@ -729,13 +729,18 @@ class SessionCreate(BaseModel):
 class SessionMessageCreate(BaseModel):
     """Request to append one message to a session.
 
-    The route also still reads these as query parameters, which is how every
-    caller reached it before this model existed. Voice transcripts can be
-    multi-kilobyte and non-Latin (a Farsi reply is 6 URL-encoded chars per
-    character), which overruns the URL well before it overruns a body — so the
-    body is the supported form and the query params are compatibility only.
+    This model is the ONLY form the route accepts. `role`/`content`/
+    `model_used`/`day_chat_id` used to be declared on the handler as bare
+    scalars too, i.e. as query parameters, and the body merely won when both
+    were present — so the constraint below could be routed around by omitting
+    the field from the body, and a spoken sentence sent the old way landed in
+    the access log. Both are now closed at the handler (R46).
     """
-    role: Optional[str] = None
+    # Constrained like its sibling `MessageCreate` above. The role is written to
+    # the row AND emitted on the live `message` frame, so an arbitrary string
+    # here becomes a role the clients have no rendering path for — and it is
+    # half of the UPSERT key the route now matches on.
+    role: Optional[str] = Field(default=None, pattern="^(user|assistant)$")
     content: Optional[str] = None
     model_used: Optional[str] = None
     day_chat_id: Optional[str] = None
@@ -754,6 +759,25 @@ class SessionMessageCreate(BaseModel):
     # the thread as a bare sentence: no steps, no actions, no sources, nothing
     # openable. Body-only (a list of objects can't ride the query shim).
     tool_events: Optional[List[Dict[str, Any]]] = None
+    # Files the turn PRODUCED, persisted onto the Message.attachments COLUMN —
+    # not into metadata_json. `media`/`tool_events` go to metadata_json because
+    # there is no column for them; `attachments` has one, and every existing
+    # reader (day_chats, sessions, GET /api/files/{message_id}/{aid}) reads it.
+    # Written into metadata_json a picture generated during a voice turn would
+    # exist in storage and be invisible to all of them.
+    attachments: Optional[List[Dict[str, Any]]] = None
+    # An agent-built app presented during the turn ({slug, title, ...}), stored
+    # in metadata_json['app_artifact'] — the key AgentRunner._save_messages
+    # writes and the only one the clients read.
+    app_artifact: Optional[Dict[str, Any]] = None
+    # Idempotency + ordering (R46 C1). `client_msg_id` makes the write an UPSERT
+    # on (conversation_id, client_msg_id) so a replayed persist cannot duplicate
+    # a spoken turn; `occurred_at` is when the utterance HAPPENED (the provider
+    # event), not when the row reached the database, so the two halves of one
+    # turn cannot invert in the thread. Both optional: an older platform build
+    # sends neither and gets exactly today's insert.
+    client_msg_id: Optional[str] = None
+    occurred_at: Optional[datetime] = None
 
 
 class SessionResponse(BaseModel):
@@ -917,6 +941,15 @@ class ChatMessageResponse(BaseModel):
     # unresolvable (deleted / column missing). content is excerpted to
     # 240 chars; see app/agent/reply_quote.py:serialize_reply_target.
     reply_to: Optional[dict] = None
+    # Turn identity (round 46, C1). DECLARE-OR-DROPPED, like every field
+    # above: this model ignores undeclared keys, so omitting them here would
+    # make the session fallback path silently lose the pairing key the app
+    # now uses to recognise its own optimistic row — the exact 2026-09-15
+    # "my message disappeared and came back" defect, restored on the fallback.
+    # Null is UNKNOWN (a pre-existing row, or one written by a container on
+    # the previous image), never "not mine".
+    client_msg_id: Optional[str] = None
+    occurred_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

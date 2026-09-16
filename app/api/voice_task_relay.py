@@ -62,6 +62,14 @@ class VoiceTaskRelay:
         self._monitor: asyncio.Task | None = None
         self._lock = asyncio.Lock()
         self._closed = False
+        # The DAY this socket's tasks belong to, learned from the agent's list
+        # response. A task outlives the socket that started it, so comparing it
+        # against the socket's own conversation id answered "not available in
+        # this conversation" for work the user started two minutes ago and can
+        # still hear running. None until the first sync, and then only ever a
+        # widening of the session check below — never a replacement, because an
+        # agent image without `scope_key` must keep behaving exactly as it does.
+        self._scope: str | None = None
         self._context_ids: set[str] = set()
         self._delivery_acks: set[tuple[str, int]] = set()
         self._client_acks: dict[tuple[str, str], int] = {}
@@ -101,13 +109,26 @@ class VoiceTaskRelay:
         self.start()
         return self._tool_result(canonical)
 
+    def _in_scope(self, task: dict, sid: str) -> bool:
+        """Does this task belong to the conversation this socket is serving?
+
+        Widened from raw session equality to the DAY. Both halves are needed:
+        `scope_key` is absent on an older agent image and on a task submitted
+        before the day stamp existed, and `self._scope` is unset until the first
+        sync — so the session check remains the floor, never the ceiling.
+        """
+        if task.get("session_id") == sid:
+            return True
+        key = task.get("scope_key")
+        return bool(key and self._scope and key == self._scope)
+
     async def control(self, *, action: str, task_id: str, request_id: str,
                       message: str = "") -> str:
         if action not in {"status", "cancel", "steer"} or not task_id or len(task_id) > 64:
             return "ERROR: Invalid task control."
         path = "/api/v1/internal/voice-tasks/" + quote(task_id, safe="")
         task = await self.request("GET", path)
-        if not isinstance(task, dict) or task.get("session_id") != await self.session():
+        if not isinstance(task, dict) or not self._in_scope(task, await self.session()):
             return "ERROR: This task is not available in this conversation."
         if action != "status":
             if action == "steer" and not message.strip():
@@ -363,10 +384,12 @@ class VoiceTaskRelay:
                                     params={"session_id": sid})
         if not isinstance(result, dict) or not isinstance(result.get("tasks"), list):
             return  # An outage proves nothing about the last known job state.
+        if isinstance(result.get("scope_key"), str) and result["scope_key"]:
+            self._scope = result["scope_key"]
         changed = []
         snapshots = result["tasks"][:TASK_LIMIT]
         for task in snapshots:
-            if not isinstance(task, dict) or task.get("session_id") != sid:
+            if not isinstance(task, dict) or not self._in_scope(task, sid):
                 continue
             old = self.tasks.get(task.get("task_id"))
             if await self._merge(task):

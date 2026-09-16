@@ -37,6 +37,7 @@ from sqlalchemy import and_, select, text, update
 from sqlalchemy.exc import ProgrammingError
 
 from app.agent import extension_bridge
+from app.api import _infra_errors as _infra
 from app.api.auth import get_current_user
 from app.config import settings
 from app.db.database import async_session_maker
@@ -261,6 +262,11 @@ async def _list_devices(user_id: str) -> List[Dict[str, Any]]:
     except ProgrammingError:
         return []
     except Exception as exc:
+        # A dead database must not read as "you have paired no devices"
+        # (2026-09-15: the same swallow made GET /api/routines answer 200 []
+        # through an eleven-minute pgbouncer outage). Schema drift above
+        # still degrades to empty.
+        _infra.raise_if_infrastructure(exc)
         logger.debug("[extension] _list_devices read failed: %s", exc)
         return []
 

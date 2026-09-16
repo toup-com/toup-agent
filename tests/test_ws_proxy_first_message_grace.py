@@ -476,12 +476,20 @@ async def test_the_upstream_close_code_is_propagated(monkeypatch):
 
 def test_reserved_close_codes_are_never_put_on_the_wire():
     """1005 (no status) and 1006 (abnormal) are RESERVED — sending either is a
-    protocol violation, and `websockets` reports both."""
-    assert proxy._safe_close_code(1005) == 1000
-    assert proxy._safe_close_code(1006) == 1000
+    protocol violation, and `websockets` reports both.
+
+    Round 46: they are no longer laundered to 1000. Mapping the most abnormal
+    upstream failure onto the most NORMAL close is what left the client with
+    nothing to class on in incident 3 — they now carry 4506
+    (`platform_upstream_lost`), which is still a legal code and is honest
+    about where the connection broke. 1011 joins them: it is what a future
+    uvicorn sends on the same path that gives us 1006 today.
+    See tests/test_ws_proxy_fault_honesty.py."""
+    assert proxy._safe_close_code(1005) == 4506
+    assert proxy._safe_close_code(1006) == 4506
+    assert proxy._safe_close_code(1011) == 4506
     assert proxy._safe_close_code(None) == 1000
     assert proxy._safe_close_code(1000) == 1000
-    assert proxy._safe_close_code(1011) == 1011
     assert proxy._safe_close_code(4503) == 4503
     # 4001 becomes 4503: by the time we propagate, the identity repair has
     # already been attempted, so a retry is safe — and the web client STOPS

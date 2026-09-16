@@ -112,7 +112,14 @@ def setup(monkeypatch):
     """The module with its two outside seams replaced, plus a config box."""
     import app.api.agent_setup as mod
 
-    state: dict[str, Any] = {"config": None, "pushes": []}
+    state: dict[str, Any] = {"config": None, "pushes": [], "deferred": []}
+
+    # R46 fix lane A: the poll now COALESCES — an unchanged snapshot spawns no
+    # task at all. That memory is module-level and every case here uses the
+    # same fake user id, so without this reset the first test's fingerprint
+    # silences the rest of the file.
+    mod._wa_snapshot_written.clear()
+    mod._wa_snapshot_inflight.clear()
 
     async def _get_or_create_config(_user_id, _db):
         return state["config"]
@@ -127,9 +134,36 @@ def setup(monkeypatch):
         state["pushes"].append(kw.get("what"))
         return True
 
+    async def _direct_push(_user_id):
+        # R46 F4a: the qr-status persist no longer goes through
+        # `_bridge_push_within_budget` — it runs behind the response, where
+        # there is no request to budget.
+        state["pushes"].append("whatsapp-qr-allowlist")
+        return True
+
+    def _spawn(coro, name=None):
+        # R46 F4a: the persist is DEFERRED. Capture it so the cases below can
+        # still assert what it wrote, and so "the route answered first" is a
+        # property rather than a silent loss of coverage.
+        state["deferred"].append(coro)
+        return MagicMock()
+
+    from contextlib import asynccontextmanager as _acm
+
+    # ONE session object across the deferred persists, so "how many writes did
+    # four identical polls cost" is still answerable now that the write happens
+    # behind the response on a private session.
+    state["worker_db"] = FakeDb()
+
+    @_acm
+    async def _session():
+        yield state["worker_db"]
+
     monkeypatch.setattr(mod, "_get_or_create_config", _get_or_create_config)
     monkeypatch.setattr(mod, "_bridge_push_within_budget", _push)
-    monkeypatch.setattr(mod, "_env_push_worker", lambda uid: MagicMock())
+    monkeypatch.setattr(mod, "_env_push_worker", _direct_push)
+    monkeypatch.setattr(mod, "_spawn_bg", _spawn)
+    monkeypatch.setattr("app.db.database.async_session_maker", _session)
     return mod, state
 
 
@@ -157,7 +191,24 @@ async def _call_qr_status(mod, state, snapshot: dict, config: FakeConfig,
         return snapshot
 
     monkeypatch.setattr(mod, "_agent_qr_proxy", _proxy)
-    return await mod.whatsapp_qr_status(current_user=_user(), db=FakeDb())
+    out = await mod.whatsapp_qr_status(current_user=_user(), db=FakeDb())
+    # R46 F4a: the route answers the poll and defers its bookkeeping. Drain it
+    # here so every assertion below still describes what actually gets written
+    # — and assert the deferral itself, so a return to a synchronous write
+    # (which is what made a read cost a write, and on the link tick an awaited
+    # bridge push) cannot pass silently.
+    # An UNCHANGED snapshot legitimately spawns nothing (the poll coalesces),
+    # so the assertion is "never synchronous", not "always spawns".
+    _unchanged = mod._wa_snapshot_written.get(str(_user().id)) == mod._wa_snapshot_fp(
+        snapshot
+    )
+    assert state["deferred"] or _unchanged, (
+        "whatsapp_qr_status no longer defers its persist — the poll is paying "
+        "for a write again"
+    )
+    while state["deferred"]:
+        await state["deferred"].pop(0)
+    return out
 
 
 # ── the decision, in isolation ───────────────────────────────────
@@ -433,11 +484,18 @@ class TestQrStatusIsAReadOnlyPoll:
         monkeypatch.setattr(mod, "_agent_qr_proxy", _proxy)
         for _ in range(4):
             await mod.whatsapp_qr_status(current_user=_user(), db=db)
+            # R46 F4a: the write is deferred, so drain it before the next poll
+            # — otherwise "four polls, one write" would be trivially true
+            # because no write ever ran.
+            while state["deferred"]:
+                await state["deferred"].pop(0)
 
+        worker_db = state["worker_db"]
         assert cfg.whatsapp_session_status == "not_linked"
-        assert db.commits == 1, (
-            f"{db.commits} writes for four identical polls — the poll is "
-            f"rewriting a value it already stored"
+        assert db.commits == 0, "the request session wrote; the persist is deferred"
+        assert worker_db.commits == 1, (
+            f"{worker_db.commits} writes for four identical polls — the poll "
+            f"is rewriting a value it already stored"
         )
         assert state["pushes"] == [], "a not-linked poll pushed container env"
         assert cfg.whatsapp_baileys_allowlist is None, (

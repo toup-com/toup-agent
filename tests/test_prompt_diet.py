@@ -261,10 +261,22 @@ def test_doc_generation_diet_keeps_tool_choice_and_convert_rule():
         "generate_pptx",
         "generate_markdown",
         "convert_document",
+        # Round 46 (C9) gave producers to CSV / JSON / txt / code and to
+        # audio. The diet is the LIVE prompt for a diet-enabled tenant, so a
+        # producer missing from this list is a tool the model cannot be told
+        # to use — which is the same defect the round fixed the other way
+        # round (`csv` in the turn-1 gate with no generator behind it).
+        "generate_data_file",
+        "generate_audio",
         "do NOT call generate_pdf",
     ):
         assert kept in DOC_GENERATION_DIET
-    assert _tokens(DOC_GENERATION_DIET) <= 260  # target ~200
+    # 256 → 281 in round 46: two new tool lines, at the shortest wording that
+    # still names what each one makes. Target is still ~200; the video refusal
+    # deliberately does NOT live here — it rides the turn-conditional
+    # `# Requested format` section, which is only built on a turn that asks
+    # for one (format_intent.requested_format_section).
+    assert _tokens(DOC_GENERATION_DIET) <= 285
 
 
 def test_runner_wiring_order_and_both_swap_sites():

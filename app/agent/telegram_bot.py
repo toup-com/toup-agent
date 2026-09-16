@@ -2008,7 +2008,16 @@ class ToupTelegramBot:
                 )
                 return
 
-            logger.info(f"[TG] Voice transcribed: {transcription[:200]}")
+            # Round 46: `transcribe_voice` now returns "" when Whisper heard
+            # nothing (it used to return the literal "(empty transcription)",
+            # which this path forwarded to the agent as if it were speech).
+            if not transcription.strip():
+                await update.message.reply_text("🎤 I couldn't hear anything in that.")
+                return
+
+            # Was `transcription[:200]` — 200 characters of the user's speech
+            # in a log shipped to Loki (round 46 A15).
+            logger.info("[TG] Voice transcribed: chars=%d", len(transcription))
 
             # Process the transcribed text through the agent (no echo to user)
             await self._process_message(update, transcription)
@@ -2154,6 +2163,22 @@ class ToupTelegramBot:
             # Send final response (removes cursor)
             await handler.finalize(final_text, reply_markup=reply_markup)
 
+            # The files this turn produced, on Telegram (round 46, C3). The
+            # bot bypasses BaseChannel entirely, so `make_channel_handler`'s
+            # delivery step never reaches it — and until now a generated
+            # document was persisted on the Message row and echoed to the
+            # app/web sockets while the Telegram reply claimed a file that
+            # never arrived here.
+            try:
+                await self._deliver_turn_attachments(
+                    chat_id, (getattr(response, "persisted", {}) or {}).get("attachments") or [],
+                )
+            except Exception as _att_exc:
+                # No traceback on this path: the frames render the per-user
+                # workspace path and the filename into the shipped trail.
+                logger.warning("[TG] attachment delivery failed err=%s",
+                               type(_att_exc).__name__)
+
             # Remove ACK reaction
             try:
                 await update.message.set_reaction()  # empty = remove
@@ -2200,3 +2225,20 @@ class ToupTelegramBot:
         finally:
             # Remove cancel flag so /stop shows "Nothing to stop" when idle
             self._cancel_flags.pop(chat_id, None)
+
+    async def _deliver_turn_attachments(self, chat_id, attachments: list) -> None:
+        """Send this turn's generated files on Telegram.
+
+        The loop itself lives in `channels/shared/message_handler` (the bot
+        never goes through a BaseChannel adapter, but the DECISIONS — role,
+        size limit, which verb per kind, the honest closing line — are the
+        same ones, and a second copy of them drifts). It is also the only way
+        this path can be driven by a test: the CI test image deliberately
+        leaves `python-telegram-bot` out, so anything importable only from
+        this module is permanently skipped.
+        """
+        if not self.app:
+            return
+        from app.agent.channels.shared.message_handler import deliver_bot_attachments
+
+        await deliver_bot_attachments(self.app.bot, chat_id, attachments)

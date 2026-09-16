@@ -176,9 +176,12 @@ async def test_session_message_lands_in_todays_local_day_chat():
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://agent") as ac:
+        # Body-only since round 46: the query form put every voice transcript
+        # in the access log (the relay always sent the body; the query copy
+        # was a redundant shim, now refused).
         resp = await ac.post(
             f"/api/sessions/{conv_id}/messages",
-            params={"role": "user", "content": "post-midnight voice turn"},
+            json={"role": "user", "content": "post-midnight voice turn"},
         )
         assert resp.status_code == 201, resp.text
 

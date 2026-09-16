@@ -72,7 +72,8 @@ _MESSAGES_DDL = """CREATE TABLE IF NOT EXISTS messages (
     memories_retrieved_json TEXT, processing_time_ms INTEGER,
     metadata_json TEXT, embedding_json TEXT, embedding BLOB,
     channel VARCHAR(50), source VARCHAR(50), origin VARCHAR(50),
-    reply_to_message_id VARCHAR(50), attachments TEXT
+    reply_to_message_id VARCHAR(50), attachments TEXT,
+    client_msg_id VARCHAR(100), occurred_at TIMESTAMP
 )"""
 
 

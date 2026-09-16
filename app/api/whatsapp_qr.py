@@ -24,8 +24,9 @@ the agent's API key — no separate auth pipeline needed.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.auth import get_current_user
@@ -33,6 +34,18 @@ from app.api.auth import get_current_user
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/whatsapp/qr", tags=["WhatsApp QR Pairing"])
+
+# How long a pairing request may wait for a restarting adapter.
+#
+# The budget that matters is WAIT + WORK, not the wait alone: this route waits
+# here and only THEN calls the sidecar, whose own mint is capped at ~8 s
+# (`requestPairingCodeWhenReady`, bounded by `_SIDECAR_HTTP_TIMEOUT_S` = 10 s).
+# 6 + 10 = 16 s, so the two platform call sites that can now wait
+# (`/whatsapp/qr-start`, `/whatsapp/pair-code`) pass `timeout_s=18.0` instead
+# of `_agent_qr_proxy`'s 10 s default — otherwise the platform 504s on a
+# request this route is still holding and a valid code exists on the sidecar
+# that nobody reads. Move one number and move the other.
+_ADAPTER_WAIT_BUDGET_S = 6.0
 
 
 def _require_active_channel():
@@ -59,6 +72,49 @@ def _require_active_channel():
     return channel
 
 
+async def _await_active_channel(budget_s: float = _ADAPTER_WAIT_BUDGET_S):
+    """The live adapter, waiting out a restart in flight (R46 F2).
+
+    A restart is not atomic with registration: between `stop()` and the new
+    `register()` the registry is empty, and this route used to answer 503
+    within milliseconds of looking — which is how a 2.6 s internal transition
+    reached the user as two failures the client had to paper over with a blind
+    1800 ms retry (incident 2026-09-15, 14:48:20.990 / 14:48:23.367). The
+    restart path publishes an event; this awaits it. It is NOT a poll and NOT
+    the fix for the incident — F1 removes the restart itself — it is the
+    bounded safety net for the restarts that remain real (mode change, sick
+    sidecar, boot).
+    """
+    from app.agent.channels.whatsapp_baileys import (
+        adapter_restart_in_flight, await_active_baileys_channel,
+        get_active_baileys_channel,
+    )
+
+    # No adapter and nothing starting one is the PRE-EXISTING condition —
+    # QR-link mode is not configured on this agent. Answer it exactly as
+    # before, immediately: waiting 6 s to say "not configured" would be a new
+    # kind of slow, and the platform proxy has its own copy for this case.
+    if get_active_baileys_channel() is None and not adapter_restart_in_flight():
+        return _require_active_channel()
+
+    channel = await await_active_baileys_channel(budget_s)
+    if channel is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "whatsapp_adapter_starting",
+                "message": (
+                    "The WhatsApp channel is still starting on your agent. "
+                    "Try again in a moment."
+                ),
+                # The client honours this instead of guessing a sleep.
+                "retry_after_s": 3,
+            },
+            headers={"Retry-After": "3"},
+        )
+    return channel
+
+
 @router.post("/start")
 async def qr_start(_user=Depends(get_current_user)):
     """Trigger a fresh QR pairing.
@@ -68,7 +124,7 @@ async def qr_start(_user=Depends(get_current_user)):
     is already in flight cancels it and starts a new one — exactly
     what the user wants when they click "Connect via QR" again.
     """
-    channel = _require_active_channel()
+    channel = await _await_active_channel()
     await channel.kick_pair()
     return {"ok": True}
 
@@ -102,7 +158,11 @@ class PairCodeRequest(BaseModel):
 
 
 @router.post("/pair-code")
-async def qr_pair_code(payload: PairCodeRequest, _user=Depends(get_current_user)):
+async def qr_pair_code(
+    payload: PairCodeRequest,
+    _user=Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
     """Mint an 8-character WhatsApp pairing code for single-device linking.
 
     The mobile app cannot scan its own QR, so we use Baileys'
@@ -112,11 +172,18 @@ async def qr_pair_code(payload: PairCodeRequest, _user=Depends(get_current_user)
     ``/qr/status`` reports ``session_status="linked"`` exactly as the
     QR flow would.
     """
-    channel = _require_active_channel()
+    channel = await _await_active_channel()
     try:
-        code = await channel.request_pairing_code(payload.phone)
+        code = await channel.request_pairing_code(
+            payload.phone, idempotency_key=idempotency_key,
+        )
     except Exception as exc:
-        logger.exception("[WHATSAPP-QR] pair_code.failed")
+        # Class name, no traceback: the exception here is built from the
+        # sidecar's own error body, which can echo the E.164 being paired —
+        # and `RedactUserIdentifiers` masks `record.getMessage()` only, never
+        # `record.exc_info`, so a `logger.exception` would ship the number to
+        # Loki unmasked.
+        logger.warning("[WHATSAPP-QR] pair_code.failed err=%s", type(exc).__name__)
         raise HTTPException(status_code=502, detail=f"Pairing-code request failed: {str(exc)[:200]}")
     return {"ok": True, "pairing_code": code, "phone": payload.phone}
 

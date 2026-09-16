@@ -405,6 +405,8 @@ _STEP_LABELS = {
     "generate_markdown": "Building a document",
     "generate_html_to_pdf": "Building a document",
     "convert_document": "Building a document",
+    "generate_data_file": "Building a file",
+    "generate_audio": "Recording audio",
     "memory_store": "Saving notes",
     "memory_delete": "Updating notes",
     "memory_search": "Checking notes",

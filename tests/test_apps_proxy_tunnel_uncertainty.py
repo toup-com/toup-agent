@@ -162,3 +162,55 @@ async def test_safe_get_tunnel_failure_keeps_direct_fallback(monkeypatch):
 
     assert response is direct_result
     assert direct_calls == 1
+
+
+# ── an unreachable agent is not an empty workspace (R46/L8) ──────
+#
+# 2026-09-15: `GET /api/routines` answered 200 with `[]` through an
+# eleven-minute database outage, and a user looking at their automations was
+# told they had none. `GET /api/apps/` carried the same swallow
+# ("Return empty list, not 502"), and the same degrade on `GET /jobs/` had
+# already shown the founder an empty board during live ticks (2026-07-16).
+# An empty list is a FACT about the user's account; it must never be how a
+# failure renders.
+
+
+@pytest.mark.asyncio
+async def test_list_apps_says_unavailable_rather_than_showing_an_empty_workspace(
+    monkeypatch,
+):
+    async def _agent(*a, **k):
+        return ("http://127.0.0.1:9999", "k", None)
+
+    class _Client:
+        async def get(self, *a, **k):
+            raise OSError("connection refused")
+
+    monkeypatch.setattr(tunnel, "is_agent_connected", lambda _user_id: False)
+    monkeypatch.setattr(apps_proxy, "_get_agent", _agent)
+    monkeypatch.setattr(
+        "app.services.agent_http.get_agent_http_client", lambda: _Client(),
+    )
+
+    response = await apps_proxy.list_apps(
+        current_user=SimpleNamespace(id="same-user"), db=object(),
+    )
+    assert response.status_code == 503, "an unreachable agent must not read as []"
+    assert _body(response)["code"] == "backend_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_a_user_with_no_agent_still_gets_a_truthful_empty_list(monkeypatch):
+    """The counterweight: "no agent configured" IS an empty workspace, and
+    turning that into an error would brick onboarding."""
+    async def _no_agent(*a, **k):
+        return None
+
+    monkeypatch.setattr(tunnel, "is_agent_connected", lambda _user_id: False)
+    monkeypatch.setattr(apps_proxy, "_get_agent", _no_agent)
+
+    response = await apps_proxy.list_apps(
+        current_user=SimpleNamespace(id="same-user"), db=object(),
+    )
+    assert response.status_code == 200
+    assert _body(response) == []

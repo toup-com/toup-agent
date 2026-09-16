@@ -93,6 +93,11 @@ TOOLS_RECALL: FrozenSet[str] = frozenset({
 TOOLS_DOCGEN: FrozenSet[str] = frozenset({
     "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",
     "generate_markdown", "generate_html_to_pdf", "convert_document",
+    # Round 46: the gate has advertised `csv` since it was written and there
+    # was no CSV generator behind it. These two close that hole — without
+    # them the new producers are invisible on turn 1, which is the same
+    # defect the other way round.
+    "generate_data_file", "generate_audio",
 })
 
 # Work tracking — the progress-card tools the platform-knowledge decision
@@ -510,11 +515,26 @@ _SCHEDULING_PATTERNS_RE = re.compile(
 #      save as / as a file / attach(ment).
 # Follow-ups after an offer ("yes please, PDF") reach here too: a
 # format word skips the greeting shortcuts in classify_query_intent.
-_DOCUMENT_INTENT_RE = re.compile(
+#   4. (round 46) The formats round 46 gave producers to: csv/json/txt/code
+#      via generate_data_file, and audio via generate_audio. `csv` was
+#      already in alternation 1 with NO generator behind it — asking to
+#      "export this as CSV" opened the export tool set and the honest answer
+#      was not in it. `DOCUMENT_FORMAT_ALTERNATION` is exported so
+#      `format_intent` and this gate cannot disagree about what counts as
+#      naming a format; the parity is asserted by
+#      tests/test_format_intent_contract.py.
+DOCUMENT_FORMAT_ALTERNATION = (
     r'\b(?:pdfs?|docx?|word\s+(?:doc(?:ument)?|file)s?|xlsx?|excel|spreadsheets?'
     r'|workbooks?|csv|pptx?|powerpoint|slides?|slide\s*decks?|decks?'
-    r'|presentations?|markdown)\b'
-    r'|\.md\b'
+    r'|presentations?|markdown|json|txt|mp3|audio\s+(?:file|version|clip)'
+    r'|voice\s*(?:note|memo|message)|podcasts?|text[\s-]to[\s-]speech'
+    r'|plain[\s-]text\s+file|text\s+file|shell\s+script|python\s+file)\b'
+    r'|\.md\b|\.(?:py|js|ts|sh|rb|go|rs|java|sql)\b'
+    r'|\bread\s+(?:it|this|that|them|the\s+\S+)\s+(?:out\s+loud|aloud|to\s+me)\b'
+)
+
+_DOCUMENT_INTENT_RE = re.compile(
+    DOCUMENT_FORMAT_ALTERNATION +
     r'|\b(?:make|write|create|generate|draft|prepare|produce|build|compile'
     r'|put\s+together|turn\s+(?:this|that|it)\s+into|convert|export|give\s+me'
     r'|send\s+me|i\s+(?:need|want))\b(?:\s+\S+){0,6}?\s+'

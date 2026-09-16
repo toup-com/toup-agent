@@ -301,9 +301,20 @@ async def proxy_to_agent(
         # The agent is the authority on duplicates, unsupported types, size
         # limits and gate refusals — surfacing those as 502 would tell the user
         # "your agent is down" when in fact it answered precisely.
+        # The typed reason IS the refusal: `X-Toup-Reason` is what both clients
+        # read to name WHICH file failed and why (`attachment_unsupported` can
+        # never succeed; `upload_failed` invites a retry). Dropping it here
+        # turned every agent-authored refusal into the generic retry sentence
+        # the moment the platform's own pre-check and the agent's disagreed.
+        _canonical = {"x-toup-reason": "X-Toup-Reason", "retry-after": "Retry-After"}
+        _typed = {
+            _canonical[k.lower()]: v for k, v in resp.headers.items()
+            if k.lower() in _canonical
+        }
         raise HTTPException(
             status_code=resp.status_code,
             detail=_agent_detail(resp, "Your agent rejected this request."),
+            headers=_typed or None,
         )
 
     logger.warning("Agent proxy %s %s returned %s", method, url, resp.status_code)

@@ -2427,6 +2427,50 @@ async def proxy_openai_image_edits(
     return resp_data
 
 
+def _decode_image_sources(body: dict) -> list[tuple[bytes, str]]:
+    """The edit sources on a Kie request: `images_b64` first, else `image_b64`.
+
+    ``images_b64`` is ``[{b64, mime}, …]`` in render order — entry 0 is the
+    BASE, the rest are references. An agent that predates references sends only
+    ``image_b64``, and an agent that has them sends BOTH (the scalar for the
+    base) so either side of a mixed fleet renders the same picture. Raises 400
+    on bad base64 or an overflow, before any billable work.
+    """
+    import base64 as _b64m
+    from app.services.kie_client import KIE_MAX_IMAGE_INPUT
+
+    raw = body.get("images_b64")
+    out: list[tuple[bytes, str]] = []
+    if isinstance(raw, list) and raw:
+        if len(raw) > KIE_MAX_IMAGE_INPUT:
+            raise HTTPException(400, (
+                f"images_b64 accepts at most {KIE_MAX_IMAGE_INPUT} images "
+                f"(1 base + {KIE_MAX_IMAGE_INPUT - 1} references); got {len(raw)}"
+            ))
+        for i, item in enumerate(raw):
+            if isinstance(item, str):
+                b64, mime = item, "image/png"
+            elif isinstance(item, dict):
+                b64 = item.get("b64") or item.get("image_b64") or ""
+                mime = item.get("mime") or item.get("image_mime") or "image/png"
+            else:
+                raise HTTPException(400, f"images_b64[{i}] must be an object or a base64 string")
+            if not b64:
+                raise HTTPException(400, f"images_b64[{i}] carries no base64 data")
+            try:
+                out.append((_b64m.b64decode(b64), mime))
+            except Exception:
+                raise HTTPException(400, f"images_b64[{i}] is not valid base64")
+        return out
+    image_b64 = body.get("image_b64")
+    if not image_b64:
+        return []
+    try:
+        return [(_b64m.b64decode(image_b64), body.get("image_mime") or "image/png")]
+    except Exception:
+        raise HTTPException(400, "image_b64 is not valid base64")
+
+
 @router.post("/kie/image")
 async def proxy_kie_image(
     request: Request,
@@ -2474,14 +2518,15 @@ async def proxy_kie_image(
     start_ts = time.time()
     try:
         if mode == "edit":
-            image_b64 = body.get("image_b64")
-            if not image_b64:
-                raise HTTPException(400, "edit mode requires image_b64")
             try:
-                src = _b64.b64decode(image_b64)
-            except Exception:
-                raise HTTPException(400, "image_b64 is not valid base64")
-            result = await kie_client.edit(prompt, src, body.get("image_mime") or "image/png")
+                srcs = _decode_image_sources(body)
+            except HTTPException:
+                await release_free_image_slot(db, _img_slot)
+                raise
+            if not srcs:
+                await release_free_image_slot(db, _img_slot)
+                raise HTTPException(400, "edit mode requires image_b64")
+            result = await kie_client.edit(prompt, sources=srcs)
         else:
             result = await kie_client.generate(prompt, body.get("size"))
     except kie_client.KieError as e:
@@ -2500,6 +2545,16 @@ async def proxy_kie_image(
              if result.credits_consumed else float(settings.kie_fallback_cents))
     cents_d = Decimal(str(round(cents, 4)))
     credits = max(_MIN_IMAGE_CREDITS, underlying_cost_to_credits(cents_d))
+    # The charge is per RENDER, and the render on this route is not idempotent:
+    # it holds one request open for the whole job, so a retry is a second Kie
+    # job by construction — already paid for, in real money. Letting the CALLER
+    # choose the ledger key made every render after the first free
+    # (`try_charge` short-circuits on a prior (user_id, idempotency_key) row and
+    # returns idempotent_hit with no deduction), i.e. unlimited billed-to-Toup
+    # renders for one charge, reachable by anything holding the tenant's token.
+    # The start+poll pair below is the path with real render idempotency — its
+    # reservation marker is keyed on the caller's key BEFORE the render — and it
+    # is the one the agent uses.
     charge_id = str(uuid.uuid4())
     try:
         await credit_service.try_charge(
@@ -2543,6 +2598,7 @@ async def proxy_kie_image_start(
     """
     from app.services import kie_client
     from app.services.credit_service import reserve_free_image_slot, release_free_image_slot
+    from app.db.models import BUCKET_MESSAGE, CreditReservation, RESERVATION_OPEN
 
     config = await _auth_agent(request, db)
     _enforce_rate_limit(config)
@@ -2552,6 +2608,38 @@ async def proxy_kie_image_start(
     if not prompt:
         raise HTTPException(400, "prompt is required")
 
+    # ── Render idempotency ─────────────────────────────────────────────
+    # A started Kie job is a BILLED job (the hold below exists so an abandoned
+    # render still stays paid for). So a retry of THIS route — a dropped
+    # response, an agent restart mid-call — must return the job that already
+    # exists rather than start a second one and charge the user twice for one
+    # request. The marker is a `credit_reservations` row under a key of the
+    # caller's choosing: its UNIQUE (user_id, idempotency_key) index is the
+    # atomic claim, and `event_type` is deliberately NOT an image ledger type
+    # so it is invisible to the free-tier cap's count of open image holds.
+    # The lookup FAILS OPEN: a marker we cannot read means we start the render,
+    # which is today's behaviour, never a refusal.
+    _idem = str(body.get("idempotency_key") or "").strip()[:100]
+    _idem_key = f"kie_idem:{_idem}" if _idem else ""
+    if _idem_key:
+        try:
+            _prior = (await db.execute(
+                select(CreditReservation).where(
+                    CreditReservation.user_id == config.user_id,
+                    CreditReservation.idempotency_key == _idem_key,
+                )
+            )).scalar_one_or_none()
+        except Exception:
+            logger.exception("[kie] idempotency lookup failed user=%s", config.user_id[:8])
+            _prior = None
+        if _prior is not None and (_prior.metadata_json or {}).get("task_id"):
+            _meta = _prior.metadata_json or {}
+            logger.info("[kie] start deduped user=%s task=%s",
+                        config.user_id[:8], str(_meta.get("task_id"))[:12])
+            return {"task_id": _meta.get("task_id"),
+                    "reservation_id": _meta.get("free_slot"),
+                    "status": "pending", "deduped": True}
+
     exceeded, used, limit, _img_slot = await reserve_free_image_slot(db, config.user_id)
     if exceeded:
         raise HTTPException(status_code=429, detail={
@@ -2560,29 +2648,48 @@ async def proxy_kie_image_start(
                         f"you've used them all. Upgrade for unlimited images."),
         })
 
-    src: Optional[bytes] = None
+    srcs: list[tuple[bytes, str]] = []
     if mode == "edit":
-        image_b64 = body.get("image_b64")
-        if not image_b64:
+        try:
+            srcs = _decode_image_sources(body)
+        except HTTPException:
+            await release_free_image_slot(db, _img_slot)
+            raise
+        if not srcs:
             await release_free_image_slot(db, _img_slot)
             raise HTTPException(400, "edit mode requires image_b64")
-        try:
-            import base64 as _b64m
-            src = _b64m.b64decode(image_b64)
-        except Exception:
-            await release_free_image_slot(db, _img_slot)
-            raise HTTPException(400, "image_b64 is not valid base64")
 
     try:
         task_id = await kie_client.start_task(
-            mode, prompt, size=body.get("size"), image_bytes=src,
-            mime=body.get("image_mime") or "image/png")
+            mode, prompt, size=body.get("size"), sources=srcs or None)
     except kie_client.KieError as e:
         await release_free_image_slot(db, _img_slot)   # nothing started → free it
         raise HTTPException(status_code=502, detail={
             "code": "kie_failed", "moderation": bool(e.moderation),
             "message": str(e)[:300],
         })
+
+    if _idem_key:
+        # Written AFTER createTask so the marker can only ever name a job that
+        # really exists. A crash in the window between the two loses the marker
+        # and a retry starts a second render — exactly today's behaviour, and
+        # the reason this is a narrowing of the window rather than a proof.
+        try:
+            db.add(CreditReservation(
+                user_id=config.user_id, event_type="kie_idem",
+                bucket=BUCKET_MESSAGE, estimated_amount=Decimal("0"),
+                status=RESERVATION_OPEN, idempotency_key=_idem_key,
+                event_id=f"kie_task:{task_id}",
+                metadata_json={"task_id": task_id, "free_slot": _img_slot,
+                               "mode": mode, "sources": len(srcs)},
+                expires_at=datetime.utcnow() + timedelta(
+                    seconds=int(float(getattr(settings, "kie_job_timeout_s", 420.0))) + 600),
+            ))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.exception("[kie] idempotency marker write failed user=%s",
+                             config.user_id[:8])
 
     # Hold the estimated cost NOW that a real (billable) render is running.
     # The charge used to live only in /poll, so a job that was started and never

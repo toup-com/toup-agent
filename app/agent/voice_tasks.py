@@ -21,6 +21,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
+from app.agent.artifact_kinds import kind_for_mime, preview_policy
 from app.agent.operation_identity import (
     mutation_invalidates_read,
     resolved_operation_is_read,
@@ -177,14 +178,29 @@ def _wire_artifact(artifact: dict[str, Any], message_id: Optional[str]) -> dict[
     }
     if aid and message_id:
         payload["download_url"] = f"{settings.api_prefix}/files/{message_id}/{aid}"
-        if mime.startswith("image/") or mime in {
-            "application/pdf",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        }:
+        # ONE preview policy for every surface (L7's artifact_kinds). This
+        # function used to carry its own third copy of the MIME set, and that
+        # copy silently omitted PPTX — the same file was previewable in chat
+        # and not previewable when a durable voice task produced it.
+        if preview_policy(mime) != "none":
             payload["preview_url"] = (
                 f"{settings.api_prefix}/files/{message_id}/{aid}/preview?format=html"
             )
+        if artifact.get("has_thumb"):
+            # Without it a task's image loaded the full-resolution original
+            # into a ~370pt card; the live chat frame and the REST history path
+            # both carry the thumb already.
+            payload["thumb_url"] = (
+                f"{settings.api_prefix}/files/{message_id}/{aid}?variant=thumb"
+            )
+    # Intrinsic to the file, not to the URL — so outside the guard above, or a
+    # card with no message id yet lays out at a guessed ratio until it decodes.
+    if artifact.get("width") and artifact.get("height"):
+        payload["width"] = artifact["width"]
+        payload["height"] = artifact["height"]
+    payload["kind"] = artifact.get("kind") or kind_for_mime(mime, payload["filename"])
+    if artifact.get("role"):
+        payload["role"] = artifact["role"]
     return payload
 
 
@@ -202,6 +218,10 @@ def _snapshot(job: BuildJob) -> dict[str, Any]:
     return {
         "task_id": job.id, "job_id": job.id,
         "session_id": job.conversation_id, "request_id": state.get("request_id"),
+        # Additive: the identity a CLIENT may compare against. Falls back to the
+        # conversation id for rows written before the day stamp existed, so an
+        # old task keeps behaving exactly as it does today.
+        "scope_key": state.get("day_chat_id") or job.conversation_id,
         "title": job.title, "status": _public_status(job, state),
         "user_message": state.get("user_message") or job.title,
         "generation": int(state.get("generation") or 0),
@@ -460,6 +480,12 @@ class VoiceTaskService:
             now = _now()
             state = {
                 "request_id": request_id, "fingerprint": fingerprint,
+                # The DAY this task belongs to, captured once at submit. It is
+                # what scopes the task afterwards: keying on the conversation id
+                # alone made a task unaddressable the moment the voice socket
+                # reconnected (a new Conversation, a new id), so "cancel that"
+                # seconds later answered "not available in this conversation".
+                "day_chat_id": conv.day_chat_id,
                 "requested_model": model or "", "original_prompt": message,
                 "execution_prompt": message, "user_message": user_message,
                 "client_tz": client_tz, "run_number": 0, "generation": 0,
@@ -505,13 +531,33 @@ class VoiceTaskService:
     async def list(self, *, user_id: str, session_id: str, limit: int = 24) -> dict[str, Any]:
         await self.start()
         async with self.session_maker() as db:
-            jobs = (await db.execute(select(BuildJob).where(
-                BuildJob.user_id == user_id, BuildJob.source_kind == SOURCE_KIND,
-                BuildJob.conversation_id == session_id,
-            ).order_by(BuildJob.created_at.desc()).limit(
-                min(100, max(1, limit))
-            ))).scalars().all()
-            return {"tasks": [_snapshot(job) for job in reversed(jobs)]}
+            # Scope by the DAY, not by the socket. A task survives the call that
+            # started it (the module docstring says so), but its list did not:
+            # any reconnect or second call created a new Conversation, and the
+            # work the user started minutes earlier vanished from the resume
+            # snapshot while still running.
+            scope_key = (await db.execute(select(Conversation.day_chat_id).where(
+                Conversation.id == session_id, Conversation.user_id == user_id,
+            ))).scalar_one_or_none()
+            where = [BuildJob.user_id == user_id, BuildJob.source_kind == SOURCE_KIND]
+            if scope_key:
+                where.append(BuildJob.conversation_id.in_(
+                    select(Conversation.id).where(
+                        Conversation.user_id == user_id,
+                        Conversation.day_chat_id == scope_key,
+                    )
+                ))
+            else:
+                where.append(BuildJob.conversation_id == session_id)
+            jobs = (await db.execute(select(BuildJob).where(*where).order_by(
+                BuildJob.created_at.desc()
+            ).limit(min(100, max(1, limit))))).scalars().all()
+            return {
+                "tasks": [_snapshot(job) for job in reversed(jobs)],
+                # What the caller should compare a task against. Absent on an
+                # older agent image; the relay then falls back to session_id.
+                "scope_key": scope_key or session_id,
+            }
 
     async def ack(
         self, *, user_id: str, task_id: str, revision: int, kind: str,
@@ -549,9 +595,14 @@ class VoiceTaskService:
                         expected_status="queued",
                     )
                     _enqueue_lifecycle(db, job, state)
-                    await self._persist_message(db, job, state)
+                    _result_frame = await self._persist_message(db, job, state)
                     await db.commit()
-                    return _snapshot(job)
+                    _cancelled, _uid = _snapshot(job), job.user_id
+                    # Terminal, and it announced nothing at all: the
+                    # cancellation row reached an open thread only on the next
+                    # history fetch. Every terminal path announces its row.
+                    await self._broadcast(_uid, _cancelled, message=_result_frame)
+                    return _cancelled
                 waiting = job.status == WAITING
                 if not state.get("cancel_requested_at"):
                     state["cancel_requested_at"] = _iso()
@@ -943,10 +994,19 @@ class VoiceTaskService:
 
     async def _persist_message(
         self, db, job: BuildJob, state: dict[str, Any], result=None,
-    ) -> None:
+    ) -> Optional[dict[str, Any]]:
+        """Commit the task's result row. Returns the LIVE FRAME for it.
+
+        The row was always written correctly and never announced: a task the
+        user started by voice reached an already-open thread only on the next
+        history fetch, so it looked like nothing had happened for as long as the
+        user kept reading. The frame is built here, from the row we just wrote,
+        because only this function knows the message id the artifact URLs are
+        scoped to; it is SENT by `_broadcast`, after the commit.
+        """
         conv = await db.get(Conversation, job.conversation_id)
         if not conv or conv.user_id != job.user_id:
-            return
+            return None
         message_id = str(uuid.uuid5(_TASK_NAMESPACE, f"result:{job.id}"))
         msg = await db.get(Message, message_id)
         fresh = msg is None
@@ -999,6 +1059,22 @@ class VoiceTaskService:
                 last_message_at=_now(),
             ).execution_options(synchronize_session=False))
         job.summary_message_id = message_id
+        from app.api.message_frames import message_frame
+        return message_frame(
+            msg,
+            channel="voice",
+            day_chat_id=msg.day_chat_id,
+            attachments=[
+                _wire_artifact(a, message_id)
+                for a in (state.get("artifacts") or [])
+            ],
+            # The row id is stable across generations, so a task corrected by
+            # `steer` finishes a second time under the id the first result
+            # already used. `state_revision` is monotonic per job, so "a higher
+            # revision replaces what is on screen" is a rule the client can
+            # apply without knowing anything about tasks.
+            revision=int(getattr(job, "state_revision", 0) or 0),
+        )
 
     async def _finish_owned(
         self, task_id: str, user_id: str, token: str, outcome: str, *,
@@ -1006,6 +1082,7 @@ class VoiceTaskService:
         error_code: Optional[str] = None, allow_expired: bool = False,
     ) -> Optional[dict[str, Any]]:
         snapshot: Optional[dict[str, Any]] = None
+        _result_frame: Optional[dict[str, Any]] = None
         async with self._locks.setdefault(task_id, asyncio.Lock()):
             async with self.session_maker() as db:
                 job = await self._lookup(db, user_id, task_id, lock=True)
@@ -1084,7 +1161,7 @@ class VoiceTaskService:
                     )
                 except _LeaseLost:
                     return None
-                await self._persist_message(db, job, state, result=result)
+                _result_frame = await self._persist_message(db, job, state, result=result)
                 _enqueue_lifecycle(db, job, state)
                 db.add(JobEvent(
                     job_id=job.id, user_id=job.user_id, kind="output_posted",
@@ -1093,7 +1170,7 @@ class VoiceTaskService:
                 await db.commit()
                 snapshot = _snapshot(job)
         if snapshot:
-            await self._broadcast(user_id, snapshot)
+            await self._broadcast(user_id, snapshot, message=_result_frame)
         # _completed removes the old handle before waking the supervisor. A
         # direct wake here could reclaim this same queued task while the old
         # handle still occupies (and is about to mutate) the handle slot.
@@ -1122,13 +1199,16 @@ class VoiceTaskService:
                     )
                 except _LeaseLost:
                     return
-                await self._persist_message(db, job, state)
+                _result_frame = await self._persist_message(db, job, state)
                 _enqueue_lifecycle(db, job, state)
                 await db.commit()
                 snapshot, uid = _snapshot(job), job.user_id
-        await self._broadcast(uid, snapshot)
+        await self._broadcast(uid, snapshot, message=_result_frame)
 
-    async def _broadcast(self, user_id: str, snapshot: dict[str, Any]) -> None:
+    async def _broadcast(
+        self, user_id: str, snapshot: dict[str, Any],
+        message: Optional[dict[str, Any]] = None,
+    ) -> None:
         try:
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(user_id, {
@@ -1138,6 +1218,12 @@ class VoiceTaskService:
             await broadcast_to_user(
                 user_id, {"type": "voice_task.updated", "task": snapshot}
             )
+            if message:
+                # The RESULT ROW itself, so an open thread paints the answer as
+                # it lands instead of on the next history fetch. Safe to repeat:
+                # the row id is the deterministic uuid5(result:<job id>) and the
+                # client de-dupes by id, so a re-broadcast is a no-op.
+                await broadcast_to_user(user_id, message)
         except Exception:
             logger.debug(
                 "Voice task broadcast unavailable; canonical state remains persisted"
@@ -1213,14 +1299,14 @@ class VoiceTaskService:
 
     async def _expire_running_in_session(
         self, db, *, now: datetime, jobs: Optional[list[BuildJob]] = None,
-    ) -> list[tuple[str, dict[str, Any]]]:
+    ) -> list[tuple[str, dict[str, Any], Optional[dict[str, Any]]]]:
         if jobs is None:
             jobs = (await db.execute(select(BuildJob).where(
                 BuildJob.source_kind == SOURCE_KIND, BuildJob.status == RUNNING,
                 BuildJob.claim_expires_at.is_not(None),
                 BuildJob.claim_expires_at <= now,
             ).with_for_update(skip_locked=True))).scalars().all()
-        expired: list[tuple[str, dict[str, Any]]] = []
+        expired: list[tuple[str, dict[str, Any], Optional[dict[str, Any]]]] = []
         for job in jobs:
             if (job.status != RUNNING or not job.claim_expires_at
                     or job.claim_expires_at > now):
@@ -1242,9 +1328,13 @@ class VoiceTaskService:
             job.claim_expires_at = None
             job.state_revision = int(job.state_revision or 0) + 1
             job.config_json = _config(job, state)
-            await self._persist_message(db, job, state)
+            # Terminal (failed / outcome unknown). The row was written and never
+            # announced, so a lease expiry reached an open thread only on the
+            # next history fetch — the same half of the defect the finish path
+            # already closed.
+            _result_frame = await self._persist_message(db, job, state)
             _enqueue_lifecycle(db, job, state)
-            expired.append((job.user_id, _snapshot(job)))
+            expired.append((job.user_id, _snapshot(job), _result_frame))
         return expired
 
     async def _expire_running(
@@ -1271,8 +1361,8 @@ class VoiceTaskService:
                         db, now=now, jobs=[job] if job is not None else []
                     )
                     await db.commit()
-                for user_id, snapshot in rows:
-                    await self._broadcast(user_id, snapshot)
+                for user_id, snapshot, result_frame in rows:
+                    await self._broadcast(user_id, snapshot, message=result_frame)
                 expired += len(rows)
             except Exception:
                 # One malformed historical row must not roll back a healthy
@@ -1690,6 +1780,13 @@ class VoiceTaskService:
                     )
                 except _LeaseLost:
                     return
+                # NOT broadcast: WAITING → queued is not a terminal transition,
+                # and the result row it writes is still the placeholder
+                # ("Working on: <title>", or the last checkpoint's text). The
+                # row id is deterministic and ChatScreen de-dupes by id with no
+                # update path, so an intermediate broadcast PINS the
+                # placeholder and the real answer — sent later under the same id
+                # — is discarded. Only terminal paths announce the row.
                 await self._persist_message(db, job, state)
                 await db.commit()
                 snapshot, uid = _snapshot(job), job.user_id
@@ -1736,11 +1833,11 @@ class VoiceTaskService:
                     )
                 except _LeaseLost:
                     return
-                await self._persist_message(db, job, state)
+                _result_frame = await self._persist_message(db, job, state)
                 _enqueue_lifecycle(db, job, state)
                 await db.commit()
                 snapshot, uid = _snapshot(job), job.user_id
-        await self._broadcast(uid, snapshot)
+        await self._broadcast(uid, snapshot, message=_result_frame)
 
     async def _database_tick(
         self, *, now: datetime,

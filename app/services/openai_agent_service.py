@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -19,6 +20,51 @@ from openai import AsyncOpenAI, RateLimitError, APIConnectionError, Authenticati
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# A canned `response.completed` used ONLY by `OpenAIAgentService.warm()` to
+# drive the SDK's stream parser once. Minimal but structurally real: the
+# expensive part is the union/discriminator resolution for the Response and
+# its output items, which this exercises.
+_WARM_RESPONSE_COMPLETED: Dict[str, Any] = {
+    "type": "response.completed",
+    "sequence_number": 0,
+    "response": {
+        "id": "resp_warm",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "warm",
+        "output": [
+            {
+                "id": "msg_warm",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "", "annotations": []}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "usage": {
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 0,
+        },
+        "metadata": {},
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "max_output_tokens": None,
+        "previous_response_id": None,
+        "reasoning": None,
+        "text": {"format": {"type": "text"}},
+        "truncation": "disabled",
+        "user": None,
+    },
+}
 
 
 def _abort_rather_than_replay(emitted_any: bool, exc: Exception, attempt: int) -> bool:
@@ -263,23 +309,100 @@ class OpenAIAgentService:
         # means the only way to round-trip it is echoing the encrypted
         # content back on the next turn's input. Bounded FIFO.
         self._responses_reasoning: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # `warm()` reaches `_ensure_client` from a worker thread (round 46);
+        # everything else reaches it from the loop. See `_ensure_client`.
+        import threading as _threading
+        self._client_lock = _threading.RLock()
         self._ensure_client()
 
     def _ensure_client(self):
-        """Rebuild the OpenAI client if the API key has changed."""
+        """Rebuild the OpenAI client if the API key has changed.
+
+        Locked, and the version stamp is written LAST. Until round 46 this ran
+        only on the event-loop thread, so the two-step update was atomic by
+        construction; `warm()` now calls it from `asyncio.to_thread`, and a
+        turn landing inside that ~500 ms bind window could otherwise read the
+        NEW version beside the OLD client and early-return — on a freshly
+        claimed container the old client is `AsyncOpenAI(api_key="missing")`,
+        i.e. the first turn 401s. Uncontended in the normal case."""
         if self._key_version == self._keys.version and self.client is not None:
             return
-        self._key_version = self._keys.version
+        with self._client_lock:
+            if self._key_version == self._keys.version and self.client is not None:
+                return
+            version = self._keys.version
 
-        from app.services.bundle_client import make_openai_client
-        client = make_openai_client(byok_key=self._keys.openai or None)
-        if client is None:
-            logger.warning("OpenAI client could not be built (no key, not in bundle mode)")
-            self.client = AsyncOpenAI(api_key="missing")
-            return
-        self.client = client
-        logger.info("[OPENAI] Client rebuilt (mode=%s, v%d)",
-                    settings.llm_mode, self._key_version)
+            from app.services.bundle_client import make_openai_client
+            client = make_openai_client(byok_key=self._keys.openai or None)
+            if client is None:
+                logger.warning("OpenAI client could not be built (no key, not in bundle mode)")
+                self.client = AsyncOpenAI(api_key="missing")
+                self._key_version = version
+                return
+            self.client = client
+            self._key_version = version
+            logger.info("[OPENAI] Client rebuilt (mode=%s, v%d)",
+                        settings.llm_mode, self._key_version)
+
+    # ------------------------------------------------------------------
+    # First-use warm  (round 46, A1)
+    # ------------------------------------------------------------------
+    def warm(self) -> float:
+        """Pay the SDK's once-per-process lazy work here instead of inside
+        the user's first turn. Returns milliseconds spent. Never raises.
+
+        Two costs, both measured on 2026-09-15 with openai==2.53.0 /
+        pydantic==2.13.5 (fresh process, 3 runs, unthrottled M-series):
+
+          * `client.responses` is a `@cached_property` whose body is
+            `from .resources.responses import AsyncResponses` — 134-141 ms
+            on the first touch, 0.0003 ms after.
+          * the first `construct_type(ResponseStreamEvent, …)` of a
+            `response.completed` — the SDK's own stream parse path — is
+            202-214 ms, and 0.42-0.54 ms on every subsequent call. A ~400x
+            ratio: that is pydantic building the core schema for the
+            Response/output-item union, not the payload.
+
+        343 ms total, unthrottled. It does NOT account for the 9.47 s
+        whole-process freeze on pool-82, which is why `loop_health` ships
+        alongside; this removes a measured third of a second of on-loop
+        first-use work from the user's first turn and claims nothing more.
+
+        MUST be called off the loop (`asyncio.to_thread`): both halves hold
+        the import lock / GIL, and running them on the loop is the defect,
+        not the fix.
+        """
+        t0 = time.perf_counter()
+        try:
+            self._ensure_client()
+            client = self.client
+            if client is None:
+                return 0.0
+            # (a) the lazy resource imports
+            _ = client.responses
+            _ = client.chat.completions
+            # (b) the pydantic core schemas for the Responses stream union,
+            #     driven through the SDK's own parser so we warm exactly the
+            #     path `AsyncStream.__stream__` takes and not a lookalike.
+            from openai._models import construct_type
+            from openai.types.responses import ResponseStreamEvent
+
+            construct_type(type_=ResponseStreamEvent, value=_WARM_RESPONSE_COMPLETED)
+        except Exception:
+            # A warm that can fail a bind is worse than a cold wire.
+            logger.debug("[OPENAI] warm skipped", exc_info=True)
+            return 0.0
+        finally:
+            # In a `finally`: the fact `llm_wire_warm` reports is "the
+            # once-per-process work has been ATTEMPTED here", and this is its
+            # only producer. Marked on the success path alone, one swallowed
+            # failure — a private import the SDK moves, a client that could
+            # not be built — left the flag false for the life of the process.
+            # It is a `turn_ready_detail` DIAGNOSTIC and never a term of
+            # `serving` (D1), precisely because a single silent producer must
+            # not be able to refuse a container that answers turns.
+            mark_wire_warm()
+        return (time.perf_counter() - t0) * 1000.0
 
     # ------------------------------------------------------------------
     # Streaming completion  (main interface used by agent_runner)
@@ -1242,6 +1365,29 @@ class OpenAIAgentService:
             else:
                 oai.append(converted)
         return oai
+
+
+# ---------------------------------------------------------------------------
+# LLM-wire warm state (round 46, A1)
+# ---------------------------------------------------------------------------
+# Read by `/agent/health` as `turn_ready_detail.llm_wire_warm`. Lives here
+# rather than in a new module so the health handler reads it from the service
+# that owns the fact — and so `warm()` cannot be called without setting it.
+_wire_warm_at: Optional[float] = None
+
+
+def mark_wire_warm() -> None:
+    global _wire_warm_at
+    if _wire_warm_at is None:
+        _wire_warm_at = time.time()
+
+
+def wire_warm() -> bool:
+    return _wire_warm_at is not None
+
+
+def wire_warm_at() -> Optional[float]:
+    return _wire_warm_at
 
 
 # ---------------------------------------------------------------------------
