@@ -295,6 +295,63 @@ def test_wipe_probes_the_pooler_before_running_psql(monkeypatch):
     assert calls == [], "psql must not be attempted against a dead pooler"
 
 
+def test_a_wipe_timeout_is_infrastructure_not_a_slot_fault(monkeypatch):
+    """2026-09-16 03:09-05:26Z: a 30 s wipe budget under a host at load 40-60
+    scored every generic spawn `db_wipe:TimeoutExpired`, three strikes each,
+    and the ledger held ten spare slots for six hours. A slow TRUNCATE is the
+    host's fault, never the slot's — it must come out as PoolerUnavailable
+    (deferred, retried next tick, no strike), exactly like a dead pooler."""
+    import subprocess as _sp
+    real = _fresh("pool_addon_wipe_timeout_uut")
+    real._pooler_reachable = lambda: True
+
+    def _hang(*a, **k):
+        raise _sp.TimeoutExpired(cmd=a[0], timeout=k.get("timeout"))
+
+    monkeypatch.setattr(_sp, "run", _hang)
+    with pytest.raises(real.PoolerUnavailable) as ei:
+        real._wipe_pool_db("07", "pw")
+    assert "slot 07" in str(ei.value) and "not the slot" in str(ei.value)
+
+
+def test_the_wipe_budget_is_generous_and_tunable(monkeypatch):
+    """A TRUNCATE of ~60 tables through the pooler on a loaded host takes
+    tens of seconds; 30 s scored it as broken. The default must leave room,
+    and an operator with a slower Postgres must be able to widen it without
+    a code change."""
+    import subprocess as _sp
+    real = _fresh("pool_addon_wipe_budget_uut")
+    assert real.WIPE_TIMEOUT_S >= 120
+    monkeypatch.setenv("BRIDGE_POOL_WIPE_TIMEOUT_S", "7")
+    tuned = _fresh("pool_addon_wipe_budget_tuned_uut")
+    assert tuned.WIPE_TIMEOUT_S == 7
+    seen: dict = {}
+
+    class _R:
+        returncode = 0
+        stderr = ""
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: seen.update(k) or _R())
+    tuned._pooler_reachable = lambda: True
+    tuned._wipe_pool_db("07", "pw")
+    assert seen.get("timeout") == 7, "the env budget is not what psql is given"
+
+
+def test_a_wipe_timeout_never_reaches_the_spawn_ledger():
+    """The classification above is only worth something if the spawn path
+    keeps its PoolerUnavailable branch AHEAD of the generic one that strikes
+    the ledger. Source pin on that order."""
+    src = BRIDGE.read_text()
+    i_wipe = src.index("await _offload(_wipe_pool_db, slot, db_pw)")
+    i_defer = src.index("except PoolerUnavailable as e:", i_wipe)
+    i_strike = src.index('_fail_spawn(slot, port, f"db_wipe:{type(e).__name__}")', i_wipe)
+    assert i_wipe < i_defer < i_strike, (
+        "a wipe timeout must be caught as PoolerUnavailable before the generic "
+        "branch scores it against the slot"
+    )
+    assert "except subprocess.TimeoutExpired" in src[src.index("def _wipe_pool_db"):src.index("def _wipe_pool_db") + 4000]
+
+
 # ── 4. the reload token bucket ───────────────────────────────────
 
 
