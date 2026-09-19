@@ -3381,6 +3381,278 @@ async def _authenticate_ws_session_token(token: str) -> Optional[str]:
     return user_id
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Job cards
+#
+# The `role='job'` pointer row that keeps a job visible in the thread
+# across a reload. Everything below is at MODULE level, not in
+# `_broadcast_reader`'s closure where it lived, because the value that
+# reached the database and the ORDER of the bookkeeping around it were
+# both the defect — and a closure inside a WebSocket handler is reachable
+# by no test, only by a grep of the source.
+# ══════════════════════════════════════════════════════════════════════
+
+#: The card is durable — written by this call, or already in the table.
+_JOB_CARD_WRITTEN = "written"
+#: There is no real conversation to point the card at *yet*. A later frame
+#: of the same job may resolve one, so this outcome is retryable.
+_JOB_CARD_NO_TARGET = "no_target"
+#: This writer is not the owner of this job's card, and never will be: the
+#: job row exists, it is an `auto_builder` build, and it names NO
+#: conversation at all — there is nothing to point at, ever. That is
+#: `app_builder`'s build/modify class (its TaskSpec sets no
+#: conversation_id, JobRunner.create_job copies only what the spec holds,
+#: and `_exec_modify_app` inserts the row bare), whose cards are written at
+#: turn end by the `_pending_job_cards` block further down this file.
+#: Answered once and never re-asked. An `auto_builder` job that DOES carry
+#: a back-link is NOT this case — app_html's `ensure_job` stamps
+#: `turn_deep_link()[0]`, and an adopted job keeps the `create_job` tool's
+#: id while its type flips — so it answers `_JOB_CARD_NO_TARGET` and keeps
+#: the retry budget and the terminal-frame grace.
+_JOB_CARD_NOT_OURS = "not_ours"
+#: The write raised. Distinct from every outcome above: an exception is an
+#: anomaly, not a race, and it is logged at WARNING every time.
+_JOB_CARD_ERROR = "error"
+
+#: How many frames of ONE job one socket will spend looking for a
+#: conversation that is not visible yet. The write is retryable, but the
+#: frames are not rare — a job emits one per step — so an unbounded retry
+#: would put a SELECT on every frame of a job whose conversation never
+#: shows up.
+_JOB_CARD_MAX_TRIES = 12
+#: Separate, much smaller budget for writes that RAISED.
+_JOB_CARD_MAX_ERRORS = 3
+
+
+def _job_frame_is_terminal(event: dict) -> bool:
+    """True when this ``job_update`` frame reports a finished job.
+
+    The vocabulary is `app.agent.job_status.TERMINAL_STATUSES` — completed
+    / failed / cancelled / timeout / budget_exhausted — never a literal
+    list copied to this file.
+    """
+    from app.agent.job_status import TERMINAL_STATUSES
+
+    return (event.get("status") or "") in TERMINAL_STATUSES
+
+
+class _JobCardBudget:
+    """One socket's job-card bookkeeping."""
+
+    __slots__ = ("closed", "tries", "final_try", "errors")
+
+    def __init__(self) -> None:
+        #: Jobs this socket will not ask about again: the card is durable
+        #: (written here, or already in the table), or it belongs to
+        #: another writer. It never means "we gave up" — that case is
+        #: bounded by the counters below instead, so the reason a card was
+        #: abandoned stays readable in one log line.
+        self.closed: set = set()
+        #: Frames spent looking for a conversation that is not visible yet.
+        self.tries: dict = {}
+        #: Jobs whose TERMINAL frame has spent its one guaranteed attempt.
+        self.final_try: set = set()
+        #: Writes that raised, on their own budget.
+        self.errors: dict = {}
+
+    def may_try(self, job_id: str, terminal: bool) -> bool:
+        if job_id in self.closed:
+            return False
+        if self.errors.get(job_id, 0) >= _JOB_CARD_MAX_ERRORS:
+            return False
+        if self.tries.get(job_id, 0) < _JOB_CARD_MAX_TRIES:
+            return True
+        # A terminal frame ALWAYS gets an attempt, one beyond the ordinary
+        # budget. The in-turn frames can spend the whole budget while the
+        # conversation is genuinely still uncommitted — the deferred
+        # pre-save paths commit it at turn end — and the last frame of a
+        # job is the one most likely to find it there.
+        return terminal and job_id not in self.final_try
+
+
+async def _persist_job_card(
+    user_id: str, event: dict, tz: Optional[str] = None,
+) -> str:
+    """Write the ``role='job'`` pointer row for one ``job_update`` frame.
+
+    Answers `_JOB_CARD_WRITTEN`, `_JOB_CARD_NO_TARGET` or
+    `_JOB_CARD_NOT_OURS`; only `_JOB_CARD_NO_TARGET` is worth re-trying on
+    a later frame of the same job.
+
+    The conversation id has to be a REAL one. ``messages.conversation_id``
+    is NOT NULL onto ``conversations.id`` and every day-chat reader INNER
+    JOINs through it (api/day_chats.py), so a synthetic value is both
+    rejected by Postgres and unreadable where it is accepted. From
+    2026-04-13 this writer synthesised ``build-<job id prefix>`` — a value
+    no writer in the repo has ever inserted into ``conversations`` — so the
+    INSERT violated ``messages_conversation_id_fkey`` on 100% of attempts
+    and every chat-originated ``agent_task`` card was lost. The app_builder
+    cards hid it: they are re-written at turn end against
+    ``response.session_id`` (the ``_pending_job_cards`` block below), which
+    is where the real id was available all along.
+
+    ``tz`` is the client's IANA zone from the message payload, and the day
+    has to be the client's like every other writer in this file: without
+    the override ``_resolve_day_chat_id_for_now`` falls back to
+    ``users.timezone``, which is nullable (so UTC) and can be stale, and
+    this card would then be filed under a different local day than every
+    other row of the same turn. The sibling turn-end writer (the
+    ``_pending_job_cards`` block below) passes the same
+    ``tz_override=client_tz`` for the ``job-<id>`` rows it owns — those are
+    the rows this writer answers ``_JOB_CARD_NOT_OURS`` for, so the two do
+    not meet today, and keeping one override between them is what stops
+    them disagreeing if they ever do. Keep both call sites reading it.
+    """
+    from sqlalchemy import select as _sel
+
+    from app.db.database import async_session_maker as _sm
+    from app.db.models import BuildJob as _BJ, Conversation as _Conv, Message as _Msg
+
+    _jid = event["job_id"]
+    _mid = f"job-{_jid}"
+    async with _sm() as _jdb:
+        if await _jdb.get(_Msg, _mid):
+            return _JOB_CARD_WRITTEN
+
+        async def _owned(_cid: str) -> bool:
+            """The FK target exists AND belongs to this user — the same
+            pair the pre-save checks (`_ensure_presave_conversation`). A
+            frame can outrun the conversation's own commit, so a miss is
+            retryable rather than fatal."""
+            return bool((await _jdb.execute(
+                _sel(_Conv.id).where(_Conv.id == _cid, _Conv.user_id == user_id)
+            )).scalar_one_or_none())
+
+        # `chat_id` is the turn's conversation (tool_executor.turn_deep_link
+        # -> _SESSION_ID_CTX). The reaper, the reconciler's cancel arm and
+        # the sub-agent orchestrator broadcast without it.
+        _frame_conv = (event.get("chat_id") or "").strip() or None
+        _conv_id = _frame_conv if (_frame_conv and await _owned(_frame_conv)) else None
+        _job = None
+        _job_conv = None
+        if not _conv_id:
+            # Fall through to the job row's own back-link even when the
+            # frame DID carry a chat_id. The two agree today (both come from
+            # `_SESSION_ID_CTX`), but a present-and-unusable chat_id is a
+            # real shape — agent_runner mints `subagent:<hex>` session ids
+            # with no Conversation row at all — and gating this lookup on
+            # "the frame carried nothing" made it dead for precisely the
+            # frames that could have needed it.
+            _job = await _jdb.get(_BJ, _jid)
+            _job_conv = (getattr(_job, "conversation_id", None) or "").strip() or None
+            if _job_conv and _job_conv != _frame_conv and await _owned(_job_conv):
+                _conv_id = _job_conv
+
+        if not _conv_id:
+            # Permanent only when the row names NOTHING to point at. A
+            # back-link that merely failed `_owned` above is the retryable
+            # case the budget exists for — the conversation can commit
+            # later in the same turn — so it must not be closed here.
+            if (
+                _job is not None
+                and not _job_conv
+                and (getattr(_job, "job_type", "") or "") == "auto_builder"
+            ):
+                return _JOB_CARD_NOT_OURS
+            return _JOB_CARD_NO_TARGET
+
+        _jdb.add(_Msg(
+            id=_mid,
+            conversation_id=_conv_id,
+            day_chat_id=await _resolve_day_chat_id_for_now(
+                _jdb, user_id, tz_override=tz,
+            ),
+            role="job",
+            content=_job_marker(
+                _jid,
+                event.get("name") or "App Build",
+                event.get("job_type"),
+            ),
+        ))
+        await _jdb.commit()
+        return _JOB_CARD_WRITTEN
+
+
+async def _write_job_card(
+    user_id: str,
+    event: dict,
+    budget: _JobCardBudget,
+    tz: Optional[str] = None,
+) -> Optional[str]:
+    """One ``job_update`` frame's whole job-card side effect: attempt the
+    write, book the attempt, log it once at the right level.
+
+    Returns the `_persist_job_card` outcome, `_JOB_CARD_ERROR` if the write
+    raised, or None when the budget said not to try at all.
+
+    Never raises. `_broadcast_reader` awaits this on every `job_update`
+    frame, and an exception escaping here would kill the task that forwards
+    EVERY event to this socket — a lost job card must not cost the user
+    their live chat. The budget check is inside the try for that reason.
+    """
+    _jid = event["job_id"]
+    try:
+        if not budget.may_try(_jid, _job_frame_is_terminal(event)):
+            return None
+        _res = await _persist_job_card(user_id, event, tz=tz)
+    except Exception as _pe:
+        # The TYPE, never the exception body: a DB error stringifies its
+        # bound parameters, and this row's parameters include the job
+        # marker — i.e. the user's own words (the leak
+        # api/message_cards.py documents).
+        _errs = budget.errors.get(_jid, 0) + 1
+        budget.errors[_jid] = _errs
+        logger.warning(
+            "[WS] job card write failed for job %s: %s (error %d/%d)",
+            _jid[:8], type(_pe).__name__, _errs, _JOB_CARD_MAX_ERRORS,
+        )
+        return _JOB_CARD_ERROR
+
+    if _res == _JOB_CARD_WRITTEN:
+        # The latch sits BELOW the attempt that earns it. Claiming the id
+        # first is what made the FK failure documented on
+        # `_persist_job_card` permanent for the life of the socket: the
+        # card was never even re-tried.
+        budget.closed.add(_jid)
+        budget.tries.pop(_jid, None)
+        return _res
+
+    if _res == _JOB_CARD_NOT_OURS:
+        # A correct, permanent answer rather than a failure: stop asking,
+        # and say so at DEBUG. A warning here is what made every healthy
+        # app build announce a card it had not lost.
+        budget.closed.add(_jid)
+        logger.debug(
+            "[WS] job card for job %s is written at turn end, not here",
+            _jid[:8],
+        )
+        return _res
+
+    _tries = budget.tries.get(_jid, 0)
+    if _tries < _JOB_CARD_MAX_TRIES:
+        budget.tries[_jid] = _tries + 1
+    else:
+        budget.final_try.add(_jid)
+    if budget.tries.get(_jid, 0) >= _JOB_CARD_MAX_TRIES and _jid in budget.final_try:
+        # Both the budget and the terminal frame's guaranteed attempt are
+        # gone, so this card really is lost — worth one line, and exactly
+        # one, because `may_try` answers False from here on. A card dropped
+        # in silence is how this writer stayed broken from 2026-04-13.
+        logger.warning(
+            "[WS] job card dropped for job %s: no conversation to point at "
+            "(gave up after %d tries)",
+            _jid[:8], _JOB_CARD_MAX_TRIES + 1,
+        )
+    else:
+        # Ordinary on an early frame — on the deferred pre-save paths the
+        # conversation commits at turn end — so DEBUG, per frame.
+        logger.debug(
+            "[WS] job card not persisted yet for job %s (try %d/%d)",
+            _jid[:8], budget.tries.get(_jid, 0), _JOB_CARD_MAX_TRIES,
+        )
+    return _res
+
+
 @router.websocket("/ws/chat")
 async def ws_chat(
     websocket: WebSocket,
@@ -3624,7 +3896,10 @@ async def ws_chat(
 
         async def _broadcast_reader():
             """Forward broadcast events to this WebSocket."""
-            _persisted_job_ids: set = set()
+            # This socket's job-card retry bookkeeping. The policy is
+            # `_JobCardBudget` / `_write_job_card` at module level, so it
+            # can be tested; only the per-socket STATE lives here.
+            _job_cards = _JobCardBudget()
 
             try:
                 while True:
@@ -3638,35 +3913,24 @@ async def ws_chat(
                         print(f"[BROADCAST_READER] Send FAILED: type={etype} error={e}", flush=True)
                         break
 
-                    # Persist job cards to DB so they survive page reload
+                    # Persist the job card so the thread still shows it
+                    # after a reload. Everything about that — the attempt,
+                    # the retry budget, the log level — is
+                    # `_write_job_card`, at module level: this closure is
+                    # where the bookkeeping USED to live, and its order was
+                    # the defect.
                     if etype == "job_update" and event.get("job_id"):
-                        _jid = event["job_id"]
-                        if _jid not in _persisted_job_ids:
-                            _persisted_job_ids.add(_jid)
-                            try:
-                                from app.db.database import async_session_maker as _sm
-                                from app.db.models import Message as _Msg
-                                from sqlalchemy import select as _sel
-                                async with _sm() as _jdb:
-                                    _existing = await _jdb.execute(
-                                        _sel(_Msg).where(_Msg.id == f"job-{_jid}")
-                                    )
-                                    if not _existing.scalar_one_or_none():
-                                        _job_dc = await _resolve_day_chat_id_for_now(_jdb, user_id)
-                                        _jdb.add(_Msg(
-                                            id=f"job-{_jid}",
-                                            conversation_id=f"build-{_jid[:8]}",
-                                            day_chat_id=_job_dc,
-                                            role="job",
-                                            content=_job_marker(
-                                                _jid,
-                                                event.get("name", "App Build"),
-                                                event.get("job_type"),
-                                            ),
-                                        ))
-                                        await _jdb.commit()
-                            except Exception as _pe:
-                                print(f"[BROADCAST_READER] Job persist failed: {_pe}", flush=True)
+                        # The client's zone, straight from the message
+                        # loop's own local, so this card and the turn-end
+                        # one agree about which local day they belong to.
+                        # Read defensively: this task starts before the
+                        # first message binds it, and reading a free
+                        # variable before its assignment raises NameError.
+                        try:
+                            _tz = client_tz
+                        except NameError:
+                            _tz = None
+                        await _write_job_card(user_id, event, _job_cards, tz=_tz)
             except asyncio.CancelledError:
                 print(f"[BROADCAST_READER] Cancelled for user={user_id[:8]}", flush=True)
 

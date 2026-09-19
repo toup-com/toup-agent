@@ -685,8 +685,16 @@ def test_flat_tool_metering_is_measure_only_by_default():
 
 async def test_credit_health_monitor_catches_both_incident_signatures():
     """The incident was queryable for months and nobody looked. This asserts
-    the monitor actually fires on the two shapes that defined it: a denied
-    charge that still cost us provider money, and a duplicate one-time grant.
+    the monitor actually fires on the two shapes that defined it: an account
+    being served work a denial refused to bill, over and over, and a duplicate
+    one-time grant.
+
+    Updated 2026-09-18: the denied side is now written as the LOOP it really
+    was — 274 rows over hours on one account. A single sub-second burst is a
+    CROSSING since the shortfall settlement (the turn that crosses zero
+    settles what the wallet holds and is still recorded denied), so it is
+    counted and not paged; pinning a page on that shape would pin the
+    permanent ⚠️ this round removed. The incident's own signature still pages.
     """
     from app.db import async_session_maker
     from app.db.models import (
@@ -698,13 +706,21 @@ async def test_credit_health_monitor_catches_both_incident_signatures():
     await _grant_via_balance(uid)   # writes the legitimate plan_grant pair
 
     async with async_session_maker() as db:
-        # A charge denied by the cap, for work a provider already billed us for.
-        db.add(CreditLedger(
-            id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_CHAT_MESSAGE,
-            bucket=BUCKET_MESSAGE, amount=Decimal("0"), balance_after=Decimal("100"),
-            underlying_cost_cents=Decimal("28"),
-            metadata_json={"denied": True, "reason": "daily_cap_exceeded"},
-        ))
+        # Charges denied by the cap, for work a provider already billed us for
+        # — spread over two hours, because that is the incident: the refusal
+        # kept not stopping the work. `created_at` is explicit for the same
+        # reason the monitor's own tests pin it: four rows written in a tick
+        # are one turn's crossing burst, which is a different signature.
+        t0 = datetime.utcnow() - timedelta(hours=3)
+        for i in range(4):
+            db.add(CreditLedger(
+                id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_CHAT_MESSAGE,
+                bucket=BUCKET_MESSAGE, amount=Decimal("0"),
+                balance_after=Decimal("100"),
+                underlying_cost_cents=Decimal("28"),
+                metadata_json={"denied": True, "reason": "daily_cap_exceeded"},
+                created_at=t0 + timedelta(minutes=40 * i),
+            ))
         # A SECOND one-time grant — the re-grant loop's fingerprint.
         db.add(CreditLedger(
             id=str(uuid.uuid4()), user_id=uid, event_type=LEDGER_PLAN_GRANT,
@@ -726,7 +742,10 @@ async def test_credit_health_monitor_catches_both_incident_signatures():
     assert result["readings"]["users_with_duplicate_grants"] >= 1
     assert result["readings"]["served_unbilled_calls"] >= 1
     assert result["readings"]["served_unbilled_usd"] >= 0.28
-    assert any(a.startswith("served_unbilled") for a in result["alerts"])
+    assert "served_unbilled_loop" in result["alerts"], (
+        "the 2026-08-03 denied-but-served shape is a loop and must still page"
+    )
+    assert result["readings"]["served_unbilled_loop_accounts"] == 1
     assert {c for c, _ in sent} >= {"credit-served-unbilled", "credit-duplicate-grants"}
 
 

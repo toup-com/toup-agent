@@ -305,3 +305,41 @@ def test_cap_of_zero_disables_it(monkeypatch):
         loop.run_until_complete(
             alerting.send_infra_alert("c", "warning", f"m{i}", subject=f"u{i}"))
     assert len(posts) == 8
+
+
+# ── "not configured" is not "refused" ─────────────────────────────────
+
+
+def test_infra_alerts_configured_reads_the_same_target_as_the_sender(monkeypatch):
+    """`send_infra_alert` answers False for THREE different things — not
+    configured, rate-limited, refused — so a caller that keeps its own retry
+    state (the fleet watch in rollout_service) needs to tell "nobody is
+    listening" from "Telegram said no": the first must consume the window,
+    the second must be retried.
+
+    The point of the assertions below is that there is ONE resolution: two
+    copies of the token/chat fallback pair is how a caller comes to believe
+    alerting is configured while the sender disagrees.
+    """
+    # The autouse fixture leaves the infra bot configured.
+    assert alerting.infra_alerts_configured() is True
+
+    monkeypatch.setattr(alerting.settings, "infra_alert_telegram_token", "", raising=False)
+    monkeypatch.setattr(alerting.settings, "admin_alert_telegram_token", "", raising=False)
+    assert alerting.infra_alerts_configured() is False
+
+    # The admin bot is the documented fallback, and it counts as configured.
+    monkeypatch.setattr(alerting.settings, "admin_alert_telegram_token", "A", raising=False)
+    monkeypatch.setattr(alerting.settings, "admin_alert_telegram_chat_id", "AC", raising=False)
+    monkeypatch.setattr(alerting.settings, "infra_alert_telegram_chat_id", "", raising=False)
+    assert alerting.infra_alerts_configured() is True
+
+    # A token with no chat id cannot reach anyone, and the sender agrees: it
+    # early-returns before any POST.
+    monkeypatch.setattr(alerting.settings, "admin_alert_telegram_chat_id", "", raising=False)
+    assert alerting.infra_alerts_configured() is False
+    posts = _install_fake_client(monkeypatch, [200])
+    loop = asyncio.get_event_loop()
+    assert loop.run_until_complete(
+        alerting.send_infra_alert("c", "warning", "m")) is False
+    assert posts == []

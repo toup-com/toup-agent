@@ -162,8 +162,14 @@ class TestFleetWatch:
     async def test_a_long_split_pages_once_not_every_tick(self):
         alerts = []
 
+        # The fake answers True: `_send_telegram` now reports whether Telegram
+        # CONFIRMED the send, and the suppression window is only consumed on a
+        # confirmed one. A fake returning None would take the not-confirmed
+        # path instead (retry if configured, consume if not), which is a
+        # different test — see test_rollout_fleet_alerting.py.
         async def _alert(level, msg):
             alerts.append((level, msg))
+            return True
 
         with patch.object(RS, "_bridge_get", AsyncMock(return_value=(_health(SPLIT), "ok"))), \
              patch.object(RS, "_send_telegram", _alert):
@@ -180,6 +186,7 @@ class TestFleetWatch:
 
         async def _alert(level, msg):
             alerts.append((level, msg))
+            return True
 
         with patch.object(RS, "_bridge_get", AsyncMock(return_value=(_health(CONVERGED), "ok"))), \
              patch.object(RS, "_send_telegram", _alert):
@@ -200,11 +207,20 @@ class TestFleetWatch:
 class TestReconcilerWiring:
     def test_the_reconciler_loop_calls_the_watch(self):
         """A watch nobody ticks reports nothing. Source-order probe: the call
-        must be inside `rollout_reconciler_loop`, before the tick sleep, and
+        must be inside the reconciler's tick body, before the tick sleep, and
         under its own try/except — like the convergence sweep beside it, so a
-        bridge blip cannot kill the loop that also resumes rollouts."""
+        bridge blip cannot kill the loop that also resumes rollouts.
+
+        The body moved into `_rollout_reconciler_ticks` when the loop gained
+        its shutdown lease release (the handler has to wrap every await in a
+        tick, not just the sleep), so the probe reads the ticks function AND
+        asserts the entry point still awaits it — a tick body nobody calls is
+        the same silent nothing as a watch nobody ticks."""
         import inspect
-        lines = inspect.getsource(RS.rollout_reconciler_loop).splitlines()
+        entry = inspect.getsource(RS.rollout_reconciler_loop)
+        assert "await _rollout_reconciler_ticks()" in entry, \
+            "the loop the app starts must still drive the tick body"
+        lines = inspect.getsource(RS._rollout_reconciler_ticks).splitlines()
         call = [i for i, l in enumerate(lines) if "_fleet_watch_once" in l]
         assert call, "the reconciler must tick the fleet watch"
         i = call[0]
@@ -212,7 +228,9 @@ class TestReconcilerWiring:
             "the fleet watch call must sit under its own try:"
         assert any("except" in l for l in lines[i + 1:i + 5]), \
             "the fleet watch call must have its own except"
-        sleep = [j for j, l in enumerate(lines) if "asyncio.sleep(30)" in l]
+        # The literal 30 became `_RECONCILER_TICK_S` when the loop was
+        # leader-gated: the tick and the lease TTL are one number.
+        sleep = [j for j, l in enumerate(lines) if "await asyncio.sleep(" in l]
         assert sleep and i < sleep[-1], "the watch must run before the tick sleeps"
 
 

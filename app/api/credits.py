@@ -514,11 +514,15 @@ async def agent_deduct(
     #
     # Now the charge always lands (already_incurred above) and admission is
     # asked separately, exactly as the proxy asks it. The agent keeps blocking
-    # after the cap, and we keep the money. `amount_charged` reports what really
-    # happened; it is deliberately no longer tied to `success`.
-    from decimal import Decimal as _Dec
+    # after the cap, and we keep the money. `amount_charged` below reports what
+    # really moved, read off the result and never inferred from `success`.
+    #
+    # PREFLIGHT_QUOTE_CREDITS, not a literal: this is the same nominal probe
+    # the proxy's two pre-flights and the shadow verdict ask, and a fourth
+    # spelling of the number is how they drift apart.
+    from app.credit_shadow import PREFLIGHT_QUOTE_CREDITS
     admission = await credit_service.check_balance(
-        db, body.user_id, _BUCKET_MESSAGE, _Dec("0.1"),
+        db, body.user_id, _BUCKET_MESSAGE, PREFLIGHT_QUOTE_CREDITS,
     )
     await db.commit()
 
@@ -526,7 +530,16 @@ async def agent_deduct(
     return AgentDeductResponse(
         success=result.success and admission.success,
         bucket=_BUCKET_MESSAGE,
-        amount_charged=float(credits) if result.success else 0.0,
+        # What really moved, not what was quoted. `float(credits) if
+        # result.success else 0.0` reported 0.0 over a real debit from
+        # 2026-09-18: this route passes already_incurred=True on the MESSAGE
+        # bucket, so a wallet shortfall here settles what the wallet holds and
+        # STILL answers success=False. Two knock-ons of reading the ledger
+        # instead of the quote, both truer than what they replace: an
+        # idempotent replay and an UNLIMITED account now report 0.0, because
+        # neither moved money on this call — `idempotent_hit` and the
+        # entitlement are how a caller tells them from a refusal.
+        amount_charged=float(result.charged),
         balance_after=float(result.balance_after),
         enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
         reason=result.reason or admission.reason,
@@ -662,13 +675,11 @@ async def agent_charge(
     return AgentDeductResponse(
         success=result.success,
         bucket=bucket,
-        # meter_only never moves the balance, so it never "charged" anything —
-        # reporting a non-zero amount here would double-count in any caller
-        # that sums amount_charged.
-        amount_charged=(
-            0.0 if body.meter_only
-            else (float(credits) if result.success else 0.0)
-        ),
+        # One vocabulary with /agent-deduct: what moved, read off the result.
+        # `meter_only` needs no special case — it never touches the balance, so
+        # `charged` is already 0 and a caller that sums this field cannot
+        # double-count a metered row.
+        amount_charged=float(result.charged),
         balance_after=float(result.balance_after),
         enforcement_enabled=bool(getattr(_settings, "credit_enforcement_enabled", False)),
         reason=result.reason,

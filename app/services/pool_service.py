@@ -1102,6 +1102,143 @@ RESTART_WINDOW_S = 3600
 # "healing is NOT happening — needs operator reconciliation".
 KEYLESS_NAMED_ESCALATE_TICKS = 3
 
+# ── Sweep mass-failure quorum ─────────────────────────────────────────
+#
+# When most probes fail inside ONE tick that is one fleet-wide fault, not N
+# individually-sick agents, and a fleet-wide restart storm turns a blip into
+# an outage. The guard existed and counted only `status is None` — the
+# TRANSPORT mode, which is the harmless one. A tenant-Postgres/pgbouncer
+# death answers 500: at 05:17Z on 2026-09-16, 172 probes returned 5xx inside
+# one minute, every one of them bypassed the guard, and each tenant took a
+# strike toward PROBE_STRIKES_BEFORE_RESTART during an outage that no
+# container restart could fix. The guard fired on the safe mode and stood
+# down on the dangerous one.
+#
+# So: correlate ANY fleet-wide failure mode, and NAME the mode in the page.
+# "nothing answered" and "everything answered 500" have different first
+# moves, and an operator reading a bare "probes failed" cannot tell which
+# one they are holding.
+SWEEP_QUORUM_FRACTION = 0.5
+# …and a floor under the 5xx arm ONLY. A quorum verdict is evidence of
+# CORRELATION, and a majority of a handful of probes is not that evidence: at
+# a fleet of one, "most probes answered 500" and "this one agent is sick" are
+# the same sentence, and reading it as the first permanently disables the
+# per-agent restart that is the only thing which heals the second. A fleet
+# that small cannot storm anyway — RESTARTS_PER_TICK caps a tick at 2
+# restarts and MAX_RESTARTS_PER_USER_PER_HOUR caps one subject at 3 an hour.
+SWEEP_QUORUM_MIN_PROBES = 4
+
+# A mass-failure tick exempts EVERY class that is a real share of the event,
+# not only the dominant one. A pgbouncer death produces BOTH at once: agents
+# that reach their DB fast answer 500, agents that hang on the connect blow
+# past this probe's 8 s httpx timeout and surface as TRANSPORT errors. One
+# event, two classes, and never an exact tie — so a dominant-mode rule read
+# 53x500 + 27xtimeout as "server", let the 27 timeouts each take a strike,
+# and two such ticks (PROBE_STRIKES_BEFORE_RESTART) start walking the fleet
+# RESTARTS_PER_TICK at a time through a database outage no restart can fix.
+# That is the storm this guard promises to prevent (8 pgbouncer SIGSEGVs in
+# the week to 2026-09-16).
+#
+# A class is part of the event once it reaches
+# max(SWEEP_MINORITY_EXEMPT_MIN, ceil(FRACTION x total)) — 5 at the fleet's
+# ~88 probes. Five agents failing the same way together is the event; one or
+# two are individual agents and keep their strikes. The floor is what stops a
+# single agent from being called a class on a small fleet.
+#
+# The judgement, stated plainly: this trades a DELAYED strike for a few
+# co-failing agents against restarting healthy containers during a shared
+# outage. The delay costs one 180 s tick — if those agents are still failing
+# alone on the next tick they are a minority again and take their strikes.
+SWEEP_MINORITY_EXEMPT_MIN = 3
+SWEEP_MINORITY_EXEMPT_FRACTION = 0.05
+
+_SWEEP_MODE_HINT = {
+    "transport": (
+        "nothing answered — platform egress or the agent host itself "
+        "(check Railway egress, then the bridge host)"
+    ),
+    "server": (
+        "the agents ANSWERED and failed — one shared dependency is down "
+        "(tenant Postgres / pgbouncer), not N sick containers"
+    ),
+    "mixed": (
+        "unreachable AND erroring agents together — the agent host and its "
+        "database are going down together, not N sick containers"
+    ),
+}
+
+
+def classify_sweep_failure(results: list) -> dict:
+    """Correlated-failure verdict for one sweep's probe results.
+
+    `results` is the sweep's own `(user_id, container_name, status, err)`
+    tuples. Pure, so the quorum rule is testable without a fleet.
+
+    401/403 and the other 4xx are deliberately NOT counted. A keyless or
+    mis-routed agent is a real PER-AGENT fault with its own repair path (the
+    forced re-claim, and the bridge's route reconciler); folding them in here
+    would let one bad Caddy reload suppress the very strikes that heal them.
+    """
+    total = len(results)
+    transport = sum(1 for _, _, s, _ in results if s is None)
+    server = sum(1 for _, _, s, _ in results if s is not None and s >= 500)
+    correlated = transport + server
+    if correlated == 0:
+        mode = None
+    elif transport > server:
+        mode = "transport"
+    elif server > transport:
+        mode = "server"
+    else:
+        mode = "mixed"
+    # The asymmetry in the floor is the point. A probe that never got an
+    # answer is not evidence the AGENT is broken — it is evidence we could not
+    # ask — so standing the restarter down on it is right at ANY fleet size,
+    # which is what the transport-only guard already did and must keep doing.
+    # A 500 IS evidence that that agent is alive and broken, so with only a
+    # handful of probes the per-agent path must still heal it; a CORRELATED
+    # set of 5xx means "the shared dependency, not the agents", and
+    # correlation needs a fleet to establish.
+    bar = total * SWEEP_QUORUM_FRACTION
+    mass = transport > bar or (total >= SWEEP_QUORUM_MIN_PROBES and correlated > bar)
+
+    # `mode` is the operator's headline only. The exemption is decided PER
+    # CLASS and returned, so the caller never re-derives it: the dominant
+    # class is exempt, and the other one is too once it is a real share of the
+    # same event (SWEEP_MINORITY_EXEMPT_*). `round` before `ceil` because
+    # `0.05 * total` is a float and a 3.0000000000000004 would raise the bar
+    # by a whole agent.
+    import math
+
+    need = 0
+    exempt: tuple = ()
+    if mass:
+        need = max(
+            SWEEP_MINORITY_EXEMPT_MIN,
+            math.ceil(round(total * SWEEP_MINORITY_EXEMPT_FRACTION, 6)),
+        )
+        dominant = {
+            "transport": ("transport",),
+            "server": ("5xx",),
+            "mixed": ("transport", "5xx"),
+        }.get(mode or "", ())
+        exempt = tuple(
+            klass
+            for klass, count in (("transport", transport), ("5xx", server))
+            if klass in dominant or count >= need
+        )
+    return {
+        "total": total,
+        "transport": transport,
+        "server": server,
+        "correlated": correlated,
+        "mass_failure": mass,
+        "mode": mode,
+        "exempt": exempt,
+        "minority_bar": need,
+        "hint": _SWEEP_MODE_HINT.get(mode or "", ""),
+    }
+
 
 # ── Sweep safety state (agent_probe_state) ────────────────────────────
 #
@@ -1443,7 +1580,9 @@ def _deletion_in_flight_user_ids():
     )
 
 
-async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
+async def reclaim_stranded_users(
+    max_per_tick: int = 5, *, probe_sweep: bool = True,
+) -> dict:
     """Reconciler backstop: replay the signup finalize for stranded users.
 
     Per user: ensure the AgentConfig exists and is primed to managed (only
@@ -1456,6 +1595,10 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     re-asserted. Truly containerless users get a fresh warm claim, exactly
     as at signup. claim_for_user's credential guarantee mints free-tier
     creds internally, so no separate activation step is needed here.
+
+    `probe_sweep=False` runs phase 1 and the closing rollup only and probes
+    nothing at all — see the gate on phase 2 for why a catch-up pass must
+    never advance restart strikes.
 
     Runs enumeration and each heal in its own narrow session; never raises.
     """
@@ -1558,28 +1701,51 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
     #                  Would have auto-healed tenant 3134fece days before the
     #                  user reported it.
     #
-    # Mass-failure guard: when the majority of probes fail at the transport
-    # layer in one tick, that's a platform-egress or host-level problem, not
-    # N individually-sick agents — no strikes are recorded (a restart storm
-    # across the fleet would turn a blip into an outage) and we alert instead.
+    # Mass-failure guard: when the majority of probes fail in one tick — in
+    # EITHER fleet-wide mode, unreachable or answering-5xx — that is a
+    # platform-egress / agent-host / shared-database problem, not N
+    # individually-sick agents. No strikes are recorded for ANY class that is
+    # a real share of that tick, dominant or not (a restart storm across the
+    # fleet would turn a blip into an outage), and we page with the mode, both
+    # counts and what the tick actually excused. See classify_sweep_failure.
     try:
         from app.db.database import async_session_maker
         import httpx as _httpx
-        async with async_session_maker() as db:
-            rows = (await db.execute(
-                select(
-                    ManagedContainer.user_id,
-                    ManagedContainer.container_name,
-                    AgentConfig.agent_url,
-                    AgentConfig.agent_api_key,
-                )
-                .join(AgentConfig, AgentConfig.user_id == ManagedContainer.user_id)
-                .where(
-                    ManagedContainer.status == "running",
-                    AgentConfig.agent_url.isnot(None),
-                    AgentConfig.agent_api_key.isnot(None),
-                )
-            )).all()
+        rows: list = []
+        if probe_sweep:
+            async with async_session_maker() as db:
+                rows = (await db.execute(
+                    select(
+                        ManagedContainer.user_id,
+                        ManagedContainer.container_name,
+                        AgentConfig.agent_url,
+                        AgentConfig.agent_api_key,
+                    )
+                    .join(AgentConfig,
+                          AgentConfig.user_id == ManagedContainer.user_id)
+                    .where(
+                        ManagedContainer.status == "running",
+                        AgentConfig.agent_url.isnot(None),
+                        AgentConfig.agent_api_key.isnot(None),
+                    )
+                )).all()
+        else:
+            # Post-boot catch-up pass (container_reconciler_loop): phase 1 and
+            # the rollup only. Phase 2's safety model is
+            # "PROBE_STRIKES_BEFORE_RESTART consecutive ticks at the full
+            # cadence", and a catch-up landing seconds behind the outgoing
+            # replica's last tick would spend every strike inside one interval
+            # and restart a container over a single bad moment.
+            #
+            # Gated by fetching NO rows rather than by wrapping the ~250
+            # lines below in an `else:`: every loop down there is over `results`,
+            # which is empty when `rows` is, and both `_probe_state_load` and
+            # `_probe_state_flush` return before any query on an empty input.
+            # Re-indenting the block that restarts production containers is a
+            # review hazard in itself. What holds the "no probe" claim up is a
+            # test that records every URL fetched and asserts the list is
+            # empty (tests/test_sweep_quorum_guard.py), not the indentation.
+            summary["probe_sweep"] = "skipped"
 
         async def _probe(uid: str, cname: str, url: str, key: str, client) -> tuple:
             try:
@@ -1599,8 +1765,17 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                     *[_probe(u, n or "", a, k, client) for u, n, a, k in rows]
                 )
 
-        transport_errors = sum(1 for _, _, s, _ in results if s is None)
-        mass_failure = bool(results) and transport_errors > len(results) / 2
+        sweep = classify_sweep_failure(results)
+        mass_failure = sweep["mass_failure"]
+        # Which failure classes this tick excuses. Decided in
+        # classify_sweep_failure and never re-derived here: every class that is
+        # a real share of one fleet-wide event is exempt, not only the dominant
+        # one, because a shared-dependency death shows up as 5xx AND transport
+        # at once. What survives from the narrower rule is the case it was
+        # right about: a lone 5xx agent inside a transport blip — or a lone
+        # unreachable agent inside a database outage — is still ONE sick agent
+        # and keeps its strike.
+        exempt: tuple = sweep["exempt"]
 
         # Shared, durable strike/cap state. One query for every row this tick
         # could touch; one flush at the end. Safe to read-modify-write without
@@ -1629,9 +1804,14 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
                 # 404 etc. — routing, owned by the bridge route reconciler.
                 _probe_state_fail(st, "4xx")
                 continue
-            if mass_failure and status is None:
-                continue  # platform-egress blip; no per-agent strikes
-            _probe_state_fail(st, "5xx" if status is not None else "transport")
+            klass = "5xx" if status is not None else "transport"
+            if klass in exempt:
+                # Fleet-wide, in THIS class. Both classes are reachable here:
+                # the 401/403 and 4xx arms `continue`d above, because a
+                # keyless or mis-routed agent is a per-agent fault with its
+                # own repair path and must keep its strikes.
+                continue
+            _probe_state_fail(st, klass)
             if st["consecutive_failures"] >= PROBE_STRIKES_BEFORE_RESTART:
                 sick.append((uid, cname, status if status is not None else err))
 
@@ -1639,17 +1819,40 @@ async def reclaim_stranded_users(max_per_tick: int = 5) -> dict:
         summary["sick"] = len(sick)
 
         if mass_failure:
+            summary["sweep_mass_failure"] = sweep["mode"]
+            summary["sweep_transport_errors"] = sweep["transport"]
+            summary["sweep_server_errors"] = sweep["server"]
             logger.warning(
-                "[pool-reclaim] sweep quorum failed: %d/%d probes hit transport "
-                "errors — skipping strikes this tick",
-                transport_errors, len(results),
+                "[pool-reclaim] sweep quorum failed: %d/%d probes failed "
+                "(transport=%d 5xx=%d mode=%s) — skipping strikes this tick",
+                sweep["correlated"], sweep["total"], sweep["transport"],
+                sweep["server"], sweep["mode"],
             )
+            # Say what THIS tick did, and nothing that another tick could
+            # falsify. So: the exempted class(es) with their counts, and the
+            # kept strikes only when a class actually had failures and was not
+            # exempt. Every fixed sentence tried here was false in some mode —
+            # "the other class still took its strike" when that class had no
+            # failures, "no agent took a strike" when 401s in the same tick
+            # took theirs. At most one class can be kept: the dominant class is
+            # always exempt.
+            counts = (("transport", sweep["transport"]), ("5xx", sweep["server"]))
+            skipped = "No strikes for " + " + ".join(
+                f"{k}={n}" for k, n in counts if k in exempt
+            ) + " (one event)."
+            for k, n in counts:
+                if k not in exempt and n:
+                    skipped += (
+                        f" {n} {k} agent{'' if n == 1 else 's'} kept a strike."
+                    )
             try:
                 from app.services.alerting import send_infra_alert
                 await send_infra_alert(
                     "sweep-quorum", "critical",
-                    f"Agent sweep: {transport_errors}/{len(results)} probes failed "
-                    "at transport level — platform egress or agent host problem?",
+                    f"Agent sweep: {sweep['correlated']}/{sweep['total']} probes "
+                    f"failed in one tick (transport={sweep['transport']}, "
+                    f"5xx={sweep['server']}) — mode={sweep['mode']}: "
+                    f"{sweep['hint']}. {skipped}",
                 )
             except Exception:
                 pass

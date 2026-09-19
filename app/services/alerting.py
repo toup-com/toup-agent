@@ -57,6 +57,33 @@ def reset_for_tests() -> None:
     _cat_window.clear()
 
 
+def _telegram_target() -> Tuple[Optional[str], Optional[str]]:
+    """The infra bot's (token, chat_id), with the admin bot as fallback.
+
+    ONE resolution, read by both `send_infra_alert` and
+    `infra_alerts_configured` — two copies of this pair is how a caller comes
+    to believe alerting is configured while the sender disagrees.
+    """
+    return (
+        settings.infra_alert_telegram_token or settings.admin_alert_telegram_token,
+        settings.infra_alert_telegram_chat_id or settings.admin_alert_telegram_chat_id,
+    )
+
+
+def infra_alerts_configured() -> bool:
+    """Is there anywhere for an alert to GO?
+
+    `send_infra_alert` answers False for three different things —
+    unconfigured, rate-limited, refused — and a caller that keeps its own
+    retry state has to tell "nobody is listening" from "Telegram said no": the
+    first must consume the window silently, the second must be retried. The
+    fleet watch in `rollout_service` is the caller that needs this; without it
+    a deployment with no Telegram config sits in the retry path forever.
+    """
+    token, chat_id = _telegram_target()
+    return bool(token and chat_id)
+
+
 def _category_state(category: str, now: float, window_s: float) -> dict:
     st = _cat_window.get(category)
     if st is None:
@@ -97,8 +124,7 @@ async def send_infra_alert(
     canonical result of two replicas posting to the same chat 0.3 s apart —
     silently suppressed the next window against a message nobody received.
     """
-    token = settings.infra_alert_telegram_token or settings.admin_alert_telegram_token
-    chat_id = settings.infra_alert_telegram_chat_id or settings.admin_alert_telegram_chat_id
+    token, chat_id = _telegram_target()
     if not token or not chat_id:
         logger.info("[infra-alert] no telegram config; skipping: %s", message)
         return False

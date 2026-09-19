@@ -220,9 +220,12 @@ class CreditState:
     #   * every let-through is provider spend billed to us and to nobody, and
     #     with enforcement on it writes a `denied: true` ledger row carrying
     #     real `underlying_cost_cents` — the exact denied-but-served shape
-    #     credit-health invariant 1 pages on ("expected steady state is zero",
-    #     critical at $5/window). The loosening manufactured a permanent alarm
-    #     stream on the channel this same change adds three alarms to.
+    #     credit-health invariant 1 pages on. 4/hour on one exhausted account
+    #     is hours of being served-and-denied with no refill in between, which
+    #     is that alarm's definition of a LOOP ("the refusal is not stopping
+    #     the work"): one warning per account, plus the fleet-wide critical at
+    #     $5/window. The loosening manufactured a permanent alarm stream on
+    #     the channel this same change adds three alarms to.
     #   * it defeated the routine handlers' clean-skip gate for EVERY plan,
     #     free included. A scheduled routine's interval always exceeds the TTL,
     #     so the latch was always stale at the top of a run: the gate never

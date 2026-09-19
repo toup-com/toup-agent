@@ -301,6 +301,15 @@ class ChargeResult:
     reason: Optional[str] = None
     ledger_id: Optional[str] = None
     idempotent_hit: bool = False
+    # What actually moved, and what could not. `success` is an ADMISSION
+    # verdict, not a receipt (see `/credits/agent-deduct`'s comment), and
+    # since a refused settlement of an already-incurred cost now still
+    # debits what the wallet holds, the two can disagree: success=False
+    # with charged > 0. Callers that report money must read these, never
+    # infer the amount from `success`. Both stay 0 on an idempotent hit —
+    # the money moved on the original call, and this result is a replay.
+    charged: Decimal = Decimal("0")
+    shortfall: Decimal = Decimal("0")
 
 
 @dataclass
@@ -412,6 +421,49 @@ def _split_message_charge(
         else:
             reason = REASON_DAILY_CAP_EXCEEDED
     return from_plan, from_purchased, feasible, reason
+
+
+def _message_wallet_total(
+    plan_remaining: Decimal, purchased_remaining: Decimal,
+) -> Decimal:
+    """Everything the MESSAGE wallets can actually pay RIGHT NOW.
+
+    Each wallet is floored at zero INDEPENDENTLY rather than summed and then
+    floored: a negative wallet is a state that already occurs (with
+    enforcement off, ``try_charge``'s ``will_deduct`` is true even on a
+    denial, so shadow mode debits past zero with no feasibility gate), and a
+    settlement must never deepen one wallet by spending another's overdraft.
+    """
+    return (
+        max(Decimal("0"), plan_remaining)
+        + max(Decimal("0"), purchased_remaining)
+    )
+
+
+def _settle_incurred_shortfall_enabled() -> bool:
+    """Whether an infeasible settlement of an ALREADY-INCURRED cost takes
+    what the wallet holds instead of taking nothing. DEFAULT ON.
+
+    Off, the balance dimension has no stop: the residual is never debited, the
+    wallet freezes at a positive value and the next nominal pre-flight admits
+    the next turn — measured on 2026-09-15 as 21 served-and-unbilled turns in
+    6h07m on one account, terminal balance 0.00.
+
+    The revert route is a REAL ENVIRONMENT VARIABLE on Railway —
+    ``CREDIT_SETTLE_INCURRED_SHORTFALL=false`` — which is the env name of
+    ``Settings.credit_settle_incurred_shortfall`` (config.py) and is read into
+    it at boot. No code change and no image rebuild, just the restart Railway
+    already does when a variable changes.
+
+    Deliberately ONE lookup. A module-local environment read here would be a
+    second resolution path that can disagree with the value every other reader
+    of ``settings`` sees, and it could never fire anyway — the declared field
+    always answers. ``Settings`` is ``extra='forbid'``, so a misspelled
+    variable fails the boot loudly instead of being quietly absorbed by a
+    fallback. The ``getattr`` default is the fail-ON direction: a field that
+    went missing must not restore the give-away.
+    """
+    return bool(getattr(settings, "credit_settle_incurred_shortfall", True))
 
 
 def _admission_verdict(
@@ -1327,6 +1379,14 @@ class CreditService:
         the next pre-flight refuse. See config.py's flag comment for the
         production numbers this closes.
 
+        The BALANCE dimension has the same shape and had no such stop until
+        2026-09-18. An incurred charge the wallet cannot cover is still
+        REFUSED (``success=False``), but it now debits what the wallet holds,
+        drives the MESSAGE bucket to zero and records the residual — see the
+        settlement block below, and ``_settle_incurred_shortfall_enabled`` for
+        the switch. ``charged`` / ``shortfall`` on the result say what really
+        moved; ``success`` is an admission verdict, not a receipt.
+
         When ``settings.credit_enforcement_enabled=False`` always succeeds
         but still writes the ledger row (shadow mode).
 
@@ -1345,6 +1405,16 @@ class CreditService:
         amount_q = _q(amount, _AMOUNT_QUANTUM)
         if amount_q <= 0:
             raise ValueError(f"try_charge requires positive amount, got {amount}")
+
+        # Hoisted because `_apply_delta` re-derives the split independently and
+        # its docstring's hazard is real: a gate that ignored the cap while the
+        # application did not pushes the whole amount onto the purchased wallet
+        # and drives it negative. One expression, read by the gate below, the
+        # shortfall settlement and `_apply_delta`.
+        incurred_ignores_cap = (
+            already_incurred
+            and getattr(settings, "credit_cap_admission_control", False)
+        )
 
         balance = await self._lock_balance(db, user_id)
         await self._reset_daily_if_needed(db, balance, user_id)
@@ -1400,10 +1470,7 @@ class CreditService:
                 (Decimal(balance.message_credits_daily_cap)
                  if balance.message_credits_daily_cap is not None else None),
                 amount_q,
-                ignore_daily_cap=(
-                    already_incurred
-                    and getattr(settings, "credit_cap_admission_control", False)
-                ),
+                ignore_daily_cap=incurred_ignores_cap,
             )
             if not _feasible:
                 deny_reason = _split_reason
@@ -1439,9 +1506,61 @@ class CreditService:
         # path below so a metered event is recorded even when the user could
         # not actually have afforded it (that's the dry-run signal).
         if deny_reason and enforcement and not meter_only:
+            # ── A refusal may not un-spend money ────────────────────────
+            # For work ALREADY DONE, "denied" has to mean "no more of this",
+            # not "this one is free". Zeroing the charge left the wallet at a
+            # positive value, so the next turn's nominal 0.1-credit pre-flight
+            # admitted it, and the loop had no bottom: 21 served-and-unbilled
+            # turns in 6h07m on one account (2026-09-15), terminal balance
+            # 0.00. So take what the wallet holds, drive it to zero, record
+            # the residual we ate — and the NEXT pre-flight is the stop.
+            #
+            # Only on a true wallet shortfall. A `daily_cap_exceeded` refusal
+            # is a rate limit on money that EXISTS, and whether an incurred
+            # cost may outrun the cap is `credit_cap_admission_control`'s
+            # decision alone — settling past it here would move that policy
+            # behind a second switch. `email_not_verified` is a policy gate
+            # with no wallet dimension at all.
+            #
+            # `ignore_daily_cap=True` regardless of that flag is not a leak of
+            # it: the amount taken is the whole wallet, so the cap has nothing
+            # left to rate-limit afterwards, and honouring cap_room here would
+            # leave a positive balance that admits the next turn — the very
+            # give-away this closes.
+            #
+            # DECIDED 2026-09-18, because the boundary is reachable and looks
+            # like a leak: with a NON-NULL cap, `credit_cap_admission_control`
+            # OFF and an amount larger than both wallets, the gate answers
+            # INSUFFICIENT (not DAILY_CAP_EXCEEDED), so this settlement runs
+            # and `message_credits_used_today` ends up past the cap. Intended
+            # — an incurred cost is owed whatever the cap says, and the now
+            # empty wallet is still the hard ceiling. Unreachable in
+            # production while every cap is NULL (2026-08-29); pinned by
+            # test_credit_settlement_shortfall.py::
+            # test_a_shortfall_settlement_outruns_a_non_null_cap so whoever
+            # re-introduces caps meets the decision instead of discovering it.
+            settled_q = Decimal("0")
+            if (
+                already_incurred
+                and bucket == BUCKET_MESSAGE
+                and deny_reason == REASON_INSUFFICIENT_MESSAGE
+                and _settle_incurred_shortfall_enabled()
+            ):
+                # The `min` is load-bearing, not defensive: one wallet can be
+                # negative from a shadow-mode overdraft while the other is
+                # positive, and then `_message_wallet_total`'s per-wallet floor
+                # exceeds what is actually owed.
+                settled_q = min(amount_q, _message_wallet_total(
+                    Decimal(balance.message_credits_remaining),
+                    Decimal(getattr(balance, "purchased_credits_remaining", 0) or 0),
+                ))
+                if settled_q > 0:
+                    _apply_delta(balance, bucket, -settled_q, ignore_daily_cap=True)
+            shortfall_q = amount_q - settled_q
+
             ledger = CreditLedger(
                 user_id=user_id, event_type=event_type, bucket=bucket,
-                amount=Decimal("0"), balance_after=_bucket_remaining(balance, bucket),
+                amount=-settled_q, balance_after=_bucket_remaining(balance, bucket),
                 idempotency_key=idempotency_key, event_id=event_id, model=model,
                 provider=provider, input_tokens=input_tokens, output_tokens=output_tokens,
                 underlying_cost_cents=(_q(underlying_cost_cents) if underlying_cost_cents is not None else None),
@@ -1456,6 +1575,14 @@ class CreditService:
                 metadata_json={
                     "denied": True, "reason": deny_reason,
                     "plan_id": balance.plan_id,
+                    # `credits_quoted` keeps the meaning it already has on the
+                    # unlimited and meter_only rows — what the event was WORTH
+                    # — so a reader needs one vocabulary, not two. `amount`
+                    # says what landed; `credits_shortfall` says what we ate.
+                    **({"settled_incurred": True,
+                        "credits_quoted": str(amount_q),
+                        "credits_shortfall": str(shortfall_q)}
+                       if settled_q > 0 else {}),
                     **(metadata or {}),
                 },
             )
@@ -1478,9 +1605,14 @@ class CreditService:
                             ledger_id=existing.id, idempotent_hit=True,
                         )
                 raise
+            # STILL a denial. Everything downstream that reads `success` — the
+            # agent's own gate, credit_health's invariant 1, the 402 the
+            # pre-flight will raise next turn — is asking "may more work
+            # happen?", and the answer is no. `charged` carries what moved.
             return ChargeResult(
                 success=False, balance_after=_bucket_remaining(balance, bucket),
                 reason=deny_reason, ledger_id=ledger.id,
+                charged=settled_q, shortfall=shortfall_q,
             )
 
         # Unlimited charges never deduct — the row stays put.
@@ -1493,10 +1625,7 @@ class CreditService:
         if will_deduct:
             _apply_delta(
                 balance, bucket, -amount_q,
-                ignore_daily_cap=(
-                    already_incurred
-                    and getattr(settings, "credit_cap_admission_control", False)
-                ),
+                ignore_daily_cap=incurred_ignores_cap,
             )
             actual_amount = -amount_q
         else:
@@ -1566,7 +1695,10 @@ class CreditService:
             except Exception:  # pragma: no cover - defensive
                 logger.debug("[unlimited-abuse] observe failed", exc_info=True)
 
-        return ChargeResult(success=True, balance_after=Decimal(ledger.balance_after), ledger_id=ledger.id)
+        return ChargeResult(
+            success=True, balance_after=Decimal(ledger.balance_after),
+            ledger_id=ledger.id, charged=-actual_amount,
+        )
 
     async def reserve(
         self, db: AsyncSession, user_id: str, event_type: str, bucket: str,

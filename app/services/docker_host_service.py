@@ -898,6 +898,40 @@ async def reconcile_managed_rows(db: AsyncSession) -> dict:
             "missing": missing}
 
 
+async def _post_boot_catchup() -> None:
+    """The reconciler legs the boot path does NOT cover, run once shortly
+    after boot instead of a full interval later.
+
+    Two legs are excluded, each for its own reason:
+
+      * `backfill_sentinel_image_containers` — platform_main already runs it
+        at boot, in this process, before this loop starts. Repeating it
+        seconds later is exactly the "redundant churn" the sleep-first
+        comment in the loop is about.
+      * the authenticated probe sweep (`probe_sweep=False`) —
+        PROBE_STRIKES_BEFORE_RESTART means "N consecutive ticks at the full
+        cadence". A catch-up landing seconds behind the outgoing replica's
+        last tick would spend every strike inside one interval and restart a
+        container over a single bad moment.
+
+    Never raises — it runs on a background loop's boot path.
+    """
+    from app.db.database import async_session_maker
+    try:
+        from app.services.pool_service import reclaim_stranded_users
+        reclaim = await reclaim_stranded_users(probe_sweep=False)
+        logger.info("[container-reconciler] post-boot catch-up reclaim: %s", reclaim)
+    except Exception:
+        logger.exception("[container-reconciler] post-boot reclaim failed")
+    try:
+        async with async_session_maker() as db:
+            drift = await reconcile_managed_rows(db)
+        if drift.get("fixed") or drift.get("failed"):
+            logger.info("[container-reconciler] post-boot row-sync: %s", drift)
+    except Exception:
+        logger.exception("[container-reconciler] post-boot row-sync failed")
+
+
 async def container_reconciler_loop() -> None:
     """Long-running background task — re-runs `backfill_sentinel_image_containers`
     on an interval so a signup that lands in the broken state (container_id
@@ -913,6 +947,32 @@ async def container_reconciler_loop() -> None:
     Railway redeploy → the DB row is the durable signal → the reconciler
     retries on its next tick. Each tick opens its own narrow session and never
     lets an exception kill the loop.
+    """
+    try:
+        await _container_reconciler_ticks()
+    except asyncio.CancelledError:
+        # Hand the lease back on a graceful shutdown so the INCOMING replica
+        # takes the next tick immediately instead of waiting out the TTL.
+        # ttl = 3x interval = 540 s at the 180 s default, and a redeploy is
+        # exactly when the dead holder's row is still live: that TTL wait, not
+        # the sleep-first inside, is most of the 733 s / 833 s post-deploy
+        # sweep gaps measured on 2026-09-16. A SIGKILL still falls back to TTL
+        # expiry, unchanged. Same pattern as apple_reconcile_loop.
+        #
+        # The lease name is spelled out rather than shared as a constant
+        # because test_infra_lease pins the literal `_lease =
+        # "container_reconciler"` inside the loop body; the two spellings are
+        # pinned equal by test_sweep_quorum_guard.
+        from app.services.infra_lease import release_lease
+        await release_lease("container_reconciler")
+        raise
+
+
+async def _container_reconciler_ticks() -> None:
+    """The loop proper — split out so `container_reconciler_loop` can release
+    the lease on cancellation without nesting this whole body one level
+    deeper. Cancellation can land on ANY await in a tick, not just the sleep,
+    so the handler has to wrap the lot.
     """
     interval = int(getattr(settings, "container_reconciler_interval_s", 180) or 0)
     if interval <= 0:
@@ -940,9 +1000,54 @@ async def container_reconciler_loop() -> None:
     from app.services.infra_lease import acquire_lease, lease_ttl_for
     _lease = "container_reconciler"
     _ttl = lease_ttl_for(interval)
+    # POST-BOOT CATCH-UP. "Sleep first" below is right for the BACKFILL leg
+    # and wrong for the other two: nothing at boot runs the stranded backstop
+    # or the row-docker sync, so every redeploy left them unrun for a full
+    # interval ON TOP of the deploy and the dead holder's lease TTL. Measured
+    # 2026-09-16: platform-sweep gaps of 733 s and 833 s immediately after the
+    # 03:19:14Z and 07:30:09Z deploys, against a 178-200 s cadence with no
+    # other gap above 200 s in 1,952 ticks.
+    #
+    # It rides the fast sub-tick rather than opening a lease gate of its own:
+    # that sub-tick is already leader-gated at the right grain (so two
+    # replicas booting together still produce ONE pass), and one gate per
+    # grain is what test_infra_lease pins. With the sub-tick off there is
+    # nothing to hook and no catch-up — that is stranded_fast_scan_interval_s
+    # at 0, and equally at the full interval, where the inner loop breaks on
+    # its first pass. Coherent either way: both settings turn the sub-tick
+    # machinery off, and production runs 15 against 180.
+    #
+    # `post_boot_catchup_s` is read the way `interval` and `fast` are — a new
+    # default-ON pass that force-claims slots must be switchable off during an
+    # incident without a deploy. It is a DELAY, not a deadline, and the
+    # sub-tick QUANTISES it: the pass fires on the first fast sub-tick at or
+    # after this many seconds of sleep, and only once this replica has WON the
+    # lease — so on a follower it fires whenever that replica becomes leader
+    # rather than that many seconds after boot (and on one that never wins,
+    # never). With the production pair (fast=15, catchup_s=20) the first
+    # eligible sub-tick is slept=30, not 20. 0 disables it.
+    #
+    # The clamp is not cosmetic. The inner loop breaks at `slept >= interval`
+    # BEFORE reaching the catch-up check, so the largest value any sub-tick can
+    # ever answer is `interval - fast`: unclamped, an operator raising the delay
+    # to the interval during an incident would be turning the pass OFF, silently.
+    # Clamp to what the sub-tick can reach and say so once at loop start.
+    catchup_s = int(getattr(settings, "post_boot_catchup_s", 20) or 0)
+    _catchup_max = max(0, interval - fast) if fast > 0 else 0
+    catchup_at = min(catchup_s, _catchup_max) if catchup_s > 0 else 0
+    catchup_pending = catchup_at > 0
+    if catchup_s > 0 and catchup_at != catchup_s:
+        logger.warning(
+            "[container-reconciler] post_boot_catchup_s=%ss clamped to %ss "
+            "(fast sub-tick=%ss, interval=%ss)%s",
+            catchup_s, catchup_at, fast, interval,
+            "" if catchup_at > 0
+            else " — catch-up DISABLED: no sub-tick can reach it",
+        )
     while True:
         # Sleep first: the boot path already runs one backfill before this
-        # loop starts, so an immediate tick would be redundant churn.
+        # loop starts, so an immediate tick would be redundant churn. The
+        # catch-up above covers the legs the boot path does NOT run.
         if fast > 0:
             slept = 0
             while slept < interval:
@@ -961,6 +1066,17 @@ async def container_reconciler_loop() -> None:
                 except Exception:
                     # Never let the cheap pass take the durable loop with it.
                     logger.exception("[container-reconciler] stranded-fast failed")
+                if catchup_pending and slept >= catchup_at:
+                    catchup_pending = False
+                    _t0 = time.monotonic()
+                    await _post_boot_catchup()
+                    # `slept` is a SLEEP tally, so the catch-up's own wall time
+                    # has to be charged against the interval explicitly or the
+                    # first full tick lands that much late — it does real work
+                    # (up to max_per_tick bridge-backed claims), which is the
+                    # opposite of what a pass that exists to close a post-deploy
+                    # gap should cost.
+                    slept += int(time.monotonic() - _t0)
         else:
             await asyncio.sleep(interval)
         if not await acquire_lease(_lease, ttl_s=_ttl):

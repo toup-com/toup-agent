@@ -527,6 +527,284 @@ async def test_sandbox_drift_is_reported_but_never_applied(
     assert "apple-reconcile-downgrade" not in _alert_categories(result)
 
 
+async def test_sandbox_drift_in_observe_only_warns_and_never_pages_critical(
+    reconcile_settings, apple_says,
+):
+    """The same fixture in the mode production actually runs — which had no
+    coverage at all, and was the one mode the fold above did not work in.
+
+    `apple_reconcile_apply` is False in production, so `_apply_finding` never
+    reaches the `apply and not may` branch that writes the
+    "sandbox:not_applied" marker. The fold keyed on that marker was therefore
+    unreachable, and every 6 h pass took the `apple-reconcile-downgrade`
+    CRITICAL arm for the Sandbox Elite — paging that the reconciler "had to
+    downgrade" a row it is structurally forbidden to touch. The fold must key
+    on the FACT (this environment is not mutatable), which holds in both
+    modes.
+    """
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED, CLASS_OVERDUE
+
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=-80, environment="Sandbox")
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_ELITE, txn=txn, environment="Sandbox",
+    ))
+
+    result = await _run()      # apply comes from the setting, as in production
+
+    assert result.apply is False
+    assert CLASS_OVERDUE in _classes(result)
+    assert (await _balance(uid)).plan_id == "elite"
+    assert (await _sub_row(txn)).status == "active"
+    assert result.applied == 0 and result.would >= 1
+
+    assert "apple-reconcile-downgrade" not in _alert_categories(result)
+    assert [a[1] for a in result.alerts] == ["warning"], result.alerts
+    body = result.alerts[0][2]
+    assert "Sandbox" in body and txn in body
+    # Nothing was written, so no body may assert a completed action.
+    assert not any("had to downgrade" in a[2] for a in result.alerts)
+    # …and in observe-only the opt-in flag alone would not act either, so the
+    # remedy must name both switches rather than send an operator to flip one
+    # and watch nothing happen.
+    assert "apple_reconcile_apply=true" in body
+    assert "apple_reconcile_sandbox_apply=true" in body
+
+
+async def test_the_aggregate_warning_names_the_opt_in_in_apply_mode(
+    reconcile_settings, apple_says,
+):
+    """Apply mode is unchanged: one aggregate warning, no critical, and it
+    names the single flag that WOULD let the loop act."""
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=-80, environment="Sandbox")
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_ELITE, txn=txn, environment="Sandbox",
+    ))
+
+    result = await _run()
+
+    assert [a[1] for a in result.alerts] == ["warning"], result.alerts
+    assert "Set apple_reconcile_sandbox_apply=true to" in result.alerts[0][2]
+
+
+async def test_a_sandbox_stale_row_folds_too_and_is_still_named(
+    reconcile_settings, apple_says,
+):
+    """Every Sandbox class folds, not only the ones proposing a downgrade.
+
+    A Sandbox `stale` finding raised `apple-reconcile-stale` in observe-only
+    before the fold was keyed on mutability. It folds like the rest now — and
+    the aggregate still names the transaction, so the operator loses the
+    second category and no signal.
+    """
+    from app.services.apple_reconciler import CLASS_STALE
+
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=+20, updated_days_ago=60,
+                        environment="Sandbox")
+    apple_says.set(txn, None)      # Apple does not know it either
+
+    result = await _run()
+
+    assert CLASS_STALE in _classes(result)
+    assert _alert_categories(result) == ["apple-reconcile-drift"], result.alerts
+    assert txn in result.alerts[0][2]
+
+
+async def test_the_aggregate_does_not_blame_the_policy_for_an_unread_row(
+    reconcile_settings, apple_says,
+):
+    """The fold is now the only reporter of a Sandbox row, so its one sentence
+    must not assert a cause it does not know.
+
+    This row was not corrected because Apple returned no answer for it — the
+    sandbox policy never got as far as refusing anything. The aggregate used
+    to say "REPORTED, not corrected — a sandbox subscription must never move a
+    production balance. Set …=true to let this loop clean them": the wrong
+    reason, plus a remedy that cannot change the outcome. (Apple answering
+    nothing for one transaction is not an outage, so no
+    `apple-reconcile-unreachable` fires here to contradict it — which is
+    exactly why this body has to be right on its own.)
+    """
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=+20, updated_days_ago=60,
+                        environment="Sandbox")
+    apple_says.set(txn, None)      # Apple has no answer for this transaction
+
+    result = await _run()
+
+    assert _alert_categories(result) == ["apple-reconcile-drift"], result.alerts
+    body = result.alerts[0][2]
+    assert txn in body
+    assert "could not be evaluated" in body, body
+    assert "must never move a production balance" not in body, body
+    # A flag that cannot change this row's outcome must not be offered for it.
+    assert "apple_reconcile_sandbox_apply" not in body, body
+
+
+async def test_a_sandbox_row_apple_agrees_with_is_not_called_refused_either(
+    reconcile_settings, apple_says,
+):
+    """The third state: Apple answered, and there was nothing to correct.
+
+    `_entitle` returns without appending an action when the balance already
+    holds the target plan, so this row carries no action for the sandbox
+    policy to have refused. Calling it "refused" would invent a correction,
+    and calling it "could not be evaluated" would contradict the Apple read
+    this pass paid for.
+    """
+    from app.services.apple_reconciler import APPLE_STATUS_ACTIVE, CLASS_STALE
+
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=+20, updated_days_ago=60,
+                        environment="Sandbox")
+    # Every field Apple leaves None is a field `_converge_mirror` skips, so
+    # this is Apple agreeing with the mirror without pinning its clock.
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_ACTIVE, product=LEGACY_ELITE, txn=txn,
+        environment="Sandbox",
+    ))
+
+    result = await _run()
+
+    assert CLASS_STALE in _classes(result)
+    assert [f.actions for f in result.findings] == [[]], result.findings
+    assert _alert_categories(result) == ["apple-reconcile-drift"], result.alerts
+    body = result.alerts[0][2]
+    assert txn in body
+    assert "produced no correction to make" in body, body
+    assert "must never move a production balance" not in body, body
+    assert "could not be evaluated" not in body, body
+
+
+async def test_the_aggregate_keeps_the_two_causes_on_their_own_rows(
+    reconcile_settings, apple_says,
+):
+    """One pass, both states, one warning — and neither cause on the other's
+    transaction. A single flat list cannot say this."""
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED
+
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid_a = await _mk_user()
+    await _mk_balance(uid_a, plan_id="elite")
+    refused_txn = await _mk_sub(uid_a, product=LEGACY_ELITE, plan_id="elite",
+                                status="active", days=-80,
+                                environment="Sandbox")
+    apple_says.set(refused_txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_ELITE, txn=refused_txn,
+        environment="Sandbox",
+    ))
+
+    uid_b = await _mk_user()
+    await _mk_balance(uid_b, plan_id="elite")
+    unread_txn = await _mk_sub(uid_b, product=LEGACY_ELITE, plan_id="elite",
+                               status="active", days=+20, updated_days_ago=60,
+                               environment="Sandbox")
+    apple_says.set(unread_txn, None)
+
+    result = await _run()
+
+    assert _alert_categories(result) == ["apple-reconcile-drift"], result.alerts
+    body = result.alerts[0][2]
+    assert "2 drifted Sandbox row(s)" in body, body
+    # The policy sentence and the opt-in belong to the row a correction was
+    # actually determined for; the unread row is named under its own cause.
+    split = body.index("could not be evaluated")
+    assert body.index(refused_txn) < split, body
+    assert body.index(unread_txn) > split, body
+    assert body.index("must never move a production balance") < split, body
+    assert body.index("apple_reconcile_apply=true and "
+                      "apple_reconcile_sandbox_apply=true") < split, body
+
+
+async def test_the_fold_keys_on_mutability_not_on_the_word_sandbox(
+    reconcile_settings, apple_says,
+):
+    """Anti-vacuity: the fold must RELEASE the moment an operator opts in.
+
+    A fold keyed on `environment != 'Production'` would look identical on
+    every test above and would silence the page for a downgrade this loop
+    really did write.
+    """
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED
+
+    reconcile_settings.apple_reconcile_sandbox_apply = True
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=-80, environment="Sandbox")
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_ELITE, txn=txn, environment="Sandbox",
+    ))
+
+    result = await _run()
+
+    assert (await _balance(uid)).plan_id == "free"
+    crit = [a for a in result.alerts if a[0] == "apple-reconcile-downgrade"]
+    assert crit and crit[0][1] == "critical"
+    assert "had to downgrade a Sandbox payer" in crit[0][2]
+
+
+async def test_an_observe_only_alert_is_written_in_the_conditional(
+    reconcile_settings, apple_says,
+):
+    """A Production row keeps its CRITICAL in observe-only — but the body may
+    not assert an action nothing took.
+
+    The shipped wording was "The reconciler had to downgrade a Production
+    payer … Actions: downgrade 'unlimited'→'free' … [observe-only: nothing was
+    written]": a completed action in the first clause, denied by a tag at the
+    end. An operator who has to read an alert twice to learn whether anything
+    happened is an operator who stops reading it.
+    """
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED
+
+    reconcile_settings.apple_reconcile_apply = False
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="unlimited")
+    txn = await _mk_sub(uid, status="active", days=-3, grandfathered=True)
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_BUILDER,
+        expires=datetime.utcnow() - timedelta(days=3), txn=txn,
+    ))
+
+    result = await _run()
+
+    assert (await _balance(uid)).plan_id == "unlimited"     # nothing written
+    crit = [a for a in result.alerts if a[0] == "apple-reconcile-downgrade"]
+    assert crit and crit[0][1] == "critical", result.alerts
+    body = crit[0][2]
+    assert "had to downgrade" not in body
+    assert "would have to downgrade" in body
+    assert "nothing was written" in body
+    assert "Proposed actions" in body
+    assert "Actions:" not in body
+
+
 async def test_the_sandbox_opt_in_is_the_only_thing_stopping_it(
     reconcile_settings, apple_says,
 ):
@@ -562,6 +840,158 @@ async def test_sandbox_scan_can_be_switched_off_entirely(
     result = await _run()
 
     assert result.findings == []
+
+
+# ── 4b. the Sandbox aggregate's CADENCE ──────────────────────────────
+
+
+class _FakeClock:
+    """A clock the test advances by whole reconciler intervals.
+
+    `send_infra_alert`'s window is real wall-clock arithmetic and two passes in
+    one test are milliseconds apart, so without this every second send would be
+    suppressed by the 600 s default and the 24 h claim would be vacuous — it
+    would pass identically with no per-alert interval at all.
+    """
+
+    def __init__(self, start: float = 1_700_000_000.0):
+        self.now = float(start)
+
+    def time(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+# `apple_reconcile_interval_s`'s default: what one pass actually costs in time.
+RECONCILE_INTERVAL_S = 21600
+
+
+@pytest.fixture
+def telegram(monkeypatch):
+    """Drive the REAL `send_infra_alert` with only the Telegram POST stubbed
+    (the way `tests/test_alerting.py` does it), on a clock the test controls.
+
+    The point is to execute `alerting.py`'s actual (category, subject) window
+    rather than re-implement it: "delivered once" is a claim about that window,
+    and a hand-rolled model of it could not be wrong in the way the bug was.
+    """
+    from app.services import alerting
+
+    monkeypatch.setattr(alerting.settings, "infra_alert_telegram_token", "T",
+                        raising=False)
+    monkeypatch.setattr(alerting.settings, "infra_alert_telegram_chat_id", "C",
+                        raising=False)
+    clock = _FakeClock()
+    monkeypatch.setattr(alerting, "time", clock)
+
+    posts: list[dict] = []
+
+    class _Client:
+        def __init__(self, *a, **k):
+            ...
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kw):
+            posts.append(kw.get("json", {}))
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(alerting.httpx, "AsyncClient", _Client)
+    alerting.reset_for_tests()
+    yield SimpleNamespace(posts=posts, clock=clock)
+    alerting.reset_for_tests()
+
+
+def _delivered(telegram, marker: str) -> list[str]:
+    return [p.get("text", "") for p in telegram.posts if marker in p.get("text", "")]
+
+
+async def test_the_sandbox_aggregate_pages_at_most_once_a_day(
+    reconcile_settings, apple_says, telegram,
+):
+    """Two passes, one message.
+
+    The Sandbox Elite's condition is STATIC — the row has read
+    `status='active'` since 2026-06-24 and this loop is forbidden to write it —
+    so every 6 h pass re-derives a byte-identical aggregate. At `alerting.py`'s
+    600 s default that is four identical Telegram messages a day, forever,
+    about a TestFlight row nobody needs to act on within hours.
+    """
+    from app.services.apple_reconciler import (
+        APPLE_STATUS_EXPIRED, SANDBOX_AGGREGATE_MIN_INTERVAL_S, _flush_alerts,
+    )
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="elite")
+    txn = await _mk_sub(uid, product=LEGACY_ELITE, plan_id="elite",
+                        status="active", days=-80, environment="Sandbox")
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_ELITE, txn=txn, environment="Sandbox",
+    ))
+
+    first = await _run()
+    await _flush_alerts(first)
+    telegram.clock.advance(RECONCILE_INTERVAL_S)
+    second = await _run()
+    await _flush_alerts(second)
+
+    # Nothing was written either pass, so the second pass really does raise the
+    # same aggregate — the suppression is the only reason it is not delivered.
+    assert _alert_categories(first) == ["apple-reconcile-drift"], first.alerts
+    assert _alert_categories(second) == ["apple-reconcile-drift"], second.alerts
+
+    sent = _delivered(telegram, "[apple-reconcile-drift sandbox]")
+    assert len(sent) == 1, telegram.posts
+    assert "drifted Sandbox row(s) were REPORTED" in sent[0]
+
+    # …and it is the per-alert interval that did it, not a lucky window.
+    assert [a[4] for a in first.alerts] == [SANDBOX_AGGREGATE_MIN_INTERVAL_S]
+    assert [a[4] for a in second.alerts] == [SANDBOX_AGGREGATE_MIN_INTERVAL_S]
+    assert SANDBOX_AGGREGATE_MIN_INTERVAL_S == 86400
+
+
+async def test_a_production_downgrade_keeps_its_every_pass_cadence(
+    reconcile_settings, apple_says, telegram,
+):
+    """The 24 h window belongs to the Sandbox aggregate ALONE.
+
+    A Production payer this loop would have to downgrade is a dropped App Store
+    notification — the failure the reconciler exists to catch — so it is queued
+    with NO widened interval and two passes deliver two pages. Anti-vacuity for
+    the test above: a module-wide widening would look identical there and would
+    mute this.
+    """
+    from app.services.apple_reconciler import APPLE_STATUS_EXPIRED, _flush_alerts
+
+    reconcile_settings.apple_reconcile_apply = False      # the mode production runs
+
+    uid = await _mk_user()
+    await _mk_balance(uid, plan_id="unlimited")
+    txn = await _mk_sub(uid, status="active", days=-3, grandfathered=True)
+    apple_says.set(txn, _apple(
+        APPLE_STATUS_EXPIRED, product=LEGACY_BUILDER,
+        expires=datetime.utcnow() - timedelta(days=3), txn=txn,
+    ))
+
+    first = await _run()
+    await _flush_alerts(first)
+    telegram.clock.advance(RECONCILE_INTERVAL_S)
+    second = await _run()
+    await _flush_alerts(second)
+
+    for r in (first, second):
+        crit = [a for a in r.alerts if a[0] == "apple-reconcile-downgrade"]
+        assert crit and crit[0][1] == "critical", r.alerts
+        # Queued with no interval of its own: the cadence stays alerting.py's.
+        assert crit[0][4] is None, crit
+
+    assert len(_delivered(telegram, "[apple-reconcile-downgrade")) == 2, telegram.posts
 
 
 # ── 5. budget, reachability, and the operator's proof of life ────────

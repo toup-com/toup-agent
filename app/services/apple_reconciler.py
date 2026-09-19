@@ -51,6 +51,10 @@ Two rules that are not negotiable
   DEVIATION from design §5.3.4, which expected the first applied pass to
   downgrade the Sandbox Elite; it will now be REPORTED every pass and left
   alone until an operator decides. Write this back into the design.
+  That report is ONE aggregate warning, in every mode — see the fold in
+  ``_raise_alarms`` — and, because the condition is static rather than
+  flapping, it pages at most once per 24 h
+  (``SANDBOX_AGGREGATE_MIN_INTERVAL_S``) rather than on every pass.
 
 Idempotency
 ===========
@@ -145,6 +149,31 @@ _MIRROR_CLAIMS_ALIVE = frozenset({
 # is evidence of a dropped message.
 _OVERDUE_SLACK = timedelta(hours=1)
 
+# The Sandbox aggregate's OWN rate-limit window, handed to `send_infra_alert`
+# per alert; every other alert this module raises keeps alerting.py's default.
+#
+# Why 24 h. The aggregate's condition is STATIC by policy, not flapping: the
+# Sandbox Elite has read `status='active'` since its 2026-06-24 expiry and
+# `_may_mutate` forbids this loop from ever writing it, so every pass of a
+# 6-hourly reconciler re-derives a byte-identical body. At the 600 s default
+# that is four identical Telegram messages a day, forever, about a
+# TestFlight/Sandbox row nobody needs to act on within hours — and an alarm
+# that arrives on a schedule rather than on a change is the one that gets the
+# whole channel muted. A day is the longest interval that still guarantees the
+# operator sees the row at least once a day, and alerting.py counts the
+# suppressed repeats and appends "(+N similar suppressed in the last window)"
+# to the next delivered message, so nothing is dropped. It is deliberately NOT
+# applied to anything else: a Production finding is evidence of a dropped App
+# Store notification, which is the failure this loop exists to catch.
+#
+# KNOWN RESIDUE: alerting.py's window is module state, per PROCESS by design
+# (fleet-wide de-duplication is the infra lease, not that file). A redeploy, a
+# replica restart, or the `apple-reconciler` lease moving to the other replica
+# starts a fresh window, so an unchanged condition can still page once more
+# inside the 24 h. Bounded and acceptable; making it durable means a DB row per
+# alert key, which is a bigger mechanism than the noise it would remove.
+SANDBOX_AGGREGATE_MIN_INTERVAL_S = 86400
+
 
 def _cfg(name: str, default):
     return getattr(settings, name, default)
@@ -175,9 +204,17 @@ class ReconcilePass:
     applied: int = 0
     would: int = 0
     errors: list[str] = field(default_factory=list)
-    # (category, level, message, subject) — flushed AFTER the commit so a slow
-    # Telegram cannot hold a write transaction open.
-    alerts: list[tuple[str, str, str, Optional[str]]] = field(default_factory=list)
+    # (category, level, message, subject, min_interval_s) — flushed AFTER the
+    # commit so a slow Telegram cannot hold a write transaction open.
+    #
+    # `min_interval_s` is None for "whatever alerting.py's default is", so the
+    # cadence of every ordinary alert keeps living in exactly one place; only
+    # the Sandbox aggregate sets it (SANDBOX_AGGREGATE_MIN_INTERVAL_S). The
+    # fifth element is additive on purpose — every reader in tests/ indexes
+    # (`a[0]`, `a[1]`, `a[2]`) rather than unpacking, so widening the tuple
+    # cannot break one.
+    alerts: list[tuple[str, str, str, Optional[str], Optional[int]]] = field(
+        default_factory=list)
 
     @property
     def classes(self) -> dict[str, int]:
@@ -413,6 +450,12 @@ def _may_mutate(environment: str) -> bool:
     See the module docstring: a sandbox subscription's lifetime is measured in
     minutes, and letting it move a production ``credit_balances`` row trades a
     visible drift for an invisible one.
+
+    Also the key ``_raise_alarms`` folds on, which is why it must stay a
+    function of the CONFIGURATION rather than of what a given pass wrote:
+    observe-only writes nothing at all, and the alerts still have to tell a
+    Sandbox row that was never going to be touched apart from a Production one
+    that was.
     """
     if (environment or ENV_PRODUCTION) == ENV_PRODUCTION:
         return True
@@ -676,6 +719,10 @@ async def _apply_finding(
     may = _may_mutate(finding.environment)
     effective_apply = apply and may
     if apply and not may:
+        # Bookkeeping only — it is what keeps `applied` from counting a write
+        # that was refused. It is NOT what the alerts fold on: this branch
+        # needs `apply`, so the marker does not exist in observe-only and
+        # keying the fold on it silenced nothing there.
         finding.actions.append("sandbox:not_applied")
 
     if finding.cls == CLASS_MISSING:
@@ -732,19 +779,43 @@ def _raise_alarms(result: ReconcilePass) -> None:
     Subjects are per-account so one noisy subscription cannot suppress an
     alert about another (alerting.py's (category, subject) window).
     """
-    def _add(category, level, message, subject=None):
-        result.alerts.append((category, level, message, subject))
+    def _add(category, level, message, subject=None, min_interval_s=None):
+        result.alerts.append((category, level, message, subject, min_interval_s))
 
-    mode = "" if result.apply else " [observe-only: nothing was written]"
+    def _acts(acted: list[str]) -> str:
+        """The action list, in the tense of the mode that produced it.
+
+        This replaces a trailing " [observe-only: nothing was written]" tag,
+        which had every body assert a completed action in its first clause and
+        deny it one sentence later. An alarm an operator must read twice to
+        learn whether anything happened is an alarm that gets muted.
+        """
+        joined = "; ".join(acted)
+        if result.apply:
+            return f"Actions: {joined}."
+        return f"Proposed actions (observe-only — nothing was written): {joined}."
 
     for f in result.findings:
         acted = [a for a in f.actions if a != "sandbox:not_applied"]
-        if "sandbox:not_applied" in f.actions:
+        if not _may_mutate(f.environment):
             # Folded into the one aggregate warning below instead. Firing
             # `apple-reconcile-downgrade` CRITICAL here would page an operator
             # about a downgrade that deliberately did not happen — an alarm
             # describing an action rather than a fact, which is how a channel
             # gets muted.
+            #
+            # Keyed on the configuration FACT, never on `_apply_finding`'s
+            # "sandbox:not_applied" marker: that marker is written only under
+            # `if apply and not may`, so in the observe-only mode production
+            # runs the fold was UNREACHABLE — a Sandbox row took the CRITICAL
+            # arm below on every pass where Apple answered that the
+            # subscription was dead, claiming a downgrade nothing was ever
+            # going to write.
+            #
+            # It cannot swallow `apple-legacy-crossgrade`, which is an alert
+            # rather than a refused write: `scan` emits that class only for
+            # ENV_PRODUCTION, so it never reaches here. Keep that true if the
+            # scan's arms ever widen.
             continue
         if f.cls == CLASS_CROSSGRADE:
             _add("apple-legacy-crossgrade", "critical",
@@ -761,14 +832,18 @@ def _raise_alarms(result: ReconcilePass) -> None:
             _add("apple-reconcile-missing-entitlement", "critical",
                  f"A LIVE Apple payer was not entitled: {f.detail} "
                  f"(user={uidp(f.user_id)}, orig_txn={f.original_txn}). "
-                 f"Actions: {'; '.join(acted)}.{mode} This is a paying customer "
+                 f"{_acts(acted)} This is a paying customer "
                  f"locked out of what they bought.",
                  uidp(f.user_id))
         elif any(a.startswith("downgrade ") for a in acted):
+            # "had to" asserts a write. In observe-only there was none, so the
+            # verb is conditional rather than contradicted by a tag at the end
+            # of its own sentence.
+            verb = "had to downgrade" if result.apply else "would have to downgrade"
             _add("apple-reconcile-downgrade", "critical",
-                 f"The reconciler had to downgrade a {f.environment} payer: "
+                 f"The reconciler {verb} a {f.environment} payer: "
                  f"{f.detail} (user={uidp(f.user_id)}, orig_txn={f.original_txn}). "
-                 f"Actions: {'; '.join(acted)}.{mode} A downgrade reaching this "
+                 f"{_acts(acted)} A downgrade reaching this "
                  f"loop means the App Store notification channel dropped the "
                  f"lapse message — the failure this reconciler exists to catch.",
                  uidp(f.user_id))
@@ -798,19 +873,68 @@ def _raise_alarms(result: ReconcilePass) -> None:
         elif acted:
             _add("apple-reconcile-drift", "warning",
                  f"{f.cls}: {f.detail} (user={uidp(f.user_id)}, "
-                 f"orig_txn={f.original_txn}). Actions: {'; '.join(acted)}.{mode}",
+                 f"orig_txn={f.original_txn}). {_acts(acted)}",
                  uidp(f.user_id))
 
+    # Same key as the fold above, for the same reason: a marker-keyed list was
+    # empty in observe-only, so the rows the fold removed from the per-finding
+    # arms were reported by NOTHING once the fold started working there.
     sandbox_skipped = [f for f in result.findings
-                       if "sandbox:not_applied" in f.actions]
+                       if not _may_mutate(f.environment)]
     if sandbox_skipped:
-        _add("apple-reconcile-drift", "warning",
-             f"{len(sandbox_skipped)} Sandbox row(s) are drifted and were "
-             f"REPORTED, not corrected — a sandbox subscription must never move "
-             f"a production balance. Set apple_reconcile_sandbox_apply=true to "
-             f"let this loop clean them: "
-             f"{', '.join(str(f.original_txn) for f in sandbox_skipped[:5])}.",
-             "sandbox")
+        # This line is the ONLY thing an operator ever reads about these rows,
+        # so it may not name a cause it does not know. A folded finding is in
+        # one of three states and only the first is the sandbox policy's doing:
+        # a correction was determined and refused (`acted` non-empty); Apple
+        # returned no answer for the transaction this pass (`f.apple is None`,
+        # which `_apply_finding` treats as "reporting is the whole action");
+        # or Apple answered and there was nothing to converge. One sentence
+        # blaming all three on "a sandbox subscription must never move a
+        # production balance" sends an operator to flip an opt-in that cannot
+        # change the last two — and, when every Apple call failed, contradicts
+        # the `apple-reconcile-unreachable` warning raised by the same pass.
+        refused, unread, converged = [], [], []
+        for f in sandbox_skipped:
+            if [a for a in f.actions if a != "sandbox:not_applied"]:
+                refused.append(f)
+            elif f.apple is None:
+                unread.append(f)
+            else:
+                converged.append(f)
+
+        def _txns(group) -> str:
+            return ", ".join(str(f.original_txn) for f in group[:5])
+
+        parts = [f"{len(sandbox_skipped)} drifted Sandbox row(s) were "
+                 f"REPORTED, not corrected."]
+        if refused:
+            # Observe-only needs both switches, and an operator sent to flip
+            # one would watch the next pass change nothing and conclude the
+            # opt-in is broken.
+            opt_in = ("apple_reconcile_sandbox_apply=true" if result.apply else
+                      "apple_reconcile_apply=true and "
+                      "apple_reconcile_sandbox_apply=true")
+            parts.append(
+                f"{len(refused)} row(s) had a correction determined and "
+                f"refused — a sandbox subscription must never move a "
+                f"production balance: {_txns(refused)}. Set {opt_in} to let "
+                f"this loop clean them.")
+        if unread:
+            parts.append(
+                f"{len(unread)} row(s) could not be evaluated — Apple "
+                f"returned no answer for them this pass (unreadable, unknown "
+                f"to Apple, or past this pass's API budget), so no correction "
+                f"is known: {_txns(unread)}.")
+        if converged:
+            parts.append(
+                f"{len(converged)} row(s) were read at Apple and produced no "
+                f"correction to make: {_txns(converged)}.")
+        # The one alert in this module with a window of its own: an unchanged
+        # Sandbox condition pages at most once a day rather than on every pass.
+        # See SANDBOX_AGGREGATE_MIN_INTERVAL_S for why, and for the per-process
+        # residue.
+        _add("apple-reconcile-drift", "warning", " ".join(parts), "sandbox",
+             SANDBOX_AGGREGATE_MIN_INTERVAL_S)
 
     # "Every Apple call failed" is a DIFFERENT fact from "nothing to fix", and
     # a reconciler that cannot tell them apart reports health it did not check.
@@ -822,9 +946,15 @@ def _raise_alarms(result: ReconcilePass) -> None:
 
 
 async def _flush_alerts(result: ReconcilePass) -> None:
-    for category, level, message, subject in result.alerts:
+    for category, level, message, subject, min_interval_s in result.alerts:
+        # Forward a window only when the alert asked for one; `min_interval_s`
+        # has a default in alerting.py and passing None would override it with
+        # nothing rather than fall back to it.
+        window = {} if min_interval_s is None else {"min_interval_s": min_interval_s}
         try:
-            await send_infra_alert(category, level, message, subject=subject)
+            await send_infra_alert(
+                category, level, message, subject=subject, **window,
+            )
         except Exception as e:  # pragma: no cover - alerting is best-effort
             logger.warning("[apple-reconcile] alert %s failed: %s", category, e)
 

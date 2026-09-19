@@ -265,6 +265,14 @@ def test_container_reconciler_gates_both_the_tick_and_the_fast_subtick():
     # different process reading its own snapshot.
     ("app/services/apple_reconciler.py", "apple-reconciler",
      "run_reconcile_pass()"),
+    # The rollout reconciler drives blue-green upgrades, CREATES sweep
+    # rollouts and pages the operator. It was exempted below on the claim
+    # that it "already owns a DB lock"; it owns no lock of any kind (see
+    # that test's docstring), and on 2026-09-16 the bridge access log caught
+    # both replicas polling /v1/pool/health every 30 s, 11 s apart, with the
+    # duplicate fleet pages to match.
+    ("app/services/rollout_service.py", "rollout_reconciler",
+     "_fleet_watch_once()"),
 ])
 def test_every_gated_loop_acquires_before_it_works(rel, name, marker):
     src = _src(rel)
@@ -277,12 +285,45 @@ def test_every_gated_loop_acquires_before_it_works(rel, name, marker):
 def test_loops_that_must_not_be_leader_gated_are_not():
     """`db_watchdog` heals THIS process's engine — electing a leader for it
     would be a bug, not a fix. `notification_dispatch` is per-row CAS, which
-    is strictly better than a leader for throughput. `rollout_reconciler`
-    already owns a DB lock."""
+    is strictly better than a leader for throughput.
+
+    `rollout_service` used to sit in this list on the justification that
+    "rollout_reconciler already owns a DB lock". It owns none: there is no
+    `FOR UPDATE`, no advisory lock and no unique constraint anywhere on that
+    path, and its three exclusions (`_resume_inflight`,
+    `_rollout_creation_lock` — whose own comment asserts a single
+    platform-api instance — and `_FLEET_STATE`) are all process-local, so
+    none of them could see the second Railway replica. It is gated now and
+    asserted in the table above."""
     for rel in ("app/services/db_watchdog.py",
-                "app/services/notification_dispatcher.py",
-                "app/services/rollout_service.py"):
+                "app/services/notification_dispatcher.py"):
         assert "infra_lease" not in _src(rel), rel
+
+
+def test_the_rollout_gate_is_on_the_loop_not_on_the_shared_functions():
+    """One acquire, in the reconciler loop's own tick body, above the work.
+
+    (The body lives in `_rollout_reconciler_ticks`, between the entry point
+    and the convergence-sweep section, so the slice below covers both. The
+    per-tick renewal itself is pinned behaviourally in
+    tests/test_rollout_fleet_alerting.py::TestLeaderGate — a source probe
+    cannot tell one acquire inside the loop from one hoisted above it.)
+
+    `start_rollout` runs `_reconcile_once(db)` as its lock self-heal pass and
+    the admin API calls into this module directly. Those serve a request an
+    operator is waiting on, not a periodic tick: a lease check there would
+    make every CI push 409 for as long as the OTHER replica held the lease,
+    and would silently stop orphaning the stuck rollout that is causing the
+    409 in the first place."""
+    src = _src("app/services/rollout_service.py")
+    assert src.count("acquire_lease(") == 1, (
+        "exactly one gate — a second one is a shared function being gated"
+    )
+    loop = src[src.index("async def rollout_reconciler_loop"):
+               src.index("# ─── Convergence sweep")]
+    assert 'acquire_lease("rollout_reconciler"' in loop, "the gate is the LOOP's"
+    assert (loop.index('acquire_lease("rollout_reconciler"')
+            < loop.index("await _reconcile_once()")), "gate above the work"
 
 
 def test_no_loop_reaches_for_a_session_scoped_advisory_lock():

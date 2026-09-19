@@ -54,15 +54,22 @@ logger = logging.getLogger(__name__)
 # ─── Alerts ────────────────────────────────────────────────────────
 
 
-async def _send_telegram(level: str, message: str) -> None:
+async def _send_telegram(level: str, message: str) -> bool:
     """Fire a Telegram alert to the infra bot (not the user-facing one).
 
     level: 'info' | 'warning' | 'critical' — rendered as emoji prefix.
     Delegates to the canonical alerting module; rollout alerts are
     deliberate one-shot events, so no rate limiting (min_interval_s=0).
+
+    Returns `send_infra_alert`'s verdict: True only on a CONFIRMED 2xx from
+    Telegram. This used to be discarded, which threw away the one property
+    `alerting.py` was rewritten to have (L3-7: "a failed send does NOT consume
+    the window") — every caller that keeps its own suppression state needs the
+    answer, and `_fleet_watch_once` is one. Callers whose alert is genuinely
+    one-shot may still ignore it.
     """
     from app.services.alerting import send_infra_alert
-    await send_infra_alert("rollout", level, message, min_interval_s=0)
+    return await send_infra_alert("rollout", level, message, min_interval_s=0)
 
 
 # ─── Queries ───────────────────────────────────────────────────────
@@ -207,10 +214,21 @@ async def _poll_health(agent_url: str, attempts: int, interval_s: float) -> int:
 #      exception triggers abort+rollback. ~60s default — long enough
 #      to catch slow crashes, fast enough to not wait pointlessly.
 #
-# Operator-set canary_wait_minutes is treated as a HARD CAP (not target):
-# the observe never runs longer than that. So setting `canary_wait_minutes=30`
-# for a high-risk schema migration extends the cap; default of 5 is fine
-# for routine deploys.
+# Operator-set canary_wait_minutes is the cap on the HEALTH phases (not a
+# target): the boot gate and the stability hold each clamp their own deadline
+# to it, so setting `canary_wait_minutes=30` for a high-risk schema migration
+# extends the window; default of 5 is fine for routine deploys.
+#
+# It is NOT a hard cap on the whole observation, and this comment claimed it
+# was until 2026-09-18. Phase 3's turn probe keeps its own retry window
+# (`rollout_turn_probe_timeout_s`, 120 s default) and is deliberately NOT
+# clamped to the cap, so the observe can run to roughly
+# cap + rollout_turn_probe_timeout_s + one in-flight request
+# (`min(90 s, rollout_turn_probe_timeout_s)`). R47 clamped it and reverted:
+# clamping makes the probe single-shot on a short window, and one transient
+# model 503 then rolls a healthy image back. The overshoot is covered — the
+# observation runs inside `_heartbeating(rollout.id, "canary-observe")`, whose
+# own comment names "turn probe up to 120 s" as the stretch it exists for.
 
 _CANARY_BOOT_GATE_S = 75.0          # consecutive-OK gate must clear in this long
 _CANARY_BOOT_INTERVAL_S = 3.0       # poll cadence during boot gate
@@ -274,11 +292,16 @@ async def _observe_canary_signal(
 ) -> tuple[bool, str]:
     """Signal-based canary observation. Returns (passed, reason).
 
-    `cap_seconds` is a hard timeout — the function never runs longer than
-    this regardless of boot/stability progress. It's the caller's
-    operator-set safety budget. Boot gate + stability hold defaults sum
-    to ~90s; setting cap_seconds < 90 effectively disables stability hold
-    (acceptable trade-off for ultra-fast deploys).
+    `cap_seconds` bounds the BOOT GATE and the STABILITY HOLD — each clamps
+    its deadline to it — not the function. It's the caller's operator-set
+    safety budget. Boot gate + stability hold defaults sum to ~90s; setting
+    cap_seconds < 90 effectively disables stability hold (acceptable
+    trade-off for ultra-fast deploys).
+
+    Phase 3's turn probe retries on its own `rollout_turn_probe_timeout_s`
+    window instead, so the real bound is cap_seconds + that timeout + one
+    in-flight request. See the module comment above `_CANARY_BOOT_GATE_S`
+    for why that is the deliberate trade and not an oversight.
 
     The timing parameters default to module constants for production but
     are injectable so tests can run the full algorithm with tiny windows
@@ -620,26 +643,68 @@ async def _resource_gate(
 # 14:35) went unreported for nine hours. The bridge's `fleet` block answers the
 # real question; this is the platform side that watches it.
 
-# last_alert_ts / last_log_ts are None until the first one fires: seeding them
+# alert_ts / last_log_ts are None until the first one fires: seeding them
 # with 0.0 makes "never alerted" indistinguishable from "alerted at the epoch",
 # and every rate limiter that starts at 0 suppresses its own first alert for
 # the whole interval — which is the one alert an operator was waiting for.
-_FLEET_STATE: dict = {"split_since": None, "last_alert_ts": None, "last_log": "", "last_log_ts": None}
+#
+# `alert_grade` is the GRADE of the fault the operator was last told about
+# (None = nothing outstanding), written only after a confirmed send — so it is
+# literally "what they know", and the page condition is "it is worse than that".
+# `send_fail_grade`/`send_fail_ts` remember a grade whose POST was REFUSED, so
+# the retry does not become a 30 s POST loop against a 429 — the window is
+# still not consumed, it is only spaced. `send_fail_count` /
+# `recovery_fail_count` count CONSECUTIVE refusals on each half, so a target
+# that will never accept stops being retried at fault speed
+# (`_FLEET_ALERT_DEAD_AFTER`). `recovery_pending` is the closing notice owed
+# for an episode that has ended (see `_fleet_watch_once`).
+_FLEET_STATE: dict = {
+    "split_since": None, "last_log": "", "last_log_ts": None,
+    "alert_grade": None, "alert_ts": None,
+    "send_fail_grade": None, "send_fail_ts": None, "send_fail_count": 0,
+    "recovery_pending": False, "recovery_ts": None, "recovery_fail_count": 0,
+}
 _FLEET_LOG_INTERVAL_S = 600.0
+
+# Spacing for a page whose POST Telegram refused. Short enough that a 429 or a
+# 30 s Telegram outage still delivers the page within one reconciler minute or
+# two; long enough that the reconciler's 30 s tick is not the POST cadence.
+_FLEET_ALERT_RETRY_S = 300.0
+
+# After this many CONSECUTIVE refusals on one half, the retry widens from
+# `_FLEET_ALERT_RETRY_S` to `rollout_fleet_alert_interval_s`. A 429 or a brief
+# Telegram outage clears long before six attempts, so the short spacing keeps
+# its whole purpose; a target that is configured but can never accept (revoked
+# token, bot removed from the chat → 401/403 forever) would otherwise POST
+# every 5 min for as long as the fault stands — ~72 attempts across a 6 h
+# episode, where the old timestamp gate made one. Six ≈ 30 min of trying
+# before we conclude it is the target and not the moment.
+_FLEET_ALERT_DEAD_AFTER = 6
+
+# Severity bands, as a fraction of the ASSIGNED fleet: (0,10%] / (10%,50%] /
+# (50%,100%]. Coarse on purpose — see `_fleet_alert_grade`.
+_FLEET_BAND_FRACTIONS = (0.10, 0.50)
 
 
 def _reset_fleet_watch_state() -> None:
     """Test seam — the split clock is module state by design (the reconciler
     is the only ticker and the platform runs one loop per replica)."""
-    _FLEET_STATE.update({"split_since": None, "last_alert_ts": None, "last_log": "", "last_log_ts": None})
+    _FLEET_STATE.update({
+        "split_since": None, "last_log": "", "last_log_ts": None,
+        "alert_grade": None, "alert_ts": None,
+        "send_fail_grade": None, "send_fail_ts": None, "send_fail_count": 0,
+        "recovery_pending": False, "recovery_ts": None, "recovery_fail_count": 0,
+    })
 
 
-def _fleet_warnings(fleet: dict, split_for_s: float, *, split_alert_after_s: Optional[float] = None) -> list[str]:
-    """Which of the two conditions this fleet is in. Pure.
+def _fleet_conditions(
+    fleet: dict, split_for_s: float, *, split_alert_after_s: Optional[float] = None
+) -> list[tuple[str, str]]:
+    """Which of the two conditions this fleet is in, as (kind, text). Pure.
 
-    A split is NORMAL while a rollout converges (49 of 50 pool members inside
-    30 minutes, 2026-08-01) — it is only a fault once it stops moving, or once
-    the mechanism that would move it is switched off.
+    The KIND exists so the page gate can key on the fault rather than on the
+    warning text: the split text embeds elapsed minutes, so a text key would
+    change on every tick and page on every tick.
     """
     after = float(
         split_alert_after_s
@@ -648,20 +713,115 @@ def _fleet_warnings(fleet: dict, split_for_s: float, *, split_alert_after_s: Opt
     )
     behind = int(fleet.get("assigned_on_other") or 0)
     generic_behind = int(fleet.get("generic_on_other") or 0)
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     if behind <= 0 and generic_behind <= 0:
         return out
     if not fleet.get("auto_upgrade_assigned", True) and behind > 0:
-        out.append(
+        out.append((
+            "auto_upgrade_off",
             f"assigned-slot auto-upgrade is OFF with {behind} slot(s) behind "
-            f"{fleet.get('current_image_tag') or 'the current tag'} — nothing will converge them"
-        )
+            f"{fleet.get('current_image_tag') or 'the current tag'} — nothing will converge them",
+        ))
     elif split_for_s >= after:
-        out.append(
+        out.append((
+            "split_stalled",
             f"fleet split for {int(split_for_s // 60)} min: {behind} assigned + "
-            f"{generic_behind} generic slot(s) off {fleet.get('current_image_tag') or 'the current tag'}"
-        )
+            f"{generic_behind} generic slot(s) off {fleet.get('current_image_tag') or 'the current tag'}",
+        ))
     return out
+
+
+def _fleet_severity_band(behind: int, total: int) -> int:
+    """How bad, coarsely: 0 none, 1 up to 10% of the assigned fleet, 2 up to
+    50%, 3 more than half. Pure.
+
+    A band and not the count, because the count MOVES. A manual fleet walk
+    converges one slot every ~2 minutes for hours (round 46: 84 slots), and a
+    gate keyed on the raw number treats every step of that as news — 84 pages
+    for one episode, in the round whose purpose is fewer pages. The band is the
+    granularity an operator acts on differently.
+
+    `total` is only read once `behind > 0`, and the sole caller
+    (`_fleet_alert_grade`) derives it as `assigned_total or
+    (assigned_on_current + behind)` — so it is >= behind >= 1 there, and a
+    bridge whose `fleet` block predates `assigned_total` lands on the top band
+    through the normal path (derived total == behind, frac == 1.0) rather than
+    through a special case.
+    """
+    if behind <= 0:
+        return 0
+    frac = behind / float(total)
+    for i, edge in enumerate(_FLEET_BAND_FRACTIONS):
+        if frac <= edge:
+            return i + 1
+    return len(_FLEET_BAND_FRACTIONS) + 1
+
+
+def _fleet_alert_grade(fleet: dict, kinds: Sequence[str]) -> dict:
+    """What the page is ABOUT, at the granularity worth paging on.
+
+    The old gate was a bare per-process timestamp, so it followed the CLOCK
+    instead of the condition: on 2026-09-16 an escalation from 1 slot behind to
+    83 of 84 was suppressed inside the same 6 h window, even though eight lines
+    higher the same function change-detects its LOG line.
+
+    Generic slots are carried as a BOOLEAN, not a band: the bridge's fleet
+    block has `assigned_total` but no generic total
+    (`bridge/pool_addon.py::_fleet_snapshot`), so there is no denominator to
+    band them against — and a generic on an old tag is replaced by the pool
+    rather than upgraded in place, so its count churns on every claim. "Are
+    there any" is the part an operator acts on.
+    """
+    behind = int(fleet.get("assigned_on_other") or 0)
+    total = int(fleet.get("assigned_total") or 0) or (
+        int(fleet.get("assigned_on_current") or 0) + behind
+    )
+    return {
+        "kinds": frozenset(kinds),
+        "tag": fleet.get("current_image_tag") or "-",
+        "band": _fleet_severity_band(behind, total),
+        "generic": bool(int(fleet.get("generic_on_other") or 0)),
+    }
+
+
+def _fleet_alert_worsened(known: Optional[dict], now_grade: dict) -> bool:
+    """Is this worse than what the operator was last told? Pure.
+
+    `known` is None when nothing is outstanding, which is always news. Only
+    the WORSENING directions count: a new condition kind, a different target
+    tag (a different rollout stuck), a higher severity band, or generics
+    joining the split. A band that holds or FALLS is not news — the operator
+    already knows about the worse reading, and the recovery notice reports the
+    end of the episode. That asymmetry is the whole point: keying on any
+    CHANGE pages once per converging slot.
+    """
+    if known is None:
+        return True
+    return bool(
+        now_grade["tag"] != known["tag"]
+        or (now_grade["kinds"] - known["kinds"])
+        or now_grade["band"] > known["band"]
+        or (now_grade["generic"] and not known["generic"])
+    )
+
+
+def _fleet_warnings(fleet: dict, split_for_s: float, *, split_alert_after_s: Optional[float] = None) -> list[str]:
+    """The operator-facing text of `_fleet_conditions`. Pure.
+
+    A split is NORMAL while a rollout converges (49 of 50 pool members inside
+    30 minutes, 2026-08-01) — it is only a fault once it stops moving, or once
+    the mechanism that would move it is switched off.
+
+    Production reads `_fleet_conditions` directly, because the page gate needs
+    the kinds and the body needs the texts and they must come from ONE
+    evaluation. This wrapper is the seam tests/test_rollout_fleet_visibility.py
+    pins the wording through.
+    """
+    return [
+        text for _, text in _fleet_conditions(
+            fleet, split_for_s, split_alert_after_s=split_alert_after_s,
+        )
+    ]
 
 
 async def fleet_status(now: Optional[float] = None) -> dict:
@@ -676,12 +836,12 @@ async def fleet_status(now: Optional[float] = None) -> dict:
     body, why = await _bridge_get("/v1/pool/health", timeout_s=10.0)
     if body is None:
         return {"available": False, "fleet": None, "reason": f"bridge: {why}",
-                "split_for_seconds": 0, "warnings": []}
+                "split_for_seconds": 0, "warnings": [], "warning_kinds": []}
     fleet = body.get("fleet")
     if not isinstance(fleet, dict):
         return {"available": False, "fleet": None,
                 "reason": "bridge /v1/pool/health carries no 'fleet' block (bridge predates the contract)",
-                "split_for_seconds": 0, "warnings": []}
+                "split_for_seconds": 0, "warnings": [], "warning_kinds": []}
 
     split = int(fleet.get("assigned_on_other") or 0) + int(fleet.get("generic_on_other") or 0) > 0
     if split:
@@ -692,13 +852,55 @@ async def fleet_status(now: Optional[float] = None) -> dict:
         _FLEET_STATE["split_since"] = None
         split_for = 0.0
 
+    # Kinds and texts come from ONE evaluation: `_fleet_watch_once` keys its
+    # suppression on the kinds and words the page from the texts, and the two
+    # deciding against different readings of the same clock is a page that
+    # names one fault while suppressing against another.
+    conditions = _fleet_conditions(fleet, split_for)
     return {
         "available": True,
         "fleet": fleet,
         "reason": "ok",
         "split_for_seconds": int(split_for),
-        "warnings": _fleet_warnings(fleet, split_for),
+        "warnings": [text for _, text in conditions],
+        "warning_kinds": [kind for kind, _ in conditions],
     }
+
+
+async def _fleet_page(level: str, message: str) -> bool:
+    """Send a fleet page and answer "is anything still owed?" — True = no.
+
+    `send_infra_alert` returns False for THREE different things: not
+    configured, rate-limited, and refused by Telegram. Only a refusal is worth
+    retrying. With no token/chat there is nothing to deliver at all, so the
+    send counts as DONE and the caller's window is consumed — otherwise a
+    deployment with no Telegram config sits in the refused-send retry path,
+    logging "[infra-alert] no telegram config; skipping" at
+    `_FLEET_ALERT_RETRY_S` until `_fleet_retry_spacing` widens it, instead of
+    once per `rollout_fleet_alert_interval_s`. (The rate-limited arm cannot
+    fire for this caller: rollout alerts pass `min_interval_s=0` and
+    `subject=None`.)
+
+    `send_infra_alert` is still CALLED when unconfigured, so the page's text
+    reaches such a deployment's own log — the check only decides whether to
+    keep retrying.
+    """
+    from app.services.alerting import infra_alerts_configured
+    return await _send_telegram(level, message) or not infra_alerts_configured()
+
+
+def _fleet_retry_spacing(consecutive_refusals: int, interval_s: float) -> float:
+    """How long to wait before re-POSTing a page Telegram refused. Pure.
+
+    `_FLEET_ALERT_RETRY_S` while the refusal still looks like a moment (a 429,
+    a short outage); `interval_s` once `_FLEET_ALERT_DEAD_AFTER` consecutive
+    attempts say it is the TARGET — `infra_alerts_configured()` cannot tell a
+    revoked token or a bot removed from the chat from a working one, so that
+    case is "configured" and refuses forever.
+    """
+    if consecutive_refusals >= _FLEET_ALERT_DEAD_AFTER:
+        return float(interval_s)
+    return _FLEET_ALERT_RETRY_S
 
 
 async def _fleet_watch_once(now: Optional[float] = None) -> None:
@@ -706,6 +908,43 @@ async def _fleet_watch_once(now: Optional[float] = None) -> None:
 
     Rate-limited on both halves — the reconciler ticks every 30 s, and a fleet
     that has been split for nine hours must produce one page, not 1080.
+
+    The page follows the CONDITION, not the clock (2026-09-16). Four rules,
+    and they only work together:
+
+      * a WORSENING pages, at once. The gate compares a coarse grade of the
+        fault (condition kinds + target tag + a severity band of the assigned
+        slots behind) against the grade the operator was last TOLD, so
+        "1 of 84 behind" → "83 of 84" is news and goes out on the next tick.
+        The old bare timestamp swallowed exactly that, inside the same 6 h
+        window.
+      * an IMPROVEMENT does not page. This is the other half, and keying on
+        any CHANGE gets it wrong: a manual fleet walk converges one slot
+        every ~2 minutes for hours (round 46: 84 slots), so a count-keyed gate
+        would have paged ~84 times for the single episode this docstring cites
+        — noisier than the bug. A band that holds or falls waits out
+        `rollout_fleet_alert_interval_s` like an unchanged fault. The page
+        BODY still carries the exact live counts; only the gate is coarse.
+      * a REFUSED send does not consume the window. `send_infra_alert` is
+        2xx-confirmed and `_send_telegram` now returns that verdict; writing
+        the state before the POST meant one 429 — the canonical result of two
+        replicas posting 0.3 s apart — suppressed the warning for 6 h against
+        a message nobody received. It matters MORE now the loop is leased:
+        with one runner there is no second replica to cover the loss. The
+        retry is BOUNDED, though: after `_FLEET_ALERT_DEAD_AFTER` consecutive
+        refusals on a half, its spacing widens from `_FLEET_ALERT_RETRY_S` to
+        the full interval, so a configured-but-dead target does not POST every
+        5 min for the length of the episode. A worsening still goes out at
+        once, and one confirmed send resets the count.
+      * the end of an episode CLEARS the gate and is announced once — and a
+        refused recovery notice is retried rather than lost, because a
+        recovery nobody received leaves the operator believing the fleet is
+        still split, which is the same asymmetry the rule above removes for
+        the warning half.
+
+    The state is per-process (no durable store, R47 constraint), so a standing
+    fault costs one page per platform-api process. That is the residue of not
+    having a table, and it is bounded by the deploy rate.
     """
     t = time.time() if now is None else now
     try:
@@ -720,6 +959,9 @@ async def _fleet_watch_once(now: Optional[float] = None) -> None:
         return
 
     f = st["fleet"]
+    # One reading of the interval for both halves: it is the widened spacing a
+    # dead target falls back to as well as the unchanged-fault window.
+    interval = float(getattr(settings, "rollout_fleet_alert_interval_s", 21600))
     line = (
         f"current={f.get('current_image_tag')} assigned_on_current={f.get('assigned_on_current')} "
         f"assigned_on_other={f.get('assigned_on_other')} generic_on_other={f.get('generic_on_other')} "
@@ -732,12 +974,86 @@ async def _fleet_watch_once(now: Optional[float] = None) -> None:
         logger.info("[ROLLOUT-FLEET] %s split_for=%ss", line, st["split_for_seconds"])
 
     if not st["warnings"]:
+        _FLEET_STATE["send_fail_grade"] = None
+        _FLEET_STATE["send_fail_ts"] = None
+        _FLEET_STATE["send_fail_count"] = 0
+        if _FLEET_STATE["alert_grade"] is not None:
+            # Close the edge we opened. The GATE is disarmed here, before any
+            # send, so a fresh fault pages at once whatever Telegram does with
+            # the notice; the notice itself is owed separately below.
+            _FLEET_STATE["alert_grade"] = None
+            _FLEET_STATE["alert_ts"] = None
+            _FLEET_STATE["recovery_pending"] = True
+            _FLEET_STATE["recovery_ts"] = None
+            _FLEET_STATE["recovery_fail_count"] = 0
+        if not _FLEET_STATE["recovery_pending"]:
+            return
+        if (_FLEET_STATE["recovery_ts"] is not None
+                and t - float(_FLEET_STATE["recovery_ts"]) < _fleet_retry_spacing(
+                    int(_FLEET_STATE["recovery_fail_count"] or 0), interval)):
+            return
+        # "No warnings" is NOT the same as "converged": re-enabling
+        # auto-upgrade clears the fault while every slot is still behind, and
+        # announcing convergence there is a lie the operator would act on. Say
+        # what was measured — and measured NOW, on this attempt's reading,
+        # because a retry minutes later is describing a different fleet than
+        # the one that cleared.
+        tag = f.get("current_image_tag") or "the current tag"
+        behind = int(f.get("assigned_on_other") or 0) + int(f.get("generic_on_other") or 0)
+        if await _fleet_page(
+            "info",
+            (f"Fleet fault cleared — {behind} slot(s) still off "
+             f"<code>{tag}</code>, inside the split window.")
+            if behind else
+            (f"Fleet converged — every slot is on <code>{tag}</code> "
+             f"({f.get('assigned_on_current')} assigned)."),
+        ):
+            _FLEET_STATE["recovery_pending"] = False
+            _FLEET_STATE["recovery_ts"] = None
+            _FLEET_STATE["recovery_fail_count"] = 0
+        else:
+            # Refused. Keep it owed and space the retry like a refused page —
+            # widening once the count says the target itself is the problem.
+            _FLEET_STATE["recovery_ts"] = t
+            _FLEET_STATE["recovery_fail_count"] = int(
+                _FLEET_STATE["recovery_fail_count"] or 0) + 1
         return
-    interval = float(getattr(settings, "rollout_fleet_alert_interval_s", 21600))
-    if _FLEET_STATE["last_alert_ts"] is not None and t - float(_FLEET_STATE["last_alert_ts"]) < interval:
+
+    # NOTE: nothing drops an owed recovery notice here, deliberately. The only
+    # send site is the branch above, and its body is rendered from that tick's
+    # own reading — so a close can never go out stale or while the fleet is
+    # faulted, and clearing the marker on a new fault is either a no-op (the
+    # next convergence re-arms it) or a loss: if THIS page is refused,
+    # `alert_grade` stays None, the next convergence does not re-arm, and the
+    # only message the operator ever received is left unclosed. Pinned by
+    # test_a_close_still_owed_survives_a_fault_page_nobody_received.
+    grade = _fleet_alert_grade(f, st["warning_kinds"])
+    if (not _fleet_alert_worsened(_FLEET_STATE["alert_grade"], grade)
+            and _FLEET_STATE["alert_ts"] is not None
+            and t - float(_FLEET_STATE["alert_ts"]) < interval):
         return
-    _FLEET_STATE["last_alert_ts"] = t
-    await _send_telegram("warning", "Fleet: " + "; ".join(st["warnings"]))
+    # A page Telegram refused is retried, but spaced — unless the fault has
+    # WORSENED since the refusal, which must not wait behind a failed attempt
+    # to report better news, and which starts the refusal count over because
+    # this is different news, not another attempt at the same news.
+    if _fleet_alert_worsened(_FLEET_STATE["send_fail_grade"], grade):
+        _FLEET_STATE["send_fail_count"] = 0
+    elif (_FLEET_STATE["send_fail_ts"] is not None
+            and t - float(_FLEET_STATE["send_fail_ts"]) < _fleet_retry_spacing(
+                int(_FLEET_STATE["send_fail_count"] or 0), interval)):
+        return
+    if await _fleet_page("warning", "Fleet: " + "; ".join(st["warnings"])):
+        # Record what they were TOLD, which is what "worse than they know"
+        # is measured against.
+        _FLEET_STATE["alert_grade"] = grade
+        _FLEET_STATE["alert_ts"] = t
+        _FLEET_STATE["send_fail_grade"] = None
+        _FLEET_STATE["send_fail_ts"] = None
+        _FLEET_STATE["send_fail_count"] = 0
+    else:
+        _FLEET_STATE["send_fail_grade"] = grade
+        _FLEET_STATE["send_fail_ts"] = t
+        _FLEET_STATE["send_fail_count"] = int(_FLEET_STATE["send_fail_count"] or 0) + 1
 
 
 # ─── Per-tenant upgrade + rollback ────────────────────────────────
@@ -1278,9 +1594,12 @@ async def _canary_observe_loop(
 ) -> bool:
     """Signal-based canary observation: boot gate (3 consecutive 200s in 30s)
     + stability hold (sustained healthy for 60s). Operator-set
-    `canary_wait_minutes` is the HARD CAP. Returns True on pass, False on
-    fail (in which case canary has already been rolled back and rollout
-    row marked aborted_canary_failed).
+    `canary_wait_minutes` caps those two phases; the turn probe past them
+    retries on `rollout_turn_probe_timeout_s`, so the observation's real
+    bound is the cap plus that timeout plus one in-flight request (see
+    `_observe_canary_signal`). Returns True on pass, False on fail (in which
+    case canary has already been rolled back and rollout row marked
+    aborted_canary_failed).
 
     Typical cap-bounded happy path: ~90 seconds. Was previously always
     `canary_wait_minutes` (default 10 min) of pure wall-clock burn after
@@ -1385,6 +1704,11 @@ _resume_inflight: set[str] = set()
 # calls and operator-extended canary windows (canary_wait_minutes can
 # be set up to 60), and won't false-positive any legitimate rollout.
 _STUCK_ROLLOUT_THRESHOLD_MIN = 30
+
+# The reconciler's tick. Also the basis of its infra-lease TTL (3x, so one
+# missed renewal cannot hand the lease over mid-tick) — the two are ONE number
+# and must move together, which is why the sleep reads it rather than a 30.
+_RECONCILER_TICK_S = 30
 
 # Pending-rollout threshold — much shorter than the running threshold. A
 # row sitting in 'pending' means the APScheduler one-shot job never fired
@@ -1502,34 +1826,78 @@ async def rollout_reconciler_loop() -> None:
       2. Auto-orphan rollouts that have been `running` for longer than
          `_STUCK_ROLLOUT_THRESHOLD_MIN`, regardless of phase. Catches
          double failures (e.g. resume crashes too) and rare phase corruptions.
+
+    LEADER-GATED (2026-09-18, R47). This loop drives blue-green upgrades,
+    orphans rollouts, CREATES sweep rollouts and pages the operator — and it
+    was the last periodic loop on `platform-api` running unelected, on both
+    Railway replicas. Measured: the bridge access log shows two platform
+    processes polling `/v1/pool/health` every 30 s, 11 s apart, and the
+    duplicate fleet pages at 04:58Z and 07:31Z on 2026-09-16 are the pair.
+    The exclusions this file already has are all PROCESS-local and none of
+    them saw the second replica: `_resume_inflight`, `_rollout_creation_lock`
+    (whose own comment asserts a single platform-api instance) and
+    `_FLEET_STATE`. There is no `FOR UPDATE`, no advisory lock and no unique
+    constraint anywhere on this path.
+
+    The gate is on the LOOP, not on the functions. `start_rollout` calls
+    `_reconcile_once(db)` as its lock self-heal pass and the admin API calls
+    into this module directly; both must keep working un-leased, because they
+    are serving a request an operator is waiting on, not a periodic tick.
     """
-    logger.info("[ROLLOUT-RECONCILER] started (tick=30s)")
+    try:
+        await _rollout_reconciler_ticks()
+    except asyncio.CancelledError:
+        # Hand the lease back on a graceful shutdown so the INCOMING replica
+        # takes the next tick immediately instead of waiting out the TTL.
+        # Everything in this loop is now behind the gate — rollout resume,
+        # stuck-rollout orphaning and the fleet watch — so without this a
+        # deploy idles all three for up to ttl = 3x the tick (90 s), where
+        # before the gate both replicas reconciled from boot. A SIGKILL still
+        # falls back to TTL expiry, unchanged. Same pattern as
+        # `container_reconciler_loop` and `apple_reconcile_loop`.
+        from app.services.infra_lease import release_lease
+        await release_lease("rollout_reconciler")
+        raise
+
+
+async def _rollout_reconciler_ticks() -> None:
+    """The loop proper — split out so `rollout_reconciler_loop` can release
+    the lease on cancellation without nesting this whole body one level
+    deeper. Cancellation can land on ANY await in a tick, not just the sleep,
+    so the handler has to wrap the lot.
+    """
+    logger.info("[ROLLOUT-RECONCILER] started (tick=%ss)", _RECONCILER_TICK_S)
+    from app.services.infra_lease import acquire_lease, lease_ttl_for
+    _ttl = lease_ttl_for(_RECONCILER_TICK_S)
     while True:
-        try:
-            await _reconcile_once()
-        except Exception:
-            # Never let a tick exception kill the loop. Log and keep going.
-            logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
-        # Convergence sweep — separate try/except so a sweep failure can't
-        # mask (or be masked by) a reconcile failure. Lives in the LOOP, not
-        # in _reconcile_once: start_rollout runs _reconcile_once as its lock
-        # self-heal pass, and a sweep firing there would grab the lock the
-        # caller is about to check and 409 every CI push with divergence.
-        # Note the tick pauses while a sweep drives its batches (bounded by
-        # hard_timeout_s per batch) — acceptable: the sweep holds the rollout
-        # lock anyway, and its heartbeat keeps the row visibly alive.
-        try:
-            await _convergence_sweep_once()
-        except Exception:
-            logger.exception("[ROLLOUT-SWEEP] tick failed; will retry")
-        # Fleet watch — its own try/except for the same reason the sweep has
-        # one: a bridge blip must not take down the loop that resumes rollouts.
-        # Rate-limited internally; the reconciler's 30s cadence is not its
-        # logging cadence.
-        try:
-            await _fleet_watch_once()
-        except Exception:
-            logger.exception("[ROLLOUT-FLEET] tick failed; will retry")
+        # A replica that loses the election skips the WHOLE tick — half a tick
+        # is worse than none (infra_lease's contract).
+        if await acquire_lease("rollout_reconciler", ttl_s=_ttl):
+            try:
+                await _reconcile_once()
+            except Exception:
+                # Never let a tick exception kill the loop. Log and keep going.
+                logger.exception("[ROLLOUT-RECONCILER] tick failed; will retry")
+            # Convergence sweep — separate try/except so a sweep failure can't
+            # mask (or be masked by) a reconcile failure. Lives in the LOOP, not
+            # in _reconcile_once: start_rollout runs _reconcile_once as its lock
+            # self-heal pass, and a sweep firing there would grab the lock the
+            # caller is about to check and 409 every CI push with divergence.
+            # Note the tick pauses while a sweep drives its batches (bounded by
+            # hard_timeout_s per batch) — acceptable: the sweep holds the rollout
+            # lock anyway, and its heartbeat keeps the row visibly alive.
+            try:
+                await _convergence_sweep_once()
+            except Exception:
+                logger.exception("[ROLLOUT-SWEEP] tick failed; will retry")
+            # Fleet watch — its own try/except for the same reason the sweep has
+            # one: a bridge blip must not take down the loop that resumes rollouts.
+            # Rate-limited internally; the reconciler's 30s cadence is not its
+            # logging cadence.
+            try:
+                await _fleet_watch_once()
+            except Exception:
+                logger.exception("[ROLLOUT-FLEET] tick failed; will retry")
         # NOTE (bulletproof plan M): the legacy prewarm reconciler
         # (`reconcile_stuck_provisioning`) used to piggy-back here. It was
         # removed — `pool_service.reclaim_stranded_users` (180s tick in the
@@ -1537,7 +1905,7 @@ async def rollout_reconciler_loop() -> None:
         # running two reconciliation systems against the same rows meant one
         # could re-fire a cold provision while the other was mid pool-claim.
         # One reconciliation system only.
-        await asyncio.sleep(30)
+        await asyncio.sleep(_RECONCILER_TICK_S)
 
 
 # ─── Convergence sweep (2026-07-28 incident) ──────────────────────

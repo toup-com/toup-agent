@@ -15,9 +15,30 @@ anything, and pages when one breaks.
 
 The invariants
 ==============
-1. **Nothing is served unbilled.** A ledger row with ``denied=true`` means the
-   charge was refused. Provider cost attached to such a row is work we gave
-   away. Steady state is zero.
+1. **A refusal holds.** A ledger row with ``denied=true`` means the charge was
+   refused; provider cost attached to such a row is work we paid for and did
+   not bill. Since 2026-09-18 that is no longer always a leak. The turn that
+   CROSSES zero settles what the wallet holds, records the residual and the
+   next pre-flight refuses — so every legitimate exhaustion leaves a short
+   burst of these rows: the crossing turn, plus one for each proxy call it
+   already had in flight (main model, utility, tools).
+
+   *Expected:* those bursts. Seconds long, one account, counted in the
+   readings and in the log line, never paged on their own.
+
+   *Not expected:* an account still being served-and-denied more than
+   ``credit_health_unbilled_loop_span_min`` minutes after its first refusal
+   **with no refill in between**. That is the stop not holding — measured
+   2026-09-15 as ONE account, 21 rows, 6h07m — and it pages one warning per
+   account, naming the span, the counts, what the settlement recovered, the
+   worst (reason, event, model, operation) group and where to look. The
+   refill clause is not a loophole: exhaust → top up → exhaust again is two
+   bounded crossings hours apart, and first→last would call a customer who
+   has just paid a leak. A burst that runs long AFTER a refill is still the
+   stop failing, and still pages. Above
+   ``credit_health_unbilled_usd_critical`` the fleet-wide provider total
+   pages critical whichever it is: enough crossings to cost real money is
+   itself news, and the body says how much is which.
 2. **The one-time grant fires once.** More than one ``plan_grant`` per bucket
    per user means a re-grant loop, which silently resets wallets and erases
    spend — and is a free-credit farm.
@@ -70,7 +91,8 @@ from app.config import settings
 from app.db.database import async_session_maker
 from app.db.models import (
     BUCKET_MESSAGE, CreditBalance, CreditLedger, LEDGER_CHAT_MESSAGE,
-    LEDGER_IMAGE_GEN, LEDGER_PLAN_GRANT, LEDGER_TOOL_CALL, LLMProxyEvent,
+    LEDGER_DAILY_RESET, LEDGER_IMAGE_GEN, LEDGER_PLAN_GRANT, LEDGER_TOOL_CALL,
+    LLMProxyEvent,
 )
 from app.db.plan_catalog import UNLIMITED_PLAN_ID
 from app.services.abuse_metrics import uidp
@@ -83,9 +105,146 @@ logger = logging.getLogger(__name__)
 # usage, so the revenue-vs-cost ratio must ignore them.
 _USAGE_EVENT_TYPES = (LEDGER_CHAT_MESSAGE, LEDGER_TOOL_CALL, LEDGER_IMAGE_GEN)
 
+# How long the SAME looping account stays quiet after it pages. This monitor
+# runs hourly over a 24-hour window, so at `alerting.py`'s 600 s default an
+# unchanged loop re-pages every hour for a day — the founder's feed shows
+# exactly that, an identical "3 call(s), $0.19" an hour apart. 6 h is the
+# fleet-watch convention. The trade, stated because it is not a bug: the
+# window lives in module state, so a redeploy clears it and a loop that is
+# still running can page once more than the interval implies.
+_LOOP_ALERT_INTERVAL_S = 6 * 3600
+
 
 def _cfg(name: str, default):
     return getattr(settings, name, default)
+
+
+def _span_words(seconds: float) -> str:
+    """A duration an operator reads at a glance. Short on purpose."""
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    if s >= 60:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s}s"
+
+
+def _group_words(subject, reason, event, model, op, calls=None, cents=None) -> str:
+    """The whole identity of a leak: user × deny reason × event type × model ×
+    operation type. Grouped on all five because the fix differs per
+    combination — a ``system.*`` operation billed to a tenant user is a tagging
+    bug, an ``image_generation`` row is a different charge path from
+    ``chat_message``, and the reason says which gate refused.
+
+    ``subject=None`` drops the prefix, for the per-account warning where the
+    account is already the subject of the sentence AND of the alert key —
+    naming it a third time reads as a formatting bug. ``calls``/``cents``
+    omitted drop the counts for the same reason: the per-account warning has
+    already said how many calls and how many dollars, and a single-group
+    account — the common case, and the 2026-09-15 shape — printed both twice.
+    """
+    head = f"{subject} — " if subject else ""
+    counts = (
+        f"{int(calls or 0)} call(s), ${float(cents or 0)/100:.2f}, "
+        if calls is not None or cents is not None else ""
+    )
+    return (
+        f"{head}{counts}"
+        f"reason={reason or '?'}, event={event}, model={model or '?'}, "
+        f"op={op or 'user'}"
+    )
+
+
+async def _bursts_for_account(db, user_id, first, last, where, reason_expr, op_expr):
+    """Split one account's denied-but-served rows into BURSTS at each credit
+    refill, and describe each burst.
+
+    Why this exists: first→last across a 24-hour window is not the span of a
+    loop. A user who exhausts their allowance, tops up (or renews) and
+    exhausts again leaves two bounded bursts hours apart — two legitimate
+    crossings — and a first→last reading pages the founder that "the refusal
+    is not stopping the work" about a customer who has just paid. A false
+    accusation costs more than a missed page, so a refill ends a burst: the
+    stop is only "not holding" while nothing has put credits back.
+
+    A refill is any ledger row for that account with ``amount > 0``, OR a
+    ``daily_reset``. The positive-amount half is deliberately NOT an
+    event-type allowlist — ``plan_grant`` (initial grant), ``period_renewal``,
+    ``iap_purchase`` (a StoreKit credit pack), ``manual_adjust`` (an admin
+    comp), ``plan_change`` (an upgrade delta, also written by
+    ``scripts/grandfather_unlimited`` and ``reconcile_duplicate_grants``
+    outside ``credit_service``) and ``refund`` all add credits, so any new
+    path that tops a BALANCE up is covered without being enumerated here.
+
+    ``daily_reset`` has to be named explicitly because it is the counterexample
+    to that reasoning: it restores spendable headroom by zeroing
+    ``message_credits_used_today`` and writes ``amount = 0``, so on the CAP
+    dimension a wallet moves with no positive amount anywhere. Left out, two
+    cap-denied bursts either side of a day roll are one "loop" and the warning
+    asserts "with no refill in between" about a user whose cap had in fact just
+    re-opened — the false accusation this whole function exists to prevent.
+    (Not reachable today: a ``daily_cap_exceeded`` row with provider cost needs
+    a non-NULL cap AND ``credit_cap_admission_control`` off, and every cap has
+    been NULL since 2026-08-29. It is exactly the 2026-08-03 configuration and
+    returns the moment a cap is restored ahead of that flag.)
+
+    Bucket is not filtered either: a grant writes both buckets in the same
+    instant (so the pair is one boundary, not two), and being generous about
+    what counts as a refill fails toward silence, which is the safer direction
+    for this alarm.
+
+    Runs ONLY for an account whose whole-window span already exceeds the
+    limit, so a healthy window still costs the two aggregates it always did.
+    Both queries ride ``ix_credit_ledger_user_created``.
+    """
+    rows = (await db.execute(
+        select(
+            CreditLedger.created_at, CreditLedger.underlying_cost_cents,
+            CreditLedger.amount, reason_expr, CreditLedger.event_type,
+            CreditLedger.model, op_expr,
+        ).where(*where, CreditLedger.user_id == user_id)
+        .order_by(CreditLedger.created_at)
+    )).all()
+    refills = (await db.execute(
+        select(CreditLedger.created_at).where(
+            CreditLedger.user_id == user_id,
+            or_(CreditLedger.amount > 0,
+                CreditLedger.event_type == LEDGER_DAILY_RESET),
+            CreditLedger.created_at >= first,
+            CreditLedger.created_at <= last,
+        ).order_by(CreditLedger.created_at)
+    )).scalars().all()
+
+    bursts: list[dict] = []
+    cur: dict | None = None
+    groups: dict = {}
+    ri = 0
+    for (ts, cents, amount, reason, event, model, op) in rows:
+        refilled = False
+        # Every refill at or before this row ends the previous burst. A tie on
+        # the timestamp treats the refill as landing first, which is the
+        # reading that splits rather than accuses.
+        while ri < len(refills) and refills[ri] <= ts:
+            ri += 1
+            refilled = True
+        if cur is None or refilled:
+            groups = {}
+            cur = {"calls": 0, "cents": 0.0, "recovered": 0.0,
+                   "first": ts, "last": ts, "groups": groups}
+            bursts.append(cur)
+        cur["calls"] += 1
+        cur["cents"] += float(cents or 0)
+        # The debit a settled refusal DID manage to take, negated in Python
+        # for the same reason the span is: no dialect-specific SQL.
+        cur["recovered"] += -float(amount or 0)
+        cur["last"] = ts
+        g = groups.setdefault((reason, event, model, op), 0.0)
+        groups[(reason, event, model, op)] = g + float(cents or 0)
+    for b in bursts:
+        b["span_s"] = (b["last"] - b["first"]).total_seconds()
+        b["dims"] = max(b["groups"].items(), key=lambda kv: kv[1])[0]
+        del b["groups"]
+    return bursts
 
 
 async def check_credit_health() -> dict:
@@ -113,47 +272,310 @@ async def check_credit_health() -> dict:
         _not_meter_only = or_(_meter_only.is_(None), ~_meter_only)
         _not_denied = or_(_denied.is_(None), ~_denied)
 
-        # ── 1. Served but not billed ──────────────────────────────────
+        # ── 1. A refusal holds ────────────────────────────────────────
         # `denied` is stamped by try_charge when enforcement refuses. A row
         # carrying underlying_cost_cents is one we paid a provider for.
+        #
+        # This alarm used to page on the mere EXISTENCE of such a row, with the
+        # words "Expected steady state is zero". Since the shortfall settlement
+        # that sentence is false: the turn that crosses zero debits what the
+        # wallet holds and is still recorded denied, so every legitimate
+        # exhaustion writes one — plus one per proxy call that turn already had
+        # in flight. With users reaching their allowance daily the hourly ⚠️
+        # would be PERMANENT, which is new noise from the round whose purpose
+        # was to remove it. What is still a defect is the stop NOT HOLDING, and
+        # that has a measurable signature: a crossing burst spans seconds to a
+        # couple of minutes (one turn), while 2026-09-15 was one account with
+        # 21 rows over 6h07m. So the span decides — the span of one burst,
+        # where a credit refill ends a burst, because exhaust → top up →
+        # exhaust again is two crossings and not a loop.
+        _unbilled_where = (
+            CreditLedger.created_at >= since,
+            _denied,
+            func.coalesce(CreditLedger.underlying_cost_cents, 0) > 0,
+            # An unlimited account is never denied (try_charge forces
+            # deny_reason to None for it), so this exclusion is already
+            # true for every row it could see. It is written anyway so the
+            # intent is explicit rather than incidental: if a future edit
+            # ever lets the two markers co-occur, that row is invariant
+            # 7's alarm, not this one's — and reading it here as $5 of
+            # "denied but served" would page on the wrong cause.
+            _not_unlimited,
+        )
         row = (await db.execute(
             select(
                 func.count(),
                 func.coalesce(func.sum(CreditLedger.underlying_cost_cents), 0),
-            ).where(
-                CreditLedger.created_at >= since,
-                _denied,
-                func.coalesce(CreditLedger.underlying_cost_cents, 0) > 0,
-                # An unlimited account is never denied (try_charge forces
-                # deny_reason to None for it), so this exclusion is already
-                # true for every row it could see. It is written anyway so the
-                # intent is explicit rather than incidental: if a future edit
-                # ever lets the two markers co-occur, that row is invariant
-                # 7's alarm, not this one's — and reading it here as $5 of
-                # "denied but served" would page on the wrong cause.
-                _not_unlimited,
-            )
+                # What a refusal DID manage to take. Since 2026-09-18 a
+                # settlement of an already-incurred cost debits what the wallet
+                # holds and still records the denial, so "denied" no longer
+                # implies "amount = 0" — and an alarm that reads the whole
+                # provider cost as given away would overstate a system that is
+                # now recovering most of it. Column arithmetic on purpose: this
+                # file keeps `metadata_json.credits_*` a reporting field, never
+                # a monitoring dependency.
+                func.coalesce(-func.sum(CreditLedger.amount), 0),
+            ).where(*_unbilled_where)
         )).first()
         given_away_calls = int(row[0] or 0)
         given_away_usd = float(row[1] or 0) / 100.0
+        recovered_credits = float(row[2] or 0)
         readings["served_unbilled_calls"] = given_away_calls
         readings["served_unbilled_usd"] = round(given_away_usd, 2)
+        readings["served_unbilled_recovered_credits"] = round(recovered_credits, 2)
 
+        # WHO and FOR HOW LONG, not just how many. One grouped query carries
+        # both: grouped on the identity of the leak for the message, with
+        # min/max created_at per group so folding the groups per user yields
+        # that ACCOUNT's first→last span over the same predicate. Run only when
+        # the count is non-zero, so a healthy window still costs exactly the
+        # one aggregate it always did.
+        span_limit_s = float(_cfg("credit_health_unbilled_loop_span_min", 15)) * 60.0
+        # The LIMIT, not a measurement: "…loop_span_min: 15.0" printed beside
+        # "loop_calls: 21" read as "the loop spanned 15 minutes". The observed
+        # worst is `served_unbilled_loop_worst_span_s`, below.
+        readings["served_unbilled_loop_span_limit_min"] = round(span_limit_s / 60.0, 1)
+        loops: list[dict] = []
+        crossings: list[dict] = []
+        loop_users: set[str] = set()
+        worst_row = None
+        if given_away_calls > 0:
+            _reason = CreditLedger.metadata_json["reason"].as_string()
+            _op = CreditLedger.metadata_json["operation_type"].as_string()
+            offenders = (await db.execute(
+                select(
+                    CreditLedger.user_id, _reason, CreditLedger.event_type,
+                    CreditLedger.model, _op,
+                    func.count(),
+                    func.coalesce(func.sum(CreditLedger.underlying_cost_cents), 0),
+                    func.coalesce(-func.sum(CreditLedger.amount), 0),
+                    # `func.min`/`func.max` take their type from the argument
+                    # (ReturnTypeFromArgs), so these come back as datetimes on
+                    # SQLite too — the same reason the whole file is
+                    # SQLAlchemy rather than raw SQL.
+                    func.min(CreditLedger.created_at),
+                    func.max(CreditLedger.created_at),
+                ).where(*_unbilled_where).group_by(
+                    CreditLedger.user_id, _reason, CreditLedger.event_type,
+                    CreditLedger.model, _op,
+                )
+            )).all()
+            readings["served_unbilled_groups"] = len(offenders)
+
+            per_user: dict[str, dict] = {}
+            for g in offenders:
+                acc = per_user.setdefault(g[0], {
+                    "user_id": g[0], "calls": 0, "cents": 0.0, "recovered": 0.0,
+                    "first": g[8], "last": g[9], "dims": None, "worst_cents": -1.0,
+                })
+                acc["calls"] += int(g[5] or 0)
+                acc["cents"] += float(g[6] or 0)
+                acc["recovered"] += float(g[7] or 0)
+                if g[8] is not None and (acc["first"] is None or g[8] < acc["first"]):
+                    acc["first"] = g[8]
+                if g[9] is not None and (acc["last"] is None or g[9] > acc["last"]):
+                    acc["last"] = g[9]
+                if float(g[6] or 0) > acc["worst_cents"]:
+                    acc["worst_cents"] = float(g[6] or 0)
+                    acc["dims"] = (g[1], g[2], g[3], g[4])
+            for acc in per_user.values():
+                span_s = (
+                    (acc["last"] - acc["first"]).total_seconds()
+                    if acc["first"] is not None and acc["last"] is not None else 0.0
+                )
+                # INCLUSIVE at exactly the setting: the config's wording is the
+                # contract ("spans MORE than this many minutes is paged as a
+                # LOOP"), and a bound that pages AT the number makes a
+                # 15-minute setting mean 14-and-a-bit.
+                if span_s <= span_limit_s:
+                    # One bounded burst across every group the account touched
+                    # — the designed cost of crossing zero. No second query.
+                    acc["span_s"] = span_s
+                    crossings.append(acc)
+                    continue
+                # Over the limit on first→last. That is NOT yet a loop: it is
+                # also what two legitimate crossings either side of a top-up
+                # look like. Ask the refills. (Only here, so the common case
+                # pays nothing for it.)
+                bursts = await _bursts_for_account(
+                    db, acc["user_id"], acc["first"], acc["last"],
+                    _unbilled_where, _reason, _op,
+                )
+                if not bursts:
+                    # Unreachable from one session — same predicate, same
+                    # window, rows the grouped query just counted. Guarded
+                    # anyway because an empty answer would drop this account's
+                    # calls and dollars out of the loop/crossing breakdown
+                    # entirely, and that breakdown has to add back up to the
+                    # totals the critical body quotes.
+                    acc["span_s"] = span_s
+                    bursts = [acc]
+                for burst in bursts:
+                    burst["user_id"] = acc["user_id"]
+                    if burst["span_s"] > span_limit_s:
+                        loops.append(burst)
+                        loop_users.add(acc["user_id"])
+                    else:
+                        crossings.append(burst)
+
+            worst_row = max(offenders, key=lambda r: float(r[6] or 0), default=None)
+            if worst_row is not None:
+                readings["served_unbilled_top_user"] = uidp(worst_row[0])
+                readings["served_unbilled_top_reason"] = worst_row[1] or "?"
+                readings["served_unbilled_top_usd"] = round(
+                    float(worst_row[6] or 0) / 100.0, 2)
+
+        # Everything is now a BURST, filed as a loop or a crossing, so
+        # loop_* + crossing_* reconciles to the totals above — an operator
+        # reading "$9.00" can add the breakdown back up. The two *_accounts
+        # counts partition the accounts as well: an account with any looping
+        # burst is a looping account, and its own quiet bursts still count
+        # their calls and dollars as crossings.
+        loop_usd = sum((b["cents"] for b in loops), 0.0) / 100.0
+        crossing_usd = sum((b["cents"] for b in crossings), 0.0) / 100.0
+        crossing_users = {b["user_id"] for b in crossings} - loop_users
+        readings["served_unbilled_loop_accounts"] = len(loop_users)
+        readings["served_unbilled_loop_calls"] = sum(int(b["calls"]) for b in loops)
+        readings["served_unbilled_loop_usd"] = round(loop_usd, 2)
+        readings["served_unbilled_loop_recovered_credits"] = round(
+            sum((b["recovered"] for b in loops), 0.0), 2)
+        readings["served_unbilled_loop_worst_span_s"] = int(
+            max((b["span_s"] for b in loops), default=0.0))
+        readings["served_unbilled_crossing_accounts"] = len(crossing_users)
+        readings["served_unbilled_crossings"] = len(crossings)
+        readings["served_unbilled_crossing_calls"] = sum(
+            int(b["calls"]) for b in crossings)
+        readings["served_unbilled_crossing_usd"] = round(crossing_usd, 2)
+        readings["served_unbilled_crossing_recovered_credits"] = round(
+            sum((b["recovered"] for b in crossings), 0.0), 2)
+
+        # The worst group is picked over the whole window, before the split, so
+        # say WHICH it is: "loop" sends the operator to the runbook, "crossing"
+        # tells them the biggest number in the window is the designed cost. The
+        # label is per ACCOUNT (any looping burst makes the account a loop),
+        # because chasing one is an account-level action.
+        #
+        # DIMENSIONS ONLY, no calls and no dollars — the same rule the warning
+        # follows, for a sharper reason here. The group is aggregated over the
+        # whole window, so on an account that both loops and crosses its
+        # figures are the PRE-SPLIT total: "Worst (loop): … 5 call(s), $6.00"
+        # overstated the loop by the crossing burst's $0.60, in the same
+        # message whose previous sentence reported the loop total correctly as
+        # $5.40. Two numbers for one thing, one of them wrong.
+        _worst_clause = ""
+        if worst_row is not None:
+            _bucket = "loop" if worst_row[0] in loop_users else "crossing"
+            _worst_clause = (
+                f" Worst ({_bucket}): "
+                + _group_words(
+                    uidp(worst_row[0]), worst_row[1], worst_row[2], worst_row[3],
+                    worst_row[4],
+                )
+                + "."
+            )
+        _recovered_clause = (
+            f" {recovered_credits:.1f} credit(s) were recovered from those "
+            f"rows by the shortfall settlement."
+            if recovered_credits > 0 else ""
+        )
+        # CRITICAL is the fleet-wide safety net on provider dollars, crossings
+        # INCLUDED: a flood of crossings large enough to cost real money is
+        # itself news. It says how much of the total is which, because "$9 was
+        # denied and served" sends an operator hunting for a loop that may not
+        # exist. It fires independently of the per-account warnings below —
+        # they answer different questions ("we are losing money" vs "these
+        # accounts are stuck") and only the warning can name every account.
+        #
+        # The breakdown is stated in ONE scope, BURSTS, because that is the
+        # scope the dollars are summed in. Pairing an account count with a
+        # burst total let a single account that loops AND crosses render "0
+        # crossing account(s) ($0.60)" — a zero carrying money, which reads as
+        # a formatting bug in a critical page. Accounts are still named, as the
+        # count the looping bursts are spread across, which is the number that
+        # says how many people to chase.
         if given_away_usd >= float(_cfg("credit_health_unbilled_usd_critical", 5.0)):
             fired.append("served_unbilled_critical")
             await send_infra_alert(
                 "credit-served-unbilled", "critical",
-                f"{given_away_calls} call(s) were DENIED but served anyway in the last "
-                f"{window_h}h — ${given_away_usd:.2f} of provider spend billed to us and "
-                f"not to anyone. A denial that does not stop the work is a discount. "
+                f"${given_away_usd:.2f} of provider spend across {given_away_calls} "
+                f"denied-but-served call(s) in the last {window_h}h: "
+                f"{len(loops)} looping burst(s) (${loop_usd:.2f}) across "
+                f"{len(loop_users)} account(s), and {len(crossings)} crossing "
+                f"burst(s) (${crossing_usd:.2f}). A "
+                f"crossing is the bounded cost of settling a turn that was already "
+                f"incurred; a loop is a refusal that is not stopping the work. "
+                f"Either way this is real money."
+                f"{_worst_clause}{_recovered_clause} "
                 f"Check `credit_ledger` where metadata->>'denied' is true.",
+                # subject stays None DELIBERATELY on the critical arm: a
+                # subject-keyed alert is what `infra_alert_category_subject_cap`
+                # counts, and a critical that can be collected into a digest is
+                # a critical that can arrive late. The account is named in the
+                # body instead.
             )
-        elif given_away_calls > 0:
-            fired.append("served_unbilled_warning")
+
+        # One WARNING per looping account, WORST FIRST. `alerting.py` collects
+        # past `infra_alert_category_subject_cap` (5) distinct subjects in a
+        # window into the next message's digest line rather than paging them,
+        # so the order decides which accounts page and which are merely named:
+        # sorted by provider cost, the expensive loops are the ones that ring.
+        # The critical arm above shares this category and is `subject=None`, so
+        # it consumes no cap slot — but it does re-roll the category window at
+        # its own 600 s, which frees the cap early. Harmless: a run loud enough
+        # to page critical is one where more named accounts is the right answer.
+        #
+        # ONE warning per account, describing its WORST burst — an account can
+        # loop twice in a window, and two messages about one account is the
+        # noise this round removes.
+        per_loop_user: dict[str, dict] = {}
+        for burst in loops:
+            e = per_loop_user.setdefault(
+                burst["user_id"], {"cents": 0.0, "worst": burst})
+            e["cents"] += burst["cents"]
+            w = e["worst"]
+            if (burst["cents"], burst["span_s"]) > (w["cents"], w["span_s"]):
+                e["worst"] = burst
+        # The name is appended ONCE, not once per account: `alerts` and the
+        # `[credit-health] … alarms=` log line are the operator's record of a
+        # run, and three looping accounts wrote the same word three times,
+        # which reads as three kinds of problem. How many accounts is
+        # `served_unbilled_loop_accounts`, in the readings beside it.
+        if per_loop_user:
+            fired.append("served_unbilled_loop")
+        for e in sorted(per_loop_user.values(), key=lambda e: e["cents"], reverse=True):
+            b = e["worst"]
+            subj = uidp(b["user_id"])
+            span = _span_words(b["span_s"])
             await send_infra_alert(
                 "credit-served-unbilled", "warning",
-                f"{given_away_calls} denied-but-served call(s) in the last {window_h}h "
-                f"(${given_away_usd:.2f}). Expected steady state is zero.",
+                # Read on a phone, so every clause has to earn its width — the
+                # ceiling is pinned in the tests. What a crossing is gets a
+                # clause rather than the sentence it used to have; the span is
+                # printed once rather than twice.
+                f"Account {subj}: denied-but-served {int(b['calls'])} time(s) "
+                f"over {span}, no refill in between (${b['cents']/100:.2f}"
+                + (f", {b['recovered']:.1f} credit(s) recovered"
+                   if b["recovered"] > 0 else "")
+                + ") — a crossing spans seconds; the stop is not holding."
+                + (f" Worst group: {_group_words(None, *b['dims'])}."
+                   if b["dims"] is not None else "")
+                # The next step, because naming a problem is half an alert. It
+                # carries the burst's START in compact UTC: the message used to
+                # say "in that window" while containing no absolute time at
+                # all, only a duration, and the burst can have ended hours
+                # before the page — so the arrival time does not recover it and
+                # the operator could not write the query they were told to
+                # write. (The account prefix is not an id, so the query still
+                # cannot be scoped to the account here.) This exact shape is
+                # also what the revert switch produces, which is the one check
+                # worth doing first.
+                + f" Check credit_ledger where metadata->>'denied' = 'true' "
+                  f"since {b['first']:%m-%d %H:%MZ}; if all show amount = 0, "
+                  "credit_settle_incurred_shortfall is off.",
+                # Keyed on the account so a SECOND looping account is not
+                # suppressed by the first one's window.
+                subject=subj,
+                min_interval_s=_LOOP_ALERT_INTERVAL_S,
             )
 
         # ── 2. Duplicate one-time grants ──────────────────────────────

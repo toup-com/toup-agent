@@ -606,16 +606,32 @@ async def _log_event(
                 # and the user already has the answer. Denying here cannot
                 # un-spend them, it only hides the cost — which is exactly what
                 # produced 274 free calls / $17.17 of provider spend carrying
-                # reason="daily_cap_exceeded". The charge lands; the resulting
-                # over-cap used_today is what makes the NEXT pre-flight (:1017)
-                # return 402 and stop the loop.
+                # reason="daily_cap_exceeded".
+                #
+                # What stops the loop, per dimension:
+                #   * BALANCE — try_charge debits what the wallet holds even on
+                #     a refusal and drives the MESSAGE bucket to zero, so the
+                #     pre-flight below (PREFLIGHT_QUOTE_CREDITS, asked before
+                #     the provider call) refuses the next turn.
+                #   * DAILY CAP — an incurred charge lands past the cap and the
+                #     over-cap used_today refuses the next pre-flight. That
+                #     half needs `credit_cap_admission_control` AND a non-NULL
+                #     cap; every cap went NULL on 2026-08-29, so it is inert
+                #     today and `already_incurred` reaches nothing but
+                #     `ignore_daily_cap`.
+                # An earlier version of this comment claimed the cap clause was
+                # the whole stop and pointed at a pre-flight at :1017 that has
+                # not been there for releases. Between them, 21 turns were
+                # served unbilled to one account in 6h07m on 2026-09-15.
                 already_incurred=True,
             )
             if not result.success:
                 logger.warning(
                     "[credits] charge DENIED but response already served "
-                    "user=%s model=%s reason=%s credits=%s cost_cents=%s",
-                    user_id[:8], model, result.reason, credits, cost_cents,
+                    "user=%s model=%s reason=%s credits=%s settled=%s "
+                    "shortfall=%s cost_cents=%s",
+                    user_id[:8], model, result.reason, credits,
+                    result.charged, result.shortfall, cost_cents,
                 )
             logger.info(
                 "[credits] deducted user=%s model=%s tokens=%d/%d credits=%s "
@@ -1579,7 +1595,23 @@ async def proxy_chat(
     # credit_enforcement_enabled=True; in shadow mode this is a no-op.
     # Returns 402 with a structured body the agent / chat client can
     # decode to render the "out of credits / upgrade" UI.
+    #
+    # PREFLIGHT_QUOTE_CREDITS, not a literal: this probe is nominal, the
+    # turn's real cost is settled afterwards, and the shadow-admission
+    # verdict has to ask the same question the live gate asks or its numbers
+    # describe a gate that never shipped.
+    #
+    # One constant, four readers — here, `proxy_responses`, the shadow verdict
+    # in `credit_service._shadow_observe_message_charge`, and
+    # `/credits/agent-deduct`'s admission probe. `ws_realtime`'s voice
+    # pre-flight is a FIFTH site, still spelling the number itself (that file
+    # is untouched this round), so it shares the quote by convention rather
+    # than by reference. The value is pinned in
+    # tests/test_credit_settlement_shortfall.py, because since 2026-09-18 this
+    # is the live 402 gate rather than a shadow-mode mirror: changing it moves
+    # production admission on two endpoints.
     try:
+        from app.credit_shadow import PREFLIGHT_QUOTE_CREDITS
         from app.services.credit_service import (
             credit_service, BUCKET_MESSAGE,
             REASON_INSUFFICIENT_MESSAGE, REASON_DAILY_CAP_EXCEEDED,
@@ -1587,7 +1619,7 @@ async def proxy_chat(
         )
         if getattr(settings, "credit_enforcement_enabled", False):
             preflight = await credit_service.check_balance(
-                db, config.user_id, BUCKET_MESSAGE, Decimal("0.1"),
+                db, config.user_id, BUCKET_MESSAGE, PREFLIGHT_QUOTE_CREDITS,
             )
             if not preflight.success:
                 raise HTTPException(
@@ -1937,15 +1969,17 @@ async def proxy_responses(
             (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
         )
 
-    # Credit pre-flight: zero-balance gate (same contract as proxy_chat).
+    # Credit pre-flight: zero-balance gate (same contract as proxy_chat,
+    # including the shared nominal quote).
     try:
+        from app.credit_shadow import PREFLIGHT_QUOTE_CREDITS
         from app.services.credit_service import (
             credit_service, BUCKET_MESSAGE,
             REASON_INSUFFICIENT_MESSAGE,
         )
         if getattr(settings, "credit_enforcement_enabled", False):
             preflight = await credit_service.check_balance(
-                db, config.user_id, BUCKET_MESSAGE, Decimal("0.1"),
+                db, config.user_id, BUCKET_MESSAGE, PREFLIGHT_QUOTE_CREDITS,
             )
             if not preflight.success:
                 raise HTTPException(

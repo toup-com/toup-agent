@@ -372,6 +372,39 @@ def _is_claude_model(model: str) -> bool:
     return model.startswith("claude-")
 
 
+def _is_credit_refusal(err: BaseException) -> bool:
+    """True when the llm-proxy's credit pre-flight refused this turn — Toup's
+    OWN 402, not the upstream provider's billing error.
+
+    TERMINAL by construction, and the retry ladder had no idea. `run_turn`
+    already handles the typed :class:`OutOfCreditsError`, but that only exists
+    on the manual-mode deduct route; a bundle turn meets the proxy's
+    ``check_balance`` gate, which answers HTTP 402 with
+    ``{"error": "out_of_credits", ...}`` and reaches the SDK as an unlisted
+    ``APIStatusError``. Nothing classified it, so the identical refused request
+    went out twice more and a third went to the fallback model — measured
+    ~6.6 s of median extra delay before the user's paywall card, for three
+    guaranteed refusals.
+
+    The reason strings come in because the proxy's 402 body carries
+    ``reason``, and ``/credits/agent-deduct``'s exhausted error stringifies as
+    ``out_of_credits:<reason>:<bucket>``. Same vocabulary as
+    ``job_status``'s ``credits_toup`` rule, deliberately: a turn and a job must
+    not disagree about what a 402 means.
+
+    NOT the upstream provider running out of money ("credit balance is too
+    low", ``insufficient_quota``) — that is a different error class with a
+    different fix, it arrives as a 400, and crossing to the other provider is
+    the right move for it.
+    """
+    text = str(err).lower()
+    return (
+        "out_of_credits" in text
+        or "insufficient_message_credits" in text
+        or "insufficient_integration_credits" in text
+    )
+
+
 def _profile_name_for_log(profile) -> str:
     """One-token profile name for [PERF] log lines. Tolerates None
     so callers that haven't yet set the default don't crash the log
@@ -3657,6 +3690,32 @@ class AgentRunner:
                     _err_str = str(e).lower()
                     _is_auth_error = "401" in str(e) or "authentication" in _err_str or "AuthenticationError" in type(e).__name__
                     _is_rate_limit = "429" in str(e) or "rate_limit" in _err_str or "RateLimitError" in type(e).__name__
+                    # Toup's own 402 is TERMINAL: no amount of retrying or
+                    # crossing providers buys credits, and both paths go back
+                    # through the same pre-flight. Checked BEFORE the generic
+                    # ladder below, and raised UNCONVERTED so
+                    # `ws_chat._extract_out_of_credits_detail` can still lift
+                    # the proxy's 402 body out of str(e) and render the paywall
+                    # card instead of an error bubble.
+                    _is_out_of_credits = _is_credit_refusal(e)
+                    if _is_out_of_credits:
+                        logger.info(
+                            "[AGENT] credit refusal from the proxy on %s (%s) — "
+                            "terminal, no retry and no cross-provider hop",
+                            active_model, type(e).__name__,
+                        )
+                        # The row the no-fallback arm below would have written
+                        # anyway. Kept so the only thing this branch removes is
+                        # the two wasted attempts, not a line of the trail.
+                        await self._log_error(
+                            user_id=user_id,
+                            session_id=session_id,
+                            error_type="llm_error",
+                            error_message=str(e),
+                            context={"iteration": iteration, "model": active_model,
+                                     "terminal": "out_of_credits"},
+                        )
+                        raise
                     _should_cross_provider = _is_auth_error or _is_rate_limit
                     if _is_auth_error:
                         attempt = MAX_RETRIES  # skip remaining retries

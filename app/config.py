@@ -719,6 +719,18 @@ class Settings(BaseSettings):
     # Provider spend attached to denied-and-served rows before it pages as
     # critical rather than a warning.
     credit_health_unbilled_usd_critical: float = 5.0
+    # A denied-but-served row is no longer always a leak. Since the shortfall
+    # settlement (credit_settle_incurred_shortfall) the turn that CROSSES zero
+    # leaves one such row — plus one per call that turn already had in flight —
+    # and then the pre-flight refuses. That burst spans seconds. The defect this
+    # invariant exists for is the stop NOT holding: the same account still being
+    # served-and-denied long after (2026-09-15: one account, 21 rows over
+    # 6h07m). An account with any BURST spanning more than this many minutes is
+    # paged as a LOOP; a credit refill (a positive ledger row, or a daily reset)
+    # ends a burst, so exhaust -> top up -> exhaust is two crossings, not a
+    # loop. A crossing is counted in the readings and not paged below the
+    # critical dollar bar.
+    credit_health_unbilled_loop_span_min: int = 15
     # Credits charged ÷ provider cents. 1.0 is break-even by design (1 credit
     # = 1¢ of underlying cost); below this the meter is undercounting.
     credit_health_ratio_critical: float = 0.5
@@ -1400,6 +1412,17 @@ class Settings(BaseSettings):
     #     ceiling. Nothing is ever served unbilled.
     # OFF (default) is byte-for-byte today's behavior.
     credit_cap_admission_control: bool = False
+    # The BALANCE-dimension stop that the cap-dimension one above never had.
+    # An infeasible settlement of an already-incurred MESSAGE-bucket cost used
+    # to debit NOTHING (amount=0 denied row), so the residual froze at a
+    # positive value and the flat 0.1-credit pre-flight admitted the next turn
+    # — 21 served-and-unbilled turns in 6h07m on one account on 2026-09-15,
+    # with every daily cap NULL since 2026-08-29 and therefore no other stop.
+    # ON: the settlement takes what the wallet holds, drives it to zero and
+    # records the shortfall, so the next pre-flight refuses. A pre-flight
+    # refusal (work not yet done) still debits nothing. OFF is the old
+    # behaviour, kept only as the revert switch.
+    credit_settle_incurred_shortfall: bool = True
     # SHADOW MODE — measurement only, and the ONLY way to answer "what would
     # enforcement actually deny?" without denying anything.
     #
@@ -2024,6 +2047,16 @@ class Settings(BaseSettings):
     # hours (2026-05-31: mrvviinn@gmail.com signed up post-boot and couldn't
     # talk to their agent at all). 0 disables the loop.
     container_reconciler_interval_s: int = 180
+    # One catch-up reconciliation this many seconds after boot, so a deploy no
+    # longer blinds the agent sweep for a full interval plus the dead holder's
+    # lease TTL (measured 733 s and 833 s gaps after the two 2026-09-16
+    # deploys, against a 178-200 s cadence). Quantised by
+    # stranded_fast_scan_interval_s: the pass fires on the first fast sub-tick
+    # at or after this many seconds, and the value is clamped to
+    # (container_reconciler_interval_s - stranded_fast_scan_interval_s) — logged
+    # once at loop start when it has to be — because no sub-tick can answer
+    # later than that. 0 disables it, and so does a fast scan interval of 0.
+    post_boot_catchup_s: int = 20
     # Phase B — Blue-green tenant rollouts. When True,
     # `docker_host_service.upgrade_tenant_image` calls the bridge's
     # `/v1/tenants/<prefix>/blue-green-upgrade` (zero-WS-drop) instead
