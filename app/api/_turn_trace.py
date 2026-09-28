@@ -21,10 +21,13 @@ import json
 import logging
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
+# R48: the hash moved to `app/services/cmid.py` so the AGENT layer can stamp
+# the same `cmid_h` without importing `app.api` (agent_runner's
+# [TURN_WATERFALL] line, app/db/db_span.py). Re-exported here because every
+# existing caller — and the app-parity fixtures — import it from this module.
+from app.services.cmid import cmid_hash  # noqa: F401  (re-export)
 
-_FNV_OFFSET = 0x811C9DC5
-_FNV_PRIME = 0x01000193
+logger = logging.getLogger(__name__)
 
 # The C10 stage list. Not enforced at runtime (a typo must not break a turn),
 # but the set a grep/dashboard can rely on.
@@ -45,23 +48,6 @@ STAGES = (
     "replay_served",
     "render",
 )
-
-
-def cmid_hash(client_msg_id: Optional[str]) -> str:
-    s = client_msg_id or ""
-    if not s:
-        return "00000000"
-    h = _FNV_OFFSET
-    # The low byte of each UTF-16 CODE UNIT — exactly what the app's
-    # `charCodeAt(i) & 0xff` yields, surrogate pairs included. NOT
-    # `encode("ascii", "ignore")`, which DROPS a non-ASCII character where the
-    # app keeps its low byte: ids are ASCII uuid4s today, so the two agreed by
-    # accident, and the first non-ASCII id would have silently broken the
-    # three-hop join this hash exists for.
-    for b in s.encode("utf-16-le")[0::2]:
-        h ^= b
-        h = (h * _FNV_PRIME) & 0xFFFFFFFF
-    return f"{h:08x}"
 
 
 def turntrace(

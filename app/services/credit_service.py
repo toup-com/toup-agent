@@ -171,14 +171,15 @@ def _llm_token_cost_cents(
     cached = min(max(int(cached_tokens or 0), 0), input_tokens) if cached_rate is not None else 0
     written = min(max(int(cache_write_tokens or 0), 0), input_tokens - cached) if write_rate is not None else 0
     base_input = input_tokens - cached - written
-    cost_usd = (
-        (Decimal(str(base_input)) * Decimal(str(pricing["input"])) / Decimal("1000"))
-        + (Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000"))
-    )
+    input_usd = Decimal(str(base_input)) * Decimal(str(pricing["input"])) / Decimal("1000")
     if cached:
-        cost_usd += Decimal(str(cached)) * Decimal(str(cached_rate)) / Decimal("1000")
+        input_usd += Decimal(str(cached)) * Decimal(str(cached_rate)) / Decimal("1000")
     if written:
-        cost_usd += Decimal(str(written)) * Decimal(str(write_rate)) / Decimal("1000")
+        input_usd += Decimal(str(written)) * Decimal(str(write_rate)) / Decimal("1000")
+    from app.services.model_resolver import long_context_price_multipliers
+    input_mult, output_mult = long_context_price_multipliers(model, input_tokens)
+    output_usd = Decimal(str(output_tokens)) * Decimal(str(pricing["output"])) / Decimal("1000")
+    cost_usd = input_usd * Decimal(str(input_mult)) + output_usd * Decimal(str(output_mult))
     return cost_usd * Decimal("100")
 
 

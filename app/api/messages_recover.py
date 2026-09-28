@@ -52,6 +52,8 @@ from app.api.message_cards import (
     load_build_jobs,
     public_text,
 )
+# The nothing-heard projection (Blocker B) — see `schemas.public_heard_text`.
+from app.schemas import public_heard_text
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/messages", tags=["messages"])
@@ -246,7 +248,19 @@ async def messages_since(
         {
             "id": msg.id,
             "role": msg.role,
-            "content": public_text(msg.role, msg.content),
+            "source": msg.source,
+            "background": msg.source == "attachment_analysis",
+            # Two guards, one body: `public_text` for the ROLE, and
+            # `public_heard_text` for a voice transcript row the caller heard
+            # nothing of. This route exists to hand back rows the socket never
+            # delivered — a call that dropped mid-epoch is exactly the row
+            # whose stored text was never played, so skipping the projection
+            # here would make the reconnect the one path that re-materialises
+            # unheard words.
+            "content": public_heard_text(
+                public_text(msg.role, msg.content),
+                _serialize_meta_card(msg, "voice"),
+            ),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "channel": channel or "web",
             "conversation_id": msg.conversation_id,
@@ -265,6 +279,13 @@ async def messages_since(
             "memory_update": _serialize_meta_card(msg, "memory_update"),
             "fix_chip": _serialize_meta_card(msg, "fix_chip"),
             "tool_events": _serialize_tool_events(msg),
+            # Voice provenance (R48 §8, contract v0.2 `message.voice`). This
+            # route is the WS-reconnect backstop, so it returns rows the socket
+            # never delivered — a voice turn cut short mid-call is exactly the
+            # kind of row that lands here, and it is the one that most needs to
+            # say so. Same four-reader parity rule as the keys above; null on
+            # every legacy row.
+            "voice": _serialize_meta_card(msg, "voice"),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
             **job_card_fields(msg, build_jobs),

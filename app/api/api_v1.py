@@ -31,12 +31,12 @@ import secrets
 import time
 from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +47,224 @@ from app.db.models import ApiKey, Conversation, Message
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["Public API v1"])
+
+
+class VoiceDelegationStatusRequest(BaseModel):
+    """A repaired Live socket's bounded, read-only reconciliation request."""
+
+    session_id: str = Field(..., min_length=1, max_length=64)
+    task_ids: List[str] = Field(..., min_length=1, max_length=4)
+
+
+class VoiceDelegationSpeechClaimRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=64)
+    task_id: str = Field(..., min_length=1, max_length=64)
+
+
+class VoiceDelegationCancelRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=64)
+    task_id: str = Field(..., min_length=1, max_length=64)
+    job_id: str = Field(..., min_length=1, max_length=64)
+
+
+def _voice_recovery_user(request: Request) -> str:
+    """This internal seam is available only inside one authenticated tenant."""
+
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=404, detail="Not Found")
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
+        raise HTTPException(status_code=401, detail="Invalid agent key")
+    if not settings.user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+    return settings.user_id
+
+
+async def _owned_voice_session(db: AsyncSession, session_id: str, user_id: str) -> None:
+    owned = (await db.execute(select(Conversation.id).where(
+        Conversation.id == session_id,
+        Conversation.user_id == user_id,
+    ))).scalar_one_or_none()
+    if not owned:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+
+def _voice_delegation_row(message: Message, task_id: str) -> Optional[dict]:
+    """Return only the persisted answer for this exact Live delegation."""
+
+    try:
+        meta = json.loads(message.metadata_json or "{}")
+    except (TypeError, ValueError):
+        return None
+    voice = meta.get("voice") if isinstance(meta, dict) else None
+    if not isinstance(voice, dict) or voice.get("delegation_id") != task_id:
+        return None
+    source = str(voice.get("source") or "")
+    if source not in {"delegated", "delegated_record"}:
+        return None
+    accepted = source == "delegated" and not (
+        voice.get("cancelled") or voice.get("superseded")
+    )
+    from app.api.day_chats import _serialize_tool_events
+
+    return {
+        "record_found": True,
+        "status": (
+            "completed" if accepted else
+            "cancelled" if voice.get("cancelled") is True else "failed"
+        ),
+        "answer": str(message.content or "")[:6000] if accepted else "",
+        "spoken": voice.get("spoken") is True,
+        "recovery_speech_claimed": voice.get("recovery_speech_claimed") is True,
+        "parent_user_turn_id": str(voice.get("parent_user_turn_id") or "")[:160],
+        "title": str(voice.get("task_title") or "")[:160],
+        # Same public projection as chat history; the raw metadata can hold
+        # tool text the call surface is not allowed to show.
+        "tool_events": (_serialize_tool_events(message) or [])[:16],
+    }
+
+
+@router.post("/internal/voice-delegations/status", include_in_schema=False)
+async def internal_voice_delegations_status(
+    req: VoiceDelegationStatusRequest, request: Request,
+):
+    """Resolve old Live cards from tenant rows after a socket repair.
+
+    The original relay may have detached on another platform replica. The
+    tenant's job and delegated answer rows are durable; this route only reads
+    those rows and never re-runs a tool or an agent turn.
+    """
+
+    from app.db.models import BuildJob
+
+    user_id = _voice_recovery_user(request)
+    task_ids = list(dict.fromkeys(
+        task_id for task_id in req.task_ids
+        if isinstance(task_id, str) and 0 < len(task_id) <= 64
+    ))[:4]
+    if not task_ids:
+        raise HTTPException(status_code=422, detail="Task id required")
+
+    async with async_session_maker() as db:
+        await _owned_voice_session(db, req.session_id, user_id)
+
+        # Recent cards only; each candidate is checked against its exact
+        # config_json identity. Old images lack this key, in which case the
+        # answer row still settles the card by voice.delegation_id.
+        jobs = (await db.execute(select(BuildJob).where(
+            BuildJob.user_id == user_id,
+            BuildJob.conversation_id == req.session_id,
+            BuildJob.job_type == "agent_task",
+        ).order_by(BuildJob.created_at.desc()).limit(100))).scalars().all()
+        by_task: dict[str, dict] = {task_id: {"status": "unknown"} for task_id in task_ids}
+        for job in jobs:
+            config = job.config_json if isinstance(job.config_json, dict) else {}
+            task_id = str(config.get("voice_delegation_id") or "")
+            if task_id in by_task and "job_id" not in by_task[task_id]:
+                by_task[task_id] = {
+                    "status": str(job.status or "unknown")[:32],
+                    "job_id": str(job.id),
+                    "cancel_requested": job.stop_requested_at is not None,
+                }
+
+        # Read one bounded recent slice by indexed conversation identity,
+        # then exact-match JSON in Python. One unindexed LIKE per task every
+        # polling interval amplified long calls and let wildcard task IDs
+        # broaden the DB scan even though the final JSON check was exact.
+        candidates = (await db.execute(select(Message).where(
+            Message.conversation_id == req.session_id,
+            Message.role == "assistant",
+        ).order_by(Message.created_at.desc()).limit(250))).scalars().all()
+        for task_id in task_ids:
+            for message in candidates:
+                row = _voice_delegation_row(message, task_id)
+                if row is not None:
+                    by_task[task_id].update(row)
+                    break
+
+    return {"tasks": by_task}
+
+
+@router.post("/internal/voice-delegations/cancel", include_in_schema=False)
+async def internal_voice_delegation_cancel(
+    req: VoiceDelegationCancelRequest, request: Request,
+):
+    """Request cooperative Stop for one exact running Live job.
+
+    The row remains running until its original runner observes the marker and
+    actually exits. A completed job wins the race and is never relabelled.
+    """
+
+    from app.db.models import BuildJob
+
+    user_id = _voice_recovery_user(request)
+    async with async_session_maker() as db:
+        await _owned_voice_session(db, req.session_id, user_id)
+        query = select(BuildJob).where(
+            BuildJob.id == req.job_id,
+            BuildJob.user_id == user_id,
+            BuildJob.conversation_id == req.session_id,
+            BuildJob.job_type == "agent_task",
+        )
+        if db.bind is not None and db.bind.dialect.name == "postgresql":
+            query = query.with_for_update()
+        job = (await db.execute(query)).scalar_one_or_none()
+        config = job.config_json if job is not None and isinstance(job.config_json, dict) else {}
+        if not job or config.get("voice_delegation_id") != req.task_id:
+            raise HTTPException(status_code=404, detail="Voice task not found")
+        if job.status != "running":
+            return {"requested": False, "status": str(job.status or "unknown")}
+        if job.stop_requested_at is None:
+            job.stop_requested_at = datetime.utcnow()
+            await db.commit()
+        return {"requested": True, "status": "running", "job_id": job.id}
+
+
+@router.post("/internal/voice-delegations/claim-speech", include_in_schema=False)
+async def internal_voice_delegation_claim_speech(
+    req: VoiceDelegationSpeechClaimRequest, request: Request,
+):
+    """Atomically allow one automatic recovered speech attempt per answer.
+
+    The claim is deliberately made *before* the provider append. If that
+    append or the phone's playback fails, the answer remains visible in chat
+    and on the Live card; a later socket must wait for the user's explicit
+    request to repeat rather than guessing whether audio was heard.
+    """
+
+    user_id = _voice_recovery_user(request)
+    async with async_session_maker() as db:
+        await _owned_voice_session(db, req.session_id, user_id)
+        query = select(Message).where(
+            Message.conversation_id == req.session_id,
+            Message.role == "assistant",
+        ).order_by(Message.created_at.desc()).limit(250)
+        for candidate in (await db.execute(query)).scalars().all():
+            if _voice_delegation_row(candidate, req.task_id) is None:
+                continue
+            locked = select(Message).where(Message.id == candidate.id).execution_options(
+                populate_existing=True,
+            )
+            if db.bind is not None and db.bind.dialect.name == "postgresql":
+                locked = locked.with_for_update()
+            message = (await db.execute(locked)).scalar_one_or_none()
+            if message is None:
+                continue
+            row = _voice_delegation_row(message, req.task_id)
+            if row is None or row["status"] != "completed" or not row["answer"]:
+                continue
+            if row["spoken"] or row["recovery_speech_claimed"]:
+                return {"claimed": False}
+            meta = json.loads(message.metadata_json or "{}")
+            voice = dict(meta["voice"])
+            voice["recovery_speech_claimed"] = True
+            meta["voice"] = voice
+            message.metadata_json = json.dumps(meta)
+            await db.commit()
+            return {"claimed": True}
+    return {"claimed": False}
 
 # References set at startup
 _agent_runner = None
@@ -143,6 +361,14 @@ async def get_api_key_user(request: Request, db: AsyncSession = Depends(get_db))
 # Request/Response schemas
 # ======================================================================
 
+#: How many context blocks the route will render, and how long each may be.
+#: A prompt assembled from a request body is unbounded input; the model-facing
+#: message is where an unbounded one costs money and context window. Declared
+#: above `ChatRequest` so the SAME number bounds the body at parse time.
+_CTX_BLOCKS_MAX = 8
+_CTX_BLOCK_CHARS = 4000
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=32000)
     session_id: Optional[str] = None
@@ -153,6 +379,180 @@ class ChatRequest(BaseModel):
     # turn, so persisting here too would duplicate the day-chat. Default True
     # keeps existing API-chat behavior unchanged.
     save: bool = True
+    # ── R48: what the caller SAID, separately from what the model is given ──
+    # On the Live path `message` is a constructed prompt: the utterance wrapped
+    # in English framing plus the prior accepted results the model needs as
+    # context. That blob is correct for the model and wrong for every surface
+    # that names the work — the job card, the Live Activity, the push body were
+    # all titled "Live-session context from earlier accepted delegations follo".
+    # `display_request` is the clean utterance, used for display only.
+    display_request: Optional[str] = Field(default=None, max_length=2000)
+    # The language the CALLER just spoke, as a hint for the answer. The
+    # delegation backend has never been told one, so a Persian question could
+    # come back in English and be read out verbatim through `commentary.append`.
+    # A short tag ("fa", "en", "fa-IR"), never a sentence.
+    reply_language: Optional[str] = Field(default=None, max_length=32)
+    # Prior accepted results, as structured blocks, for a caller that would
+    # rather hand them over than pre-scaffold them into `message`. Exactly ONE
+    # of the two mechanisms is in use per caller: a caller that already renders
+    # its own context block (today's `delegated_agent_input`) sends nothing
+    # here, and this field stays absent. Sending both feeds the context twice,
+    # which `_compose_agent_message` refuses to do (it renders one and logs).
+    context_blocks: Optional[List[Dict[str, Any]]] = Field(
+        default=None, max_length=_CTX_BLOCKS_MAX)
+    # WHICH delegation this turn is, in the relay's own vocabulary. The voice
+    # card's cancelled close proves delivery from the thread, and on Live two
+    # delegations can run at once — so without this the OTHER task's answer
+    # closes this card `completed` (addendum C1).
+    delegation_id: Optional[str] = Field(default=None, max_length=64)
+    # Contract v0.3 §7 (addendum 6 R6-4 / R6-4b): the caller-turn ORDER of the
+    # request that started this run, the provider session it belongs to and
+    # that session's STAMP (the relay's hybrid logical clock, app-floored:
+    # ordinals restart with each session), bound into the run so its
+    # play_media is superseded only by a stop the caller asked for AFTER it
+    # (pairwise: same scope by order, stamped scopes by stamp, otherwise by
+    # arrival — `radio.control`). Voice-only and optional: absent
+    # (every other caller, a legacy relay) keeps the arrival mark. Lenient on
+    # purpose — a malformed value reads as absent rather than failing the turn.
+    media_order: Optional[int] = None
+    media_scope: Optional[str] = None
+    media_scope_started_ms: Optional[int] = None
+
+    @field_validator("media_order", mode="before")
+    @classmethod
+    def _check_media_order(cls, value):
+        return _lenient_media_order(value)
+
+    @field_validator("media_scope", mode="before")
+    @classmethod
+    def _check_media_scope(cls, value):
+        return _lenient_media_scope(value)
+
+    @field_validator("media_scope_started_ms", mode="before")
+    @classmethod
+    def _check_media_scope_started_ms(cls, value):
+        return _lenient_started_ms(value)
+
+
+def _lenient_media_order(value):
+    """An additive ordering field never fails a request: anything that is not
+    a non-negative int (a digit string is accepted, a bool is not) is None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, int) and 0 <= value <= 2**31 - 1:
+        return value
+    return None
+
+
+def _lenient_media_scope(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()[:128]
+
+
+def _lenient_started_ms(value):
+    """Epoch milliseconds, or None — the same leniency as the order."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, int) and 0 <= value <= 2**53:
+        return value
+    return None
+
+
+#: Openings a caller uses when it has ALREADY scaffolded its own context into
+#: `message` (the relay's `delegated_agent_input`). Kept in sync with
+#: `voice_jobs._SCAFFOLD_MARKERS`, which rejects the same strings as a title.
+_SCAFFOLDED_MESSAGE_MARKERS = (
+    "live-session context",
+    "context from earlier in this conversation",
+)
+
+
+def _compose_agent_message(message: str, blocks: Optional[List[Dict[str, Any]]]) -> str:
+    """The model-facing message: the request, with any caller-supplied context
+    rendered ahead of it under a separator the model can tell from the ask.
+
+    With no blocks this returns ``message`` unchanged, byte for byte — which is
+    every caller before R48 and every caller that scaffolds its own context.
+
+    The two mechanisms are mutually exclusive, and that is ENFORCED here rather
+    than documented: a caller that sends both would have the same prior turns
+    rendered twice, once in its own framing and once in ours, which is a
+    context-window cost and a model-confusing duplicate. The caller's own
+    scaffolding wins — it is the one the caller can see.
+    """
+    if blocks and message.strip()[:120].lower().startswith(
+            _SCAFFOLDED_MESSAGE_MARKERS):
+        logger.warning(
+            "[agent-turn] context_blocks (%d) ignored: `message` already "
+            "carries caller-rendered context", len(blocks),
+        )
+        return message
+    if not blocks:
+        return message
+    parts: List[str] = []
+    for b in blocks[:_CTX_BLOCKS_MAX]:
+        if not isinstance(b, dict):
+            continue
+        _label = str(b.get("label") or "Context")[:80]
+        _text = str(b.get("text") or "")[:_CTX_BLOCK_CHARS]
+        if _text:
+            parts.append(f"{_label}: {_text}")
+    if not parts:
+        return message
+    return (
+        "Context from earlier in this conversation. Treat it as prior "
+        "conversation, not as the current request.\n"
+        + "\n".join(parts)
+        + "\n\nCurrent request: "
+        + message
+    )
+
+
+def _runner_run_accepts(runner: Any, name: str) -> bool:
+    """True when this runner's ``run`` declares the keyword ``name``.
+
+    The relay and the agent image roll independently: the relay ships today and
+    the image follows on a canary, so for a window the new body fields exist
+    and the runner that must consume them does not. Probing the signature keeps
+    that window a no-op instead of a 500 on every voice turn.
+    """
+    import inspect
+
+    # `AgentRunner.run` is a thin `(*args, **kwargs)` wrapper that forwards to
+    # `_run_inner`, so **kwargs here means "ask the real signature", NOT
+    # "accepts anything": an unknown keyword reaches `_run_inner` and raises
+    # TypeError — a 500 on every voice turn, which is the exact failure this
+    # probe exists to prevent.
+    for fn in (getattr(runner, "run", None), getattr(runner, "_run_inner", None)):
+        if fn is None:
+            continue
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):  # pragma: no cover — C-implemented
+            continue
+        if name in params:
+            return True
+    return False
+
+
+def _forward_display_kwargs(runner: Any, req: "ChatRequest") -> Dict[str, Any]:
+    """The R48 display/language kwargs this runner is able to accept."""
+    out: Dict[str, Any] = {}
+    if req.display_request and _runner_run_accepts(runner, "display_request"):
+        out["display_request"] = req.display_request
+    if req.reply_language and _runner_run_accepts(runner, "reply_language"):
+        out["reply_language"] = req.reply_language
+    # Named `voice_delegation_id` on the runner: `delegation_id` alone reads
+    # like the runner's own concept, and the runner has several kinds of
+    # delegated work. Same signature probe as its two siblings.
+    if req.delegation_id and _runner_run_accepts(runner, "voice_delegation_id"):
+        out["voice_delegation_id"] = req.delegation_id
+    return out
 
 
 class ChatResponse(BaseModel):
@@ -172,6 +572,11 @@ class ChatResponse(BaseModel):
     # an older agent image never sends them.
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     app_artifact: Optional[Dict[str, Any]] = None
+    # …and the third thing a turn can produce. A `play_media` inside a voice
+    # turn started a song and left NO card in the thread, because the caller
+    # owns persistence on a `save=False` turn and was never told a card
+    # existed. Same optional-and-absent contract as the two above.
+    media: Optional[Dict[str, Any]] = None
 
 
 class SessionSummary(BaseModel):
@@ -272,6 +677,107 @@ class PlayMediaRequest(BaseModel):
     # Open-ended ask (artist/genre/vibe): pick a varied starting track instead
     # of the pinned top hit. See _tool_play_media's variety branch.
     variety: bool = Field(default=False)
+    # Contract v0.3 §7: the caller-turn order of the request that asked for
+    # this play, its provider session and that session's stamp (R6-4b). With
+    # an order and a scope, a stop supersedes it only if the caller asked for
+    # that stop AFTER this play (pairwise rule, `radio.control`).
+    media_order: Optional[int] = None
+    media_scope: Optional[str] = None
+    media_scope_started_ms: Optional[int] = None
+
+    @field_validator("media_order", mode="before")
+    @classmethod
+    def _check_media_order(cls, value):
+        return _lenient_media_order(value)
+
+    @field_validator("media_scope", mode="before")
+    @classmethod
+    def _check_media_scope(cls, value):
+        return _lenient_media_scope(value)
+
+    @field_validator("media_scope_started_ms", mode="before")
+    @classmethod
+    def _check_media_scope_started_ms(cls, value):
+        return _lenient_started_ms(value)
+
+
+class MediaControlRequest(BaseModel):
+    user_id: str = Field(..., min_length=1, max_length=128)
+    # stop/pause (contract v0.3 §H, `media_transport`) are confirmed by the
+    # phone, not by the station; see `radio.control._execute_transport`.
+    action: Literal["next", "previous", "stop", "pause"]
+    channel: Optional[str] = Field(default="app", max_length=32)
+    # Contract v0.3 §7, stop/pause only: the caller-turn order of this halt,
+    # its provider session and that session's stamp (R6-4b). It then halts
+    # exactly the ordered plays requested before it (pairwise across the
+    # user's scopes, `radio.control`), and leaves a NEWER ordered item alone
+    # (`reason: "newer_playing"`, ok false; `paused: true` when that item is
+    # paused). Absent: exactly as before.
+    before_order: Optional[int] = None
+    media_scope: Optional[str] = None
+    media_scope_started_ms: Optional[int] = None
+
+    @field_validator("before_order", mode="before")
+    @classmethod
+    def _check_before_order(cls, value):
+        return _lenient_media_order(value)
+
+    @field_validator("media_scope", mode="before")
+    @classmethod
+    def _check_media_scope(cls, value):
+        return _lenient_media_scope(value)
+
+    @field_validator("media_scope_started_ms", mode="before")
+    @classmethod
+    def _check_media_scope_started_ms(cls, value):
+        return _lenient_started_ms(value)
+
+
+def _media_arrival_mark(user_id: str, req=None):
+    """The media halt mark for a request arriving now (radio.control), or
+    None when unavailable — the play tool then takes its own. With a request
+    that carries the caller's order (`media_order` + `media_scope`, and
+    `media_scope_started_ms`; contract v0.3 §7) the mark is ordered;
+    otherwise it is the unchanged arrival mark."""
+    try:
+        from app.agent.radio.control import media_halt_mark
+        return media_halt_mark(
+            user_id,
+            media_order=getattr(req, "media_order", None),
+            media_scope=getattr(req, "media_scope", None),
+            media_scope_started_ms=getattr(req, "media_scope_started_ms", None),
+        )
+    except Exception:  # noqa: BLE001 - the guard never blocks a turn
+        return None
+
+
+def _bind_media_run_mark(mark):
+    try:
+        from app.agent.radio.control import bind_run_halt_mark
+        return bind_run_halt_mark(mark)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _reset_media_run_mark(token) -> None:
+    if token is None:
+        return
+    try:
+        from app.agent.radio.control import reset_run_halt_mark
+        reset_run_halt_mark(token)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _vs_play_superseded(name: str, body) -> bool:
+    """A play_media result that says its play was dropped for a newer stop."""
+    if name != "play_media":
+        return False
+    try:
+        from app.agent.radio.control import PLAY_SUPERSEDED_PREFIX
+    except Exception:  # noqa: BLE001
+        return False
+    return str(body or "").lstrip().startswith(PLAY_SUPERSEDED_PREFIX)
 
 
 @router.post("/internal/play-media", include_in_schema=False)
@@ -308,6 +814,19 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
     if not user_id:
         raise HTTPException(status_code=503, detail="Agent user not configured")
 
+    # When this play was asked for. The search below takes seconds; a voice
+    # stop/pause or a radio OFF that lands meanwhile is the caller's newer
+    # intent, and the tool drops the play instead of restarting the music.
+    # With the caller's order (contract v0.3 §7) an ordered stop supersedes
+    # it only when the caller asked for that stop after this play.
+    from app.agent.radio.control import PLAY_SUPERSEDED_PREFIX, media_halt_mark
+    halt_mark = media_halt_mark(
+        user_id,
+        media_order=req.media_order,
+        media_scope=req.media_scope,
+        media_scope_started_ms=req.media_scope_started_ms,
+    )
+
     tools = getattr(_agent_runner, "tools", None)
     if tools is None:
         raise HTTPException(status_code=503, detail="Tool executor not available")
@@ -332,9 +851,21 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
         # the user just returned to. A voice session has no visible surface to
         # watch on, ever; the user can flip to Video from the card afterwards.
         "mode": "audio",
+        "_halt_mark": halt_mark,
     })
 
     text = str(result or "")
+    if text.startswith(PLAY_SUPERSEDED_PREFIX):
+        # Nothing was sent to the phone. Not an error: the relay must neither
+        # announce this play nor hand it to the full agent to play anyway.
+        return {
+            "ok": False,
+            "reason": "superseded",
+            "title": "",
+            "video_id": "",
+            "thumbnail_url": "",
+            "detail": text[:300],
+        }
     if text.upper().startswith("ERROR") or text.startswith("Could not find"):
         # Surface the real reason. The caller turns this into something the user
         # can act on; it must never become "I can't play music".
@@ -360,6 +891,84 @@ async def internal_play_media(req: PlayMediaRequest, request: Request):
         ),
         "detail": text[:300],
     }
+
+
+@router.post("/internal/media-control", include_in_schema=False)
+async def internal_media_control(req: MediaControlRequest, request: Request):
+    """Move an active tenant radio session without running an agent turn.
+
+    next/previous navigate the station. stop turns the station OFF and asks the
+    phone to stop; pause asks the phone to pause. For those two `ok` is true
+    only on the phone's ack, and `reason` says what happened
+    (stopped | paused | nothing_playing | partially_confirmed | unacknowledged |
+    delivery_failed | error). `partially_confirmed` (additive, ok false): every
+    device that answered was idle but another socket that could be playing
+    stayed silent; `acked_devices` / `silent_devices` count them.
+
+    Contract v0.3 §7: a stop/pause may carry `before_order` + `media_scope`
+    (+ `media_scope_started_ms`), the caller's order for it. It then
+    supersedes only the ordered plays requested before it (pairwise across
+    the user's scopes: same scope by order, stamped scopes by stamp, otherwise
+    by arrival), and when the item last broadcast is a NEWER ordered one it is
+    left alone: `{ok: false, reason: "newer_playing"}` (additive), with that
+    item's `video_id` / `title` (+ `paused: true` when it is paused), and
+    nothing is sent."""
+
+    if settings.run_mode != "agent":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    agent_key = request.headers.get("X-Agent-Key", "")
+    if not settings.agent_api_key or not secrets.compare_digest(
+        agent_key, settings.agent_api_key
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid agent key")
+    user_id = settings.user_id
+    if not user_id:
+        raise HTTPException(status_code=503, detail="Agent user not configured")
+    if not secrets.compare_digest(req.user_id, user_id):
+        logger.error(
+            "[media-control] body user=%s does not match tenant owner=%s",
+            req.user_id[:8], user_id[:8],
+        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User mismatch")
+
+    from app.agent.radio.control import (
+        MediaControlOutcome,
+        execute_media_control,
+        media_control_budget_s,
+    )
+
+    # The stop/pause ack wait ends inside this same budget (minus a margin),
+    # so an unanswered stop reports `unacknowledged` rather than `timeout`.
+    timeout_s = media_control_budget_s()
+    # Contract v0.3 §7: the halt's own order, passed only when the relay sent
+    # one (and only for stop/pause), so a legacy body calls exactly as before.
+    ordered = (
+        {
+            "before_order": req.before_order,
+            "media_scope": req.media_scope,
+            "media_scope_started_ms": req.media_scope_started_ms,
+        }
+        if req.action in ("stop", "pause")
+        and req.before_order is not None and req.media_scope
+        else {}
+    )
+    try:
+        outcome = await asyncio.wait_for(
+            execute_media_control(user_id, req.action, req.channel, **ordered),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        outcome = MediaControlOutcome(
+            ok=False,
+            user_id=user_id,
+            action=req.action,
+            channel=req.channel or "app",
+            changed=False,
+            # stop/pause answer from a closed reason set the relay words
+            # from; a hung OFF or broadcast there is an error, not a state.
+            reason="timeout" if req.action in ("next", "previous") else "error",
+        )
+    return outcome.as_dict()
 
 
 @router.post("/internal/agent-turn", response_model=ChatResponse, include_in_schema=False)
@@ -400,9 +1009,14 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
     if not user_id:
         raise HTTPException(status_code=503, detail="Agent user not configured")
 
+    # The run's media halt mark, taken on arrival: a stop/pause while the
+    # agent is still thinking supersedes a play_media it calls later. With
+    # the caller's order (`media_order` + `media_scope`, contract v0.3 §7) an
+    # ordered stop supersedes it only when asked for after this request.
+    _halt_token = _bind_media_run_mark(_media_arrival_mark(user_id, req))
     try:
         response = await _agent_runner.run(
-            user_message=req.message,
+            user_message=_compose_agent_message(req.message, req.context_blocks),
             user_id=user_id,
             session_id=req.session_id,
             model_override=req.model,
@@ -423,6 +1037,10 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
             # Voice memories still get extracted, once, on the platform side
             # (ws_realtime._extract_voice_memories) from the real transcript.
             disable_post_processing=not req.save,
+            # Only when this image's runner declares them — the relay ships
+            # before the agent image rolls, so the fields can arrive at a
+            # runner that has never heard of them.
+            **_forward_display_kwargs(_agent_runner, req),
         )
         _resp_model = response.model
         if settings.security_leak_filter and _resp_model:
@@ -443,10 +1061,13 @@ async def internal_agent_turn(req: ChatRequest, request: Request):
             # tool list has already been drained by the time we get here.
             attachments=list((response.persisted or {}).get("attachments") or []),
             app_artifact=(response.persisted or {}).get("app_artifact") or None,
+            media=(response.persisted or {}).get("media") or None,
         )
     except Exception as e:
         logger.exception(f"Internal agent-turn error for user {user_id}")
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+    finally:
+        _reset_media_run_mark(_halt_token)
 
 
 class VoiceContextRequest(BaseModel):
@@ -463,6 +1084,15 @@ class VoiceContextRequest(BaseModel):
     # sides; without a shared instant a minute tick between the legacy
     # build and this call reads as a Voice Conversation Mode divergence.
     now: Optional[datetime] = None
+    # Which voice wire this prompt is for. The Realtime path has a `think`
+    # tool, `navigate_to`, terminal access and screen share; the GPT-Live path
+    # has NONE of them — its only lever over the backend is a delegation the
+    # model decides to emit, and the prompt is the only channel that can tell
+    # it when to. So the two paths need different channel documents, and
+    # serving the Realtime one on Live instructed the model, imperatively, to
+    # call tools it does not have. Default False: an older relay sends nothing
+    # and gets exactly today's prompt.
+    live: bool = Field(default=False)
 
 
 class VoiceContextResponse(BaseModel):
@@ -523,6 +1153,7 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
                 budget_chars=req.budget_chars,
                 tz_name=req.tz_name,
                 now_utc=_now,
+                live=req.live,
             )
             # Genuinely read-only since the day leg moved to the relay's
             # newest-day selection (W-6 parity): nothing here INSERTs any
@@ -630,6 +1261,7 @@ async def internal_curate_turn(req: CurateTurnRequest, request: Request):
 _VS_QUEUE_MAX       = 512     # frames buffered between runner and generator
 _VS_MAX_EVENTS      = 120     # tool.*/status frames per turn; `done` is exempt
 _VS_HEARTBEAT_S     = 10.0
+_VS_CANCEL_POLL_S   = 1.5
 _VS_FRAME_BYTES_MAX = 4096
 _VS_SRC_MAX         = 6
 _VS_SRC_TITLE_MAX   = 120
@@ -644,6 +1276,11 @@ _VS_PREVIEW_MAX     = 240
 # structurally unreachable rather than merely filtered.
 _VS_ARG_ALLOW: Dict[str, tuple] = {
     "web_search":         ("query",),
+    # What the agent asked to play: a benign search string, the same class as
+    # web_search's query (addendum 6 R6-6). Without it `tool.start` carried
+    # args={} and the relay had no title for an agent play it had to stop, so
+    # it quoted the caller's own sentence back as a track name (media-6).
+    "play_media":         ("query",),
     "extension_search":   ("query",),
     "extension_research": ("query",),
     "web_fetch":          ("url",),
@@ -659,6 +1296,63 @@ _VS_SOURCE_ONE_TOOLS  = {"web_fetch", "extension_read", "browser"}
 _VS_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _VS_NUM_RE  = re.compile(r"^\s*\d+\.\s+(.*\S)\s*$")
 _VS_URL_RE  = re.compile(r"^\s+(https?://\S+)\s*$")
+
+# ── needs_auth (A5-10) ────────────────────────────────────────────────────
+# A connector tool that has lost its credential does not FAIL in any sense the
+# user can act on by retrying — it is waiting for them to reconnect the
+# account. The wire has an outcome for that (`needs_auth`, read by the relay's
+# `_outcome_of`), and until now nothing produced it.
+#
+# The signal is STRUCTURAL, not model prose: `connector_mcp._serialize_result`
+# turns each `ConnectorResult` variant into `{kind, message, …}` and
+# `ToolExecutor._canonicalize_mcp_result` lifts `message`, which this server
+# wrote as `[<kind>] …`. So the marker is the envelope's own `kind`, spelled
+# by one function in this repo.
+#
+# `scope_missing` is here with `reauth_required` because the user's action is
+# the same one — reconnect the account and grant it — and the client's
+# needs_auth branch deep-links to exactly that screen. Both are a request for
+# authorization; neither is a failure of the work.
+_VS_NEEDS_AUTH_KINDS = ("reauth_required", "scope_missing")
+
+
+def _vs_needs_auth(name: str, body: str) -> Optional[str]:
+    """The connector slug when ``body`` is a connector-authorization result,
+    else None.
+
+    Both halves are structural. The KIND is the `[<kind>] …` head that
+    `connector_mcp._serialize_result` writes from the `ConnectorResult`
+    subclass; the SLUG is read ONLY out of the tool's own `<slug>__<action>`
+    namespace (the same split `tool_executor` uses for `connector_id`), never
+    out of the result string.
+
+    The namespace gate is a security boundary, not tidiness. `body` is the
+    DE-FENCED result, so for `web_fetch` / `web_search` / `browser` /
+    `extension_*` it IS the fetched page — attacker-controlled by
+    construction, which is the whole reason the fence exists
+    (`tool_executor._EXTERNAL_CONTENT_TOOLS`, whose comment states the rule
+    this function has to obey: a decision must not be derived from the result
+    string). Without the gate, a page beginning with the marker forged a
+    needs_auth prompt on the voice wire, and — because the slug used to be
+    scraped from a `/agent/integrations/<slug>` URL inside that page — named
+    an attacker-chosen connector for the user to "reconnect". None of those
+    tools is namespaced, so requiring the namespace excludes every one of
+    them, and the slug can only ever name the tool that actually ran.
+
+    The slug is NOT put on the wire this round (ruling C10 — nothing reads it,
+    and the client's reconnect CTA is a fixed `toup://connectors`); the caller
+    only tests None-ness. It is still what this function returns, because the
+    slug is the evidence that the verdict came from the tool THIS server ran
+    and not from the body, and it is what a per-connector consumer would need.
+    Returns "" only for the degenerate `__action` name. NEVER returns any part
+    of the body.
+    """
+    if "__" not in name:
+        return None
+    head = (body or "").lstrip()[:24].lower()
+    if not any(head.startswith(f"[{k}]") for k in _VS_NEEDS_AUTH_KINDS):
+        return None
+    return name.split("__", 1)[0][:32]
 
 
 def _vs_defence(s: str) -> str:
@@ -893,6 +1587,15 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
     if not user_id:
         raise HTTPException(status_code=503, detail="Agent user not configured")
 
+    # When this request arrived, for media (addendum-2 item 9): bound for the
+    # run below, so a stop/pause while the agent is still thinking supersedes
+    # a play_media it calls later, not only one that lands during its search.
+    # Carries the caller's order when the relay sent one (contract v0.3 §7):
+    # then an ordered stop supersedes the run's play only when the caller
+    # asked for it after this request — a run still thinking when an OLDER
+    # stop fires plays.
+    halt_mark = _media_arrival_mark(user_id, req)
+
     q: "asyncio.Queue" = asyncio.Queue(maxsize=_VS_QUEUE_MAX)
     budget = {"n": 0, "dropped": 0}
     cancelled = {"v": False}
@@ -954,6 +1657,29 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                     "sources": _vs_sources(name, inp, raw) or _vs_sources_from_domains(ev),
                     **_attr,
                 }
+                # `outcome` is ADDITIVE: `ok` keeps the value every shipped
+                # client already reads, and a consumer that does not know the
+                # key is byte-identical to today. Only named when this server
+                # can prove what happened — everything else stays derived from
+                # `ok` on the relay's side.
+                #
+                # The SLUG is deliberately not emitted (ruling C10). Nothing
+                # downstream reads it: `_InnerToolRelay` builds
+                # `tool_call.completed` key by key and has no `connector` key,
+                # and the app's needs_auth CTA opens the fixed
+                # `toup://connectors` with no per-connector route. A field
+                # emitted and dropped at every hop is a false impression of
+                # specificity; re-introduce it together with the consumer when
+                # the web tool-activity UI lands.
+                if _vs_needs_auth(name, body) is not None:
+                    frame["outcome"] = "needs_auth"
+                if _vs_play_superseded(name, body):
+                    # The tool dropped its play because the user stopped or
+                    # paused the music after asking (addendum-2 item 9). Not a
+                    # started track: never ok, and named, so the relay and the
+                    # app show a cancelled step, not "Starting the music".
+                    frame["ok"] = False
+                    frame["outcome"] = "cancelled"
                 if name in _VS_PREVIEW_ALLOW:
                     frame["preview"] = _vs_clean(body)[:_VS_PREVIEW_MAX]
                 _put(frame)
@@ -961,9 +1687,10 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
             logger.debug("[VSTREAM] on_tool_event sink failed", exc_info=True)
 
     async def _run_wrapped():
+        _halt_token = _bind_media_run_mark(halt_mark)
         try:
             return await _agent_runner.run(
-                user_message=req.message,
+                user_message=_compose_agent_message(req.message, req.context_blocks),
                 user_id=user_id,
                 session_id=req.session_id,
                 model_override=req.model,
@@ -978,18 +1705,65 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                 on_tool_start=on_tool_start,
                 on_tool_event=on_tool_event,
                 cancel_check=lambda: cancelled["v"],
+                # Same signature probe as the blocking sibling — the relay
+                # ships before the agent image rolls.
+                **_forward_display_kwargs(_agent_runner, req),
                 # on_text_chunk deliberately NOT passed: voice renders no token
                 # deltas, and omitting it takes the frame count from thousands
                 # per turn to 2-40, which makes backpressure a non-problem.
             )
         finally:
+            _reset_media_run_mark(_halt_token)
             try:
                 q.put_nowait(None)          # terminal sentinel
             except asyncio.QueueFull:
                 pass                        # drain loop's task.done() check covers it
 
+    async def _watch_durable_voice_cancel(task: asyncio.Task) -> None:
+        """The same tenant that executes tools observes the durable Stop bit.
+
+        A repaired phone may be attached to another platform replica. This
+        monitor is tied to the original agent run, not its socket, and the
+        runner's existing cancel_check handles the next safe tool boundary.
+        A bounded hard cancel follows for a tool that never yields back.
+        """
+
+        from app.db.models import BuildJob
+
+        if not req.delegation_id or not req.session_id or req.save:
+            return
+        while not task.done():
+            await asyncio.sleep(_VS_CANCEL_POLL_S)
+            try:
+                async with async_session_maker() as db:
+                    jobs = (await db.execute(select(BuildJob).where(
+                        BuildJob.user_id == user_id,
+                        BuildJob.conversation_id == req.session_id,
+                        BuildJob.job_type == "agent_task",
+                    ).order_by(BuildJob.created_at.desc()).limit(100))).scalars().all()
+                job = next((item for item in jobs
+                            if isinstance(item.config_json, dict)
+                            and item.config_json.get("voice_delegation_id") == req.delegation_id),
+                           None)
+            except Exception:  # noqa: BLE001
+                logger.warning("[VSTREAM] voice cancel watch read failed")
+                continue
+            if job is None:
+                continue  # voice job opens at its first planned tool round
+            if job.status != "running":
+                return  # terminal completion won the race
+            if job.stop_requested_at is None:
+                continue
+            cancelled["v"] = True
+            logger.info("[VSTREAM] voice cancel observed job=%s", job.id[:8])
+            await asyncio.sleep(_VS_CANCEL_POLL_S)
+            if not task.done():
+                task.cancel()
+            return
+
     async def generate():
         task = asyncio.create_task(_run_wrapped())
+        cancel_watch = asyncio.create_task(_watch_durable_voice_cancel(task))
         try:
             yield _vs_sse({"type": "ready"})
             while True:
@@ -1007,6 +1781,12 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
             try:
                 response = await task
             except asyncio.CancelledError:
+                if cancelled["v"]:
+                    # The tenant observed an authenticated, exact-job Stop.
+                    # Without a terminal event the relay sees EOF and may
+                    # enter its tool-less fallback, answering a stopped turn.
+                    yield _vs_sse({"type": "cancelled", "reason": "voice_stop"})
+                    return
                 raise
             except Exception as e:
                 logger.exception("[VSTREAM] agent-turn stream failed for %s", user_id)
@@ -1035,10 +1815,18 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                    if (response.persisted or {}).get("attachments") else {}),
                 **({"app_artifact": (response.persisted or {})["app_artifact"]}
                    if (response.persisted or {}).get("app_artifact") else {}),
+                # The media card the turn started. `save=False` means this
+                # process writes no row, and the relay — which does — was never
+                # told a card existed, so a song started by voice reopened as
+                # plain text with nothing to tap. Key present only when
+                # non-empty, so an older relay's parse is unchanged.
+                **({"media": (response.persisted or {})["media"]}
+                   if (response.persisted or {}).get("media") else {}),
             })
             if budget["dropped"]:
                 logger.warning("[VSTREAM] dropped %d frames (queue full)", budget["dropped"])
         finally:
+            cancel_watch.cancel()
             # Client gone (Starlette cancels the generator). Cooperative cancel
             # first — the runner polls cancel_check — then hard cancel.
             if not task.done():

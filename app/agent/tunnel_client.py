@@ -279,6 +279,10 @@ class AgentTunnelClient:
                 break
 
         if env_path:
+            # A complete config sync omits desktop access for dark accounts.
+            # load_dotenv does not clear removed keys: clear this managed gate
+            # before loading so removing an allowlist entry also disables it.
+            os.environ.pop("DESKTOP_RELAY_ENABLED", None)
             load_dotenv(env_path, override=True)
             logger.info("[TUNNEL-CLIENT] Reloaded env vars from %s", env_path)
 

@@ -119,6 +119,20 @@ _KNOWN_CHANNELS = frozenset({
     # unattended set — a thread question reads the automation's accounts
     # and does not write to them (thread_agent's documented boundary).
     "automation_thread",
+    # Toup for Mac. Named here on purpose and for exactly the reason the
+    # R33 note above gives: the clamp would give `desktop` a policy that is
+    # right by accident (`background` is in the unattended deny set), log a
+    # warning on every tool call the surface ever made, and change its
+    # permissions silently the day the clamp target moves. `extension` is in
+    # that state TODAY and is deliberately not fixed here — see the return
+    # value's `gaps`; it is a one-line change with its own blast radius and
+    # it does not belong in a dark-launched feature's diff.
+    #
+    # `desktop` is ATTENDED: the user is at the machine the tools act on. So
+    # it is in `_CONFIRMABLE_CHANNELS` (it can draw a card) and in neither
+    # mutating deny set — a write from here meets the pending-action gate
+    # rather than a refusal.
+    "desktop",
     # internal orchestration turns — pass through so the dispatcher applies its
     # normal policy instead of being fail-closed-clamped (re-audit round 6 found
     # the round-5 clamp over-denied these, breaking their connector calls).

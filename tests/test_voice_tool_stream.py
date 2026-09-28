@@ -13,6 +13,9 @@ These lock the two things most likely to rot silently:
      connector bodies to a phone. The negative cases below are the guard.
 """
 import pytest
+import json
+import asyncio
+from types import SimpleNamespace
 
 from app.api.api_v1 import (
     _vs_args,
@@ -22,6 +25,174 @@ from app.api.api_v1 import (
     _vs_sse,
     _VS_PREVIEW_ALLOW,
 )
+
+
+@pytest.mark.asyncio
+async def test_inner_tool_trail_survives_lost_live_socket(monkeypatch):
+    """A failed progress send must not discard later SSE tools and sources."""
+    from app.api.ws_realtime import _InnerToolRelay, _vps_api_stream
+    from app.services import agent_http
+
+    class DeadSocket:
+        async def send_json(self, _frame):
+            raise OSError("socket closed")
+
+    events = [
+        {"type": "status", "stage": "thinking"},
+        {"type": "tool.start", "call_id": "search-1", "name": "web_search",
+         "args": {"query": "sample"}, "job_id": "job-1", "step_index": 0,
+         "step_name": "Search", "steps_total": 2},
+        {"type": "tool.end", "call_id": "search-1", "name": "web_search",
+         "ok": True, "elapsed_ms": 100, "job_id": "job-1", "step_index": 0,
+         "step_name": "Search", "steps_total": 2,
+         "sources": [{"title": "Sample", "url": "https://example.com/page",
+                      "domain": "example.com"}]},
+        {"type": "done", "text": "A result"},
+    ]
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+
+        async def aclose(self):
+            pass
+
+    class Client:
+        def build_request(self, *_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, *, stream):
+            assert stream
+            return Response()
+
+    monkeypatch.setattr(agent_http, "get_agent_http_client", lambda: Client())
+    trail = []
+    relay = _InnerToolRelay(DeadSocket(), "live-delegation:task-1", sink=trail)
+    outcome, payload, frames = await _vps_api_stream(
+        "https://agent.example", "test-key", "/agent-turn/stream", {}, relay,
+    )
+
+    assert (outcome, payload["text"], frames) == ("stream", "A result", 4)
+    assert relay.alive is False
+    assert len(trail) == 1
+    assert trail[0]["job_id"] == "job-1"
+    assert trail[0]["step_index"] == 0
+    assert trail[0]["domains"] == ["example.com"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_tool_frame", [False, True])
+async def test_explicit_cancelled_stream_never_retries_agent_or_falls_back(
+    monkeypatch, prior_tool_frame,
+):
+    from app.api import ws_realtime as rt
+    from app.services import agent_http, model_router
+    from app.config import settings
+
+    events = ([{"type": "tool.start", "call_id": "one", "name": "web_search"}]
+              if prior_tool_frame else []) + [{"type": "cancelled", "reason": "voice_stop"}]
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+
+        async def aclose(self):
+            pass
+
+    class Client:
+        def build_request(self, *_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, *, stream):
+            assert stream
+            return Response()
+
+    monkeypatch.setattr(agent_http, "get_agent_http_client", lambda: Client())
+    monkeypatch.setattr(model_router, "classify_request", lambda _text: SimpleNamespace(model="gpt-5.2"))
+    monkeypatch.setattr(rt, "_agent_runner", None)
+    monkeypatch.setattr(rt, "_v2_active", lambda: True)
+    monkeypatch.setattr(rt, "_stream_ok", lambda _url: True)
+    monkeypatch.setattr(settings, "voice_realtime_tool_events", True)
+
+    async def vps(_user_id):
+        return "https://tenant.example", "test-key"
+
+    async def duplicate_agent(*_args, **_kwargs):
+        raise AssertionError("a stopped turn must not dispatch again")
+
+    monkeypatch.setattr(rt, "_get_vps_info", vps)
+    monkeypatch.setattr(rt, "_vps_api", duplicate_agent)
+    class Relay:
+        async def on_event(self, _event):
+            pass
+
+        async def close_open(self):
+            pass
+
+    with pytest.raises(asyncio.CancelledError):
+        await rt._think("user-1", "search for something", "session-1", relay=Relay())
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_zero_frame_stream_failure_does_not_rerun_agent(monkeypatch):
+    from app.api import ws_realtime as rt
+    from app.services import model_router
+    from app.config import settings
+    import httpx
+
+    monkeypatch.setattr(model_router, "classify_request", lambda _text: SimpleNamespace(model="gpt-5.2"))
+    monkeypatch.setattr(rt, "_agent_runner", None)
+    monkeypatch.setattr(rt, "_v2_active", lambda: True)
+    monkeypatch.setattr(rt, "_stream_ok", lambda _url: True)
+    monkeypatch.setattr(settings, "voice_realtime_tool_events", True)
+
+    async def vps(_user_id):
+        return "https://tenant.example", "test-key"
+
+    async def ambiguous_stream(*_args, **_kwargs):
+        return "fail", None, 0  # even ready may have been lost after dispatch
+
+    async def duplicate_agent(*_args, **_kwargs):
+        raise AssertionError("ambiguous POST must not be reissued")
+
+    class DirectResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": "I cannot verify the search result."}}]}
+
+    class DirectClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, *_args, **_kwargs):
+            return DirectResponse()
+
+    monkeypatch.setattr(rt, "_get_vps_info", vps)
+    monkeypatch.setattr(rt, "_vps_api_stream", ambiguous_stream)
+    monkeypatch.setattr(rt, "_vps_api", duplicate_agent)
+    monkeypatch.setattr(httpx, "AsyncClient", DirectClient)
+    class Relay:
+        async def close_open(self):
+            pass
+
+    answer, _model = await rt._think("user-1", "search for something", "session-1", relay=Relay())
+    assert answer == "I cannot verify the search result."
 
 
 def _fence(tool: str, body: str) -> str:
@@ -324,3 +495,51 @@ class TestDomainsFallback:
         from app.api.api_v1 import _vs_sources_from_domains
         assert _vs_sources_from_domains({}) == []
         assert _vs_sources_from_domains({"domains": None}) == []
+
+@pytest.mark.asyncio
+async def test_failed_agent_and_failed_direct_fallback_do_not_complete_a_voice_job(monkeypatch):
+    """The owner's search card must not finish 100% with a stock non-answer."""
+    from app.api import ws_realtime as rt
+    from app.services import model_router
+    from app.config import settings
+    import httpx
+
+    monkeypatch.setattr(model_router, "classify_request", lambda _text: SimpleNamespace(model="gpt-5.2"))
+    monkeypatch.setattr(rt, "_agent_runner", None)
+    monkeypatch.setattr(rt, "_v2_active", lambda: True)
+    monkeypatch.setattr(rt, "_stream_ok", lambda _url: True)
+    monkeypatch.setattr(settings, "voice_realtime_tool_events", True)
+
+    async def owner_agent(_user_id):
+        return "https://tenant.example", "test-key"
+
+    async def uncertain_stream(*_args, **_kwargs):
+        return "fail", None, 0
+
+    async def must_not_rerun(*_args, **_kwargs):
+        raise AssertionError("uncertain agent turn must not run twice")
+
+    class FailedDirectClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("direct fallback unavailable")
+
+    class Relay:
+        async def close_open(self):
+            pass
+
+    monkeypatch.setattr(rt, "_get_vps_info", owner_agent)
+    monkeypatch.setattr(rt, "_vps_api_stream", uncertain_stream)
+    monkeypatch.setattr(rt, "_vps_api", must_not_rerun)
+    monkeypatch.setattr(httpx, "AsyncClient", FailedDirectClient)
+
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        await rt._think("owner", "search the question for me now", "session", relay=Relay())

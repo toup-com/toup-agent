@@ -1,13 +1,13 @@
-"""G1 gate preparation (W4.1) — gpt-5.6-terra migration plumbing, all dark.
+"""GPT-5.6 price, cache, and capability plumbing.
 
 The fleet default does NOT change in this unit (the gate's stop line:
 FLEET DEFAULT CHANGES ONLY ON WRITTEN APPROVAL — see
 docs/audits/2026-07-g1-model-gate.md). These tests pin the preparation:
 
-  1. Pricing: gpt-5.6-terra/sol/luna present in all three pricing dicts
+  1. Pricing: GPT-5.6 and GPT-6 Sol present in all three pricing dicts
      (settings.pricing_per_1k, token_tracker.MODEL_PRICING,
      model_session.AVAILABLE_MODELS) with the cached_input column and the
-     NEW cache_write column at exactly 1.25x input (5.6 bills cache
+     cache_write column at exactly 1.25x input (5.6 bills cache
      writes; 5.5 writes are free).
   2. Cost math: _calc_cost_cents + tokens_to_credits apply cached/write
      rates ONLY for models carrying the columns; legacy models bill
@@ -47,27 +47,15 @@ async def _reset_database():
 
 # (input, cached_input, cache_write, output) in USD per 1M tokens.
 #
-# terra's cache_write was 3.125 — a MODELLED 1.25x input surcharge, taken from
-# the pricing page during G1 prep. Measured against OpenAI's organization
-# billing on 2026-08-07 it is 2.50, terra's plain list input rate: the billed
-# `cache writes` line divided by the tokens it covers gives $2.548/M, while the
-# separate `terra, input` line is $0.0045, i.e. nil. OpenAI files terra's
-# ordinary uncached input under that label rather than surcharging it.
-# See docs/audits/2026-08-g1-cost-and-latency.md §8.2.
-#
-# sol and luna keep the modelled 1.25x: neither has carried production
-# traffic, so there is nothing to measure, and "correcting" them by analogy
-# with terra would be inventing a number.
+# Current OpenAI published Standard short-context rates (2026-09-28).
+# Terra's older measured $2.548/M cache-write line now aligns with the
+# published 1.25x surcharge on its $2/M input price.
 _EXPECTED_PER_1M = {
-    "gpt-5.6-terra": (2.50, 0.25, 2.50, 15.00),
-    "gpt-5.6-sol": (5.00, 0.50, 6.25, 30.00),
-    "gpt-5.6-luna": (1.00, 0.10, 1.25, 6.00),
+    "gpt-6-sol": (2.00, 0.20, 2.50, 10.00),
+    "gpt-5.6-terra": (2.00, 0.20, 2.50, 12.00),
+    "gpt-5.6-sol": (4.00, 0.40, 5.00, 20.00),
+    "gpt-5.6-luna": (0.20, 0.02, 0.25, 1.20),
 }
-
-# Which of the above are MEASURED against real billing vs modelled from the
-# published price list. Kept explicit so a future edit cannot quietly promote
-# a modelled figure to a measured one.
-_MEASURED_CACHE_WRITE = {"gpt-5.6-terra"}
 
 
 class TestPricingDicts(unittest.TestCase):
@@ -81,25 +69,11 @@ class TestPricingDicts(unittest.TestCase):
             self.assertAlmostEqual(entry["cache_write"], write / 1000)
             self.assertAlmostEqual(entry["output"], out / 1000)
 
-    def test_unmeasured_tiers_keep_the_modelled_1_25x_cache_write(self):
-        """sol and luna have never carried production traffic, so 1.25x is
-        the published-price model and there is nothing to check it against.
-        Pin the ratio so a price edit can't silently break the economics note.
-        """
+    def test_cache_write_matches_published_1_25x_input(self):
         from app.config import settings
-        for model in set(_EXPECTED_PER_1M) - _MEASURED_CACHE_WRITE:
+        for model in _EXPECTED_PER_1M:
             entry = settings.pricing_per_1k[model]
             self.assertAlmostEqual(entry["cache_write"], entry["input"] * 1.25)
-
-    def test_terra_cache_write_is_measured_at_the_plain_input_rate(self):
-        """terra is the one tier with real billing behind it, and the 1.25x
-        surcharge did not survive contact with it (see _EXPECTED_PER_1M).
-        This is the anti-vacuity partner of the test above: without it, the
-        1.25x rule would look like it still held across the family."""
-        from app.config import settings
-        entry = settings.pricing_per_1k["gpt-5.6-terra"]
-        self.assertAlmostEqual(entry["cache_write"], entry["input"])
-        self.assertNotAlmostEqual(entry["cache_write"], entry["input"] * 1.25)
 
     def test_models_with_no_measured_cached_rate_have_no_cached_column(self):
         """A cached_input column must never be present without a measurement
@@ -138,14 +112,15 @@ class TestPricingDicts(unittest.TestCase):
             self.assertEqual(entry["provider"], "openai")
             self.assertAlmostEqual(entry["cost_in"], inp)
             self.assertAlmostEqual(entry["cost_out"], out)
-            self.assertEqual(entry["context"], 1_000_000)
+            expected_context = 1_050_000 if model == "gpt-6-sol" else 1_000_000
+            self.assertEqual(entry["context"], expected_context)
 
     def test_resolver_pricing_for_resolves_terra(self):
         result = mr.pricing_for("gpt-5.6-terra")
         self.assertIsNotNone(result)
         inp, out = result
-        self.assertAlmostEqual(inp, 0.0025)
-        self.assertAlmostEqual(out, 0.015)
+        self.assertAlmostEqual(inp, 0.002)
+        self.assertAlmostEqual(out, 0.012)
 
 
 # ── 2. Cost math: cache-aware ONLY for models with the columns ───────
@@ -154,43 +129,33 @@ class TestPricingDicts(unittest.TestCase):
 class TestProxyCostMath(unittest.TestCase):
     def test_terra_cold_turn_prices_at_base_input(self):
         from app.api.llm_proxy import _calc_cost_cents
-        # 100k in / 1k out, nothing cached: 100k*$2.5/M + 1k*$15/M
-        # = $0.25 + $0.015 = 26.5c → int() → 26.
-        self.assertEqual(_calc_cost_cents("gpt-5.6-terra", 100_000, 1_000), 26)
+        # 100k*$2/M + 1k*$12/M = 21.2c, capped at legacy 21c.
+        self.assertEqual(_calc_cost_cents("gpt-5.6-terra", 100_000, 1_000), 21)
 
     def test_terra_cached_read_bills_at_cached_rate(self):
         from app.api.llm_proxy import _calc_cost_cents
-        # 100k in of which 80k cached: 20k*$2.5/M + 80k*$0.25/M + 1k*$15/M
-        # = $0.05 + $0.02 + $0.015 = 8.5c → 8.
+        # 20k*$2/M + 80k*$0.20/M + 1k*$12/M = 6.8c → 6.
         self.assertEqual(
-            _calc_cost_cents("gpt-5.6-terra", 100_000, 1_000, cached_tokens=80_000), 8
+            _calc_cost_cents("gpt-5.6-terra", 100_000, 1_000, cached_tokens=80_000), 6
         )
 
-    def test_terra_cache_write_bills_at_the_plain_input_rate(self):
+    def test_terra_cache_write_bills_at_1_25x_input(self):
         from app.api.llm_proxy import _calc_cost_cents
-        # 100k in of which 80k written to cache: 20k*$2.5/M + 80k*$2.5/M
-        # + 1k*$15/M = $0.05 + $0.20 + $0.015 = 26.5c → 26.
-        #
-        # This asserted 31 (the 1.25x model) until the rate was measured. A
-        # write turn costs the SAME as an uncached turn, which is why terra's
-        # billing looked so alarming from the outside — 97% of its spend sat
-        # under a "cache writes" line that is really just its input line.
+        # 20k*$2/M + 80k*$2.50/M + 1k*$12/M = 25.2c → 25.
         self.assertEqual(
             _calc_cost_cents(
                 "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
             ),
-            26,
+            25,
         )
 
-    def test_a_terra_write_turn_costs_the_same_as_an_uncached_one(self):
-        """States the economics directly rather than through a magic number,
-        so the claim survives a list-price change."""
+    def test_a_terra_write_turn_costs_more_than_an_uncached_one(self):
         from app.api.llm_proxy import _calc_cost_cents
         uncached = _calc_cost_cents("gpt-5.6-terra", 100_000, 1_000)
         written = _calc_cost_cents(
             "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
         )
-        self.assertEqual(written, uncached)
+        self.assertGreater(written, uncached)
 
     def test_terra_read_and_write_disjoint_and_clamped(self):
         from app.api.llm_proxy import _calc_cost_cents
@@ -203,10 +168,10 @@ class TestProxyCostMath(unittest.TestCase):
                 "gpt-5.6-terra", 10_000, 0,
                 cached_tokens=20_000, cache_write_tokens=20_000,
             ),
-            # 10k * $0.25/M = $0.0025 → 0.25¢. Before R-3 the 1¢/call floor
+            # 10k * $0.20/M = $0.002 → 0.2¢. Before R-3 the 1¢/call floor
             # turned this into 1; the clamp arithmetic this test pins is
             # unchanged — the recorded value is just no longer inflated.
-            Decimal("0.25"),
+            Decimal("0.2"),
         )
 
     def test_gpt55_cached_reads_are_discounted(self):
@@ -237,18 +202,16 @@ class TestCreditMath(unittest.TestCase):
         from app.services.credit_service import tokens_to_credits
         cold = tokens_to_credits("gpt-5.6-terra", 100_000, 1_000)
         warm = tokens_to_credits("gpt-5.6-terra", 100_000, 1_000, cached_tokens=80_000)
-        self.assertEqual(cold, Decimal("26.5"))
-        self.assertEqual(warm, Decimal("8.5"))
+        self.assertEqual(cold, Decimal("21.2"))
+        self.assertEqual(warm, Decimal("6.8"))
 
-    def test_terra_credits_bill_cache_writes_at_the_input_rate(self):
+    def test_terra_credits_bill_cache_writes_at_1_25x_input(self):
         from app.services.credit_service import tokens_to_credits
         write_turn = tokens_to_credits(
             "gpt-5.6-terra", 100_000, 1_000, cache_write_tokens=80_000
         )
-        # Was 31.5 under the modelled 1.25x surcharge; measured, a write turn
-        # prices identically to an uncached one.
-        self.assertEqual(write_turn, Decimal("26.5"))
-        self.assertEqual(
+        self.assertEqual(write_turn, Decimal("25.2"))
+        self.assertGreater(
             write_turn, tokens_to_credits("gpt-5.6-terra", 100_000, 1_000)
         )
 
@@ -426,8 +389,9 @@ class TestProModelGuard(unittest.TestCase):
 
 
 class TestCapabilityPlumbing(unittest.TestCase):
-    def test_context_windows_1m(self):
+    def test_context_windows_preserve_existing_5_6_budget(self):
         from app.agent.context_manager import MODEL_CONTEXT_WINDOWS
+        self.assertEqual(MODEL_CONTEXT_WINDOWS["gpt-6-sol"], 1_050_000)
         for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6"):
             self.assertEqual(MODEL_CONTEXT_WINDOWS[model], 1_000_000, model)
 
@@ -435,19 +399,19 @@ class TestCapabilityPlumbing(unittest.TestCase):
         self.assertEqual(mr.context_window_for("gpt-5.6-terra"), 1_000_000)
 
     def test_uses_max_completion_tokens(self):
-        for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
+        for model in ("gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
             self.assertTrue(mr.uses_max_completion_tokens(model), model)
 
     def test_is_reasoning_model(self):
-        for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
+        for model in ("gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
             self.assertTrue(mr.is_reasoning_model(model), model)
 
     def test_no_custom_temperature(self):
-        for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
+        for model in ("gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
             self.assertFalse(mr.supports_custom_temperature(model), model)
 
     def test_classified_as_openai(self):
-        for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
+        for model in ("gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"):
             self.assertTrue(mr.is_openai_model(model), model)
             self.assertFalse(mr.is_claude_model(model), model)
 
@@ -458,6 +422,7 @@ class TestCapabilityPlumbing(unittest.TestCase):
             public_model_label, TIER_DEEP, TIER_FAST,
         )
         self.assertEqual(public_model_label("gpt-5.6-terra"), TIER_DEEP)
+        self.assertEqual(public_model_label("gpt-6-sol"), TIER_DEEP)
         self.assertEqual(public_model_label("gpt-5.6-sol"), TIER_DEEP)
         self.assertEqual(public_model_label("gpt-5.6-luna"), TIER_FAST)
 

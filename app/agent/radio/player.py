@@ -58,7 +58,12 @@ def infer_requested_mode(text: str) -> str | None:
         return None
     if _VIDEO_INTENT_RE.search(text) or _NON_MUSIC_RE.search(text):
         return "video"
-    return None
+    # The Persian half of the same question. It lives in `media_intent`
+    # because the intent classifier and the relay's fast path need it too and
+    # a second copy is how the English list came to cover nothing but English.
+    # Imported lazily: this module is a leaf of ws_chat and tool_executor.
+    from app.agent.media_intent import requested_mode_fa
+    return requested_mode_fa(text)
 
 
 # Does the platform this agent talks to have the single-flight SPOOL
@@ -181,6 +186,7 @@ async def broadcast_radio_track(
     reason: str = "auto_advance",
     upcoming: list | None = None,
     duration: int = 0,
+    reannounces: str = "",
 ) -> bool:
     """Emit a media_play event flagged radio_auto + kick age-check in background.
 
@@ -201,6 +207,13 @@ async def broadcast_radio_track(
     ([{video_id, title, artist, thumbnail_url}, ...]). Mobile pre-buffers them
     into the native player queue so lock-screen skip / auto-advance is instant
     (no on-tap cold-load). Web ignores it. Backward-compatible additive field.
+
+    `reannounces` (addendum 6 R6-10 TA1): the video id of the item this frame
+    re-announces — the toggle seed answering the app's reseed of the song it
+    plays, a re-anchor to the station's current track, a variant swap of the
+    current track (the id it swaps FROM). The chokepoint keeps that item's
+    caller order when it is the item recorded as live; empty (every advance,
+    step, skip, saved playlist) is a new, unordered station item.
     """
     try:
         from app.api.ws_chat import broadcast_to_user, _check_age_and_swap, _user_ws_queues
@@ -229,7 +242,43 @@ async def broadcast_radio_track(
             frame["duration"] = int(duration)
         if upcoming:
             frame["upcoming"] = upcoming
-        sent = await broadcast_to_user(user_id, frame)
+        # Every station media_play (next, auto-advance, the toggle seed, a
+        # surface swap, a saved playlist) leaves through the one chokepoint
+        # that records what plays (R6-9 T4). A new station track carries no
+        # caller order, so an ordered stop always reaches it; a
+        # re-announcement of the item already playing (`reannounces`) is that
+        # same item and keeps its caller order (R6-10 TA1).
+        try:
+            from app.agent.radio.control import holds_paused_reannouncement, send_media_play
+        except Exception:  # noqa: BLE001 - bookkeeping never blocks a broadcast
+            holds_paused_reannouncement = send_media_play = None
+        if (
+            reannounces and holds_paused_reannouncement is not None
+            and holds_paused_reannouncement(user_id, reannounces)
+        ):
+            # R6-11 TB4: this frame re-announces an item the caller PAUSED by
+            # a halt newer than it. A same-id media_play resumes a paused
+            # track on the phone, so the station's re-announcement would undo
+            # the caller's newer request. The station ships its window only
+            # (the caller's radio_state follows as usual); the record stays
+            # paused, and the device keeps what it holds. Nothing new is
+            # queued to play, so this is a completed command, not a failure.
+            if upcoming:
+                await broadcast_to_user(user_id, {
+                    "type": "radio_upcoming",
+                    "channel": channel,
+                    "upcoming": upcoming,
+                })
+            logger.info(
+                "[radio/player] re-announcement held (paused by a newer halt) user=%s "
+                "channel=%s video=%s reason=%s",
+                user_id[:8], channel, video_id, reason,
+            )
+            return True
+        if send_media_play is not None:
+            sent = await send_media_play(user_id, frame, reannounces=reannounces)
+        else:
+            sent = await broadcast_to_user(user_id, frame)
         asyncio.create_task(_check_age_and_swap(video_id, user_id))
         # Warm the platform's remux cache for what is playing NOW and what
         # plays NEXT — audio-first means the phone asks for these bytes within
@@ -265,7 +314,10 @@ async def broadcast_radio_track(
             "video=%s title=%r artist=%r video_type=%r reason=%s",
             user_id[:8], channel, num_ws, sent, video_id, title, artist, video_type, reason,
         )
-        return True
+        # A successful enqueue to at least one live device is the completion
+        # proof used by the internal voice-control route. Mutating the server
+        # cursor with no recipient is not an executed playback command.
+        return bool(sent)
     except Exception as e:
         logger.warning("[radio/player] broadcast failed: %s", e)
         return False

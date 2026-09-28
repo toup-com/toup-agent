@@ -14,11 +14,9 @@ Found 2026-08-07 by reading OpenAI's organization billing directly
     window's uncached rate.
   * `gpt-4o-mini` — the memory-extraction model, 43.3% of 46.2M input tokens
     cached — same defect. Measured $0.0750/M = exactly 0.500x uncached.
-  * `gpt-5.6-terra`'s `cache_write` was 0.003125, a MODELLED 1.25x input
-    surcharge. Measured, that billed line prices at $2.548/M — terra's list
-    input rate — while the separate `terra, input` line is $0.0045. There is
-    no surcharge; OpenAI files terra's ordinary uncached input under that
-    label.
+  * GPT-5.6 Terra's old $2.50/M input rate made its measured $2.548/M
+    cache-write line appear unsurcharged. At the current $2/M input rate,
+    the published 1.25x cache-write price is $2.50/M.
 
 Sections:
   A. The measured rates, pinned as ratios (robust to a list-price change).
@@ -45,6 +43,7 @@ from app.api.llm_proxy import _calc_cost_cents
     ("gpt-5.5", 0.10),        # $0.5493/M measured vs $5.591/M uncached -> 0.098
     ("gpt-4o-mini", 0.50),    # $0.0750/M measured vs $0.1502/M uncached -> 0.500
     ("gpt-5.6-terra", 0.10),  # published 10%, consistent with $0.206/M measured
+    ("gpt-6-sol", 0.10),
 ])
 def test_cached_input_is_the_measured_fraction_of_input(model, ratio):
     """Asserted as a RATIO, not an absolute. A list-price change moves both
@@ -57,19 +56,13 @@ def test_cached_input_is_the_measured_fraction_of_input(model, ratio):
     assert entry["cached_input"] == pytest.approx(entry["input"] * ratio, rel=1e-6)
 
 
-def test_terra_cache_write_is_the_input_rate_not_a_surcharge():
-    """MEASURED: the `gpt-5.6-terra, cache writes` billing line prices at
-    $2.548/M against the tokens it covers — terra's $2.50/M list input rate.
-    It was encoded as 1.25x (0.003125), which overstated it by 25%."""
-    terra = settings.pricing_per_1k["gpt-5.6-terra"]
-    assert terra["cache_write"] == pytest.approx(terra["input"], rel=1e-6)
+def test_current_models_cache_write_is_1_25x_input():
+    for model in ("gpt-6-sol", "gpt-5.6-terra"):
+        row = settings.pricing_per_1k[model]
+        assert row["cache_write"] == pytest.approx(row["input"] * 1.25, rel=1e-6)
 
 
-def test_unmeasured_models_keep_their_modelled_rate():
-    """Anti-overreach control. sol and luna have carried no production
-    traffic, so there is nothing to measure and nothing to correct. Changing
-    them by analogy with terra would be inventing a number and presenting it
-    as a measurement — the failure mode this whole audit exists to end."""
+def test_other_5_6_tiers_match_published_cache_write_ratio():
     for model in ("gpt-5.6-sol", "gpt-5.6-luna"):
         entry = settings.pricing_per_1k[model]
         assert entry["cache_write"] == pytest.approx(entry["input"] * 1.25, rel=1e-6)

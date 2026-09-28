@@ -415,6 +415,25 @@ _STEP_LABELS = {
     "sessions_history": "Reviewing conversations",
     "session_status": "Reviewing conversations",
     "thread": "Reviewing conversations",
+    # Toup for Mac. Plain words, and every one of them says WHOSE machine —
+    # "Reading a file" beside "Reading a file on your Mac" is the difference
+    # between the agent's workspace and the user's own disk, and the step row
+    # is the only place a person sees which happened. No path, no command and
+    # no app name here: the label is the vocabulary, and the grant-relative
+    # target belongs in the tool's own `display` sentence.
+    "desktop__fs_list": "Looking at files on your Mac",
+    "desktop__fs_read": "Reading a file on your Mac",
+    "desktop__fs_search": "Searching files on your Mac",
+    "desktop__fs_write": "Writing a file on your Mac",
+    "desktop__fs_mkdir": "Making a folder on your Mac",
+    "desktop__fs_move": "Moving a file on your Mac",
+    "desktop__fs_trash": "Moving something to the Trash on your Mac",
+    "desktop__exec_run": "Running a command on your Mac",
+    "desktop__screen_capture": "Taking a screenshot of your Mac",
+    "desktop__ui_snapshot": "Looking at an app on your Mac",
+    "desktop__ui_click": "Clicking in an app on your Mac",
+    "desktop__ui_type": "Typing in an app on your Mac",
+    "desktop__ui_key": "Pressing a key on your Mac",
     "doctor": "Running a health check",
     "spawn": "Starting a helper",
     "start_mission": "Starting a mission",

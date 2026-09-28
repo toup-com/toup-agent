@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.api.models import router as models_router
+from app.config import settings
 from app.services import model_resolver as mr
 
 
@@ -38,8 +39,11 @@ async def _client():
     app = FastAPI()
     app.include_router(models_router, prefix="/api")
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
+    # The white-label gate now requires authentication by default. These
+    # catalogue tests exercise the public endpoint mode without auth setup.
+    with patch.object(settings, "security_leak_filter", False):
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            yield c
 
 
 def _settings_with(**overrides):
@@ -78,6 +82,14 @@ async def test_provider_lists_are_id_label_objects():
         assert "label" in entry
         assert isinstance(entry["id"], str)
         assert isinstance(entry["label"], str)
+
+
+@pytest.mark.asyncio
+async def test_gpt_6_sol_is_available_and_labelled():
+    async with _client() as c:
+        resp = await c.get("/api/models")
+    body = resp.json()
+    assert {"id": "gpt-6-sol", "label": "GPT-6 Sol"} in body["openai"]
 
 
 # ── Resolver integration — flipping settings is visible on the wire ──

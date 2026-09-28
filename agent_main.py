@@ -223,6 +223,23 @@ _LOBBY_ALLOWED = frozenset({
 _BOOT_BACKGROUND_TASKS: set = set()
 
 
+async def attachment_analysis_reconcile_loop() -> None:
+    """Resume durable file analyses on a serving tenant after restart."""
+    from app.agent.attachment_analysis import reconcile_local_analyses
+
+    while True:
+        try:
+            # The reconciler checks the same bind/drain/passive gate as
+            # voice-task claims. A blue-green passive slot must not deliver
+            # or start model work until promoted.
+            await reconcile_local_analyses()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("attachment analysis reconciliation failed", exc_info=True)
+        await asyncio.sleep(60)
+
+
 # ── Module-level refs for hot-restart of channel bots ──────────────
 _telegram_bot = None
 _agent_runner = None
@@ -847,6 +864,13 @@ async def lifespan(app: FastAPI):
                     print(f"✅ Owner user exists: {settings.user_id[:8]}...")
         except Exception as e:
             print(f"⚠️ Could not ensure owner user: {e}")
+
+    # The production Dockerfile starts agent_main, not app/main. Reconcile
+    # the dedicated analysis table after schema and owner setup so page jobs
+    # resume even when the user never reconnects or asks a follow-up.
+    attachment_reconciler_task = asyncio.create_task(
+        attachment_analysis_reconcile_loop(), name="attachment-analysis-reconcile",
+    )
 
     # ── Migrate orphaned Telegram sessions to platform owner ──
     # Runs before any services start to avoid lock conflicts
@@ -2142,6 +2166,12 @@ async def lifespan(app: FastAPI):
     # ── Shutdown (reverse order) ──────────────────────────────
     logger.info("[SHUTDOWN] Agent shutting down — marking in-flight jobs as failed")
 
+    attachment_reconciler_task.cancel()
+    try:
+        await attachment_reconciler_task
+    except asyncio.CancelledError:
+        pass
+
     # Deliberately UNGATED. Gating on settings.voice_tasks_enabled meant the
     # stop path was skipped exactly when the flag had been turned off while a
     # supervisor was already running, so the loop kept polling through shutdown
@@ -2493,6 +2523,48 @@ except ImportError as _e:
 # the agent for pairing — it calls the platform).
 from app.api.extension import router as extension_router
 app.include_router(extension_router, prefix=settings.api_prefix)
+
+# Toup for Mac — /ws/desktop lives HERE (per-tenant agent), because this is
+# the process `desktop_bridge.dispatch()` is called from: the skill runs
+# inside tool_executor inside this container, so the socket and the future
+# it resolves are in one process and the hot path never crosses a boundary
+# (agent-tool-relay.md §1.9 — the defect that makes the extension's session
+# routes answer [] in production).
+#
+# Also served here: /desktop/internal/{revoked,dispatch-approved}, both
+# platform→agent pushes authenticated with X-Agent-Key.
+#
+# The pairing, device-list, revoke and pending-action routes in this router
+# are PLATFORM-owned and touch PLATFORM_ONLY tables. They are mounted here
+# too (one router, both mains, as `extension.py` is) but nothing calls the
+# agent for them — the Mac app and the web Settings page both talk to
+# toup.ai, and `_platform_db_local()` is False in this process, so the two
+# helpers that could reach across (`_verify_device_token`, `_post_heartbeat`)
+# go BACK to the platform over X-Agent-Key rather than querying here.
+#
+# What a stray direct call to one of them on this host actually gets, which
+# is NOT uniform and is stated rather than tidied because nothing in
+# production makes the call: `pair/init` and `pair/poll` answer 503 (they
+# wrap the table access); `GET /desktop/devices` and `/desktop/status`
+# answer an empty list (the ProgrammingError branch, which exists so schema
+# drift degrades rather than 500s); and the rest — `pair/approve`,
+# `pair/lookup`, `pair/deny`, `heartbeat`, `internal/verify-token`,
+# `internal/stage-action`, the pending-action routes — raise and answer 500,
+# because the tables are absent in a tenant DB by design. Giving them a
+# uniform 503 means a guard on eleven routes that no client reaches; the
+# honest note is cheaper than the guard, and this is where a reader looks.
+from app.api.desktop import router as desktop_router
+app.include_router(desktop_router, prefix=settings.api_prefix)
+
+# The socket itself is on its own router, and ONLY this main mounts it
+# (CONNECTIONS.md F-A, §4.6). While it rode the shared router, a Mac that
+# dialled toup.ai landed on a platform replica, which verified the token and
+# wrote `last_seen_at` — so the Mac read "Online" while this process's
+# registry held no endpoint and every desktop tool answered "not connected".
+# A route the platform does not serve cannot lie that way, even to an old
+# client that still dials the wrong host.
+from app.api.desktop import ws_router as desktop_ws_router
+app.include_router(desktop_ws_router, prefix=settings.api_prefix)
 
 # Mount App MCP server for external MCP clients. The ASGI app was built
 # BEFORE the FastAPI constructor so its lifespan is composed into

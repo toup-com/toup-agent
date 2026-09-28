@@ -301,6 +301,7 @@ _PAYLOAD_TO_SETTING = {
     "connect_token": "toup_token",
     "supabase_url": "supabase_url",
     "supabase_anon_key": "supabase_anon_key",
+    "desktop_relay_enabled": "desktop_relay_enabled",
 }
 
 

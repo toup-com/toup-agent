@@ -17,15 +17,11 @@ AVAILABLE_MODELS = {
     "claude-opus-4-6": {"provider": "anthropic", "cost_in": 15.0, "cost_out": 75.0, "context": 200000},
     "claude-sonnet-4-20250514": {"provider": "anthropic", "cost_in": 3.0, "cost_out": 15.0, "context": 200000},
     "gpt-5.5": {"provider": "openai", "cost_in": 5.0, "cost_out": 30.0, "context": 1050000},
-    # gpt-5.6 family. terra became the fleet default 2026-08-07 when G1
-    # passed (docs/audits/2026-08-g1-cost-and-latency.md §8). The 1.25x
-    # cache-write surcharge these tables encode did NOT survive measurement
-    # against org billing — that line prices at terra's list input rate —
-    # but correcting the pricing tables changes recorded cost values, so it
-    # is G2-adjacent and lands in its own PR. Rates: settings.pricing_per_1k.
-    "gpt-5.6-terra": {"provider": "openai", "cost_in": 2.5, "cost_out": 15.0, "context": 1000000},
-    "gpt-5.6-sol": {"provider": "openai", "cost_in": 5.0, "cost_out": 30.0, "context": 1000000},
-    "gpt-5.6-luna": {"provider": "openai", "cost_in": 1.0, "cost_out": 6.0, "context": 1000000},
+    # Current OpenAI Standard, short-context list prices per 1M tokens.
+    "gpt-6-sol": {"provider": "openai", "cost_in": 2.0, "cost_out": 10.0, "context": 1050000},
+    "gpt-5.6-terra": {"provider": "openai", "cost_in": 2.0, "cost_out": 12.0, "context": 1000000},
+    "gpt-5.6-sol": {"provider": "openai", "cost_in": 4.0, "cost_out": 20.0, "context": 1000000},
+    "gpt-5.6-luna": {"provider": "openai", "cost_in": 0.2, "cost_out": 1.2, "context": 1000000},
     "gpt-5.4": {"provider": "openai", "cost_in": 3.0, "cost_out": 12.0, "context": 1000000},
     "gpt-4o": {"provider": "openai", "cost_in": 2.5, "cost_out": 10.0, "context": 128000},
     "gpt-4o-mini": {"provider": "openai", "cost_in": 0.15, "cost_out": 0.60, "context": 128000},
@@ -134,7 +130,12 @@ class ModelSessionManager:
     ) -> UsageRecord:
         """Track token usage for a request."""
         model_info = AVAILABLE_MODELS.get(model, {"cost_in": 0, "cost_out": 0})
-        cost = (tokens_in / 1_000_000 * model_info["cost_in"]) + (tokens_out / 1_000_000 * model_info["cost_out"])
+        from app.services.model_resolver import long_context_price_multipliers
+        input_mult, output_mult = long_context_price_multipliers(model, tokens_in)
+        cost = (
+            (tokens_in / 1_000_000 * model_info["cost_in"] * input_mult)
+            + (tokens_out / 1_000_000 * model_info["cost_out"] * output_mult)
+        )
 
         record = UsageRecord(
             record_id=str(uuid.uuid4())[:12],

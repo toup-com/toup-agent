@@ -64,6 +64,7 @@ from app.agent.query_intent import (
     classify_query_intent, filter_tools_by_intent, QueryIntent, INTENT_FULL,
     with_inbound_image,
 )
+from app.agent.intent_wire_prune import select_first_call_tools, pruned_cache_key
 from app.agent.channel_annotations import (
     make_stream_tag_filter,
     strip_leaked_tags,
@@ -79,11 +80,23 @@ from app.agent.prefix_stability import (
     head_hashes,
     tools_array_change,
 )
-from app.config import settings
+from app.config import (
+    app_html_static_diet_enabled,
+    intent_wire_prune_enabled,
+    intent_wire_prune_question_enabled,
+    preferred_provider_reuse_enabled,
+    prompt_config_reuse_enabled,
+    settings,
+)
 # Leaf module (pure `enum` declarations, no ORM/engine import), so this is
 # safe at module scope — the persona renderers below key their section
 # headers off the enum instead of bare string literals.
 from app.db.models.enums import IdentityType
+# R48 per-turn DB attribution. `db_span` is a no-op object unless the turn was
+# armed for a canary user; the import itself pulls in no engine.
+from app.db import db_span as _db_span_mod
+from app.db.db_span import db_span as _db_span
+from app.services.cmid import cmid_hash as _cmid_hash
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
 from app.services.model_router import classify_request, RoutingDecision
@@ -500,7 +513,10 @@ CHANNEL_GUIDANCE = {
         "already carries several extra passages from the page — that is usually enough. Use "
         "`web_fetch` on at most ONE source, and only when the snippets genuinely do not answer the "
         "question: a fetch costs seconds per page and the caller is listening to silence while it "
-        "runs. Do not narrate that you are about to start; just do it and then talk.\n"
+        "runs. The one standing exception is a person's CURRENT role or affiliation: snippets "
+        "often describe a former position, so spend that one fetch on the organisation's own "
+        "current page (its faculty or staff directory) and say plainly when a source describes a "
+        "former role. Do not narrate that you are about to start; just do it and then talk.\n"
         "  2. NEVER promise a deliverable. No 'I'll put together a report', no 'when it's ready I'll "
         "tell you', no 'let me look into that and get back to you'. If you cannot finish it now, say "
         "what you DO know now and offer `start_mission` in plain words.\n"
@@ -613,6 +629,79 @@ def stable_prefix_enabled(user_id: Optional[str]) -> bool:
     if not raw or not user_id:
         return False
     return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
+@dataclass(frozen=True)
+class _PromptConfigSnapshot:
+    """Only the scalar prompt fields from this turn's phase-1 config read."""
+
+    agent_name: Optional[str]
+    onboarding_completed: Optional[bool]
+
+
+def _prompt_config_from_phase1(
+    user_id: str,
+    channel: Optional[str],
+    prompt_profile: "PromptProfile",
+    config_row: Any,
+) -> Optional[_PromptConfigSnapshot]:
+    """Opt in only one mobile user's main turn; never share ORM state."""
+    from app.agent.prompt_profile import PromptProfile
+
+    if (
+        (channel or "").strip().lower() != "mobile"
+        or prompt_profile != PromptProfile.FULL
+        or config_row is None
+        or not prompt_config_reuse_enabled(user_id)
+    ):
+        return None
+    return _PromptConfigSnapshot(
+        agent_name=getattr(config_row, "agent_name", None),
+        onboarding_completed=getattr(config_row, "onboarding_completed", None),
+    )
+
+
+async def _preferred_provider_for_auto_route(
+    user_id: str,
+    channel: Optional[str],
+    phase1_value: Optional[str],
+    phase1_loaded: bool,
+) -> Optional[str]:
+    """Reuse this turn's config read for canary mobile routing only.
+
+    The phase-1 value is a scalar, never an ORM object or closed session. A
+    failed phase-1 read retains the legacy second SELECT as a retry. The one
+    semantic edge is a provider edit between two successful reads: the canary
+    uses the value observed earlier in the same turn.
+    """
+    if (
+        (channel or "").strip().lower() == "mobile"
+        and preferred_provider_reuse_enabled(user_id)
+        and phase1_loaded
+    ):
+        logger.info("[PERF] preferred_provider_source=phase1")
+        return phase1_value
+
+    preferred = None
+    t_read = time.perf_counter()
+    try:
+        from app.db import AgentConfig
+        from sqlalchemy import select
+        # The Phase 1 session has closed. Reusing it after exit would leak a
+        # connection (test_session_use_after_close); retain a fresh session.
+        from app.db.database import async_session_maker
+        async with _db_span("gap_preferred_provider"), async_session_maker() as db:
+            preferred = (await db.execute(
+                select(AgentConfig.preferred_provider).where(AgentConfig.user_id == user_id)
+            )).scalar_one_or_none()
+    except Exception:
+        pass
+    if (channel or "").strip().lower() == "mobile":
+        logger.info(
+            "[PERF] preferred_provider_read_ms=%d source=late",
+            int((time.perf_counter() - t_read) * 1000),
+        )
+    return preferred
 
 
 def _note_turn_persisted(persisted: Optional[Dict[str, Any]]) -> None:
@@ -1438,6 +1527,16 @@ class AgentRunner:
         `spawn` / `start_mission` are consumed there too and stay open, which
         is correct — something else owns them.
         """
+        # R48: mark this `run()` FRAME. A sub-agent or mission is launched
+        # with `create_task` from inside a live turn, so its context copy
+        # holds the parent's turn object BY REFERENCE — the child's finally
+        # then emitted `[PERF] turn_host` under the parent's `cmid_h` and
+        # channel and the parent emitted none, with exactly one host line in
+        # the log so every acceptance gate stayed green (R48 blocking finding
+        # B1, reproduced locally). The depth is a ContextVar, which a copy
+        # does not share writes to, so it is what tells parent from child.
+        # Two ContextVar operations; a no-op off-canary in every other sense.
+        _db_span_run_tok = _db_span_mod.enter_run()
         try:
             return await self._run_inner(*args, **kwargs)
         finally:
@@ -1451,6 +1550,33 @@ class AgentRunner:
             # on voice is the common ending, not the rare one. Synchronous and
             # fire-and-forget for the reason above.
             sweep_current_voice_job()
+            # R48: one `[PERF] turn_host` line per run() FRAME (`nest=0` is
+            # the turn the user started; a sub-agent run emits its own at
+            # `nest=1`) — the cgroup's own
+            # throttling and PSI deltas across the turn, read from INSIDE the
+            # container. It settles "0.5 or 1.0 CPU, throttled or not" (round
+            # 1 found THREE different limits for this container name depending
+            # on which of four creation paths made it) with no host access.
+            # Here, in the `finally`, because a cancelled or failed turn is
+            # exactly the turn most likely to have been throttled — and
+            # because this method has the only try/finally on the path.
+            # A no-op unless the turn was armed for a canary user.
+            _db_span_mod.emit_turn_host()
+            # …and then DISARM. `begin_turn` keeps an already-armed turn so the
+            # WS handler's identity wins inside `create_task`; the cost of that
+            # rule is that a caller which awaits `run()` repeatedly on ONE
+            # context (ws_router's `while True`, several `_think`s per voice
+            # call, the heartbeat's per-user loop, cron) would give every later
+            # turn the FIRST turn's cmid_h — and, with `host_emitted` already
+            # set, no `[PERF] turn_host` line at all. Across users it is worse:
+            # a heartbeat cycle that visited a non-canary user first left the
+            # canary's own turn unarmed. Must stay AFTER emit_turn_host(),
+            # which reads the turn this clears.
+            _db_span_mod.end_turn()
+            # …and LAST, because both calls above ask `_RUN_NEST` whether this
+            # frame owns the turn they are about to act on. Restoring the
+            # depth first would make a nested run look like the outer one.
+            _db_span_mod.exit_run(_db_span_run_tok)
 
     def _sweep_unclosed_created_jobs(self, user_id: Optional[str]) -> None:
         """Close jobs this turn created but never finished. Never awaits.
@@ -1765,6 +1891,30 @@ class AgentRunner:
         managed_voice_task: bool = False,
         steering_check: Optional[Callable[[], Coroutine[Any, Any, List[str]]]] = None,
         managed_resolved_operations: Optional[Iterable[Dict[str, Any]]] = None,
+        # ── Voice-delegation envelope (R48) — keyword-only, at the END ──
+        # Every one of the ~20 call sites passes by keyword, so appending
+        # here cannot shift anyone's positional argument; the bare `*`
+        # makes that structural rather than a convention.
+        *,
+        # The clean utterance, when `user_message` is scaffolded. The GPT-Live
+        # relay wraps a delegated turn in English framing ("Live-session
+        # context from earlier accepted delegations follows…", "Current caller
+        # request: …") because the provider hands it no task text — and the
+        # voice job card was titled from that wrapper, so the user's own run
+        # card read as the relay's scaffolding rather than as what they asked.
+        display_request: Optional[str] = None,
+        # The language the CALLER just spoke, as a BCP-47-ish tag or a plain
+        # name. A8-5: the strong per-turn reply-language rule lives in a
+        # fallback stub a healthy session never uses, and the delegation
+        # backend was never told anything at all — so a Persian question could
+        # be answered in English, and `commentary.append` (which the provider
+        # paraphrases rather than translates) spoke it back in English.
+        reply_language: Optional[str] = None,
+        # WHICH delegation this turn is. The card's cancelled close proves
+        # delivery from the thread, and on Live two delegations can run at
+        # once — so "an answer landed" has to become "THIS answer landed" or
+        # the other task's reply closes this card as completed (addendum C1).
+        voice_delegation_id: Optional[str] = None,
     ) -> AgentResponse:
         """
         Run the full agent loop for a single user message.
@@ -1816,6 +1966,14 @@ class AgentRunner:
         if prompt_profile is None:
             prompt_profile = PromptProfile.FULL
         start = time.time()
+        # R48: arm this turn's DB attribution for callers that never touch a
+        # socket (cron, a routine, Telegram, the internal turn API). A WS turn
+        # is already armed by `ws_chat` before `create_task`, and the task
+        # copied that context, so this call sees a turn and returns — the
+        # handler's `cmid_h` and its host-counter baseline win.
+        _db_span_mod.begin_turn(
+            user_id=user_id, client_msg_id=client_msg_id, channel=channel,
+        )
         # Round 4 (item 7a): one waterfall per turn — every stage below
         # records into it and it renders as ONE [TURN_WATERFALL] line at the
         # end. The scattered [PERF] lines stay as per-stage detail.
@@ -1975,6 +2133,8 @@ class AgentRunner:
         self.tools.set_user_id(user_id)
         self.tools.set_chat_id(telegram_chat_id)
         self.tools.set_channel(channel)
+        _clean_user_request = display_request or display_user_message or user_message
+        self.tools.set_original_user_text(_clean_user_request)
         # Expose the user's inbound uploads so edit_image can use the image they
         # just sent as its edit source (persisted by the WS handler in PR1).
         self.tools.set_inbound_media(inbound_attachments or [])
@@ -2022,7 +2182,14 @@ class AgentRunner:
         # ── Phase 1: Load from DB (short-lived session) ──────────
         t_phase1 = time.perf_counter()
         _wf.start("phase1")
-        async with async_session_maker() as db:
+        _provider_phase1_loaded = False
+        _provider_from_phase1 = None
+        _prompt_config_snapshot: Optional[_PromptConfigSnapshot] = None
+        # R48: the span wraps the session's own `async with`, so the dial, the
+        # BEGIN, every statement and the checkin are attributed — including
+        # the SECOND connection `should_use_day_chat_context()` opens from
+        # inside this block, which shows up as `conns=2`. No-op off-canary.
+        async with _db_span("phase1"), async_session_maker() as db:
             # PR-2 (F-5/A2-2): resolve the effective timezone BEFORE session
             # resolution so _get_or_create_session can (a) stamp the new
             # Conversation's day_chat_id with the user's local day and
@@ -2127,8 +2294,14 @@ class AgentRunner:
                         user_id=user_id, conversation_id=session_id,
                         # The `think` task string: what the realtime model
                         # synthesised from what the user said, and already an
-                        # imperative description of the ask.
-                        request_text=user_message,
+                        # imperative description of the ask. On GPT-Live there
+                        # is no such string — the provider sends a delegation
+                        # event with no text — so the relay reconstructs the
+                        # turn from transcripts and hands the clean utterance
+                        # separately; `user_message` is then its English
+                        # scaffolding, which must never become a card title.
+                        request_text=display_request or user_message,
+                        delegation_id=voice_delegation_id,
                     )
                     set_current_voice_job(_vjob)
                 except Exception:  # noqa: BLE001 — never fail a turn on a card
@@ -2138,6 +2311,9 @@ class AgentRunner:
             # Load user's disabled tools from AgentConfig
             # AgentConfig is platform-only — may not exist in agent DBs
             t_db = time.perf_counter()
+            # The auto-router also reads this same row after phase 1. Keep a
+            # turn-local scalar only when this read succeeds; on a transient
+            # failure the later read remains available as a retry.
             try:
                 from sqlalchemy import select as _select
                 from app.db import AgentConfig
@@ -2146,6 +2322,8 @@ class AgentRunner:
                         _select(AgentConfig).where(AgentConfig.user_id == user_id)
                     )
                     _ac = _ac_result.scalars().first()
+                _provider_from_phase1 = getattr(_ac, "preferred_provider", None) if _ac else None
+                _provider_phase1_loaded = True
                 # W2.2: the runner-side set goes into _RUN_DISABLED_TOOLS_CTX,
                 # NOT self._disabled_tool_names — the bare attr on this
                 # process singleton let a concurrent run's write land between
@@ -2161,6 +2339,9 @@ class AgentRunner:
                 else:
                     self.tools.user_disabled_tools = set()
                     _RUN_DISABLED_TOOLS_CTX.set(frozenset())
+                _prompt_config_snapshot = _prompt_config_from_phase1(
+                    user_id, channel, prompt_profile, _ac,
+                )
             except Exception:
                 self.tools.user_disabled_tools = set()
                 _RUN_DISABLED_TOOLS_CTX.set(frozenset())
@@ -2307,6 +2488,24 @@ class AgentRunner:
                 history = await self._load_history(db, session_id, client_tz=client_tz)
                 logger.info(f"[PERF] load_history: {(time.perf_counter() - t_db) * 1000:.0f}ms — {len(history)} messages")
 
+            # Today's compact context omits yesterday's attachment cards.
+            # Keep only a few validated, user-scoped original/analysis IDs in
+            # the volatile turn context so a plain follow-up can read the
+            # stored source without asking the user to reattach it.
+            _recent_file_context = ""
+            from app.agent.attachment_analysis import (
+                likely_file_followup, references_prior_attachment,
+            )
+            _prior_attachment_ref = references_prior_attachment(_clean_user_request)
+            if (prompt_profile != PromptProfile.SUBAGENT
+                    and not attachment_records):
+                try:
+                    from app.agent.attachment_provenance import recent_user_file_refs
+                    if likely_file_followup(_clean_user_request) or _prior_attachment_ref:
+                        _recent_file_context = await recent_user_file_refs(db, user_id)
+                except Exception:
+                    logger.warning("[AGENT] recent attachment locator unavailable", exc_info=True)
+
             # If conversation has active app_builder context (direction cards,
             # tool calls), override intent so tools and skill prompts stay available
             if query_intent.category != "full" and self._has_builder_context(history):
@@ -2320,6 +2519,8 @@ class AgentRunner:
             # message after history at message-prep below. Function-local —
             # no shared runner state (this runner is a singleton).
             _turn_context_parts: Dict[str, Any] = {}
+            if _recent_file_context:
+                _turn_context_parts["recent_attachments"] = _recent_file_context
             _stable_layout = stable_prefix_enabled(user_id)
             system_prompt = await self._build_system_prompt(
                 db, user_id, user_message,
@@ -2328,6 +2529,7 @@ class AgentRunner:
                 subagent_task_label=subagent_task_label,
                 automation_context=_automation_ctx,
                 turn_context_out=_turn_context_parts if _stable_layout else None,
+                prompt_config_snapshot=_prompt_config_snapshot,
             )
             # W1.4c: capture THIS turn's trivial classification synchronously,
             # before any other await can let a concurrent run overwrite the
@@ -2403,6 +2605,36 @@ class AgentRunner:
                     _turn_context_parts["reply_to_directive"] = _rtd_block
                 else:
                     system_prompt += _rtd_block
+
+            # ── The caller's language (R48 / A8-5) ───────────────────
+            # ONE line, and it has to be here rather than in the voice
+            # prompt: on GPT-Live the spoken answer is the provider
+            # PARAPHRASING what this turn returns through
+            # `commentary.append`, so a Persian question answered in
+            # English is heard in English no matter what the voice model
+            # was told. Nothing in this file told it otherwise — `grep -i
+            # language agent_runner.py` had three unrelated hits — and the
+            # delegated task arrives wrapped in English scaffolding, which
+            # is itself a pull toward English.
+            #
+            # Turn-scoped, not prompt-scoped: the value flips every time a
+            # bilingual caller switches, and in the system prompt that is a
+            # cache fork per switch on a ~45k-token head (A3-6 is the same
+            # defect one layer down). `_tc_order` below carries the key.
+            # `_allow_post_builder` like every sibling block here: a SUBAGENT's
+            # <turn_context> is asserted to carry nothing but its own clock
+            # (`test_subagent_context_isolation`), and no child run is handed a
+            # caller language anyway.
+            if reply_language and _allow_post_builder:
+                _lang_block = (
+                    f"\nReply in {str(reply_language).strip()[:40]} — the "
+                    "language the caller just used. This instruction being in "
+                    "English is not a reason to answer in English.\n"
+                )
+                if _stable_layout:
+                    _turn_context_parts["reply_language"] = _lang_block
+                else:
+                    system_prompt += _lang_block
 
             # F8: Inject <recent_days> recap on day-boundary warm starts.
             # Only fires when today's day-chat is fresh (no rolling summary
@@ -2571,8 +2803,8 @@ class AgentRunner:
             # fallback below, landing in an arbitrary position relative to
             # the clock and the day blocks — so a new key goes HERE.
             _tc_order = (
-                "clock", "today_so_far", "recent_days", "user_brain",
-                "reply_to_directive",
+                "clock", "today_so_far", "recent_days", "recent_attachments", "user_brain",
+                "reply_to_directive", "reply_language",
             )
             _tc_msg = build_turn_context_message(
                 [_turn_context_parts[k] for k in _tc_order if k in _turn_context_parts]
@@ -2671,7 +2903,7 @@ class AgentRunner:
         # ── ContextBudgetLog telemetry (day-chat path only) ──
         if _use_day_ctx and _day_context and _day_chat_id:
             try:
-                async with async_session_maker() as _cbl_db:
+                async with _db_span("gap_context_budget"), async_session_maker() as _cbl_db:
                     from app.agent.context_budget import log_context_budget
                     await log_context_budget(
                         db=_cbl_db,
@@ -2854,32 +3086,10 @@ class AgentRunner:
 
         if model_override == "auto" or model_override is None:
             # Read user's preferred provider from agent_config (bundle mode).
-            # Defaults to anthropic if not set or BYOK.
-            preferred = None
-            try:
-                from app.db import AgentConfig as _AC
-                from sqlalchemy import select as _sel
-                # OWN session. `db` here is the Phase 1 session, whose
-                # `async with` block closed ~150 lines above — but Python does
-                # not unbind the name at the end of a `with`, so this read used
-                # to run on a CLOSED session. That is not an error: a closed
-                # AsyncSession is still usable, so it silently CHECKED OUT A
-                # NEW CONNECTION that nothing would ever return, and the
-                # `except Exception: pass` below hid it completely.
-                #
-                # That was the connection leak. Measured 2026-08-03 on the
-                # canary at ~0.5 leaked connections per turn — this branch runs
-                # once per turn whenever the model is auto-routed, which is the
-                # default. Found by the pool-checkout instrument (#421) after
-                # three fixes aimed by log-context inference missed it.
-                from app.db.database import async_session_maker as _pref_maker
-                async with _pref_maker() as _pref_db:
-                    _pref = (await _pref_db.execute(
-                        _sel(_AC.preferred_provider).where(_AC.user_id == user_id)
-                    )).scalar_one_or_none()
-                preferred = _pref
-            except Exception:
-                pass
+            # The router chooses its default when the preference is unset.
+            preferred = await _preferred_provider_for_auto_route(
+                user_id, channel, _provider_from_phase1, _provider_phase1_loaded,
+            )
             routing_decision = classify_request(
                 user_message=user_message,
                 conversation_history=messages[:-1],
@@ -3015,6 +3225,8 @@ class AgentRunner:
         # the tools tier re-caches on array change anyway — TKT-LAT-001.)
         _stable_prefix = _stable_layout and not _is_claude_model(active_model)
         _allowed_tool_names: Optional[List[str]] = None
+        _intent_wire_pruned = False
+        _stable_tools = None
         _channel_converge = _stable_layout and bool(
             getattr(settings, "channel_converge", False)
         )
@@ -3095,6 +3307,33 @@ class AgentRunner:
                     query_intent.category,
                 )
 
+                # This exact-user canary changes only the first wire array for
+                # small, already gated intents. Keep the allow-list too: it is
+                # the existing first-call policy and protects against a
+                # future accidental extra definition in the selected array.
+                if _allowed_tool_names:
+                    _pruned_tools = select_first_call_tools(
+                        _stable_tools, _allowed_tool_names,
+                        canary_enabled=intent_wire_prune_enabled(user_id),
+                        question_canary_enabled=intent_wire_prune_question_enabled(user_id),
+                        channel=channel,
+                        intent_category=query_intent.category,
+                        message_text=user_message,
+                        main_chat=(prompt_profile == PromptProfile.FULL),
+                        has_attachment=bool(inbound_attachments or media_paths or attachment_records),
+                        has_job=bool(current_job_id),
+                    )
+                    if _pruned_tools is not None:
+                        current_tools = _pruned_tools
+                        _intent_wire_pruned = True
+                        logger.info(
+                            "[PERF] intent_wire_prune: stable=%d first_call=%d "
+                            "allowed=%d intent=%s channel=%s",
+                            len(_stable_tools), len(current_tools),
+                            len(_allowed_tool_names), query_intent.category,
+                            channel,
+                        )
+
         # W2.4(c): fingerprint the finalized wire array vs this user's
         # previous turn — tools serialize ahead of system+history, so ANY
         # change here busts the whole cached prefix. Observability only;
@@ -3169,39 +3408,167 @@ class AgentRunner:
         # because a warm whose head differs by one character is a paid no-op
         # that reports itself as a success — see that module's docstring.
         # Bookkeeping only; it never reads back into this turn.
-        try:
-            from app.agent import cache_warm as _cw
-            from datetime import datetime as _dt, timezone as _tz
-
-            _warm_today = None
+        def _record_cache_warm_head() -> None:
             try:
-                _warm_now = _dt.now(_tz.utc)
-                if client_tz:
-                    from zoneinfo import ZoneInfo as _ZI
-                    _warm_today = _warm_now.astimezone(_ZI(client_tz)).date()
-                else:
-                    _warm_today = _warm_now.date()
-            except Exception:  # noqa: BLE001 — a bad tz must not lose the record
-                _warm_today = _dt.now(_tz.utc).date()
-            _cw.record_head(
-                user_id or "", llm=active_llm, system_prompt=system_prompt,
-                tools=current_tools, model=active_model,
-                prompt_cache_key=None, safety_identifier=user_id or None,
-                stable_prefix_active=_stable_prefix, channel=channel,
-                local_date=_warm_today, tz_name=client_tz,
-                # R44 F3: a SUBAGENT run carries the sub-agent prompt and a
-                # `subagent:{job_id}` cache scope; recording it would aim the
-                # warm at a prefix no chat turn asks for. Any future non-main
-                # profile is excluded the same way rather than by name.
-                is_main_turn=(prompt_profile == PromptProfile.FULL),
+                from app.agent import cache_warm as _cw
+                from datetime import datetime as _dt, timezone as _tz
+
+                try:
+                    _warm_now = _dt.now(_tz.utc)
+                    if client_tz:
+                        from zoneinfo import ZoneInfo as _ZI
+                        _warm_today = _warm_now.astimezone(_ZI(client_tz)).date()
+                    else:
+                        _warm_today = _warm_now.date()
+                except Exception:  # noqa: BLE001 — a bad tz must not lose the record
+                    _warm_today = _dt.now(_tz.utc).date()
+                _cw.record_head(
+                    user_id or "", llm=active_llm, system_prompt=system_prompt,
+                    tools=current_tools, model=active_model,
+                    prompt_cache_key=None, safety_identifier=user_id or None,
+                    stable_prefix_active=_stable_prefix, channel=channel,
+                    local_date=_warm_today, tz_name=client_tz,
+                    # R44 F3: a SUBAGENT run carries the sub-agent prompt and a
+                    # `subagent:{job_id}` cache scope; recording it would aim the
+                    # warm at a prefix no chat turn asks for. Any future non-main
+                    # profile is excluded the same way rather than by name.
+                    is_main_turn=(prompt_profile == PromptProfile.FULL),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        _record_cache_warm_head()
+
+        def _restore_full_intent_wire(reason: str) -> None:
+            nonlocal current_tools, _intent_wire_pruned, _head_est
+            if not _intent_wire_pruned:
+                return
+            current_tools = _stable_tools
+            _intent_wire_pruned = False
+            try:
+                _head_est = estimate_tokens(system_prompt) + estimate_tokens(
+                    json.dumps(current_tools or [], ensure_ascii=False, default=str)
+                )
+            except Exception:
+                _head_est = 0
+            try:
+                _tac = tools_array_change(self._last_tools_hash, user_id, current_tools)
+                if _tac is not None:
+                    logger.info(
+                        "[PERF] tools_array_changed old_n=%d new_n=%d reason=intent_wire_restore",
+                        _tac[0], _tac[1],
+                    )
+            except Exception:
+                pass
+            try:
+                _restored_tools_hash, _restored_sys_hash, _ = head_hashes(
+                    current_tools, system_prompt, history,
+                )
+                logger.info(
+                    "[PERF] intent_wire_prune_restored_head tools=%s sys=%s",
+                    _restored_tools_hash, _restored_sys_hash,
+                )
+            except Exception:
+                pass
+            _record_cache_warm_head()
+            logger.info(
+                "[PERF] intent_wire_prune restored full stable tools: %s (%d defs)",
+                reason, len(current_tools),
             )
-        except Exception:  # noqa: BLE001
-            pass
 
         logger.info(f"[AGENT] Using {active_model} via {'Anthropic' if _is_claude_model(active_model) else 'OpenAI'} with {len(messages)} messages")
 
         text_buf = ""
         _max_iter = self._effective_max_iterations()
+        # A clear whole-file summary request with one accepted stored upload
+        # must not be answered from its small turn preview. Start the durable
+        # original-file job here, after the session and assistant message ID
+        # exist, then persist a truthful processing reply through the normal
+        # turn path. Upload alone and narrow page questions do not enter here.
+        if prompt_profile == PromptProfile.FULL and save_assistant_message:
+            from app.agent.attachment_analysis import (
+                explicit_current_attachment_summary,
+                explicit_full_document_summary,
+            )
+
+            _eligible_uploads = [
+                r for r in (attachment_records or [])
+                if r.get("status", "ok") in ("ok", "truncated")
+                and isinstance(r.get("attachment_id"), str)
+                and re.fullmatch(r"[0-9a-f]{32}", r["attachment_id"])
+                and r.get("mime") in (
+                    "application/pdf", "text/plain", "text/markdown", "text/csv",
+                    "application/json",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            ]
+            if _prior_attachment_ref and attachment_records:
+                # The user attached a new file but explicitly requested an
+                # older one. The current preview remains in messages, so even
+                # an ordinary model call could answer from the wrong file.
+                # Ask for selection before invoking either path.
+                final_text = (
+                    "یک فایل تازه پیوست کرده‌اید، اما به فایل دیگری اشاره کردید. "
+                    "لطفاً بگویید برای این درخواست از کدام فایل استفاده کنم."
+                    if re.search(r"[\u0600-\u06ff]", _clean_user_request) else
+                    "You attached a new file but referred to another one. "
+                    "Which file should I use for your request?"
+                )
+                if on_text_chunk:
+                    await on_text_chunk(final_text)
+                _max_iter = 0
+            elif (len(_eligible_uploads) == 1 and len(attachment_records or []) == 1
+                    and (
+                        explicit_full_document_summary(_clean_user_request)
+                        or explicit_current_attachment_summary(_clean_user_request)
+                    )):
+                from app.agent.attachment_analysis import _wants_unit_details, start_analysis
+                from app.api.chat_attachments import load_attachment_record
+
+                _aid = _eligible_uploads[0]["attachment_id"]
+                try:
+                    _original_record = await asyncio.to_thread(load_attachment_record, user_id, _aid)
+                    if _original_record is None:
+                        raise FileNotFoundError("stored attachment unavailable")
+                    _analysis = await start_analysis(
+                        user_id, _aid, _original_record, _clean_user_request,
+                        retry_failed=True,
+                        session_id=session_id, channel=channel,
+                        anchor_message_id=asst_message_id,
+                        include_unit_details=_wants_unit_details(_clean_user_request),
+                        request_identity=_clean_user_request,
+                    )
+                    _complete = _analysis["status"] in ("completed", "partial", "failed")
+                    if re.search(r"[\u0600-\u06ff]", _clean_user_request):
+                        final_text = (
+                            "تحلیل این فایل قبلاً انجام شده است؛ نتیجه را در همین گفتگو می‌فرستم."
+                            if _complete else
+                            "دارم تمام فایل را بررسی می‌کنم. نتیجه را در همین گفتگو می‌فرستم."
+                        )
+                    else:
+                        final_text = (
+                            "I found the completed analysis and will post it in this chat."
+                            if _complete else
+                            "I’m analyzing the full file. I’ll post the result in this chat."
+                        )
+                except (ValueError, RuntimeError, FileNotFoundError, OSError) as exc:
+                    _reason = str(exc)
+                    if _reason == "too_many_pages":
+                        final_text = "This PDF has more than 500 pages, so I can’t analyze the whole file in one job."
+                    elif _reason in ("file_too_large", "invalid_pdf", "unreadable_pdf", "empty_pdf"):
+                        final_text = "I couldn’t open the stored PDF for full-file analysis. Please attach a readable PDF under 25 MiB."
+                    elif _reason == "renderer_unavailable":
+                        final_text = "Full-file PDF analysis is unavailable on this server right now."
+                    else:
+                        final_text = "I couldn’t start full-file analysis of this attachment. Please attach it again."
+                except Exception:
+                    logger.exception("[AGENT] full-file analysis kickoff failed")
+                    final_text = "I couldn’t start full-file analysis of this attachment. Please try again."
+                if on_text_chunk:
+                    await on_text_chunk(final_text)
+                _max_iter = 0
         _filesystem_path_resolver = getattr(
             self.tools, "resolve_operation_path", None,
         )
@@ -3394,6 +3761,10 @@ class AgentRunner:
                     else:
                         _cache_scope = _day_chat_id or session_id
                     _cache_key = f"{user_id}:{_cache_scope}" if user_id and _cache_scope else None
+                    if _intent_wire_pruned and user_id:
+                        # The pruned tools head is a separate cache lineage;
+                        # a full-head retry or post-tool call uses the old key.
+                        _cache_key = pruned_cache_key(user_id, query_intent.category)
                     _idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
 
                     # R44 I2: the cache key is minted here, after the head is
@@ -3418,6 +3789,30 @@ class AgentRunner:
                         except Exception:  # noqa: BLE001
                             pass
 
+                    # R48-G: `x-toup-trace` — the join key between this
+                    # turn's [PERF] lines and the platform proxy's own
+                    # per-request line. Default OFF; None means no header at
+                    # all, which is the byte-identical path.
+                    #
+                    # Per ITERATION, not per turn, so a tool loop's calls stay
+                    # distinguishable — and computed here rather than folded
+                    # into `_llm_extra_kwargs` (which is built once, before
+                    # the loop) for that reason. Withheld on Claude models the
+                    # same way `reasoning_effort` is: AnthropicService's
+                    # signature has no such parameter and passing one is a
+                    # TypeError that would end the turn.
+                    _iter_kwargs = _llm_extra_kwargs
+                    if not _is_claude_model(active_model):
+                        try:
+                            from app.agent import llm_trace as _llm_trace
+                            _tv = _llm_trace.trace_for_turn(
+                                user_id, client_msg_id, iteration,
+                            )
+                        except Exception:  # noqa: BLE001 — telemetry never costs a turn
+                            _tv = None
+                        if _tv:
+                            _iter_kwargs = {**_llm_extra_kwargs, "llm_trace": _tv}
+
                     async for event in active_llm.create_message_stream(
                         messages=messages,
                         system=system_prompt,
@@ -3430,7 +3825,7 @@ class AgentRunner:
                         idempotency_key=_idem_key,
                         stable_prefix_active=_stable_prefix,
                         channel=channel,
-                        **_llm_extra_kwargs,
+                        **_iter_kwargs,
                     ):
                         if cancel_check and cancel_check():
                             logger.info("[AGENT] Cancelled during streaming")
@@ -3513,7 +3908,13 @@ class AgentRunner:
                         f"out={event.usage.get('output_tokens', 0)}, stop={stop_reason}, "
                         f"cached={_cached_tok}, head_est={_head_est}, "
                         f"cached_beyond_head={_cached_beyond_head}, "
-                        f"effort={_reasoning_effort or '-'})"
+                        f"effort={_reasoning_effort or '-'}, "
+                        # The service reports the value attached to the
+                        # actual client's request. A stale direct client can
+                        # make the settings-based gate optimistic, in which
+                        # case the final wire guard withholds the header and
+                        # this line must say `-` rather than a false join key.
+                        f"trace={getattr(event, 'llm_trace_sent', None) or '-'})"
                     )
                     try:
                         from app.services import health_signals as _hs_cache
@@ -3613,6 +4014,7 @@ class AgentRunner:
                         and is_tool_choice_rejection(e)
                     ):
                         _tool_choice_restriction_rejected = True
+                        _restore_full_intent_wire("allowed_tools rejection")
                         logger.warning(
                             "[AGENT] provider rejected the allowed_tools tool_choice on %s "
                             "(%s) — retrying the same call unrestricted; the tool policy "
@@ -3756,6 +4158,8 @@ class AgentRunner:
                         if active_model != fallback:
                             fallback_llm = self.anthropic if _is_claude_model(fallback) else self.llm
                             try:
+                                _restored_for_fallback = _intent_wire_pruned
+                                _restore_full_intent_wire("model fallback")
                                 text_buf = ""
                                 pending_tool_calls = []
                                 stop_reason = ""
@@ -3769,6 +4173,12 @@ class AgentRunner:
                                 )
                                 _fb_cache_key = f"{user_id}:{_fb_scope}" if user_id and _fb_scope else None
                                 _fb_idem_key = f"{user_id}:{session_id}" if user_id and session_id else None
+                                if _restored_for_fallback:
+                                    try:
+                                        from app.agent import cache_warm as _cw_fallback
+                                        _cw_fallback.set_cache_key(user_id or "", _fb_cache_key)
+                                    except Exception:  # noqa: BLE001 — bookkeeping only
+                                        pass
                                 async for event in fallback_llm.create_message_stream(
                                     messages=messages,
                                     system=system_prompt,
@@ -4418,6 +4828,7 @@ class AgentRunner:
             # tool_choice is None from iteration 1 on) — mutating the array
             # here would re-introduce the guaranteed intra-turn cache miss
             # this flag exists to remove (finding F-2), so skip.
+            _restore_full_intent_wire("tool use")
             if not _stable_prefix and current_tools is not all_tools and query_intent.category != "full":
                 # Re-apply ALL channel strips after escalation via the shared
                 # helper (review #4). This also closes a latent gap: the old
@@ -4565,8 +4976,14 @@ class AgentRunner:
         _effective_media = _tool_media or preset_media
         _voice_media = _effective_media if managed_voice_task else None
         if _effective_media and not save_assistant_message:
-            logger.warning(
-                "[media-persist] DROPPED user=%s channel=%s reason=no_assistant_row "
+            # No longer a drop: the card rides out on `persisted["media"]`
+            # below, the same echo `attachments` and `app_artifact` already
+            # use. Whether it reaches a row is now the CALLER's to answer, so
+            # the line names the hand-off rather than claiming a loss — a log
+            # that cries DROPPED on the healthy path is how the real drop
+            # stays invisible.
+            logger.info(
+                "[media-persist] HANDED-OFF user=%s channel=%s reason=no_assistant_row "
                 "video=%s", (user_id or "")[:8], channel,
                 (_effective_media or {}).get("video_id"),
             )
@@ -4583,7 +5000,13 @@ class AgentRunner:
         # write_subagent_message instead.
         _persisted: Dict[str, Any] = {}
         if save_assistant_message:
-            async with async_session_maker() as db:
+            # R48: the span wraps the `async with` itself, NOT `t_phase3` —
+            # `t_phase3` starts ~40 lines of pure-Python bookkeeping above
+            # this line, so a gate written against it could never close
+            # (a1-VERIFY's objection to the first sketch of this patch). The
+            # span's own `total_ms` is the envelope its buckets must account
+            # for; `[PERF] phase3_save` stays exactly as it is.
+            async with _db_span("save"), async_session_maker() as db:
                 _persisted = await self._save_messages(
                     db=db,
                     session_id=session_id,
@@ -4631,6 +5054,18 @@ class AgentRunner:
             self.tools.pending_attachments = []
             if _pending_atts_unsaved:
                 _persisted["attachments"] = _pending_atts_unsaved
+            if _effective_media:
+                # A3-8: the card followed `attachments` and `app_artifact` out
+                # of this branch and then stopped — media is plumbed three
+                # different ways (`tools._last_media` → `media_meta_override`,
+                # `metadata.media` on the managed-voice path, and
+                # `_save_voice_messages(media=…)` on the relay path) and a
+                # GPT-Live delegation intersects none of them. So a song the
+                # agent genuinely started had no card when the user reopened
+                # the app: the 2026-07-31 "a voice play persists a real card"
+                # regression, restored by the Live migration. The caller owns
+                # the row; this is the echo it builds the row from.
+                _persisted["media"] = _effective_media
             if _presented_apps:
                 _art_unsaved: Dict[str, Any] = {"slug": _presented_apps[-1]}
                 try:
@@ -4919,6 +5354,24 @@ class AgentRunner:
             "in": total_input, "out": total_output,
             "job": _steps.job_id, "steps_total": _steps.steps_total or None,
         })
+        # R48/c2-F11: the waterfall was the ONE per-turn line with no turn
+        # identity on it — `[PERF] ws_pre_turn` and `[PERF] ws_ttfb` carry
+        # `mission=`/`user=`, the waterfall carried neither, so the map of a
+        # turn could not be joined to the pre-turn that preceded it or to the
+        # `[PERF] db_span` lines inside it. The key is ADDED, not set to null,
+        # only when the instrument is armed: `meta` is splatted into the JSON
+        # whole, so a `None` here would still change every flag-off line.
+        if _db_span_mod.turn_enabled():
+            try:
+                # Same coercion `begin_turn` uses, and for the same reason:
+                # `client_msg_id` is raw client input on the WS path and the
+                # hash walks it. Wrapped as well — this is the one flag-on
+                # telemetry write that sits at the very END of a turn, after
+                # the answer has streamed, so a raise here would turn a
+                # delivered answer into an error (R48 final review, N3).
+                _wf.meta["cmid_h"] = _cmid_hash(str(client_msg_id or "")[:100])
+            except Exception:  # noqa: BLE001 — telemetry never costs a turn
+                pass
         _wf.start("finalize")
 
         # Round 13: close the voice card. Deliberately BEFORE the create_job
@@ -5871,6 +6324,7 @@ class AgentRunner:
         subagent_task_label: Optional[str] = None,
         automation_context: Optional[dict] = None,
         turn_context_out: Optional[Dict[str, Any]] = None,
+        prompt_config_snapshot: Optional[_PromptConfigSnapshot] = None,
     ) -> str:
         """Build a rich system prompt from identities + memories + runtime context.
 
@@ -5972,14 +6426,18 @@ class AgentRunner:
         # by naming the underlying provider. We override that explicitly:
         # the agent identifies as the user's agent name (or generic "your
         # agent" until they've named it), period.
-        try:
-            from app.db.models import AgentConfig as _AC
-            async with db.begin_nested():
-                _name_cfg = (await db.execute(
-                    select(_AC.agent_name).where(_AC.user_id == user_id)
-                )).scalar_one_or_none()
-        except Exception:
-            _name_cfg = None
+        if prompt_config_snapshot is not None:
+            _name_cfg = prompt_config_snapshot.agent_name
+            logger.info("[PERF] prompt_config_source=phase1")
+        else:
+            try:
+                from app.db.models import AgentConfig as _AC
+                async with db.begin_nested():
+                    _name_cfg = (await db.execute(
+                        select(_AC.agent_name).where(_AC.user_id == user_id)
+                    )).scalar_one_or_none()
+            except Exception:
+                _name_cfg = None
         _agent_label = (_name_cfg or "").strip()
         # ONE renderer, shared with the voice assembler — the "chat" format
         # is the markdown wording; voice asks the SAME function for its
@@ -6491,6 +6949,43 @@ class AgentRunner:
         # included — the extra tokens are cached after the first turn.
         if self.skill_loader and (intent.include_skill_prompts or _stable):
             skill_parts = self.skill_loader.get_all_system_prompt_sections()
+            # The larger static app_html cut takes precedence when both owner
+            # pilots are armed. Its source-hash guard can decline the change;
+            # in that case the smaller R49 redundancy diet still gets a turn.
+            _static_skill_diet_applied = False
+            if skill_parts and app_html_static_diet_enabled(user_id, channel):
+                app_html = self.skill_loader.get_skill("app_html")
+                if app_html is not None:
+                    render_compact = getattr(
+                        app_html, "get_compact_system_prompt_section", None
+                    )
+                    if callable(render_compact):
+                        try:
+                            full = app_html.get_system_prompt_section()
+                            compact = render_compact()
+                        except Exception:
+                            # A prose diet must never break prompt assembly.
+                            full = compact = None
+                        if full and compact and full != compact and skill_parts.count(full) == 1:
+                            skill_parts[skill_parts.index(full)] = compact
+                            _static_skill_diet_applied = True
+            # R48 patch I: the skill prose diet, a SEPARATE flag from
+            # PROMPT_DIET and default OFF. These sections are 15,092 tokens
+            # (LOCAL, o200k) and the `or _stable` above sends all of them on
+            # every turn of every intent, so this is the largest always-on
+            # prose block on the wire. The mapping behind this call removes
+            # REDUNDANCY only (app_html, 447 tok LOCAL; atom gate + retained-
+            # twin check, test-gated) — the flip is still its own decision. Flag-off
+            # keeps the loader's own join above byte-identical.
+            from app.agent.prompt_diet import (
+                skill_prose_diet_enabled as _skill_prose_diet_enabled,
+                skill_sections_diet as _skill_sections_diet,
+            )
+            if _skill_prose_diet_enabled(user_id, channel):
+                if not _static_skill_diet_applied:
+                    skill_parts = _skill_sections_diet(
+                        self.skill_loader, skill_parts, user_id, channel
+                    )
             if skill_parts:
                 section_parts["skills"] = "\n\n".join(skill_parts)
 
@@ -7396,13 +7891,19 @@ class AgentRunner:
 
         # ── 8. Onboarding (CONDITIONAL) ────────────────────────────
         try:
-            from app.db.models import AgentConfig
-            async with db.begin_nested():
-                _cfg_result = await db.execute(
-                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+            if prompt_config_snapshot is not None:
+                _onboarding_needed = not prompt_config_snapshot.onboarding_completed
+            else:
+                from app.db.models import AgentConfig
+                async with db.begin_nested():
+                    _cfg_result = await db.execute(
+                        select(AgentConfig).where(AgentConfig.user_id == user_id)
+                    )
+                    _agent_cfg = _cfg_result.scalar_one_or_none()
+                _onboarding_needed = bool(
+                    _agent_cfg and not _agent_cfg.onboarding_completed
                 )
-                _agent_cfg = _cfg_result.scalar_one_or_none()
-            if _agent_cfg and not _agent_cfg.onboarding_completed and not has_soul_identity:
+            if _onboarding_needed and not has_soul_identity:
                 section_parts["onboarding"] = (
                     "# Onboarding Mode (ACTIVE)\n"
                     "You are in onboarding mode — this is a new user who just set up their agent. "
@@ -7575,6 +8076,12 @@ class AgentRunner:
             if msg.role not in ("user", "assistant"):
                 continue
             _content = msg.content
+            if msg.role == "user":
+                from app.agent.attachment_provenance import history_attachment_refs
+                _content = (_content or "") + history_attachment_refs(getattr(msg, "attachments", None))
+            elif msg.role == "assistant":
+                from app.agent.attachment_provenance import history_analysis_ref
+                _content = (_content or "") + history_analysis_ref(getattr(msg, "metadata_json", None))
             _rt_id = getattr(msg, "reply_to_message_id", None)
             if _rt_id and _rt_id in _reply_targets:
                 try:
@@ -7748,7 +8255,7 @@ class AgentRunner:
         # two producers, a card that reached this function is always written
         # (`_meta["media"]` below), so the only way this turn loses one is by
         # never reaching this function — which `_run_inner` logs as
-        # `[media-persist] DROPPED` and which `media_expected − media_persisted`
+        # `[media-persist] HANDED-OFF` and which `media_expected − media_persisted`
         # counts. A guard on `not media_meta and (override or tool_set)` was
         # `not (A or B) and (A or B)`: false for every input, silent forever.
 
@@ -8094,7 +8601,10 @@ class AgentRunner:
         # Page rasters of one scanned PDF count as that many images to the model,
         # so "image i of n" is never a lie about what the model can see.
         _image_supply = sum(
-            (len(r.get("page_images_b64") or []) if r.get("page_images_b64") else (1 if r.get("image_b64") else 0))
+            (min(2, len(r.get("page_images_b64") or []))
+             if r.get("page_images_b64") and r.get("attachment_id") and (r.get("page_count") or 0) > 20
+             else len(r.get("page_images_b64") or []) if r.get("page_images_b64")
+             else 1 if r.get("image_b64") else 0)
             for r in recs
         )
         # MAX_ATTACHMENTS_PER_TURN counts FILES; eight scanned PDFs legitimately
@@ -8116,6 +8626,8 @@ class AgentRunner:
             status = r.get("status") or STATUS_OK
             att_id = r.get("attachment_id")
             kind = r.get("kind")
+            original_ref = (f" — attachment_id {att_id}" if att_id and r.get("attachment")
+                            and kind != "image" else "")
 
             if r.get("image_b64"):
                 if images_left <= 0:
@@ -8142,7 +8654,8 @@ class AgentRunner:
 
             if r.get("page_images_b64"):
                 _all_pages = r["page_images_b64"]
-                pages = _all_pages[: max(0, images_left)]
+                preview_cap = 2 if original_ref and (r.get("page_count") or 0) > 20 else len(_all_pages)
+                pages = _all_pages[: min(preview_cap, max(0, images_left))]
                 images_left -= len(pages)
                 if not pages:
                     manifest.append(f"[{idx}] {name} — NOT SHOWN (too many images this turn)")
@@ -8153,15 +8666,18 @@ class AgentRunner:
                                  f"the most that can be read at once. Tell the user."),
                     })
                     continue
-                manifest.append(
-                    f"[{idx}] {name} (scanned document, {len(pages)} page images)"
-                )
+                manifest.append(f"[{idx}] {name} (scanned document, "
+                                f"{r.get('page_count') or len(_all_pages)} pages{original_ref}; "
+                                f"{len(pages)} preview images)")
                 note = (
                     f"[{idx}] {name} — scanned PDF with almost no text layer; its first "
                     f"{len(pages)} page(s) follow as images. Read them as the document."
                 )
                 if r.get("truncated") or len(pages) < len(_all_pages):
-                    note += " Later pages were not included."
+                    note += (" Later pages were not included in this preview. "
+                             "For a whole-file task, call analyze_attachment with this "
+                             "attachment_id and the user's request; do not answer from "
+                             "the preview as if it covered all pages.")
                 # Whatever text there WAS still goes in. A short text layer is
                 # the reason this file was rasterized, not a reason to throw it
                 # away — a header or a footer is often the only machine-readable
@@ -8181,7 +8697,7 @@ class AgentRunner:
                     })
                 continue
 
-            label = f"[{idx}] {name} — {kind or 'file'}"
+            label = f"[{idx}] {name} — {kind or 'file'}{original_ref}"
             if r.get("page_count"):
                 label += f", {r['page_count']} pages"
             if status in (STATUS_OK, STATUS_TRUNCATED) and r.get("text"):
@@ -8193,8 +8709,16 @@ class AgentRunner:
                 chars_left -= len(chunk)
                 if r.get("truncated"):
                     label += ", TRUNCATED"
-                manifest.append(f"[{idx}] {name} ({kind or 'file'})")
-                body.append({"type": "text", "text": f"{label}\n{chunk}"})
+                manifest.append(f"[{idx}] {name} ({kind or 'file'}{original_ref})")
+                guidance = ""
+                if original_ref and (r.get("truncated") or r.get("mime") == "application/pdf"):
+                    guidance = (
+                        "\nThis is only the chat preview. For a task needing the whole file "
+                        "or PDF graphics, call analyze_attachment with this attachment_id "
+                        "and the user's request. Never claim this preview covers later pages "
+                        "or all diagrams."
+                    )
+                body.append({"type": "text", "text": f"{label}{guidance}\n{chunk}"})
             else:
                 guidance = MODEL_GUIDANCE.get(status, MODEL_GUIDANCE[STATUS_UNREADABLE])
                 manifest.append(f"[{idx}] {name} — COULD NOT BE READ ({status})")

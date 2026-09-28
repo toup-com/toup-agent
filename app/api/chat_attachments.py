@@ -220,6 +220,10 @@ async def ingest_and_store(
             await get_storage_backend().put(key, page)
             page_keys.append(key)
 
+        attachment_dict = att.to_dict()
+        # Preserve the user-scoped original upload identity on the chat card.
+        # The storage file's own `id` is a different identifier.
+        attachment_dict["attachment_id"] = att_id
         record = {
             "attachment_id": att_id,
             "sha256": sha,
@@ -227,7 +231,7 @@ async def ingest_and_store(
             "mime": ing.mime,
             "kind": ing.kind,
             "size_bytes": ing.size_bytes,
-            "attachment": att.to_dict(),
+            "attachment": attachment_dict,
             "ingest": ing.to_record(),
             "text_key": text_key,
             "page_keys": page_keys,

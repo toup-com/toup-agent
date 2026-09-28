@@ -144,6 +144,15 @@ def test_an_image_side_exemption_is_real_and_still_needed(flag: str):
     "CHANNEL_ENVELOPE",
     "CHANNEL_ENVELOPE_CANARY_USER_IDS",
     "DAY_CHAT_REBUCKET_ENABLED",
+    "PRESAVE_REFRESH_TRIM_CANARY_USER_IDS",
+    "PREFERRED_PROVIDER_REUSE_CANARY_USER_IDS",
+    "PROMPT_CONFIG_REUSE_CANARY_USER_IDS",
+    "TURN_DB_SPAN_CANARY_USER_IDS",
+    "LLM_TRACE_HEADER_CANARY_USER_IDS",
+    "SKILL_PROSE_DIET_CANARY_USER_IDS",
+    "APP_HTML_STATIC_DIET_CANARY_USER_IDS",
+    "INTENT_WIRE_PRUNE_CANARY_USER_IDS",
+    "INTENT_WIRE_PRUNE_QUESTION_CANARY_USER_IDS",
 ])
 def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     """Dropping one of these from the bridge list is how a fleet silently
@@ -152,6 +161,22 @@ def test_flag_that_must_stay_forwardable_is_still_in_the_list(flag: str):
     assert flag in _forwarded_flags(), (
         f"{flag} left _FEATURE_FLAG_ENVS — containers can no longer receive it"
     )
+
+
+@pytest.mark.parametrize("flag", [
+    "PRESAVE_REFRESH_TRIM_CANARY_USER_IDS",
+    "PREFERRED_PROVIDER_REUSE_CANARY_USER_IDS",
+    "PROMPT_CONFIG_REUSE_CANARY_USER_IDS",
+    "TURN_DB_SPAN_CANARY_USER_IDS",
+    "LLM_TRACE_HEADER_CANARY_USER_IDS",
+    "SKILL_PROSE_DIET_CANARY_USER_IDS",
+    "APP_HTML_STATIC_DIET_CANARY_USER_IDS",
+    "INTENT_WIRE_PRUNE_CANARY_USER_IDS",
+    "INTENT_WIRE_PRUNE_QUESTION_CANARY_USER_IDS",
+])
+def test_chat_latency_pilots_are_unique_and_off_by_default(flag: str):
+    assert _forwarded_flags().count(flag) == 1
+    assert Settings.model_fields[flag.lower()].default == ""
 
 
 def test_embeddings_via_proxy_is_forwarded_because_memory_hard_fails_without_it():

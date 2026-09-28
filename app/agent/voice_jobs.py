@@ -56,7 +56,10 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import logging
+import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
@@ -66,13 +69,113 @@ from app.services.background_tasks import spawn as _spawn_bg
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "SEAL_CANCELLED",
+    "SEAL_COMPLETED",
+    "SEAL_INTERRUPTED_AFTER_ANSWER",
     "VoiceTurnJob",
+    "clean_request_text",
     "current_voice_job",
     "is_work_tool",
     "set_current_voice_job",
     "step_label_for_tool",
     "sweep_current_voice_job",
 ]
+
+# ── How a card ENDED ──────────────────────────────────────────────────────
+#: The turn produced its answer. Today's normal close.
+SEAL_COMPLETED = "completed"
+#: The turn produced its answer and was then cut off — the caller hanging up
+#: after hearing the reply, which is how a voice call normally ends. Still a
+#: COMPLETED card: "Didn't finish" over work the agent already spoke aloud is
+#: the exact lie `job_status.turn_interrupted` was written to stop telling.
+SEAL_INTERRUPTED_AFTER_ANSWER = "interrupted_after_answer"
+#: The turn was stopped before anything was delivered — a barge-in, a
+#: supersession, a hang-up mid-research. The work genuinely happened and its
+#: steps and sources stay readable, but nothing was ever received, so the card
+#: says `cancelled`. It used to say "Done in 3 steps", over an answer the user
+#: never heard, and tapping it showed real steps and real sources, which made
+#: the claim more convincing rather than less.
+SEAL_CANCELLED = "cancelled"
+
+# ── Scaffolding must never become a title ─────────────────────────────────
+# A Live delegation's `user_message` is a CONSTRUCTED PROMPT: the utterance
+# wrapped in English framing plus verbatim prior-turn content
+# (`live_voice_protocol.delegated_agent_input`). The title path fans whatever
+# it is handed out to four surfaces — the card, the chat marker row, the APNs
+# body and the Live Activity content-state — and the last two escape nothing.
+# Production shipped `Working on: Live-session context from earlier accepted…`
+# to a lock screen.
+#
+# `display_request` (R48) is the real fix: the caller passes the clean
+# utterance. This list is the belt-and-braces half, and it is independent of
+# that field on purpose — a caller that forgets to send it must not be able to
+# put prompt scaffolding on a notification surface.
+_SCAFFOLD_MARKERS = (
+    "live-session context",
+    "prior caller request",
+    "accepted backend result",
+    "current caller request",
+    "treat it as prior conversation",
+    "context from earlier in this conversation",
+)
+
+#: Below this a derived title is a caption fragment, not a request. A 350 ms
+#: transcript settle produces exactly that — "ایونتش", "چک کن" — and a card
+#: titled with a clipped word names nothing. Two words is the floor; the
+#: fallback ("Voice request") is a truthful label and a better one.
+_TITLE_MIN_WORDS = 2
+
+#: …but a WORD floor is a claim about the script, not about the request.
+#: Chinese, Japanese and Thai do not separate words with spaces, so a whole
+#: sentence is one `split()` token: `'播放周杰伦的歌'` and `'ニュースを教えて'`
+#: are complete requests and were both titled "Voice request", unconditionally,
+#: for every speaker of those languages. For those scripts the honest floor is
+#: a LENGTH: a settle fragment is a character or two, a request is not.
+_SPACELESS_SCRIPT_RE = re.compile(
+    "["
+    "\\u3040-\\u309f"   # hiragana
+    "\\u30a0-\\u30ff"   # katakana
+    "\\u3400-\\u4dbf"   # CJK extension A
+    "\\u4e00-\\u9fff"   # CJK unified ideographs
+    "\\uf900-\\ufaff"   # CJK compatibility ideographs
+    "\\u0e00-\\u0e7f"   # thai
+    "]"
+)
+#: Characters, for the scripts above. Deliberately small: two ideographs is a
+#: word ("天气"), four is a request.
+_TITLE_MIN_CHARS = 4
+
+
+def clean_request_text(request: Optional[str]) -> Optional[str]:
+    """The part of ``request`` that may become a user-visible title.
+
+    Returns None when the text is prompt scaffolding rather than a request, so
+    the caller falls back to its generic label. Matched on the marker's own
+    line: a delegation prompt puts the framing FIRST, and an utterance that
+    merely quotes one of these phrases mid-sentence is still the user's.
+    """
+    if not request or not isinstance(request, str):
+        return None
+    head = request.strip()[:200].lower()
+    if any(head.startswith(m) or f"\n{m}" in head for m in _SCAFFOLD_MARKERS):
+        return None
+    return request
+
+
+def _title_is_fragment(title: str) -> bool:
+    """True when ``title`` is a settle fragment rather than a request.
+
+    Two rules, one per script family, because the question "is this a whole
+    request" is asked of text: where words are separated by spaces, count
+    words; where they are not, count characters. Applying the word rule to a
+    space-free script answers "fragment" for every sentence in it.
+    """
+    stripped = (title or "").strip()
+    if not stripped:
+        return True
+    if _SPACELESS_SCRIPT_RE.search(stripped):
+        return len(stripped) < _TITLE_MIN_CHARS
+    return len(stripped.split()) < _TITLE_MIN_WORDS
 
 
 # ── What counts as work ───────────────────────────────────────────────────
@@ -234,6 +337,93 @@ def step_label_for_tool(
     return labels["other"]
 
 
+#: The stopped card's own words, in the same two languages the step labels
+#: use and picked by the same `rtl` flag. A card that says `cancelled` has to
+#: say it in the language the request was made in, or the honest word is one
+#: the user cannot read.
+_STOPPED_STEP_EN = "Stopped"
+_STOPPED_STEP_FA = "متوقف شد"
+_STOPPED_BODY_EN = "This stopped before it had an answer. Ask me again and I'll pick it up."
+_STOPPED_BODY_FA = "پیش از رسیدن به پاسخ متوقف شد. دوباره بپرس تا ادامه بدهم."
+
+#: The delegation id's ONE bound, for every side of this file's comparison.
+#: The id is provider-supplied and unbounded (`live_voice_protocol` reads it
+#: off the provider's delegation object), and it reaches the card and the
+#: persisted row down different paths — relay body `[:64]`, `ChatRequest`
+#: max_length=64, `sessions._clean_voice` (which bounds this key to the same
+#: number for exactly this reason). All three must agree or the delivery proof
+#: fails closed and a delivered answer is announced as cancelled.
+_DELEGATION_ID_MAX = 64
+
+#: The cancelled close asks the thread whether an answer landed, and POLLS
+#: rather than guessing one interval. The relay's assistant write and this
+#: coroutine race: the row that counts is the DELEGATED one, which the relay
+#: submits after the delegation completes, through a persistence queue and an
+#: HTTP POST to the tenant — an interval nothing in either process measures. A
+#: single sleep therefore had to be either too short (a delivered answer
+#: announced as cancelled: silent, and safe-looking) or a flat cost on every
+#: real cancellation. This runs off the turn's critical path — the caller is
+#: already gone — so polling costs the call nothing, answers a row that is
+#: ALREADY there immediately, and bounds the wrong answer by a ceiling instead
+#: of by a guess.
+_CANCEL_PROOF_POLL_S = 0.5
+_CANCEL_PROOF_MAX_WAIT_S = 6.0
+
+#: How many of the newest assistant rows the delivery proof reads. The relay
+#: writes one spoken row per output epoch, so a talkative turn can leave
+#: several between the job opening and this question; the answer row this card
+#: is looking for is among the newest of them or it does not exist.
+_PROOF_ROW_SCAN = 20
+
+
+def _stop_open_steps(
+    steps: List[Dict[str, Any]], now: datetime,
+) -> List[Dict[str, Any]]:
+    """Close a cancelled card's open steps WITHOUT greening them.
+
+    A terminal row whose step list still says a step is ``running`` is a
+    stopped job that renders a live spinner forever — the Round-27 "archived
+    frozen as running" class, on the durable surface. ``finish_all_steps`` is
+    not the answer either: it marks every remaining step done, which is the
+    overclaim this whole close exists to correct.
+
+    So the step that was running gets its REAL window (it really ran, and for
+    that long) and becomes ``skipped``; steps that never started become
+    ``skipped`` with no window, because a duration nobody measured is unknown.
+    Both words are already in the clients' step vocabulary.
+    """
+    for s in steps:
+        status = s.get("status")
+        if status == "running":
+            started = s.get("started_at")
+            s["status"] = "skipped"
+            if not s.get("completed_at"):
+                s["completed_at"] = _iso_ms(now)
+                start_dt = _parse_iso_ms(started)
+                if start_dt is not None:
+                    dur = int(max(0.0, (now - start_dt).total_seconds() * 1000))
+                    s["duration_ms"] = dur
+                    s["durationMs"] = dur
+        elif status in (None, "pending"):
+            s["status"] = "skipped"
+    return steps
+
+
+def _iso_ms(dt: datetime) -> str:
+    """The same millisecond-truncated ISO stamp ``job_steps`` writes, so one
+    card's step windows are not written in two formats."""
+    return dt.replace(microsecond=(dt.microsecond // 1000) * 1000).isoformat()
+
+
+def _parse_iso_ms(raw: Any) -> Optional[datetime]:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def answer_step_label(*, rtl: bool = False) -> str:
     """The closing step every voice job carries — the round with no tools, in
     which the agent actually says the answer. Declared at open time and kept
@@ -271,12 +461,17 @@ def sweep_current_voice_job() -> None:
     awaits, for exactly the reason ``_sweep_unclosed_created_jobs`` does not:
     an ``await`` inside that ``finally`` raises ``CancelledError`` immediately
     and the cleanup is skipped by the very condition that makes it necessary.
+
+    Reaching here means ``finalize`` did not run, so THIS turn produced no
+    answer — the happy path seals inside the turn and this is then a no-op. So
+    the reason is :data:`SEAL_CANCELLED`, and the close checks the thread for a
+    delivered answer before it settles on that word.
     """
     try:
         job = current_voice_job()
         set_current_voice_job(None)
         if job is not None:
-            job.seal(interrupted=True)
+            job.seal(reason=SEAL_CANCELLED)
     except Exception:  # noqa: BLE001 — cleanup must never mask the real error
         logger.exception("[voice-job] sweep failed")
 
@@ -286,9 +481,9 @@ class VoiceTurnJob:
     returns immediately, and never raises."""
 
     __slots__ = (
-        "_active", "_answer_label", "_conversation_id", "_job_id", "_lock",
-        "_opened", "_row_exists", "_rtl", "_sealed", "_steps", "_title",
-        "_user_id",
+        "_active", "_answer_label", "_conversation_id", "_delegation_id",
+        "_job_id", "_lock", "_opened", "_opened_at", "_row_exists", "_rtl",
+        "_sealed", "_steps", "_title", "_user_id",
     )
 
     def __init__(
@@ -297,21 +492,48 @@ class VoiceTurnJob:
         user_id: str,
         conversation_id: Optional[str],
         request_text: Optional[str],
+        display_request: Optional[str] = None,
+        delegation_id: Optional[str] = None,
     ) -> None:
+        """``display_request`` is what the caller SAID, when the caller knows
+        it separately from what the model was given. On the Live path they are
+        different strings — `request_text` is a constructed prompt — and only
+        the first of them may reach a screen.
+
+        ``delegation_id`` names WHICH piece of work this card is, so the
+        cancelled close can tell this turn's answer from a different one that
+        landed in the same conversation at the same time — two concurrent
+        delegations are an ordinary Live state, not an edge case.
+        """
         from app.agent.job_titles import derive_job_title, is_rtl_text
 
         self._user_id = user_id
         self._conversation_id = conversation_id
-        self._rtl = is_rtl_text(request_text)
-        self._title = derive_job_title(
-            request_text,
-            fallback="جمع‌بندی درخواست صوتی" if self._rtl else "Voice request",
+        self._delegation_id = (
+            str(delegation_id)[:_DELEGATION_ID_MAX] if delegation_id else None
         )
+        _display = clean_request_text(display_request) or clean_request_text(request_text)
+        self._rtl = is_rtl_text(_display if _display else request_text)
+        _fallback = "جمع‌بندی درخواست صوتی" if self._rtl else "Voice request"
+        _derived = derive_job_title(_display, fallback="")
+        # A one-word title is a caption fragment. `derive_job_title` normalises
+        # a REQUEST; it has no notion of "this is only part of one", so the
+        # floor lives here, where the input is known to be a transcript. Which
+        # floor depends on the SCRIPT: a space-free one measures the fragment
+        # in characters, because there every request is one `split()` token.
+        if _title_is_fragment(_derived):
+            _derived = ""
+        self._title = _derived or derive_job_title(None, fallback=_fallback)
         self._answer_label = answer_step_label(rtl=self._rtl)
         # Minted here, not by JobRunner: the id has to exist synchronously so
         # the StepTracker can stamp `job_id` on the tool frames of the very
         # round that opens the job. The row is inserted with this id off-turn.
         self._job_id: str = str(uuid.uuid4())
+        # When this turn started, in the same naive-UTC clock the Message rows
+        # use. The cancelled close asks whether an answer landed in the thread
+        # AFTER this instant; without it the proof would match the question the
+        # turn was answering.
+        self._opened_at: datetime = datetime.utcnow()
         self._steps: List[Dict[str, Any]] = []
         self._active: int = 0
         self._opened = False
@@ -331,6 +553,10 @@ class VoiceTurnJob:
     @property
     def title(self) -> str:
         return self._title
+
+    @property
+    def delegation_id(self) -> Optional[str]:
+        return self._delegation_id
 
     def step_labels(self) -> List[str]:
         return [str(s.get("label") or "") for s in self._steps]
@@ -432,14 +658,20 @@ class VoiceTurnJob:
         final_text: str = "",
         total_tokens: Optional[int] = None,
         model: Optional[str] = None,
-        interrupted: bool = False,
+        reason: str = SEAL_COMPLETED,
     ) -> None:
-        """Terminalise the card. Idempotent; safe from a ``finally``."""
+        """Terminalise the card. Idempotent; safe from a ``finally``.
+
+        ``reason`` is one of the three SEAL_* constants. It replaced an
+        ``interrupted: bool``, which could only ever express two of the three
+        outcomes — and the pair it collapsed ("stopped after the answer" and
+        "stopped before it") are the two this round exists to tell apart.
+        """
         try:
             if not self._opened or self._sealed:
                 return
             self._sealed = True
-            self._spawn(self._close(final_text, total_tokens, model, interrupted))
+            self._spawn(self._close(final_text, total_tokens, model, reason))
         except Exception:  # noqa: BLE001
             logger.exception("[voice-job] seal failed")
 
@@ -538,7 +770,14 @@ class VoiceTurnJob:
                         # to close. Leaving it unset drops the row onto the
                         # "any later assistant message in this conversation"
                         # proof path, which voice does satisfy.
-                        config_json={"job_type": job_type, "voice_turn": True},
+                        # Durable link back to the Live delegation. A repaired
+                        # socket may land on another platform replica, so the
+                        # tenant job row is the source of truth for its card.
+                        config_json={
+                            "job_type": job_type, "voice_turn": True,
+                            **({"voice_delegation_id": self._delegation_id}
+                               if self._delegation_id else {}),
+                        },
                     ),
                     title=self._title,
                     prompt=self._title,
@@ -736,9 +975,118 @@ class VoiceTurnJob:
         except Exception:  # noqa: BLE001
             logger.debug("[voice-job] card push failed", exc_info=True)
 
+    @staticmethod
+    def _voice_of(raw: Any) -> Optional[Dict[str, Any]]:
+        """``metadata_json.voice`` of one row, or None when it has none."""
+        if isinstance(raw, dict):
+            meta: Any = raw
+        elif isinstance(raw, str) and raw:
+            try:
+                meta = json.loads(raw)
+            except (ValueError, TypeError):
+                return None
+        else:
+            return None
+        if not isinstance(meta, dict):
+            return None
+        voice = meta.get("voice")
+        return voice if isinstance(voice, dict) else None
+
+    def _row_is_proof(self, raw_metadata: Any) -> bool:
+        """Is THIS assistant row the answer to THIS turn?
+
+        A row with no ``voice`` provenance at all is the Realtime path, where
+        the only assistant writer is the turn itself — unchanged behaviour, and
+        the reason this is not simply "voice.source == 'delegated'".
+
+        A ``live_spoken`` row is NEVER proof. That is the whole defect: the
+        Live prompt tells the model to "say one short line and delegate", so a
+        filler line — and therefore a spoken row — lands in the same
+        conversation a second after the job opens, and the cancelled outcome
+        became unreachable in exactly the scenario it was written for.
+        """
+        voice = self._voice_of(raw_metadata)
+        if voice is None:
+            return True
+        if str(voice.get("source") or "") != "delegated":
+            return False
+        if voice.get("cancelled") or voice.get("superseded"):
+            return False
+        if self._delegation_id is None:
+            return True
+        # Two concurrent delegations are an ordinary Live state (D9 allows
+        # two, queues the third). The OTHER one's answer is somebody else's
+        # proof.
+        #
+        # Both sides are bounded to the SAME length before comparing. The id is
+        # provider-supplied and unbounded, and it reaches the two sides of this
+        # comparison down different paths with different bounds: the card's
+        # copy came through the relay body (`[:64]`) and `ChatRequest`
+        # (max_length=64), while the row's copy is stamped straight onto the
+        # persisted message. Compared raw, an id longer than 64 characters
+        # makes this permanently False — so every DELIVERED delegated answer
+        # would close `cancelled`, which is the A5-05 lie inverted and looks
+        # correct from outside.
+        return str(voice.get("delegation_id") or "")[:_DELEGATION_ID_MAX] == self._delegation_id
+
+    async def _answer_was_delivered(self) -> bool:
+        """Did THIS turn's answer land in this conversation after it opened?
+
+        The one proof of delivery this process can see. On voice the answer row
+        is written by the platform relay under an id this container never
+        learns, so there is nothing to look up by key — but the relay writes it
+        into the SAME conversation, stamped with the provenance
+        (``metadata_json.voice``) that says which writer produced it. That is
+        the proof path ``job_reconciler.reconcile_delivered_turn_jobs`` trusts,
+        narrowed: that watchdog only ever looks at ``running`` rows, so a card
+        closed ``cancelled`` can never be upgraded later, and the question has
+        to be asked here, once, before the row goes terminal.
+        """
+        from sqlalchemy import select as _sel
+        from app.db.database import async_session_maker
+        from app.db.models import Message as _Msg
+
+        if not self._conversation_id:
+            return False
+        try:
+            async with async_session_maker() as db:
+                rows = (await db.execute(
+                    _sel(_Msg.metadata_json).where(
+                        _Msg.conversation_id == self._conversation_id,
+                        _Msg.role == "assistant",
+                        _Msg.created_at > self._opened_at,
+                    ).order_by(_Msg.created_at.desc()).limit(_PROOF_ROW_SCAN)
+                )).all()
+                return any(self._row_is_proof(r[0]) for r in rows)
+        except Exception:  # noqa: BLE001
+            # Fail towards the honest word. A close that cannot prove delivery
+            # must not claim it.
+            logger.debug("[voice-job] delivery proof read failed", exc_info=True)
+            return False
+
+    async def _await_answer_proof(self) -> bool:
+        """`_answer_was_delivered`, polled to a ceiling.
+
+        Asks IMMEDIATELY first: an answer that landed before the cancellation
+        reached us is already in the thread, and the old single sleep paid a
+        flat 2 s to learn what the first read would have said. Then re-reads
+        until the ceiling, so the window this has to cover is bounded by a
+        number instead of assumed to be one.
+
+        Fails towards the honest word: the ceiling expiring means "no proof",
+        never "delivered".
+        """
+        deadline = time.monotonic() + _CANCEL_PROOF_MAX_WAIT_S
+        while True:
+            if await self._answer_was_delivered():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(_CANCEL_PROOF_POLL_S)
+
     async def _close(
         self, final_text: str, total_tokens: Optional[int],
-        model: Optional[str], interrupted: bool,
+        model: Optional[str], reason: str,
     ) -> None:
         """Terminalise through the SHARED closer, so the row, the step
         windows, the ``job_events`` heartbeat and the terminal push are the
@@ -746,6 +1094,21 @@ class VoiceTurnJob:
         from app.agent.job_reconciler import announce_completed, close_job_completed
         from app.db.database import async_session_maker
 
+        if reason == SEAL_CANCELLED:
+            # A cancel reaches here because `AgentRunner.run`'s finally ran
+            # without `finalize` — so THIS turn produced no answer. It does not
+            # follow that the user got nothing: the relay may already have
+            # persisted the answer of a delegation that was detached rather
+            # than killed. Ask — repeatedly, up to a ceiling — and upgrade to
+            # the honest completed word when the thread says so.
+            if await self._await_answer_proof():
+                reason = SEAL_INTERRUPTED_AFTER_ANSWER
+
+        if reason == SEAL_CANCELLED:
+            await self._close_cancelled()
+            return
+
+        interrupted = reason == SEAL_INTERRUPTED_AFTER_ANSWER
         async with self._lock:
             if not self._row_exists:
                 # The insert never landed (or is still in flight and failed):
@@ -778,13 +1141,133 @@ class VoiceTurnJob:
             self._job_id[:8], self._title[:60],
             " (turn interrupted)" if interrupted else "",
         )
-        # An interrupted voice turn still gets a COMPLETED card, not a failed
-        # one: the caller hanging up is how a voice call normally ends, and
-        # "Didn't finish" over work the agent already spoke aloud is the exact
-        # lie job_status.turn_interrupted was written to stop telling. Only
-        # the preview differs — there is no delivered answer text to show.
+        # An interrupted voice turn whose answer WAS delivered still gets a
+        # COMPLETED card, not a failed one: the caller hanging up after hearing
+        # the reply is how a voice call normally ends, and "Didn't finish" over
+        # work the agent already spoke aloud is the exact lie
+        # job_status.turn_interrupted was written to stop telling. Only the
+        # preview differs — there is no delivered answer text to show. A turn
+        # stopped BEFORE delivery never reaches here; see `_close_cancelled`.
         await announce_completed(
             closed, message_id=None,
             preview=None if interrupted else (final_text or None),
             chat_id_fallback=self._conversation_id,
         )
+
+    async def _close_cancelled(self) -> None:
+        """Terminalise a card whose work was stopped before anything was
+        delivered.
+
+        Not `close_job_completed`: that closer's whole job is to mark every
+        remaining step done, which is the claim being corrected here. The steps
+        keep the state they actually reached — the searches that ran really
+        ran, and the card stays worth opening — and the row goes `cancelled`,
+        a value both clients already treat as terminal
+        (`job_status.TERMINAL_STATUSES`).
+
+        Same guarded `status == 'running'` UPDATE every other closer uses, so
+        the sweep, the reconciler and the reaper still resolve to exactly one
+        writer and the phone card is pushed exactly once.
+        """
+        from sqlalchemy import update as _upd
+        from app.agent.job_status import STATUS_CANCELLED, turn_interrupted
+        from app.agent.job_steps import counts, dump_steps
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob, JobEvent
+
+        async with self._lock:
+            if not self._row_exists:
+                return
+            await self._write_chat_card()
+            now = datetime.utcnow()
+            steps = _stop_open_steps(self._snapshot(), now)
+            done, total = counts(steps)
+            verdict = turn_interrupted()
+            try:
+                async with async_session_maker() as db:
+                    res = await db.execute(
+                        _upd(BuildJob)
+                        .where(BuildJob.id == self._job_id,
+                               BuildJob.user_id == self._user_id,
+                               BuildJob.status == "running")
+                        .values(
+                            status=STATUS_CANCELLED,
+                            completed_at=now,
+                            # The steps as they stood. `finish_all_steps` would
+                            # paint the unreached ones done, which is the
+                            # overclaim.
+                            steps_json=dump_steps(steps),
+                            error_class=verdict.error_class,
+                            # NOT `verdict.user_message`: that sentence is
+                            # English-only, and the card detail surface renders
+                            # it beside step labels this module has already
+                            # localised. One card, one language.
+                            user_message=(_STOPPED_BODY_FA if self._rtl
+                                          else _STOPPED_BODY_EN),
+                        )
+                        .returning(BuildJob.id)
+                    )
+                    if res.first() is None:
+                        return
+                    db.add(JobEvent(
+                        job_id=self._job_id, user_id=self._user_id,
+                        kind="info", level="info",
+                        status=STATUS_CANCELLED, ts=now,
+                        label=(f"Stopped: {done}/{total} steps"
+                               if total else "Stopped")[:200],
+                    ))
+                    await db.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[voice-job] could not cancel %s", self._job_id[:8])
+                return
+        # The title is the user's own utterance; the log carries its length,
+        # never its words (ids, counts, hashes only on this surface).
+        logger.info(
+            "[voice-job] cancelled %s title_len=%d (%d/%d steps, nothing delivered)",
+            self._job_id[:8], len(self._title), done, total,
+        )
+        await self._announce_cancelled(done, total)
+
+    async def _announce_cancelled(self, done: int, total: int) -> None:
+        """The live surfaces for a stopped card.
+
+        The in-app frame is the whole announcement, and there is deliberately
+        NO push.
+
+        A Live Activity is closed only by a terminal notification, and the two
+        terminal kinds are `mission_completed` and `mission_failed`
+        (KNOWN_NOTIFY_KINDS is a closed enum validated at ingest, in
+        `db/models/notification.py`). `mission_failed` maps to the widget's
+        `failed` phase — `JOB_PHASE_BY_KIND` in subagent_orchestrator.py, and
+        the phone's own `JobFace.Phase` — which draws a red mark and the words
+        "Didn't finish" over work the user STOPPED. Announcing a failure for a
+        cancellation is the same class of lie as announcing a completion for
+        one, and neither the kind enum nor the widget's phase vocabulary can be
+        extended from this module's files.
+        [No `phase` override either: an unknown phase string makes the widget
+        fall through to its legacy derivation, which reads a non-empty step
+        line as work IN PROGRESS — a terminal card drawn as running.]
+        So: the `job_update` frame above carries the cancellation to every open
+        client, the row carries it to Mission Control and to a card opened
+        later, and the lock-screen card is left to the conversation's NEXT turn
+        (the Live Activity is keyed `chatjob:<chat_id>`, so the next
+        `mission_started` refreshes it in place) or to its own 30-minute stale
+        date.
+        """
+        try:
+            from app.api.ws_chat import broadcast_to_user
+            await broadcast_to_user(self._user_id, {
+                "type": "job_update",
+                "job_id": self._job_id,
+                "job_type": self._job_type(),
+                "name": self._title,
+                "status": "cancelled",
+                "step": _STOPPED_STEP_FA if self._rtl else _STOPPED_STEP_EN,
+                "total_steps": total,
+                "completed_steps": done,
+                "chat_id": self._conversation_id,
+                "message_id": None,
+            })
+        except Exception:  # noqa: BLE001
+            logger.debug("[voice-job] cancel broadcast failed", exc_info=True)

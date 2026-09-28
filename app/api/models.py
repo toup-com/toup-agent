@@ -51,6 +51,7 @@ _LABEL_MAP: dict[str, str] = {
     "claude-3-5-haiku-20241022": "Claude 3.5 Haiku",
     "claude-haiku-4-5-20251001": "Claude Haiku 4.5",
     "gpt-5.5": "GPT-5.5",
+    "gpt-6-sol": "GPT-6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-luna": "GPT-5.6 Luna",

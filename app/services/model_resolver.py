@@ -44,17 +44,17 @@ logger = logging.getLogger(__name__)
 # `_CANONICAL_ANTHROPIC_MODEL` stays Claude — it's the explicit-Claude
 # fallback, only reached when a user/operator deliberately picks Anthropic.
 #
-# 2026-08-07: moved gpt-5.5 → gpt-5.6-terra. G1 passed on measured OpenAI
-# organization billing (docs/audits/2026-08-g1-cost-and-latency.md §8):
-# terra is 50-55% cheaper per token on every token class, p50 -17.5%,
-# p95 -54.1%, and marginally more reliable (2.1% vs 2.6% error rate).
+# 2026-09: GPT-6 Sol supersedes the August 2026 Terra default for normal
+# chat. Its published input/cache-write rates match Terra and its output
+# rate is lower. Both models require a task-level quality gate before a
+# production rollout; see the migration evaluation.
 # `_CANONICAL_FALLBACK_MODEL` deliberately stays gpt-4o: it is the
 # cross-provider fallback and keeps its long-proven chat wire (see
 # `wire_api_for` below).
-_CANONICAL_AGENT_MODEL = "gpt-5.6-terra"
+_CANONICAL_AGENT_MODEL = "gpt-6-sol"
 _CANONICAL_FALLBACK_MODEL = "gpt-4o"
 _CANONICAL_ANTHROPIC_MODEL = "claude-opus-4-7"
-_CANONICAL_OPENAI_MODEL = "gpt-5.6-terra"
+_CANONICAL_OPENAI_MODEL = "gpt-6-sol"
 
 
 # ── G1 chat-model guard (no-cached-rate tier) ─────────────────────────
@@ -105,7 +105,34 @@ def has_cached_input_rate(model: str | None) -> bool:
 # agent_config column. The setting still governs every other family, so an
 # operator can still move gpt-4o/gpt-5.5 onto the Responses wire
 # deliberately.
-_RESPONSES_ONLY_PREFIXES = ("gpt-5.6",)
+_RESPONSES_ONLY_PREFIXES = ("gpt-5.6", "gpt-6")
+
+# OpenAI bills the whole request at long-context rates once input exceeds
+# 272K tokens (not just the tokens above the threshold). This applies to
+# GPT-5.6 and GPT-6 Sol, including cached reads and cache writes.
+LONG_CONTEXT_THRESHOLD = 272_000
+_LONG_CONTEXT_PREFIXES = ("gpt-5.6", "gpt-6-sol")
+
+
+def long_context_price_multipliers(model: str | None, input_tokens: int) -> tuple[float, float]:
+    """Return (input/cache, output) price multipliers for this request."""
+    m = (model or "").lower().strip()
+    if m.startswith(_LONG_CONTEXT_PREFIXES) and input_tokens > LONG_CONTEXT_THRESHOLD:
+        return 2.0, 1.5
+    return 1.0, 1.0
+
+
+def prompt_cache_retention_params(model: str | None, retention: str | None) -> dict:
+    """Select the model family's cache-lifetime request parameter.
+
+    GPT-6 uses prompt_cache_options.ttl=30m; the older 24h parameter is
+    unsupported there. Leave existing models' retention behavior intact.
+    """
+    if not retention:
+        return {}
+    if (model or "").lower().strip().startswith("gpt-6"):
+        return {"prompt_cache_options": {"ttl": "30m"}}
+    return {"prompt_cache_retention": retention}
 
 
 def requires_responses_wire(model: str | None) -> bool:
@@ -312,8 +339,7 @@ def is_openai_model(model: str | None) -> bool:
 
 
 def supports_custom_temperature(model: str | None) -> bool:
-    """False for OpenAI reasoning models + gpt-5.x family (incl. the
-    gpt-5.6-* tiers) — they only accept
+    """False for OpenAI reasoning models + GPT-5/GPT-6 families — they only accept
     temperature=1 (the default) and reject any explicit value with HTTP 400.
     Callers should omit the `temperature` kwarg from the API request entirely
     when this returns False.
@@ -323,14 +349,13 @@ def supports_custom_temperature(model: str | None) -> bool:
     m = model.lower()
     if m.startswith(("o1", "o3", "o4")):
         return False
-    if m.startswith("gpt-5"):
+    if m.startswith(("gpt-5", "gpt-6")):
         return False
     return True
 
 
 def uses_max_completion_tokens(model: str | None) -> bool:
-    """True for OpenAI reasoning models + gpt-5.x family (incl. the
-    gpt-5.6-* tiers) — they reject the
+    """True for OpenAI reasoning models + GPT-5/GPT-6 families — they reject the
     classic `max_tokens` parameter with HTTP 400 ("Unsupported parameter:
     'max_tokens' is not supported with this model. Use 'max_completion_tokens'
     instead.") and require `max_completion_tokens` instead.
@@ -344,14 +369,14 @@ def uses_max_completion_tokens(model: str | None) -> bool:
     m = model.lower()
     if m.startswith(("o1", "o3", "o4")):
         return True
-    if m.startswith("gpt-5"):
+    if m.startswith(("gpt-5", "gpt-6")):
         return True
     return False
 
 
 def is_reasoning_model(model: str | None) -> bool:
     """True for OpenAI models that do internal chain-of-thought reasoning
-    (o-series + gpt-5 family, incl. the gpt-5.6-* tiers).
+    (o-series and GPT-5/GPT-6 families).
 
     These models silently spend output-token budget on hidden reasoning
     tokens BEFORE emitting any visible text. Burned the routine path: a
@@ -364,7 +389,7 @@ def is_reasoning_model(model: str | None) -> bool:
     if not model:
         return False
     m = model.lower()
-    return m.startswith(("o1", "o3", "o4", "gpt-5"))
+    return m.startswith(("o1", "o3", "o4", "gpt-5", "gpt-6"))
 
 
 # ── OAuth token detection ─────────────────────────────────────────────

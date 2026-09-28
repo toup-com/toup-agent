@@ -22,6 +22,7 @@ branch, which is why every failure path here returns a string starting with
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,9 @@ from app.agent.skills.builtins.app_html.store import AppStoreError
 logger = logging.getLogger(__name__)
 
 DESIGN_SKILL_FILENAME = "toup-frontend-design.md"
+_FULL_DESIGN_SHA256 = "275216c1b822a18d9c3ca363a9361afcec69c0ab28681eb39acc059c6eddcdd3"
+_COMPACT_SECTION_8 = "{{FULL_SECTION_8}}"
+_COMPACT_SECTION_11 = "{{FULL_SECTION_11}}"
 
 #: How many times the publish gate may refuse an app over POLISH findings
 #: (layout, audio, the visual review) before it publishes with the remaining
@@ -134,6 +138,36 @@ def _design_guidance() -> str:
         "looks\nlike every other generated page.",
     )
     return body.strip()
+
+
+def _compact_design_guidance(full_guidance: str) -> str:
+    """Static owner pilot. Fail back to the full document on source drift.
+
+    The compact copy shortens only sections 1–7 and 9–10. Sections 8 and 11
+    drive the app publish gate, so splice their exact current bytes into the
+    compact template. Both files are image-local and read only at skill init;
+    the choice therefore leaves one stable prompt prefix for each pilot state.
+    """
+    original = _packaged_design_skill()
+    if hashlib.sha256(original.encode("utf-8")).hexdigest() != _FULL_DESIGN_SHA256:
+        return full_guidance
+    headings = ("## 8. ", "## 9. ", "## 11. ")
+    if any(full_guidance.count(heading) != 1 for heading in headings):
+        return full_guidance
+    i8, i9, i11 = (full_guidance.index(heading) for heading in headings)
+    if not i8 < i9 < i11:
+        return full_guidance
+    path = os.path.join(os.path.dirname(__file__), "DESIGN_SKILL_COMPACT.md")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            template = fh.read()
+    except OSError:
+        return full_guidance
+    if template.count(_COMPACT_SECTION_8) != 1 or template.count(_COMPACT_SECTION_11) != 1:
+        return full_guidance
+    compact = (template.replace(_COMPACT_SECTION_8, full_guidance[i8:i9])
+               .replace(_COMPACT_SECTION_11, full_guidance[i11:]).strip())
+    return compact if compact else full_guidance
 
 
 #: How many in-flight tool calls may be tracked at once (round 25). A turn
@@ -305,6 +339,9 @@ class AppHtmlSkill(Skill):
         # are therefore fixed for the life of the process, which is the cache
         # invariant `get_system_prompt_section` has to hold.
         self._design_guidance: str = _design_guidance()
+        self._compact_design_guidance: str = _compact_design_guidance(
+            self._design_guidance
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -679,6 +716,17 @@ class AppHtmlSkill(Skill):
             "\n"
             f"{self._design_guidance}"
         )
+
+    def get_compact_system_prompt_section(self) -> Optional[str]:
+        """Return the same operational head with only static design prose cut."""
+        full = self.get_system_prompt_section()
+        if (
+            not full
+            or self._compact_design_guidance == self._design_guidance
+            or full.count(self._design_guidance) != 1
+        ):
+            return full
+        return full.replace(self._design_guidance, self._compact_design_guidance, 1)
 
     # ------------------------------------------------------------------
     # Dispatch

@@ -3,7 +3,7 @@ Model Router — simple key-based model selection.
 
 No classifier, no tiers. Just picks the best model based on available keys:
   - Anthropic key available: agent default (resolved through model_resolver)
-  - OpenAI key only:         cross-provider fallback (also resolved)
+  - OpenAI key only:         OpenAI default (also resolved)
   - No keys:                 agent default (will fail, but sane default)
 
 All literal model strings live in `app.services.model_resolver`. To
@@ -20,10 +20,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from app.config import settings
 from app.services.model_resolver import (
     default_model,
-    default_fallback_model,
     is_claude_model,
 )
 
@@ -60,7 +58,7 @@ def classify_request(
          providers are reachable via the proxy regardless of local keys;
          the model id is resolved through `model_resolver`.
       2. BYOK Anthropic key → agent default model (model_resolver)
-      3. BYOK OpenAI key    → cross-provider fallback (model_resolver)
+      3. BYOK OpenAI key    → OpenAI default (model_resolver)
       4. No keys + no bundle → agent default (will fail, but sane default)
 
     Bundle subscribers always have BOTH providers available through the
@@ -124,7 +122,7 @@ def classify_request(
         model = default_model()
         reason = f"anthropic key available → {model}"
     elif keys.has_openai:
-        model = default_fallback_model()
+        model = _openai_model()
         reason = f"openai key only → {model}"
     else:
         model = default_model()

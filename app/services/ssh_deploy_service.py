@@ -1360,6 +1360,7 @@ def generate_env_content(
     db_mode: str = "auto",
     supabase_url: str = "",
     automations_enabled: bool = False,
+    desktop_relay_enabled: bool = False,
 ) -> str:
     """Generate .env file content for the agent service."""
     lines = [
@@ -1480,6 +1481,8 @@ def generate_env_content(
     # Feature flags the platform resolves per-tenant. Emitted only when ON
     # so a dark tenant's env stays byte-identical to what it was before the
     # flag existed (absent key = the agent-side default, False).
+    if desktop_relay_enabled:
+        lines.extend(["", "# --- Mac Connections ---", "DESKTOP_RELAY_ENABLED=true"])
     if automations_enabled:
         lines.extend(["", "# --- Features ---", "AUTOMATIONS_ENABLED=true"])
 

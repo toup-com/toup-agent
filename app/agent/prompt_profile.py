@@ -202,6 +202,40 @@ def allows_post_builder_blocks(profile: PromptProfile) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Toup for Mac — the tools that act on the user's OWN computer
+#
+# `agent-tool-relay.md` §2.5 item 9 names this file as a site the
+# `desktop__*` family touches: "sub-agent and voice turns must not drive
+# the Mac." Two sets, because the two halves fail differently.
+#
+# The names are a LITERAL here rather than an import from the skill. That
+# module is loaded by the skill loader at boot and is gated on
+# `settings.desktop_relay_enabled`; importing it from a module on the
+# prompt path would evaluate it unconditionally and make a withheld
+# capability's absence depend on an import side effect. The literal is
+# kept honest by `tests/test_desktop_unattended_turns.py`, which asserts
+# it equals the skill's own `ALL_TOOLS` / `CONSENT_TOOLS`.
+#
+# Withholding a name that is not in the array is a no-op, so with the flag
+# off (the shipped default) every line below changes nothing.
+DESKTOP_LOCAL_TOOLS: frozenset[str] = frozenset({
+    "desktop__fs_list", "desktop__fs_read", "desktop__fs_search",
+    "desktop__fs_write", "desktop__fs_mkdir", "desktop__fs_move",
+    "desktop__fs_trash", "desktop__exec_run", "desktop__screen_capture",
+    "desktop__ui_snapshot", "desktop__ui_click", "desktop__ui_type",
+    "desktop__ui_key",
+})
+
+#: The half that changes something, runs something or drives the machine.
+#: Each one stages a confirmation card before it reaches the Mac.
+DESKTOP_MUTATING_TOOLS: frozenset[str] = frozenset({
+    "desktop__fs_write", "desktop__fs_mkdir", "desktop__fs_move",
+    "desktop__fs_trash", "desktop__exec_run", "desktop__ui_click",
+    "desktop__ui_type", "desktop__ui_key",
+})
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Tool-disable defaults for SUBAGENT profile
 #
 # Memory-write tools, spawn (no recursive grandchildren), and the
@@ -254,7 +288,20 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "extension_search",
     "extension_read",
     "extension_research",
-})
+}) | DESKTOP_LOCAL_TOOLS
+# ^ Toup for Mac, the WHOLE family, reads included.
+#
+# A sub-agent is the turn furthest from the user: it runs unattended, and
+# its input is routinely text the agent did not author — a fetched page, a
+# file, an email — which is the `_EXTERNAL_CONTENT_TOOLS` threat arriving
+# with a tool that can read `~/.ssh`. The reads are withheld along with
+# the writes for that reason and not the extension's (latency): a refusal
+# the user never sees is not a refusal, and the mutating half's
+# confirmation card would be drawn against a turn nobody is watching.
+#
+# This is the conservative default, not a permanent product decision. If
+# sub-agent research on local files is wanted later, it wants its own
+# consent surface first.
 
 
 # Unsupervised-action policy for autonomous mission ticks
@@ -288,7 +335,13 @@ AUTOPILOT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "save_streaming_credential",
     # No mission-from-mission recursion (Autopilot PR8).
     "start_mission",
-})
+}) | DESKTOP_LOCAL_TOOLS
+# ^ Toup for Mac: a mission tick runs while the user is away, by
+# definition. The mutating half would stage a card onto a surface nobody
+# is looking at, and the read half would take a machine's contents into a
+# turn with no one to notice — the same "unsupervised outward mutation"
+# line this set already draws, applied to the one executor that is the
+# user's own laptop.
 
 
 def disabled_tools_for(profile: PromptProfile) -> frozenset[str]:
@@ -344,6 +397,29 @@ VOICE_DISABLED_TOOLS: frozenset[str] = frozenset({
     "update_job",
     "spawn",
 })
+# Toup for Mac is DELIBERATELY ABSENT from this set, and the reasoning is
+# recorded because `agent-tool-relay.md` §2.5 item 9 asks for the opposite
+# ("sub-agent and voice turns must not drive the Mac") and a reader will
+# look for it here.
+#
+# Voice is ATTENDED — the user is speaking to the agent — so the safety
+# argument that withholds the family from SUBAGENT/AUTOPILOT/trigger does
+# not apply. What remains is a UX objection: `voice` is not in
+# `connector_dispatcher._CONFIRMABLE_CHANNELS`, so a spoken
+# `desktop__exec_run` ends the turn saying "a confirmation card is on your
+# screen" about a screen the speaker may not be looking at.
+#
+# That is not a reason to put it HERE. This set is half of the
+# channel-converge mechanism (`agent_runner.tool_defs_ignoring`): its
+# members stay in the wire array for cache identity and are banned through
+# `allowed_tools` plus the executor's disabled set. Its two tests
+# (`test_channel_converge_voice_array.py`,
+# `test_voice_answers_inline.py::test_voice_loses_the_three_deferral_tools`)
+# pin the membership exactly, and every member is a CORE def that is always
+# in the array — which a flag-gated skill tool is not. Fixing the voice UX
+# belongs in the skill, where the card's surface is known, not in a
+# cache-lineage set.
+
 
 
 # G-19b: an email trigger's runner turn is UNATTENDED background work.
@@ -362,7 +438,11 @@ TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
     "spawn",
     "start_mission",
     "save_streaming_credential",
-})
+}) | DESKTOP_LOCAL_TOOLS
+# ^ Toup for Mac: "unlike voice there is no user in the loop to notice"
+# is the whole argument, and it applies hardest to a tool whose executor
+# is the user's own laptop. An inbound email must not be able to ask for
+# a file off it.
 
 
 # Round 33, item 8: an automation THREAD turn is the user asking a
@@ -461,10 +541,17 @@ def disabled_tools_for_channel(channel: str | None) -> frozenset[str]:
     voice sub-agent loses the union of both — which is already what both
     sets independently want.
     """
-    if (channel or "").strip().lower() == "voice":
-        return VOICE_DISABLED_TOOLS
-    if (channel or "").strip().lower() == "trigger":
-        return TRIGGER_DISABLED_TOOLS
-    if (channel or "").strip().lower() == "automation_thread":
-        return AUTOMATION_THREAD_DISABLED_TOOLS
-    return frozenset()
+    normalized = (channel or "").strip().lower()
+    # Only these attended surfaces can request access to the user's Mac.
+    # New/background channel names stay dark until deliberately reviewed.
+    desktop_denied = (
+        frozenset() if normalized in {"web", "app", "mobile", "desktop", "voice"}
+        else DESKTOP_LOCAL_TOOLS
+    )
+    if normalized == "voice":
+        return VOICE_DISABLED_TOOLS | desktop_denied
+    if normalized == "trigger":
+        return TRIGGER_DISABLED_TOOLS | desktop_denied
+    if normalized == "automation_thread":
+        return AUTOMATION_THREAD_DISABLED_TOOLS | desktop_denied
+    return desktop_denied

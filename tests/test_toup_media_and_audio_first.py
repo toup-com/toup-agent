@@ -927,7 +927,10 @@ async def test_fast_path_pre_extracts_the_track_it_just_broadcast(monkeypatch):
     )
 
     queue: asyncio.Queue = asyncio.Queue()
-    result = await ws_chat._fast_media_check("Play me something", "user-1", queue)
+    # PIN CHANGED (R2 addendum 6 R6-17): 'something' is in the closed indefinite
+    # class and now declines to the agent; this pin is about pre-extract warming,
+    # so it uses a clean request with no class word.
+    result = await ws_chat._fast_media_check("Play me some jazz", "user-1", queue)
     assert result is not None
 
     assert warmed, "the fast path must warm the track it broadcast"

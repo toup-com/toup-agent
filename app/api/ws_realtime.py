@@ -165,6 +165,29 @@ def _chat_turn_note(state: str, count, kinds, text) -> str:
         )
     return ""
 
+
+def _now_playing_note(title: str, state: str = "") -> Optional[str]:
+    """The bracketed system note one `now_playing` frame becomes. PURE.
+
+    `state: "stopped"` (v0.3 §H) is the phone reporting the caller stopped the
+    music — the X, a remote stop, a voice stop — with an EMPTY title, which is
+    why a shipped relay ignores it. The title is client-supplied and lands
+    inside the directive, so the characters that could close the note are
+    removed, as for `chat_turn`.
+    """
+    if str(state or "").strip().lower() == "stopped":
+        return (
+            "[System note, do not reply: the user stopped the music; nothing is "
+            "playing. Do not bring the music up unless they ask.]"
+        )
+    _title = _CHAT_TURN_UNSAFE_RE.sub(" ", str(title or "")).strip()[:200]
+    if not _title:
+        return None
+    return (
+        f"[System note, do not reply: the music moved on. Now playing: {_title}. "
+        f"If asked what is playing, say this.]"
+    )
+
 # ── Module refs (set from agent_main.py lifespan) ─────────────────────
 _tool_executor = None
 _agent_runner = None
@@ -220,8 +243,21 @@ _REALTIME_NATIVE = {"think", "navigate_to", "play_media"}
 # an unrunnable tool array, and which no test could reach while these were
 # literals buried in a closure.
 _CTX_INSTRUCTIONS_TIMEOUT_S = 40.0
+# GPT-Live has immutable first-session instructions. Wait briefly for the
+# tenant's real day/session scope; otherwise send a visible error and close.
+# A fabricated local session id or a generic greeting would lose the user's
+# current work and make delegated results impossible to reconcile.
+_LIVE_STARTUP_CONTEXT_BUDGET_S = 6.0
+# From socket acceptance through Live's first `ready`, including the provider
+# handshake. A status beacon is progress, not permission to wait indefinitely.
+_LIVE_STARTUP_READY_BUDGET_S = 12.0
+_VOICE_AUTH_BUDGET_S = 10.0
 _CTX_TOOLS_TIMEOUT_S = 10.0
 _CTX_LANG_TIMEOUT_S = 10.0
+
+
+class _LiveStartupUnavailable(RuntimeError):
+    """Live cannot start truthfully without a durable day session and context."""
 
 
 def _executable_tools(tools: Optional[list] = None) -> list:
@@ -353,10 +389,24 @@ def _base_voice_instructions() -> str:
         "- Respond naturally and conversationally; keep replies to 1-3 sentences "
         "unless the user asks for detail.\n"
         "- No markdown, lists, or formatting — spoken prose only.\n"
-        "- REPLY LANGUAGE: answer in the language the user JUST SPOKE, turn by "
-        "turn, even for a two-word turn. Farsi in, Farsi out — every time. This "
-        "prompt being in English is never a reason to reply in English. The "
-        "user may mix English product names (Grok, ChatGPT, Claude, Gemini…) "
+        # §G: the explicit-request clause comes FIRST, worded as the relay's
+        # `LIVE_REPLY_LANGUAGE_RULE` and the tenant's `voice_context` rule. A
+        # bare "Farsi in, Farsi out — every time" is a rule a caller's own
+        # "speak English with me" could never win against (V3) — and on Live
+        # this stub is served right beside the relay's rule, so the two must
+        # agree (`adapt_instructions_for_live` appends that rule after it).
+        "- REPLY LANGUAGE: if the user has explicitly asked you during this "
+        "call to speak a particular language, that request stands for the rest "
+        "of the call: reply only in that language "
+        "— short confirmations and the results of earlier tasks included — "
+        "until they ask for a different one or to be answered in whatever "
+        "language they speak, even when they speak another "
+        "language. An explicit request outranks the turn-by-turn rule. "
+        "Otherwise answer in the language the user JUST SPOKE, turn by turn, "
+        "even for a two-word turn — Farsi in, Farsi out, and the same for every "
+        "other language. "
+        "This prompt being in English is never a reason to reply in English. "
+        "The user may mix English product names (Grok, ChatGPT, Claude, Gemini…) "
         "into another language mid-sentence — hear those as English names "
         "without switching languages, and if a name came through garbled, ask "
         "one short question instead of acting on a guess.\n"
@@ -998,15 +1048,27 @@ async def build_realtime_instructions(
         "- Do NOT use markdown, code blocks, bullet points, or any text formatting.\n"
         "- Do NOT say 'here is a list' or read structured data verbatim.\n"
         "- Use natural speech patterns: contractions, casual phrasing.\n"
-        "- REPLY LANGUAGE — the rule that outranks everything else here: answer "
-        "in the language the user JUST SPOKE, turn by turn, even for a two-word "
-        "turn. Farsi in, Farsi out — every time. These instructions, your "
+        # §G, same precedence and wording as `voice_context._REPLY_LANGUAGE_RULE`
+        # (the renderer that replaces this block): an explicit request outranks
+        # turn-by-turn mirroring until the caller changes it. "The rule that
+        # outranks everything else … every time" left an explicit "speak
+        # English with me" nothing to win with (V3).
+        "- REPLY LANGUAGE: if the user has explicitly asked you during this "
+        "call to speak a particular language, that request stands for the rest "
+        "of the call: reply only in that language "
+        "— short confirmations and the results of earlier tasks included — "
+        "until they ask for a different one or to be answered in whatever "
+        "language they speak, even when they speak another "
+        "language. An explicit request outranks the turn-by-turn rule. "
+        "Otherwise answer in the language the user JUST SPOKE, turn by turn, "
+        "even for a two-word turn — Farsi in, Farsi out, and the same for every "
+        "other language. These instructions, your "
         "memories, and the context above being written in English is NEVER a "
         "reason to reply in English; English brand names inside a foreign "
         "sentence do not make it an English sentence.\n"
         "- Speak EVERY language with a natural, NATIVE "
         "accent and native pronunciation — never a foreign or English-accented one.\n"
-        "- When the user speaks Persian/Farsi, reply in fluent, natural Farsi with a "
+        "- When you reply in Persian/Farsi, speak fluent, natural Farsi with a "
         "native Tehrani accent, pronouncing every Persian sound correctly (خ، غ، ق، ژ, "
         "and the tapped ر) exactly as a native speaker from Tehran would — NOT with an "
         "English accent. In Persian: «فارسی را کاملاً روان و طبیعی صحبت کن، با لهجهٔ "
@@ -1315,15 +1377,62 @@ async def _get_vps_info(user_id: str) -> Optional[tuple]:
     return None
 
 
+#: Set by a caller that RETRIES a voice-row write (the Live `PersistenceQueue`).
+#: While set, `_save_voice_messages` appends one (transient|permanent, cause)
+#: per row that did not land and leaves the loss verdict to that caller — it
+#: must not log `LOST` or count `voice_transcript_lost` for an attempt the
+#: caller is about to retry. Unset (every other caller), nothing changes.
+_VOICE_SAVE_OUTCOMES: contextvars.ContextVar = contextvars.ContextVar(
+    "voice_save_outcomes", default=None,
+)
+
+# 408/425/429 say "not now", not "never": retrying the same upsert later is
+# what the status asks for.
+_TRANSIENT_HTTP = frozenset({408, 425, 429})
+
+
+def _vps_failure_class(exc: Optional[BaseException] = None, status: Optional[int] = None) -> str:
+    """"transient" or "permanent" for one failed tenant call.
+
+    Transient: a timeout or transport error (the tenant was slow, restarting,
+    or unreachable — production's empty `failed: ` line was an httpx
+    ReadTimeout), a 5xx, 408/425/429, or a 2xx whose body could not be read
+    (the upsert may well have committed; repeating it is harmless). Permanent:
+    any other status (a 400 "Content is required" is a 400 on every retry) and
+    an exception that is a programming error rather than a network event.
+    """
+
+    if exc is not None:
+        import httpx
+
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError,
+                            asyncio.TimeoutError, OSError)):
+            return "transient"
+        if isinstance(exc, (TypeError, ValueError, KeyError, AttributeError)):
+            return "permanent"
+        return "transient"
+    if status is None:
+        return "transient"
+    if status >= 500 or status in _TRANSIENT_HTTP or 200 <= status < 300:
+        return "transient"
+    return "permanent"
+
+
 async def _vps_api(
     agent_url: str, agent_api_key: str, method: str, path: str,
     params: dict = None, json_body: dict = None, timeout: float = 15.0,
+    outcome: Optional[dict] = None,
 ):
     """Make an authenticated API call to the user's VPS agent.
 
     Uses X-Agent-Key header — VPS auth.py resolves to settings.user_id.
     `timeout` defaults to 15 s (fine for the short identity/memory reads); a
     full agent turn via /api/chat (think parity path) passes a larger value.
+
+    `outcome`, when given, receives why a call returned None: `status` for an
+    answer that was not a usable 2xx, `error` (the exception CLASS) for one that
+    raised, and `failure` (transient|permanent). Additive: every existing caller
+    passes nothing and sees nothing change.
     """
     url = f"{agent_url}{path}"
     # TKT-LAT-007 (wave 3): shared agent_http client.
@@ -1357,10 +1466,20 @@ async def _vps_api(
                     "[REALTIME] VPS API %s %s → %s, non-JSON body",
                     method, path, resp.status_code,
                 )
+                if outcome is not None:
+                    outcome.update(status=resp.status_code, error="non_json",
+                                   failure=_vps_failure_class(status=resp.status_code))
                 return None
         logger.warning("[REALTIME] VPS API %s %s → %s", method, path, resp.status_code)
+        if outcome is not None:
+            outcome.update(status=resp.status_code,
+                           failure=_vps_failure_class(status=resp.status_code))
     except Exception as e:
-        logger.warning("[REALTIME] VPS API %s %s failed: %s", method, path, e)
+        # The CLASS, always: `str()` of an httpx ReadTimeout/PoolTimeout is
+        # empty, which is how production logged `failed: ` with no cause.
+        logger.warning("[REALTIME] VPS API %s %s failed: %s: %s", method, path, type(e).__name__, e)
+        if outcome is not None:
+            outcome.update(error=type(e).__name__, failure=_vps_failure_class(exc=e))
     return None
 
 
@@ -1493,6 +1612,17 @@ def _shrink_frame(frame: dict, limit: int) -> None:
             src["url"] = str(src.get("url", ""))[:120]
 
 
+_TOOL_OUTCOMES = frozenset({"ok", "error", "cancelled", "not_run", "needs_auth"})
+
+
+def _outcome_of(ev: dict) -> str:
+    """The agent's own outcome when it names one, else derived from `ok`."""
+    named = str(ev.get("outcome") or "").strip().lower()
+    if named in _TOOL_OUTCOMES:
+        return named
+    return "ok" if bool(ev.get("ok", True)) else "error"
+
+
 class _InnerToolRelay:
     """Maps agent-side SSE frames onto the ALREADY-SHIPPED phone wire.
 
@@ -1500,15 +1630,46 @@ class _InnerToolRelay:
     agent talking to an older platform can never flood the audio WS.
     """
 
-    def __init__(self, websocket, outer_call_id: str, sink: Optional[list] = None):
+    def __init__(self, websocket, outer_call_id: str, sink: Optional[list] = None,
+                 on_progress=None, frame_context: Optional[dict] = None,
+                 frame_clock=None, sanitize_text=None, state_sender=None,
+                 frame_sender=None):
         self._ws = websocket
+        # Live has several independent frame producers. Route its tool frames
+        # through the session's one socket writer; Realtime keeps its existing
+        # direct sender when no callback is supplied.
+        self._frame_sender = frame_sender
         self._outer = outer_call_id
+        # ── The other direction: what to tell the PROVIDER while work runs ──
+        # On GPT-Live the model is the one holding the conversation, and until
+        # this hook existed it learned nothing between dispatch and the final
+        # answer — so "what are you searching?" during a 25 s research turn
+        # could only be answered by inventing something or by delegating again
+        # (which, before round 48, destroyed the first delegation). Awaited
+        # with (phase, name, detail); the owner decides rate and wording, and
+        # a raising callback must never break the tool row it rode in on.
+        self._on_progress = on_progress
+        self._frame_context = {
+            str(k): v for k, v in (frame_context or {}).items()
+            if k in {"task_id", "parent_user_turn_id"} and v not in (None, "")
+        }
+        self._frame_clock = frame_clock
+        self._sanitize_text = sanitize_text
+        self._state_sender = state_sender
+        # Lifecycle-aware callers expose only actual tool.start/tool.end facts.
+        # Timing is orthogonal: a timing-only client keeps the historical
+        # provisional intent row, now with a timestamp.  Conflating the clock
+        # with lifecycle negotiation silently removed that row.
+        self._actual_only = bool(self._frame_context)
         self._open: dict = {}        # inner call_id → row call_id
         # A row opened from `tool.intent`, waiting for the `tool.start` that
         # names its arguments: (tool_name, row call_id). At most one.
         self._pending: Optional[tuple] = None
         self._rows = 0
         self.alive = True
+        # Monotonic instant of the turn's first `tool.intent`/`tool.start`:
+        # the relay's "time to first tool" in the delegation-finished line.
+        self.first_tool_monotonic: Optional[float] = None
         # ── What the turn DID, for the chat thread it writes into ──────────
         # The phone renders these frames live and then throws them away, so a
         # voice run that read nineteen pages landed in the day chat as a bare
@@ -1522,6 +1683,17 @@ class _InnerToolRelay:
         # opened, and ordered by insertion so the thread reads in call order.
         self._sink = sink
         self._rec: dict = {}
+
+    def _public_text(self, value: object) -> str:
+        """Bounded tool copy after the caller-specific visibility filter."""
+
+        text = str(value or "")
+        if self._sanitize_text is None:
+            return text
+        try:
+            return str(self._sanitize_text(text) or "")
+        except Exception:  # noqa: BLE001 - a display filter fails closed
+            return ""
 
     def _open_rec(self, cid: str, name: str, ev: Optional[dict] = None) -> None:
         if self._sink is None or cid in self._rec:
@@ -1581,20 +1753,56 @@ class _InnerToolRelay:
         # Namespaced so inner ids can never collide with OpenAI's outer ids.
         return f"{self._outer}:{inner}"[:128]
 
+    async def _progress(self, phase: str, name: str, detail: str, call_id: str) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            await self._on_progress(phase, name, detail, call_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("[REALTIME] tool progress hook failed phase=%s", phase)
+
     async def _send(self, frame: dict) -> bool:
         if not self.alive:
             return False
         try:
+            if str(frame.get("type") or "").startswith("tool_call."):
+                frame.update(self._frame_context)
+                if self._frame_clock is not None:
+                    stamp = max(0, int(self._frame_clock()))
+                    if frame.get("type") == "tool_call.started":
+                        frame["started_ms"] = stamp
+                    elif frame.get("type") == "tool_call.completed":
+                        frame["completed_ms"] = stamp
+                    frame["clock"] = "provider"
             if len(json.dumps(frame)) > _INNER_FRAME_BYTES:
                 _shrink_frame(frame, _INNER_FRAME_BYTES)
+            if self._frame_sender is not None:
+                sent = bool(await self._frame_sender(frame))
+                if not sent:
+                    self.alive = False
+                return sent
             await self._ws.send_json(frame)
             return True
         except Exception:
             self.alive = False       # phone gone — stop emitting, keep draining
             return False
 
+    async def _send_state(self, state: str) -> bool:
+        """Use the owning Live session's sequencer when one is available."""
+
+        if self._state_sender is None:
+            return await self._send({"type": "state", "state": state})
+        try:
+            result = await self._state_sender(state)
+            return True if result is None else bool(result)
+        except Exception:  # noqa: BLE001
+            self.alive = False
+            return False
+
     async def on_event(self, ev: dict) -> bool:
         t = ev.get("type")
+        if t in ("tool.intent", "tool.start") and self.first_tool_monotonic is None:
+            self.first_tool_monotonic = time.monotonic()
         if t == "tool.intent":
             # `tool.intent` fires at the model's tool_use_start — BEFORE the
             # arguments have finished streaming, so it carries a name but no
@@ -1613,10 +1821,14 @@ class _InnerToolRelay:
                 # blocks before either one's arguments land would otherwise have
                 # its second step adopt the first's row. Falling back to the
                 # coarse flag costs the head start, never correctness.
-                return await self._send({"type": "state", "state": "tool_use"})
+                if self._actual_only:
+                    return True
+                return await self._send_state("tool_use")
             cid = self._cid(f"intent{self._rows}")
             self._pending = (name, cid)
             self._rows += 1
+            if self._actual_only:
+                return True
             self._open_rec(cid, name, ev)
             title, _ = _tool_activity(name, {})
             return await self._send({
@@ -1629,6 +1841,7 @@ class _InnerToolRelay:
             name = str(ev.get("name", ""))[:64]
             args = ev.get("args") if isinstance(ev.get("args"), dict) else {}
             title, detail = _tool_activity(name, args)
+            detail = self._public_text(detail)
             # Adopt the provisional row only when it is unambiguously the same
             # step: same tool, and nothing else outstanding.
             pending = self._pending
@@ -1636,7 +1849,7 @@ class _InnerToolRelay:
             if pending and pending[0] == name:
                 cid = pending[1]
             else:
-                if pending:
+                if pending and not self._actual_only:
                     # Claimed a row we are not going to fill — close it rather
                     # than leave the phone with a spinner that never resolves.
                     await self._send({"type": "tool_call.completed", "call_id": pending[1],
@@ -1648,6 +1861,7 @@ class _InnerToolRelay:
                 cid = self._cid(inner)
             self._open[inner] = cid
             self._open_rec(cid, name, ev)
+            await self._progress("start", title, str(detail)[:_INNER_DETAIL_MAX], cid)
             return await self._send({
                 "type": "tool_call.started",
                 "call_id": cid,
@@ -1671,6 +1885,7 @@ class _InnerToolRelay:
                 doms = [str(s.get("domain") or "") for s in srcs if s.get("domain")]
                 if doms:
                     preview = f"{len(srcs)} sources · " + " · ".join(doms[:3])
+            preview = self._public_text(preview)
             # Recorded BEFORE the send, and unconditionally: `_send` gives up
             # the moment the phone is gone (`self.alive`), and a call the user
             # walked away from is exactly the one whose record has to survive
@@ -1679,11 +1894,24 @@ class _InnerToolRelay:
                 cid, str(ev.get("name", ""))[:64], bool(ev.get("ok", True)),
                 preview, srcs, int(ev.get("elapsed_ms") or 0), ev,
             )
+            _title, _detail = _tool_activity(str(ev.get("name", ""))[:64], {})
+            # NO `preview`: the end-phase note goes to the PROVIDER, and
+            # `preview` is the tool's own output. D9 says progress notes carry
+            # no tool output text, and a note is not the place to discover
+            # whether a search result was fit to say out loud.
+            await self._progress("end", _title, "", cid)
             return await self._send({
                 "type": "tool_call.completed",
                 "call_id": cid, "parent_call_id": self._outer,
                 "name": str(ev.get("name", ""))[:64],
                 "ok": bool(ev.get("ok", True)),
+                # ── `ok` is a boolean about an ATTEMPT; `outcome` is what
+                # happened. A row the user cancelled is not a row that failed,
+                # and the client renders "that one didn't work" for ok:false —
+                # a claim of failure about work that was deliberately stopped.
+                # `ok` stays for build 129; the agent may name the outcome
+                # itself (needs_auth), otherwise it is derived.
+                "outcome": _outcome_of(ev),
                 "result_preview": preview,
                 "sources": srcs,
                 "elapsed_ms": int(ev.get("elapsed_ms") or 0),
@@ -1697,19 +1925,27 @@ class _InnerToolRelay:
                                      "call_id": self._outer, "stage": "thinking"})
         return True
 
-    async def close_open(self) -> None:
-        """Fail every still-running row so the phone never leaves a spinner."""
-        if self._pending:
+    async def close_open(self, outcome: str = "error") -> None:
+        """Fail every still-running row so the phone never leaves a spinner.
+
+        `outcome` names WHY. A provisional row that never got its arguments is
+        `not_run` — the client drops it rather than rendering a step that never
+        happened — while a cancelled turn's rows are `cancelled`, which is
+        neutral copy, not a failure claim.
+        """
+        if self._pending and not self._actual_only:
             # A turn that ends between tool_use_start and the arguments landing
             # leaves this row open; it is a spinner like any other.
             await self._send({"type": "tool_call.completed", "call_id": self._pending[1],
                               "parent_call_id": self._outer, "name": self._pending[0],
-                              "ok": False, "result_preview": ""})
-            self._pending = None
+                              "ok": False,
+                              "outcome": "cancelled" if outcome == "cancelled" else "not_run",
+                              "result_preview": ""})
+        self._pending = None
         for cid in list(self._open.values()):
             await self._send({"type": "tool_call.completed", "call_id": cid,
                               "parent_call_id": self._outer, "name": "",
-                              "ok": False, "result_preview": ""})
+                              "ok": False, "outcome": outcome, "result_preview": ""})
         self._open.clear()
 
 
@@ -1769,7 +2005,15 @@ async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
             if etype == "error":
                 logger.warning("[REALTIME] think stream error frame: %s", ev.get("code"))
                 return ("fail", None, frames)
-            if relay is not None and relay.alive:
+            if etype == "cancelled":
+                return ("cancelled", ev, frames)
+            # A dead phone socket only disables wire delivery. The inner agent
+            # keeps running after Live detaches, and its tool trail still has
+            # to be persisted with the delegated answer. `relay.on_event`
+            # records each tool before its best-effort send; gating it on
+            # `alive` lost every later search/source once an early progress
+            # frame discovered that the socket had gone away.
+            if relay is not None:
                 await relay.on_event(ev)
         return ("fail", None, frames)          # stream ended with no terminal frame
     except Exception as e:
@@ -1940,11 +2184,15 @@ def _same_local_day(started_utc: datetime, now_utc: datetime, tz_name: Optional[
     return started_utc.date() == now_utc.date()
 
 
-async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) -> str:
-    """Get existing session or create a new one on VPS. Returns session_id.
+async def _get_or_create_voice_session(
+    user_id: str, session_id: Optional[str], *, require_persisted: bool = False,
+) -> Optional[str]:
+    """Get or create the user's voice session on the tenant.
 
     Uses VPS HTTP API (works for all DB backends: local postgres, Supabase, etc.)
     All conversation data lives on the user's VPS, never the platform DB.
+    In strict Live mode, return None rather than invent an unpersisted id or
+    create another session after an ambiguous failed ownership lookup.
     """
     import uuid as _uuid
 
@@ -1954,11 +2202,16 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
 
         # Check if existing session is reusable (from today)
         if session_id:
+            lookup_outcome: dict = {}
             data = await _vps_api(
                 agent_url, agent_api_key, "GET", f"/api/sessions/{session_id}",
                 params={"include_messages": "false"},
+                **({"outcome": lookup_outcome} if require_persisted else {}),
             )
-            if data and data.get("id"):
+            if require_persisted and data and data.get("id") != session_id:
+                return None
+            if (data and data.get("id")
+                    and (not require_persisted or data.get("channel", "voice") == "voice")):
                 # Reuse only when the session started TODAY in the user's
                 # LOCAL calendar day (same_local_day semantics) — the old
                 # UTC-date comparison stranded post-local-midnight voice
@@ -1973,6 +2226,10 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
                 ):
                     logger.info("[REALTIME] Reusing existing VPS session %s", session_id[:8])
                     return session_id
+            if require_persisted and not data and lookup_outcome.get("status") != 404:
+                # A timeout/5xx is not proof the id is absent. Creating a
+                # replacement here would split today's work across sessions.
+                return None
 
         # No usable id from the client (or one from another day): reuse the
         # user's own voice Conversation for TODAY before minting another.
@@ -1984,10 +2241,17 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
         # sessions nobody can name. Readers are unaffected: the day thread is
         # keyed on `day_chat_id`, not on conversation identity.
         try:
+            list_outcome: dict = {}
             recent = await _vps_api(
                 agent_url, agent_api_key, "GET", "/api/sessions",
                 params={"channel": "voice", "limit": "5"},
+                **({"outcome": list_outcome} if require_persisted else {}),
             )
+            if (require_persisted and (
+                not isinstance(recent, dict)
+                or not isinstance(recent.get("sessions"), list)
+            )):
+                return None
             _tz_name = await _get_user_tz_name(user_id)
             _now = datetime.now(timezone.utc)
             for _row in ((recent or {}).get("sessions") or []):
@@ -1995,6 +2259,7 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
                     _row.get("started_at") or _row.get("updated_at")
                 )
                 if (_row.get("id") and _started is not None
+                        and (not require_persisted or _row.get("channel", "voice") == "voice")
                         and _same_local_day(_started, _now, _tz_name)):
                     logger.info(
                         "[REALTIME] Reusing today's voice session %s",
@@ -2002,6 +2267,8 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
                     )
                     return str(_row["id"])
         except Exception:
+            if require_persisted:
+                return None
             # A lookup failure must never cost the user a call; fall through to
             # creating one, which is exactly the pre-R46 behaviour.
             logger.debug("[REALTIME] voice session reuse lookup failed", exc_info=True)
@@ -2015,6 +2282,9 @@ async def _get_or_create_voice_session(user_id: str, session_id: Optional[str]) 
             logger.info("[REALTIME] Created VPS voice session via API %s", new_data["id"][:8])
             return new_data["id"]
 
+    if require_persisted:
+        logger.warning("[REALTIME] durable Live session unavailable user=%s", user_id[:8])
+        return None
     # Fallback: generate UUID locally (session still works for audio relay, just not persisted)
     fallback_id = session_id or str(_uuid.uuid4())
     logger.warning("[REALTIME] VPS unreachable, using local session ID %s (not persisted)", fallback_id[:8])
@@ -2037,6 +2307,8 @@ def _message_payload(
     app_artifact: Optional[dict] = None,
     client_msg_id: Optional[str] = None,
     occurred_at: Optional[datetime] = None,
+    voice: Optional[dict] = None,
+    revision: Optional[int] = None,
 ):
     """Build (json_body, query_params) for POST /api/sessions/{id}/messages.
 
@@ -2074,6 +2346,13 @@ def _message_payload(
         body["occurred_at"] = (
             occurred_at.isoformat() if isinstance(occurred_at, datetime) else str(occurred_at)
         )
+    # Voice provenance and the revise-in-place counter. Both are ADDITIVE: an
+    # agent image that predates them ignores unknown body fields, so a relay
+    # that sends them can talk to a container that does not read them yet.
+    if voice:
+        body["voice"] = voice
+    if revision is not None:
+        body["revision"] = int(revision)
     return body, None
 
 
@@ -2105,56 +2384,121 @@ async def _save_voice_messages(
     assistant_ref: Optional[str] = None,
     user_occurred_at: Optional[datetime] = None,
     assistant_occurred_at: Optional[datetime] = None,
-) -> None:
+    user_voice: Optional[dict] = None,
+    assistant_voice: Optional[dict] = None,
+    user_revision: Optional[int] = None,
+    assistant_revision: Optional[int] = None,
+) -> int:
     """Persist a user/assistant message pair to VPS via HTTP API.
 
     Uses POST /api/sessions/{id}/messages on the VPS agent.
     Works for all DB backends (local postgres, Supabase, etc.)
+
+    Returns the number of rows that did NOT persist. Callers that revise a row
+    in place (the Live relay) need that number to retry — the `client_msg_id`
+    is pure precisely so a retry upserts instead of speaking the sentence
+    twice. Every pre-existing caller ignores the value, so this stays additive.
+
+    **Emptiness is about the ROW, not about its text.** A delegated Live turn
+    can answer by doing — a media card, a tool record, a file — with no words
+    at all. Testing the two text strings alone dropped that row here, silently,
+    while the Live persistence queue counted it as written; the card never
+    reached the thread and C1's delivery proof then found nothing, so the job
+    card closed `cancelled` for music the user heard start (ruling C9). The
+    Realtime path never reaches this branch with a payload and no text, so its
+    behaviour is unchanged.
     """
-    if not user_text and not assistant_text:
-        return
+    if not user_text and not assistant_text and not (
+        media or tool_events or attachments or app_artifact
+    ):
+        return 0
 
     logger.info(
         "[REALTIME] Saving to VPS session %s: user=%d chars, assistant=%d chars",
         session_id[:8], len(user_text), len(assistant_text),
     )
 
+    # A retrying caller (the Live queue) owns the loss verdict; see
+    # `_VOICE_SAVE_OUTCOMES`.
+    sink = _VOICE_SAVE_OUTCOMES.get()
+
     vps = await _get_vps_info(user_id)
     if not vps:
         logger.warning("[REALTIME] VPS info not available, cannot save voice messages")
-        return
+        if sink is not None:
+            # `_get_vps_info` folds a pool timeout into None as well as a
+            # missing agent: nothing here says "never", so it is worth a retry.
+            sink.append(("transient", "vps_unavailable"))
+        # Count what the payload ASKED for, exactly as the loop below does.
+        # Counting the assistant row by its text alone made a card-only row
+        # report 0 here, and 0 is `_save_voice_messages`' word for "nothing
+        # failed" — so `PersistenceQueue` incremented `written`, no retry ran,
+        # and neither `voice_transcript_lost` nor `live_persist_lost` fired for
+        # a row that was never written. That is C9's incident again on the sad
+        # path, and it is reachable well short of "the agent is down":
+        # `_get_vps_info` swallows a pool timeout into None. The Realtime path
+        # never arrives here with a payload and no text, and its only caller
+        # discards this value, so nothing moves there.
+        return (1 if user_text else 0) + (
+            1 if (assistant_text or media or tool_events or attachments or app_artifact) else 0
+        )
 
     agent_url, agent_api_key = vps
     saved = 0
     lost = 0
 
-    for _role, _text, _model, _media, _tools, _atts, _app, _ref, _when in (
-        ("user", user_text, None, None, None, None, None, user_ref, user_occurred_at),
+    for _role, _text, _model, _media, _tools, _atts, _app, _ref, _when, _voice, _rev in (
+        ("user", user_text, None, None, None, None, None, user_ref,
+         user_occurred_at, user_voice, user_revision),
         # Media, the tool record, the files and the app all ride the ASSISTANT
         # row, matching how a chat turn persists them — the card, the run and
         # the artifact belong to the reply that produced them.
         ("assistant", assistant_text, model, media, tool_events, attachments,
-         app_artifact, assistant_ref, assistant_occurred_at),
+         app_artifact, assistant_ref, assistant_occurred_at,
+         assistant_voice, assistant_revision),
     ):
-        if not _text:
+        if not _text and not (_media or _tools or _atts or _app):
+            # Same rule as the early return: the payload rides the ASSISTANT
+            # row, so a card-only answer is skipped here or nowhere. The user
+            # row carries no payload, so this is a no-op for it.
             continue
         body, params = _message_payload(
             _role, _text, _model, _media, _tools,
             attachments=_atts, app_artifact=_app,
             client_msg_id=voice_client_msg_id(session_id, _ref) if _ref else None,
             occurred_at=_when,
+            voice=_voice,
+            revision=_rev,
         )
+        failure: dict = {}
         result = await _vps_api(
             agent_url, agent_api_key, "POST",
             f"/api/sessions/{session_id}/messages",
             params=params, json_body=body,
+            # Only for the retrying caller: a stub `_vps_api` elsewhere in the
+            # suite need not accept the keyword.
+            **({"outcome": failure} if sink is not None else {}),
         )
         if result:
             saved += 1
         else:
             lost += 1
+            if sink is not None:
+                cause = failure.get("error") or (
+                    f"http_{failure['status']}" if failure.get("status") else "no_body"
+                )
+                sink.append((failure.get("failure") or "transient", cause))
 
-    if lost:
+    if lost and sink is not None:
+        # Not LOST yet: the caller retries this upsert (same `client_msg_id`)
+        # and reports the loss itself, once, if it is final. Declaring it here
+        # is what put `LOST 1` in production's log for a row that then landed.
+        logger.warning(
+            "[REALTIME] %d voice message(s) not persisted on this attempt for session %s "
+            "(%s) — the caller retries",
+            lost, session_id[:8], ",".join(str(c) for _k, c in sink[-lost:]),
+        )
+    elif lost:
         # ERROR, not INFO. This is the only thing that persists a spoken turn —
         # `think` deliberately calls the agent with save=False to avoid a
         # duplicate day-chat entry, so a failure here loses the transcript
@@ -2170,6 +2514,7 @@ async def _save_voice_messages(
         # grepping Loki for an ERROR nobody is watching.
         _vcount("voice_transcript_lost", user_id, n=lost)
     logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", saved, session_id[:8])
+    return lost
 
 
 # ── The voice turn's memory write (v3 §2.1.2) ─────────────────────────
@@ -2261,6 +2606,104 @@ _THINK_FALLBACK_SYSTEM = (
 )
 
 
+#: `_play_media_direct`'s answer when the tenant reports the play `superseded`
+#: (`{ok: false, reason: "superseded"}`): a stop or pause landed after the play
+#: began, so the tenant never broadcast it. An ERROR for the model — no
+#: "Starting …", no card — and, by `is_superseded_play`, not a failure to
+#: retry: the Live relay ends the task `cancelled` instead of handing it to a
+#: full agent turn that would start the track anyway.
+PLAY_MEDIA_SUPERSEDED = (
+    "ERROR: superseded — the user stopped or paused the music after asking for "
+    "this track, so it was not started. Do not start it again and do not say "
+    "it is playing."
+)
+
+
+def is_superseded_play(text: Optional[str]) -> bool:
+    return (text or "").strip() == PLAY_MEDIA_SUPERSEDED
+
+
+# ── Contract v0.3 §7 (R2 addendum 6 R6-4 / R6-4b): order-scoped media ────
+#: The order scope of the ONE tenant request being made right now, set by the
+#: Live relay around each ordered call (`_LiveSession.media_order_scope`):
+#: {"order": caller-turn ordinal, "scope": provider session id, "started_ms":
+#: the scope stamp}.  Unset (every other caller, every existing test) → the
+#: request body is exactly what it was.
+MEDIA_ORDER: contextvars.ContextVar = contextvars.ContextVar("toup_media_order", default=None)
+_MEDIA_ORDER_LIMIT = 2 ** 31
+_MEDIA_STAMP_LIMIT = 2 ** 53
+
+
+def _bounded_int(value, limit: int) -> int:
+    """A positive int below `limit` (never a bool), else 0."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value if 0 < value < limit else 0
+
+
+def _media_order_fields(*, halt: bool = False) -> dict:
+    """The additive order fields for the current request, or {}.
+
+    ALL OR NOTHING: an order goes out only with its scope AND its stamp (the
+    relay never sends an order without a stamp).  A play / delegated run
+    carries `media_order`; a stop / pause carries `before_order`.
+    """
+
+    raw = MEDIA_ORDER.get()
+    if not isinstance(raw, dict):
+        return {}
+    order = _bounded_int(raw.get("order"), _MEDIA_ORDER_LIMIT)
+    stamp = _bounded_int(raw.get("started_ms"), _MEDIA_STAMP_LIMIT)
+    scope = raw.get("scope")
+    scope = scope.strip()[:128] if isinstance(scope, str) else ""
+    if not (order and stamp and scope):
+        return {}
+    return {
+        "before_order" if halt else "media_order": order,
+        "media_scope": scope,
+        "media_scope_started_ms": stamp,
+    }
+
+
+def _bind_inprocess_media_run_mark(user_id: str):
+    """R2 addendum 6 R6-10 residual (Option A parity with V2): the in-process
+    agent run (`_think` with `_agent_runner`, no HTTP body) carries the same
+    caller order as `/internal/agent-turn(/stream)` does — the run's media
+    halt mark is taken NOW, ordered by `media_order` + `media_scope` +
+    `media_scope_started_ms`, exactly as the tenant endpoint binds it for a
+    request that carries them.  With no order in scope (every non-Live
+    caller) nothing is bound and the run behaves exactly as before.  Returns
+    the token for `_reset_inprocess_media_run_mark`, or None."""
+
+    fields = _media_order_fields()
+    if not fields:
+        return None
+    try:
+        from app.agent.radio.control import bind_run_halt_mark, media_halt_mark
+
+        return bind_run_halt_mark(media_halt_mark(
+            user_id,
+            media_order=fields.get("media_order"),
+            media_scope=fields.get("media_scope"),
+            media_scope_started_ms=fields.get("media_scope_started_ms"),
+        ))
+    except Exception:  # noqa: BLE001 - the guard never blocks a turn
+        logger.debug("[REALTIME] in-process media run mark unavailable", exc_info=True)
+        return None
+
+
+def _reset_inprocess_media_run_mark(token) -> None:
+    if token is None:
+        return
+    try:
+        from app.agent.radio.control import reset_run_halt_mark
+
+        reset_run_halt_mark(token)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # ── Deep Think — Claude Opus reasoning for complex voice tasks ────────
 async def _play_media_direct(user_id: str, query: str, variety: bool = False) -> str:
     """Start playback via the agent's tool-less /internal/play-media route.
@@ -2293,7 +2736,7 @@ async def _play_media_direct(user_id: str, query: str, variety: bool = False) ->
             agent_url, agent_api_key, "POST", "/api/v1/internal/play-media",
             # Voice is always audio (a call has no screen for video); `variety`
             # rides through so an open-ended ask starts somewhere fresh.
-            json_body={"query": query, "variety": variety},
+            json_body={"query": query, "variety": variety, **_media_order_fields()},
             timeout=_PLAY_MEDIA_TIMEOUT_S,
         )
     except Exception as e:  # noqa: BLE001
@@ -2302,6 +2745,11 @@ async def _play_media_direct(user_id: str, query: str, variety: bool = False) ->
                 "reaching the user's agent. Ask them to try again in a moment."), None
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
+    if isinstance(data, dict) and not data.get("ok") and data.get("reason") == "superseded":
+        # The tenant dropped it: a stop/pause landed after this play began
+        # (addendum 2 item 9). Nothing started, so nothing may say it did.
+        logger.info("[REALTIME] play_media superseded for %s in %dms", user_id[:8], elapsed_ms)
+        return PLAY_MEDIA_SUPERSEDED, None
     if not data or not data.get("ok"):
         logger.warning("[REALTIME] play_media no-result for %s in %dms", user_id[:8], elapsed_ms)
         return ("ERROR: could not start that track. It may not be available. "
@@ -2324,15 +2772,95 @@ async def _play_media_direct(user_id: str, query: str, variety: bool = False) ->
     } if video_id else None
     # The title is the answer to "what's playing?" for the rest of the call —
     # it stays in the model's own conversation as this tool's result.
-    text = (f"Now playing: {title}. It is already audible on the user's device, "
-            f"and more in the same style will follow automatically.") if title else \
-           "Playback started on the user's device."
+    # Progressive (v0.3 §H): the tenant QUEUED the track; the phone has not yet
+    # rendered it. "It is already audible" was paraphrased into "it changed,
+    # listen" over the old track, and a different one played ten seconds later.
+    text = (f"Starting {title} on the user's device; more in the same style "
+            f"will follow automatically.") if title else \
+           "Playback is starting on the user's device."
     return text, media
+
+
+async def _control_media_direct(user_id: str, action: str) -> dict:
+    """Execute next/previous/stop/pause through the tenant's tool-less control
+    route.
+
+    stop/pause are v0.3 §H: the tenant turns the station off (stop) and waits
+    for the phone's `media_stop_ack`/`media_pause_ack`, answering `ok` only on
+    that ack, with `reason` ∈ stopped|paused|nothing_playing|unacknowledged|
+    delivery_failed|error. `reason` passes through untouched: the relay's
+    spoken line depends on it. A tenant that predates stop rejects the action,
+    which arrives here as an honest failure, never as a stop.
+    """
+
+    action = str(action or "").strip().lower()
+    if action not in {"next", "previous", "stop", "pause"}:
+        return {"ok": False, "action": action, "reason": "unsupported_action"}
+    vps = await _get_vps_info(user_id)
+    if not vps:
+        return {"ok": False, "action": action, "reason": "agent_unreachable"}
+    agent_url, agent_api_key = vps
+    body = {"user_id": user_id, "action": action, "channel": "app"}
+    if action in {"stop", "pause"}:
+        # Contract v0.3 §7: the halt applies to the plays asked for before it.
+        body.update(_media_order_fields(halt=True))
+    try:
+        data = await _vps_api(
+            agent_url, agent_api_key, "POST", "/api/v1/internal/media-control",
+            json_body=body,
+            # Tenant owns an 8 s wall-clock cancellation/rollback deadline.
+            # Leave transport and response propagation margin outside it; an
+            # httpx float timeout applies per phase, not as that tenant budget.
+            timeout=12.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REALTIME] media_control failed user=%s action=%s error=%s",
+            user_id[:8], action, type(exc).__name__,
+        )
+        return {"ok": False, "action": action, "reason": "agent_error"}
+    if not isinstance(data, dict):
+        return {"ok": False, "action": action, "reason": "invalid_response"}
+    out = {
+        "ok": bool(data.get("ok")),
+        "action": action,
+        "reason": str(data.get("reason") or ("executed" if data.get("ok") else "error"))[:64],
+        "changed": bool(data.get("changed")),
+        "video_id": str(data.get("video_id") or "")[:64],
+        "title": str(data.get("title") or "")[:200],
+    }
+    if data.get("paused") is True:
+        # Contract v0.3 §7: a `newer_playing` item that is PAUSED — the relay
+        # words it without claiming it plays.  Additive, only when sent.
+        out["paused"] = True
+    return out
+
+
+def _note_agent_cost(out: dict, data: dict) -> None:
+    """Add the agent's own time and tokens for one turn to `out` (P6).
+
+    The done payload has always carried them; the relay discarded them, so the
+    5.4-16 s of backend time per delegation in production could not be split
+    into agent time and transport. ACCUMULATED, because a continuation retry
+    calls `_think` twice into the same `out` and the relay's elapsed time spans
+    both. Counts only; an older agent that omits a field simply adds nothing.
+    """
+
+    for key in ("processing_time_ms", "tokens_input", "tokens_output"):
+        try:
+            value = int(data.get(key) or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if value > 0:
+            out[key] = int(out.get(key) or 0) + value
 
 
 async def _think(user_id: str, task: str, session_id: Optional[str],
                  relay: Optional["_InnerToolRelay"] = None,
-                 out: Optional[dict] = None) -> tuple:
+                 out: Optional[dict] = None,
+                 display_request: Optional[str] = None,
+                 reply_language: Optional[str] = None,
+                 delegation_id: Optional[str] = None) -> tuple:
     """
     Route reasoning to the best model using the model router.
 
@@ -2348,7 +2876,25 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
     agent just generated exists in storage with no row to authorize
     `GET /api/files/{message_id}/{aid}` against, and a `present_app` made during
     a call is unreachable. Out-param rather than a wider return so the three
-    existing return sites keep their arity.
+    existing return sites keep their arity. It also collects `media`, so a
+    delegated play persists a real card instead of bare text.
+
+    `display_request` is the CALLER'S OWN WORDS — the clean utterance, with none
+    of the context scaffolding the message carries. The job card, the push and
+    the durable row all derive their title from the message today, which is how
+    "Live-session context…" became a card title in the founder's chat.
+    `reply_language` rides beside it so the agent answers a Persian question in
+    Persian. Both are additive body fields: an agent image that predates them
+    ignores them, which is why the caller ALSO appends the language line to the
+    message itself.
+
+    `delegation_id` is the SAME id the relay stamps on the persisted assistant
+    row as `voice.delegation_id` (C1). It is what lets the agent's own
+    delivery check key on THIS delegation instead of on time: with two
+    concurrent delegations, "an assistant row exists" is true for the other
+    one's answer too. Additive like the other two; `HEAD`'s
+    `SessionMessageCreate`/agent-turn models declare no `extra='forbid'`, so
+    the deployed image ignores it rather than 422ing.
     """
     from app.services.model_router import classify_request
 
@@ -2360,34 +2906,45 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
 
     # Option A: Use agent_runner (preferred — full tool access + memory)
     if _agent_runner:
+        # Contract v0.3 §7 parity (R6-10): the run's caller order, bound as
+        # the tenant's agent-turn endpoints bind it (no-op outside the relay).
+        _halt_token = _bind_inprocess_media_run_mark(user_id)
         try:
             # Voice has no client-side tz in the WebRTC payload; agent_runner
             # will fall back to User.timezone from DB (then UTC with warn log
             # if that's NULL). Channel is explicit so the unknown-channel
             # warning path isn't hit for legitimate voice traffic.
-            response = await _agent_runner.run(
-                user_message=task,
-                user_id=user_id,
-                session_id=session_id,
-                channel="voice",
-                model_override=model_override,
-                # Parity with the V2 relay path (it sends save=False, which
-                # api_v1's agent-turn maps to exactly these three): `task` is
-                # a string the REALTIME MODEL synthesised, not what the user
-                # said — persisting it double-writes the day chat next to
-                # _save_voice_messages' real transcripts, and mining it for
-                # memories minted facts the user never stated (the 409A
-                # incident api_v1.py documents). Voice memory extraction runs
-                # from real transcripts via _curate_voice_turn instead.
-                save_user_message=False,
-                save_assistant_message=False,
-                disable_post_processing=True,
-            )
+            try:
+                response = await _agent_runner.run(
+                    user_message=task,
+                    user_id=user_id,
+                    session_id=session_id,
+                    channel="voice",
+                    model_override=model_override,
+                    # Parity with the V2 relay path (it sends save=False, which
+                    # api_v1's agent-turn maps to exactly these three): `task` is
+                    # a string the REALTIME MODEL synthesised, not what the user
+                    # said — persisting it double-writes the day chat next to
+                    # _save_voice_messages' real transcripts, and mining it for
+                    # memories minted facts the user never stated (the 409A
+                    # incident api_v1.py documents). Voice memory extraction runs
+                    # from real transcripts via _curate_voice_turn instead.
+                    save_user_message=False,
+                    save_assistant_message=False,
+                    disable_post_processing=True,
+                )
+            finally:
+                _reset_inprocess_media_run_mark(_halt_token)
             logger.info(
                 "[REALTIME] think via agent_runner: %d chars, model=%s, %dms",
                 len(response.text), response.model, response.processing_time_ms,
             )
             if out is not None:
+                _note_agent_cost(out, {
+                    "processing_time_ms": getattr(response, "processing_time_ms", None),
+                    "tokens_input": getattr(response, "tokens_input", None),
+                    "tokens_output": getattr(response, "tokens_output", None),
+                })
                 # `persisted` is AgentResponse's echo of what the turn made;
                 # on a save=False turn it is the only place it appears.
                 _p = getattr(response, "persisted", None) or {}
@@ -2395,6 +2952,8 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                     out["attachments"] = list(_p["attachments"])
                 if _p.get("app_artifact"):
                     out["app_artifact"] = _p["app_artifact"]
+                if _p.get("media"):
+                    out["media"] = _p["media"]
             return response.text, response.model or model_override
         except Exception as e:
             logger.warning("[REALTIME] think via agent_runner failed: %s", e)
@@ -2429,6 +2988,16 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                 # after its agent has that build (see deploy notes).
                 "save": False,
             }
+            if display_request:
+                _body["display_request"] = display_request[:400]
+            if reply_language:
+                _body["reply_language"] = reply_language[:16]
+            if delegation_id:
+                _body["delegation_id"] = delegation_id[:64]
+            # Contract v0.3 §7: the run's caller-turn order + scope + stamp, so
+            # the tenant supersedes a play inside it only for a halt the caller
+            # asked for AFTER this request (additive; absent outside the relay).
+            _body.update(_media_order_fields())
             data = None
             _no_retry = False
             try:
@@ -2450,13 +3019,20 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                     if outcome == "skew":
                         _stream_skew[agent_url] = time.monotonic()
                         logger.info("[REALTIME] agent predates think-stream route: %s", agent_url)
+                    elif outcome == "cancelled":
+                        # An exact, durable user Stop must not retry the agent
+                        # even with zero tool frames, or synthesize an Option B
+                        # answer to work the caller explicitly cancelled.
+                        raise asyncio.CancelledError("Voice delegation stopped")
                     elif outcome in ("stream", "json") and payload and payload.get("text"):
                         data = payload
-                    elif frames > 0:
-                        # The turn ALREADY RAN on the agent. Re-issuing the
-                        # blocking POST would double-charge credits and re-fire
-                        # any mutating connector. Drop straight to Option B
-                        # (tool-less, side-effect-free) instead.
+                    else:
+                        # Once the stream POST was attempted, even zero SSE
+                        # frames cannot prove the tenant did not accept and
+                        # execute it: the ready frame or final response may
+                        # have been lost. Only a definitive 404/405 route
+                        # skew above permits the blocking compatibility call.
+                        # Reissuing here could run a mutating connector twice.
                         #
                         # This is the branch the founder hit on 2026-07-31: the
                         # chip read "That one didn't work / Trying another way",
@@ -2504,10 +3080,13 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                         len(data["text"]), data.get("model"), data.get("tool_calls"),
                     )
                     if out is not None:
+                        _note_agent_cost(out, data)
                         if data.get("attachments"):
                             out["attachments"] = list(data["attachments"])
                         if data.get("app_artifact"):
                             out["app_artifact"] = data["app_artifact"]
+                        if data.get("media"):
+                            out["media"] = data["media"]
                     return data["text"], data.get("model") or model_override
                 logger.warning("[REALTIME] think via agent full-turn: empty result, falling back")
             except Exception as e:
@@ -2581,7 +3160,11 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
 
     except Exception as e:
         logger.warning("[REALTIME] think fallback failed: %s", e)
-        return "I'll do my best to answer directly.", "gpt-4o-realtime"
+        # A failed agent run followed by a failed direct provider is not an
+        # answer.  Returning a reassuring sentence made the Live delegation
+        # terminalise as completed (100%) with no search or result.  Let the
+        # caller record a failed task and give its localized retry line.
+        raise RuntimeError("Voice reasoning temporarily unavailable") from e
 
 
 # ── Finalize onboarding — compile profiles + write .md files ─────────
@@ -3132,6 +3715,9 @@ async def resolve_voice_language(user_id: str) -> Optional[str]:
 # here would be the cleaner fix and is the tracked follow-up; it needs a
 # cross-replica store this service does not currently have.
 _voice_session_owner: dict = {}
+# A retry can overtake an older attempt while its OpenAI connect is still in
+# flight. Only the newest attempt on this process may claim Live Activity.
+_live_connect_latest: dict[str, str] = {}
 _VOICE_LA_END_GRACE_S = 6.0
 _deferred_la_tasks: set = set()
 
@@ -3141,8 +3727,18 @@ def _defer_voice_la_end(user_id: str, mission_id, nonce: str, immediate: bool) -
         try:
             if not immediate:
                 await asyncio.sleep(_VOICE_LA_END_GRACE_S)
-                if _voice_session_owner.get(user_id) != nonce:
-                    return  # a reconnect superseded us — the card is theirs now
+            # A Retry may still be connecting when this socket tears down.
+            # Wait for its bounded startup to claim ownership or fail; merely
+            # returning here would strand this card if the retry failed.
+            deadline = time.monotonic() + _LIVE_STARTUP_READY_BUDGET_S + 1.0
+            while (
+                _live_connect_latest.get(user_id) not in (None, nonce)
+                and _voice_session_owner.get(user_id) == nonce
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.2)
+            if _voice_session_owner.get(user_id) != nonce:
+                return  # a reconnect superseded us — the card is theirs now
             from app.services.live_activity_service import end_voice_activities
             await asyncio.wait_for(end_voice_activities(user_id, mission_id), timeout=10.0)
         except Exception:  # noqa: BLE001
@@ -3567,6 +4163,49 @@ def _maybe_meter_response(user_id: str, response: dict, using_platform_key: bool
     )
 
 
+def _live_user_allowed(user_id: str) -> bool:
+    if settings.voice_live_all_users:
+        return True
+    configured = {
+        value.strip().lower()
+        for value in (settings.voice_live_user_ids or "").split(",")
+        if value.strip()
+    }
+    if not configured:
+        return False
+    import uuid as _uuid
+    valid: set[str] = set()
+    for value in configured:
+        try:
+            if str(_uuid.UUID(value)) == value:
+                valid.add(value)
+        except (ValueError, AttributeError):
+            continue
+    if len(valid) != len(configured):
+        logger.error(
+            "[LIVE] ignored %d invalid cohort id(s); canonical full UUIDs are required",
+            len(configured) - len(valid),
+        )
+    return str(user_id or "").lower() in valid
+
+
+def _live_protocol_selected(
+    user_id: str,
+    protocol: Optional[str],
+    *,
+    onboarding: bool,
+) -> bool:
+    """Select Live only after an exact client/server protocol negotiation."""
+
+    return bool(
+        settings.voice_live_enabled
+        and settings.voice_live_provider == "openai"
+        and not onboarding
+        and protocol == "live1"
+        and _live_user_allowed(user_id)
+    )
+
+
 @router.websocket("/ws/realtime")
 async def realtime_voice_ws(
     websocket: WebSocket,
@@ -3574,6 +4213,11 @@ async def realtime_voice_ws(
     session_id: Optional[str] = Query(None),
     onboarding: bool = Query(False),
     lang: Optional[str] = Query(None),
+    # Provider negotiation must happen before opening OpenAI's socket.  New
+    # clients opt in on the URL as well as repeating the value in their config
+    # frame; old installed clients therefore remain on the Realtime protocol
+    # even when the server-side Live rollout flag is enabled globally.
+    protocol: Optional[str] = Query(None),
     # Which app opened this socket, when it is willing to say. Only ever used
     # to decide whether a purchase URL may be shown (App Review 3.1.1); never
     # to change what the agent does. Absent from every shipped client today —
@@ -3589,24 +4233,43 @@ async def realtime_voice_ws(
         safe_send_close_ws,
     )
     subprotocol_token = await accept_with_subprotocol_auth(websocket)
+    # The caller's clock starts HERE. Every later mark (`_t0`, the relay's own
+    # `elapsed_ms`) begins after auth, the key read and the context fan-out, so
+    # each of them understates the wait the caller actually sits through — by
+    # 1.5-6.7 s in the five founder sessions measured on d3ebda17.
+    _accept_monotonic = time.monotonic()
+    _auth_deadline = _accept_monotonic + _VOICE_AUTH_BUDGET_S
+
+    async def _auth_before_deadline(auth_token: str) -> Optional[str]:
+        try:
+            return await asyncio.wait_for(
+                _authenticate_ws(auth_token),
+                timeout=max(0.001, _auth_deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("[REALTIME] authentication timed out after accept")
+            return None
 
     # ── 1. Authenticate ───────────────────────────────────────
     user_id = None
     if subprotocol_token:
-        user_id = await _authenticate_ws(subprotocol_token)
+        user_id = await _auth_before_deadline(subprotocol_token)
 
     if not user_id and token:
         log_deprecated_query_token("/api/ws/realtime")
-        user_id = await _authenticate_ws(token)
+        user_id = await _auth_before_deadline(token)
 
     client_disconnected = False
     if not user_id:
         # Try auth message
         try:
-            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+            raw = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=max(0.001, _auth_deadline - time.monotonic()),
+            )
             msg = json.loads(raw)
             if msg.get("type") == "auth" and msg.get("token"):
-                user_id = await _authenticate_ws(msg["token"])
+                user_id = await _auth_before_deadline(msg["token"])
         except (asyncio.TimeoutError, json.JSONDecodeError):
             pass
         except WebSocketDisconnect:
@@ -3632,19 +4295,63 @@ async def realtime_voice_ws(
     # metering, …). One read, one source of truth for the whole connection.
     _v2_ctx.set(_resolve_v2_for_user(user_id))
     managed_voice = bool(_v2_active() and settings.voice_tasks_enabled and not onboarding)
+    # GPT-Live is a different protocol, selected once for the whole socket.
+    # Onboarding retains the proven Realtime flow until its setup-only tools are
+    # represented in the Live client-delegation backend.
+    use_live = _live_protocol_selected(user_id, protocol, onboarding=onboarding)
+    _session_nonce = str(uuid.uuid4())
+    if use_live:
+        _live_connect_latest[user_id] = _session_nonce
+    _live_ready_deadline = (
+        _accept_monotonic + _LIVE_STARTUP_READY_BUDGET_S if use_live else None
+    )
     logger.info("[REALTIME] voice v2=%s for user %s", _v2_active(), user_id[:8])
+    logger.info("[REALTIME] voice provider=%s for user %s", "live" if use_live else "realtime", user_id[:8])
 
-    async def _status(stage: str) -> None:
+    async def _status(stage: str) -> bool:
         # Pre-ready progress beacons. The clients' connect watchdogs treat any
         # frame as "pipeline engaged"; total silence reads as a dead route and
         # fails their UI at ~20s. Best-effort — if the client is gone, the
         # relay loop below notices immediately anyway.
         try:
-            await websocket.send_json({"type": "status", "stage": stage})
+            await asyncio.wait_for(
+                websocket.send_json({"type": "status", "stage": stage}),
+                timeout=0.5,
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _live_startup_error(cause: str) -> None:
+        logger.warning(
+            "[LIVE] startup dependency unavailable user=%s cause=%s elapsed_ms=%d",
+            user_id[:8], cause,
+            int((time.monotonic() - _accept_monotonic) * 1000),
+        )
+        _vcount("live_startup_dependency_unavailable", user_id, cause=cause)
+        try:
+            await asyncio.wait_for(websocket.send_json({
+                "type": "error", "code": "live_context_unavailable",
+                "recoverable": False,
+                "message": "Voice is unavailable right now. Try again shortly.",
+            }), timeout=0.5)
         except Exception:
             pass
 
-    await _status("authenticated")
+    def _clear_live_attempt() -> None:
+        if use_live and _live_connect_latest.get(user_id) == _session_nonce:
+            _live_connect_latest.pop(user_id, None)
+
+    async def _close_failed_live_status() -> None:
+        _clear_live_attempt()
+        try:
+            await asyncio.wait_for(websocket.close(code=1011), timeout=0.5)
+        except Exception:
+            pass
+
+    if not await _status("authenticated") and use_live:
+        await _close_failed_live_status()
+        return
 
     # ── 2. Load OpenAI API key ────────────────────────────────
     # Fall back to the platform key (parity with /voice/transcribe + /voice/tts)
@@ -3654,7 +4361,9 @@ async def realtime_voice_ws(
     # a bare 1011 close with zero frames sent — the silent-forever class.
     try:
         openai_key, is_byok = await asyncio.wait_for(
-            _get_user_openai_key_ex(user_id), timeout=8.0,
+            _get_user_openai_key_ex(user_id),
+            timeout=min(8.0, max(0.001, _live_ready_deadline - time.monotonic()))
+            if use_live else 8.0,
         )
     except Exception:
         logger.exception("[REALTIME] OpenAI key lookup failed")
@@ -3667,6 +4376,7 @@ async def realtime_voice_ws(
     using_platform_key = not is_byok
     openai_key = openai_key or settings.openai_api_key
     if not openai_key:
+        _clear_live_attempt()
         await websocket.send_json({
             "type": "error",
             "message": "OpenAI API key not configured. Please set up your API key in Settings.",
@@ -3681,102 +4391,126 @@ async def realtime_voice_ws(
     # misleading-copy incident).
     if _v2_active() and using_platform_key:
         try:
-            from decimal import Decimal as _Dec
-            from app.db.database import async_session_maker as _asm
-            from app.services.credit_service import credit_service, BUCKET_MESSAGE
-            if getattr(settings, "credit_enforcement_enabled", False):
-                from app.services.credit_exhausted import REASON_RATE_LIMITED
-                _plan_source = None
-                async with _asm() as _db:
-                    preflight = await credit_service.check_balance(
-                        _db, user_id, BUCKET_MESSAGE, _Dec("0.1"),
-                    )
-                    if not preflight.success:
-                        # Only on the refusal path — a healthy session must
-                        # not pay for a second balance read.
-                        _plan_source = (await credit_service.get_balance_view(
-                            _db, user_id,
-                        )).plan_source
-                if not preflight.success:
-                    if preflight.reason == REASON_RATE_LIMITED:
-                        # The unlimited rate ladder, not a balance. This
-                        # account cannot run out of anything, so the copy
-                        # names the real cause and carries no billing flag —
-                        # `billing: True` is what makes the client render a
-                        # billing surface at all (useRealtimeVoice.ts:718).
-                        _frame = {
-                            "type": "error",
-                            "message": (
-                                "You're going faster than we can serve right "
-                                "now. Give it a few seconds and try again."
-                            ),
-                        }
-                    else:
-                        _frame = {
-                            "type": "error",
-                            "message": "You're out of Toup credits. Top up or upgrade your plan to keep talking.",
-                            "billing": True,
-                        }
-                        # ANTI-STEERING (App Review 3.1.1). This used to ship
-                        # `https://toup.ai/account?tab=billing`
-                        # unconditionally, to every client.
-                        #
-                        # Two independent reasons to withhold it, and they are
-                        # NOT the same question:
-                        #
-                        #   * WHO PAYS. An Apple subscriber cannot manage or
-                        #     buy anything at that URL, so it is useless as
-                        #     well as exposed. `plan_source` answers this.
-                        #   * WHICH APP IS ASKING. 3.1.1 is about linking to an
-                        #     off-app purchase FROM INSIDE THE APP, and it
-                        #     binds hardest for a NON-subscriber — who is
-                        #     exactly the person a purchase link is aimed at.
-                        #     `plan_source` cannot answer this: a free iOS user
-                        #     reads 'free', not 'iap'.
-                        #
-                        # `client` is the honest key for the second, and no
-                        # shipped build sends it yet — so today a free iOS user
-                        # still receives the link. That gap is named here
-                        # rather than papered over: suppressing on
-                        # `plan_source == 'free'` would take the link away from
-                        # free WEB users, who are the one cohort it genuinely
-                        # helps. The app can close it in one line by appending
-                        # `client=ios` in `realtimeVoiceWsUrl`.
-                        _mobile_client = (client or "").strip().lower() in {
-                            "ios", "android", "mobile", "app",
-                        }
-                        if _plan_source != "iap" and not _mobile_client:
-                            _frame["billing_url"] = "https://toup.ai/account?tab=billing"
-                    await websocket.send_json(_frame)
-                    await websocket.close(code=4402)
-                    return
-        except Exception:
-            logger.warning("[REALTIME] credit pre-flight failed open — continuing", exc_info=True)
+            async with asyncio.timeout_at(_live_ready_deadline if use_live else None):
+                try:
+                    from decimal import Decimal as _Dec
+                    from app.db.database import async_session_maker as _asm
+                    from app.services.credit_service import credit_service, BUCKET_MESSAGE
+                    if getattr(settings, "credit_enforcement_enabled", False):
+                        from app.services.credit_exhausted import REASON_RATE_LIMITED
+                        _plan_source = None
+                        async with _asm() as _db:
+                            preflight = await credit_service.check_balance(
+                                _db, user_id, BUCKET_MESSAGE, _Dec("0.1"),
+                            )
+                            if not preflight.success:
+                                # Only on the refusal path — a healthy session must
+                                # not pay for a second balance read.
+                                _plan_source = (await credit_service.get_balance_view(
+                                    _db, user_id,
+                                )).plan_source
+                        if not preflight.success:
+                            if preflight.reason == REASON_RATE_LIMITED:
+                                # The unlimited rate ladder, not a balance. This
+                                # account cannot run out of anything, so the copy
+                                # names the real cause and carries no billing flag —
+                                # `billing: True` is what makes the client render a
+                                # billing surface at all (useRealtimeVoice.ts:718).
+                                _frame = {
+                                    "type": "error",
+                                    "message": (
+                                        "You're going faster than we can serve right "
+                                        "now. Give it a few seconds and try again."
+                                    ),
+                                }
+                            else:
+                                _frame = {
+                                    "type": "error",
+                                    "message": "You're out of Toup credits. Top up or upgrade your plan to keep talking.",
+                                    "billing": True,
+                                }
+                                # ANTI-STEERING (App Review 3.1.1). This used to ship
+                                # `https://toup.ai/account?tab=billing`
+                                # unconditionally, to every client.
+                                #
+                                # Two independent reasons to withhold it, and they are
+                                # NOT the same question:
+                                #
+                                #   * WHO PAYS. An Apple subscriber cannot manage or
+                                #     buy anything at that URL, so it is useless as
+                                #     well as exposed. `plan_source` answers this.
+                                #   * WHICH APP IS ASKING. 3.1.1 is about linking to an
+                                #     off-app purchase FROM INSIDE THE APP, and it
+                                #     binds hardest for a NON-subscriber — who is
+                                #     exactly the person a purchase link is aimed at.
+                                #     `plan_source` cannot answer this: a free iOS user
+                                #     reads 'free', not 'iap'.
+                                #
+                                # `client` is the honest key for the second, and no
+                                # shipped build sends it yet — so today a free iOS user
+                                # still receives the link. That gap is named here
+                                # rather than papered over: suppressing on
+                                # `plan_source == 'free'` would take the link away from
+                                # free WEB users, who are the one cohort it genuinely
+                                # helps. The app can close it in one line by appending
+                                # `client=ios` in `realtimeVoiceWsUrl`.
+                                _mobile_client = (client or "").strip().lower() in {
+                                    "ios", "android", "mobile", "app",
+                                }
+                                if _plan_source != "iap" and not _mobile_client:
+                                    _frame["billing_url"] = "https://toup.ai/account?tab=billing"
+                            await websocket.send_json(_frame)
+                            await websocket.close(code=4402)
+                            _clear_live_attempt()
+                            return
+                except Exception:
+                    logger.warning("[REALTIME] credit pre-flight failed open — continuing", exc_info=True)
+        except asyncio.TimeoutError:
+            _clear_live_attempt()
+            await _live_startup_error("deadline")
+            await websocket.close(code=1011)
+            return
 
-    # ── 3+4+5 fan-out: `ready` waits ONLY on the OpenAI connect ──────────
-    # The single hard prerequisite for the user to start talking is an OpenAI
-    # socket with a VAD/format config written to it. Everything personal —
-    # VPS session, instructions, tools — rides in behind and hot-swaps onto
-    # the live session via a second session.update (responses created after
-    # it use the new instructions). Warm reopens skip even that thin window
-    # via _instr_cache. Previously all of this was serialized ahead of
-    # `ready`: several seconds warm, up to 25s cold.
-    await _status("preparing")
+    # ── 3+4+5 fan-out: Realtime ready waits only on OpenAI ────────────
+    # For Realtime, the OpenAI socket is the only ready prerequisite;
+    # personalized fields hot-swap through session.update. Live's first
+    # session.start is immutable, so its separately bounded owner/day
+    # dependencies are collected below after this parallel fan-out.
+    if not await _status("preparing") and use_live:
+        await _close_failed_live_status()
+        return
+    if use_live and time.monotonic() >= _live_ready_deadline:
+        _clear_live_attempt()
+        await _live_startup_error("deadline")
+        await websocket.close(code=1011)
+        return
 
     async def _connect_openai():
+        _url = realtime_url()
+        if use_live:
+            from app.services.live_voice_protocol import LIVE_WS_URL
+            _url = LIVE_WS_URL
         return await websockets.connect(
-            realtime_url(),
+            _url,
             additional_headers={
                 "Authorization": f"Bearer {openai_key}",
             },
             max_size=10 * 1024 * 1024,  # 10MB for audio chunks
+            **({"open_timeout": max(0.001, _live_ready_deadline - time.monotonic())}
+               if use_live else {}),
         )
 
     async def _session_step() -> Optional[str]:
         try:
-            return await _get_or_create_voice_session(user_id, session_id)
+            return await _get_or_create_voice_session(
+                user_id, session_id, require_persisted=use_live,
+            )
         except Exception:
             logger.exception("[REALTIME] Failed to create DB session")
+            if use_live:
+                # A blind second create can duplicate a call whose first
+                # response was merely delayed. Live must have a tenant row.
+                return None
             try:
                 return await _get_or_create_voice_session(user_id, None)
             except Exception:
@@ -3786,9 +4520,8 @@ async def realtime_voice_ws(
     async def _agent_voice_context(now_utc: Optional[datetime] = None) -> Optional[str]:
         """Ask the tenant's own agent to assemble the instructions (G-19a).
 
-        Returns None on ANY failure so the caller falls back to the legacy
-        builder — a Realtime session must never open with no instructions,
-        which is the 2026-07-31 shape.
+        Returns None on failure. Realtime can use its legacy builder; Live
+        requires owner/day context before its immutable session.start.
         """
         vps = await _get_vps_info(user_id)
         if not vps:
@@ -3798,6 +4531,13 @@ async def realtime_voice_ws(
             "onboarding": onboarding,
             "budget_chars": settings.voice_realtime_instructions_budget_chars if _v2_active() else 0,
             "tz_name": await _get_user_tz_name(user_id),
+            # Which wire this prompt is for. The agent-side renderer drops the
+            # Realtime-only tool paragraphs and adds the delegation section
+            # itself once the image rolls; until then
+            # `adapt_instructions_for_live` does the same surgery on the text
+            # that comes back, and the two must agree word for word. An image
+            # that predates the field ignores it (pydantic default extra).
+            "live": use_live,
             # One instant for both builders — the shadow must never read a
             # minute tick between the legacy build and this call as a
             # section divergence.
@@ -3818,6 +4558,10 @@ async def realtime_voice_ws(
                 "[REALTIME] agent voice-context DEGRADED user=%s legs=%s",
                 str(user_id)[:8], ",".join(map(str, degraded)),
             )
+        if use_live and "day" in degraded:
+            # The opening promise uses this day's conversation. A builder
+            # that reports a failed day read cannot satisfy that promise.
+            return None
         logger.info(
             "[REALTIME] agent voice-context ok user=%s chars=%d day=%s",
             str(user_id)[:8], len(instr), data.get("day_date"),
@@ -3879,6 +4623,11 @@ async def realtime_voice_ws(
                     ",".join(cmp_["same"]) or "-",
                     ",".join(cmp_["differs"]) or "-",
                 )
+                # Expected `differs` entries today: `voice_mode` — the agent
+                # renderer (`voice_context.render_voice_mode`) carries the
+                # REPLY LANGUAGE bullet (R48 A8-5) that the legacy block below
+                # deliberately does not, so on a legacy-only deployment this
+                # line names that section every session. Not a drift to chase.
                 if not cmp_["order_match"]:
                     # Sections carry the same bytes in a different sequence.
                     # Expected today (Drift D2 moves identity_anchor to the
@@ -3899,6 +4648,13 @@ async def realtime_voice_ws(
         # want_agent: serve it, but never at the cost of having nothing.
         if agent_instr:
             return agent_instr
+
+        if use_live:
+            logger.warning(
+                "[REALTIME] live context unavailable user=%s; retaining day scope",
+                str(user_id)[:8],
+            )
+            return None
 
         # ── The residual case, made COUNTABLE ────────────────────────────
         #
@@ -4008,10 +4764,43 @@ async def realtime_voice_ws(
         except Exception as e:
             logger.warning("[REALTIME] _ensure_vps_user failed (non-fatal): %s", e)
 
+    # These are the two required tenant reads for an immutable Live start.
+    # Record only fixed leg/outcome labels and elapsed time: neither the
+    # session id nor any prompt or day-history text belongs in a log.
+    _live_leg_outcomes: dict[str, tuple[str, int]] = {
+        "session": ("pending", 0), "context": ("pending", 0),
+    }
+
+    def _live_leg_outcome(task: asyncio.Task) -> str:
+        if not task.done():
+            return "pending"
+        if task.cancelled():
+            return "cancelled"
+        try:
+            return "ready" if task.result() else "empty"
+        except BaseException:
+            return "error"
+
+    def _record_live_leg(name: str, started: float, task: asyncio.Task) -> None:
+        outcome = _live_leg_outcome(task)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _live_leg_outcomes[name] = (outcome, elapsed_ms)
+        logger.info(
+            "[LIVE] startup leg user=%s attempt=%s leg=%s outcome=%s elapsed_ms=%d",
+            user_id[:8], _session_nonce[:8], name, outcome, elapsed_ms,
+        )
+
     _t0 = time.monotonic()
     _openai_t = asyncio.create_task(_connect_openai())
     _session_t = asyncio.create_task(_session_step())
     _instructions_t = asyncio.create_task(_instructions_step())
+    if use_live:
+        _session_t.add_done_callback(
+            lambda task: _record_live_leg("session", _t0, task)
+        )
+        _instructions_t.add_done_callback(
+            lambda task: _record_live_leg("context", _t0, task)
+        )
     _tools_t = asyncio.create_task(_tools_step())
     _health_t = asyncio.create_task(_health_step())
     _lang_t = asyncio.create_task(_lang_step())
@@ -4047,8 +4836,25 @@ async def realtime_voice_ws(
 
     db_session_id: Optional[str] = None
 
+    # ── Voice presence, hoisted ABOVE the protocol fork ──────────────────
+    # These three used to be declared with the Realtime message loop's state,
+    # several hundred lines below — i.e. after the `if use_live:` block returns.
+    # On Live nothing held the app-reported mission, so the Lock-Screen card
+    # could claim "Listening…" forever after a force-quit, and `_defer_voice_la_end`
+    # was unreachable. Both protocols now share one owner.
+    #
+    # A dict so the two Realtime relay loops (and the Live relay, which takes it
+    # as an argument) close over ONE slot.
+    voice_activity_mission: dict = {"id": None}
+    # A clean client 'stop' means the call ENDED — no successor is coming and
+    # the card should die immediately, no grace.
+    got_stop: dict = {"v": False}
+
     # ── 5. OpenAI connect — the critical path ─────────────────
-    await _status("connecting_ai")
+    if not await _status("connecting_ai") and use_live:
+        _cancel_bg()
+        await _close_failed_live_status()
+        return
     # Realtime API voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar
     # V2 defaults to marin — the GA-new voice OpenAI documents as its most
     # natural (with cedar); clients can still request any valid voice.
@@ -4056,10 +4862,21 @@ async def realtime_voice_ws(
     openai_ws = None
 
     try:
-        openai_ws = await _openai_t
-        logger.info("[REALTIME] Connected to OpenAI Realtime API (+%.0fms)", (time.monotonic() - _t0) * 1000)
+        openai_ws = await asyncio.wait_for(
+            _openai_t,
+            timeout=max(0.001, _live_ready_deadline - time.monotonic())
+            if use_live else None,
+        )
+        logger.info(
+            "[REALTIME] Connected to OpenAI %s API (+%.0fms)",
+            "Live" if use_live else "Realtime",
+            (time.monotonic() - _t0) * 1000,
+        )
+        # The voice-presence claim is NOT made here. See the two claim sites
+        # below (one per protocol), and the comment on the Live one.
     except Exception as e:
         _cancel_bg()
+        _clear_live_attempt()
         logger.exception("[REALTIME] Failed to connect to OpenAI")
         err_str = str(e).lower()
         is_billing = any(kw in err_str for kw in ["quota", "billing", "rate_limit", "402", "429", "credit", "balance"])
@@ -4083,6 +4900,149 @@ async def realtime_voice_ws(
             )
         await websocket.send_json(error_payload)
         await websocket.close(code=4502)
+        return
+
+    if use_live:
+        # An older provider connect may finish after Manual Retry has opened a
+        # newer socket. It must not steal that socket's Live Activity owner.
+        if _live_connect_latest.get(user_id) != _session_nonce:
+            _cancel_bg()
+            await asyncio.gather(*_bg_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(openai_ws.close(), timeout=1.0)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(websocket.close(code=1000), timeout=1.0)
+            except Exception:
+                pass
+            return
+        # Live startup fields are immutable, so unlike Realtime's fast stub +
+        # session.update path we must have the personalized prompt before
+        # session.start.  The provider socket and context/session work were
+        # still fanned out in parallel above.
+        try:
+            if not await _status("restoring_context"):
+                raise _LiveStartupUnavailable("client_closed")
+            if _live_connect_latest.get(user_id) != _session_nonce:
+                raise _LiveStartupUnavailable("superseded")
+            # Claim only after a status frame reaches this socket. A stale
+            # socket discovered during provider connect must never replace
+            # the newer call's owner even briefly.
+            _voice_session_owner[user_id] = _session_nonce
+            try:
+                db_session_id, live_instructions = await asyncio.wait_for(
+                    asyncio.gather(_session_t, _instructions_t),
+                    timeout=min(
+                        _LIVE_STARTUP_CONTEXT_BUDGET_S,
+                        max(0.001, _live_ready_deadline - time.monotonic()),
+                    ),
+                )
+            except asyncio.TimeoutError as exc:
+                session_outcome, session_ms = _live_leg_outcomes["session"]
+                context_outcome, context_ms = _live_leg_outcomes["context"]
+                if session_outcome == "pending":
+                    session_outcome = _live_leg_outcome(_session_t)
+                    session_ms = int((time.monotonic() - _t0) * 1000)
+                if context_outcome == "pending":
+                    context_outcome = _live_leg_outcome(_instructions_t)
+                    context_ms = int((time.monotonic() - _t0) * 1000)
+                logger.warning(
+                    "[LIVE] context deadline user=%s attempt=%s "
+                    "session=%s session_ms=%d context=%s context_ms=%d",
+                    user_id[:8], _session_nonce[:8],
+                    session_outcome, session_ms, context_outcome, context_ms,
+                )
+                raise _LiveStartupUnavailable("deadline") from exc
+            if not db_session_id:
+                raise _LiveStartupUnavailable("durable_session")
+            if not live_instructions:
+                raise _LiveStartupUnavailable("personal_context")
+            for _unused in (_tools_t, _lang_t):
+                _unused.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(_tools_t, _lang_t, return_exceptions=True),
+                    timeout=0.5,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[LIVE] optional startup task cancellation timed out")
+            if _live_connect_latest.get(user_id) != _session_nonce:
+                raise _LiveStartupUnavailable("superseded")
+            from app.services.live_voice_protocol import run_live_voice_session
+            await run_live_voice_session(
+                websocket=websocket,
+                provider_ws=openai_ws,
+                user_id=user_id,
+                using_platform_key=using_platform_key,
+                db_session_id=db_session_id,
+                instructions=live_instructions,
+                requested_voice=settings.voice_live_default_voice,
+                voice_activity=voice_activity_mission,
+                got_stop=got_stop,
+                accept_monotonic=_accept_monotonic,
+                startup_deadline_monotonic=_live_ready_deadline,
+                # The user's pin, computed here because this branch returns
+                # long before `_pinned_lang` below. REPLY language only (§G):
+                # Live never pins transcription.
+                language_pin=lang if lang in _VOICE_LANG_PINS else None,
+            )
+        except _LiveStartupUnavailable as exc:
+            cause = str(exc)
+            await _live_startup_error(cause)
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.exception("[LIVE] relay failed")
+            try:
+                await websocket.send_json({
+                    "type": "error",
+                    "code": "live_relay_error",
+                    # This socket is being torn down in the `finally` directly
+                    # below, so the session cannot continue (C5.6). The user
+                    # reopens it; the frame is not a retry hint.
+                    "recoverable": False,
+                    # DELETE THIS `message` once build 129 is no longer
+                    # installable; build 130+ localises the code.
+                    "message": "Voice disconnected. Tap the orb to try again.",
+                })
+            except Exception:
+                pass
+        finally:
+            _clear_live_attempt()
+            # Manual Retry closes the prior socket. Never leave its session,
+            # context or health reads running into another provider attempt.
+            _cancel_bg()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_bg_tasks, return_exceptions=True),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[LIVE] startup background cancellation timed out")
+            try:
+                await asyncio.wait_for(openai_ws.close(), timeout=1.0)
+            except Exception:
+                pass
+            # `LiveSession.send` may discover a dead downstream socket before
+            # Starlette's receive loop does. Without an explicit close, the
+            # phone waits for the 20s+20s WebSocket keepalive timeout and shows
+            # no response while the detached job continues. A close of an
+            # already disconnected socket is harmless and best-effort.
+            try:
+                await asyncio.wait_for(
+                    websocket.close(code=1000 if got_stop["v"] else 1011),
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
+            # The island/Lock-Screen card must not outlive the CALL. Same rule
+            # as the Realtime teardown: detached, after a grace, and only if no
+            # newer session has taken ownership — except on a clean 'stop',
+            # where no successor is coming.
+            _defer_voice_la_end(
+                user_id, voice_activity_mission["id"], _session_nonce, got_stop["v"],
+            )
         return
 
     # ── 6. Configure session: cached-or-base config now, full context behind ──
@@ -4457,17 +5417,15 @@ async def realtime_voice_ws(
     speech_stopped_at: dict = {"t": 0.0}
     first_audio_of_response: dict = {"pending": False}
 
-    # The app-reported Live Activity mission for THIS call (config frame).
-    # A dict so both relay loops close over one slot.
-    voice_activity_mission: dict = {"id": None}
-    # This session now owns the user's voice presence; a reconnect that opens
-    # a newer session takes the ownership with it, and the finally checks
-    # before ending the island card (see _defer_voice_la_end).
-    _session_nonce = str(uuid.uuid4())
+    # `voice_activity_mission`, `_session_nonce` and `got_stop` are declared
+    # above the protocol fork so the Live branch shares them.
+    #
+    # The CLAIM stays here, at its pre-round-48 position: everything above it
+    # on this path returns without ending a Live Activity card (the session
+    # config failure and the `ready` send failure both do), and an owner entry
+    # written by a session that never ends a card is how a concurrently live
+    # call loses the right to end its own.
     _voice_session_owner[user_id] = _session_nonce
-    # A clean client 'stop' means the call ENDED — no successor is coming and
-    # the card should die immediately, no grace.
-    got_stop: dict = {"v": False}
 
     # Transcript/history writes share ordering but do not share the provider
     # reader's latency budget. Values are copied at enqueue time so a later
@@ -4785,7 +5743,8 @@ async def realtime_voice_ws(
                     # know the new title, not announce it. Announcing every
                     # station advance mid-call would be unbearable.
                     _np_title = str(msg.get("title") or "").strip()[:200]
-                    if _np_title:
+                    _np_note = _now_playing_note(_np_title, str(msg.get("state") or ""))
+                    if _np_note:
                         try:
                             await lifecycle.send_event({
                                 "type": "conversation.item.create",
@@ -4794,15 +5753,11 @@ async def realtime_voice_ws(
                                     "role": "user",
                                     "content": [{
                                         "type": "input_text",
-                                        "text": (
-                                            f"[System note, do not reply: the music moved on. "
-                                            f"Now playing: {_np_title}. If asked what is playing, "
-                                            f"say this.]"
-                                        ),
+                                        "text": _np_note,
                                     }],
                                 },
                             })
-                            logger.info("[REALTIME] now_playing → %s", _np_title[:60])
+                            logger.info("[REALTIME] now_playing → %s", _np_title[:60] or "stopped")
                         except Exception as e:  # noqa: BLE001
                             logger.warning("[REALTIME] now_playing inject failed: %s", e)
 

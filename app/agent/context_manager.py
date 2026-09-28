@@ -22,8 +22,10 @@ CHARS_PER_TOKEN = 4
 # Model context windows (tokens)
 MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
     "gpt-5.5": 1_050_000,
-    # gpt-5.6 family — 1M window (G1 prep; bare "gpt-5.6" included so a
-    # tier-less id budgets correctly instead of the 128k default).
+    # GPT-6 Sol advertises 1.05M. Keep the established GPT-5.6 1M budget
+    # for pinned tenants so this migration does not change their compaction
+    # threshold; bare "gpt-5.6" also uses that established budget.
+    "gpt-6-sol": 1_050_000,
     "gpt-5.6-terra": 1_000_000,
     "gpt-5.6-sol": 1_000_000,
     "gpt-5.6-luna": 1_000_000,

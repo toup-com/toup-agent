@@ -146,6 +146,20 @@ FAMILIES: Dict[str, _Family] = {
             "the software-engineering toolkit (specs, scaffolds, reviews)",
             skills=("toup",),
         ),
+        _Family(
+            "desktop",
+            "Toup for Mac (reading files, running commands and operating "
+            "the user's own computer)",
+            # The family exists so a plan or a tenant can withhold the whole
+            # capability CACHE-STABLY, which is the §2.6 answer to "I don't
+            # want this at all". It is not the launch gate: that is
+            # `settings.desktop_relay_enabled` in `skill_enabled` below, and
+            # the two are orthogonal in the same way `app_html_enabled` and
+            # the `app_builder` family are. A family withheld here also
+            # gives `refusal_for_tool` wording for a call that arrives some
+            # other way (a replayed tool_use block, a hallucinated name).
+            skills=("desktop",),
+        ),
     )
 }
 
@@ -320,6 +334,22 @@ def skill_enabled(skill_name: str) -> bool:
     if skill_name == "automations":
         from app.config import settings
         if not getattr(settings, "automations_enabled", False):
+            return False
+    # Toup for Mac: the same dark-launch shape, and for the same reason.
+    # Resolved per process from a settings default of False, so merging this
+    # work leaves every tenant's wire array byte-identical — the 13
+    # `desktop__*` defs are absent, the skill's system-prompt section is
+    # absent, and its execution path is absent, together.
+    #
+    # ⚠️ This is the ONLY gate that may vary here. Never add a condition on
+    # whether a Mac is currently paired or online: presence flips every time
+    # a lid closes, and a tools array keyed on it forks the provider cache
+    # several times an hour (the module docstring above, and
+    # `prefix_stability.py:1-28`). Availability is decided at EXECUTION time
+    # in the skill's `_require_device`.
+    if skill_name == "desktop":
+        from app.config import settings
+        if not getattr(settings, "desktop_relay_enabled", False):
             return False
     if skill_name in _EXPO_PIPELINE_SKILLS and not pipeline_enabled("expo"):
         return False

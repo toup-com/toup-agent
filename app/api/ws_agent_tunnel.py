@@ -460,12 +460,13 @@ async def _push_latest_config(tunnel: TunnelConnection) -> bool:
             if not config:
                 return True
 
-            from app.api.agent_setup import _build_env, _automations_env_flag
+            from app.api.agent_setup import _build_env, _automations_env_flag, _desktop_env_flag
 
             env = _build_env(
                 config,
                 tunnel.user_id,
                 automations_enabled=await _automations_env_flag(tunnel.user_id),
+                desktop_relay_enabled=await _desktop_env_flag(tunnel.user_id),
             )
             if not await _send_current_control(
                 tunnel, {"type": "config_update", "env_content": env},

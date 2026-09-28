@@ -14,6 +14,9 @@ to providers directly.
 import asyncio
 import hashlib
 import logging
+import os
+import re
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -352,12 +355,15 @@ def _calc_cost_cents(
     cached = min(max(int(cached_tokens or 0), 0), input_tokens) if cached_rate is not None else 0
     written = min(max(int(cache_write_tokens or 0), 0), input_tokens - cached) if write_rate is not None else 0
     base_input = input_tokens - cached - written
+    from app.services.model_resolver import long_context_price_multipliers
+    input_mult, output_mult = long_context_price_multipliers(model, input_tokens)
     cost_usd = (
         (base_input * pricing["input"] / 1000)
         + (cached * cached_rate / 1000 if cached else 0.0)
         + (written * write_rate / 1000 if written else 0.0)
-        + (output_tokens * pricing["output"] / 1000)
-    )
+    ) * input_mult + (
+        output_tokens * pricing["output"] / 1000
+    ) * output_mult
     return _never_higher_cents(cost_usd)
 
 
@@ -523,8 +529,19 @@ async def _log_event(
     cached_tokens: Optional[int] = None,
     cache_write_tokens: Optional[int] = None,
     channel: Optional[str] = None,
+    wire_suffix: str = "",
 ):
     """Log an LLM usage event.
+
+    `wire_suffix` (R48): a pre-rendered ` rid=… trace=…` fragment appended
+    to the `llm_proxy` summary line so that line joins the two [CACHE]
+    lines of the same request. Built by `_wire_join_suffix`, which returns
+    `""` unless wire observability is on for the user — so the default and
+    every caller that does not pass it leave the summary line
+    byte-identical to R47. It is a string rather than the ids themselves
+    because the gate belongs to one function: a second `if flag` here
+    could drift out of step with the [CACHE] lines and produce a summary
+    line nothing can join to.
 
     `channel` (alembic 082): the surface the turn came from, sanitized by
     `_sanitize_channel` — see there for why this is not validated against
@@ -658,10 +675,10 @@ async def _log_event(
         # cost_cents is a Decimal since R-3 and is usually SUB-CENT; %d
         # truncates toward zero, so every fractional call logged as 0 —
         # the exact class of call the floor removal exists to record.
-        "cached=%d cost_cents=%s latency=%dms fallback=%s status=%s op=%s",
+        "cached=%d cost_cents=%s latency=%dms fallback=%s status=%s op=%s%s",
         user_id[:8], provider, model, input_tokens, output_tokens,
         cached_tokens or 0, cost_cents, latency_ms, was_fallback, status,
-        operation_type or "user",
+        operation_type or "user", wire_suffix,
     )
 
 
@@ -795,11 +812,32 @@ class OpenAIBackend(LLMBackend):
                 },
             )
 
-    async def responses_stream(self, body: dict, api_key: str):
+    async def responses_stream(self, body: dict, api_key: str,
+                               meta: Optional[dict] = None):
         """Streaming /v1/responses passthrough. Unlike chat_stream we do
         NOT inject stream_options — Responses streams always carry usage in
         the response.completed event (their stream_options only controls
-        obfuscation); any client-sent value is forwarded untouched."""
+        obfuscation); any client-sent value is forwarded untouched.
+
+        R48: `meta`, when given, receives the upstream's opaque
+        `x-request-id` under "request_id" the moment the response headers
+        land. The httpx response object never leaves this generator — which
+        is precisely why that id had no reader outside a DEBUG dump nobody
+        enables, and why no slow turn could be joined to OpenAI's own trace.
+        An out-parameter rather than a return value because this is an async
+        generator; the handler pre-pulls the first chunk before it returns
+        its StreamingResponse, so by the time anything reads `meta` the
+        generator has already run past this line. A caller that passes
+        nothing gets byte-identical behaviour.
+
+        The write sits ABOVE the status check on purpose (R48 review, N6):
+        a 4xx/5xx is precisely the response an OpenAI escalation needs the
+        id for, and raising first left the handler's UpstreamProviderError
+        WARNING with nothing to quote. It is also above `aiter_bytes()` for
+        a second reason — on a client disconnect the body loop never
+        completes, and a `meta` written after it would be empty on exactly
+        the turns worth investigating (`test_meta_is_written_before_any_body_byte`).
+        """
         body["stream"] = True
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(
@@ -811,6 +849,8 @@ class OpenAIBackend(LLMBackend):
                     "content-type": "application/json",
                 },
             ) as resp:
+                if meta is not None:
+                    meta["request_id"] = resp.headers.get("x-request-id") or ""
                 if resp.status_code >= 400:
                     body_bytes = await resp.aread()
                     raise UpstreamProviderError(resp.status_code, body_bytes, "openai")
@@ -1163,6 +1203,45 @@ def _extract_openai_usage(raw_bytes: bytes) -> tuple[int, int, int]:
     return input_tokens, output_tokens, cached_tokens
 
 
+# ── Log-atom allowlist ───────────────────────────────────────────────
+# One shared shape for every value this module prints that it did not
+# author: a single run of printable, non-space ASCII. It is the same
+# discipline as `_wire_trace_header` and `_wire_req_id` below, hoisted
+# here because `_cache_log_fields` needs it and runs before them.
+#
+# What it is for, exactly: a `\n` inside a logged value ends the real
+# line and starts a line of the SENDER's composition in a shared,
+# two-replica platform log stream. That is a log-forgery primitive, and
+# the [CACHE] lines are the substrate of gates G7/G8 — a forged line
+# makes either of them count a request that never happened.
+#
+# Deliberately WIDE (any printable non-space ASCII) rather than a closed
+# vocabulary: these fields report values that legitimately change without
+# our involvement (a new retention spelling, a new provider id format),
+# and a value we have never seen should still be REPORTED rather than
+# silently read as absent. What it rejects is the log-structure set —
+# newline, carriage return, tab, space, NUL, every other control
+# character, and anything longer than the caller's bound.
+#
+# Rejection renders the vocabulary word `invalid` and echoes NOTHING of
+# the rejected value: not a prefix, not its length, not a `%r`. Quoting
+# an attacker-supplied string into the line is the bug the validation
+# exists to prevent.
+_LOG_ATOM_RE = re.compile(r"\A[\x21-\x7e]+\Z")
+
+
+def _log_atom(value, *, max_len: int, fallback: str = "invalid") -> str:
+    """`value` if it is one printable ASCII token within `max_len`, else `fallback`.
+
+    The length guard runs BEFORE the regex so a megabyte of body field
+    costs a `len()` and not a scan (the same ordering, and the same
+    reason, as `_wire_trace_header`'s 12-char guard).
+    """
+    if not isinstance(value, str) or not value or len(value) > max_len:
+        return fallback
+    return value if _LOG_ATOM_RE.match(value) else fallback
+
+
 # ── Cache observability (W0.2b) ──────────────────────────────────────
 # Read-only [CACHE] log lines that make OpenAI prompt-cache behavior
 # auditable per call: retention="24h" is verified sent end-to-end yet
@@ -1178,12 +1257,514 @@ def _cache_log_fields(body: dict) -> tuple[bool, str, str]:
     Returns (has_cache_key, key_hash_8, retention). The prompt_cache_key
     itself is NEVER logged — only a stable 8-char sha256 prefix so calls
     that should share a cache entry can be correlated across log lines.
+
+    `retention` reports whichever cache-lifetime control the body actually
+    carries, because the two spellings belong to different model
+    generations and the fleet will cross between them:
+
+      * `prompt_cache_retention` (pre-GPT-5.6) → reported verbatim, e.g. 24h
+      * `prompt_cache_options.ttl` (GPT-5.6+)  → reported as `opt:30m`
+
+    R48: this function read ONLY the legacy key, so the day the agent starts
+    sending `prompt_cache_options` this line would have printed
+    `retention=none` for every migrated request — the instrument that has to
+    verify the migration going dark exactly on the migration, and reading as
+    "the fleet stopped asking for retention" rather than "the fleet moved".
+    The legacy field wins when both are present: that is the one the request
+    is actually sending to a pre-5.6 model, and a body carrying both is a
+    bug we would want to see as the legacy value it will be billed under.
+
+    `retention` IS A CLIENT-SUPPLIED BODY STRING on both routes, so it goes
+    out through `_log_atom` (FINAL review round 2, BLOCKING-1). Before that
+    guard, `prompt_cache_options.ttl` — the route this patch ADDED — was
+    rendered with an f-string and no check of any kind, so
+    `{"ttl": "5m\\n[CACHE] user=deadbeef …"}` put a well-formed forged
+    `[CACHE]` line into the platform stream, and `{"ttl": {"a": "b"}}`
+    produced `opt:{'a': 'b'}` — the exact wholesale-`str()` shape that made
+    `_tool_choice_kind` a blocking finding one round earlier. The legacy
+    `prompt_cache_retention` route had the same hole at `4f0e9fe1` and is
+    closed by the same call. Reproduced at unit and handler level before
+    the fix; see the mutation set in the NOTES.
+
+    A rejected value renders `retention=invalid`, which is also how an
+    operator learns a caller is sending something that is not a TTL —
+    `none` would have hidden it. Every real spelling (`24h`, `opt:30m`,
+    `opt:1h`) is a printable ASCII token well under 32 characters and is
+    reported verbatim, so no line the fleet produces today changes.
+
+    NOT closed by this, and the [CACHE] line's remaining caller-written
+    field: `model=`. It is rendered raw at 21 `model=%s` sites in this
+    module — all four [CACHE] lines, the `llm_proxy` summary, three
+    `[credits]` lines, both `[LLM-PROXY]` upstream WARNINGs, the
+    dedup/cap/prune warnings and the DEBUG header dump — all PRE-EXISTING
+    at `4f0e9fe1`, and closing only the [CACHE] four would leave the class
+    open through the other 17 while looking closed. Four of the 21 are
+    inside `_log_event`, which embeddings, images, kie and internal_llm
+    also call, so a full fix is a behaviour delta outside a log-only
+    patch's envelope. `/responses` only requires
+    `str(model).lower().startswith(("gpt","o1","o3","o4"))`, which
+    `"gpt-5.6\\n[CACHE] …"` satisfies. Consequence, stated where it
+    matters rather than only in a document: **G7/G8 rows are
+    caller-influenced** — by the holder of that tenant's own agent token,
+    so this is a self-corruption risk for one tenant's own series, not a
+    cross-tenant one. `test_the_model_field_is_still_caller_written_pinned`
+    executes that residual and fails the day someone closes it.
     """
     key = body.get("prompt_cache_key")
     has_key = isinstance(key, str) and bool(key)
     key_hash = hashlib.sha256(key.encode()).hexdigest()[:8] if has_key else "none"
-    retention = body.get("prompt_cache_retention") or "none"
-    return has_key, key_hash, str(retention)
+    retention = body.get("prompt_cache_retention")
+    if not retention:
+        opts = body.get("prompt_cache_options")
+        ttl = opts.get("ttl") if isinstance(opts, dict) else None
+        retention = f"opt:{ttl}" if ttl else None
+    return has_key, key_hash, _log_atom(str(retention or "none"), max_len=32)
+
+
+# ── R48 wire observability (log-only) ────────────────────────────────
+# What the PROVIDER received, as opposed to what the agent believes it
+# sent. Everything below is read-only over the already-assembled outbound
+# body: no request or response byte changes, no llm_proxy_events column.
+#
+# WHAT THIS CAN AND CANNOT JOIN — read before building anything on it.
+#   * `rid` joins the THREE PLATFORM LINES of one request to each other
+#     (request-side [CACHE], usage-side [CACHE], `llm_proxy` summary).
+#     It is platform-local: it is generated here and is NOT returned to
+#     the agent in any header or body field, so it does not join the
+#     agent's `[PERF]` lines to these.
+#   * `trace` joins an agent line to these IF AND ONLY IF the agent sends
+#     the `x-toup-trace` header. Nothing in the deployed agent
+#     (166b835e) sends it — that half is a separate patch
+#     (`g-llm-trace-header`) and until it ships every line here reads
+#     `trace=-` and there is NO agent↔platform join.
+#   * `req_id` is the provider's own opaque id. It joins a platform line
+#     to an OpenAI support escalation; it is not a token the agent or
+#     the browser ever sees.
+# There is therefore no single value spanning agent → platform → OpenAI
+# today. Anything that needs one needs BOTH this patch and the agent half.
+
+# `x-toup-trace`: the agent's own turn marker, in the one shape the agent
+# already computes — `<cmid_h>.<iteration>`, where `cmid_h` is
+# `app/api/_turn_trace.py::cmid_hash` (FNV-1a/32, always exactly 8
+# lowercase hex) and the iteration is the turn's tool-loop index, bounded
+# well under 1000 by `agent_max_tool_iterations` (40 at 166b835e). So the
+# pattern is the contract, not a guess at one. Note the consequence: if
+# that ceiling is ever raised above 999 the header silently becomes `-`
+# here. Validated, never parsed for meaning — this side never splits it,
+# never hashes it and never reads an iteration out of it.
+#
+# NOTHING IN THE DEPLOYED AGENT SENDS THIS HEADER (grepped at 166b835e).
+# The producer is a separate patch (`g-llm-trace-header`); until it ships
+# every line reads `trace=-`.
+#
+# `\A…\Z`, not `^…$`: in Python `$` also matches just before a trailing
+# newline, so `^…$` would accept "a1b2c3d4.7\n" and that value is a log
+# FORGERY primitive — it would end the [CACHE] line and start a line of
+# the sender's own composition in the platform's log stream. A bare `$`
+# here is the whole vulnerability. (Starlette/h11 reject a header value
+# containing a newline before it reaches us today, so this is defence in
+# depth behind a wall someone else owns — an ASGI server swap, or a
+# future non-HTTP caller, and this validator is the only one left. The
+# cheapest place to be right is the validator itself.)
+_TRACE_RE = re.compile(r"\A[0-9a-f]{8}\.[0-9]{1,3}\Z")
+_TRACE_MAX_LEN = 12  # 8 + 1 + 3, the longest string the pattern accepts
+
+# `req_id` is the PROVIDER's opaque `x-request-id`, not ours, so the same
+# rule applies to it as to anything else we did not author: a value that
+# could carry a line break must not reach a shared log stream unchecked
+# (R48 FINAL review, N5 — the same class as B2). httpx/h11 reject a
+# control character in a response header today, so this is defence in
+# depth behind someone else's wall; the shape is deliberately WIDE (any
+# run of printable, non-space ASCII up to 128 chars) so a provider that
+# changes its id format keeps being reported rather than silently reading
+# `-`, while every log-structure primitive — newline, carriage return,
+# tab, space, NUL — is rejected.
+_REQ_ID_RE = re.compile(r"\A[\x21-\x7e]{1,128}\Z")
+
+
+def _wire_req_id(raw) -> str:
+    """The provider's `x-request-id`, or `-` if it is absent or unsafe."""
+    if not isinstance(raw, str) or not raw:
+        return "-"
+    return raw if _REQ_ID_RE.match(raw) else "-"
+
+
+def _wire_trace_header(headers) -> str:
+    """The validated inbound `x-toup-trace`, or `-`.
+
+    ALLOWLIST, not sanitisation: a value that does not match the exact
+    shape is discarded here and never reaches a log line, a metric, an
+    exception message or the upstream request. Nothing about the
+    rejected value is echoed — not a prefix, not its length, not a
+    "malformed: %r" — because an attacker-supplied string quoted into a
+    log line is the log-forging bug the validation exists to prevent, and
+    because the header is un-authenticated by construction (the agent
+    token authenticates the CALLER, not this field's contents).
+
+    `-` therefore means "absent OR rejected" and those two are
+    deliberately indistinguishable in the log.
+    """
+    try:
+        raw = headers.get("x-toup-trace")
+    except Exception:
+        return "-"
+    if not isinstance(raw, str) or not raw or len(raw) > _TRACE_MAX_LEN:
+        return "-"
+    return raw if _TRACE_RE.match(raw) else "-"
+
+
+def _new_request_rid() -> str:
+    """A per-request opaque join id: 8 hex characters, 4 random bytes.
+
+    Carries no user data, no time, no counter — it is a random label whose
+    only job is to make the three platform log lines of ONE request
+    joinable. `cache_key_hash` + `tools_sha` is a COHORT key, not a unique
+    one: two concurrent requests from the same user with the same body
+    (an ordinary event — `subagent.py:129` starts child runs with
+    `asyncio.create_task`, `cache_warm` is a third producer, and
+    platform-api runs two replicas into one log stream) produce four lines
+    carrying identical cohort keys, and pairing them by adjacency is then
+    a coin flip that reads like a measurement.
+
+    32 bits is not a uniqueness guarantee, and is not meant to be: the
+    join is only ever performed inside one short log window for one user,
+    where a collision needs two of the handful of concurrent requests to
+    draw the same 4 bytes. Two lines that disagree about `tools_n` under
+    one `rid` are a visible collision; a silent adjacency mis-join is not.
+
+    `secrets` rather than `random`: the value is printed in a shared log
+    stream, and a predictable per-request label in a multi-tenant log is
+    free information nobody asked to publish. The cost is one
+    `os.urandom(4)` — LOCAL 0.95 µs, 200k iterations, unloaded laptop.
+    """
+    return secrets.token_hex(4)
+
+
+def _wire_observability_on(user_id: Optional[str]) -> bool:
+    """Whether R48's wire fields ride this request's [CACHE] lines.
+
+    Global flag OR a comma-separated canary allowlist of full user ids —
+    the same shape `stable_prefix_enabled` uses on the agent side, and for
+    the same reason: a fleet-wide flag is the wrong first move for a field
+    that canonically re-serialises the forwarded tools array on the event
+    loop of a shared, CPU-capped replica (0.57 ms p50 for 128 tools /
+    112 KB on an unloaded laptop; the container's factor is unmeasured).
+
+    Parsed per call, and deliberately NOT memoised on this function or on
+    the module. `/admin/bind` can re-point a process at another tenant, and
+    a memo that outlives the bind is a tenant-isolation bug; a set
+    comprehension over a handful of ids is not worth that class of risk.
+    """
+    if getattr(settings, "llm_proxy_wire_observability", False):
+        return True
+    raw = getattr(settings, "llm_proxy_wire_observability_canary_user_ids", "") or ""
+    if not raw or not user_id:
+        return False
+    return user_id in {u.strip() for u in raw.split(",") if u.strip()}
+
+
+def _tools_digest(tools) -> str:
+    """8-char sha256 of the FORWARDED tools array, canonically encoded.
+
+    NOT a digest of the literal outbound bytes, and must never be read as
+    one: httpx re-encodes `json=body` with its own separators, its own
+    `ensure_ascii` and the dict's insertion order. Canonicalising
+    (`sort_keys`) is the point — it makes two structurally identical arrays
+    hash equal, which is the only question this field exists to answer:
+    *did two requests offer the provider the same tools?*
+
+    One-way over bytes we already hold. No name, no description, no schema
+    fragment is recoverable from 8 hex characters, so this is loggable where
+    the arrays themselves are not.
+
+    The `encode` is INSIDE the try, and that placement is the whole point of
+    the try (R48 FINAL review, B1). `ensure_ascii=False` leaves any lone
+    surrogate in the string, `json.dumps` accepts one happily, and
+    `str.encode("utf-8")` then raises `UnicodeEncodeError` — a `ValueError`
+    subclass, so the clause below catches it. A lone surrogate reaches a
+    tools array by an ordinary route (`json.loads('"\\ud800"')` succeeds, so
+    a third-party MCP server mis-serialising UTF-16, or half an emoji pair,
+    produces one), and with the encode outside the try that raise left the
+    handler BEFORE the upstream call and lost the turn outright — a 500
+    caused by a telemetry field, in exactly the canary state this patch asks
+    to enter. `import json` is function-local to match this file's existing
+    convention (four other call sites do the same).
+    """
+    import json
+    if not isinstance(tools, list):
+        return "none"
+    try:
+        blob = json.dumps(tools, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False)
+        digest = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+    except TypeError:
+        # A value `json.dumps` cannot represent at all (a set, bytes, a
+        # custom object). A tools array like this would 400 upstream
+        # anyway; a telemetry field must not be the thing that raises.
+        return "unserialisable"
+    except ValueError:
+        # `json.dumps` accepted it and `encode` refused: a lone surrogate
+        # (the ordinary case — see above), or a circular reference, which
+        # raises ValueError from `dumps` itself. Split from the TypeError
+        # branch because the two have different owners: a surrogate is a
+        # third party's UTF-16 mis-serialisation, a TypeError is our own
+        # tool-definition assembly (FINAL review round 2, non-blocking 3).
+        return "unencodable"
+    return digest
+
+
+# The complete vocabulary `tc=` may print. Anything a client sends that is
+# not one of these renders as "other" — see `_tool_choice_kind`.
+_TC_WORDS = ("none", "auto", "required")
+
+
+def _tool_choice_kind(body: dict) -> str:
+    """`tc=` — the SHAPE of the forwarded tool_choice, never its names.
+
+    ALLOWLIST, the same discipline as `_wire_trace_header`, and for the same
+    reason (R48 FINAL review, B2). `tool_choice` is a CLIENT-SUPPLIED JSON
+    body field: before this was an allowlist, a string form was returned
+    VERBATIM and a dict's `type` was `str()`-ed wholesale, so an arbitrary
+    length, arbitrary bytes, NEWLINE-BEARING value went straight onto a
+    `[CACHE]` line in a shared multi-tenant log stream. One `\\n` ends the
+    real line and starts a well-formed forged one under any `user=` prefix
+    the sender likes, which corrupts exactly the two gates this patch exists
+    to feed (the `tools_sha`-per-lineage count and the request→usage `rid`
+    join). The h11 wall that rejects a newline in a HEADER value does not
+    apply to a JSON body field, so this validator is the only guard there is.
+
+    The complete output vocabulary, and nothing else can ever be printed:
+
+      `none`         tool_choice absent, or the literal string "none".
+                     (Those two are deliberately not distinguished — `tc=`
+                     reports the shape the cap sees, and both give the cap
+                     an empty protected set.)
+      `auto`         the literal string "auto".
+      `required`     the literal string "required".
+      `allowed:<n>`  an allowlist, printed as its SIZE — the number that
+                     moves between a turn's iterations. `<n>` is a `len()`,
+                     so it is an integer by construction.
+      `function`     a forced single call.
+      `other`        EVERYTHING else: an unknown string, a non-str `type`,
+                     a dict or list `type`, a number, a hostile payload.
+
+    Tool names themselves stay where they already are: the cap's WARN and
+    the prune's ERROR.
+
+    Shape matters here because `_requested_tool_names` derives the cap's
+    protected set from exactly this field, so it is the input that makes
+    `tools_sha` vary between two otherwise identical requests.
+    """
+    tc = body.get("tool_choice")
+    if tc is None:
+        return "none"
+    if isinstance(tc, str):
+        return tc if tc in _TC_WORDS else "other"
+    if not isinstance(tc, dict):
+        return "other"
+    kind = tc.get("type")
+    if kind == "allowed_tools":
+        container = tc["allowed_tools"] if isinstance(
+            tc.get("allowed_tools"), dict) else tc
+        entries = container.get("tools")
+        return "allowed:%d" % (len(entries) if isinstance(entries, list)
+                               else 0)
+    if kind == "function":
+        return "function"
+    return "other"
+
+
+def _wire_join_suffix(user_id: Optional[str], *, rid: str, trace: str) -> str:
+    """` rid=… trace=…`, or `""` when observability is off for this user.
+
+    The join prefix shared by every R48 line: the request-side [CACHE]
+    line, the usage-side [CACHE] line, the `llm_proxy` summary line, and
+    the upstream-error WARNING. Emitted FIRST inside every suffix so that
+    `grep rid=<x>` returns one request's whole trail regardless of which
+    line shape it lands on.
+
+    `trace` is the agent's marker when the agent sent one and `-`
+    otherwise — which is every request today, because no producer of
+    `x-toup-trace` exists in the deployed agent (166b835e). See the
+    section header above for what each id can and cannot join.
+    """
+    if not _wire_observability_on(user_id):
+        return ""
+    return " rid=%s trace=%s" % (rid or "-", trace or "-")
+
+
+def _wire_tools_suffix(body: dict, tools_sent: int,
+                       user_id: Optional[str], *,
+                       rid: str, trace: str) -> tuple[str, str]:
+    """`(suffix, tools_sha)` for a request-side [CACHE] line, or `("", "")`.
+
+    Call it with the body as it will go upstream — after dedup, after
+    `_cap_tools`, after `_prune_tool_choice` — because the pre-cap array is
+    the one the agent already fingerprints, and a stable PRE-cap hash says
+    nothing either way about what the wire carried.
+
+    What the cap does, stated exactly: `_cap_tools` derives its protected
+    set from THIS request's `tool_choice` (`_requested_tool_names`), so the
+    forwarded tools array is a function of `tool_choice` as well as of the
+    array the agent sent. PRODUCTION (supervisor E2, test account, three
+    gpt-5.6-terra requests on 2026-09-19/20): identical agent-side
+    fingerprints, identical `cache_key_hash=3c275b30`, all `174 > 128,
+    dropped 46 (namespace-fair)`, three DIFFERENT dropped lists, and
+    `cached=0` on all three — one of them 10 s after a 45,347-token cache
+    write. That is an observed coincidence of a wire-array fork with three
+    misses on one account, not a demonstration that caching cannot work
+    over 128 tools and not a claim that every over-cap turn must miss: a
+    partial-prefix hit up to the first differing tool, an unchanged
+    protected set across turns, and early eviction are all still open, and
+    the documented 30-minute retention is a MINIMUM lifetime rather than a
+    ceiling. `tools_sha` is what turns the open question into a count.
+
+    The digest comes back to the caller as well as onto the line so the
+    usage-side suffix can print the SAME value without re-serialising 112 KB
+    (R48 review, B1). Note what that pair is and is not: `cache_key_hash` +
+    `tools_sha` is a COHORT key — every request in a cohort shares it — so
+    it answers "were these two requests offering the same tools?" and NOT
+    "are these two lines the same request". `rid` is the unique-per-request
+    join (F6); the cohort key rides both lines so a cohort can still be
+    aggregated when one of its lines is missing.
+
+    `dropped_n` is the RAW `tools_sent - tools_n` and may be negative: it
+    counts dedup casualties as well as capped ones, and a converter that
+    ADDS tools would be an anomaly worth seeing rather than clamping to 0.
+    Two shapes to read correctly before blaming the cap:
+      * `tools_n=0 tools_sent=N dropped_n=N tools_sha=none` on `/chat` is the
+        Anthropic→OpenAI daily-cap fallback, not the cap:
+        `_anthropic_to_openai_request` builds its result with no `tools` key
+        at all while `_cap_tools` ran earlier against the PRE-fallback
+        backend. Literally correct for "the body going upstream", and a real
+        defect of that fallback (it strips every tool while the system prompt
+        keeps advertising them) — but it is not a cap casualty.
+      * `dropped_n` > 0 with `tools_sent` <= 128 is dedup alone.
+
+    The empty string when observability is off is what keeps the line
+    byte-identical to R47.
+    """
+    if not _wire_observability_on(user_id):
+        return "", ""
+    tools = body.get("tools")
+    tools_n = len(tools) if isinstance(tools, list) else 0
+    sha = _tools_digest(tools)
+    return (
+        _wire_join_suffix(user_id, rid=rid, trace=trace) +
+        " tools_n=%d tools_sha=%s tools_sent=%d dropped_n=%d tc=%s" % (
+            tools_n, sha, tools_sent,
+            tools_sent - tools_n, _tool_choice_kind(body),
+        ),
+        sha,
+    )
+
+
+def _wire_timing_suffix(user_id: Optional[str], *, rid: str, trace: str,
+                        req_id: str,
+                        cache_key_hash: str, tools_sha: str,
+                        body_ms: int, pre_ms: int, ttfb_ms: int,
+                        total_ms: int) -> str:
+    """The R48 suffix for the usage-side [CACHE] line, or "".
+
+    `req_id` is the provider's opaque `x-request-id`, passed through
+    `_wire_req_id` (printable non-space ASCII, <=128 chars, else `-`) for
+    the same reason `x-toup-trace` is allowlisted: it is a string we did
+    not author reaching a shared log stream. It joins THIS line to an
+    OpenAI support escalation about the same call. It carries no prompt
+    content, no model identity and no key material. `-` means the upstream
+    sent none, we never reached it, or what it sent was not a safe token.
+    It does NOT join anything to the agent: the agent never sees it.
+
+    `rid` is the platform-local per-request id and is the ONLY unique join
+    between this line and its own request-side line (F6). `cache_key_hash`
+    and `tools_sha` are repeats of the request line's values and are a
+    COHORT key: two concurrent requests from one user with the same body
+    share them exactly, so pairing on the cohort key — or worse, on log
+    adjacency — silently mis-joins, and a mis-joined answer to "does the
+    cap fork cost the cache?" is indistinguishable from a real one.
+    Concurrency here is ordinary, not hypothetical: `subagent.py:129`
+    starts child runs with `asyncio.create_task`, `cache_warm` is a third
+    producer, and platform-api runs two replicas into a single Railway
+    stream.
+
+    The split exists because `latency` has never been decomposable:
+    `start_ts` is stamped after auth, dedup, the tool cap, the credit
+    pre-flight and the budget check, so the proxy's own pre-work has always
+    been invisible, and everything from connect through the last token was
+    one scalar.
+
+      `body_ms`  the `await request.json()` call alone — the socket RECEIVE
+                 of the agent's request body (112,088 canonical bytes of
+                 tools alone on the sampled turn) plus its parse, over
+                 Contabo → Cloudflare → Railway. This is UPLOAD, not proxy
+                 work, and it is a sub-term of `pre_ms`; subtract it before
+                 attributing anything to the proxy. Without it a 250 ms
+                 `pre_ms` from a congested hop reads as platform-DB
+                 pre-work and sends the next round somewhere else entirely.
+      `pre_ms`   handler entry → `start_ts`, i.e. `body_ms` + auth SELECT +
+                 rate-limit check + dedup + cap + credit pre-flight +
+                 budget SELECT.
+      `ttfb_ms`  `start_ts` → the first upstream chunk (on the streaming path
+                 the same boundary `[req-timing]` reports, because the
+                 handler pre-pulls that chunk before returning the
+                 StreamingResponse). `-1` means "no first-chunk boundary
+                 exists" — the non-streaming path — and must never be
+                 averaged into the series.
+      `total_ms` the existing `latency`.
+
+    BLIND AREAS — the three things this split provably cannot see. Each of
+    them lands in the residual against `[req-timing]`, so a reconciliation
+    that does not subtract them is a false dichotomy rather than a check.
+
+      1. Everything before the handler BODY. `entry_mono` is the first
+         statement of `proxy_responses`, so the ASGI middleware chain,
+         CORS, FastAPI routing and `db: AsyncSession = Depends(get_db)` —
+         the platform session/connection acquire, resolved by FastAPI
+         before the first statement runs, on an engine that sets no
+         `pool_timeout` (SQLAlchemy's silent 30 s default) — appear here
+         as nothing at all. That is the exact term workstream A is
+         chasing. There is no `dep_ms` field because the timing
+         middleware's start stamp is NOT reachable from a handler:
+         `_t0` is a local of `_RequestTimingMiddleware.__call__`
+         (platform_main.py:1018) and is never written to `scope`,
+         `scope["state"]` or `request.state`. Publishing it would mean an
+         unconditional `scope` mutation on every HTTP request of the
+         shared platform process, which is outside this patch's
+         log-only/flag-gated envelope — and it would still not be "ASGI
+         entry", because `AttachmentBodyLimitMiddleware` (added later, so
+         mounted outside it) and Starlette's own `ServerErrorMiddleware`
+         both run before that stamp.
+      2. The `/openai/v1/chat/completions` wire has NO timing suffix at
+         all — only the request-side tools fields and the `rid`/`trace`
+         join. `gpt-5.6-*` is forced onto `/responses` by the resolver, so
+         the investigated turns are not on that wire; a turn that IS on it
+         has `total_ms` from the summary line and nothing finer.
+      3. `[req-timing]`, the only external clock to reconcile against, is
+         emitted only when its gate passes, and that gate has THREE
+         disjuncts, quoted from SOURCE at 4f0e9fe1
+         (platform_main.py:1035): `_dur_ms > 500 or
+         _p.startswith("/api/auth/") or "/agent-setup/config" in _p`.
+         `/api/llm/openai/v1/responses` matches none of the three, so for
+         THIS route the only live disjunct is the 500 ms one and the
+         reconciliation can be run on the slow tail alone — never on the
+         fast requests a p50 needs. (The third disjunct was omitted from an
+         earlier draft of this block; it changes nothing for `/api/llm/`,
+         and it is quoted in full here because a partial quote of a gate
+         reads as the whole gate to the next person.)
+
+    Log-only by construction: `llm_proxy_events` is the highest-insert-rate
+    table in the platform DB and R48 is not the round that migrates it.
+    """
+    if not _wire_observability_on(user_id):
+        return ""
+    return (
+        _wire_join_suffix(user_id, rid=rid, trace=trace) +
+        " req_id=%s cache_key_hash=%s tools_sha=%s"
+        " body_ms=%d pre_ms=%d ttfb_ms=%d total_ms=%d" % (
+            req_id or "-", cache_key_hash or "none", tools_sha or "none",
+            body_ms, pre_ms, ttfb_ms, total_ms,
+        )
+    )
 
 
 def _debug_log_upstream_cache_headers(headers, model: str) -> None:
@@ -1403,8 +1984,80 @@ def _namespace_of(name: str) -> str:
     return name.split("__", 1)[0] if "__" in name else ""
 
 
+#: Tools the overflow path may not reach until nothing else is left.
+#:
+#: `protected` is whatever the REQUEST named, which is the right thing to
+#: preserve and is also entirely under the caller's control — so when the
+#: allow-list itself overflows (see the R44 note in `_cap_tools`) the trim
+#: runs over exactly the names the caller cares about, namespace-fair and
+#: tail-first, with no idea which of them the PRODUCT cannot work without.
+#: Measured on the founder's tenant 2026-09-20: `play_media` was in the drop
+#: list on every unprotected round, so its survival on any given turn was
+#: positional luck. This floor is the small set for which that is not
+#: acceptable: music, the two web tools, day recall, and the memory surface
+#: the system prompt advertises by name on every turn.
+#:
+#: A floor entry that is not in the array costs nothing. Override with
+#: LLM_PROXY_PROTECTED_CORE_TOOLS (comma-separated) to widen or empty it
+#: without a deploy of new code.
+#:
+#: Exactly the five names the brief specifies, and no more. Every extra entry
+#: is one more name the floor can hold on the wire at the expense of a tool
+#: the REQUEST named — the trade `_cap_tools` makes below — so widening this
+#: set is not free and is not a judgement call to make while writing it.
+_PROTECTED_CORE_DEFAULT = (
+    "play_media", "web_search", "web_fetch", "recall_day", "memory_search",
+)
+
+
+def _protected_core_tools() -> frozenset:
+    raw = os.environ.get("LLM_PROXY_PROTECTED_CORE_TOOLS")
+    if raw is None:
+        return frozenset(_PROTECTED_CORE_DEFAULT)
+    return frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+#: Read once at import: the value has to be a constant for the process, or the
+#: kept ORDER stops being a pure function of the wire array and the provider's
+#: prefix cache re-forks on whatever changed the env.
+PROTECTED_CORE_TOOLS = _protected_core_tools()
+
+
+def _capped_hash(kept: list) -> str:
+    """Fingerprint of the array that actually goes upstream.
+
+    A3-6: `_cap_tools` reads `protected` from `tool_choice`, and the agent
+    builds `tool_choice` on iteration 0 only — so iteration 0 protected ~14
+    names and dropped 46, iteration 1 protected nothing and dropped a
+    DIFFERENT 46. Tools serialize ahead of system and history, so the whole
+    ~45k-token prefix was invalidated between round 1 and round 2 of every
+    over-128 turn (measured: the run whose array changed cached nothing on its
+    first two rounds; the run whose array did not, cached on all three).
+    Two rounds of one turn are comparable by eye only if the line carries a
+    digest — reconstructing the kept array from two drop lists is not
+    something anyone does at 2am.
+
+    V-5: the `kept_hash=` field this feeds is NOT comparable to the latency
+    programme's `tools_sha=`. Both digest a tools array and they canonicalise
+    it differently, so two equal arrays can print two different values and an
+    eyeball comparison across the two log lines will report a prefix re-fork
+    that did not happen. Compare `kept_hash=` only with `kept_hash=`."""
+    try:
+        # V-3: this file documents "no app.agent dependency by design", and
+        # this is the one exception. It stays inside the function (so importing
+        # llm_proxy never pulls app.agent), the target is stdlib-only, the
+        # whole thing is wrapped, and a failure degrades to "?" — a log line
+        # may never fail a request. Anything more than a pure hash here breaks
+        # that contract.
+        from app.agent.prefix_stability import tools_wire_hash
+        return tools_wire_hash(kept)[:12]
+    except Exception:  # noqa: BLE001 — a log line may never fail a request
+        return "?"
+
+
 def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
-               protected: Optional[set] = None) -> tuple[list, list]:
+               protected: Optional[set] = None,
+               floor: Optional[frozenset] = None) -> tuple[list, list]:
     """Fit an over-long tools array under `limit`. Returns (kept, dropped).
 
     This is a cliff, not a slope: at `limit` everything works and at
@@ -1430,9 +2083,12 @@ def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
 
     So the trim is now:
 
-      1. **`protected` is never dropped.** These are the tools the
-         request itself names (`tool_choice` / `allowed_tools`) —
-         dropping one guarantees a 400, which is the ND-22 path.
+      1. **`protected` is dropped LAST, and only to stay valid.** These
+         are the tools the request itself names (`tool_choice` /
+         `allowed_tools`) — dropping one costs a capability, which is
+         the ND-22 path. But an allow-list that alone exceeds the cap
+         cannot be honoured at all (see below), so "never" became
+         "last".
       2. **Every namespace keeps at least one tool.** A connector that
          is present at all stays reachable; the model can discover the
          rest is missing, but it cannot discover a connector that has
@@ -1442,6 +2098,51 @@ def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
          best afford it instead of landing entirely on whoever sorts
          last.
 
+    **R44: rule 1 used to be absolute, and that shipped an invalid
+    request.** (This block and the three-tier `_pick` below are the
+    change written on 2026-09-15 in the `toup-r44-fix` worktree,
+    adopted here verbatim except for the floor tier.) Measured on the
+    founder's tenant 2026-09-15: 173 tools wire, of which the voice
+    channel's intent filter allow-listed 130 (`[PERF] stable_tools:
+    wire=173 allowed=130 intent=code`). The loop dropped all 43
+    unprotected tools, reached `n_kept=130 > 128`, found no droppable
+    victim and `break`'d — leaving the array two OVER the cap.
+    `_prune_tool_choice` then pruned nothing, because no allow-listed
+    name had been dropped. So the request went upstream with 130 tools
+    AND a 130-entry allow-list, and OpenAI's Responses API answered
+    `400 invalid_request_error param=tool_choice.type "Invalid value:
+    'allowed_tools'"` — the union validator fails the allowed_tools
+    variant and reports the discriminator, which is why the error blames
+    `type` and not the array length. Three identical 400s per turn, then
+    the silent fallback to gpt-4o.
+
+    A too-long array is a guaranteed 400 for the whole turn; a trimmed
+    allow-list is a lost capability on one turn, announced twice (the
+    ERROR below and `_prune_tool_choice`'s CAPABILITY REMOVED). So
+    when the protected set alone overflows, the same namespace-fair
+    tail-first policy keeps running with protected names as candidates
+    until the array actually fits, and the trimmed names come back in
+    `dropped` so `_prune_tool_choice` takes them out of the allow-list
+    too. Deterministic for identical input — the prefix-cache lineage
+    depends on the kept order being a pure function of the wire array.
+
+    **R48 adds a third tier under that.** `floor` (see
+    `PROTECTED_CORE_TOOLS`) is the LAST thing the overflow path may
+    touch: allow-listed names are trimmed first, the floor only if the
+    floor alone still does not fit. Without it the R44 policy would have
+    trimmed `play_media` off the founder's voice turn, namespace-fair
+    and tail-first, which is the capability the whole round is about.
+
+    The floor applies in full only when the request names NOTHING — the
+    unrestricted retry, which is the round measured on 2026-09-20 and
+    the only one the floor was written for. When the request DOES carry
+    an allow-list the floor is intersected with it, because a floored
+    name the allow-list omits is not callable on that request: holding
+    it on the wire would evict an allow-listed tool that is, turning a
+    valid fully-honoured request into a CAPABILITY REMOVED. This
+    function runs for every user and every channel, so that trade has to
+    be strictly a gain.
+
     Still the least-bad truncation, not a good one. The real fix is per
     step tool selection at the agent, and the WARN below is what keeps
     that visible rather than silent.
@@ -1449,14 +2150,100 @@ def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
     if len(tools) <= limit:
         return tools, []
 
-    protected = protected or set()
+    floor = floor if floor is not None else PROTECTED_CORE_TOOLS
+    n_named = len(protected or ())
+    protected = set(protected or ())
+
+    # A request that RESTRICTS the callable set can only be helped by flooring
+    # names it can actually call. Under `allowed_tools`, a tool that is in the
+    # array but not in the allow-list is dead weight — the model may not call
+    # it — so holding it on the wire costs an allow-listed tool its place for
+    # nothing. Measured on this policy (wire 175, allow-list built to exclude
+    # the floor): allow-list 121 → 1 allow-listed tool lost, 124 → 4, 128 → 8,
+    # each one then announced by `_prune_tool_choice` as CAPABILITY REMOVED on
+    # a request that was previously valid and fully honoured. Reachable with
+    # the real gate: every non-`full` intent omits 1–3 floor names, so a `code`
+    # turn on a ~98-connector tenant forces a trim every time. The case the
+    # floor was actually written for — the unrestricted retry, which names
+    # nothing and where the cap trims purely by position — is untouched.
+    if protected:
+        floor = frozenset(floor) & protected
+    # What the trim may not touch at all, for the ERROR line below. These three
+    # are reported separately rather than summed: `floor` is a SUBSET of
+    # `protected` on a restricted request and disjoint from it on an
+    # unrestricted one, so one number cannot describe both.
+    n_floored = len(floor)
+    n_untrimmable = len(protected | set(floor))
+
+    # NOTE: the floor is NOT merged into `protected`. `_eligible`'s tier-0
+    # test is the single authoritative guard — it has to be, because a merged
+    # floor name would pass tier 1 (`if tier >= 1: return True`) and become
+    # trimmable one tier too early. Read the two together before editing
+    # either: a guard whose precondition something above it destroys is
+    # invisible to every check in this repo.
     keep_flags = [True] * len(tools)
     names = [_tool_name_of(t) for t in tools]
     spaces = [_namespace_of(n) for n in names]
 
-    # How many of each namespace are still in. Core tools (no `__`) are
-    # one namespace and are never the biggest by construction, but they
-    # are protected by rule 2 anyway.
+    # How many of each namespace are still in.
+    #
+    # R48 CORRECTION. The comment that stood here claimed un-namespaced
+    # tools can never be the largest namespace, and that rule 2 protects
+    # them anyway. Both halves are false, and together they invert rule 3.
+    #
+    # `_namespace_of` returns "" for every name without `__`, so ALL of
+    # those tools share ONE namespace here. Its membership is not just the
+    # static core definitions: it is the static core PLUS the un-namespaced
+    # first-party MCP tools the agent also offers. Counted 2026-09-20 by
+    # importing the shipped definitions at the deployed agent revision
+    # 166b835e, the static subset alone is 63 (get_agent_tools 31 +
+    # get_extended_tools 22 + get_doc_generation_tools 9 +
+    # get_navigation_tools 1, none of them namespaced), and the production
+    # WARN lines below add at least nine more names that are in none of
+    # those four functions (entity_search, graph_traverse, memory_remember,
+    # identity_get, …, all defined in the agent's app/mcp_server.py) — so
+    # the "" namespace is >= 72, not 63. Against a typical connector's ~10
+    # it is the LARGEST namespace by a wide margin on every account, so
+    # "drop from the largest namespace first" reads as "drop un-namespaced
+    # first" — and rule 2 does not protect them, it only guarantees the
+    # namespace keeps ONE tool. What holds SPECIFIC un-namespaced names is
+    # (rule 1) whatever THIS request's tool_choice names — the allow-list
+    # the agent sends on its first iteration, or a forced function — and,
+    # under that, the Voice programme's (PR 756) `floor` above
+    # (`PROTECTED_CORE_TOOLS`, five names by default). On a request that
+    # names nothing, those five are never trimmed while any other candidate
+    # remains. On a request that names anything (allow-list or forced
+    # function), the floor is intersected with what it names, so it holds
+    # nothing rule 1 does not already hold and only decides that those
+    # names are trimmed last if the named set alone overflows; every other
+    # floor name is an ordinary candidate.
+    #
+    # Measured in production on three of the founder's gpt-5.6-terra turns
+    # (2026-09-19 21:00, 21:00, 2026-09-20 04:07; each `174 > 128, dropped
+    # 46 (namespace-fair)`) — before the floor existed; it is not in
+    # 4f0e9fe1, and `recall_day`, one victim below, is now a floor name:
+    # every dropped name was UN-NAMESPACED, and not
+    # one namespaced connector tool was dropped on any of them. What "core"
+    # alone can claim is narrower and is the claim this comment makes: of
+    # the 51 distinct names dropped across the three, 42 are static core
+    # definitions (analyze_image, generate_image, edit_image, process, tts
+    # on one; recall_day, start_mission, create_job, update_job,
+    # navigate_to on the next) and the remaining 9 are first-party MCP
+    # tools that live in the same "" namespace. The system prompt meanwhile
+    # keeps advertising what the cap removed, which is the constrained
+    # decode failure class documented in query_intent.py.
+    #
+    # This correction deliberately changes NO selection logic. The two
+    # selection changes since it was written are the Voice programme's
+    # (PR 756), not this comment's: the R44 overflow tiers (named names
+    # trimmable last, only when they alone overflow) and the floor. Neither
+    # reorders namespaces, so for every name outside the floor "largest
+    # namespace first" still reads as "un-namespaced first". Which tools a
+    # turn should carry beyond that is a product decision with a known
+    # blocker (a naive "spare core" inversion gutted skills and connectors
+    # when it was simulated), and the first thing that decision needs is the
+    # `tools_sha` series this round adds — until then nobody can count how
+    # often, or for whom, the forwarded array actually differs.
     from collections import Counter
     remaining = Counter(spaces)
     n_kept = len(tools)
@@ -1467,32 +2254,81 @@ def _cap_tools(tools: list, limit: int = _OPENAI_MAX_TOOLS,
         range(len(tools)),
         key=lambda i: -i,          # tail first
     )
-    while n_kept > limit:
+
+    def _eligible(i: int, tier: int) -> bool:
+        """Tier 0: never named. Tier 1: named by the request. Tier 2: the
+        product floor. Each tier only WIDENS the candidate pool; the policy
+        (rule 2 first, then the flat tail) is identical in all three, so the
+        overflow path degrades the same way the ordinary one does."""
+        if tier >= 2:
+            return True
+        if names[i] in floor:
+            return False
+        if tier >= 1:
+            return True
+        return names[i] not in protected
+
+    def _pick(tier: int) -> Optional[int]:
         victim = None
         best_size = 0
         for i in order:
-            if not keep_flags[i]:
-                continue
-            if names[i] in protected:
+            if not keep_flags[i] or not _eligible(i, tier):
                 continue
             ns = spaces[i]
             if remaining[ns] <= 1:
                 continue           # rule 2: never empty a namespace
             if remaining[ns] > best_size:
                 best_size, victim = remaining[ns], i
+        if victim is not None:
+            return victim
+        # Every candidate is its namespace's last. Rule 2 yields — a
+        # 400 for everyone is worse than a degraded turn.
+        for i in order:
+            if keep_flags[i] and _eligible(i, tier):
+                return i
+        return None
+
+    trimmed_protected: list = []
+    trimmed_floor: list = []
+    while n_kept > limit:
+        victim = _pick(0)
         if victim is None:
-            # Every remaining tool is protected or is its namespace's
-            # last. Fall back to the old behaviour for the remainder —
-            # a 400 for everyone is worse than a degraded turn.
-            for i in order:
-                if keep_flags[i] and names[i] not in protected:
-                    victim = i
-                    break
+            # Nothing unnamed left and still over the cap: the allow-list
+            # alone exceeds `limit`. Keep trimming, allow-listed names first.
+            victim = _pick(1)
+            if victim is not None:
+                trimmed_protected.append(names[victim] or "<unnamed>")
+            else:
+                victim = _pick(2)
+                if victim is not None:
+                    trimmed_floor.append(names[victim] or "<unnamed>")
         if victim is None:
-            break                  # nothing left we may drop
+            break                  # unreachable while n_kept > limit >= 0
         keep_flags[victim] = False
         remaining[spaces[victim]] -= 1
         n_kept -= 1
+
+    if trimmed_protected or trimmed_floor:
+        # Its own ERROR line, separate from `_prune_tool_choice`'s.
+        # That one says "a capability the caller asked for was removed";
+        # this one says WHY it was unavoidable — the request named more
+        # tools than the provider will accept in one array, which is a
+        # defect in whatever built the allow-list, not in the cap.
+        # The counts are reported, never asserted: the old line said
+        # "(%d named > %d)" with n_named == limit, which is a falsehood the
+        # moment the floor is what pushed the untrimmable set over.
+        logger.error(
+            "[LLM-PROXY] the untrimmable set does not fit under the provider "
+            "cap: %d untrimmable (%d named by tool_choice, %d on the protected "
+            "core floor) vs limit %d — trimmed %d allow-listed tool(s) so the "
+            "request is valid at all: %s%s",
+            n_untrimmable, n_named, n_floored, limit,
+            len(trimmed_protected), trimmed_protected,
+            (f" | AND {len(trimmed_floor)} from the protected core floor, "
+             f"i.e. the floor itself no longer fits and has been widened "
+             f"past what the provider accepts: {trimmed_floor}"
+             if trimmed_floor else ""),
+        )
 
     kept = [t for t, k in zip(tools, keep_flags) if k]
     dropped = [n or "<unnamed>" for n, k in zip(names, keep_flags) if not k]
@@ -1525,6 +2361,13 @@ async def proxy_chat(
     Proxy a chat completion request. Accepts Anthropic Messages API format.
     Streams SSE responses without buffering.
     """
+    # R48 join ids. Minted at handler entry, before anything can fail, so
+    # every line this request produces carries the same pair. Both are
+    # computed unconditionally (4 random bytes + one header lookup +
+    # one anchored regex on a ≤12-char string); only the PRINTING is
+    # gated, so the gate cannot leave one line joinable and another not.
+    wire_rid = _new_request_rid()
+    wire_trace = _wire_trace_header(request.headers)
     config = await _auth_agent(request, db)
     _enforce_rate_limit(config)
     # Captured once, then passed explicitly to every _log_event below —
@@ -1550,6 +2393,8 @@ async def proxy_chat(
     # the offender. Last-write-wins is arbitrary; first-wins is safer
     # because core tools come first in the agent's assembly order.
     tools = body.get("tools")
+    # R48: captured before dedup, for `dropped_n` on the [CACHE] line below.
+    tools_sent = len(tools) if isinstance(tools, list) else 0
     if isinstance(tools, list) and tools:
         deduped, dups = _dedup_tool_names(tools)
         if dups:
@@ -1584,10 +2429,12 @@ async def proxy_chat(
                 body, _dropped, model_name=str(model),
                 original_len=len(_tools))
             logger.warning(
-                "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-                "%d > %d, dropped %d (namespace-fair): %s%s",
-                config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
-                len(_dropped), _dropped,
+                "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s "
+                "channel=%s: %d > %d, dropped %d (namespace-fair) kept_hash=%s: "
+                "%s%s",
+                config.user_id[:8], model, req_channel or "-",
+                len(_tools), _OPENAI_MAX_TOOLS,
+                len(_dropped), _capped_hash(_kept), _dropped,
                 (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
             )
 
@@ -1663,10 +2510,35 @@ async def proxy_chat(
     # Pairs with the usage-side [CACHE] line below for hit-ratio series.
     has_cache_key, cache_key_hash, cache_retention = _cache_log_fields(body)
     if backend.name == "openai":
+        # R48 suffix (""-by-default; see _wire_tools_suffix). On a daily-cap
+        # fallback `body` has already been rewritten into OpenAI shape and
+        # carries NO tools at all, so this line reads tools_n=0 dropped_n=N —
+        # correct for "the body going upstream", and documented in
+        # _wire_tools_suffix so it is not read as a cap casualty.
+        # No timing suffix on this wire (BLIND AREA 2 in
+        # _wire_timing_suffix): gpt-5.6-* is forced onto /responses by the
+        # resolver, so the investigated turns are not here. The rid/trace
+        # join IS here, on all three of this wire's lines.
+        #
+        # `model=` on this line is CALLER-WRITTEN and unvalidated — PRE-
+        # EXISTING at 4f0e9fe1, not introduced or widened here, and not
+        # closed here either (it is rendered from `_log_event`, the
+        # `[credits]` lines and the upstream WARNINGs too, none of which
+        # a log-only patch owns). `retention=` next to it IS allowlisted
+        # as of the FINAL round-2 pass. Read the consequence in
+        # `_cache_log_fields`: G7/G8 rows are caller-influenced.
+        _tools_suffix, _ = _wire_tools_suffix(
+            body, tools_sent, config.user_id, rid=wire_rid, trace=wire_trace)
         logger.info(
-            "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s",
+            "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s%s",
             config.user_id[:8], model, has_cache_key, cache_key_hash, cache_retention,
+            _tools_suffix,
         )
+    # Rendered once for every line below, including the ones inside the
+    # streaming generator (which closes over it). `""` unless the user is on
+    # the canary, so the untouched lines stay byte-identical to R47.
+    _join_suffix = _wire_join_suffix(
+        config.user_id, rid=wire_rid, trace=wire_trace)
 
     start_ts = time.time()
 
@@ -1680,10 +2552,19 @@ async def proxy_chat(
         try:
             first_chunk = await gen.__anext__()
         except UpstreamProviderError as e:
+            # R48 (FINAL review round 2, non-blocking 2): the FAILED-turn
+            # summary line carries the join too. Without it a failed turn
+            # emitted a `[CACHE]` request line with a `rid` and an
+            # `llm_proxy … status=error` line WITHOUT one, so the two lines
+            # that exist for the turn nobody got an answer from — the turns
+            # G7/G8 most need to exclude — were the only pair that could not
+            # be joined. Gated like every other render, so off-canary this
+            # line stays byte-identical to R47.
             await _log_event(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
                 channel=req_channel,
+                wire_suffix=_join_suffix,
             )
             logger.warning(
                 "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
@@ -1723,11 +2604,13 @@ async def proxy_chat(
                     cache_write = _extract_openai_cache_write_from_sse(bytes(collected_bytes))
                     # W0.2b usage-side [CACHE] line: prompt+cached tokens
                     # together so one grep yields the per-tenant ratio series.
+                    # R48 appends the rid/trace join and nothing else — this
+                    # wire carries no timing split (BLIND AREA 2).
                     logger.info(
                         "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-                        "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+                        "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s%s",
                         config.user_id[:8], model, has_cache_key, cache_retention,
-                        inp, cached, cache_write,
+                        inp, cached, cache_write, _join_suffix,
                     )
                 cost = _calc_cost_cents(
                     model, inp, out,
@@ -1754,6 +2637,7 @@ async def proxy_chat(
                             cached_tokens=cached,
                             cache_write_tokens=cache_write,
                             channel=req_channel,
+                            wire_suffix=_join_suffix,
                         )
 
                 try:
@@ -1781,6 +2665,7 @@ async def proxy_chat(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, latency, is_fallback, "error",
                 channel=req_channel,
+                wire_suffix=_join_suffix,
             )
             raise HTTPException(502, f"Provider error: {e}")
         # Surface clean upstream errors (model-not-found, rate-limit, etc.)
@@ -1790,6 +2675,7 @@ async def proxy_chat(
                 db, config.user_id, backend.name, model, "chat",
                 0, 0, 0, int((time.time() - start_ts) * 1000), is_fallback, "error",
                 channel=req_channel,
+                wire_suffix=_join_suffix,
             )
             try:
                 detail = body_bytes.decode("utf-8", errors="replace")
@@ -1817,11 +2703,12 @@ async def proxy_chat(
             cached = _extract_openai_cached_tokens(usage)
             cache_write = _extract_openai_cache_write_tokens(usage)
             # W0.2b usage-side [CACHE] line (non-stream twin of the SSE path).
+            # R48: rid/trace join only — no timing split on this wire.
             logger.info(
                 "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-                "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+                "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s%s",
                 config.user_id[:8], model, has_cache_key, cache_retention,
-                inp, cached, cache_write,
+                inp, cached, cache_write, _join_suffix,
             )
             _debug_log_upstream_cache_headers(resp.headers, model)
 
@@ -1835,6 +2722,7 @@ async def proxy_chat(
             cached_tokens=cached,
             cache_write_tokens=cache_write,
             channel=req_channel,
+            wire_suffix=_join_suffix,
         )
 
         # Use JSONResponse so we can attach the resolved-model header.
@@ -1905,10 +2793,37 @@ async def proxy_responses(
     inside _log_event, and _get_spend sums by provider so these rows count
     toward the openai monthly budget automatically.
     """
+    # R48: `start_ts` below is stamped after auth, dedup, the tool cap, the
+    # credit pre-flight and the budget check, so `latency` has never
+    # contained one millisecond of the proxy's own pre-work. This stamp is
+    # what makes that gap a number instead of an assumption.
+    #
+    # Read the boundary honestly (R48 review, B2): this is the first
+    # statement of the handler BODY, so it is already too late for the
+    # middleware chain, FastAPI routing and `Depends(get_db)` — the platform
+    # session acquire resolves before it, and never appears in the split. And
+    # it is early enough to include `await request.json()` below, i.e. the
+    # socket receive of the agent's ~200 KB body over Contabo → Cloudflare →
+    # Railway, which is upload and not proxy work. `body_ms` exists to hold
+    # that term separately so `pre_ms` can be read net of it.
+    #
+    # The full list of what this split cannot see — including why there is
+    # no `dep_ms` for the session acquire — is BLIND AREAS in
+    # `_wire_timing_suffix`. Read it before reconciling anything against
+    # `[req-timing]`.
+    entry_mono = time.monotonic()
+    # R48 join ids, minted at handler entry (see proxy_chat for why both
+    # are unconditional while only the printing is gated). They sit after
+    # `entry_mono` so that stamp stays the first statement and the ~1 µs
+    # they cost is inside the window it measures rather than before it.
+    wire_rid = _new_request_rid()
+    wire_trace = _wire_trace_header(request.headers)
     config = await _auth_agent(request, db)
     _enforce_rate_limit(config)
     req_channel = _sanitize_channel(request.headers.get(CHANNEL_HEADER))
+    _body_mono = time.monotonic()
     body = await request.json()
+    body_ms = int((time.monotonic() - _body_mono) * 1000)
     # R44: platform overhead (a prompt-cache warm) is logged for cost
     # tracking but never charged and never counted against the user's cap —
     # `_log_event` and `_get_spend` both key that off "system.".
@@ -1932,6 +2847,9 @@ async def proxy_responses(
     # Responses flattened function tools carry a top-level `name`, so the
     # shared first-wins helper applies verbatim.
     tools = body.get("tools")
+    # Captured BEFORE dedup so `dropped_n` on the [CACHE] line counts every
+    # tool the proxy removed, by whatever route.
+    tools_sent = len(tools) if isinstance(tools, list) else 0
     if isinstance(tools, list) and tools:
         deduped, dups = _dedup_tool_names(tools)
         if dups:
@@ -1962,10 +2880,12 @@ async def proxy_responses(
             body, _dropped, model_name=str(model),
             original_len=len(_tools))
         logger.warning(
-            "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s: "
-            "%d > %d, dropped %d (namespace-fair): %s%s",
-            config.user_id[:8], model, len(_tools), _OPENAI_MAX_TOOLS,
-            len(_dropped), _dropped,
+            "[LLM-PROXY] tools array over OpenAI's cap for user=%s model=%s "
+            "channel=%s: %d > %d, dropped %d (namespace-fair) kept_hash=%s: "
+            "%s%s",
+            config.user_id[:8], model, req_channel or "-",
+            len(_tools), _OPENAI_MAX_TOOLS,
+            len(_dropped), _capped_hash(_kept), _dropped,
             (f" | pruned from tool_choice: {_pruned}" if _pruned else ""),
         )
 
@@ -2002,34 +2922,73 @@ async def proxy_responses(
     if budget_result == "monthly_exceeded":
         raise HTTPException(429, "Monthly openai budget exceeded")
 
-    # W0.2b request-side [CACHE] line — Responses bodies use the same
-    # top-level prompt_cache_key/prompt_cache_retention names, so the
-    # shared field extractor works unchanged.
+    # W0.2b request-side [CACHE] line — the shared extractor reads both
+    # prompt_cache_retention and GPT-6's prompt_cache_options.ttl.
     has_cache_key, cache_key_hash, cache_retention = _cache_log_fields(body)
+    # R48 suffix — renders as "" unless this user is on the wire-observability
+    # canary, which keeps the line byte-identical to R47 by default. It sits
+    # here, after dedup + _cap_tools + _prune_tool_choice, because the array
+    # the agent fingerprints is the PRE-cap one and that instrument is blind
+    # to the only array the provider ever caches. `wire_tools_sha` is carried
+    # to the usage line so the pair can be joined without relying on log
+    # adjacency, which concurrent turns destroy.
+    _tools_suffix, wire_tools_sha = _wire_tools_suffix(
+        body, tools_sent, config.user_id, rid=wire_rid, trace=wire_trace)
     logger.info(
-        "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s",
+        "[CACHE] user=%s model=%s has_cache_key=%s cache_key_hash=%s retention=%s%s",
         config.user_id[:8], model, has_cache_key, cache_key_hash, cache_retention,
+        _tools_suffix,
     )
+    # Rendered once and reused by the usage line's builder, the summary line
+    # and the upstream-error WARNING — `""` off the canary.
+    _join_suffix = _wire_join_suffix(
+        config.user_id, rid=wire_rid, trace=wire_trace)
 
     start_ts = time.time()
+    start_mono = time.monotonic()
+    pre_ms = int((start_mono - entry_mono) * 1000)
 
     if is_stream:
         # Streaming: pre-pull the first chunk INSIDE try so an upstream
         # non-2xx converts to a clean HTTPException BEFORE the
         # StreamingResponse commits its 200 headers (same as proxy_chat).
-        gen = backend.responses_stream(body, api_key)
+        # R48: the only channel for the upstream's x-request-id — the httpx
+        # response is confined to the generator. Passed unconditionally; the
+        # canary decides whether it is LOGGED, not whether it is captured,
+        # so the two halves cannot drift apart.
+        upstream_meta: dict = {}
+        gen = backend.responses_stream(body, api_key, meta=upstream_meta)
         try:
             first_chunk = await gen.__anext__()
         except UpstreamProviderError as e:
+            # R48 (FINAL review round 2, non-blocking 2): the join rides the
+            # FAILED-turn summary line too — see the /chat twin above for
+            # why the error path is the one that most needs it. Gated.
             await _log_event(
                 db, config.user_id, "openai", model, "responses",
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
                 channel=req_channel,
                 operation_type=req_operation,
+                wire_suffix=_join_suffix,
             )
+            # R48 review N6: the id is written into `meta` before the status
+            # check inside the generator, so an upstream 4xx/5xx — the one
+            # response an OpenAI escalation is actually about — can quote it.
+            # Unconditional: it is the provider's opaque id, the same value
+            # the DEBUG header dump has always been allowed to print, and no
+            # usage-side [CACHE] line is emitted on this path at all.
+            # The rid/trace join rides it too, gated. A failed turn emits no
+            # usage-side [CACHE] line, so its trail is exactly three lines —
+            # the request-side [CACHE], this WARNING, and the `llm_proxy …
+            # status=error` summary. All three now carry `rid`; until the
+            # round-2 FINAL pass the summary did not, which left the turns
+            # G7/G8 most need to EXCLUDE as the only ones that could not be
+            # identified as failures.
             logger.warning(
-                "[LLM-PROXY] %s upstream %d for user=%s model=%s body=%r",
-                e.provider, e.status, config.user_id[:8], model, e.body,
+                "[LLM-PROXY] %s upstream %d for user=%s model=%s req_id=%s%s body=%r",
+                e.provider, e.status, config.user_id[:8], model,
+                _wire_req_id(upstream_meta.get("request_id")),
+                _join_suffix, e.body,
             )
             try:
                 detail = e.body.decode("utf-8", errors="replace")
@@ -2041,6 +3000,11 @@ async def proxy_responses(
             raise HTTPException(e.status, detail=detail)
         except StopAsyncIteration:
             first_chunk = b""
+
+        # R48: the pre-pull above is exactly the upstream's time-to-first-byte
+        # — the same boundary `[req-timing]` reports for this route, because
+        # the StreamingResponse is not returned until it completes.
+        ttfb_ms = int((time.monotonic() - start_mono) * 1000)
 
         collected_bytes = bytearray(first_chunk)
 
@@ -2057,12 +3021,22 @@ async def proxy_responses(
                     bytes(collected_bytes)
                 )
                 # W0.2b usage-side [CACHE] line (same format as /chat so the
-                # per-tenant hit-ratio grep spans both wires).
+                # per-tenant hit-ratio grep spans both wires). R48 appends the
+                # provider request id and the timing split; "" when off.
                 logger.info(
                     "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-                    "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+                    "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s%s",
                     config.user_id[:8], model, has_cache_key, cache_retention,
                     inp, cached, cache_write,
+                    _wire_timing_suffix(
+                        config.user_id,
+                        rid=wire_rid, trace=wire_trace,
+                        req_id=_wire_req_id(upstream_meta.get("request_id")),
+                        cache_key_hash=cache_key_hash,
+                        tools_sha=wire_tools_sha,
+                        body_ms=body_ms, pre_ms=pre_ms,
+                        ttfb_ms=ttfb_ms, total_ms=latency,
+                    ),
                 )
                 cost = _calc_cost_cents(
                     model, inp, out,
@@ -2083,6 +3057,7 @@ async def proxy_responses(
                             cache_write_tokens=cache_write,
                             channel=req_channel,
                             operation_type=req_operation,
+                            wire_suffix=_join_suffix,
                         )
 
                 try:
@@ -2111,6 +3086,7 @@ async def proxy_responses(
                 0, 0, 0, latency, False, "error",
                 channel=req_channel,
                 operation_type=req_operation,
+                wire_suffix=_join_suffix,
             )
             raise HTTPException(502, f"Provider error: {e}")
         if resp.status_code >= 400:
@@ -2120,6 +3096,7 @@ async def proxy_responses(
                 0, 0, 0, int((time.time() - start_ts) * 1000), False, "error",
                 channel=req_channel,
                 operation_type=req_operation,
+                wire_suffix=_join_suffix,
             )
             try:
                 detail = body_bytes.decode("utf-8", errors="replace")
@@ -2141,11 +3118,22 @@ async def proxy_responses(
             usage, details_key="input_tokens_details"
         )
         # W0.2b usage-side [CACHE] line (non-stream twin of the SSE path).
+        # R48: ttfb_ms=-1 — this path has no first-chunk boundary at all, and
+        # a number that silently meant "the whole call" would poison the p50
+        # of a series whose whole purpose is separating the two.
         logger.info(
             "[CACHE] user=%s model=%s has_cache_key=%s retention=%s "
-            "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s",
+            "prompt_tokens=%s cached_tokens=%s cache_write_tokens=%s%s",
             config.user_id[:8], model, has_cache_key, cache_retention,
             inp, cached, cache_write,
+            _wire_timing_suffix(
+                config.user_id,
+                rid=wire_rid, trace=wire_trace,
+                req_id=_wire_req_id(resp.headers.get("x-request-id")),
+                cache_key_hash=cache_key_hash,
+                tools_sha=wire_tools_sha,
+                body_ms=body_ms, pre_ms=pre_ms, ttfb_ms=-1, total_ms=latency,
+            ),
         )
         _debug_log_upstream_cache_headers(resp.headers, model)
 
@@ -2160,6 +3148,7 @@ async def proxy_responses(
             cache_write_tokens=cache_write,
             channel=req_channel,
             operation_type=req_operation,
+            wire_suffix=_join_suffix,
         )
 
         from fastapi.responses import JSONResponse

@@ -11,6 +11,47 @@ from typing import List, Dict, Any
 def get_agent_tools() -> List[Dict[str, Any]]:
     """Return all tool definitions available to the agent."""
     return [
+        {
+            "name": "analyze_attachment",
+            "description": (
+                "Read the ORIGINAL uploaded document when the chat preview is incomplete "
+                "or the user's task needs full-file evidence. Use the attachment_id from "
+                "the chat manifest, with the user's natural task. PDF pages, including "
+                "visual slides, are analyzed in order with bounded background work; long "
+                "text documents are processed in chunks. Returns a durable analysis_id "
+                "and progress. Do not invent results while it is running."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string", "description": "The 32-character chat attachment ID."},
+                    "task": {"type": "string", "description": "The user's actual analysis, extraction, or summary request."},
+                    "retry_failed": {"type": "boolean", "description": "Retry only failed units of an earlier analysis."},
+                    "page_start": {"type": "integer", "description": "Optional first PDF page for a focused follow-up, 1-based."},
+                    "page_end": {"type": "integer", "description": "Optional last PDF page, inclusive; up to 20 pages per focused request."},
+                },
+                "required": ["attachment_id", "task"],
+            },
+        },
+        {
+            "name": "read_attachment_analysis",
+            "description": (
+                "Read durable progress, the synthesized answer, or numbered page/chunk "
+                "details from a prior analyze_attachment call. Use it for follow-up "
+                "questions and to collect every slide/page in batches. Reading a running "
+                "analysis resumes it after a process restart."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string"},
+                    "analysis_id": {"type": "string"},
+                    "start": {"type": "integer", "description": "First page/chunk, 1-based."},
+                    "limit": {"type": "integer", "description": "Number of details, maximum 10."},
+                },
+                "required": ["attachment_id", "analysis_id"],
+            },
+        },
         # ------------------------------------------------------------------
         # 1. Shell execution
         # ------------------------------------------------------------------

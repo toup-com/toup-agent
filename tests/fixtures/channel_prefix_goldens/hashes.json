@@ -1,6 +1,6 @@
 {
-  "_why": "Flag-OFF goldens for tests/test_channel_neutral_prefix.py. REGENERATED 2026-09-15 at the merge of R44 (#749) and round 46, deliberately, for two prompt changes that landed on two branches: (1) R44 moved the `Today's date:` line out of the system prompt into the per-turn <turn_context> block, so the head is DATE-INVARIANT and these goldens no longer rot at local midnight; (2) round 46 (contract C9, A10) made the Document Generation section name `generate_data_file` and `generate_audio` — two tools added in ONE change so the provider prompt-cache lineage moves exactly once — and it no longer tells the model its file appears in 'the document pane', a web-only surface that exists on neither iOS nor WhatsApp; the diet copy moved with it (pinned by tests/test_format_intent_contract.py and tests/test_requested_format_reaches_the_model.py). `_freeze()` still normalises a `- Today's date: …` line on both sides should one ever return, and test_no_golden_contains_a_calendar_date keeps a calendar date out of the fixture. Regenerate only for a deliberate prompt change.",
-  "agent_runner_sha256": "4de42fdbb1e4a521ab130fdd5118db3513697237f5f3a700f9a30f7db8f91b95",
+  "_why": "Flag-OFF goldens for tests/test_channel_neutral_prefix.py. REGENERATED 2026-09-15 at the merge of R44 (#749) and round 46, deliberately, for two prompt changes that landed on two branches: (1) R44 moved the `Today's date:` line out of the system prompt into the per-turn <turn_context> block, so the head is DATE-INVARIANT and these goldens no longer rot at local midnight; (2) round 46 (contract C9, A10) made the Document Generation section name `generate_data_file` and `generate_audio` — two tools added in ONE change so the provider prompt-cache lineage moves exactly once — and it no longer tells the model its file appears in 'the document pane', a web-only surface that exists on neither iOS nor WhatsApp; the diet copy moved with it (pinned by tests/test_format_intent_contract.py and tests/test_requested_format_reaches_the_model.py). `_freeze()` still normalises a `- Today's date: …` line on both sides should one ever return, and test_no_golden_contains_a_calendar_date keeps a calendar date out of the fixture. Regenerate only for a deliberate prompt change. REGENERATED AGAIN 2026-09-23, VOICE ONLY, deliberately, for toup-voice R2 (RT-9): the voice surface contract's rule 1 (ANSWER IN THIS TURN, FROM THE SNIPPETS) gained one standing exception — a person's CURRENT role or affiliation spends the one allowed fetch on the organisation's own current page (faculty/staff directory) and says plainly when a source describes a former role — because on the recorded 2026-09-22 call the caller had to challenge a professor's stated affiliation (R2 investigation RT-9: an old snippet against the organisation's current faculty page). Every other channel's sha and full text are unchanged (verified before writing); flag ON is still one prefix for every channel.",
+  "agent_runner_sha256": "f0c61e57aad1b0b9cc47593805a1b799519c15e827733fee1287e376d67806ce",
   "full_text_channels": [
     "web",
     "mobile",
@@ -10,7 +10,7 @@
     "vibecoding",
     "app"
   ],
-  "git_rev": "9b68f2d3c077bebf50bbf2c4c97d47aec7a60fe7 (round-46 branch) merged with ae6365a5 (main, #749)",
+  "git_rev": "toup-voice R2 integrated relay (b99f62d0 + R2 stage merges); voice golden regenerated over 9b68f2d3c077bebf50bbf2c4c97d47aec7a60fe7 (round-46 branch) merged with ae6365a5 (main, #749)",
   "sha256": {
     "": "b5470cbb7afd820261bad1778b8392855817ccfae4e52c2ade2c3761b8997584",
     "admin": "937ac9c56ee00b6db590178a4020b4e1ba825959f97662f04c9a5f9374859751",
@@ -31,7 +31,7 @@
     "telegram": "11c3b604ae16899bbb66f00cc8f77440f7b7c7e99520816865b2318abfbe9652",
     "trigger": "3369885a0a503c8d49e863de45552cca00ddad09414b37693f7ce8ea15ba4d03",
     "vibecoding": "48ea333b11482d793c4f85e570d1caf293d224776b7c5f2fe040a2fd5a1e903c",
-    "voice": "e8e22607e41e4863633a7f2ea76f56568bd881d7be49821018811cd0b7623d5b",
+    "voice": "32d06f72e474abc7372a1c91b38037a18d635b479c090785086b7a12ac9cde94",
     "web": "cb8a8c1967e11681312b5ebdb47cce51a54711e6b589aeea65e9157e0f4d2cc7",
     "whatsapp": "a410b93af057879e29073a2d166e4de42a0fdeef577e6109e092a0cbd928c4d8"
   },

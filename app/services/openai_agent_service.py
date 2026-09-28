@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -111,6 +112,26 @@ class StreamEvent:
     tool_input: Dict[str, Any] = field(default_factory=dict)
     stop_reason: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
+    # The header actually attached to this completed Responses request.
+    # None on the chat wire, when the flag is off, or when a stale cached
+    # client points directly at the provider despite bundle-mode settings.
+    llm_trace_sent: Optional[str] = None
+
+
+def _client_targets_platform_proxy(client: Any) -> bool:
+    """Check the client that will send the request, not mutable settings alone.
+
+    `/admin/bind` can update settings before its non-fatal key refresh builds
+    a replacement client. Exact URL equality fails closed for a stale direct
+    client and for any unexpected endpoint; a prefix check would allow a
+    lookalike host.
+    """
+    try:
+        expected = f"{settings.platform_api_url.rstrip('/')}/llm/openai/v1"
+        actual = str(getattr(client, "base_url", "") or "").rstrip("/")
+        return bool(actual) and actual == expected
+    except Exception:  # noqa: BLE001 — diagnostic headers must never cost a turn
+        return False
 
 
 def _metering_idempotency_key(
@@ -170,6 +191,22 @@ def _responses_cache_key(prompt_cache_key: str) -> str:
 #: never sufficient.
 OPERATION_TYPE_HEADER = "X-Toup-Operation-Type"
 
+#: R48-G. The agent<->platform correlation header and the exact grammar the
+#: platform half validates. The contract, the gate and the value live in
+#: `app/agent/llm_trace.py`; only the NAME and the GRAMMAR are restated here,
+#: because this module is imported on paths that must not depend on
+#: `app/agent/` existing (the same reason `OPERATION_TYPE_HEADER` is spelled
+#: out both here and in `app/api/llm_proxy.py`). The duplication is covered by
+#: a drift test — `tests/test_llm_trace_header.py::
+#: test_the_transport_constants_do_not_drift_from_the_contract` — which fails
+#: if either spelling moves. Nothing about the HASH is duplicated.
+#: Anchored `\A…\Z`, not `^…$`: Python's `$` also matches before a final
+#: newline, so the `^…$` spelling ACCEPTS `"a1b2c3d4.0\n"` and would put a
+#: lone LF into a header value. Measured through this very function, not
+#: reasoned about. Must stay byte-identical to `llm_trace.TRACE_VALUE_RE`.
+LLM_TRACE_HEADER = "x-toup-trace"
+_TRACE_VALUE_RE = re.compile(r"\A[0-9a-f]{8}\.[0-9]{1,3}\Z")
+
 
 def is_system_operation(operation_type: Optional[str]) -> bool:
     """True for platform overhead that must never be billed to the user.
@@ -181,7 +218,7 @@ def is_system_operation(operation_type: Optional[str]) -> bool:
     return bool(operation_type and operation_type.startswith("system."))
 
 
-_REASONING_EFFORT_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+_REASONING_EFFORT_PREFIXES = ("gpt-5", "gpt-6", "o1", "o3", "o4")
 
 
 def supports_reasoning_effort(model: str | None) -> bool:
@@ -424,6 +461,7 @@ class OpenAIAgentService:
         channel: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         operation_type: Optional[str] = None,
+        llm_trace: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a chat completion. Yields StreamEvent objects matching the
@@ -432,6 +470,14 @@ class OpenAIAgentService:
         ``reasoning_effort`` is honoured on the Responses wire only (the chat
         wire here exists for the gpt-4o fallback, which has no reasoning to
         budget); it is a request parameter, never prompt input.
+
+        ``llm_trace`` (R48-G) is likewise Responses-only: it is the
+        ``x-toup-trace`` correlation value minted by ``app/agent/llm_trace``,
+        already gated by its caller. None (the default, and what every caller
+        that does not opt in passes) means no header at all — see
+        ``_create_responses_stream``. The chat wire deliberately does not carry
+        it: it is the gpt-4o fallback, and adding an untested header there
+        would widen this patch past the path the contract is written for.
         """
         self._ensure_client()
         model = model or self.default_model
@@ -475,6 +521,7 @@ class OpenAIAgentService:
                 channel=channel,
                 reasoning_effort=reasoning_effort,
                 operation_type=operation_type,
+                llm_trace=llm_trace,
             ):
                 yield _ev
             return
@@ -936,6 +983,7 @@ class OpenAIAgentService:
         channel: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         operation_type: Optional[str] = None,
+        llm_trace: Optional[str] = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """
         Stream a completion over the Responses API (/v1/responses), yielding
@@ -981,18 +1029,20 @@ class OpenAIAgentService:
         # R44: effort rides the request, never the prompt. Gated on the model
         # family rather than trusted from the caller — agent_runner decides
         # policy, this decides whether the wire can carry it.
+        if reasoning_effort == "minimal" and model.lower().startswith("gpt-6"):
+            reasoning_effort = "low"
         if reasoning_effort and supports_reasoning_effort(model):
             kwargs["reasoning"] = {"effort": reasoning_effort}
-        # Same cache/abuse params as the chat wire (first-class Responses
-        # params, verified against SDK types — prompt_cache_retention is
-        # Literal["in-memory","24h"] on responses.create). Same effective
-        # per-turn gate as the chat path (see comment there). Responses
+        # Same cache/abuse intent as the chat wire. GPT-6 uses
+        # prompt_cache_options.ttl=30m; older models keep their existing
+        # prompt_cache_retention=24h behavior. Responses
         # streams always deliver usage in response.completed, so there is
         # no stream_options={"include_usage": True} equivalent to send.
         if prompt_cache_key:
             kwargs["prompt_cache_key"] = _responses_cache_key(prompt_cache_key)
         if stable_prefix_active:
-            kwargs["prompt_cache_retention"] = "24h"
+            from app.services.model_resolver import prompt_cache_retention_params
+            kwargs.update(prompt_cache_retention_params(model, "24h"))
             if safety_identifier:
                 kwargs["safety_identifier"] = safety_identifier
 
@@ -1016,6 +1066,33 @@ class OpenAIAgentService:
             kwargs.setdefault("extra_headers", {})[OPERATION_TYPE_HEADER] = (
                 str(operation_type)[:40]
             )
+        # R48-G: `<cmid_h>.<iteration>` — the agent<->platform join key. A
+        # HEADER for the same reason X-Toup-Channel is one: the body is
+        # forwarded to OpenAI verbatim and an unknown key there 400s the turn.
+        # The value is minted and gated by app/agent/llm_trace (default off,
+        # hex-by-construction, never a user id or message text). The actual
+        # client destination is checked below on every attempt, because a
+        # cached client can lag behind settings during a failed bind refresh.
+        #
+        # Re-validated HERE rather than trusted from the caller. This is the
+        # last place before `extra_headers`, and the header would otherwise be
+        # whatever a future caller passed. Absent (and NOT an empty
+        # extra_headers dict) for every caller that sends nothing, which is
+        # what keeps flag-off byte-identical.
+        #
+        # `isinstance` first, and it is not belt-and-braces: `re.match` RAISES
+        # on a non-str (`TypeError: expected string or bytes-like object` for
+        # an int or a list, `cannot use a string pattern on a bytes-like
+        # object` for bytes — measured through this function). A guard whose
+        # job is to REFUSE a bad value must not convert one class of bad value
+        # into an exception that ends the attempt; the whole point of
+        # re-validating is that the request goes out without the header, not
+        # that the turn goes slow. Unreachable from `trace_for_turn` (it
+        # returns Optional[str]); that is what "last line of defence" means.
+        valid_trace = (
+            llm_trace if isinstance(llm_trace, str) and _TRACE_VALUE_RE.match(llm_trace)
+            else None
+        )
 
         if tools:
             kwargs["tools"] = _anthropic_tools_to_responses(tools)
@@ -1025,7 +1102,29 @@ class OpenAIAgentService:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                stream = await self.client.responses.create(**kwargs)
+                # Capture the exact client used by this attempt. A worker may
+                # rebuild self.client after the caller's settings-based gate;
+                # checking one client and sending through another would leak
+                # the trace header to the direct-provider path.
+                client = self.client
+                sent_trace = None
+                request_kwargs = kwargs
+                if valid_trace and _client_targets_platform_proxy(client):
+                    request_kwargs = {
+                        **kwargs,
+                        "extra_headers": {
+                            **kwargs.get("extra_headers", {}),
+                            LLM_TRACE_HEADER: valid_trace,
+                        },
+                    }
+                    sent_trace = valid_trace
+                elif valid_trace and not getattr(self, "_trace_client_mismatch_warned", False):
+                    self._trace_client_mismatch_warned = True
+                    logger.warning(
+                        "[LLMTRACE] trace withheld: active OpenAI client does not "
+                        "target the configured platform proxy"
+                    )
+                stream = await client.responses.create(**request_kwargs)
 
                 # item_id ("fc_…") → in-flight function_call tracker. The
                 # yielded tool_id is ALWAYS the call_id ("call_…") — that's
@@ -1242,6 +1341,7 @@ class OpenAIAgentService:
                     type="message_end",
                     stop_reason=mapped_stop,
                     usage=usage_data,
+                    llm_trace_sent=sent_trace,
                 )
                 return  # Success, no retry
 

@@ -430,7 +430,15 @@ def test_debt_is_not_growing_silently():
     # GET /api/routines answers 503 instead of the 200 [] it returned through
     # the 2026-09-15 pgbouncer outage. Raised deliberately, with headroom for
     # the lanes still landing in this round; it may only shrink after.
-    CEILING = 115
+    # Voice R2 (+1): test_voice_record_metadata.py drives the real
+    # `message.voice` readers over day_chats/conversations/messages (AGENT_ONLY)
+    # and shipped in 16ee4958 WITHOUT its entry — the R31/R42/R43 mis-invocation
+    # once more, although its docstring said "Lane: RUN_MODE=agent". The
+    # platform sweep ran it (9 × 'no such table', CI run 35792648976) and its
+    # failure skipped the agent-mode step. ROUTING entry, not an excuse: it RUNS
+    # in the agent-mode step (24/24 there). The docstring-lane check at the end
+    # of this file now catches that omission locally.
+    CEILING = 116
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "
@@ -501,3 +509,77 @@ def test_the_agent_mode_marker_in_a_test_file_matches_this_list():
     )
 
     # No reverse assertion — see the docstring.
+
+
+#: An explicit lane declaration in a test file's MODULE DOCSTRING. A closed,
+#: line-anchored grammar — the two forms the suite already writes
+#: ("Lane: RUN_MODE=agent" / "Lane: platform", and "Needs RUN_MODE=agent") —
+#: never a search for the words anywhere: docstrings mention RUN_MODE in run
+#: commands and in prose about OTHER files, and neither is a declaration.
+_LANE_DECLARATION = re.compile(
+    r"^\s*(?:Lane:\s*(?:RUN_MODE\s*=\s*)?(?P<lane>agent|platform)\b"
+    r"|Needs\s+RUN_MODE\s*=\s*(?P<needs>agent)\b)"
+)
+
+
+def _declared_lane(path: pathlib.Path) -> str | None:
+    import ast
+
+    try:
+        doc = ast.get_docstring(ast.parse(path.read_text()), clean=False) or ""
+    except SyntaxError:
+        return None
+    for line in doc.splitlines():
+        m = _LANE_DECLARATION.match(line)
+        if m:
+            return m.group("lane") or m.group("needs")
+    return None
+
+
+def test_a_lane_declared_in_a_docstring_is_the_lane_this_list_routes():
+    """The header check above sees only the first three lines, and the lane is
+    usually declared further down, in the module docstring, in prose.
+
+    test_voice_record_metadata.py shipped (16ee4958) saying "Lane:
+    RUN_MODE=agent" and "needs its `# agent-mode` line in
+    tests/COVERAGE_DEBT.txt" — and never got that line. Every local run passed
+    it, because a local run chooses its own RUN_MODE; only the platform sweep
+    chooses for it, and there it failed 9 × "no such table: day_chats" (CI run
+    35792648976). That failure then skipped every later step, the agent-mode
+    sweep included, so a second, unrelated red test in that lane went unseen.
+
+    Same single direction as the header check — a file with no declaration
+    is not asked for one — but for both lanes, because a declaration is
+    written on purpose and is a claim this list must agree with:
+
+      "Lane: RUN_MODE=agent" / "Needs RUN_MODE=agent"
+          ⇒  routed `# agent-mode` here, or run by a named workflow step
+             (a named step sets its own RUN_MODE)
+      "Lane: platform"
+          ⇒  NOT routed to the agent-mode step
+    """
+    tests_dir = BACKEND / "tests"
+    agent_listed = {
+        raw.split("#", 1)[0].strip()
+        for raw in DEBT.read_text().splitlines()
+        if re.search(r"#\s*agent-mode", raw) and not raw.strip().startswith("#")
+    }
+    named = _named_by_a_step()
+
+    unrouted, misrouted = [], []
+    for rel in sorted(_test_files()):
+        lane = _declared_lane(tests_dir / rel)
+        if lane == "agent" and rel not in agent_listed and rel not in named:
+            unrouted.append(rel)
+        elif lane == "platform" and rel in agent_listed:
+            misrouted.append(rel)
+
+    assert not unrouted, (
+        "these files declare RUN_MODE=agent in their docstring but have no "
+        "`# agent-mode` line in COVERAGE_DEBT.txt and no named step, so the "
+        f"platform sweep runs them and they fail 'no such table': {unrouted}"
+    )
+    assert not misrouted, (
+        "these files declare the platform lane but COVERAGE_DEBT.txt routes "
+        f"them to the agent-mode step instead: {misrouted}"
+    )

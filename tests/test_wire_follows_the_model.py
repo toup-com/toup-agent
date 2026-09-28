@@ -111,8 +111,9 @@ _TOOLS = [{
 @pytest.mark.parametrize("model", [
     "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6",
     "GPT-5.6-TERRA", "  gpt-5.6-terra  ",
+    "gpt-6-sol", "GPT-6-SOL", "  gpt-6-sol  ",
 ])
-def test_the_5_6_family_mandates_the_responses_wire(model):
+def test_tool_using_reasoning_families_mandate_the_responses_wire(model):
     assert mr.requires_responses_wire(model) is True
 
 
@@ -132,6 +133,7 @@ def test_the_prefix_is_matched_at_the_start_not_anywhere(model=None):
     'my-gpt-5.6-clone' or a vendor-prefixed 'openrouter/gpt-5.6'."""
     assert mr.requires_responses_wire("not-gpt-5.6-really") is False
     assert mr.requires_responses_wire("openrouter/gpt-5.6") is False
+    assert mr.requires_responses_wire("openrouter/gpt-6-sol") is False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -218,6 +220,51 @@ async def test_a_5_6_model_reaches_the_responses_wire_despite_chat_settings(
 
 
 @pytest.mark.asyncio
+async def test_gpt_6_sol_reaches_responses_with_tools_and_reasoning(monkeypatch):
+    monkeypatch.setattr(settings, "openai_wire_api", "chat", raising=False)
+    fake = _responses_only_client()
+    svc = _make_service(fake)
+
+    events = await _drive(
+        svc,
+        messages=[{"role": "user", "content": "hi"}],
+        system="sys",
+        tools=_TOOLS,
+        model="gpt-6-sol",
+        max_tokens=64,
+        reasoning_effort="low",
+        stable_prefix_active=True,
+    )
+
+    assert fake.responses.create.await_count == 1
+    kwargs = fake.responses.create.await_args.kwargs
+    assert kwargs["reasoning"] == {"effort": "low"}
+    assert "temperature" not in kwargs
+    assert kwargs["max_output_tokens"] == 64
+    assert kwargs["prompt_cache_options"] == {"ttl": "30m"}
+    assert "prompt_cache_retention" not in kwargs
+    assert [e.type for e in events][-1] == "message_end"
+
+
+@pytest.mark.asyncio
+async def test_gpt_6_minimal_effort_is_mapped_to_low(monkeypatch):
+    monkeypatch.setattr(settings, "openai_wire_api", "chat", raising=False)
+    fake = _responses_only_client()
+    svc = _make_service(fake)
+
+    await _drive(
+        svc,
+        messages=[{"role": "user", "content": "hi"}],
+        tools=_TOOLS,
+        model="gpt-6-sol",
+        max_tokens=64,
+        reasoning_effort="minimal",
+    )
+
+    assert fake.responses.create.await_args.kwargs["reasoning"] == {"effort": "low"}
+
+
+@pytest.mark.asyncio
 async def test_control_a_5_5_model_still_reaches_the_chat_wire(monkeypatch):
     """The anti-vacuity control for the test above. Without it, that test
     also passes in the world where EVERY model was routed to Responses —
@@ -268,11 +315,9 @@ async def test_the_shipped_default_model_reaches_the_responses_wire(
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_the_shipped_default_is_terra():
-    """Pins the G1 decision itself (docs/audits/2026-08-g1-cost-and-latency.md
-    §8). Changing it should be a deliberate edit that updates this line."""
-    assert Settings.model_fields["agent_model"].default == "gpt-5.6-terra"
-    assert mr._CANONICAL_AGENT_MODEL == "gpt-5.6-terra"
+def test_the_shipped_default_is_gpt_6_sol():
+    assert Settings.model_fields["agent_model"].default == "gpt-6-sol"
+    assert mr._CANONICAL_AGENT_MODEL == "gpt-6-sol"
 
 
 def test_the_default_is_not_barred_by_the_g1_pro_guard():

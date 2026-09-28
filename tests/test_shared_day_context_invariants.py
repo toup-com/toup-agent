@@ -358,13 +358,8 @@ def test_history_budget_is_sixty_percent_of_the_window():
     it is a CLIFF — one token over and the loader drops to summary +
     VERBATIM_WINDOW messages.
 
-    2026-08-07: was 630_000 (gpt-5.5's 1.05M window). The fleet default
-    moved to gpt-5.6-terra, whose window is 1.00M, so the cliff sits at
-    600_000 — 4.8% earlier. Deliberate and accepted: a single day would
-    need ~600k tokens of conversation to reach it, and terra is 50-55%
-    cheaper per token (docs/audits/2026-08-g1-cost-and-latency.md §8).
-    Asserted as an exact value rather than a floor because this is a cliff:
-    it should move only when someone means to move it.
+    GPT-6 Sol's published 1.05M window gives a 630K history budget.
+    Asserted exactly because compaction changes abruptly at this threshold.
     """
     from app.agent.context_manager import get_context_window
     from app.agent.day_context_loader import HISTORY_BUDGET_RATIO, VERBATIM_WINDOW
@@ -373,7 +368,7 @@ def test_history_budget_is_sixty_percent_of_the_window():
     assert HISTORY_BUDGET_RATIO == 0.60
     assert VERBATIM_WINDOW == 20
     window = get_context_window(default_model())
-    assert window == 1_000_000, f"default model window moved: {window}"
-    assert int(window * HISTORY_BUDGET_RATIO) == 600_000, (
+    assert window == 1_050_000, f"default model window moved: {window}"
+    assert int(window * HISTORY_BUDGET_RATIO) == 630_000, (
         f"day-history budget moved: {window} x {HISTORY_BUDGET_RATIO}"
     )

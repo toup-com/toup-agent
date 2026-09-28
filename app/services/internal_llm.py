@@ -458,7 +458,8 @@ async def _system_call_openai(
             if prompt_cache_key:
                 kwargs["prompt_cache_key"] = prompt_cache_key
             if prompt_cache_retention:
-                kwargs["prompt_cache_retention"] = prompt_cache_retention
+                from app.services.model_resolver import prompt_cache_retention_params
+                kwargs.update(prompt_cache_retention_params(model, prompt_cache_retention))
             if safety_identifier:
                 kwargs["safety_identifier"] = safety_identifier
             # Reasoning models (gpt-5.x, o-series) silently spend output
@@ -680,7 +681,8 @@ async def _direct_openai(
     if prompt_cache_key:
         body["prompt_cache_key"] = prompt_cache_key
     if prompt_cache_retention:
-        body["prompt_cache_retention"] = prompt_cache_retention
+        from app.services.model_resolver import prompt_cache_retention_params
+        body.update(prompt_cache_retention_params(model, prompt_cache_retention))
     if safety_identifier:
         body["safety_identifier"] = safety_identifier
 

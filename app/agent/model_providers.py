@@ -123,7 +123,8 @@ class ModelProviderRegistry:
             provider_type=ProviderType.OPENAI,
             base_url="https://api.openai.com/v1",
             api_key_env="OPENAI_API_KEY",
-            models=["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1", "o1-mini", "o3-mini"],
+            models=["gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna",
+                    "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o1", "o1-mini", "o3-mini"],
             default_model="gpt-4o",
             priority=10,
         ))

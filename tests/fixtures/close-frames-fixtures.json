@@ -1,0 +1,266 @@
+[
+  {
+    "name": "live-epoch-partial-prefix",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "First sentence.",
+      "playedMs": 1150
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 900,
+        "reason": "client_request",
+        "heard_text": "First sentence."
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "live-epoch-empty-prefix",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "",
+      "playedMs": 310
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 60,
+        "reason": "client_request",
+        "heard_text": ""
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "live-epoch-full-text",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "First sentence. Second sentence.",
+      "playedMs": 3250
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 3000,
+        "reason": "client_request",
+        "heard_text": "First sentence. Second sentence."
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "caption-is-the-previous-epoch",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:6",
+      "displayedPrefix": "Words from the answer before this one.",
+      "playedMs": 1150
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 900,
+        "reason": "client_request"
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "caption-identity-blank",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "",
+      "displayedPrefix": "Something was on screen.",
+      "playedMs": 1150
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 900,
+        "reason": "client_request"
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "client-cannot-say",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "playedMs": 1150
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 900,
+        "reason": "client_request"
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "caption-keyed-on-the-additive-turn-id",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:9",
+        "itemId": "live:s:9",
+        "assistantTurnId": "turn:9",
+        "startMs": 0,
+        "epoch": 4
+      },
+      "captionIdentity": "turn:9",
+      "displayedPrefix": "Half of it.",
+      "playedMs": 640
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:9",
+        "item_id": "live:s:9",
+        "played_ms": 640,
+        "reason": "client_request",
+        "heard_text": "Half of it."
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "played-clock-behind-the-epoch-anchor",
+    "input": {
+      "live": true,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "First",
+      "playedMs": 40
+    },
+    "frames": [
+      {
+        "type": "interrupt",
+        "response_id": "live:s:7",
+        "item_id": "live:s:7",
+        "played_ms": 0,
+        "reason": "client_request",
+        "heard_text": "First"
+      },
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "no-epoch-playing",
+    "input": {
+      "live": true,
+      "playback": null,
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "x",
+      "playedMs": 900
+    },
+    "frames": [
+      {
+        "type": "stop"
+      }
+    ]
+  },
+  {
+    "name": "legacy-session-not-live",
+    "input": {
+      "live": false,
+      "playback": {
+        "responseId": "live:s:7",
+        "itemId": "live:s:7",
+        "assistantTurnId": "live:s:7",
+        "startMs": 250,
+        "epoch": 2
+      },
+      "captionIdentity": "live:s:7",
+      "displayedPrefix": "First sentence.",
+      "playedMs": 1150
+    },
+    "frames": [
+      {
+        "type": "stop"
+      }
+    ]
+  }
+]

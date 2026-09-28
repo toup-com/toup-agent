@@ -98,8 +98,23 @@ def test_save_assistant_message_gates_save_messages_call():
     """The save_messages call lives under an `if save_assistant_message:`
     block — sub-agent runs (save_assistant_message=False) skip it."""
     # Match the gate's prefix and the following call shape.
+    #
+    # R48: this regex used to require the `async with` on the very NEXT line,
+    # so it was in effect asserting "nobody has written a comment here" — not
+    # the property the test is named for. Patch A puts a six-line comment
+    # between the gate and the session and opens the session under a second
+    # context manager, and the guard went red while the gate it guards was
+    # untouched: the `async with` is still the first STATEMENT under the `if`,
+    # with `_save_messages` inside it. Comments and blank lines may intervene;
+    # a statement may not — that is what is checked now. The intervening
+    # context managers may not contain a `:`, so `async_session_maker` has to
+    # belong to THIS `async with` rather than to some later, ungated one, and
+    # the line must START with `async with`, so a comment that merely mentions
+    # the call cannot satisfy the guard.
     assert re.search(
-        r"if save_assistant_message:\s*\n[^\n]*async with async_session_maker",
+        r"if save_assistant_message:[ \t]*\n"                # the gate
+        r"(?:[ \t]*(?:#[^\n]*)?\n)*"                         # comments/blanks only
+        r"[ \t]*async with [^\n:]*async_session_maker\(",    # the session, still first
         _AGENT_RUNNER_SRC,
     ), "save_assistant_message gate must wrap the _save_messages call"
 

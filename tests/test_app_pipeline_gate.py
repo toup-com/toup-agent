@@ -195,6 +195,11 @@ async def test_the_design_skill_path_is_settled_before_get_tools(tmp_path, monke
     # …and the file the prompt points at is really there.
     assert os.path.isfile(path_before)
     assert "Toup frontend design" in open(path_before, encoding="utf-8").read()
+    # The owner-only prompt compact copy must never replace the full source
+    # written to the app workspace and named by the skill's tool contract.
+    from app.agent.skills.builtins.app_html.skill import _packaged_design_skill
+    with open(path_before, encoding="utf-8") as fh:
+        assert fh.read() == _packaged_design_skill()
 
 
 # ── 2. Gating removes the WHOLE pipeline ─────────────────────────────

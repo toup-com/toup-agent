@@ -1,0 +1,206 @@
+[
+ {
+  "raw": "First sentence. Second sentence.",
+  "expected": "First sentence. Second sentence."
+ },
+ {
+  "raw": "",
+  "expected": ""
+ },
+ {
+  "raw": "Hello",
+  "expected": "Hello"
+ },
+ {
+  "raw": "[clears throat] Hello",
+  "expected": "Hello"
+ },
+ {
+  "raw": "[clears throat] … Hello there",
+  "expected": "Hello there"
+ },
+ {
+  "raw": "Hello  world",
+  "expected": "Hello world"
+ },
+ {
+  "raw": "(laughs) Sure, I can help.",
+  "expected": "Sure, I can help."
+ },
+ {
+  "raw": "*sighs* Fine.",
+  "expected": "Fine."
+ },
+ {
+  "raw": "[inaudible]",
+  "expected": ""
+ },
+ {
+  "raw": "(laughter)",
+  "expected": ""
+ },
+ {
+  "raw": "سلام. حالت چطوره؟",
+  "expected": "سلام. حالت چطوره؟"
+ },
+ {
+  "raw": "[خنده] سلام",
+  "expected": "سلام"
+ },
+ {
+  "raw": "می‌گردم دنبالش",
+  "expected": "می‌گردم دنبالش"
+ },
+ {
+  "raw": "قیمت ۱۰۰ تومان است، (سرفه) بله.",
+  "expected": "قیمت ۱۰۰ تومان است، بله."
+ },
+ {
+  "raw": "I will look for that professor.",
+  "expected": "I will look for that professor."
+ },
+ {
+  "raw": "Use [brackets] in code",
+  "expected": "Use in code"
+ },
+ {
+  "raw": "a (music) b (noise) c",
+  "expected": "a b c"
+ },
+ {
+  "raw": "trailing space ",
+  "expected": "trailing space"
+ },
+ {
+  "raw": "  leading and trailing  ",
+  "expected": "leading and trailing"
+ },
+ {
+  "raw": "...ellipsis kept",
+  "expected": "...ellipsis kept"
+ },
+ {
+  "raw": "[tag]...ellipsis dropped",
+  "expected": "ellipsis dropped"
+ },
+ {
+  "raw": "emoji 😀 test",
+  "expected": "emoji 😀 test"
+ },
+ {
+  "raw": "ZWNJ‌joined",
+  "expected": "ZWNJ‌joined"
+ },
+ {
+  "raw": "【全角】 hello",
+  "expected": "hello"
+ },
+ {
+  "raw": "（laughs） full width",
+  "expected": "full width"
+ },
+ {
+  "raw": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "expected": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "raw": "[yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy] too long to be a tag",
+  "expected": "[yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy] too long to be a tag"
+ },
+ {
+  "raw": "[[(]】",
+  "expected": ""
+ },
+ {
+  "raw": "[[)】］",
+  "expected": ""
+ },
+ {
+  "raw": "[[(］］",
+  "expected": ""
+ },
+ {
+  "raw": "[ 】",
+  "expected": ""
+ },
+ {
+  "raw": "[[【]］",
+  "expected": "[[【]］"
+ },
+ {
+  "raw": "［(］】",
+  "expected": "】"
+ },
+ {
+  "raw": "[[music]]",
+  "expected": ""
+ },
+ {
+  "raw": "【[cough]】",
+  "expected": ""
+ },
+ {
+  "raw": "((laughs))",
+  "expected": ""
+ },
+ {
+  "raw": "*(sighs)*",
+  "expected": ""
+ },
+ {
+  "raw": "[a][b]",
+  "expected": ""
+ },
+ {
+  "raw": "[[]]",
+  "expected": ""
+ },
+ {
+  "raw": "[ ] [ ]",
+  "expected": ""
+ },
+ {
+  "raw": "［［music］］",
+  "expected": ""
+ },
+ {
+  "raw": "[[[[(]】】】",
+  "expected": ""
+ },
+ {
+  "raw": "[[[[)】］】】",
+  "expected": ""
+ },
+ {
+  "raw": "[[[[[x]]]]]",
+  "expected": ""
+ },
+ {
+  "raw": "【【【[cough]】】】",
+  "expected": ""
+ },
+ {
+  "raw": "［［［(music)］］］",
+  "expected": ""
+ },
+ {
+  "raw": "[[[[[[[[x]]]]]]]]",
+  "expected": ""
+ },
+ {
+  "raw": "hello [[[[[[[[[[[[[[[[[[[[x]]]]]]]]]]]]]]]]]]]] world",
+  "expected": "hello world"
+ },
+ {
+  "raw": "[[[[[[[[[[[[[[[[[[y]]]]]]]]]]]]]]]]]]",
+  "expected": ""
+ },
+ {
+  "raw": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[z]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+  "expected": ""
+ },
+ {
+  "raw": "keep (((((laughs))))) this",
+  "expected": "keep (((( )))) this"
+ }
+]

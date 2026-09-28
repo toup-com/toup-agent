@@ -32,8 +32,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime
-from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, MutableMapping, Optional, Sequence, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # Channels where the vault confirmation card cannot render — mirror of
 # agent_runner.VAULT_TOOL_CHANNEL_BLOCK usage (single import site below).
@@ -85,11 +88,18 @@ def strip_tools_for_channel(
     return stripped
 
 
+#: The provider will not accept an ``allowed_tools`` list longer than the tools
+#: array it can accept in the first place. Mirrored from
+#: ``llm_proxy._OPENAI_MAX_TOOLS``; the two are the same number for the same
+#: reason and a test pins them equal.
+ALLOWED_TOOLS_MAX = 128
+
+
 def build_allowed_tools_choice(
     allowed_names: Sequence[str],
     *,
     mode: str = "auto",
-) -> Dict[str, Any]:
+) -> Optional[Union[str, Dict[str, Any]]]:
     """OpenAI ``tool_choice`` payload restricting the model to a subset of
     the (unchanged) tools array. Shape per SDK
     ``ChatCompletionAllowedToolChoiceParam`` (verified openai>=2.14):
@@ -101,7 +111,55 @@ def build_allowed_tools_choice(
     Names are sorted so the payload is deterministic for identical sets.
     ``tool_choice`` is not part of the cached prompt prefix, so this may
     vary per request without costing a cache miss.
+
+    **Returns None when the list is longer than ``ALLOWED_TOOLS_MAX``**, which
+    means "send no restriction at all". Measured on the founder's tenant
+    2026-09-20: a `full`-intent voice turn allow-listed 170 names over a
+    174-tool array, the proxy's cap could drop only the 4 unprotected ones,
+    and OpenAI answered `400 param=tool_choice.type "Invalid value:
+    'allowed_tools'"`. The runner's recovery is to retry with NO restriction —
+    which also removes the protection the cap was reading, so the retry was
+    capped to 128 with nothing protected and lost 46 capabilities including
+    `play_media`. So the widest intent produced the NARROWEST effective
+    toolset, at the cost of an extra round trip, and the only trace was a drop
+    list in a proxy warning.
+
+    Dropping the restriction here converts that guaranteed 400 into a no-op,
+    deterministically, before the wire. It costs nothing in policy: the tool
+    bans are enforced at EXECUTE time (`_RUN_DISABLED_TOOLS_CTX` plus the
+    executor's refusal), which is the same argument the runner's own rejection
+    branch already makes when it retries unrestricted.
+
+    The guard lives here rather than at the call site because this function is
+    the single place the restriction is built — a check at one of the callers
+    would be invisible to the other, and to the next one.
+
+    **``mode='required'`` survives the guard.** Dropping the restriction may
+    not also drop the FORCING: the runner's only caller assigns this return
+    value straight over a ``_tool_choice`` it had already set to ``"required"``
+    for vibecoding's first iteration, so a plain ``None`` there silently
+    degrades forced tool use to ``auto`` on exactly the turns whose allow-list
+    is widest. The bare string is the pre-R48 value that call site used, it is
+    what the provider accepted before the allow-list shape existed, and
+    ``is_tool_choice_rejection``'s retry is keyed on ``isinstance(dict)`` so a
+    string cannot re-enter that ladder.
     """
+    if len(allowed_names) > ALLOWED_TOOLS_MAX:
+        # Once per call, with the number a human needs to act on it: a set
+        # this large means the INTENT gate stopped narrowing anything, which
+        # is a defect upstream of here.
+        logger.warning(
+            "[PREFIX] allowed_tools restriction dropped — %d names > %d, "
+            "which the provider rejects as an invalid tool_choice. The turn "
+            "runs %s; tool policy is still enforced at execute time.",
+            len(allowed_names), ALLOWED_TOOLS_MAX,
+            "unrestricted but still FORCED to call a tool"
+            if mode == "required" else "unrestricted",
+        )
+        if mode == "required":
+            # Drop the RESTRICTION, keep the FORCING — see the docstring.
+            return "required"
+        return None
     return {
         "type": "allowed_tools",
         "allowed_tools": {

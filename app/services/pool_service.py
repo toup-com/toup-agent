@@ -346,6 +346,10 @@ async def _build_bind_payload(
         if v:
             payload[field] = v
 
+    # Pool tenants do not consume the SSH env file. Explicit False is
+    # necessary on refresh/rebind to remove a previously granted capability.
+    from app.api.agent_setup import _desktop_env_flag
+    payload["desktop_relay_enabled"] = await _desktop_env_flag(user_id)
     return payload
 
 

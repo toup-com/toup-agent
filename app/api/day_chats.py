@@ -31,6 +31,10 @@ from app.api.message_cards import (
     load_build_jobs,
     public_text,
 )
+# The nothing-heard projection (Blocker B). One implementation for all five
+# client serializers, declared beside the wire field it enforces — see
+# `schemas.public_heard_text`.
+from app.schemas import public_heard_text
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +260,16 @@ def _serialize_meta_card(msg: Message, key: str) -> Optional[dict]:
     """Round 29 — dict-shaped metadata payloads with no `id` field:
     `pending_action` (the confirm card, same key the chat path uses),
     `draft_card`, `memory_update`, and `fix_chip`. Same four-serializer
-    parity contract as the automation cards above."""
+    parity contract as the automation cards above.
+
+    …and `voice` (R48 §8, contract v0.2), which is not a card at all but has
+    exactly this shape and exactly this contract: a bounded dict written into
+    `metadata_json` by one writer, rendered by clients that fall back between
+    these readers. It was allowlisted in, persisted, and read back NOWHERE —
+    write-only on every surface — which made the wire contract false at its
+    first read. One implementation rather than a fifth near-copy, so the
+    isinstance guard (a hand-edited row must degrade, not 500 a history load)
+    and the absent→null behaviour cannot drift between readers."""
     parsed = _metadata(msg)
     card = parsed.get(key)
     return card if isinstance(card, dict) and card else None
@@ -1033,7 +1046,17 @@ async def get_day_chat_messages(
             {
                 "id": m.id,
                 "role": m.role,
-                "content": public_text(m.role, m.content),
+                "source": m.source,
+                "background": m.source == "attachment_analysis",
+                # Two guards, one body: `public_text` for the ROLE (a marker
+                # row is never prose), `public_heard_text` for a voice
+                # transcript row the caller heard nothing of. Both arms of
+                # this route build their own dict, so both need both — a
+                # projection applied to one arm only is invisible on
+                # whichever path a given tenant's day happens to take.
+                "content": public_heard_text(
+                    public_text(m.role, m.content), _serialize_meta_card(m, "voice"),
+                ),
                 "created_at": m.created_at.isoformat() if m.created_at else None,
                 "channel": _row_channel(m, channel_map.get(m.conversation_id)),
                 "conversation_id": m.conversation_id,
@@ -1052,6 +1075,12 @@ async def get_day_chat_messages(
                 "memory_update": _serialize_meta_card(m, "memory_update"),
                 "fix_chip": _serialize_meta_card(m, "fix_chip"),
                 "tool_events": _serialize_tool_events(m),
+                # Voice provenance (R48 §8, contract v0.2 `message.voice`).
+                # Same four-reader parity rule as the keys above — and this
+                # one had NO reader at all until now, so the relay's record
+                # of what was heard, and of which row is the complete task
+                # result, never reached a client. Null on every legacy row.
+                "voice": _serialize_meta_card(m, "voice"),
                 "reply_to_message_id": getattr(m, "reply_to_message_id", None),
                 "reply_to": reply_targets.get(m.id),
                 # Turn identity (round 46, C1). NULL on every pre-existing row and
@@ -1147,7 +1176,15 @@ async def get_day_chat_messages(
         {
             "id": msg.id,
             "role": msg.role,
-            "content": public_text(msg.role, msg.content),
+            "source": msg.source,
+            "background": msg.source == "attachment_analysis",
+            # Two guards, one body — see the other arm above. THIS is the arm
+            # every client with a backfilled day takes, so an unheard epoch
+            # served here is the saved chat disagreeing with what the call
+            # actually played.
+            "content": public_heard_text(
+                public_text(msg.role, msg.content), _serialize_meta_card(msg, "voice"),
+            ),
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "channel": _row_channel(msg, channel),
             "conversation_id": msg.conversation_id,
@@ -1166,6 +1203,12 @@ async def get_day_chat_messages(
             "memory_update": _serialize_meta_card(msg, "memory_update"),
             "fix_chip": _serialize_meta_card(msg, "fix_chip"),
             "tool_events": _serialize_tool_events(msg),
+            # Voice provenance (R48 §8, contract v0.2 `message.voice`). THE
+            # primary history fetch — every client asks this route first, so a
+            # key missing here is a key the app never sees at all. Same
+            # four-reader parity rule as the keys above; null on every legacy
+            # row.
+            "voice": _serialize_meta_card(msg, "voice"),
             "reply_to_message_id": getattr(msg, "reply_to_message_id", None),
             "reply_to": reply_targets.get(msg.id),
             # Turn identity (round 46, C1). NULL on every pre-existing row and

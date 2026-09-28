@@ -16,7 +16,7 @@ Contract (regression-pinned in tests/test_prompt_diet.py):
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 def prompt_diet_enabled() -> bool:
@@ -225,3 +225,382 @@ DOC_GENERATION_DIET = (
     "call, confirm in one sentence — the file is attached to your reply; "
     "don't repeat its contents back in markdown."
 )
+
+
+# ── (i) skill prose diet ────────────────────────────────────────────────
+# R48 patch I. A SEPARATE flag from `prompt_diet` above, default OFF, and a
+# separate module section because it compacts a different thing: not a
+# literal this repo wrote into agent_runner, but the system-prompt sections
+# the loaded SKILLS render.
+#
+# Why it is worth a seam (LOCAL, o200k, this tree, agent lane): the joined
+# skill sections are 15,092 tokens — app_html 11,603 (9,874 of it the
+# packaged DESIGN_SKILL.md, 1,729 hand-written prose), automations 2,340,
+# routines 1,149, triggers 0. The stable layout includes them on EVERY turn
+# of EVERY intent (`agent_runner.py`: `intent.include_skill_prompts or
+# _stable`), so this is the largest always-on prose block the agent sends.
+#
+# What this section does NOT do, deliberately: it cuts no rule. The one entry
+# (`app_html`, below) removes only text the retained text restates and
+# whitespace that carries nothing — LOCAL, o200k: 11,603 → 11,156 tokens. Which
+# sentences of a design document that drives a publish gate may be SHORTENED
+# (memo D4b: B1/B2″) is a product judgment and is not here: app_html §8 and
+# §11 are EXECUTED by the publish gate and pass through byte-identical.
+
+def skill_prose_diet_enabled(
+    user_id: str | None = None, channel: str | None = None,
+) -> bool:
+    """True for the global flag or an exact-user mobile canary.
+
+    Separate from `prompt_diet_enabled()` on purpose — `prompt_diet` ships
+    ON with text that was reviewed alongside it, and this flag would carry
+    whatever a future mapping holds.
+    """
+    from app.config import settings, _exact_user_canary_enabled
+    return bool(getattr(settings, "skill_prose_diet", False)) or (
+        channel == "mobile" and _exact_user_canary_enabled(
+            user_id, getattr(settings, "skill_prose_diet_canary_user_ids", "")
+        )
+    )
+
+
+# ── the one entry: app_html, REDUNDANCY ONLY (R48 patch I, round 2) ──────
+# Everything below removes text whose content the RETAINED text still states,
+# or whitespace/separators that carry no content. It is NOT the memo's B1/B2″
+# (those cut the only statement of some rules and are owner decisions); the
+# classification table and the R2 list live in patches/i-skill-prose-diet.NOTES.md.
+#
+# Four walls, each pinned by its own tests in test_prompt_diet.py:
+#   * §8 (motion/sound/state machine) and §11 (before `present_app`) are
+#     passed through BYTE-IDENTICAL — the publish gate executes them (the
+#     §8/§11 byte test).
+#   * every fenced code block and every table row is passed through verbatim
+#     (a block can be the only source of an exact value the model reproduces;
+#     the atom gate, which also covers headings, modal sentences, backticked
+#     and bold spans, names, URLs, paths and numbers).
+#   * any anchor that is not found exactly once raises, and
+#     `skill_section_diet` then serves the FULL body (the drift tests).
+#   * every cut names its RETAINED TWINS (`_APP_HTML_TWINS`): the sentences,
+#     elsewhere in the section, that still state what the cut removed. Each
+#     twin must be present, whitespace-normalised, in its own region of the
+#     DIETED output, or the diet raises and the full body is served. The
+#     anchors alone only cover drift of the text being CUT; a cut deletes one
+#     copy of a rule and relies on another copy, often in a different file
+#     (`skill.py`'s head vs the packaged DESIGN_SKILL.md), and editing THAT
+#     copy away must not leave the rule stated nowhere (the twin tests).
+#   And the cut set itself is pinned by an independent copy of what review
+#   round 2 read (`test_the_shipped_cuts_are_the_reviewed_ones`,
+#   `test_the_diet_changes_exactly_the_reviewed_words`), so widening this
+#   entry is red even where the atom gate is blind.
+#   What is and is not proven: anchor drift and twin drift for the listed
+#   twins fall back to the full body; the atom gate is a NECESSARY condition
+#   over its atom classes (spans, names, numbers, modal sentences, fences,
+#   headings), not a proof that no rule was lost. A twin is a substring
+#   test, so an edit that NEGATES one by adding a prefix would still pass.
+#   The reflow would also join a GFM table row without a leading `|`, a
+#   setext underline or a `1)` list; none occurs today (review round 2, N7).
+
+_APP_HTML_DOC_MARK = "\n# Toup frontend design\n"
+
+#: (old, new) exact replacements in the HAND-WRITTEN head of the section.
+#: Cut: the head's one-sentence summary of §7. Retained, verbatim, in §7:
+#: "The app runs in a sandboxed frame with an **opaque origin**", "The runner
+#: replaces all three before your code runs, with objects that cannot throw",
+#: "Seed the UI from defaults immediately and reconcile when the data lands",
+#: "Still genuinely unavailable in the sandbox: network requests (…), top-level
+#: navigation, popups, and the parent page."
+_APP_HTML_HEAD_CUTS = (
+    (
+        " It runs in a sandboxed frame on an opaque origin: there is no network, "
+        "no navigation and no parent page. Storage cannot throw (the runner "
+        "replaces it), but it is not durable within a first paint either, so "
+        "seed the UI from in-memory defaults and reconcile after.",
+        "",
+    ),
+)
+
+#: (old, new) exact replacements in the design document's §10. Cut: the
+#: PLAY-button anecdote and its lead-in, and the half of item 3 that the head's
+#: "## Changing an app that is already open" states verbatim ("CHANGE THEM
+#: ALL: every control of that kind, in the same way, in one round of edits",
+#: "Widening the change is nearly free; guessing wrong costs a whole turn",
+#: "A person who says a control is too small and gets a bigger menu button has
+#: been answered with the wrong object", "change the thing the words are
+#: actually about, not the first match for them"). Item 3's "Do not ask them
+#: which one they meant." is kept word for word.
+_APP_HTML_SEC10_CUTS = (
+    (
+        "A change request is about the thing the person was *using*, and they will\n"
+        "describe it with the shortest word that fits. \"Make the button bigger\", said\n"
+        "about a game, means the buttons they were pressing to play it.\n"
+        "\n"
+        "This went wrong exactly that way: asked to make the button bigger on a Snake\n"
+        "with a D-pad, the edit landed on the start screen's `PLAY` button — pressed\n"
+        "once, already large enough, and the element in the file that most literally\n"
+        "answers to the word \"button\". The D-pad, pressed hundreds of times and\n"
+        "genuinely too small, was untouched. The app came back with the same defect and\n"
+        "a message saying it had been fixed.\n"
+        "\n"
+        "So, before you edit:",
+        "Before you edit:",
+    ),
+    (
+        "3. **If more than one answer is reasonable, change them all** — every control\n"
+        "   of that kind, the same way, in one round of edits. Widening the change is\n"
+        "   nearly free; guessing wrong costs the person another turn. Do not ask them\n"
+        "   which one they meant.",
+        "3. **If more than one answer is reasonable, change them all**. Do not ask them\n"
+        "   which one they meant.",
+    ),
+)
+
+#: (region, twin) — the retained statements every cut above relies on. The
+#: region is where the twin must sit in the DIETED output: "head" (the
+#: hand-written prose before the design document), "sec7" (§7 up to §8) or
+#: "sec10" (§10 up to §11). Compared whitespace-normalised.
+_APP_HTML_TWINS = (
+    # the head cut (sandbox/storage) is carried by §7
+    ("sec7", "The app runs in a sandboxed frame with an **opaque origin**"),
+    ("sec7", "The runner replaces all three before your code runs, with objects that cannot throw"),
+    ("sec7", "a read taken during first paint returns `null` even when a value exists."),
+    ("sec7", "Seed the UI from defaults immediately and reconcile when the data lands"),
+    ("sec7", "Still genuinely unavailable in the sandbox: network requests"),
+    ("sec7", "top-level navigation, popups, and the parent page."),
+    # §10's lead-in + anecdote are carried by the head and by §10 item 2
+    ("head", "\"Make the button bigger\" is about the control the person was USING when they said it."),
+    ("head", "not the PLAY button on the start screen, which they pressed once."),
+    ("head", "A person who says a control is too small and gets a bigger menu button has been answered with the wrong object, and has to ask again."),
+    ("head", "change the thing the words are actually about, not the first match for them."),
+    ("head", "do not narrate the problem and do not claim the change."),
+    ("sec10", "In a game the controls are the D-pad / paddle / fire button; `PLAY`, `RESTART` and menu items are chrome."),
+    # §10 item 3's second half is carried by the head
+    ("head", "CHANGE THEM ALL: every control of that kind, in the same way, in one round of edits."),
+    ("head", "Widening the change is nearly free; guessing wrong costs a whole turn."),
+)
+
+#: Lines that START a block and so never continue the line above them.
+_BLOCK_STARTS = ("#", "|", "```", "- ", "* ", "+ ", "> ", "---")
+
+
+def _replace_once(text: str, old: str, new: str) -> str:
+    if text.count(old) != 1:
+        raise ValueError("skill prose diet anchor not found exactly once")
+    return text.replace(old, new)
+
+
+def _reflow_markdown(md: str) -> str:
+    """Join soft-wrapped lines of a paragraph or list item into one line.
+
+    Markdown renders a single newline inside a paragraph as a space, so this
+    is whitespace only: no word, span or number moves. Fenced blocks and table
+    rows are copied verbatim; a line that starts a block (heading, list item,
+    numbered item, table row, fence, rule, quote) is never joined upward and a
+    heading/table row/rule never absorbs the line below it.
+    """
+    import re
+
+    out: List[str] = []
+    in_fence = False
+    for line in md.split("\n"):
+        s = line.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence or not out:
+            out.append(line)
+            continue
+        if s.startswith("~~~") or (
+            line.startswith("    ") and s and not out[-1].strip()
+        ):
+            # A `~~~` fence or a four-space indented code block: neither exists
+            # in the document these rules were written against, and joining
+            # either would rewrite code. Serve the section whole.
+            raise ValueError("unrecognised code block")
+        ps = out[-1].strip()
+        joins = (
+            bool(s) and bool(ps)
+            and not ps.startswith(("#", "|", "```")) and ps != "---"
+            and not s.startswith(_BLOCK_STARTS)
+            and not re.match(r"\d+\.\s", s)
+        )
+        if joins:
+            out[-1] = out[-1].rstrip() + " " + s
+        else:
+            out.append(line)
+    if in_fence:
+        # An unbalanced fence means the document is not what these rules were
+        # written against. Serve it whole.
+        raise ValueError("unbalanced code fence")
+    return "\n".join(out)
+
+
+def _drop_rules(text: str) -> str:
+    """Remove a bare `---` line that sits between two blank lines, outside
+    any fenced block (a `---` inside a fence is code, not a separator)."""
+    lines = text.split("\n")
+    out: List[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+        elif (
+            not in_fence and line == "---"
+            and len(out) >= 2 and out[-1] == ""
+            and i + 2 < len(lines) and lines[i + 1] == ""
+        ):
+            i += 2  # the rule and the blank line after it
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _diet_unprotected(text: str) -> str:
+    return _reflow_markdown(_drop_rules(text))
+
+
+def _check_twins(head: str, before8: str, sec9_10: str) -> None:
+    import re
+
+    def _n(x: str) -> str:
+        return " ".join(x.split())
+
+    def _from(chunk: str, heading: str) -> str:
+        if chunk.count(heading) != 1:
+            raise ValueError("twin region heading not found exactly once")
+        return chunk[chunk.index(heading):]
+
+    regions = {
+        "head": _n(head),
+        "sec7": _n(_from(before8, "\n## 7. ")),
+        "sec10": _n(_from(sec9_10, "\n## 10. ")),
+    }
+    for region, twin in _APP_HTML_TWINS:
+        if _n(twin) not in regions[region]:
+            raise ValueError("a retained twin is missing: " + re.sub(r"\s+", " ", twin)[:60])
+
+
+def _diet_app_html(body: str) -> str:
+    if body.count(_APP_HTML_DOC_MARK) != 1:
+        raise ValueError("design document marker not found exactly once")
+    k = body.index(_APP_HTML_DOC_MARK)
+    head, doc = body[:k], body[k:]
+    for old, new in _APP_HTML_HEAD_CUTS:
+        head = _replace_once(head, old, new)
+
+    # §8 runs from its heading to §9's; §11 from its heading to the end.
+    anchors = ("\n## 8. ", "\n## 9. ", "\n## 11. ")
+    if any(doc.count(a) != 1 for a in anchors):
+        raise ValueError("design document sections moved")
+    i8, i9, i11 = (doc.index(a) for a in anchors)
+    if not i8 < i9 < i11:
+        raise ValueError("design document sections reordered")
+    before8, sec8, sec9_10, sec11 = doc[:i8], doc[i8:i9], doc[i9:i11], doc[i11:]
+
+    for old, new in _APP_HTML_SEC10_CUTS:
+        sec9_10 = _replace_once(sec9_10, old, new)
+
+    # A rule that closes an unprotected chunk sits right before a protected
+    # heading ("…\n\n---\n" + "\n## 8. …"); it goes too, the heading stays.
+    def _strip_trailing_rule(chunk: str) -> str:
+        return chunk[: -len("\n---\n")] if chunk.endswith("\n\n---\n") else chunk
+
+    before8 = _strip_trailing_rule(_diet_unprotected(before8))
+    sec9_10 = _strip_trailing_rule(_diet_unprotected(sec9_10))
+    # Checked on the OUTPUT, after every cut: a cut is only redundancy while
+    # the statement it relies on is still in what the model is sent.
+    _check_twins(head, before8, sec9_10)
+    return head + before8 + sec8 + sec9_10 + sec11
+
+
+#: skill name (``skill.meta.name``) → a compact replacement for that skill's
+#: rendered system-prompt section. Each value takes the full body and returns
+#: the compact one. Only entries that remove REDUNDANCY belong here; a cut
+#: that changes what the model is told is an owner decision (NOTES, R2).
+#: `automations` and `routines` have no entry: no cut in them survives the
+#: atom gate (NOTES, round 2).
+_SKILL_SECTION_DIETS: Dict[str, Callable[[str], str]] = {
+    "app_html": _diet_app_html,
+}
+
+
+def skill_section_diet(name: str, body: str) -> str:
+    """The compact section for ``name``, or ``body`` unchanged.
+
+    Unknown names are returned untouched — the same discipline
+    ``apply_tool_description_diet`` follows, and for the same reason: a
+    skill added, renamed or retired in the loader can never make this path
+    raise, and can never silently DROP a section it does not recognise. A
+    replacement that raises is also swallowed back to the full body: a
+    broken compaction must cost tokens, never capability.
+
+    This function does not read the flag. The caller decides whether the
+    diet applies, exactly as the two ``prompt_diet`` call sites in
+    ``agent_runner`` do.
+    """
+    fn = _SKILL_SECTION_DIETS.get(name)
+    if fn is None:
+        return body
+    try:
+        compact = fn(body)
+    except Exception:  # noqa: BLE001 — see the docstring: fall back to full
+        return body
+    return compact if isinstance(compact, str) and compact else body
+
+
+def skill_sections_diet(
+    skill_loader: Any, sections: List[str],
+    user_id: str | None = None, channel: str | None = None,
+) -> List[str]:
+    """Route each already-rendered section through ``skill_section_diet``.
+
+    ``SkillLoader.get_all_system_prompt_sections()`` returns bodies with no
+    names attached, and ``skills/loader.py`` is deliberately out of scope for
+    this patch (it is shared with the Voice programme and with patch H's
+    neighbourhood). So the names are recovered HERE, by re-rendering each
+    loaded skill's section and matching it to the body the loader produced.
+
+    Two consequences worth stating rather than discovering:
+
+    * ``get_system_prompt_section()`` is called a second time per skill —
+      ONLY when the flag is on. The renders are pure and cheap (app_html's
+      reads ``self._design_guidance``, fixed in ``__init__``), but it is a
+      second call and a future non-deterministic renderer would simply fail
+      to match.
+    * A body that matches no skill is passed through UNCHANGED. A section is
+      never dropped, never reordered, and never attributed to the wrong
+      skill; the list that comes back is the same length, in the same order.
+
+    Anything that goes wrong — a loader without ``.skills``, a renderer that
+    raises — leaves ``sections`` exactly as it arrived.
+    """
+    if not skill_prose_diet_enabled(user_id, channel):
+        # The byte-identity guarantee, made EXECUTABLE. The call site gates
+        # too, and that is the gate that earns its keep — it skips the
+        # re-render below entirely. This one exists because a public
+        # "apply the diet" helper that ignores its own flag is a footgun the
+        # next caller will step on, and because a guarantee only a source-pin
+        # can check is a guarantee no test stands on. Deleting EITHER is a
+        # defect: without this one the guarantee becomes untestable, without
+        # the caller's it stops being free.
+        return list(sections)
+
+    try:
+        by_body: Dict[str, str] = {}
+        for skill_name, skill in getattr(skill_loader, "skills", {}).items():
+            rendered = skill.get_system_prompt_section()
+            if rendered:
+                # First writer wins: if two skills somehow render identical
+                # bodies, attributing both to the first is still a no-op for
+                # an unknown name and stays deterministic.
+                by_body.setdefault(rendered, skill_name)
+    except Exception:  # noqa: BLE001 — a diet must never break the prompt
+        return sections
+
+    return [
+        skill_section_diet(by_body.get(body, ""), body)
+        for body in sections
+    ]

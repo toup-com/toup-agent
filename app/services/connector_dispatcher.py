@@ -103,8 +103,22 @@ logger = logging.getLogger(__name__)
 # call. Adding the channel here without that would have been a card
 # nobody could draw; adding the card without the policy change would
 # have been a button that reports failure on every tap.
+#
+# `desktop` (Toup for Mac) joins on the same test the R38 note applies to
+# `automation_thread`: is there a surface that can DRAW the card, and does
+# the tap actually run the call? Yes to both — the desktop confirm card is
+# the existing `{"type":"pending_action"}` frame (`app/api/desktop.py`
+# `_action_card`), which every client that renders a connector card already
+# renders, and `POST /api/desktop/pending-actions/{id}/approve` is what
+# executes it. Adding the channel without that would be a card nobody could
+# draw; adding the card without the route would be a button that fails on
+# every tap.
+#
+# Being here also means a CONNECTOR tool called from a desktop turn can be
+# confirmed rather than refused, which is the honest answer: the user is
+# sitting at the machine.
 _CONFIRMABLE_CHANNELS = frozenset({"web", "app", "mobile",
-                                   "automation_thread"})
+                                   "automation_thread", "desktop"})
 
 # Channels where a MUTATING connector tool is staged for the user's
 # approval rather than denied. `automation_thread` is attended — the
@@ -179,6 +193,27 @@ _MUTATES_UNATTENDED_DENY_CHANNELS = frozenset({
     # would make "why is this channel allowed to write?" unanswerable from
     # the policy the way it was before the surface existed.
     "automation_thread",
+    # `desktop` (Toup for Mac) is DELIBERATELY ABSENT from this set, and
+    # from `_MUTATES_DEFAULT_DENY_CHANNELS`, and from
+    # `_MUTATES_CONFIRM_CHANNELS`. Recorded here because absence is not
+    # self-explanatory and the reader will look for it in this file:
+    #
+    #   * Not unattended. The channel exists because the user is sitting at
+    #     the machine the tools act on. Denying its connector writes would
+    #     be denying them in the surface where someone is most demonstrably
+    #     present.
+    #   * Not confirm-everything either. A desktop turn is the user typing
+    #     in the Mac app's own window — the same conversation `web` and
+    #     `app` serve. Making every Gmail send draw a card there and not in
+    #     the browser would be an inconsistency between two views of one
+    #     product, not a safety gain.
+    #   * It IS in `_CONFIRMABLE_CHANNELS`, so an `elevation: true`
+    #     connector tool stages a card instead of being refused.
+    #
+    # None of this governs the LOCAL `desktop__*` tools. Those require
+    # explicit consent on every mutating, executing or controlling call
+    # regardless of connector policy — the gate is in the skill and in
+    # `app/api/desktop.py`, and the device re-validates independently.
 })
 
 

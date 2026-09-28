@@ -229,6 +229,12 @@ async def load_day_context(
         # so the LLM sees the threading link instead of two unrelated
         # turns. UI side reads the structured reply_to_message_id column.
         _content = msg.content
+        if msg.role == "user":
+            from app.agent.attachment_provenance import history_attachment_refs
+            _content = (_content or "") + history_attachment_refs(getattr(msg, "attachments", None))
+        elif msg.role == "assistant":
+            from app.agent.attachment_provenance import history_analysis_ref
+            _content = (_content or "") + history_analysis_ref(getattr(msg, "metadata_json", None))
         if msg.role == "assistant":
             # ASSISTANT ONLY. A user may legitimately have pasted such a
             # string, and deleting their words is worse than the leak.

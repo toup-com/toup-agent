@@ -266,6 +266,69 @@ def test_static_rule_leads_both_instruction_blocks():
     assert src.count("reason to reply in English") == 2
 
 
+# ── §G: an explicit request outranks turn-by-turn mirroring, in BOTH blocks ─
+#
+# V3: the caller asked, in Persian, to be spoken to in English only; the reply
+# came back in English twice and then in Persian. Both platform copies of the
+# rule said "Farsi in, Farsi out — every time", one of them as "the rule that
+# outranks everything else here" — a rule an explicit request can never win
+# against. The relay's `LIVE_REPLY_LANGUAGE_RULE` and the tenant's
+# `voice_context` rule were rewritten in R2; these are the other two copies,
+# and on Live the stub is served right beside the relay's rule.
+
+def _reply_language_rule(text: str) -> str:
+    return text.split("- REPLY LANGUAGE", 1)[1].split("\n- ", 1)[0]
+
+
+def _assert_an_explicit_request_outranks_mirroring(text: str, where: str) -> None:
+    rule = _reply_language_rule(text)
+    assert "explicitly asked" in rule, where
+    assert "An explicit request outranks the turn-by-turn rule" in rule, where
+    assert "until they ask for a different one" in rule, where
+    # The exception comes FIRST, or the model has already mirrored by the time
+    # it reads it.
+    assert rule.index("explicitly asked") < rule.index("JUST SPOKE"), where
+    assert "every time" not in rule, where
+    assert "outranks everything else" not in text, where
+    # Mirroring must not be restated, exception-free, in a neighbouring bullet.
+    assert "When the user speaks Persian/Farsi, reply" not in text, where
+    # Still language-neutral, and still immune to the prompt's own language.
+    assert "the same for every other language" in rule, where
+    assert "reason to reply in English" in rule, where
+
+
+def test_the_instant_start_stub_lets_an_explicit_request_outrank_mirroring():
+    from app.services.live_voice_protocol import (
+        LIVE_REPLY_LANGUAGE_RULE,
+        adapt_instructions_for_live,
+    )
+
+    stub = ws_realtime._base_voice_instructions()
+    _assert_an_explicit_request_outranks_mirroring(stub, "_base_voice_instructions")
+    # What Live actually serves when the tenant context could not be built:
+    # the stub, then the relay's rule. They must not contradict each other.
+    served = adapt_instructions_for_live(stub)
+    assert LIVE_REPLY_LANGUAGE_RULE.strip() in served
+    assert "every time" not in served
+
+
+async def test_the_legacy_builder_lets_an_explicit_request_outrank_mirroring(monkeypatch):
+    """`build_realtime_instructions` is what a session is served when the
+    agent-rendered context is off (and what the shadow compares against)."""
+    import uuid
+
+    async def _none(_uid):
+        return None
+
+    monkeypatch.setattr(ws_realtime, "_get_vps_info", _none)
+    monkeypatch.setattr(ws_realtime, "_get_agent_name", _none)
+    text = await ws_realtime.build_realtime_instructions(str(uuid.uuid4()))
+    assert "# Voice Conversation Mode" in text
+    _assert_an_explicit_request_outranks_mirroring(text, "build_realtime_instructions")
+    # The accent guidance is kept; only its mirroring clause went.
+    assert "native Tehrani accent" in text
+
+
 # ── Where the decision runs, and what it is allowed to read ───────────────
 
 def test_the_directive_is_decided_where_BOTH_halves_are_known():

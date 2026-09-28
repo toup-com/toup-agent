@@ -83,6 +83,15 @@ FLAGS: dict[str, FlagSpec] = {
         env_attr="automations_rollout_pct",
         salt="automations",
     ),
+    # Toup for Mac, phone connections (CONNECTIONS.md §12). One decision
+    # drives the platform's QR/task routes AND whether the tenant's env
+    # carries DESKTOP_RELAY_ENABLED, so the two halves cannot disagree.
+    "desktop_connections": FlagSpec(
+        name="desktop_connections",
+        setting_key="desktop.connections_rollout_pct",
+        env_attr="desktop_connections_rollout_pct",
+        salt="desktop_connections",
+    ),
 }
 
 # Back-compat: the key literal was exported and may be referenced elsewhere.

@@ -54,6 +54,12 @@ class RadioSession:
     user_id: str
     channel: str
     enabled: bool = False
+    # Monotonic identity for the station state held by this object.  The
+    # manager deliberately reuses one RadioSession per (user, channel), so
+    # object identity alone cannot tell an in-flight advance that toggle-off,
+    # a same-seed rebuild, a direct play, or a display-mode change superseded
+    # the state it captured before awaiting the network.
+    station_epoch: int = 0
     seed_intent: str = ""                           # user's original phrasing
     seed_track: Optional[SeedTrack] = None          # the first video that seeded the session
     current_track_id: Optional[str] = None
@@ -221,6 +227,7 @@ class RadioSessionManager:
         if sess is None:
             return None
         prev_enabled = sess.enabled
+        sess.station_epoch += 1
         sess.enabled = False
         sess.last_activity_ts = time.time()
         logger.info(
@@ -242,6 +249,9 @@ class RadioSessionManager:
         """Turn radio on with a freshly-built station."""
         sess = self.get_or_create(user_id, channel)
         prior_seed_vid = sess.seed_track.video_id if sess.seed_track else None
+        # Increment even for a same-seed rebuild: variety=True can replace the
+        # entire queue while leaving seed_video_id unchanged.
+        sess.station_epoch += 1
         sess.enabled = True
         sess.seed_intent = seed_intent or sess.seed_intent
         sess.seed_track = seed_track
@@ -329,6 +339,7 @@ class RadioSessionManager:
         actual new station is built on the next explicit radio_toggle=true.
         """
         sess = self.get_or_create(user_id, channel)
+        sess.station_epoch += 1
         was_enabled = sess.enabled
         prior_seed_vid = sess.seed_track.video_id if sess.seed_track else None
         prior_intent = (sess.seed_intent or "").strip().lower()
@@ -449,6 +460,10 @@ class RadioSessionManager:
         detect stops overwriting the user's pick on subsequent track loads.
         """
         prev = sess.display_mode
+        # A mode flip can replace playlist variants and even the current track
+        # after an awaited lookup.  Treat it as a superseding station mutation
+        # so a cancelled voice skip never rolls those changes back.
+        sess.station_epoch += 1
         sess.display_mode = "video" if mode == "video" else "song"
         if user_initiated:
             sess.display_mode_user_override = True
@@ -513,6 +528,7 @@ class RadioSessionManager:
         sess.consecutive_failures += 1
         sess.last_activity_ts = time.time()
         if sess.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            sess.station_epoch += 1
             sess.enabled = False
             logger.warning(
                 "[radio] enabled_mutation source=fail_safe user=%s channel=%s "

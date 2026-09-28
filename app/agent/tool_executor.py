@@ -534,6 +534,9 @@ def turn_started_at() -> Optional[float]:
 _ASST_MESSAGE_ID_CTX: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "tool_executor_asst_message_id", default=None,
 )
+_ORIGINAL_USER_TEXT_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "tool_executor_original_user_text", default="",
+)
 # Inbound attachments (persisted dicts) the user sent with the current turn.
 # Lets edit_image reach "the photo I just sent" without re-decoding the WS
 # payload. Per-asyncio-task, like the other per-call context above.
@@ -587,6 +590,8 @@ _RUN_LAST_MEDIA_CTX: contextvars.ContextVar[Optional[Any]] = contextvars.Context
 
 # Per-tool output limits (bytes)
 TOOL_OUTPUT_LIMITS: Dict[str, int] = {
+    "analyze_attachment": 8_000,
+    "read_attachment_analysis": 55_000,
     "exec": 10_000,
     "read_file": 50_000,
     "write_file": 1_000,
@@ -601,6 +606,28 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "extension_search": 12_000,
     "extension_read": 20_000,
     "extension_research": 60_000,
+    # Toup for Mac. `agent-tool-relay.md` §2.3: "A `desktop__read_file`
+    # needs an entry here or it inherits whatever the default is."
+    #
+    # The device caps its own result at 2 MiB and REPLACES an oversize one
+    # rather than truncating it (§5.4: "A shortened payload that still says
+    # `ok: true` is a lie the model cannot detect, and it would act on half
+    # a file as though it were the file"). These caps are the second, byte
+    # cap applied after that — so a value here has to be large enough that a
+    # legitimate read is not silently head-cut into a different meaning.
+    "desktop__fs_read":        60_000,   # a source file, like read_file
+    "desktop__fs_list":        20_000,
+    "desktop__fs_search":      30_000,
+    "desktop__fs_write":        1_000,   # confirmation, not content
+    "desktop__fs_mkdir":        1_000,
+    "desktop__fs_move":         1_000,
+    "desktop__fs_trash":        1_000,
+    "desktop__exec_run":       20_000,   # stdout+stderr; 2x `exec`'s 10k
+    "desktop__screen_capture": 2_000_000,  # base64 PNG, like browser_screenshot
+    "desktop__ui_snapshot":    40_000,   # an accessibility tree is verbose
+    "desktop__ui_click":        1_000,
+    "desktop__ui_type":         1_000,
+    "desktop__ui_key":          1_000,
     "browser_session_start": 2_000,
     "browser_session_end":   500,
     "browser_action":        2_500_000,   # may include base64 JPEG + DOM snapshot
@@ -1367,6 +1394,18 @@ class ToolExecutor:
                 "web_fetch", "web_search", "browser", "browser_action",
                 "extension_read", "extension_research", "extension_search",
                 "analyze_image",
+                # Toup for Mac — every `desktop__*` READ, unconditionally
+                # (RELAY_PROTOCOL.md §7.4, agent-tool-relay.md §2.3). A local
+                # file's contents, a directory listing, the accessibility text
+                # of a window and a screenshot are all content the agent did
+                # not author and an attacker may have placed on the user's
+                # disk — a README, a filename, a commit message, a web page
+                # saved to Downloads. The set is a literal here for the same
+                # reason the rest of it is: the fence must never be derived
+                # from the result string, because that string is
+                # attacker-controlled.
+                "desktop__fs_list", "desktop__fs_read", "desktop__fs_search",
+                "desktop__screen_capture", "desktop__ui_snapshot",
             }
             # Always fence external-content tool results (audit-2026 re-audit
             # round 7): the fence-skip must NOT be derived from the result
@@ -1980,6 +2019,81 @@ class ToolExecutor:
         except PermissionError:
             return f"ERROR: Permission denied: {path}"
     
+    # ------------------------------------------------------------------
+    # On-demand reading of originals uploaded to an ordinary chat turn.
+    # ------------------------------------------------------------------
+    async def _tool_analyze_attachment(self, inp: Dict[str, Any]) -> str:
+        from app.agent.attachment_analysis import _wants_unit_details, public_state, start_analysis
+        from app.api.chat_attachments import load_attachment_record
+
+        uid = self._current_user_id
+        aid = inp.get("attachment_id")
+        task = inp.get("task")
+        if not uid or not isinstance(aid, str) or not re.fullmatch(r"[0-9a-f]{32}", aid):
+            return "ERROR: A valid uploaded attachment_id is required."
+        if not isinstance(task, str) or not task.strip():
+            return "ERROR: The user's document task is required."
+        record = load_attachment_record(uid, aid)
+        if record is None:
+            return "ERROR: This attachment is unavailable for this user. Ask them to attach it again."
+        try:
+            state = await start_analysis(
+                uid, aid, record, task, retry_failed=bool(inp.get("retry_failed")),
+                session_id=self.turn_deep_link()[0], channel=self._current_channel,
+                anchor_message_id=self.turn_deep_link()[1],
+                include_unit_details=_wants_unit_details(_ORIGINAL_USER_TEXT_CTX.get() or task),
+                page_start=inp.get("page_start"), page_end=inp.get("page_end"),
+                request_identity=_ORIGINAL_USER_TEXT_CTX.get() or task,
+            )
+        except ValueError as exc:
+            explanations = {
+                "invalid_task": "The document request is too long (maximum 2,000 characters).",
+                "too_many_pages": "This PDF has more than 500 pages. It cannot be fully analyzed in one job.",
+                "text_too_long": "This text document exceeds the 2,000,000-character full-analysis limit.",
+                "unsupported_document": "Full-file analysis supports PDF, DOCX, PPTX, XLSX, plain text, Markdown, CSV, and JSON.",
+                "empty_document": "The document contains no readable text.",
+                "invalid_pdf": "The stored original is not a valid PDF.",
+                "unreadable_pdf": "The PDF could not be opened or may be password-protected.",
+                "file_too_large": "The stored file exceeds the 25 MiB analysis limit.",
+                "invalid_page_range": "A focused PDF request must name 1–20 valid consecutive pages.",
+                "page_range_requires_pdf": "Page ranges are available only for PDFs.",
+            }
+            return "ERROR: " + explanations.get(str(exc), "The original document could not be analyzed.")
+        except (FileNotFoundError, OSError):
+            return "ERROR: The original upload is missing. Ask the user to attach it again."
+        result = public_state(state)
+        result["guidance"] = (
+            "Analysis is running in the background. Tell the user it is processing and "
+            "that the result will appear in this chat. Never claim to have read unfinished units."
+            if state["status"] in ("queued", "running") else
+            "The result is stored. Use read_attachment_analysis for numbered details."
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _tool_read_attachment_analysis(self, inp: Dict[str, Any]) -> str:
+        from app.agent.attachment_analysis import ensure_running, load_state_async, public_state
+        from app.api.chat_attachments import load_attachment_record
+
+        uid = self._current_user_id
+        aid = inp.get("attachment_id")
+        analysis_id = inp.get("analysis_id")
+        if (not uid or not isinstance(aid, str) or not re.fullmatch(r"[0-9a-f]{32}", aid)
+                or not isinstance(analysis_id, str) or not re.fullmatch(r"[0-9a-f]{20}", analysis_id)):
+            return "ERROR: A valid attachment_id and analysis_id are required."
+        if load_attachment_record(uid, aid) is None:
+            return "ERROR: This attachment is unavailable for this user."
+        state = await load_state_async(uid, aid, analysis_id)
+        if state is None:
+            return "ERROR: No analysis with that ID exists for this attachment."
+        if state["status"] in ("queued", "running"):
+            ensure_running(uid, aid, analysis_id)
+        try:
+            start = max(1, int(inp.get("start", state.get("selected_start", 1))))
+            limit = min(10, max(1, int(inp.get("limit", 5))))
+        except (TypeError, ValueError):
+            return "ERROR: start and limit must be integers."
+        return json.dumps(public_state(state, include_units=True, start=start, limit=limit), ensure_ascii=False)
+
     # ------------------------------------------------------------------
     # 5. memory_search — file bodies + the document/media leg (v3 §3.2/§3.4)
     # ------------------------------------------------------------------
@@ -5800,6 +5914,11 @@ class ToolExecutor:
                     _body = msg.content
                     if msg.role == "assistant":
                         _body, _ = strip_leaked_tags(_body or "")
+                        from app.agent.attachment_provenance import history_analysis_ref
+                        _body = (_body or "") + history_analysis_ref(getattr(msg, "metadata_json", None))
+                    else:
+                        from app.agent.attachment_provenance import history_attachment_refs
+                        _body = (_body or "") + history_attachment_refs(getattr(msg, "attachments", None))
                     formatted.append(f"{tag} {role_label}: {_body}")
 
                 # v1 query filter: case-insensitive substring match + ±2 context window.
@@ -6872,6 +6991,10 @@ class ToolExecutor:
         Writes to the ``_CHANNEL_CTX`` ContextVar."""
         _CHANNEL_CTX.set((channel or "").strip().lower() or None)
 
+    def set_original_user_text(self, text: Optional[str]) -> None:
+        """Capture the actual utterance, separate from a model-paraphrased task."""
+        _ORIGINAL_USER_TEXT_CTX.set((text or "")[:4000])
+
     def set_session_id(self, session_id: Optional[str], asst_message_id: Optional[str] = None,
                        turn_started_at: Optional[float] = None):
         """Set the conversation this turn belongs to, and clear the per-turn
@@ -7088,6 +7211,31 @@ class ToolExecutor:
 
         query = (inp.get("query") or "").strip()
         channel = (inp.get("channel") or "youtube").strip().lower()
+        # When this play was asked for, so a stop/pause that lands while the
+        # search runs wins over it (checked right before the broadcast below).
+        # `internal_play_media` passes the mark it took on arrival; an agent
+        # call uses the mark its RUN took when the user's request arrived
+        # (`run_halt_mark`, bound by the voice think endpoints and the typed
+        # chat turn), so a stop while the model was still thinking counts too;
+        # with neither, the mark is taken here, when the tool starts. Anything
+        # else in the key (a model's JSON) is not a mark and is ignored.
+        # A mark may carry the caller's order (contract v0.3 §7): then an
+        # ordered stop drops this play only when the caller asked for it
+        # AFTER this play (`radio.control.media_play_superseded`).
+        try:
+            from app.agent.radio.control import (
+                MediaHaltMark as _HaltMark,
+                media_halt_mark as _halt_mark_now,
+                run_halt_mark as _run_halt_mark,
+            )
+            _halt_mark = inp.get("_halt_mark")
+            if not isinstance(_halt_mark, _HaltMark):
+                _halt_mark = _run_halt_mark(self._current_user_id or "")
+            if not isinstance(_halt_mark, _HaltMark):
+                _halt_mark = _halt_mark_now(self._current_user_id or "")
+        except Exception as _he:  # noqa: BLE001 - the guard never blocks a play
+            logger.debug("[play_media] halt mark unavailable: %s", _he)
+            _halt_mark = None
         # Playback surface. Audio-first: 'audio' unless the user explicitly
         # asked to WATCH — the model passes mode='video' only then. The frame
         # carries the resolved value so the phone renders the right surface.
@@ -7263,7 +7411,13 @@ class ToolExecutor:
                 logger.warning("[play_media] yt-dlp error: %s", e)
 
         if not video_id:
-            return f"Could not find a video for '{query}'. Try a different search term."
+            # `ERROR:`-prefixed like every other failure return in this tool.
+            # The voice tool-event stream derives its `ok` flag from exactly
+            # this prefix (api_v1 `on_tool_event`), so prose here rendered a
+            # green, completed "Starting the music" step with no music — and
+            # the model, reading the same prose, narrated it as a start.
+            return (f"ERROR: Could not find a video for '{query}'. "
+                    "Try a different search term.")
 
         # Remember the resolution so the next ask for this song skips the
         # scrape entirely.
@@ -7342,7 +7496,55 @@ class ToolExecutor:
         if user_id:
             try:
                 from app.api.ws_chat import broadcast_to_user, _check_age_and_swap
-                await broadcast_to_user(user_id, {
+                # A stop/pause that landed while this play was searching is the
+                # caller's newer intent. Broadcasting now would restart music
+                # the stop just ended (review F29), so the play is dropped: no
+                # frame, no `_last_media`, no station seed. No await between
+                # this check and the broadcast.
+                try:
+                    from app.agent.radio.control import (
+                        NEWER_PLAY_SUPERSEDES,
+                        PLAY_SUPERSEDED_PREFIX,
+                        media_play_superseded,
+                        recorded_media_item,
+                        send_media_play,
+                    )
+                    _halted = media_play_superseded(_halt_mark)
+                except Exception:  # noqa: BLE001 - never blocks a play
+                    _halted = None
+                    send_media_play = None
+                if _halted and _halted == NEWER_PLAY_SUPERSEDES:
+                    # R6-9 T1: what is on the device was asked for AFTER this
+                    # play (the caller's newest media request), so this older
+                    # one must not replace it. No frame, no seed.
+                    _newer = (recorded_media_item(user_id) or {}).get("title") or ""
+                    logger.info(
+                        "[play_media] superseded by a newer play already on the "
+                        "device — %s not broadcast", video_id,
+                    )
+                    return (
+                        f"{PLAY_SUPERSEDED_PREFIX} not started. A newer play the "
+                        f"user asked for after this one is already on their device"
+                        + (f" (\"{_newer}\")" if _newer else "")
+                        + ", so this older play request was dropped. Do not call "
+                        "play_media again for it and do not say this track is "
+                        "starting or playing."
+                    )
+                if _halted:
+                    _verb = "paused" if _halted == "pause" else "stopped"
+                    logger.info(
+                        "[play_media] superseded by a newer %s — %s not broadcast",
+                        _halted, video_id,
+                    )
+                    return (
+                        f"{PLAY_SUPERSEDED_PREFIX} not started. The user {_verb} "
+                        f"the music after asking for this, so this older play "
+                        f"request was dropped and nothing new is playing. Do not "
+                        f"call play_media again for it and do not say anything "
+                        f"is starting or playing; if they want music again they "
+                        f"will ask."
+                    )
+                _frame = {
                     "type": "media_play",
                     "provider": "youtube",
                     "video_id": video_id,
@@ -7363,8 +7565,45 @@ class ToolExecutor:
                     # resolved surface rides the frame so the client never has
                     # to guess. Web ignores the field.
                     "mode": "video" if mode == "video" else "song",
-                })
-                logger.info("[play_media] Broadcast media_play: %s - %s (mode=%s)", video_id, video_title, mode or "audio")
+                }
+                # The one chokepoint every media_play leaves through (R6-9
+                # T4): it also records this item — with the caller's order
+                # when the mark carries one — as what now plays, so an ordered
+                # stop the caller asked for BEFORE it leaves it alone
+                # (`newer_playing`) instead of silencing the newest request.
+                if send_media_play is not None:
+                    _sent = await send_media_play(user_id, _frame, mark=_halt_mark)
+                else:
+                    _sent = await broadcast_to_user(user_id, _frame)
+                logger.info("[play_media] Broadcast media_play: %s - %s (mode=%s) sent=%s",
+                            video_id, video_title, mode or "audio", _sent)
+                # DELIVERY, not dispatch. `broadcast_to_user` returns how many
+                # sockets received the event and that count was thrown away, so
+                # the tool's success string — the only thing the model has to
+                # go on — was emitted on the strength of having SENT. During a
+                # voice call the phone's chat WS is a different socket from the
+                # audio one, supervised on a 4 s timer and dropped by every
+                # ordinary rollout or network transition, so `sent == 0` is
+                # routine: the agent said "Now playing" into silence. Returning
+                # here also skips `_last_media` and `record_user_seed` below —
+                # a station must not be seeded from a track that never played.
+                if not _sent:
+                    logger.warning(
+                        "[play_media] media_play reached 0 sockets for %s — "
+                        "reporting ERROR instead of a play", video_id,
+                    )
+                    return (
+                        "ERROR: The player on the user's device is not reachable "
+                        "right now, so nothing started. Tell them to open the app "
+                        "and ask again. "
+                        # The link is what the channels WITHOUT a player socket
+                        # (WhatsApp, a web user whose tab is closed) have always
+                        # been given, and this branch is their ordinary outcome —
+                        # dropping it turned a tappable result into "open the
+                        # app". The sibling failure two blocks down keeps it for
+                        # the same reason.
+                        f"URL: {yt_url}"
+                    )
                 asyncio.create_task(_check_age_and_swap(video_id, user_id))
                 # EXTRACT warm for the track we just broadcast — deliberately
                 # NOT a build, even with the platform's single-flight spool
@@ -7384,7 +7623,8 @@ class ToolExecutor:
                     logger.debug("[play_media] pre-extract warm skipped: %s", _we)
             except Exception as e:
                 logger.warning("[play_media] Broadcast failed: %s", e)
-                return f"Found '{video_title}' but could not send to player. URL: {yt_url}"
+                return (f"ERROR: Found '{video_title}' but could not send it to "
+                        f"the player. URL: {yt_url}")
 
         # Store media metadata for message persistence
         self._last_media = {"type": "youtube", "video_id": video_id, "title": video_title}

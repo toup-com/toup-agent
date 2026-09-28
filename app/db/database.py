@@ -46,6 +46,23 @@ def _build_engine(database_url: str) -> AsyncEngine:
             pool_debug.install(eng)
     except Exception as _pd_err:  # never let a diagnostic break boot
         logger.warning("[pool-leak] install failed: %s", _pd_err)
+    if settings.run_mode == "agent":
+        try:
+            from app.db import slow_query_probe
+            slow_query_probe.install(eng)
+        except Exception as _sq_err:  # diagnostic; never gate tenant startup
+            logger.warning("[slow-sql] install failed: %s", type(_sq_err).__name__)
+    # R48 per-turn DB attribution. Asked here rather than inside `install`
+    # so that with `turn_db_span` off and no canary list no db_span listener
+    # is registered — other diagnostics, including the Voice slow-query
+    # probe above, keep their own listeners. Covers rebind-built engines for the
+    # same reason `pool_debug` does.
+    try:
+        from app.db import db_span as _db_span
+        if _db_span.armed():
+            _db_span.install(eng)
+    except Exception as _ds_err:  # never let a diagnostic break boot
+        logger.warning("[db_span] install failed: %s", _ds_err)
     _register_pool_gauge(eng)
     return eng
 

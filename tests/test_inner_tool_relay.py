@@ -118,6 +118,32 @@ def test_second_intent_falls_back_to_the_coarse_flag() -> None:
     assert frames[-1] == {"type": "state", "state": "tool_use"}
 
 
+def test_live_coarse_state_fallback_uses_the_session_sequencer() -> None:
+    ws = FakeWS()
+    seq = 0
+
+    async def send_state(state: str) -> None:
+        nonlocal seq
+        seq += 1
+        await ws.send_json({"type": "state", "state": state, "seq": seq})
+
+    relay = _InnerToolRelay(
+        ws,
+        "outer1",
+        frame_clock=lambda: 25,
+        state_sender=send_state,
+    )
+
+    async def run() -> None:
+        await relay.on_event({"type": "tool.intent", "name": "web_search"})
+        await relay.on_event({"type": "tool.intent", "name": "recall_day"})
+
+    asyncio.run(run())
+
+    states = [frame for frame in ws.sent if frame.get("type") == "state"]
+    assert states == [{"type": "state", "state": "tool_use", "seq": 1}]
+
+
 def test_unnamed_intent_opens_no_row() -> None:
     frames = drive([{"type": "tool.intent", "name": ""}])
     assert started(frames) == []
@@ -141,6 +167,63 @@ def test_end_without_a_start_is_dropped() -> None:
     """Pre-existing contract: never orphan a completion onto an unopened row."""
     frames = drive([{"type": "tool.end", "call_id": "nope", "name": "x", "ok": True}])
     assert completed(frames) == []
+
+
+def test_live_visibility_filter_removes_internal_scaffold_from_tool_copy() -> None:
+    ws = FakeWS()
+    sink: list[dict] = []
+    marker = "Live-session context from earlier accepted delegations follows"
+    relay = _InnerToolRelay(
+        ws,
+        "outer1",
+        sink=sink,
+        frame_context={"task_id": "d1", "parent_user_turn_id": "u1"},
+        sanitize_text=lambda value: "" if marker in value else value,
+    )
+
+    async def run() -> None:
+        await relay.on_event({
+            "type": "tool.start", "call_id": "c1", "name": "web_search",
+            "args": {"query": marker},
+        })
+        await relay.on_event({
+            "type": "tool.end", "call_id": "c1", "name": "web_search",
+            "ok": True, "preview": marker,
+        })
+
+    asyncio.run(run())
+    assert started(ws.sent)[0]["detail"] == ""
+    assert completed(ws.sent)[0]["result_preview"] == ""
+    assert sink and "summary" not in sink[0]
+
+
+@pytest.mark.parametrize(
+    ("frame_context", "frame_clock", "expects_provisional"),
+    [
+        (None, None, True),
+        (None, lambda: 25, True),
+        ({"task_id": "d1", "parent_user_turn_id": "u1"}, None, False),
+        ({"task_id": "d1", "parent_user_turn_id": "u1"}, lambda: 25, False),
+    ],
+)
+def test_actual_only_tool_events_are_gated_by_lifecycle_not_timing(
+    frame_context, frame_clock, expects_provisional,
+) -> None:
+    ws = FakeWS()
+    relay = _InnerToolRelay(
+        ws,
+        "outer1",
+        frame_context=frame_context,
+        frame_clock=frame_clock,
+    )
+
+    asyncio.run(relay.on_event({"type": "tool.intent", "name": "web_search"}))
+
+    starts = started(ws.sent)
+    assert bool(starts) is expects_provisional
+    if frame_clock is not None and starts:
+        assert starts[0]["started_ms"] == 25
+        assert starts[0]["clock"] == "provider"
 
 
 if __name__ == "__main__":  # pragma: no cover

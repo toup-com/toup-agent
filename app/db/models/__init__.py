@@ -49,9 +49,23 @@ from .document import Document, DocumentChunk, Media
 
 # Apps & Build Jobs
 from .app import App, BuildJob, BuildUsage, JobEvent, ReconciliationLog
+from .attachment_analysis import AttachmentAnalysisJob
 
 # Agent runtime
 from .agent import CronJob, TelegramUserMapping, AgentError, ApiKey, AgentConfig, ExtensionDevice
+
+# Toup for Mac — the desktop relay (pairing, devices, local-action consent)
+from .desktop import (
+    DesktopDevice,
+    DesktopPairing,
+    DesktopPendingAction,
+    DesktopTask,
+    DESKTOP_TASK_STATUSES,
+    DESKTOP_TASK_TERMINAL,
+    PAIRING_STATUSES,
+    DESKTOP_ACTION_STATUSES,
+    DESKTOP_ACTION_TERMINAL,
+)
 
 # Routines (system-managed scheduled actions — email briefing, etc.)
 from .routine import Routine, RoutineRun, RoutineNotificationDedupe
@@ -263,6 +277,10 @@ __all__ = [
     "Document", "DocumentChunk", "Media",
     "App", "BuildJob", "BuildUsage", "ReconciliationLog",
     "CronJob", "TelegramUserMapping", "AgentError", "ApiKey", "AgentConfig", "ExtensionDevice",
+    # Toup for Mac — desktop relay
+    "DesktopDevice", "DesktopPairing", "DesktopPendingAction", "DesktopTask",
+    "DESKTOP_TASK_STATUSES", "DESKTOP_TASK_TERMINAL",
+    "PAIRING_STATUSES", "DESKTOP_ACTION_STATUSES", "DESKTOP_ACTION_TERMINAL",
     "Routine", "RoutineRun", "RoutineNotificationDedupe",
     "Trigger", "TriggerEvent",
     "TRIGGER_KINDS", "TRIGGER_ACTIONS", "TRIGGER_STATUSES", "TRIGGER_EVENT_STATUSES",

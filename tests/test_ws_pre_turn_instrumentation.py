@@ -533,15 +533,15 @@ def test_the_ttfb_line_is_latched_so_a_long_answer_logs_once():
 def test_the_fast_media_external_request_is_behind_the_classifier():
     """`_fast_media_check` can spend up to 8 s on a YouTube request. A message
     the play-pattern does not match must never reach it — and it does not: the
-    regexes are the first thing the function does and it returns None."""
+    classifier (`media_intent.media_request`) is the first thing the function does and it returns None."""
     import app.api.ws_chat as ws
 
     body = inspect.getsource(ws._fast_media_check)
     head = body[:body.index("import httpx")]
-    assert "_PLAY_PATTERNS" in head and "return None" in head, (
+    assert "media_request" in head and "return None" in head, (
         "the external request is no longer gated on the play-pattern match"
     )
-    assert head.index("if not query or len(query) < 2") < head.index("logger.info")
+    assert head.index("if len(query) < 2") < head.index("logger.info")
 
 
 @pytest.mark.asyncio
@@ -851,3 +851,87 @@ def test_the_contextvar_default_is_none_so_an_unset_turn_reads_as_absent():
     from app.api.ws_chat import CURRENT_TURN_DAY_CHAT_ID
 
     assert CURRENT_TURN_DAY_CHAT_ID.get() is None
+
+
+# ── Exact-user pre-save refresh pilot ───────────────────────────────────
+
+def test_presave_refresh_pilot_requires_an_exact_canonical_user_id(monkeypatch):
+    from app.config import presave_refresh_trim_enabled, settings
+
+    owner = "00000000-0000-4000-8000-000000000001"
+    other = "00000000-0000-4000-8000-000000000002"
+    monkeypatch.setattr(settings, "presave_refresh_trim_canary_user_ids", "")
+    assert not presave_refresh_trim_enabled(owner)
+
+    monkeypatch.setattr(settings, "presave_refresh_trim_canary_user_ids", "*,00000000")
+    assert not presave_refresh_trim_enabled(owner)
+
+    monkeypatch.setattr(
+        settings, "presave_refresh_trim_canary_user_ids", f"invalid, {owner}, {other[:8]}"
+    )
+    assert presave_refresh_trim_enabled(owner)
+    assert not presave_refresh_trim_enabled(other)
+    assert not presave_refresh_trim_enabled(None)
+    assert not presave_refresh_trim_enabled("")
+
+
+def test_presave_refresh_pilot_keeps_commit_before_id_and_ack():
+    src = WS_CHAT_SRC
+    commit = src.index("await _presave_db.commit()", src.index("_new_msg = DbMessage(**_msg_kwargs)"))
+    gate = src.index("_presave_refresh_skipped = presave_refresh_trim_enabled(user_id)", commit)
+    refresh = src.index("await _presave_db.refresh(_new_msg)", gate)
+    persisted = src.index("_persisted_user_msg_id = _new_msg.id", refresh)
+    ack = src.index('"type": "user_message_persisted"', persisted)
+    assert commit < gate < refresh < persisted < ack
+    assert "if not _presave_refresh_skipped:\n                                await _presave_db.refresh(_new_msg)" in src
+    assert "presave_refresh_skipped=int(_presave_refresh_skipped)" in src
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("poolclass_name", ["NullPool", "AsyncAdaptedQueuePool"])
+async def test_post_commit_refresh_adds_a_checkout_without_changing_the_assigned_id(
+    tmp_path, poolclass_name
+):
+    """Measure the round trip this canary removes, in both DB pool modes."""
+    from sqlalchemy import Column, String, event
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.orm import declarative_base
+    from sqlalchemy import pool as sa_pool
+
+    base = declarative_base()
+
+    class Row(base):
+        __tablename__ = "presave_probe"
+        id = Column(String, primary_key=True)
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'presave.db'}",
+        poolclass=getattr(sa_pool, poolclass_name),
+    )
+    checkouts = []
+    event.listen(engine.sync_engine, "checkout", lambda *args: checkouts.append(1))
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(base.metadata.create_all)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        checkouts.clear()
+        async with maker() as session:
+            row = Row(id="assigned-before-commit")
+            session.add(row)
+            await session.commit()
+            assert row.id == "assigned-before-commit"
+        without_refresh = len(checkouts)
+
+        checkouts.clear()
+        async with maker() as session:
+            row = Row(id="refreshed")
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            assert row.id == "refreshed"
+        with_refresh = len(checkouts)
+    finally:
+        await engine.dispose()
+
+    assert without_refresh == 1
+    assert with_refresh == without_refresh + 1

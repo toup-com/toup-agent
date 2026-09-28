@@ -228,11 +228,17 @@ def _watch() -> None:
         frames = _capture_frames(_loop_thread_ident)
         cap_ms = (time.monotonic() - _cap_t0) * 1000.0
         top = frames[0] if frames else "unknown"
+        try:
+            from app.db.slow_query_probe import active_snapshot
+            sql_active = active_snapshot()
+        except Exception:
+            sql_active = "-"
         _last_stall = {
             "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "lag_ms": round(lag * 1000.0, 1),
             "top": top,
             "cap_ms": round(cap_ms, 1),
+            "sql_active": sql_active,
             # False ⇒ `top` names the loop's resume point, not the blocker.
             "top_is_blocker": cap_ms < max(250.0, warn_s * 1000.0 * 0.25),
         }
@@ -244,13 +250,14 @@ def _watch() -> None:
         try:
             logger.warning(
                 "[LOOP_STALL] lag_ms=%d threshold_ms=%d cap_ms=%d "
-                "top_is_blocker=%d top=%s stack=%s threads=%d stalls=%d",
+                "top_is_blocker=%d top=%s stack=%s sql_active=%s threads=%d stalls=%d",
                 int(lag * 1000.0),
                 int(warn_s * 1000.0),
                 int(cap_ms),
                 1 if _last_stall.get("top_is_blocker") else 0,
                 top,
                 ">".join(frames[:_STACK_FRAMES]) or "-",
+                sql_active,
                 threading.active_count(),
                 _stalls,
             )

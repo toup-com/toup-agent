@@ -1122,7 +1122,7 @@ async def test_responses_stream_passthrough_and_metering(
     user_id, token = responses_agent
     seen_bodies: list[dict] = []
 
-    async def fake_stream(self, body, api_key):
+    async def fake_stream(self, body, api_key, meta=None):
         seen_bodies.append(dict(body))
         yield _RESPONSES_SSE
 
@@ -1182,7 +1182,7 @@ async def test_responses_upstream_error_logs_zero_token_error_event(
 
     user_id, token = responses_agent
 
-    async def fail_stream(self, body, api_key):
+    async def fail_stream(self, body, api_key, meta=None):
         raise lp.UpstreamProviderError(400, b'{"error": {"message": "bad"}}', "openai")
         yield b""  # pragma: no cover — makes this an async generator
 
@@ -1214,7 +1214,7 @@ async def test_responses_route_does_not_inject_stream_options(
     user_id, token = responses_agent
     seen_bodies: list[dict] = []
 
-    async def fake_stream(self, body, api_key):
+    async def fake_stream(self, body, api_key, meta=None):
         seen_bodies.append(dict(body))
         yield _RESPONSES_SSE
 

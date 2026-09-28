@@ -133,6 +133,7 @@ _BIND_FIELDS = (
     "connect_token",
     "supabase_url",
     "supabase_anon_key",
+    "desktop_relay_enabled",
 )
 
 
@@ -192,6 +193,9 @@ async def admin_bind(
 
     # Filter to whitelisted fields only.
     filtered = {k: payload[k] for k in _BIND_FIELDS if k in payload and payload[k] is not None}
+    # Older platform bind payloads omit this gate. Never inherit a previous
+    # binding's desktop access, and accept only an actual JSON boolean.
+    filtered["desktop_relay_enabled"] = payload.get("desktop_relay_enabled") is True
 
     logger.info(
         "[admin/bind] Binding container to user_id=%s (fields: %d)",
@@ -415,6 +419,15 @@ async def admin_bind(
             )
     except Exception as e:
         logger.warning("[admin/bind] AgentConfig identity reset failed (non-fatal): %s", e)
+
+    # A pool bind can activate desktop tools after the lobby loader ran.
+    try:
+        from app.agent.skills.loader import get_active_loader
+        loader = get_active_loader()
+        if loader is not None:
+            await loader.refresh_entitlements()
+    except Exception as exc:
+        logger.warning("[admin/bind] skill refresh failed: %s", exc)
 
     # 2c. Refresh the LLM key cache. OpenAI/Anthropic clients are
     #     constructed once at agent boot and cached on KeyProvider's

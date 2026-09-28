@@ -26,7 +26,7 @@ TIER_DEEP = "Deep"
 
 # Substrings that map a real model id to a tier. Order matters: first hit wins.
 # Kept broad so unseen future ids still land on a sane tier rather than leaking.
-_DEEP = ("opus", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4", "o1", "o3", "-pro", "reasoning")
+_DEEP = ("opus", "gpt-6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4", "o1", "o3", "-pro", "reasoning")
 _FAST = ("haiku", "mini", "nano", "flash", "luna", "gpt-4o-mini", "small", "lite", "turbo")
 
 # Provider / model tokens to scrub from free-text output (case-insensitive).

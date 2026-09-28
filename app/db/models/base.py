@@ -111,6 +111,7 @@ AGENT_ONLY_TABLES: set[str] = {
     # Apps & build jobs
     "apps",
     "build_jobs",
+    "attachment_analysis_jobs",
     "build_usage",
     "reconciliation_logs",
     # The per-job event log. `app/api/jobs_events.py` lives under app/api/ but
@@ -314,6 +315,22 @@ PLATFORM_ONLY_TABLES: set[str] = {
     # escalation). It describes PLATFORM loops probing tenants; a tenant has
     # no sweep and must never read its own strike count.
     "agent_probe_state",
+    # Toup for Mac — the desktop relay. Deliberately NOT SHARED, which is the
+    # opposite call from `extension_devices` below; the full argument is in
+    # `app/db/models/desktop.py`'s module docstring. In one line: the device
+    # row IS the revocation list for a credential that can read files and run
+    # commands, so it lives beside the connector tokens, and a second empty
+    # tenant copy is exactly the two-stores-one-policy drift that
+    # `agent-tool-relay.md` risk #7 is about. `app/api/desktop.py` is mounted
+    # on both mains but its agent half reaches the platform over HTTP
+    # (X-Agent-Key) rather than querying these tables, so the bi-residency
+    # that forced `extension_devices` to be SHARED does not arise.
+    "desktop_devices",
+    "desktop_pairings",
+    "desktop_pending_actions",
+    # A phone's remote task. Its status is derived from the device's presence
+    # and the task's cards, which are both here, so it lives beside them.
+    "desktop_tasks",
 }
 
 SHARED_TABLES: set[str] = {

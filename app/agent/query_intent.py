@@ -33,6 +33,10 @@ from typing import FrozenSet, Set
 # by the extraction gate in agent_runner. query_classifier is a leaf module
 # (stdlib-only imports), so this cannot cycle.
 from app.services.query_classifier import is_explicit_remember_request
+# The Persian play grammar and the codepoint folder, shared with ws_chat's
+# fast path and the GPT-Live relay so a play request has ONE verdict wherever
+# it is asked. Also a leaf module (re + unicodedata only).
+from app.agent.media_intent import fa_media_score, normalize_fa
 
 logger = logging.getLogger(__name__)
 
@@ -706,6 +710,24 @@ INTENT_FULL = QueryIntent(
 # Main classifier
 # ---------------------------------------------------------------------------
 
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+#: Below this share of Latin letters the text is "a script this classifier has
+#: no vocabulary for". Not zero: a Persian sentence routinely carries an
+#: English proper noun ("یه آهنگ از Coldplay بذار"), and demanding zero Latin
+#: would exempt exactly the mixed-script asks a bilingual user types.
+_NON_LATIN_MAX_LATIN_SHARE = 0.30
+
+
+def _is_predominantly_non_latin(text: str) -> bool:
+    letters = _LETTER_RE.findall(text or "")
+    if not letters:
+        return False
+    latin = sum(1 for ch in letters if _LATIN_RE.match(ch))
+    return (latin / len(letters)) < _NON_LATIN_MAX_LATIN_SHARE
+
+
 def classify_query_intent(message: str) -> QueryIntent:
     """
     Classify a user message into an intent category for tool/prompt filtering.
@@ -720,6 +742,8 @@ def classify_query_intent(message: str) -> QueryIntent:
       6. Explicit web keywords/patterns → web
       7. Explicit code keywords/patterns → code
       8. Explicit agent keywords/patterns → agent
+     8b. Zero score in a script this file has no vocabulary for → full
+         (≥2 tokens, predominantly non-Latin) — see the block itself
       9. Short (≤6 words) with no tool indicators → question
      10. Default → full (send everything)
 
@@ -731,6 +755,12 @@ def classify_query_intent(message: str) -> QueryIntent:
 
     stripped = message.strip()
     normalized = stripped.lower()
+    # Every Persian family below reads from HERE, not from `normalized`. A
+    # soft keyboard emits ARABIC kaf/yeh (ك/ي) where Persian wants ک/ی, and
+    # ZWNJ where a space would do — so `ایمیل‌هام` and `ايميل هام` are the
+    # same sentence typed on two keyboards, and until this fold existed they
+    # classified differently (owned-data vs. nothing).
+    normalized_fa = normalize_fa(normalized)
 
     # Remove trailing punctuation/emoji for matching
     clean = normalized.rstrip("!?.,;:) \t\n")
@@ -816,19 +846,32 @@ def classify_query_intent(message: str) -> QueryIntent:
             scores["media"] += 2
     if _MEDIA_PATTERNS_RE.search(normalized):
         scores["media"] += 3
+    # A3-2: every natural Persian play phrasing of ≤8 words scored zero in
+    # every family and fell to INTENT_QUESTION, whose tool set has no
+    # play_media — so the agent said it would start the music and could not.
+    # The grammar lives in `media_intent` because ws_chat's fast path and the
+    # Live relay need the same verdict. English keeps its own families above:
+    # they also cover image generation and send_photo, which are media INTENT
+    # but not playback, so a second scorer over the same text would
+    # double-count and change which category wins a tie.
+    scores["media"] += fa_media_score(normalized_fa)
 
     # Web.  An explicitly named owned-data target keeps the broad capability
     # surface even when a modifier such as ``آنلاین``, ``آخرین``, ``قیمت``,
     # or a URL also appears.  Full intent still includes web tools; the key is
     # not to hide the inbox/calendar/filesystem tool needed for the first step.
-    _persian_owned_data_target = bool(_PERSIAN_OWNED_DATA_RE.search(normalized))
+    _persian_owned_data_target = bool(_PERSIAN_OWNED_DATA_RE.search(normalized_fa))
     if not _persian_owned_data_target:
         for kw in _WEB_KEYWORDS:
-            if kw in normalized:
+            if kw in normalized or kw in normalized_fa:
                 scores["web"] += 2
-        if _WEB_PATTERNS_RE.search(normalized):
+        # Both spellings: the fold is a strict superset for the Persian
+        # alternations, but `_WEB_PATTERNS_RE` is half English and NFKC is not
+        # a provable no-op over arbitrary Latin text — so the raw form keeps
+        # its exact behaviour and the folded form only adds.
+        if _WEB_PATTERNS_RE.search(normalized) or _WEB_PATTERNS_RE.search(normalized_fa):
             scores["web"] += 3
-        if _PERSIAN_SEARCH_RE.search(normalized):
+        if _PERSIAN_SEARCH_RE.search(normalized_fa):
             scores["web"] += 3
         # URLs are a strong web signal
         if "http://" in normalized or "https://" in normalized:
@@ -879,6 +922,26 @@ def classify_query_intent(message: str) -> QueryIntent:
                 }
                 return _finish(intent_map[cat])
 
+    # 8b. The language-agnostic backstop, and it is the part that must not be
+    #     skipped. Every keyword family in this file is Latin-script except
+    #     the handful of Persian ones added by hand, so for a user writing in
+    #     Arabic, Turkish, Hindi, Russian or Persian-we-have-not-covered, a
+    #     zero score means "this classifier has no vocabulary for that script"
+    #     — NOT "this request needs no tools". Those two have opposite correct
+    #     answers, and rule 9 below gives the second one: the tool-less
+    #     question intent, which is how ``یه آهنگ پخش کن`` reached a model
+    #     that could see play_media and was forbidden to call it.
+    #
+    #     `full` is merely WIDER, never wrong: it sends every tool and lets
+    #     the model choose. Two guards keep it from widening the common path:
+    #     the text must be predominantly non-Latin, and it must be at least
+    #     two whitespace tokens — the caption fragments a voice transcript
+    #     settles mid-utterance (`حال`, `بذار`, `برام` in recording 1) are one
+    #     token each, and a one-word fragment must never open the full surface
+    #     on its own.
+    if max_score == 0 and word_count >= 2 and _is_predominantly_non_latin(stripped):
+        return _finish(INTENT_FULL)
+
     # 9. Short messages with no tool indicators → question (no tools needed)
     #    A short ask that names a file ("as a word doc please") keeps the
     #    question category but carries the export tools.
@@ -898,6 +961,8 @@ def classify_query_intent(message: str) -> QueryIntent:
 # came back as `<navigate_to path="/brain/user" />` plain text instead
 # of an actual tool call).
 _ALWAYS_INCLUDED_TOOLS = frozenset({
+    "analyze_attachment",  # A short "summarize this" may need the full uploaded file.
+    "read_attachment_analysis",  # Follow-up turns can retrieve stored page evidence.
     "navigate_to",  # Page transfers — needed in any intent
     "recall_day",   # Past-day questions can fall under any category
     "memory_search",  # "what do you remember about X" can hit any intent

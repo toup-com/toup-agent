@@ -519,10 +519,20 @@ async def test_the_turn_does_not_wait_for_the_card(monkeypatch, tmp_path):
 async def test_a_hung_up_turn_still_closes_its_card(monkeypatch, tmp_path):
     """Cancellation is how a voice call normally ends — the SSE generator
     cancels the turn task the moment the caller disconnects. A card left
-    running would sit frozen until the 30-minute reaper closed it with a
-    false "Didn't finish" over work the agent already spoke aloud."""
+    running would sit frozen until the 30-minute reaper closed it.
+
+    R48 changed the WORD, not the guarantee. The card still terminalises from
+    the sweep; it closes `cancelled` rather than `completed` because this turn
+    was stopped before it had an answer, and the delivered case is covered by
+    `test_a_hung_up_turn_whose_answer_landed_still_closes_completed` below.
+    Never `failed`: the caller hanging up is not the work breaking.
+    """
     import app.agent.voice_jobs as vj
 
+    # The delivery proof is a bounded poll; a ceiling of zero is "ask once,
+    # do not wait" — this turn has no answer to find either way.
+    monkeypatch.setattr(vj, "_CANCEL_PROOF_POLL_S", 0.0)
+    monkeypatch.setattr(vj, "_CANCEL_PROOF_MAX_WAIT_S", 0.0)
     job = vj.VoiceTurnJob(
         user_id=await _make_user(), conversation_id=str(uuid.uuid4()),
         request_text="find the strongest image-generation model",
@@ -532,10 +542,10 @@ async def test_a_hung_up_turn_still_closes_its_card(monkeypatch, tmp_path):
     # The sweep runs from run()'s finally, synchronously, on a cancelled task.
     vj.sweep_current_voice_job()
     assert vj.current_voice_job() is None
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.4)
     rows = await _jobs_for(job._user_id)  # noqa: SLF001 — the row is the point
     assert len(rows) == 1
-    assert rows[0].status == "completed", (
-        "an interrupted voice turn closes COMPLETED, never failed — the "
-        "caller hanging up is not the work failing"
+    assert rows[0].status == "cancelled", (
+        "a voice turn stopped before it delivered anything must not claim "
+        "'Done in N steps' — the work happened, the answer never arrived"
     )

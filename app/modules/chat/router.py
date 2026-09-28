@@ -34,6 +34,7 @@ from app.services.prompt_builder import get_prompt_builder
 from app.services.memory_service import MemoryService
 from app.services.embedding_service import get_embedding_service
 from app.config import settings
+from app.services.model_resolver import default_model as default_chat_model
 
 from app.services.memory_log import describe_memory
 
@@ -129,7 +130,7 @@ async def _chat_complete(
     )
     
     # 5. Generate LLM response
-    model = request.model or settings.default_model
+    model = request.model or default_chat_model()
     temperature = request.temperature if request.temperature is not None else settings.temperature
     max_tokens = request.max_tokens or settings.max_tokens
     
@@ -301,7 +302,7 @@ async def _chat_stream(
             )
             
             # 5. Stream LLM response
-            model = request.model or settings.default_model
+            model = request.model or default_chat_model()
             temperature = request.temperature if request.temperature is not None else settings.temperature
             max_tokens = request.max_tokens or settings.max_tokens
             

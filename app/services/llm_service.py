@@ -139,7 +139,8 @@ class LLMService:
         if prompt_cache_key:
             kwargs["prompt_cache_key"] = prompt_cache_key
         if prompt_cache_retention:
-            kwargs["prompt_cache_retention"] = prompt_cache_retention
+            from app.services.model_resolver import prompt_cache_retention_params
+            kwargs.update(prompt_cache_retention_params(model, prompt_cache_retention))
         if safety_identifier:
             kwargs["safety_identifier"] = safety_identifier
 
@@ -285,7 +286,9 @@ class LLMService:
         temperature = temperature if temperature is not None else self.default_temperature
         max_tokens = max_tokens or self.default_max_tokens
 
-        from app.services.model_resolver import supports_custom_temperature
+        from app.services.model_resolver import (
+            supports_custom_temperature, uses_max_completion_tokens,
+        )
 
         try:
             call_kwargs = dict(kwargs)
@@ -294,12 +297,14 @@ class LLMService:
             if prompt_cache_key:
                 call_kwargs["prompt_cache_key"] = prompt_cache_key
             if prompt_cache_retention:
-                call_kwargs["prompt_cache_retention"] = prompt_cache_retention
+                from app.services.model_resolver import prompt_cache_retention_params
+                call_kwargs.update(prompt_cache_retention_params(model, prompt_cache_retention))
             if safety_identifier:
                 call_kwargs["safety_identifier"] = safety_identifier
+            token_arg = "max_completion_tokens" if uses_max_completion_tokens(model) else "max_tokens"
+            call_kwargs[token_arg] = max_tokens
             stream = await self._openai_client.chat.completions.create(
-                model=model, messages=messages,
-                max_tokens=max_tokens, stream=True, **call_kwargs,
+                model=model, messages=messages, stream=True, **call_kwargs,
             )
             async for chunk in stream:
                 if chunk.choices:

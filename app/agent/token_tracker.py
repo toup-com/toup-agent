@@ -32,15 +32,14 @@ logger = logging.getLogger(__name__)
 # tracker has no per-call cached-token counts); the extra keys exist to keep
 # the pricing dicts in sync, and test_pricing_table_matches_billing pins that.
 #
-# 2026-08-07: cached_input MEASURED against OpenAI organization billing for
-# gpt-5.5 ($0.5493/M, 0.098x uncached) and gpt-4o-mini ($0.0750/M, 0.500x);
-# both were missing it. terra's cache_write dropped 3.125 -> 2.50 because the
-# billed line measures at terra's list input rate, not a 1.25x surcharge.
+# 2026-09-28: current published GPT-6 Sol/GPT-5.6 rates. Long-context
+# multipliers are applied at calculation time, not stored as another row.
 MODEL_PRICING: Dict[str, Dict[str, float]] = {
     "gpt-5.5": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
-    "gpt-5.6-terra": {"input": 2.50, "cached_input": 0.25, "cache_write": 2.50, "output": 15.00},
-    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "cache_write": 6.25, "output": 30.00},
-    "gpt-5.6-luna": {"input": 1.00, "cached_input": 0.10, "cache_write": 1.25, "output": 6.00},
+    "gpt-6-sol": {"input": 2.00, "cached_input": 0.20, "cache_write": 2.50, "output": 10.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "cache_write": 2.50, "output": 12.00},
+    "gpt-5.6-sol": {"input": 4.00, "cached_input": 0.40, "cache_write": 5.00, "output": 20.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "cache_write": 0.25, "output": 1.20},
     "gpt-5.4": {"input": 3.00, "output": 12.00},
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
@@ -74,8 +73,10 @@ class UsageRecord:
 
     def _calculate_cost(self) -> float:
         pricing = MODEL_PRICING.get(self.model, {"input": 0.0, "output": 0.0})
-        input_cost = self.input_tokens / 1_000_000 * pricing["input"]
-        output_cost = self.output_tokens / 1_000_000 * pricing["output"]
+        from app.services.model_resolver import long_context_price_multipliers
+        input_mult, output_mult = long_context_price_multipliers(self.model, self.input_tokens)
+        input_cost = self.input_tokens / 1_000_000 * pricing["input"] * input_mult
+        output_cost = self.output_tokens / 1_000_000 * pricing["output"] * output_mult
         return round(input_cost + output_cost, 6)
 
     @property

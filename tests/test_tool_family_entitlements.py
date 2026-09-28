@@ -326,6 +326,18 @@ def test_shipped_default_withholds_exactly_the_toup_family():
       * dropping `app_builder` or `doc_generation` breaks tenants that
         were measured using them, with a scripted refusal and no way for
         the turn to recover.
+
+    `desktop` (Toup for Mac) was added to the loadout when the family was
+    created, and that IS a product decision rather than a drive-by edit —
+    recorded here and beside the field in config.py. It changes no tenant's
+    array today, because `skill_enabled("desktop")` also requires
+    `settings.desktop_relay_enabled`, which defaults to False; the
+    byte-identity test below is what proves that. It is named rather than
+    withheld so that launching the feature is ONE flag rather than two —
+    a family absent from this string makes `DESKTOP_RELAY_ENABLED=1` a
+    silent no-op, which is the trap the automations rollout already paid
+    for. Withholding it per tenant remains available afterwards, which is
+    the whole reason the family exists.
     """
     from app.config import Settings
     from app.agent.tool_entitlements import FAMILIES
@@ -333,7 +345,7 @@ def test_shipped_default_withholds_exactly_the_toup_family():
     default = Settings.model_fields["agent_tool_families"].default
     shipped = {f.strip() for f in default.split(",") if f.strip()}
 
-    assert shipped == {"doc_generation", "app_builder"}, (
+    assert shipped == {"doc_generation", "app_builder", "desktop"}, (
         f"the shipped tool-family loadout changed to {sorted(shipped)} — "
         "see the measurement recorded beside the field in config.py"
     )

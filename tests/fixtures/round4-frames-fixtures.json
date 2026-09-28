@@ -1,0 +1,3519 @@
+{
+ "consent_after_question:yes, sounds good": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "yes, sounds good",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes, sounds good",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "accepted"
+  }
+ ],
+ "consent_after_question:sure, that's fine": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "sure, that's fine",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "sure, that's fine",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "accepted"
+  }
+ ],
+ "consent_after_question:yes, perfect": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. Should I book you in for tomorrow at ten?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "yes, perfect",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes, perfect",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "accepted"
+  }
+ ],
+ "consent_after_question:آره عالیه": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. برای فردا ساعت ده وقت بگیرم؟",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. برای فردا ساعت ده وقت بگیرم؟",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "آره عالیه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "آره عالیه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "accepted"
+  }
+ ],
+ "consent_after_question:باشه خوبه": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. برای فردا ساعت ده وقت بگیرم؟",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. برای فردا ساعت ده وقت بگیرم؟",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "باشه خوبه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "باشه خوبه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "accepted"
+  }
+ ],
+ "closing_after_statement:yes, sounds good": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "yes, sounds good",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes, sounds good",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "stale"
+  }
+ ],
+ "closing_after_statement:sure, that's fine": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "sure, that's fine",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "sure, that's fine",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "stale"
+  }
+ ],
+ "closing_after_statement:yes, perfect": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "I found Union Dental on Front Street. It is open until six today.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "yes, perfect",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes, perfect",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "stale"
+  }
+ ],
+ "closing_after_statement:آره عالیه": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. امروز تا ساعت شش بازه.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. امروز تا ساعت شش بازه.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "آره عالیه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "آره عالیه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "stale"
+  }
+ ],
+ "closing_after_statement:باشه خوبه": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. امروز تا ساعت شش بازه.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "start_ms": 1000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "دندونپزشکی یونیون رو پیدا کردم. امروز تا ساعت شش بازه.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "باشه خوبه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "باشه خوبه",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:2",
+   "outcome": "stale"
+  }
+ ],
+ "prompt_after_request:so?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "so?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "so?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:well?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "well?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "well?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:and?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "and?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "and?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:پس؟": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "پس؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "پس؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:Um.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Um.",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Um.",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:can you still hear me?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "can you still hear me?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "can you still hear me?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:hello? anyone?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello? anyone?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello? anyone?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:هستی هنوز؟": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "هستی هنوز؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "هستی هنوز؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "prompt_after_request:did you hear me?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "did you hear me?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "did you hear me?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 4000,
+   "end_ms": 4600,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted"
+  }
+ ],
+ "span_tail:Are you there?": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Are you there?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Are you there?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 3050,
+   "updated_ms": 3353,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 3050,
+   "updated_ms": 3353,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "completed",
+   "task_revision": 3,
+   "created_ms": 3050,
+   "updated_ms": 3353,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 4
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "spoken": false,
+   "result_text": "Union Dental, Front Street."
+  }
+ ],
+ "span_tail:هستی؟": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "هستی؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "هستی؟",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 3050,
+   "updated_ms": 3351,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 3050,
+   "updated_ms": 3352,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "completed",
+   "task_revision": 3,
+   "created_ms": 3050,
+   "updated_ms": 3352,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 4
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "spoken": false,
+   "result_text": "Union Dental, Front Street."
+  }
+ ],
+ "span_tail:Okay, thanks.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find me a dentist near union station",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Okay, thanks.",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "Okay, thanks.",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 2400,
+   "end_ms": 3000,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 3050,
+   "updated_ms": 3352,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 3050,
+   "updated_ms": 3352,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "task_id": "d-span",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "completed",
+   "task_revision": 3,
+   "created_ms": 3050,
+   "updated_ms": 3353,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 4
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d-span",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find me a dentist near union station",
+   "spoken": false,
+   "result_text": "Union Dental, Front Street."
+  }
+ ],
+ "conditional_reask:Yes, I'm here.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "response_text",
+   "text": "Yes, I'm here.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 8600,
+   "end_ms": 9900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Yes, I'm here.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted",
+   "conditional": true
+  }
+ ],
+ "conditional_reask:Yes, I'm here, let me check the library hours.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "response_text",
+   "text": "Yes, I'm here, let me check the library hours.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 8600,
+   "end_ms": 9900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Yes, I'm here, let me check the library hours.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted",
+   "conditional": true
+  }
+ ],
+ "conditional_reask:The Union Station library closes at nine tonight.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "response_text",
+   "text": "The Union Station library closes at nine tonight.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 8600,
+   "end_ms": 9900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "The Union Station library closes at nine tonight.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted",
+   "conditional": true
+  }
+ ],
+ "conditional_reask:It's open until nine this evening.": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "what time does the union station library close",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "hello?",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 8000,
+   "end_ms": 8400,
+   "clock": "provider",
+   "phatic": true
+  },
+  {
+   "type": "response_text",
+   "text": "It's open until nine this evening.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 8600,
+   "end_ms": 9900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 2
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "A"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "It's open until nine this evening.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 3
+  },
+  {
+   "type": "reask_result",
+   "user_turn_id": "live-utt:live-psid:1",
+   "outcome": "accepted",
+   "conditional": true
+  }
+ ],
+ "confirm_yes:yes": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 950,
+   "updated_ms": 1252,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 950,
+   "updated_ms": 1253,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 5850,
+   "updated_ms": 6153,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 5850,
+   "updated_ms": 6153,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 4
+  },
+  {
+   "type": "response_text",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 20000,
+   "end_ms": 21500,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 5
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "Q"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 6
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 7
+  },
+  {
+   "type": "transcript",
+   "text": "yes",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 3,
+   "created_ms": 5850,
+   "updated_ms": 25104,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "cancelled",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "canceled",
+   "task_revision": 3,
+   "created_ms": 950,
+   "updated_ms": 25104,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0,
+   "reason": "user_cancel"
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "completed",
+   "task_revision": 4,
+   "created_ms": 5850,
+   "updated_ms": 26781,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 8
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "spoken": false,
+   "result_text": "Done."
+  }
+ ],
+ "confirm_yes:yes stop it": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 950,
+   "updated_ms": 1254,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 950,
+   "updated_ms": 1254,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 5850,
+   "updated_ms": 6154,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 5850,
+   "updated_ms": 6154,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 4
+  },
+  {
+   "type": "response_text",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 20000,
+   "end_ms": 21500,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 5
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "Q"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 6
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 7
+  },
+  {
+   "type": "transcript",
+   "text": "yes stop it",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "yes stop it",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 3,
+   "created_ms": 5850,
+   "updated_ms": 25105,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "cancelled",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "canceled",
+   "task_revision": 3,
+   "created_ms": 950,
+   "updated_ms": 25105,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0,
+   "reason": "user_cancel"
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "completed",
+   "task_revision": 4,
+   "created_ms": 5850,
+   "updated_ms": 26786,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 8
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "spoken": false,
+   "result_text": "Done."
+  }
+ ],
+ "confirm_yes:cancel it": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "find iranian computer science professors at the university of toronto",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 900,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 950,
+   "updated_ms": 1252,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 950,
+   "updated_ms": 1253,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "no, book me a hotel in toronto",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 5000,
+   "end_ms": 5800,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 5850,
+   "updated_ms": 6153,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 5850,
+   "updated_ms": 6153,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 4
+  },
+  {
+   "type": "response_text",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 20000,
+   "end_ms": 21500,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 5
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "Q"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Should I stop «find iranian computer science professors at the university…»?",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 6
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 7
+  },
+  {
+   "type": "transcript",
+   "text": "cancel it",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "cancel it",
+   "turn_id": "live-utt:live-psid:3",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 24000,
+   "end_ms": 24500,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "running",
+   "task_revision": 3,
+   "created_ms": 5850,
+   "updated_ms": 25104,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ]
+  },
+  {
+   "type": "delegation",
+   "phase": "cancelled",
+   "delegation_id": "d1",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "find iranian computer science professors at the university of toronto",
+   "task_id": "d1",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "canceled",
+   "task_revision": 3,
+   "created_ms": 950,
+   "updated_ms": 25105,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0,
+   "reason": "user_cancel"
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "task_id": "d2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "state": "completed",
+   "task_revision": 4,
+   "created_ms": 5850,
+   "updated_ms": 26801,
+   "clock": "provider",
+   "relation": {
+    "kind": "replaces",
+    "task_id": "d1"
+   },
+   "request_turn_ids": [
+    "live-utt:live-psid:2"
+   ],
+   "tools": 0
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 8
+  },
+  {
+   "type": "delegation",
+   "phase": "completed",
+   "delegation_id": "d2",
+   "turn_id": "live-utt:live-psid:2",
+   "title": "no, book me a hotel in toronto",
+   "spoken": false,
+   "result_text": "Done."
+  }
+ ],
+ "media_pending_stop:en": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "play some jazz",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 500,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "play some jazz",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 500,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 520,
+   "updated_ms": 822,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 520,
+   "updated_ms": 828,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "waiting_for_tool",
+   "task_revision": 3,
+   "created_ms": 520,
+   "updated_ms": 828,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tool": "play_media",
+   "tool_call_id": "live-media:dPlay"
+  },
+  {
+   "type": "state",
+   "state": "tool_use",
+   "seq": 4
+  },
+  {
+   "type": "transcript",
+   "text": "stop the music",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 2000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "stop the music",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 2000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "Okay.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 2700,
+   "end_ms": 2900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 5
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "OK"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "Okay.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 6
+  },
+  {
+   "type": "state",
+   "state": "tool_use",
+   "seq": 7
+  },
+  {
+   "type": "media_control",
+   "control_id": "media-control:relay-media:live-utt:live-psid:2",
+   "action": "stop",
+   "task_id": "relay-media:live-utt:live-psid:2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "status": "requested",
+   "revision": 1,
+   "requested_ms": 3204,
+   "updated_ms": 3204,
+   "clock": "provider"
+  },
+  {
+   "type": "media_control",
+   "control_id": "media-control:relay-media:live-utt:live-psid:2",
+   "task_id": "relay-media:live-utt:live-psid:2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "action": "stop",
+   "status": "error",
+   "outcome": "error",
+   "ok": false,
+   "reason": "nothing_playing",
+   "title": "",
+   "revision": 2,
+   "requested_ms": 3204,
+   "updated_ms": 3204,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "cancelled",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "canceled",
+   "task_revision": 4,
+   "created_ms": 520,
+   "updated_ms": 4107,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0,
+   "reason": "media_stopped"
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 8
+  }
+ ],
+ "media_pending_stop:fa": [
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 1
+  },
+  {
+   "type": "transcript",
+   "text": "play some jazz",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 0,
+   "end_ms": 500,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "play some jazz",
+   "turn_id": "live-utt:live-psid:1",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 0,
+   "end_ms": 500,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "created",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "queued",
+   "task_revision": 1,
+   "created_ms": 520,
+   "updated_ms": 822,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 2
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "running",
+   "task_revision": 2,
+   "created_ms": 520,
+   "updated_ms": 822,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ]
+  },
+  {
+   "type": "state",
+   "state": "thinking",
+   "seq": 3
+  },
+  {
+   "type": "delegation",
+   "phase": "started",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "waiting_for_tool",
+   "task_revision": 3,
+   "created_ms": 520,
+   "updated_ms": 823,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tool": "play_media",
+   "tool_call_id": "live-media:dPlay"
+  },
+  {
+   "type": "state",
+   "state": "tool_use",
+   "seq": 4
+  },
+  {
+   "type": "transcript",
+   "text": "آهنگ رو قطع کن",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": true,
+   "final": false,
+   "revision": 1,
+   "start_ms": 2000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "transcript",
+   "text": "آهنگ رو قطع کن",
+   "turn_id": "live-utt:live-psid:2",
+   "partial": false,
+   "final": true,
+   "revision": 2,
+   "start_ms": 2000,
+   "end_ms": 2600,
+   "clock": "provider"
+  },
+  {
+   "type": "response_text",
+   "text": "چشم.",
+   "partial": true,
+   "assistant_turn_id": "live:live-psid:1",
+   "epoch": 1,
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "start_ms": 2700,
+   "end_ms": 2900,
+   "clock": "provider"
+  },
+  {
+   "type": "state",
+   "state": "speaking",
+   "seq": 5
+  },
+  {
+   "type": "audio_delta",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "item": "live:live-psid:1",
+   "content_index": 0,
+   "data": "OK"
+  },
+  {
+   "type": "speech_segment_complete",
+   "response_id": "live:live-psid:1",
+   "item_id": "live:live-psid:1",
+   "text": "چشم.",
+   "provider_complete": false,
+   "durable": false,
+   "epoch": 1,
+   "played_ms": null,
+   "interrupted": false
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 6
+  },
+  {
+   "type": "state",
+   "state": "tool_use",
+   "seq": 7
+  },
+  {
+   "type": "media_control",
+   "control_id": "media-control:relay-media:live-utt:live-psid:2",
+   "action": "stop",
+   "task_id": "relay-media:live-utt:live-psid:2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "status": "requested",
+   "revision": 1,
+   "requested_ms": 3205,
+   "updated_ms": 3205,
+   "clock": "provider"
+  },
+  {
+   "type": "media_control",
+   "control_id": "media-control:relay-media:live-utt:live-psid:2",
+   "task_id": "relay-media:live-utt:live-psid:2",
+   "parent_user_turn_id": "live-utt:live-psid:2",
+   "action": "stop",
+   "status": "error",
+   "outcome": "error",
+   "ok": false,
+   "reason": "nothing_playing",
+   "title": "",
+   "revision": 2,
+   "requested_ms": 3205,
+   "updated_ms": 3205,
+   "clock": "provider"
+  },
+  {
+   "type": "delegation",
+   "phase": "cancelled",
+   "delegation_id": "dPlay",
+   "turn_id": "live-utt:live-psid:1",
+   "title": "play some jazz",
+   "task_id": "dPlay",
+   "parent_user_turn_id": "live-utt:live-psid:1",
+   "state": "canceled",
+   "task_revision": 4,
+   "created_ms": 520,
+   "updated_ms": 4103,
+   "clock": "provider",
+   "request_turn_ids": [
+    "live-utt:live-psid:1"
+   ],
+   "tools": 0,
+   "reason": "media_stopped"
+  },
+  {
+   "type": "state",
+   "state": "listening",
+   "seq": 8
+  }
+ ]
+}

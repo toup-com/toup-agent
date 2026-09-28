@@ -224,6 +224,67 @@ async def test_the_block_rides_turn_context_not_the_cached_prefix():
     await engine.dispose()
 
 
+async def test_owner_static_app_html_diet_reaches_only_web_and_mobile(monkeypatch):
+    """Exercise the real prompt builder, not just the static document helper."""
+    from app.agent.agent_runner import AgentRunner
+    from app.agent.skills.builtins.app_html.skill import AppHtmlSkill
+    from app.config import settings
+
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    owner = await _seed(sm)
+    other = str(uuid.uuid4())
+    skill = AppHtmlSkill()
+
+    class OneSkillLoader:
+        skills = {"app_html": skill}
+
+        def get_all_system_prompt_sections(self):
+            return [skill.get_system_prompt_section()]
+
+        def get_skill(self, name):
+            return skill if name == "app_html" else None
+
+    monkeypatch.setattr(settings, "app_html_static_diet_canary_user_ids", owner)
+    monkeypatch.setattr(settings, "skill_prose_diet_canary_user_ids", owner)
+    monkeypatch.setattr(settings, "stable_prefix_layout", True)
+    runner = AgentRunner(
+        llm_service=AsyncMock(), tool_executor=AsyncMock(),
+        skill_loader=OneSkillLoader(),
+    )
+    full = skill.get_system_prompt_section()
+    compact = skill.get_compact_system_prompt_section()
+    async with sm() as db:
+        for channel in ("web", "mobile"):
+            prompt = await runner._build_system_prompt(
+                db=db, user_id=owner, user_message="Build a snake game",
+                channel=channel, turn_context_out={},
+            )
+            assert compact in prompt
+            assert full not in prompt
+        for user_id, channel in ((owner, "voice"), (other, "web")):
+            prompt = await runner._build_system_prompt(
+                db=db, user_id=user_id, user_message="Build a snake game",
+                channel=channel, turn_context_out={},
+            )
+            assert full in prompt
+            assert compact not in prompt
+        # Both owner flags can be carried by one image. The larger static
+        # design cut wins on mobile; the 447-token redundancy diet remains
+        # usable as its own arm when the static flag is disabled.
+        monkeypatch.setattr(settings, "app_html_static_diet_canary_user_ids", "")
+        from app.agent.prompt_diet import skill_section_diet
+        r49_only = skill_section_diet("app_html", full)
+        assert r49_only != full
+        prompt = await runner._build_system_prompt(
+            db=db, user_id=owner, user_message="Build a snake game",
+            channel="mobile", turn_context_out={},
+        )
+        assert r49_only in prompt
+        assert compact not in prompt
+    await engine.dispose()
+
+
 # ── Test 2: structural — catches F1 bug class for any future section ──
 
 def test_built_keys_are_subset_of_section_order():

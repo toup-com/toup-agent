@@ -778,6 +778,23 @@ class SessionMessageCreate(BaseModel):
     # sends neither and gets exactly today's insert.
     client_msg_id: Optional[str] = None
     occurred_at: Optional[datetime] = None
+    # How many times this row has been REWRITTEN (R48). A Live utterance is
+    # revised in place as its fragments settle, so the same
+    # (client_msg_id, role) is POSTed repeatedly with a longer sentence each
+    # time. Passed straight to `message_frame(revision=…)`: without it an open
+    # ChatScreen de-dupes by id and KEEPS THE FIRST version, so every
+    # correction is the frame that gets discarded. Never a column — a history
+    # refetch returns rows with no revision, and the clients correctly read
+    # absent as "not a correction".
+    revision: Optional[int] = None
+    # Where a voice row came from, persisted into metadata_json as
+    # {"voice": ...} (R48 §8). Small and bounded — `source`, the delegation id,
+    # the model, played_ms / interrupted / generated_chars — so the thread can
+    # tell a spoken reply from a delegated answer without a second lookup. Not
+    # free-form: `sessions._clean_voice` drops every key it does not know and
+    # every value that is not a short scalar, because this dict is written into
+    # a row the clients render.
+    voice: Optional[Dict[str, Any]] = None
 
 
 class SessionResponse(BaseModel):
@@ -832,10 +849,136 @@ class ChatRequest(BaseModel):
     auto_extract_memories: bool = Field(True, description="Auto-extract memories from response")
 
 
+# ── The nothing-heard rule (Blocker B, contract v0.2 `message.voice`) ──
+#
+# A voice turn leaves up to two rows: the `task_result` — the complete
+# backend answer, never truncated — and the `assistant_transcript`, which
+# records what the caller ACTUALLY HEARD of one output epoch. The relay
+# cannot always write the transcript row's text honestly: the persistence
+# API refuses an empty body (`ws_realtime._save_voice_messages`, and the
+# receiving route 400s on empty content), so a row for an epoch the caller
+# heard nothing of is stored carrying the GENERATED text with a receipt of
+# `heard_chars: 0` beside it.
+#
+# That storage compromise must never reach a client. The live surface
+# showed nothing; serving the generated text on the next history fetch
+# makes the saved chat claim the caller heard a whole answer that was
+# never played — the exact live/saved divergence this repair exists to
+# remove. So the rule is cross-layer and this module owns the middle of
+# it: SAVE never presents unheard words as heard, READ (here) projects
+# such a row's content to the empty string on EVERY surface, and RENDER
+# draws nothing for it.
+#
+# `heard_nothing` and `public_heard_text` live beside
+# `ChatMessageResponse.voice` rather than in any one route because the rule
+# is part of the WIRE CONTRACT, not of a route: the same projection has to hold for the three REST readers, the
+# `by-date` fallback and the live `{"type":"message"}` frame, and this
+# module is the one place all five already import with no cycle and no
+# FastAPI/DB dependency (`api/message_frames.py` deliberately imports
+# nothing else from `app.api`).
+
+#: `record_kind` of the row that says what was heard. Only this kind is
+#: ever projected.
+VOICE_KIND_TRANSCRIPT = "assistant_transcript"
+#: …and of the row carrying the complete backend answer. Named here so a
+#: reader can see, at the projection, the kind it must never touch: a
+#: `task_result` is not a playback claim, carries no playback numbers, and
+#: is served whole even when every spoken paraphrase of it was cut off.
+VOICE_KIND_TASK_RESULT = "task_result"
+
+
+def _heard_count_is_zero(value: Any) -> bool:
+    """Is `heard_chars` a receipt for ZERO characters?
+
+    ABSENCE IS NOT ZERO. The relay omits `heard_chars` entirely when no
+    receipt arrived (`live_voice_protocol.voice_record_fields`), precisely
+    so "we never heard back from this client" cannot be read as "the
+    client reported hearing nothing". Only a present, numeric 0 is a
+    claim of silence; `True`/`False` are flags that happen to compare
+    equal to 1/0 in Python and are not counts.
+    """
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and value == 0
+
+
+def _retracted(value: Any) -> bool:
+    """Is `transcript_retracted` set?
+
+    The relay's second way of saying "nothing of this epoch stands": a row
+    already written with text, later contradicted by a validated empty
+    receipt. It cannot be un-written (the caller may have read it in the
+    thread), and it cannot be rewritten to empty content (the persistence
+    API refuses that body), so the row is re-stamped with this flag and
+    every reader stops serving the text. A flag is a bool or a number —
+    never a string, which would make `"false"` retract a row.
+    """
+    if value is True:
+        return True
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and value != 0
+
+
+def heard_nothing(voice: Optional[Dict[str, Any]]) -> bool:
+    """True when this row's provenance says the caller heard NONE of it.
+
+    Exactly one shape qualifies: an `assistant_transcript` row whose
+    receipt counted zero characters, or one the relay has retracted.
+
+    Everything else is False, and the two "everything else" cases are the
+    ones worth naming:
+
+    * a row with NO `voice` at all, or with `voice` but no `record_kind` —
+      every legacy row, every typed turn, and every row written by a
+      tenant still on an image whose `_VOICE_KEYS` predates this repair.
+      Those rows serialize byte-for-byte as they do today: a projection
+      that fired on them would blank ordinary chat history during a
+      rollout window, which is a far worse failure than the one it fixes.
+    * a `task_result` row, whatever its playback numbers say. The backend
+      answer is not a playback claim and is never projected or clipped.
+    """
+    if not isinstance(voice, dict):
+        return False
+    if voice.get("record_kind") != VOICE_KIND_TRANSCRIPT:
+        return False
+    return (
+        _heard_count_is_zero(voice.get("heard_chars"))
+        or _retracted(voice.get("transcript_retracted"))
+    )
+
+
+def public_heard_text(text: Optional[str], voice: Optional[Dict[str, Any]]) -> str:
+    """The body a client may render for a row, given its voice provenance.
+
+    Composes with `api/message_cards.public_text`, which answers the same
+    question for the row's ROLE — call it on that function's result, so a
+    marker row stays blanked and a voice row that was never heard becomes
+    blank too:
+
+        content=public_heard_text(public_text(role, content), voice)
+
+    The `voice` object itself is deliberately NOT altered. `heard_chars`,
+    `interrupted` and `record_kind` stay on the projected row because they
+    are how the client renders the row HONESTLY — an interrupted turn with
+    nothing heard is a real event in the thread and should read as one,
+    not vanish into an unexplained empty bubble.
+
+    Pure, idempotent, and never touches the ORM object: this is an
+    on-the-way-out projection, and mutating `Message.content` here would
+    flush the blanking back into the database on the next commit.
+    """
+    if heard_nothing(voice):
+        return ""
+    return text or ""
+
+
 class ChatMessageResponse(BaseModel):
     """Individual message in chat response"""
     id: str
     role: str
+    source: Optional[str] = None
+    background: bool = False
     content: str
     created_at: datetime
     tokens_prompt: Optional[int] = None
@@ -903,6 +1046,22 @@ class ChatMessageResponse(BaseModel):
     # row records one; the client applies its own default rather than the API
     # guessing (see agent/channel_util.py).
     channel: Optional[str] = None
+    # Voice provenance, the object `sessions._clean_voice` allowlisted on the
+    # way in: {version, record_kind, source, assistant_turn_id, task_id,
+    # interrupted, heard_chars, …}. `channel` says which SURFACE the row came
+    # from; this says what the voice relay observed about it — which of the two
+    # rows a delegated turn produced, and how much of a spoken epoch the caller
+    # actually heard.
+    #
+    # DECLARE-OR-DROPPED, and this field is why that rule matters: the key was
+    # written to `metadata_json` from the first day and read back by nobody, so
+    # `message.voice` was write-only on every REST and WS surface. Adding it to
+    # the serializers without adding it HERE would change nothing at all —
+    # this model ignores undeclared keys (pydantic `extra="ignore"`), so the
+    # dict would be built and then silently discarded on the way out.
+    # Null is "this row has no voice provenance", which is every pre-relay row
+    # and every typed turn; an older app ignores the field entirely.
+    voice: Optional[dict] = None
     # Job card fields (role == 'job'). Projected by
     # api/message_cards.job_card_fields — one implementation for all four
     # history readers, because three of them had none and returned the row's

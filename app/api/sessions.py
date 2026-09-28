@@ -10,6 +10,7 @@ Each session maintains:
 """
 
 import logging
+import unicodedata
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Query
 from fastapi.responses import JSONResponse
@@ -31,7 +32,10 @@ import httpx
 from app.db import get_db, Conversation, Message, User, AgentConfig
 from app.schemas import (
     SessionCreate, SessionResponse, SessionWithMessages, SessionListResponse,
-    ChatMessageResponse, SessionMessageCreate
+    ChatMessageResponse, SessionMessageCreate,
+    # The nothing-heard projection. One implementation for all five client
+    # serializers, declared beside the wire field it enforces.
+    public_heard_text,
 )
 from app.api.auth import get_current_user
 from app.api.message_cards import (
@@ -694,6 +698,173 @@ _TOOL_EVENT_KEYS = {
 _TOOL_EVENTS_MAX = 40
 
 
+# Voice provenance (R48 §8). The relay stamps WHERE a row came from so the
+# thread can tell a spoken reply apart from a delegated answer, and so a row
+# that was cut off says so. Allowlisted for the same reason `_TOOL_EVENT_KEYS`
+# is: this dict is request-body input that ends up inside a row every client
+# renders, and an open-ended blob there is an unbounded write.
+_VOICE_KEYS = {
+    "source",          # live_spoken | delegated | fast_path | …
+    "delegation_id",
+    "model",
+    "played_ms",
+    "generated_chars",
+    "interrupted",
+    "superseded",
+    "cancelled",
+    "epoch",
+    # GPT-Live causal/timing provenance. These are bounded scalar identifiers
+    # and provider-clock positions, never transcript or model text.
+    "turn_id",
+    # Exact caller turns consumed by a task, in spoken order. The app may
+    # coalesce only these persisted user rows after the voice socket closes.
+    "request_turn_ids",
+    "assistant_turn_id",
+    "parent_user_turn_id",
+    "task_id",
+    "start_ms",
+    "end_ms",
+    "clock",
+    # Blocker B / contract v0.2 §`message.voice`. The record's own shape number
+    # and WHICH of the two rows a delegated turn produced:
+    #   task_result          — the complete backend answer, never truncated,
+    #                          and therefore carrying NO playback numbers
+    #                          (they describe the spoken paraphrase, not this);
+    #   assistant_transcript — what the caller actually heard for one epoch.
+    # A reader without `record_kind` cannot tell the two apart and falls back
+    # to legacy single-row semantics, which is why the relay must keep
+    # degrading correctly while a tenant is still on an image without these
+    # keys — until this set ships, they are dropped here and the drop is
+    # logged rather than silent.
+    # `heard_chars` is a COUNT, never the words: "how much of the epoch this
+    # client displayed". It is not an acoustic claim and is never estimated
+    # from `played_ms`. The text itself is the row's own content — no key here
+    # ever carries transcript, which is what `_VOICE_STR_MAX` below enforces
+    # (`task_title`, at the end, is the task's bounded NAME, not a transcript).
+    "version",
+    "record_kind",
+    "heard_chars",
+    # …and the relay's SECOND way of saying "nothing of this epoch stands".
+    # A transcript row already written with text, then contradicted by a
+    # validated empty receipt, cannot be un-written (the caller may have read
+    # it in the thread) and cannot be rewritten to empty content (this very
+    # route 400s an empty body). It is re-stamped with this flag instead, and
+    # `schemas.heard_nothing` — the one projection every reader funnels
+    # through — stops serving the text. Dropped here, the row would keep
+    # serving words that were never played: the flag must survive the
+    # allowlist or the retraction never reaches a client at all.
+    "transcript_retracted",
+    # R12.2: did the provider actually SAY this delegated answer out loud?
+    # False is not a failure — the result is in the thread either way — but
+    # nothing may claim audio that never happened, and the row is the only
+    # place that survives the call.
+    "spoken",
+    # R2 §D: the task this one replaces, refines or continues — an id, so a
+    # reader can link a correction to the request it corrected after the call.
+    "related_task_id",
+    # R2 AF6: the task's NAME — the same string the live `delegation` frame
+    # carried as `title`, which headed the call's card — so the day chat names
+    # a voice run the way the call did instead of by the nearest (fragment)
+    # user row. The ONE key here that carries words rather than an id, count or
+    # flag, and they are the caller's own request as already shown on the
+    # card: see `_VOICE_TEXT_KEYS` for how it is sanitized and bounded.
+    "task_title",
+}
+#: A provenance value is an id, a count or a flag — never prose. Anything
+#: longer is not provenance and is dropped rather than truncated, so a caller
+#: cannot smuggle a paragraph in under a known key.
+_VOICE_STR_MAX = 120
+#: …with ONE exception, and it is not a style choice. `delegation_id` is
+#: COMPARED, by `voice_jobs.VoiceTurnJob._row_is_proof`, against a copy of the
+#: same provider-supplied id that reached the agent bounded to 64 (the relay
+#: body, then `ChatRequest(max_length=64)`). Stored at a different length the
+#: two can never match, and a delivered answer closes its card `cancelled` —
+#: silently, in the safe-looking direction. So this key is TRUNCATED to the
+#: same bound rather than kept long or dropped when oversize; 64 characters of
+#: an id is not the paragraph the rule above exists to stop.
+_VOICE_ID_MAX = 64
+_VOICE_BOUNDED_IDS = {"delegation_id"}
+#: …and the one key that is WORDS: `task_title` (AF6). Sanitized to one line —
+#: a control character (a newline, a NUL) becomes a space and whitespace runs
+#: collapse, so a name cannot break the card it heads; a ZWNJ is not
+#: whitespace and survives — then bounded by `_VOICE_STR_MAX` with the rule
+#: above: dropped, not truncated. The relay already cuts the title at a word
+#: boundary to 80 (`live_voice_protocol.request_title`), so anything longer is
+#: not a title it wrote, and a half-cut one would be a new fragment. Empty
+#: after cleaning is dropped too: an empty name still reads as a name, and
+#: without one the app keeps its own ask-derived title.
+_VOICE_TEXT_KEYS = {"task_title"}
+_VOICE_REQUEST_TURN_IDS_MAX = 16  # live_voice_protocol.REQUEST_TURN_IDS_MAX
+
+
+def _clean_voice_text(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    if len(value) > 4 * _VOICE_STR_MAX:
+        # Request-body input: no per-character pass over a value this far past
+        # the ceiling. Returned as-is, it is longer than `_VOICE_STR_MAX`
+        # whatever its whitespace, so the caller drops it as oversize.
+        return value
+    one_line = "".join(
+        " " if unicodedata.category(ch) == "Cc" else ch for ch in value
+    )
+    return " ".join(one_line.split())
+
+
+def _clean_voice(voice) -> Optional[dict]:
+    """Key-allowlist and bound the body's `voice` provenance dict.
+
+    A dropped key is LOGGED, by name. The allowlist is the right default for
+    request-body input, but the producer is our own relay: the failure mode
+    that matters is "L1 added a key and it vanished", and a silent drop makes
+    that indistinguishable from a relay that never sent it. Names and counts
+    only — a provenance VALUE is an id the row already carries, and the rule in
+    this round is that nothing logs content.
+    """
+    if not isinstance(voice, dict) or not voice:
+        return None
+    out: dict = {}
+    dropped: list = []
+    for k, v in voice.items():
+        if k not in _VOICE_KEYS:
+            dropped.append(str(k)[:40])
+            continue
+        if k == "request_turn_ids":
+            if (
+                isinstance(v, list)
+                and 0 < len(v) <= _VOICE_REQUEST_TURN_IDS_MAX
+                and all(isinstance(turn_id, str) and 0 < len(turn_id) <= _VOICE_STR_MAX
+                        for turn_id in v)
+                and len(set(v)) == len(v)
+            ):
+                out[k] = list(v)
+            else:
+                dropped.append(f"{k}:invalid")
+            continue
+        if k in _VOICE_BOUNDED_IDS and isinstance(v, str):
+            out[k] = v[:_VOICE_ID_MAX]
+            continue
+        if k in _VOICE_TEXT_KEYS:
+            text = _clean_voice_text(v)
+            if text and len(text) <= _VOICE_STR_MAX:
+                out[k] = text
+            else:
+                dropped.append(f"{str(k)[:40]}:{'oversize' if text else 'empty'}")
+            continue
+        if isinstance(v, bool) or isinstance(v, int) or isinstance(v, float):
+            out[k] = v
+        elif isinstance(v, str) and len(v) <= _VOICE_STR_MAX:
+            out[k] = v
+        else:
+            dropped.append(f"{str(k)[:40]}:oversize")
+    if dropped:
+        logger.warning(
+            "[sessions] voice provenance dropped %d key(s): %s",
+            len(dropped), ",".join(sorted(dropped)[:12]),
+        )
+    return out or None
+
+
 def _clean_tool_events(events) -> Optional[list]:
     if not isinstance(events, list) or not events:
         return None
@@ -757,7 +928,7 @@ def _clean_attachments(atts, *, user_id: str, trusted: bool) -> Optional[list]:
     return out or None
 
 
-def _build_metadata(media, tool_events, app_artifact=None) -> Optional[str]:
+def _build_metadata(media, tool_events, app_artifact=None, voice=None) -> Optional[str]:
     """The message's metadata_json, in AgentRunner._save_messages' shape.
 
     One writer for every key: they used to be mutually exclusive here (media
@@ -772,7 +943,74 @@ def _build_metadata(media, tool_events, app_artifact=None) -> Optional[str]:
     if app_artifact:
         # Same key AgentRunner._save_messages writes; the clients read only it.
         meta["app_artifact"] = app_artifact
+    if voice:
+        meta["voice"] = voice
     return json.dumps(meta) if meta else None
+
+
+def _merge_metadata(existing: Optional[str], incoming: Optional[str]) -> Optional[str]:
+    """Metadata for a REWRITE of a row that already exists.
+
+    R48 made repeated writes of one key the normal case (a Live utterance is
+    revised in place as it is spoken), and the revisions after the first carry
+    provenance and nothing else. A whole-blob replace would therefore delete
+    the media card and the run rail off a row that had them — the same defect
+    the `metadata_json is None → skip` rule above already guards for the
+    no-metadata case, one step further along. So a rewrite only ever overwrites
+    the keys it actually carries; a key it is silent about is kept.
+
+    The merge is TOP-LEVEL ONLY, and for `voice` that is deliberate rather than
+    an oversight — a rewrite REPLACES the whole provenance object.
+
+    Blocker B D2 requires the delegated row's playback numbers (`played_ms`,
+    `interrupted`, `epoch`, `start_ms`, `end_ms`) to be GONE once that row is
+    re-stamped `record_kind: "task_result"`: they describe the spoken
+    paraphrase, and the complete backend answer is a different, longer string.
+    A deep/additive merge cannot express a removal, so it would resurrect those
+    numbers under the one key whose whole purpose is that it does not carry
+    them — a row claiming playback facts about text it is not. Replacement is
+    the only semantics that can.
+
+    The cost is the mirror case: a partial revision loses the keys the earlier
+    write established. That is a producer contract, not a hope — the relay
+    writes the FULL voice object on every write of a row (contract v0.2,
+    `message.voice`), so there is no partial revision to lose anything. It is
+    pinned by `tests/test_voice_record_metadata.py`, which asserts both halves:
+    siblings (`media`, `tool_events`) survive a voice-only rewrite, and `voice`
+    itself does not accumulate.
+    """
+    if incoming is None:
+        return None
+    try:
+        new = json.loads(incoming)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(new, dict):
+        return None
+    old = {}
+    if existing:
+        try:
+            _parsed = json.loads(existing)
+            if isinstance(_parsed, dict):
+                old = _parsed
+        except (TypeError, ValueError):
+            old = {}
+    # A repaired Live socket claims one automatic read-aloud attempt directly
+    # on the durable answer row. The original detached relay may still submit
+    # a later full-voice revision with `spoken:false`; preserve only this
+    # monotonic claim when it names the SAME delegation. This does not restore
+    # any playback fields that the full-voice replacement intentionally drops.
+    previous_voice = old.get("voice") if isinstance(old.get("voice"), dict) else {}
+    incoming_voice = new.get("voice") if isinstance(new.get("voice"), dict) else None
+    if (
+        incoming_voice is not None
+        and previous_voice.get("recovery_speech_claimed") is True
+        and previous_voice.get("delegation_id")
+        and previous_voice.get("delegation_id") == incoming_voice.get("delegation_id")
+    ):
+        incoming_voice["recovery_speech_claimed"] = True
+    old.update(new)
+    return json.dumps(old) if old else None
 
 
 @router.post("/{session_id}/messages", response_model=ChatMessageResponse, status_code=status.HTTP_201_CREATED)
@@ -813,6 +1051,8 @@ async def create_session_message(
     app_artifact = None
     client_msg_id = None
     occurred_at = None
+    revision = None
+    voice = None
     # "Authenticated with the agent key", i.e. from the platform voice relay —
     # the only intended producer of `attachments`. See `_clean_attachments`.
     _trusted = False
@@ -840,6 +1080,16 @@ async def create_session_message(
         app_artifact = body.app_artifact or None
         client_msg_id = (body.client_msg_id or None)
         occurred_at = body.occurred_at
+        voice = _clean_voice(getattr(body, "voice", None))
+        # Absent stays absent: `message_frame` only puts `revision` on the wire
+        # when it is not None, and the clients read absent as "not a
+        # correction". A negative counter is noise, never a correction.
+        _rev = getattr(body, "revision", None)
+        revision = (
+            int(_rev)
+            if isinstance(_rev, int) and not isinstance(_rev, bool) and _rev >= 0
+            else None
+        )
 
     # The pydantic pattern is only a gate if nothing can route round it. `role`
     # is half of the UPSERT key and is stamped on the live frame; an arbitrary
@@ -857,6 +1107,20 @@ async def create_session_message(
             Conversation.user_id == current_user.id,
         )
     )
+    # A KEYED write is a read-modify-write with no unique constraint behind it
+    # (`client_msg_id` is deliberately non-unique — a chat turn stamps one value
+    # on both of its rows), so two overlapping POSTs of the same key both find
+    # nothing and both INSERT. That was latent while no producer ever repeated a
+    # key; R48's revise-in-place makes a repeated key the normal case, and the
+    # duplicate would be two rows holding different prefixes of one sentence.
+    # Locking the CONVERSATION row makes the lookup-then-write atomic per
+    # session. It is not an extra lock: the write below updates
+    # `session.message_count` on this same row, so Postgres takes it either way
+    # — this only takes it earlier, in the same order, which is why it cannot
+    # deadlock where today does not. Postgres only; SQLite serialises writes
+    # itself and MySQL is not a target.
+    if client_msg_id and db.bind is not None and db.bind.dialect.name == "postgresql":
+        session_query = session_query.with_for_update()
     result = await db.execute(session_query)
     session = result.scalar_one_or_none()
 
@@ -989,7 +1253,7 @@ async def create_session_message(
         # chat-started one does, and a voice RUN gets the same steps, actions
         # and sources a typed run does (`day_chats._serialize_tool_events`
         # reads both through one function).
-        metadata_json=_build_metadata(media, tool_events, app_artifact),
+        metadata_json=_build_metadata(media, tool_events, app_artifact, voice),
     )
     if attachments:
         # The COLUMN, not metadata_json — GET /api/files/{message_id}/{aid}
@@ -1006,12 +1270,18 @@ async def create_session_message(
         for _k, _v in _msg_kwargs.items():
             if _k == "id":
                 continue
-            if _k == "metadata_json" and _v is None:
+            if _k == "metadata_json":
                 # Degrade the way `attachments` does, not the opposite way. A
                 # replayed assistant persist after a relay reconnect carries no
                 # media and no tool_events by construction (both are per-socket
                 # state), so an unconditional write NULLed the media card and
-                # the run rail off a row that already had them.
+                # the run rail off a row that already had them. A rewrite that
+                # DOES carry metadata is merged for the same reason — see
+                # `_merge_metadata`.
+                _merged = _merge_metadata(getattr(msg, "metadata_json", None), _v)
+                if _merged is None:
+                    continue
+                setattr(msg, _k, _merged)
                 continue
             setattr(msg, _k, _v)
         if _occurred is not None and _has_occurred:
@@ -1076,20 +1346,46 @@ async def create_session_message(
         from app.api.ws_chat import broadcast_to_user
         from app.api.message_frames import message_frame
         from app.api.day_chats import _serialize_attachments
+        # The frame describes the COMMITTED row, not the request body. They
+        # diverge on a rewrite: a revision carries provenance and a longer
+        # sentence, not the media card the first write established, and the
+        # merge above deliberately kept that card on the row. Sending the
+        # body's view would hand the client a frame with no media for a row
+        # that has one — and the client replaces in place on `revision`, so the
+        # card would vanish from an open thread until the next refetch.
+        _frame_media, _frame_tools, _frame_app = media, tool_events, app_artifact
+        if existing is not None:
+            try:
+                _committed = json.loads(getattr(msg, "metadata_json", None) or "{}")
+            except (TypeError, ValueError):
+                _committed = {}
+            if isinstance(_committed, dict):
+                _frame_media = media or _committed.get("media")
+                _frame_tools = tool_events or _committed.get("tool_events")
+                _frame_app = app_artifact or _committed.get("app_artifact")
         _frame = message_frame(
             msg,
             channel=session.channel,
             day_chat_id=_day_chat_id,
-            media=media,
-            tool_events=tool_events,
+            media=_frame_media,
+            tool_events=_frame_tools,
             # From the COMMITTED row, not from the request body: the wire form
             # of an attachment is message-scoped (download_url / preview_url /
             # thumb_url / kind) and the body carries none of it. Handing the raw
             # dicts to the client rendered a file produced during a voice turn
             # as a dead card until the next history refetch — the sibling writer
             # (voice_tasks._persist_message) has always passed enriched dicts.
-            attachments=_serialize_attachments(msg) if attachments else None,
-            app_artifact=app_artifact,
+            attachments=(
+                _serialize_attachments(msg)
+                if (attachments
+                    or (existing is not None and getattr(msg, "attachments", None)))
+                else None
+            ),
+            app_artifact=_frame_app,
+            # The caller's monotonic counter for this key. Without it an open
+            # ChatScreen de-dupes the corrected row away and keeps the first
+            # fragment of the sentence until the next full refetch.
+            revision=revision,
         )
         import asyncio as _asyncio
         _asyncio.create_task(broadcast_to_user(current_user.id, _frame))
@@ -1149,7 +1445,7 @@ def _message_to_response(
     it is.)
     """
     # Local import: sessions ↔ day_chats would cycle at module load.
-    from app.api.day_chats import _serialize_tool_events
+    from app.api.day_chats import _serialize_meta_card, _serialize_tool_events
 
     memories_retrieved = None
     if message.memories_retrieved_json:
@@ -1203,13 +1499,27 @@ def _message_to_response(
         from app.services.model_alias import public_model_label
         _model_used = public_model_label(_model_used)
 
+    # Read ONCE, above the payload: the body's projection and the `voice` key
+    # itself must be built from the same object, or a row could be blanked
+    # while its provenance says it was heard (or the reverse).
+    _voice = _serialize_meta_card(message, "voice")
+
     resp = dict(
         id=message.id,
         role=message.role,
-        # Through the guard, not raw. See api/message_cards.py — a marker
-        # row must never reach a client as text on ANY of the four
-        # readers, and this one only ever blanked the role it knew about.
-        content=public_text(message.role, message.content),
+        source=message.source,
+        background=message.source == "attachment_analysis",
+        # Through the guards, not raw — TWO of them, and neither subsumes the
+        # other. `public_text` answers "may this ROLE's body be rendered at
+        # all": a marker row must never reach a client as text on ANY of the
+        # four readers, and this one only ever blanked the role it knew about
+        # (see api/message_cards.py). `public_heard_text` answers "did the
+        # caller hear any of it" for a voice transcript row whose stored text
+        # the persistence API would not let the relay write empty (see
+        # schemas.py). Composed, never either alone.
+        content=public_heard_text(
+            public_text(message.role, message.content), _voice,
+        ),
         created_at=message.created_at,
         tokens_prompt=message.tokens_prompt,
         tokens_completion=message.tokens_completion,
@@ -1261,6 +1571,21 @@ def _message_to_response(
         # reminder card vanished, the fire row un-folded, and the thread
         # visibly flickered for one frame while completely idle.
         tool_events=_serialize_tool_events(message),
+        # Voice provenance (R48 §8, contract v0.2 `message.voice`). Until now
+        # this key was WRITE-ONLY end to end: the relay minted it,
+        # `_clean_voice` allowlisted it, `_build_metadata` persisted it — and
+        # not one reader sent it back, so the contract was false at its very
+        # first read and the app could not see the field at all. Read through
+        # the same helper the other three readers use, so the isinstance guard
+        # and the absent→null behaviour are one implementation; same parity
+        # rule as every neighbour above (api/day_chats.py and
+        # api/messages_recover.py carry this key too, or it disappears the
+        # moment a client takes its fallback path). NULL on every legacy row,
+        # which is every row not written by the voice relay. Serialized
+        # UNPROJECTED even when the body above was blanked: `heard_chars`,
+        # `interrupted` and `record_kind` are how the client renders the empty
+        # row honestly instead of as an unexplained blank bubble.
+        voice=_voice,
         attachments=attachments_list,
         channel=(
             getattr(message, "channel", None)

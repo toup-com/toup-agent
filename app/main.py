@@ -92,6 +92,26 @@ async def lifespan(app: FastAPI):
     print(_boot_banner())
     await init_db()
     print("✅ Database initialized")
+
+    # Full-file chat analyses live beyond their originating socket. Reconcile
+    # durable checkpoints on an agent boot and periodically thereafter, so a
+    # worker interrupted halfway through a long PDF resumes without the user
+    # sending another message. The platform process owns no tenant blobs.
+    attachment_reconciler_task = None
+    if settings.run_mode == "agent":
+        async def _reconcile_attachments() -> None:
+            from app.agent.attachment_analysis import reconcile_local_analyses
+            while True:
+                try:
+                    await reconcile_local_analyses()
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "attachment analysis reconciliation failed", exc_info=True)
+                await _asyncio.sleep(60)
+
+        import asyncio as _asyncio
+        attachment_reconciler_task = _asyncio.create_task(_reconcile_attachments())
     
     # Pre-load embedding service (optional, for faster first request)
     try:
@@ -351,6 +371,13 @@ async def lifespan(app: FastAPI):
 
     # Shutdown — reverse order for clean teardown
     print("🧠 Toup Agent shutting down gracefully...")
+
+    if attachment_reconciler_task and not attachment_reconciler_task.done():
+        attachment_reconciler_task.cancel()
+        try:
+            await attachment_reconciler_task
+        except (Exception, BaseException):
+            pass
 
     # 0. Cancel rollout reconciler so its 30 s sleep doesn't drag shutdown.
     if rollout_reconciler_task and not rollout_reconciler_task.done():

@@ -144,11 +144,19 @@ class TestVoiceDisabledTools:
 
         assert "start_mission" not in disabled_tools_for_channel("voice")
 
-    @pytest.mark.parametrize("channel", ["web", "app", "mobile", "telegram", None, ""])
-    def test_no_other_channel_is_touched(self, channel):
+    @pytest.mark.parametrize("channel", ["web", "app", "mobile"])
+    def test_other_attended_channels_keep_their_tools(self, channel):
         from app.agent.prompt_profile import disabled_tools_for_channel
 
         assert disabled_tools_for_channel(channel) == frozenset()
+
+    @pytest.mark.parametrize("channel", ["telegram", None, ""])
+    def test_unattended_or_unknown_channels_cannot_use_the_mac(self, channel):
+        from app.agent.prompt_profile import (
+            DESKTOP_LOCAL_TOOLS, disabled_tools_for_channel,
+        )
+
+        assert disabled_tools_for_channel(channel) == DESKTOP_LOCAL_TOOLS
 
     @pytest.mark.parametrize("raw", ["VOICE", " voice ", "Voice"])
     def test_channel_match_is_normalised(self, raw):

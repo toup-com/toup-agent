@@ -115,6 +115,59 @@ class Settings(BaseSettings):
     # which `_infra_errors` renders as a 503 with nothing naming the cause.
     agent_db_pool_timeout_s: float = 10.0
 
+    # R48 — per-turn DB attribution (`app/db/db_span.py`). PURE
+    # INSTRUMENTATION: it adds one `[PERF] db_span` line per DB phase and one
+    # `[PERF] turn_host` line per `AgentRunner.run()` frame, and changes
+    # nothing else.
+    #
+    # WHY IT EXISTS. One 2026-09-20 sample turn spent 5.023 s inside
+    # `[PERF] phase3_save`, a single timer around the save (round 1's map
+    # counted six statements there; the instrument measures five cursor
+    # executions on sqlite, because the ORM batches the two `messages`
+    # INSERTs — the count on asyncpg is unobserved). Round 1 of the
+    # investigation produced four mechanisms — a fresh dial (NullPool is the
+    # SOURCE DEFAULT at `agent_db_pool_size=0`; a per-slot AGENT_DB_POOL_SIZE
+    # override is possible and was not checked for that container), a
+    # PgBouncer server-connection wait (assigned at the transaction's first
+    # query, which on asyncpg is INSIDE the first `cursor.execute()`, hence
+    # the `stmt1_ms` bucket — NOT `begin_ms`, whose `do_begin` is a no-op on
+    # this driver), a row lock, and a starved event loop or a throttled
+    # cgroup — that ALL fit that one number, and the deployed trail separates
+    # none of them. None of the four is refuted and this flag refutes none of
+    # them: every proposed fix in the round aims at one, so three would be
+    # shipped blind.
+    #
+    # OFF FLEET-WIDE, and the listeners are not even registered when it is:
+    # `db_span.armed()` is read once per engine build (so turning it on takes
+    # a container restart), and an ordinary container carries no db_span
+    # listeners. The separate Voice slow-query probe remains installed.
+    # Turn it on for ONE tenant first with
+    # TURN_DB_SPAN_CANARY_USER_IDS (the shape
+    # `channel_envelope_canary_user_ids` already uses) — agent flags are
+    # otherwise fleet-wide, and this one writes up to TEN extra INFO lines per
+    # armed turn (nine `db_span` phases plus one `turn_host`) on a path a
+    # round-1 finding says can itself block on a full log pipe. "Per turn"
+    # means per `AgentRunner.run()` FRAME: a turn that spawns a sub-agent or a
+    # mission runs a second frame, which adds up to four more lines of its own
+    # (three `db_span` phases — a child does not save an assistant message —
+    # plus its own `turn_host`), tagged `nest=1`. An agentic turn that spawns
+    # several is several times that; there is no fixed ceiling per turn.
+    #
+    # THE VALUE IS A FULL USER UUID and matching is EXACT. The 8-character
+    # prefix in a container name or a log line is NOT a user id: it would arm
+    # the process, open no span and print nothing, which reads on every
+    # acceptance gate as a healthy control. `db_span` rejects a too-short
+    # entry and an entry that is merely a PREFIX of a real id, LOUDLY (one
+    # ERROR per process per entry) — and when every entry is rejected it
+    # refuses to arm at all rather than run listeners that can never fire.
+    #
+    # PRIVACY: statements are reduced to a `verb:table` token drawn from two
+    # fixed whitelists — never SQL text, never parameters (a `messages`
+    # INSERT's parameters ARE the user's message). Correlation is `cmid_h`,
+    # the same FNV-1a hash the three-hop turn trace uses, never a raw id.
+    turn_db_span: bool = False
+    turn_db_span_canary_user_ids: str = ""
+
     # Deployment environment. Drives the sk_live_ / sk_test_ guard below.
     # Anything other than "production" treats the deployment as non-prod and
     # forbids live Stripe keys. Set via ENVIRONMENT env var.
@@ -470,23 +523,21 @@ class Settings(BaseSettings):
     # OpenAI default has no shared-account dependency. Anthropic models remain
     # fully available as an explicit per-user `agent_config.agent_model`
     # choice once the platform Claude account is funded.
-    # 2026-08-07: gpt-5.5 → gpt-5.6-terra. Gate G1 passed on OpenAI's own
-    # organization billing, normalised for prompt-cache hit rate — terra is
-    # 50-55% cheaper per token on EVERY token class (uncached input -53.8%,
-    # cached input -62.5%, output -62.1%), p50 -17.5%, p95 -54.1%, and its
-    # error rate is marginally lower (2.1% vs 2.6% over 755 and 697 calls).
-    # Full working, including the retracted earlier "-14.2%, G1 = NO" cut
-    # that failed to control for cache hit rate:
-    # docs/audits/2026-08-g1-cost-and-latency.md §8.
+    # 2026-09: GPT-6 Sol replaces Terra for normal agent chat after its
+    # task-level migration gate. Previous Terra-vs-5.5 evidence remains in
+    # docs/audits/2026-08-g1-cost-and-latency.md.
     # The Responses wire follows automatically — model_resolver.wire_api_for()
     # derives it, so this cannot be flipped into the broken half-state.
-    agent_model: str = "gpt-5.6-terra"  # Primary agent model (OpenAI — per-tenant key)
+    agent_model: str = "gpt-6-sol"  # Primary agent model (OpenAI — per-tenant key)
     agent_fallback_model: str = "gpt-4o"  # Distinct OpenAI fallback if primary fails
     # analyze_image tool (vision Q&A on a URL/workspace image). Routed through
     # the bundle LLM proxy in bundle mode so it is metered + governed like every
     # other LLM call; gpt-4o matches the previously hardcoded model. Override
     # via ANALYZE_IMAGE_MODEL for a cheaper default (e.g. gpt-4o-mini).
     analyze_image_model: str = "gpt-4o"
+    # Server-owned model for on-demand full-file analysis. With no override,
+    # use the configured vision model so image-heavy PDF pages are readable.
+    attachment_analysis_model: Optional[str] = None
     # Anthropic provider master switch. DEACTIVATED platform-wide on
     # 2026-05-29: bundle Anthropic calls share ONE platform Claude account
     # and it ran out of credit, hard-400ing every bundle user's Claude call
@@ -903,6 +954,30 @@ class Settings(BaseSettings):
     # the global flag once proven. Empty = nobody (default).
     stable_prefix_canary_user_ids: str = ""
 
+    # Skip the post-commit message refresh on interactive chat pre-save for
+    # these exact users only. Empty by default: deployment of the code alone
+    # changes no turn. This is separate from broader turn-path experiments.
+    presave_refresh_trim_canary_user_ids: str = ""
+
+    # Reuse the preferred_provider value loaded with AgentConfig in phase 1
+    # instead of opening a second DB session immediately before the LLM call.
+    # Empty by default; pilot on one authenticated user before widening.
+    preferred_provider_reuse_canary_user_ids: str = ""
+
+    # Reuse the successful phase-1 AgentConfig read for the agent name and
+    # onboarding prompt on owner mobile turns. Empty by default; a failed
+    # phase-1 read keeps both independent prompt reads as retries.
+    prompt_config_reuse_canary_user_ids: str = ""
+
+    # Exact-user web/mobile pilot: for a main-chat greeting or question, send
+    # only the already allowed first-call tool definitions. Empty by default;
+    # the full stable array remains in use until explicitly activated.
+    intent_wire_prune_canary_user_ids: str = ""
+
+    # Optional second dial. Question turns retain full tool descriptions in
+    # the initial greeting pilot, even when the base canary is active.
+    intent_wire_prune_question_canary_user_ids: str = ""
+
     # Cache-aware overflow rollover (token-efficiency PR-3; audit finding
     # F-6 / A8-5..A8-6 in docs/audits/2026-07-token-efficiency.md). When
     # true, compact_messages:
@@ -942,6 +1017,44 @@ class Settings(BaseSettings):
     # byte-identical to the pre-diet prompt (regression-pinned in
     # tests/test_prompt_diet.py); disable with PROMPT_DIET=false.
     prompt_diet: bool = True
+
+    # Skill prose diet (R48 patch I; the seam of
+    # artifacts/.../round4/DESIGN_skill_content_selection.md §9). The always-on
+    # skill sections are the largest single block of prose the agent sends —
+    # 15,092 o200k tokens, LOCAL-measured on this tree (app_html 11,603 /
+    # automations 2,340 / routines 1,149 / triggers 0), and they are sent on
+    # every turn of every intent because the stable layout's `or _stable`
+    # includes them regardless of `intent.include_skill_prompts`.
+    #
+    # This flag routes each rendered skill section through
+    # `prompt_diet.skill_section_diet(name, body)`. `_SKILL_SECTION_DIETS`
+    # holds one entry, `app_html`, which removes REDUNDANCY only (447 o200k
+    # tokens LOCAL; every rule-bearing atom of the original is still present —
+    # the atom gate in tests/test_prompt_diet.py — and each cut's retained twin
+    # must be in the output or the full body is served). It saves nothing until this
+    # flag is flipped. Cutting prose that is the ONLY statement of a rule is a
+    # product judgment (memo D4b), not this flag's.
+    #
+    # Default OFF, UNLIKE `prompt_diet` above. `prompt_diet`'s compact text was
+    # reviewed and shipped together with its flag; this flag would carry
+    # whatever text a future mapping holds, so the flip must be its own
+    # decision. Flag-off output is byte-identical to today's
+    # `get_all_system_prompt_sections()` join (regression-pinned in
+    # tests/test_prompt_diet.py). The exact-user canary below permits an
+    # mobile owner trial without setting the global switch. Bridge forwarding is a
+    # separate deployment gate and must be verified before activation.
+    #
+    # No tool definition, name, argument shape or enum is reachable from this
+    # seam in either state: it touches only system-prompt section strings.
+    skill_prose_diet: bool = False
+    # Exact-owner mobile trial without enabling the prose change for every tenant.
+    skill_prose_diet_canary_user_ids: str = ""
+
+    # Exact authenticated owner pilot for static app_html design guidance.
+    # Applies to web and mobile text turns; empty by default. The compact
+    # document leaves the operational build head and publish-gate sections
+    # intact. A malformed/prefix entry cannot enable another tenant.
+    app_html_static_diet_canary_user_ids: str = ""
 
     # Channel convergence (token-efficiency W2.3a). Today every channel gets
     # its own wire tools array (vault strip, vibecoding/app strips) — and
@@ -1026,6 +1139,32 @@ class Settings(BaseSettings):
     # them is wrong. Worst case at 12/day/user: 12 x 40,192 tok x $2.50/1M =
     # $1.21 of TOUP-side provider spend per user per day, and $0 to the user.
     llm_cache_warm_max_per_day: int = 12
+
+    # R48-G — `x-toup-trace`, the AGENT half of an agent<->platform join key.
+    #
+    # Today nothing joins an agent turn's [PERF] lines to the platform proxy's
+    # own per-request lines: the proxy's `req_id` is platform-local and is
+    # never handed back to the agent, so "this slow turn" and "this slow
+    # upstream call" are two unconnected observations. When this is on, each
+    # LLM request on the Responses wire carries ONE header,
+    # `x-toup-trace: <cmid_h>.<iteration>`, where `cmid_h` is the existing
+    # 8-hex FNV-1a hash of the turn's client_msg_id (the same value already
+    # logged by [TURNTRACE]) and `iteration` is the 0-based LLM iteration.
+    # No user id, no message text, no raw client id — a hex hash and a small
+    # integer. See app/agent/llm_trace.py.
+    #
+    # Default OFF, and off is byte-identical on the wire (no header, no body
+    # change). It is ONLY useful once the platform half (llm_proxy logging the
+    # validated header) is deployed; an old platform ignores an unknown header
+    # and an old agent sends none, so a mixed fleet is safe in both directions.
+    llm_trace_header: bool = False
+    # Per-tenant canary, comma-separated FULL user uuids. Matching is EXACT on
+    # the full id — the 8-char prefix that appears in log lines is NOT a user
+    # id and will never match. An entry that is not a canonical uuid is logged
+    # as an ERROR by app/agent/llm_trace.py rather than silently matching
+    # nobody. Empty = nobody (default).
+    llm_trace_header_canary_user_ids: str = ""
+
     # Incident 2026-09-14: the day-index self-heal is now a service that runs in
     # its own session (app/services/day_chat_rebucket.py). This switch turns
     # every AUTOMATIC write path off without a rollback: `rebucket_user_days`
@@ -1114,7 +1253,33 @@ class Settings(BaseSettings):
     # pool_addon's _FEATURE_FLAG_ENVS) + a recreate wave; blank and "*"
     # both parse to ALL. Expect exactly one cache-lineage bust per tenant
     # on the flip, and one on the rollback.
-    agent_tool_families: str = "doc_generation,app_builder"
+    #
+    # `desktop` (Toup for Mac) is NAMED here, and it costs nothing today.
+    # The family gate and the launch gate are different questions:
+    #
+    #   * this string answers "is this TENANT entitled to the capability?"
+    #     — the per-plan withhold `agent-tool-relay.md` §5.7 asks for, and
+    #     the reason the family exists at all;
+    #   * `desktop_relay_enabled` (default False) answers "is the feature
+    #     launched?", and it is the one that keeps the array byte-identical
+    #     on merge. `skill_enabled` consults BOTH.
+    #
+    # Naming it here rather than leaving it withheld is deliberate: with the
+    # family absent, turning `DESKTOP_RELAY_ENABLED=1` on would do NOTHING,
+    # and "I flipped the flag and the tools never appeared" is precisely the
+    # two-gates-one-intent trap this fleet has already paid for once (the
+    # automations rollout, where `automations_rollout_pct` and
+    # `automations_enabled` were BOTH required and raising one opened the
+    # door onto a dark engine). One gate decides launch; this string stays
+    # available for withholding it per tenant afterwards.
+    #
+    # No telemetry row above it because there is none to have: nothing has
+    # invoked these tools, on any tenant, because nothing can — the skill
+    # does not register. The measurement that belongs here is the one to
+    # take AFTER launch, and the 13 defs are ~1,500-1,900 tok on every turn
+    # for every tenant that has it (§2.2's ~150-190 tok/def), which is the
+    # number that would justify withholding it later.
+    agent_tool_families: str = "doc_generation,app_builder,desktop"
 
     # PR 8 of the unified-jobs arc: when True, every Auto Builder
     # job completion (success or failure) writes one Message into
@@ -1152,6 +1317,181 @@ class Settings(BaseSettings):
     # global flag is on OR its user_id is listed here.
     voice_realtime_v2_user_ids: str = ""
     voice_realtime_model: str = "gpt-realtime-2.1"
+    # GPT-Live is a protocol migration, not a Realtime model alias.  Keep the
+    # transport dark until the relay + clients have passed the rollout gate;
+    # False is the one-step rollback to the proven Realtime V2 path.
+    voice_live_enabled: bool = False
+    # Exact authenticated user UUIDs for the GPT-Live pilot.  Enabling the
+    # transport with an empty cohort selects nobody; this prevents a mistyped
+    # rollout variable from silently becoming an all-user launch.
+    voice_live_user_ids: str = ""
+    voice_live_all_users: bool = False
+    voice_live_provider: str = "openai"
+    voice_live_model: str = "gpt-live-1"
+    voice_live_default_voice: str = "marin"
+    voice_live_price_usd_per_minute: float = 0.05
+    # A client delegation has no task text and can precede the final transcript
+    # fragment.  The relay must wait for transcript time to settle before it
+    # dispatches AgentRunner; this is the bounded debounce for that correlation.
+    voice_live_transcript_settle_ms: int = 350
+    # ── The other two clocks (round 48) ─────────────────────────────
+    # The settle above is a DEBOUNCE for showing and correlating. It is not an
+    # utterance boundary: 350 ms is an inter-word pause, and using it as the
+    # durable-row key wrote one chat row per two characters. A turn closes on a
+    # PROVIDER-TIMELINE silence gap, so network jitter can never split a
+    # sentence, or on a size cap so a monologue is paragraphs not one blob.
+    voice_live_utterance_gap_ms: int = 1200
+    # A pause after a dangling connective/request stem is not an endpoint.
+    # Live exposes transcript deltas but no transcript-done event, so those
+    # turns wait for this bounded hard silence instead of executing a fragment.
+    voice_live_utterance_hard_gap_ms: int = 2600
+    voice_live_utterance_max_chars: int = 600
+    voice_live_utterance_max_ms: int = 60000
+    # A delegation binds to the contiguous run of unanswered caller turns that
+    # ends at its causal turn, not just that one turn: a hesitation longer than
+    # the gap splits one request into turns, and GPT-Live's delegation carries
+    # no request text of its own. Bounded by size and by the silence between
+    # two turns of the run, so an old unanswered remark is never swept in.
+    voice_live_request_span_max_chars: int = 600
+    voice_live_request_span_max_gap_ms: int = 8000
+    # One durable row per turn, revised in place: written on the first settle
+    # (so it survives a crash within ~350 ms) and re-written no more often than
+    # this until the turn closes.
+    voice_live_persist_min_interval_ms: int = 1000
+    # A client delegation with nothing to consume is a provider judgement the
+    # relay could not match. Expire it rather than let it capture the NEXT
+    # utterance and put every answer one request behind.
+    voice_live_delegation_ttl_s: float = 10.0
+    voice_live_max_concurrent_delegations: int = 2
+    # Progress notes for the model while a delegation runs (thinking.append,
+    # never commentary: a progress note must not be spoken over the caller).
+    voice_live_progress_min_interval_s: float = 4.0
+    voice_live_progress_max_per_delegation: int = 6
+    # …and the one exception, grounded (R2 §E): once a REAL tool.start has
+    # arrived and the caller has heard nothing for this long, ONE short line
+    # from the relay's fixed fa/en table ("still searching the web") is spoken
+    # on the task's own turn. Never before tool-start evidence, never with the
+    # raw query, never over the caller or a result.
+    voice_live_progress_speak_after_s: float = 6.0
+    # R2 addendum 7: at most this many unprompted lines per task — the first
+    # after a real tool.start, a second only when a tool of a DIFFERENT spoken
+    # kind really starts (search → reading a page).
+    voice_live_progress_spoken_max: int = 2
+    # …and a task that never started a tool gets at most one honest "still
+    # working on «title»" line after this much silence (never "searching"; not
+    # earlier than `voice_live_progress_speak_after_s`).
+    voice_live_progress_idle_after_s: float = 8.0
+    # Output epochs. GPT-Live has no response id and no output-complete event,
+    # so the relay closes an epoch on the client ack OR on this much provider
+    # silence — one missed native ack used to fuse an entire call into one
+    # caption with the mic gate latched open behind it.
+    voice_live_output_epoch_gap_ms: int = 700
+    # The interrupt fence is time-bounded. Its predecessor had no deadline and
+    # one unlucky comparison muted the assistant for the rest of the session.
+    voice_live_interrupt_suppress_ms: int = 2500
+    # Server-synthesized barge-in, so talking over the agent works on Live the
+    # way it did on Realtime. Off is a no-build rollback if the speaker-route
+    # echo test fails.
+    voice_live_bargein_enabled: bool = True
+    # R13: barge-in is decided on NON-ECHO transcript evidence, and needs BOTH
+    # this much speech AND this many words — a single delta can never be an
+    # interruption. A delta whose content words are at least `echo_overlap`
+    # the agent's own recent words is its voice coming back through the
+    # speaker and counts for nothing. A `speech_started` the client does not
+    # answer with an interrupt within `rearm_ms` is given back for that reply.
+    voice_live_bargein_min_ms: int = 600
+    voice_live_bargein_min_tokens: int = 3
+    voice_live_bargein_rearm_ms: int = 1500
+    voice_live_echo_overlap: float = 0.6
+    # Appends are limited to 500 TOKENS each. Budget below that, in tokens —
+    # the old 350-CHARACTER cap split ordinary answers into two independently
+    # paraphrased halves.
+    voice_live_append_token_ceiling: int = 450
+    # Reconnect seeding: session.start accepts prior messages (128 max / 8192
+    # tokens). Bounded well under both, and skipped entirely on a slow tenant.
+    voice_live_history_rows: int = 20
+    voice_live_history_chars: int = 6000
+    # ── R14 RELAY-START: readiness never waits on a tenant read ─────
+    # The seed used to be awaited BETWEEN the config wait and `session.start`,
+    # i.e. squarely on the critical path — measured in production (n=5) at
+    # ~1.0-1.5 s on every start and 2.0 s whenever the tenant timed out, of an
+    # accept→ready median of 4.43 s. It now runs concurrently from the first
+    # line of `start_provider`; if it lands before `session.start` it rides in
+    # natively, and otherwise it is injected as a context append when it
+    # arrives. This is how long that late injection may wait before the seed is
+    # dropped — a cold model is a worse call, never a failed one.
+    #
+    # It is the OUTER bound of a pair. `fetch_history` puts its own 2 s deadline
+    # around the whole seed, so at these values this one cannot fire: the task
+    # always resolves first and `history seed dropped reason=budget` is
+    # unreachable in production (R14V-5). It bites only if that inner deadline
+    # is raised above it — move the two together, and never read this number as
+    # the bound that is holding a sick tenant off `ready`.
+    voice_live_history_budget_ms: int = 6000
+    # The audio a caller speaks while the client still says "connecting" is not
+    # lost: it queues on the socket and is read in one burst the moment
+    # `client_loop` starts — which is exactly when the agent's opening reply
+    # begins. Transcribed, those words read as the user talking over that reply
+    # (production 15:06:28Z, first reply cut at played_ms=300). They are the
+    # FIRST TURN. The backlog is recognised by ARRIVAL, not content: a frame
+    # the relay did not have to wait for was already buffered, and the first
+    # frame that costs real time to arrive ends the drain. `first_turn_grace_ms`
+    # then covers the provider's transcription lag (same order as the client's
+    # own corroboration window). The audio is delivered and answered either
+    # way; only barge-in evidence is withheld.
+    voice_live_preready_gap_ms: int = 20
+    voice_live_preready_window_ms: int = 3000
+    voice_live_first_turn_grace_ms: int = 1500
+    # Teardown gets a real budget: the last thing said before hang-up is the
+    # request the user just made.
+    voice_live_persist_drain_s: float = 8.0
+    # …and that inline drain is not the end of it. Whatever it did not finish
+    # is handed to a detached finisher with this larger budget instead of being
+    # discarded (production: "persistence drain timed out; 25 queued" and no
+    # loss signal after it). A record still queued when it runs out is counted
+    # and logged as lost, one by one. It outlives the socket, not the process.
+    voice_live_persist_background_drain_s: float = 120.0
+    # A transcript row whose write fails because the TENANT is away (refused
+    # connection, timeout, 502/503/504, no tenant address while it deploys)
+    # keeps retrying — backoff 0.5/1/2/4/8 s — for this long after its first
+    # attempt while the call is live; the detached finisher widens it to its
+    # own budget above. A row-specific failure (a tenant 500) still gets three
+    # attempts, and a permanent one only one.
+    voice_live_persist_retry_window_s: float = 30.0
+    # Memory curation is a tenant LLM call (60 s timeout) and rides its own
+    # bounded, low-priority lane so it can never hold a transcript row or the
+    # teardown drain behind it. Full ⇒ the OLDEST waiting curation is dropped
+    # and counted (`live_curate_dropped`); after hang-up it gets this budget
+    # once the transcript rows are done.
+    voice_live_curate_queue_max: int = 32
+    voice_live_curate_drain_s: float = 60.0
+    # The relay answers a plain "play X" itself instead of putting a 26k-token
+    # agent turn in front of a search and a websocket frame.
+    voice_live_media_fast_path: bool = True
+    # Tenant-side next/previous must settle before the platform relay's 12 s
+    # HTTP budget. On timeout the transactional handler is cancelled and rolls
+    # its in-memory navigation state back, preventing a late unacknowledged skip.
+    voice_live_media_control_timeout_s: float = 8.0
+    # R2 addendum 6, the media BACKSTOP: a closed caller turn whose own words
+    # are a bare media command (the closed next/previous/stop/pause grammar)
+    # and that no model delegation claims within the grace is executed by the
+    # relay itself through the correlated media_control path. Production V2/V3:
+    # «آهنگ رو قطع» closed, GPT-Live only said «چشم», and nothing stopped.
+    voice_live_media_backstop_enabled: bool = True
+    voice_live_media_backstop_grace_ms: int = 1500
+    # ── Delivering a delegated result out loud (R12) ────────────────
+    # A finished task is not delivered until the provider has actually STARTED
+    # an output epoch for the commentary that carries it. This is how long the
+    # relay waits for that epoch before nudging, and again before writing the
+    # result off as `spoken:false`. The clock does NOT run while the caller's
+    # own utterance is open — a task finishing mid-sentence is common and the
+    # deferral below is the correct behaviour, not a missed deadline.
+    voice_live_speak_timeout_s: float = 6.0
+    # How long a finished result may wait for a safe conversational boundary
+    # (the caller's utterance still open, or the interrupt fence still up)
+    # before it is spoken anyway. Bounded, because an answer nobody ever hears
+    # is the defect this whole section exists to remove.
+    voice_live_result_defer_max_ms: int = 4000
     # gpt-4o-transcribe, measured — not assumed. 2026-08-16, after a session
     # transcribed "grok bot" six different wrong ways and every downstream
     # consumer (UI, session history that think() loads, memory extraction)
@@ -1622,6 +1962,46 @@ class Settings(BaseSettings):
     # ONCE. That is inherent to launching the feature, not a regression.
     automations_enabled: bool = True
 
+    # ── Toup for Mac: the desktop relay ─────────────────────────────────
+    #
+    # OFF, and the default may not be flipped casually — it is the reason
+    # merging this work changes nothing for anybody.
+    #
+    # `tool_entitlements.skill_enabled` reads it ONCE per process (same
+    # treatment as `automations_enabled` above, and for the same reason), so
+    # with it False the `desktop` skill never registers: its 13 tool defs are
+    # absent from the wire array, its system-prompt section is absent, and its
+    # execution path is absent — together, which is the only safe combination
+    # (`skills/loader.py:390-409`: "a skill that is half-gated … is worse than
+    # either extreme"). A dark tenant's tools array stays byte-identical to
+    # today's, so no provider cache lineage forks on merge.
+    #
+    # What it does NOT gate, on purpose: the ROUTES in `app/api/desktop.py`.
+    # A user who has paired a Mac and then has the flag turned off must still
+    # be able to list and REVOKE that device — a kill switch that the kill
+    # switch can switch off is not one. The relay socket refuses to serve
+    # tasks when the skill is dark (there is no tool that could call it), and
+    # revocation keeps working regardless.
+    #
+    # It is a pure boot-time tenant fact. Do not key it on a user, a turn, a
+    # channel, or on whether a Mac is currently online: per-turn variation in
+    # the tools array forks the provider cache and re-bills system+history at
+    # full price (`tool_entitlements.py:21-39`). Presence is decided at
+    # EXECUTION time instead, and every `desktop__*` description says so.
+    desktop_relay_enabled: bool = False
+
+    # How long a freshly-minted device token lives before the app must
+    # re-issue. Hours, not the extension's 90 days (`EXT_TOKEN_TTL_S`,
+    # `extension.py:156`) — RELAY_PROTOCOL.md §2: "A laptop is lost, lent or
+    # resold in a way a browser profile is not."
+    desktop_token_ttl_s: int = 12 * 3600
+
+    # Env floor for the `desktop_connections` registry flag (CONNECTIONS.md
+    # §12), the ONE per-user switch behind both the phone-pairing and task
+    # routes here and the tenant's rendered DESKTOP_RELAY_ENABLED. Zero, and
+    # the allowlist starts empty, so nobody is enrolled by a deploy.
+    desktop_connections_rollout_pct: int = 0
+
     # CONTRACTS-R31 §4.1: refuse a chat-socket `message` frame addressed
     # to an automation's conversation (`use_thread_route`). OFF by
     # default and deliberately so — build 91, the build in the field
@@ -1932,6 +2312,7 @@ class Settings(BaseSettings):
         # first instead of being cut off mid-flight.
         "generate_image": 480,
         "edit_image": 480,
+        "analyze_attachment": 60,
     }
 
     # ── DM / Group Policy ────────────────────────────────────
@@ -2791,14 +3172,77 @@ class Settings(BaseSettings):
     # NOT be acceptable for a quota. 0 disables.
     llm_proxy_rate_limit_per_min: int = 300
 
+    # R48 — wire observability on the OpenAI proxy's [CACHE] lines.
+    #
+    # The agent fingerprints its tools array BEFORE the proxy touches it
+    # (`[PERF] prefix_head tools=`, agent_runner), so the one array that
+    # actually heads the provider's cached prefix — post-dedup, post-cap,
+    # post-`_prune_tool_choice` — has never been measured anywhere. The
+    # proxy's 128-tool cap derives its protected set from THIS request's
+    # `tool_choice`, so the forwarded array is a function of tool_choice as
+    # well as of what the agent sent.
+    #
+    # PRODUCTION (supervisor extract, test account, 2026-09-19/20): three
+    # gpt-5.6-terra requests carried the same agent-side fingerprint AND the
+    # same `cache_key_hash=3c275b30`, all logged `174 > 128, dropped 46
+    # (namespace-fair)`, all had a DIFFERENT dropped list, and all came back
+    # `cached=0` — one of them 10 s after a 45,347-token cache WRITE. That is
+    # an observed COINCIDENCE of a wire-array fork with three misses on one
+    # account. It does not show that caching cannot work above 128 tools and
+    # does not mean every over-cap turn must miss: partial-prefix hits, an
+    # unchanged protected set across turns and early eviction all remain
+    # open, and the documented 30-minute retention is a MINIMUM lifetime
+    # rather than a ceiling. `tools_sha` is what turns the open question
+    # into a count; nothing here has measured a latency gain.
+    #
+    # Log-only: no request or response byte changes and no llm_proxy_events
+    # column. Flag-off, every [CACHE] line is byte-identical to R47 (the added
+    # fields are one interpolated suffix that renders as the empty string) —
+    # tests/test_proxy_wire_observability.py pins that with literal expected
+    # messages. ONE deliberate exception, and it is not behind this flag:
+    # `retention=` is a client-supplied body string on both of its routes and
+    # is now rendered through `_log_atom`, so a value that is not one
+    # printable-ASCII token within 32 characters prints `invalid` instead of
+    # being echoed into a shared two-replica log stream. No real spelling
+    # (`24h`, `opt:30m`) is affected. `model=` on the same line is ALSO
+    # caller-written and is NOT validated — pre-existing, unchanged here, and
+    # the reason the gates below must be read as caller-influenced. See
+    # `_cache_log_fields` and the patch NOTES §9.
+    # It is a flag rather than an unconditional line because
+    # `tools_sha` canonically re-serialises the whole forwarded tools array
+    # per request, ON THE EVENT LOOP of a CPU-capped replica shared by every
+    # tenant: measured 2026-09-20 at 0.57 ms p50 / 0.68 ms p95 for a 128-tool
+    # array (112,088 canonical bytes, built from the shipped tool
+    # definitions) on an unloaded M-series laptop. A throttled 1-vCPU
+    # container is slower by an unmeasured factor, which is exactly why this
+    # runs on one tenant before it runs on the fleet.
+    #
+    # The canary list is comma-separated FULL user ids (the [CACHE] lines only
+    # ever print the 8-char prefix). Same shape as
+    # `stable_prefix_canary_user_ids` / `channel_envelope_canary_user_ids`.
+    # An 8-char prefix pasted here matches NOTHING and is a silent no-op —
+    # resolve the full uuid from the platform users table.
+    #
+    # What the gated fields join, exactly: `rid` (a per-request
+    # secrets.token_hex(4)) joins this service's OWN three lines for one
+    # request — request-side [CACHE], usage-side [CACHE], `llm_proxy`
+    # summary. It is platform-local and is never returned to the agent.
+    # `trace` echoes the agent's `x-toup-trace` header IF the agent sends
+    # one; no deployed agent does (166b835e), so it reads `-` on every
+    # request until the separate agent-side patch ships, and there is no
+    # agent↔platform join before then. `req_id` is OpenAI's own id and
+    # joins a line to a provider escalation, nothing else. There is no
+    # single id spanning agent → platform → OpenAI today.
+    llm_proxy_wire_observability: bool = False
+    llm_proxy_wire_observability_canary_user_ids: str = ""
+
     # Pricing per 1K tokens (USD)
     #
-    # `cached_input` / `cache_write` are OPTIONAL per-model columns (G1 prep,
-    # docs/audits/2026-07-g1-model-gate.md): the gpt-5.6 explicit-caching
-    # regime bills cache READS at the cached_input rate and cache WRITES at
-    # 1.25x the input rate (terra $3.125/M). Cost math (_calc_cost_cents,
-    # tokens_to_credits) only applies these columns when present, so every
-    # model WITHOUT them (all currently-live models) bills exactly as before.
+    # `cached_input` / `cache_write` are OPTIONAL per-model columns.
+    # GPT-5.6 and GPT-6 Sol bill cache reads at 0.1x and writes at 1.25x
+    # the input rate. Cost math applies these columns only when present.
+    # Requests above 272K input tokens incur a full-request long-context
+    # surcharge in model_resolver.long_context_price_multipliers().
     # gpt-5.5-pro is deliberately ABSENT: it has NO cached-input rate at all
     # ($30/$180) and is barred from chat/agent selection by the resolver
     # guard (model_resolver.has_cached_input_rate).
@@ -2809,17 +3253,15 @@ class Settings(BaseSettings):
         # Its absence billed every cached 5.5 token at the FULL input rate, and
         # 56.8% of 5.5's input comes back cached.
         "gpt-5.5": {"input": 0.005, "cached_input": 0.0005, "output": 0.030},
-        # cache_write was 0.003125 (a modelled 1.25x input). MEASURED, that
-        # line prices at $2.548/M — terra's LIST INPUT rate — while the
-        # separate `terra, input` line is $0.0045, i.e. nil. OpenAI is not
-        # surcharging cache writes; it files terra's ordinary uncached input
-        # under that label. See docs/audits/2026-08-g1-cost-and-latency.md 8.2.
-        "gpt-5.6-terra": {"input": 0.0025, "cached_input": 0.00025, "cache_write": 0.0025, "output": 0.015},
-        # sol/luna keep their MODELLED 1.25x cache_write: neither has carried
-        # production traffic, so there is nothing to measure. Do not "correct"
-        # them by analogy with terra — that would be inventing a number.
-        "gpt-5.6-sol": {"input": 0.005, "cached_input": 0.0005, "cache_write": 0.00625, "output": 0.030},
-        "gpt-5.6-luna": {"input": 0.001, "cached_input": 0.0001, "cache_write": 0.00125, "output": 0.006},
+        # OpenAI's current Standard, short-context rates (2026-09-28):
+        # https://developers.openai.com/api/docs/models/gpt-6-sol
+        # https://developers.openai.com/api/docs/models/gpt-5.6-terra
+        # Older 2026-08 Terra billing showed $2.548/M for cache writes,
+        # which now matches the published 1.25x of its reduced $2/M input.
+        "gpt-6-sol": {"input": 0.002, "cached_input": 0.0002, "cache_write": 0.0025, "output": 0.010},
+        "gpt-5.6-terra": {"input": 0.002, "cached_input": 0.0002, "cache_write": 0.0025, "output": 0.012},
+        "gpt-5.6-sol": {"input": 0.004, "cached_input": 0.0004, "cache_write": 0.005, "output": 0.020},
+        "gpt-5.6-luna": {"input": 0.0002, "cached_input": 0.00002, "cache_write": 0.00025, "output": 0.0012},
         "gpt-5.4": {"input": 0.003, "output": 0.012},
         "gpt-5": {"input": 0.003, "output": 0.012},
         "gpt-4.1": {"input": 0.002, "output": 0.008},
@@ -3133,6 +3575,59 @@ def reasoning_effort_for_intent(category: str | None) -> str | None:
     if not settings.reasoning_effort_by_intent:
         return None
     return REASONING_EFFORT_BY_INTENT.get((category or "").strip().lower())
+
+
+def presave_refresh_trim_enabled(user_id: str | None) -> bool:
+    """Opt in only a canonical, full authenticated user UUID.
+
+    A prefix, wildcard, malformed entry, or missing user must never turn a
+    fleet-wide bridge setting into a fleet-wide behavior change.
+    """
+    return _exact_user_canary_enabled(user_id, settings.presave_refresh_trim_canary_user_ids)
+
+
+def preferred_provider_reuse_enabled(user_id: str | None) -> bool:
+    """Whether this turn may reuse its phase-1 AgentConfig provider value."""
+    return _exact_user_canary_enabled(user_id, settings.preferred_provider_reuse_canary_user_ids)
+
+
+def prompt_config_reuse_enabled(user_id: str | None) -> bool:
+    """Whether this turn may reuse its phase-1 prompt config values."""
+    return _exact_user_canary_enabled(user_id, settings.prompt_config_reuse_canary_user_ids)
+
+
+def app_html_static_diet_enabled(user_id: str | None, channel: str | None) -> bool:
+    """Only exact authenticated web/mobile owner turns use compact guidance."""
+    return channel in {"web", "mobile"} and _exact_user_canary_enabled(
+        user_id, settings.app_html_static_diet_canary_user_ids
+    )
+
+
+def intent_wire_prune_enabled(user_id: str | None) -> bool:
+    """Opt in an authenticated user UUID, never a prefix or wildcard."""
+    return _exact_user_canary_enabled(user_id, settings.intent_wire_prune_canary_user_ids)
+
+
+def intent_wire_prune_question_enabled(user_id: str | None) -> bool:
+    """Separate exact-user opt-in for question-intent schema pruning."""
+    return _exact_user_canary_enabled(user_id, settings.intent_wire_prune_question_canary_user_ids)
+
+
+def _exact_user_canary_enabled(user_id: str | None, raw: str) -> bool:
+    if not user_id:
+        return False
+    if not raw:
+        return False
+    import uuid
+
+    for entry in raw.split(","):
+        candidate = entry.strip()
+        try:
+            if str(uuid.UUID(candidate)) == candidate == user_id:
+                return True
+        except (ValueError, AttributeError):
+            continue
+    return False
 
 
 @lru_cache()
