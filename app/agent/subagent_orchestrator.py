@@ -344,6 +344,10 @@ async def _run_child(
     final_text: Optional[str] = None
     outcome = "failed"
     error_message: Optional[str] = None
+    # Set only when the failure has a story the user may read (the proxy's
+    # monthly model budget); `error_message` stays the raw text.
+    job_user_message: Optional[str] = None
+    job_error_class: Optional[str] = None
     tokens_prompt: Optional[int] = None
     tokens_completion: Optional[int] = None
     model_used: Optional[str] = None
@@ -498,6 +502,23 @@ async def _run_child(
             outcome = "failed"
             error_message = f"{type(exc).__name__}: {str(exc)[:500]}"
             final_text = f"Sub-agent task failed: {error_message}"
+            # `final_text` is posted into the user's day chat and the
+            # failed push. For the proxy's monthly model budget the raw
+            # text is an exception repr carrying cents and timestamps, so
+            # both carry the dated sentence instead; the raw text stays in
+            # `error_message` (operators, lane release).
+            try:
+                from app.agent.job_status import model_budget_verdict, user_tz_name
+                from app.services.budget_refusal import is_budget_refusal
+                if is_budget_refusal(exc):
+                    _verdict = model_budget_verdict(exc, await user_tz_name(user_id))
+                    if _verdict is not None:
+                        job_user_message = _verdict.user_message
+                        job_error_class = _verdict.error_class
+                        final_text = _verdict.user_message
+            except Exception:  # noqa: BLE001 — copy must never cost the close
+                logger.debug("[subagent_orchestrator] budget verdict skipped",
+                             exc_info=True)
             logger.exception(
                 "[subagent_orchestrator] job=%s FAILED", job_id,
             )
@@ -574,6 +595,8 @@ async def _run_child(
                 started_at=started_at,
                 session_maker=session_maker,
                 parent_channel=parent_channel,
+                user_message=job_user_message,
+                error_class=job_error_class,
             )
         except Exception as fin_err:  # pragma: no cover — defensive
             logger.exception(
@@ -818,8 +841,14 @@ async def _finalize(
     started_at: datetime,
     session_maker: Any,
     parent_channel: Optional[str] = None,
+    user_message: Optional[str] = None,
+    error_class: Optional[str] = None,
 ) -> None:
-    """Announce-back + terminal status transition."""
+    """Announce-back + terminal status transition.
+
+    ``user_message`` / ``error_class`` are written onto the row, ride the
+    terminal ``job_update`` frame, and replace the raw ``error_message`` as
+    the failed push body when set."""
     from app.agent.subagent_message_writer import (
         broadcast_subagent_message,
         write_subagent_message,
@@ -912,6 +941,15 @@ async def _finalize(
                 .values(summary_message_id=msg_id, outcome=outcome)
                 .execution_options(synchronize_session=False)
             )
+        if user_message or error_class:
+            # `transition_job_status` writes only status + error_message;
+            # the two fields a client may render are stamped here.
+            await db.execute(
+                update(BuildJob)
+                .where(BuildJob.id == job_id)
+                .values(user_message=user_message, error_class=error_class)
+                .execution_options(synchronize_session=False)
+            )
         if tokens_prompt or tokens_completion:
             total = (tokens_prompt or 0) + (tokens_completion or 0)
             await db.execute(
@@ -961,6 +999,8 @@ async def _finalize(
         label=label,
         outcome=outcome,
         summary_message_id=msg_id,
+        user_message=user_message,
+        error_class=error_class,
     )
 
     # 6. Phone surface: end the Live Activity card. Success cards
@@ -995,7 +1035,7 @@ async def _finalize(
         await _notify_job_event(
             job_id=job_id, label=label, kind="mission_failed",
             title=f"Didn't finish: {(label or 'background task')[:150]}",
-            body=(error_message or outcome)[:300],
+            body=(user_message or error_message or outcome)[:300],
             dedup_suffix="failed",
             urgent=_urgent,
         )
@@ -1023,6 +1063,8 @@ async def _emit_job_update(
     label: Optional[str] = None,
     outcome: Optional[str] = None,
     summary_message_id: Optional[str] = None,
+    user_message: Optional[str] = None,
+    error_class: Optional[str] = None,
 ) -> None:
     try:
         from app.api.ws_chat import broadcast_to_user
@@ -1038,6 +1080,10 @@ async def _emit_job_update(
             event["outcome"] = outcome
         if summary_message_id is not None:
             event["summary_message_id"] = summary_message_id
+        if user_message is not None:
+            event["user_message"] = user_message
+        if error_class is not None:
+            event["error_class"] = error_class
         await broadcast_to_user(user_id, event)
     except Exception as e:
         logger.debug(

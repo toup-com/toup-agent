@@ -96,6 +96,7 @@ from app.db.models.enums import IdentityType
 # armed for a canary user; the import itself pulls in no engine.
 from app.db import db_span as _db_span_mod
 from app.db.db_span import db_span as _db_span
+from app.services.budget_refusal import is_budget_refusal
 from app.services.cmid import cmid_hash as _cmid_hash
 from app.services.openai_agent_service import OpenAIAgentService, StreamEvent
 from app.services.anthropic_service import AnthropicService
@@ -1537,12 +1538,25 @@ class AgentRunner:
         # does not share writes to, so it is what tells parent from child.
         # Two ContextVar operations; a no-op off-canary in every other sense.
         _db_span_run_tok = _db_span_mod.enter_run()
+        # What ended the turn, if anything did — so the sweep can tell the
+        # jobs it closes WHY (a spent monthly model budget is not "the
+        # conversation ended"). Captured, never handled: it re-raises as is.
+        _cause: Optional[BaseException] = None
         try:
             return await self._run_inner(*args, **kwargs)
+        except BaseException as _exc:
+            _cause = _exc
+            raise
         finally:
-            self._sweep_unclosed_created_jobs(
-                kwargs.get("user_id") or (args[1] if len(args) > 1 else None)
-            )
+            _sweep_uid = kwargs.get("user_id") or (args[1] if len(args) > 1 else None)
+            if _cause is None:
+                self._sweep_unclosed_created_jobs(_sweep_uid)
+            else:
+                self._sweep_unclosed_created_jobs(_sweep_uid, cause=_cause)
+                # What `except … as` does for `_exc`: drop this frame's
+                # reference, or frame → exception → traceback → frame is a
+                # cycle holding the turn's locals until a full GC pass.
+                _cause = None
             # Round 13: the same guarantee for the card the RUNNER opened on a
             # voice turn. It is not in the create_job registry (nothing calls
             # that tool on voice), so it needs its own line here — and this is
@@ -1578,7 +1592,10 @@ class AgentRunner:
             # depth first would make a nested run look like the outer one.
             _db_span_mod.exit_run(_db_span_run_tok)
 
-    def _sweep_unclosed_created_jobs(self, user_id: Optional[str]) -> None:
+    def _sweep_unclosed_created_jobs(
+        self, user_id: Optional[str],
+        cause: Optional[BaseException] = None,
+    ) -> None:
         """Close jobs this turn created but never finished. Never awaits.
 
         Deliberately synchronous and fire-and-forget. It runs inside a
@@ -1587,6 +1604,10 @@ class AgentRunner:
         the cleanup would be skipped by the very condition that makes it
         necessary. A detached task survives; the 30-minute reaper stays the
         backstop for a process that dies before it is scheduled.
+
+        `cause` is the exception that ended the turn. Only a monthly model
+        budget refusal is handed on: it changes what the closed jobs say,
+        and every other ending closes them exactly as before.
         """
         try:
             ids = (self.tools.take_created_job_ids()
@@ -1609,15 +1630,19 @@ class AgentRunner:
             staged = list(
                 getattr(self.tools, "staged_pending_action_ids", []) or []
             )
-            _spawn_bg(self._close_interrupted_jobs(
-                tuple(ids), user_id, staged_action_id=staged[-1] if staged else None,
-            ))
+            _close_kw: Dict[str, Any] = {
+                "staged_action_id": staged[-1] if staged else None,
+            }
+            if cause is not None and is_budget_refusal(cause):
+                _close_kw["cause"] = cause
+            _spawn_bg(self._close_interrupted_jobs(tuple(ids), user_id, **_close_kw))
         except Exception:  # noqa: BLE001 — cleanup must never mask the real error
             logger.exception("[job-finalize] sweep failed")
 
     async def _close_interrupted_jobs(
         self, job_ids: tuple, user_id: str,
         staged_action_id: Optional[str] = None,
+        cause: Optional[BaseException] = None,
     ) -> None:
         """Terminalise abandoned inline jobs and CLOSE their phone cards.
 
@@ -1633,12 +1658,20 @@ class AgentRunner:
         Approving that card creates the event, so the job had not been
         cancelled by anything; it was waiting, and `cancelled` renders inside
         the clients' `isFailed` branch just like `failed` does.
+
+        `cause` — the exception that ended the turn, handed on only when it
+        is the proxy's monthly model budget refusal. The conversation did
+        not end: the budget is spent, so "ask me to pick it up again" would
+        be a promise the same gate refuses (incident 2026-09-28: a job card
+        that read "Couldn't build …" with a retry, over a push saying the
+        conversation had ended). The row, the frame and the push carry the
+        dated budget sentence and `model_budget` instead.
         """
         from sqlalchemy import update as _upd
         from app.agent.job_status import (
-            ERR_AWAITING_CONFIRMATION, ERR_TURN_INTERRUPTED, STATUS_CANCELLED,
-            STATUS_RUNNING, STATUS_WAITING_ON_USER, awaiting_confirmation,
-            turn_interrupted,
+            STATUS_CANCELLED, STATUS_RUNNING, STATUS_WAITING_ON_USER,
+            awaiting_confirmation, model_budget_verdict, turn_interrupted,
+            user_tz_name,
         )
         from app.db.database import async_session_maker
         from app.db.models import BuildJob as _BJ
@@ -1648,7 +1681,17 @@ class AgentRunner:
         # against the rule table, and the bare class name matches nothing, so
         # that would silently hand back the `unknown` copy.
         verdict = awaiting_confirmation() if parked else turn_interrupted()
+        # A parked job keeps its card: the budget does not un-stage it.
+        budget = None
+        if not parked and cause is not None and is_budget_refusal(cause):
+            try:
+                budget = model_budget_verdict(cause, await user_tz_name(user_id))
+            except Exception:  # noqa: BLE001 — copy must never cost the close
+                logger.debug("[job-finalize] budget verdict skipped", exc_info=True)
+        if budget is not None:
+            verdict = budget
         msg = verdict.user_message
+        err_class = verdict.error_class
         closed: List[tuple] = []
         try:
             _now = datetime.utcnow()
@@ -1674,8 +1717,12 @@ class AgentRunner:
                 )
                 for jid in build_ids:
                     try:
-                        await settle_build(jid, user_id=user_id, now=_now,
-                                           reason="turn_interrupted")
+                        await settle_build(
+                            jid, user_id=user_id, now=_now,
+                            reason=("model_budget" if budget is not None
+                                    else "turn_interrupted"),
+                            user_message=msg if budget is not None else None,
+                        )
                     except Exception:  # noqa: BLE001
                         logger.exception(
                             "[job-finalize] build settle failed for %s", jid)
@@ -1697,10 +1744,9 @@ class AgentRunner:
                             # A parked job is NOT over — stamping completed_at
                             # files it under History, the terminal-only tab.
                             completed_at=None if parked else _now,
-                            error_class=(
-                                ERR_AWAITING_CONFIRMATION if parked
-                                else ERR_TURN_INTERRUPTED
-                            ),
+                            # awaiting_confirmation / turn_interrupted /
+                            # model_budget — the verdict chosen above.
+                            error_class=err_class,
                             user_message=msg,
                         )
                         .returning(_BJ.id, _BJ.title, _BJ.conversation_id,
@@ -1766,9 +1812,17 @@ class AgentRunner:
                 from app.api.ws_chat import broadcast_to_user
                 await broadcast_to_user(user_id, {
                     "type": "job_update", "job_id": jid, "name": title,
+                    # The kind rides every frame that can START a card: a
+                    # tab meeting the job first here would otherwise draw
+                    # it as an app build ("Couldn't build …").
+                    "job_type": _card["job_type"],
                     "status": (
                         STATUS_WAITING_ON_USER if parked else STATUS_CANCELLED
                     ),
+                    # What the row now says, so the live card matches a
+                    # reloaded one (and hides a retry for model_budget).
+                    "user_message": msg,
+                    "error_class": err_class,
                 })
             except Exception:  # noqa: BLE001
                 pass
@@ -1793,6 +1847,19 @@ class AgentRunner:
                         action_type="permission",
                         cta_label="Open the chat to approve",
                         **_card,
+                    )
+                    continue
+                if budget is not None:
+                    # The turn did not "end": the monthly budget is spent,
+                    # and asking again before it resets hits the same gate.
+                    # "finish", as in the sentence: the turn often did work
+                    # before the refused call.
+                    await _notify_job_event(
+                        job_id=jid, label=title, kind="mission_failed",
+                        title=f"Couldn’t finish: {(title or 'background task')[:150]}",
+                        body=msg,
+                        dismiss_after_s=600, dedup_suffix="turn-interrupted",
+                        urgent=False, **_card,
                     )
                     continue
                 await _notify_job_event(
@@ -3524,10 +3591,13 @@ class AgentRunner:
                         explicit_full_document_summary(_clean_user_request)
                         or explicit_current_attachment_summary(_clean_user_request)
                     )):
-                from app.agent.attachment_analysis import _wants_unit_details, start_analysis
+                from app.agent.attachment_analysis import (
+                    _wants_unit_details, blocked_reply_text, start_analysis,
+                )
                 from app.api.chat_attachments import load_attachment_record
 
                 _aid = _eligible_uploads[0]["attachment_id"]
+                _persian_request = bool(re.search(r"[\u0600-\u06ff]", _clean_user_request))
                 try:
                     _original_record = await asyncio.to_thread(load_attachment_record, user_id, _aid)
                     if _original_record is None:
@@ -3539,9 +3609,24 @@ class AgentRunner:
                         anchor_message_id=asst_message_id,
                         include_unit_details=_wants_unit_details(_clean_user_request),
                         request_identity=_clean_user_request,
+                        # When the monthly model budget still blocks the
+                        # retry, the reply below IS the message; a
+                        # re-delivered status part would say it twice.
+                        redeliver_when_blocked=False,
+                    )
+                    # A retry the monthly model budget still blocks is NOT
+                    # requeued: it stays failed/partial, which below would
+                    # read "I found the completed analysis". Say what is true
+                    # \u2014 the analysis module owns the wording (the reset date
+                    # in this turn's zone, and an automatic retry promised
+                    # only when the reconciler will make one).
+                    _blocked_reply = blocked_reply_text(
+                        _analysis, persian=_persian_request, tz_name=client_tz,
                     )
                     _complete = _analysis["status"] in ("completed", "partial", "failed")
-                    if re.search(r"[\u0600-\u06ff]", _clean_user_request):
+                    if _blocked_reply:
+                        final_text = _blocked_reply
+                    elif _persian_request:
                         final_text = (
                             "تحلیل این فایل قبلاً انجام شده است؛ نتیجه را در همین گفتگو می‌فرستم."
                             if _complete else
@@ -3558,7 +3643,14 @@ class AgentRunner:
                     if _reason == "too_many_pages":
                         final_text = "This PDF has more than 500 pages, so I can’t analyze the whole file in one job."
                     elif _reason in ("file_too_large", "invalid_pdf", "unreadable_pdf", "empty_pdf"):
-                        final_text = "I couldn’t open the stored PDF for full-file analysis. Please attach a readable PDF under 25 MiB."
+                        from app.agent.attachment_limits import (
+                            MAX_BYTES_PER_DOCUMENT, format_limit_bytes,
+                        )
+                        final_text = (
+                            "I couldn’t open the stored PDF for full-file analysis. "
+                            "Please attach a readable PDF under "
+                            f"{format_limit_bytes(MAX_BYTES_PER_DOCUMENT)}."
+                        )
                     elif _reason == "renderer_unavailable":
                         final_text = "Full-file PDF analysis is unavailable on this server right now."
                     else:
@@ -4116,6 +4208,30 @@ class AgentRunner:
                             error_message=str(e),
                             context={"iteration": iteration, "model": active_model,
                                      "terminal": "out_of_credits"},
+                        )
+                        raise
+                    # The platform proxy's monthly MODEL budget is terminal
+                    # for the same reason: a retry, the back-off sleep and
+                    # the other provider all go back through the one proxy
+                    # gate, and nothing changes until the budget window
+                    # rolls. Here, before `_should_cross_provider` consults
+                    # `_is_auth_error` (the typed 429 detail carries numbers
+                    # that can contain "401"), and raised unconverted so
+                    # ws_chat can still lift the typed detail and name the
+                    # reset date.
+                    if is_budget_refusal(e):
+                        logger.info(
+                            "[AGENT] model budget refusal from the proxy on %s (%s) — "
+                            "terminal, no retry and no cross-provider hop",
+                            active_model, type(e).__name__,
+                        )
+                        await self._log_error(
+                            user_id=user_id,
+                            session_id=session_id,
+                            error_type="llm_error",
+                            error_message=str(e),
+                            context={"iteration": iteration, "model": active_model,
+                                     "terminal": "model_budget_exceeded"},
                         )
                         raise
                     _should_cross_provider = _is_auth_error or _is_rate_limit

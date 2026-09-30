@@ -438,8 +438,9 @@ def test_schedule_warm_outside_an_event_loop_is_a_no_op():
 def test_the_warm_declares_itself_a_system_operation():
     assert cw.SYSTEM_OPERATION == "system.cache_warm"
     assert cw.SYSTEM_OPERATION.startswith("system."), (
-        "the platform keys its exemption off the `system.` prefix in three "
-        "places (llm_proxy._log_event, _get_spend, credits.agent-deduct)"
+        "the platform keys its exemption off the `system.` prefix in two "
+        "places (llm_proxy._log_event, _get_spend); credits.agent-deduct "
+        "no longer exempts a self-reported system.* (2026-09-30)"
     )
 
 
@@ -527,6 +528,13 @@ class TestProxyHonoursTheMarker:
         "tool_choice": "none", "input": [{"role": "user", "content": "."}],
     }
 
+    @pytest.fixture(autouse=True)
+    def _exemption_on(self, monkeypatch):
+        """2026-09-30: the exemption is a platform switch that is OFF by
+        default (see test_the_exemption_is_off_by_default). Everything below
+        describes the gate WITH the switch on."""
+        monkeypatch.setattr(settings, "llm_proxy_system_operation_exemption", True)
+
     def _call(self, raw, body=None):
         from app.api.llm_proxy import _system_operation_for
 
@@ -534,6 +542,18 @@ class TestProxyHonoursTheMarker:
 
     def test_the_warm_marker_is_honoured(self):
         assert self._call("system.cache_warm") == "system.cache_warm"
+
+    def test_the_exemption_is_off_by_default(self, monkeypatch):
+        """Any holder of an agent token can send the header, and the header
+        exempts the call from the credit charge and the monthly window on
+        the strength of its shape alone. Until an attested platform-side
+        path exists the switch stays off: a perfectly shaped warm is served
+        but billed and counted like any other request."""
+        from app.config import Settings
+
+        assert Settings.model_fields["llm_proxy_system_operation_exemption"].default is False
+        monkeypatch.setattr(settings, "llm_proxy_system_operation_exemption", False)
+        assert self._call("system.cache_warm") is None
 
     def test_an_absent_header_is_a_user_request(self):
         assert self._call(None) is None
@@ -561,6 +581,25 @@ class TestProxyHonoursTheMarker:
         {"tool_choice": "auto"},
         {"input": [{"role": "user", "content": "a"}] * 40},
         {"input": "not a list"},
+        # Provider-side context the proxy cannot see or bound: a tiny body
+        # that continues a stored response / conversation / prompt template
+        # is a full-sized billed request.
+        {"previous_response_id": "resp_abc"},
+        {"conversation": "conv_abc"},
+        {"conversation": {"id": "conv_abc"}},
+        {"prompt": {"id": "pmpt_abc"}},
+        {"include": ["file_search_call.results"]},
+        {"store": True},
+        {"tools": [{"type": "web_search"}]},
+        {"input": [{"role": "user", "content": [{"type": "input_file", "file_id": "file_abc"}]}]},
+        {"input": [{"type": "item_reference", "id": "msg_abc"}]},
+        {"model": "claude-opus-5-5"},
+        {"model": "gpt-5.5-pro"},              # a pro tier wearing the prefix is not a warm model
+        {"model": "gpt-image-2"},
+        {"metadata": {"k": "v"}},
+        {"max_output_tokens": "16"},
+        {"store": 0},
+        {"input": [{"role": "system", "content": "."}]},
     ])
     def test_a_real_turn_wearing_the_header_is_still_billed(self, override):
         """Shape gate: a cache warm asks for ~16 tokens, forbids tools and
@@ -569,6 +608,54 @@ class TestProxyHonoursTheMarker:
         completion — not free chat."""
         body = {**self.WARM_BODY, **override}
         assert self._call("system.cache_warm", body) is None
+
+    @pytest.mark.parametrize("model,stable,with_tools", [
+        ("gpt-5.6-terra", True, True), ("gpt-6-sol", True, True), ("gpt-4.1", True, True),
+        ("gpt-5.6-terra", False, True), ("gpt-5.5", True, True),
+    ])
+    def test_the_real_warm_request_passes_the_gate(self, model, stable, with_tools):
+        """Drift guard: the body is built by the REAL sender
+        (OpenAIAgentService._create_responses_stream with the kwargs
+        warm_prefix passes) and captured before the wire, so a new
+        agent-side field shows up here as a failure — not as silently
+        billed warms in production."""
+        import asyncio
+
+        from app.services import openai_agent_service as oas
+
+        captured: dict = {}
+
+        class _Stop(Exception):
+            pass
+
+        class _Responses:
+            async def create(self, **kw):
+                captured.update(kw)
+                raise _Stop()
+
+        class _Client:
+            responses = _Responses()
+            base_url = "http://example.invalid/"
+
+        svc = oas.OpenAIAgentService.__new__(oas.OpenAIAgentService)
+        svc.client = _Client()
+        tools = ([{"name": "read", "description": "d", "input_schema": {"type": "object", "properties": {}}}]
+                 if with_tools else None)
+
+        async def run():
+            try:
+                async for _ in svc._create_responses_stream(
+                        messages=[{"role": "user", "content": "."}], system="S" * 2000, tools=tools,
+                        model=model, max_tokens=16, tool_choice="none", prompt_cache_key="u:s",
+                        safety_identifier="sid", stable_prefix_active=stable, channel="system",
+                        operation_type=cw.SYSTEM_OPERATION):
+                    pass
+            except _Stop:
+                pass
+        asyncio.run(run())
+        body = {k: v for k, v in captured.items() if k != "extra_headers"}
+        assert body, "the fake client captured nothing"
+        assert self._call(cw.SYSTEM_OPERATION, body) == "system.cache_warm", sorted(body)
 
     def test_every_log_site_in_proxy_responses_carries_the_operation_type(self):
         """The interesting branches are the ERROR ones. A warm that 502s and

@@ -45,6 +45,13 @@ from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.services.budget_refusal import (
+    ERROR_CLASS as BUDGET_ERROR_CLASS,
+    budget_refusal_detail,
+    is_budget_refusal,
+    job_sentence as budget_job_sentence,
+)
+
 from .base_handler import TriggerResult
 from .filter_evaluator import matches_filter, _flatten_headers
 from .message_writer import write_trigger_message, broadcast_trigger_message
@@ -134,6 +141,21 @@ class _ReauthRequired(Exception):
 
 class _ToolMissing(Exception):
     """Gmail tool wasn't in tools/list. Treated as reauth."""
+
+
+class _SummarizerBudgetStop(RuntimeError):
+    """`call_system_llm` returned None because the platform proxy refused the
+    summary on the tenant's monthly model budget (its `failure_out` reason is
+    ``model_budget``). `call_system_llm` never raises, so without this the
+    stop read as "internal_llm returned None (timeout / auth / parse
+    failure)" — a timeout, served verbatim. Carries only the reset
+    (``detail["period_end"]``, ISO UTC; None when the refusal named none),
+    never the proxy's text; `_execute_core` renders it as the job sentence.
+    """
+
+    def __init__(self, period_end: Optional[str]):
+        super().__init__("summarizer stopped by the monthly model budget")
+        self.detail: Optional[dict] = {"period_end": period_end} if period_end else None
 
 
 @dataclass
@@ -467,11 +489,28 @@ class EmailReceivedHandler:
                 "[trigger_email] action_failed trigger_id=%s action=%s err=%s",
                 trigger.id, action, e,
             )
+            error_class, error_detail = type(e).__name__, str(e)[:300]
+            summarizer_stop = isinstance(e, _SummarizerBudgetStop)
+            if summarizer_stop or is_budget_refusal(e):
+                # `error_detail` becomes the event row's error and the
+                # trigger's `last_error`, which the dashboard renders
+                # verbatim: the job sentence, never the raw 429 (the proxy's
+                # period timestamps). The raw text is in the log line above.
+                # The runner path raises the refusal itself; the summarize
+                # path (`call_system_llm`, which never raises) its reset.
+                # A returned `failed` result is terminal in the runner: no
+                # retry walks back into the same gate before the reset.
+                from app.agent.job_status import user_tz_name
+
+                error_class = BUDGET_ERROR_CLASS
+                error_detail = budget_job_sentence(
+                    e.detail if summarizer_stop else budget_refusal_detail(e),
+                    await user_tz_name(trigger.user_id))
             return TriggerResult(
                 status="failed",
                 per_event_status={ev.id: "failed" for ev in events},
-                error_class=type(e).__name__,
-                error_detail=str(e)[:300],
+                error_class=error_class,
+                error_detail=error_detail,
             )
 
         # ── 4. Mark every kept event success, point at the Message ──
@@ -816,6 +855,13 @@ class EmailReceivedHandler:
         try:
             text, model_choice, _resp = await self._runner_text(trigger, emails)
         except Exception as e:
+            if is_budget_refusal(e):
+                # Not a runner failure: the monthly model budget is spent.
+                # The summarize path goes back through the same proxy (or
+                # into another provider's budget — a silent switch), and
+                # its refusal would surface as "internal_llm returned None".
+                # The action's own handler records the budget sentence.
+                raise
             # Fail-open — the summarize path has been delivering since
             # launch; the runner path is the experiment.
             logger.warning(
@@ -981,6 +1027,7 @@ class EmailReceivedHandler:
         # `config_json.model` on the trigger explicitly.
         model_choice = (cfg.get("model") or "").strip() or "gpt-4o-mini"
 
+        failure: dict = {}
         text = await llm(
             user_id=trigger.user_id,
             operation_type=_OPERATION_TYPE,
@@ -989,8 +1036,11 @@ class EmailReceivedHandler:
             system=_SUMMARIZE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
             timeout=120,
+            failure_out=failure,
         )
         if not text:
+            if failure.get("reason") == BUDGET_ERROR_CLASS:
+                raise _SummarizerBudgetStop(failure.get("period_end"))
             raise RuntimeError(
                 "internal_llm returned None (timeout / auth / parse failure)"
             )

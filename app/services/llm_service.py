@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import AsyncGenerator, List, Dict, Any, Optional
 
 from app.config import settings
+from app.services.budget_refusal import is_budget_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,12 @@ class LLMService:
                     finish_reason=choice.finish_reason
                 )
             except RateLimitError as e:
+                # The platform proxy's monthly model budget is a 429 too,
+                # but TERMINAL: every retry goes back through the same gate
+                # and nothing changes until the budget window rolls (it
+                # also says `x-should-retry: false`). Raised as is, at once.
+                if is_budget_refusal(e):
+                    raise
                 if attempt < max_retries - 1:
                     await asyncio.sleep(retry_delay * (2 ** attempt))
                 else:

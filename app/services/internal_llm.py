@@ -44,6 +44,13 @@ from typing import Optional, List, Dict, Any
 import httpx
 
 from app.config import settings
+from app.services.budget_refusal import (
+    ERROR_CLASS as MODEL_BUDGET_REASON,
+    budget_refusal_detail,
+    is_budget_refusal,
+    iso_utc,
+    parse_utc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +98,11 @@ async def call_system_llm(
     None, `failure_out["reason"]` is set to a taxonomy value from
     `_classify_failure_reason` so callers that persist structured
     failure stubs (day_summarizer M3) can record WHY. Untouched on
-    success.
+    success. A reason of ``"model_budget"`` (``budget_refusal.ERROR_CLASS``)
+    means the platform proxy refused on the tenant's monthly model budget:
+    no retry clears it before the reset, which is then in
+    `failure_out["period_end"]` (ISO UTC) when the refusal named it —
+    absent otherwise. Callers render it with ``budget_refusal.job_sentence``.
     W1.0: `prompt_cache_key` / `prompt_cache_retention` / `safety_identifier`
     are optional OpenAI prompt-cache params, forwarded only when set (no
     request-shape change for callers that don't opt in). The Anthropic
@@ -185,13 +196,22 @@ def _classify_failure_reason(
 ) -> str:
     """Map a failed dispatch onto the M3 reason taxonomy used by the day
     summarizer ({auth_error, rate_limit, timeout, server_error,
-    parse_error, no_keys, other}).
+    parse_error, no_keys, model_budget, other}).
 
     Surfaced to callers via the `failure_out` param — values end up in
     day_chats.summary_last_failure_reason and metric labels, so keep the
     set small and stable (matches day_summarizer._classify_failure).
+
+    ``model_budget`` is the platform proxy's monthly model budget refusal,
+    recognised on the exception (typed header/body, or a 429 carrying the
+    legacy sentence) BEFORE the status-code mapping: on the wire it is a
+    429, but it is not a rate limit — nothing changes until the budget
+    resets. A bare status code cannot say it, and the direct (BYOK) paths
+    never reach the proxy.
     """
     if exception is not None:
+        if is_budget_refusal(exception):
+            return MODEL_BUDGET_REASON
         # SDK errors (anthropic/openai APIStatusError) carry .status_code
         code = getattr(exception, "status_code", None)
         if isinstance(code, int):
@@ -209,6 +229,40 @@ def _classify_failure_reason(
     if 500 <= status_code < 600:
         return "server_error"
     return "other"
+
+
+def _budget_period_end(exception: Optional[BaseException]) -> Optional[str]:
+    """The budget refusal's reset (``period_end``) as ISO UTC, or None when
+    ``exception`` is not the refusal or the refusal named no reset (a
+    platform that predates the typed detail). Only the timestamp leaves
+    here — never the exception's text."""
+    if exception is None or not is_budget_refusal(exception):
+        return None
+    return iso_utc((budget_refusal_detail(exception) or {}).get("period_end"))
+
+
+def _earliest_reset(*values: Optional[str]) -> Optional[str]:
+    """The earliest of the known resets (ISO UTC), or None."""
+    known = [dt for dt in (parse_utc(v) for v in values) if dt is not None]
+    return iso_utc(min(known)) if known else None
+
+
+def _record_failure(
+    failure_out: Optional[Dict[str, str]],
+    reason: str,
+    period_end: Optional[str] = None,
+) -> None:
+    """Write a failed dispatch's reason into the caller's dict. The reset
+    belongs to the reason: ``period_end`` is set only with ``model_budget``
+    and dropped otherwise, so a composed Anthropic→OpenAI failure can never
+    pair one leg's reason with the other leg's reset."""
+    if failure_out is None:
+        return
+    failure_out["reason"] = reason
+    if reason == MODEL_BUDGET_REASON and period_end:
+        failure_out["period_end"] = period_end
+    else:
+        failure_out.pop("period_end", None)
 
 
 # Production fallback model when an Anthropic dispatch can't complete.
@@ -254,6 +308,7 @@ async def _system_call_anthropic(
     text: Optional[str] = None
     fallback_reason: Optional[str] = None  # set if we should fall through to OpenAI
     anthropic_reason = ""  # taxonomy reason for the Anthropic-side failure
+    anthropic_period_end: Optional[str] = None  # its reset, for model_budget
 
     if _bundle_active():
         # SDK path — let bundle_client handle proxy URL, TOUP_TOKEN auth,
@@ -302,6 +357,7 @@ async def _system_call_anthropic(
             )
             fallback_reason = f"bundle_exc_{type(e).__name__}"
             anthropic_reason = _classify_failure_reason(exception=e)
+            anthropic_period_end = _budget_period_end(e)
     else:
         # Legacy direct-API path. Same code as `call_anthropic_system`
         # below — inlined here to keep one logging call per dispatch.
@@ -389,12 +445,22 @@ async def _system_call_anthropic(
         # platform-wide the anthropic leg ALWAYS fails no_keys, and letting
         # it stomp the OpenAI leg's real diagnostic (rate_limit, timeout…)
         # would mislabel every dual failure on the prod-default config.
-        if fb_text is None and failure_out is not None and anthropic_reason not in ("", "other", "no_keys"):
-            failure_out["reason"] = anthropic_reason
+        # The OpenAI leg already recorded its own reason (and, for
+        # model_budget, its reset) — kept when the Anthropic one is generic.
+        if fb_text is None and failure_out is not None:
+            if (anthropic_reason == MODEL_BUDGET_REASON
+                    and failure_out.get("reason") == MODEL_BUDGET_REASON):
+                # Both providers refused on their monthly budgets. A retry
+                # first goes through at the EARLIER reset (Anthropic
+                # directly, or this fallback), so that is the date to name.
+                _record_failure(failure_out, MODEL_BUDGET_REASON, _earliest_reset(
+                    anthropic_period_end, failure_out.get("period_end")))
+            elif anthropic_reason not in ("", "other", "no_keys"):
+                _record_failure(failure_out, anthropic_reason, anthropic_period_end)
         return fb_text
-    if text is None and failure_out is not None:
+    if text is None:
         # 200-with-empty-content (no fallback engaged) — closest taxonomy fit.
-        failure_out["reason"] = anthropic_reason or "parse_error"
+        _record_failure(failure_out, anthropic_reason or "parse_error", anthropic_period_end)
     return text
 
 
@@ -430,6 +496,7 @@ async def _system_call_openai(
     output_tokens = 0
     text: Optional[str] = None
     openai_reason = ""  # taxonomy reason for a failed dispatch
+    openai_period_end: Optional[str] = None  # its reset, for model_budget
 
     chat_messages = [{"role": "system", "content": system}] + list(messages)
     token_kwarg = "max_completion_tokens" if uses_max_completion_tokens(model) else "max_tokens"
@@ -444,8 +511,7 @@ async def _system_call_openai(
                     "[internal_llm] bundle mode but make_openai_client returned None for op=%s",
                     operation_type,
                 )
-                if failure_out is not None:
-                    failure_out["reason"] = "no_keys"
+                _record_failure(failure_out, "no_keys")
                 return None
             kwargs: Dict[str, Any] = {
                 "model": model,
@@ -523,6 +589,7 @@ async def _system_call_openai(
         except Exception as e:
             status = "error"
             openai_reason = _classify_failure_reason(exception=e)
+            openai_period_end = _budget_period_end(e)
             logger.warning(
                 "[internal_llm] bundle OpenAI call failed for op=%s: %s: %s",
                 operation_type, type(e).__name__, str(e)[:300],
@@ -574,8 +641,8 @@ async def _system_call_openai(
             )
         except Exception:
             logger.exception("[credits] internal_llm openai direct deduct failed")
-    if text is None and failure_out is not None:
-        failure_out["reason"] = openai_reason or "parse_error"
+    if text is None:
+        _record_failure(failure_out, openai_reason or "parse_error", openai_period_end)
     return text
 
 

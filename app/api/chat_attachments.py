@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.attachment_limits import (
@@ -49,7 +51,9 @@ from app.agent.attachment_limits import (
     REASON_TOO_LARGE,
     REASON_UNSUPPORTED,
     check_one,
+    kind_for,
     normalize_mime,
+    too_large_detail,
 )
 from app.api.auth import get_current_user
 from app.api.tenant_proxy import (
@@ -63,7 +67,56 @@ from app.services.file_storage import get_storage_backend
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/chat", tags=["Chat attachments"])
+#: The upload form carries ONE file part plus, at most, the `sha256` and
+#: `client_attachment_id` fields (see `upload_chat_attachment`). starlette's
+#: defaults are 1000 of each; a flood of parts is refused by the parser, before
+#: any part is handed to the handler. A second file part was never read — the
+#: handler takes one — so refusing it is not a behaviour any client relies on.
+UPLOAD_FORM_MAX_FILES = 1
+UPLOAD_FORM_MAX_FIELDS = 4
+#: The largest NON-file field worth holding in memory (the real ones are a hex
+#: digest and a short client id). Applied only where the installed starlette's
+#: `Request.form` accepts `max_part_size` (>= 0.40); the pinned 0.35.1 has no
+#: such bound, so there the body byte count in
+#: :class:`AttachmentBodyLimitMiddleware` is what caps a huge field.
+UPLOAD_FORM_MAX_FIELD_BYTES = 64 * 1024
+_FORM_HAS_MAX_PART_SIZE = "max_part_size" in inspect.signature(Request.form).parameters
+
+
+class _BoundedUploadRequest(Request):
+    """A `Request` whose `form()` never exceeds the upload route's part bounds,
+    whatever the caller (fastapi's body parser calls it with no arguments)."""
+
+    def form(self, *, max_files: Any = UPLOAD_FORM_MAX_FILES,  # type: ignore[override]
+             max_fields: Any = UPLOAD_FORM_MAX_FIELDS, **kwargs: Any) -> Any:
+        if _FORM_HAS_MAX_PART_SIZE:
+            kwargs["max_part_size"] = min(
+                kwargs.get("max_part_size", UPLOAD_FORM_MAX_FIELD_BYTES),
+                UPLOAD_FORM_MAX_FIELD_BYTES,
+            )
+        return super().form(
+            max_files=min(max_files, UPLOAD_FORM_MAX_FILES),
+            max_fields=min(max_fields, UPLOAD_FORM_MAX_FIELDS),
+            **kwargs,
+        )
+
+
+class _BoundedUploadRoute(APIRoute):
+    """fastapi parses the form inside the route handler, BEFORE dependencies,
+    with starlette's default part limits; this hands it the bounded request."""
+
+    def get_route_handler(self) -> Any:
+        handler = super().get_route_handler()
+
+        async def bounded(request: Request) -> Any:
+            return await handler(
+                _BoundedUploadRequest(request.scope, request.receive, request._send)
+            )
+
+        return bounded
+
+
+router = APIRouter(prefix="/chat", tags=["Chat attachments"], route_class=_BoundedUploadRoute)
 
 #: The largest single file any kind may be. The per-kind cap is applied after
 #: the type is known; this is the read ceiling so a 200 MB body is refused
@@ -166,9 +219,11 @@ async def _read_capped(file: UploadFile) -> bytes:
             break
         total += len(chunk)
         if total > _ABSOLUTE_MAX:
+            # Past the largest cap of any kind, so the document number is the
+            # true one to state.
             raise _refuse(
                 REASON_TOO_LARGE,
-                "That file is larger than this chat accepts.",
+                too_large_detail(None),
                 status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             )
         chunks.append(chunk)
@@ -337,9 +392,12 @@ async def upload_chat_attachment(
             status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
         )
     if reason == REASON_TOO_LARGE:
+        # `check_one` answers kind=None on this path, so the kind is looked up
+        # again: an image over its cap is told the image number (15 MB), not
+        # the document one.
         raise _refuse(
             REASON_TOO_LARGE,
-            "That file is larger than this chat accepts.",
+            too_large_detail(kind_for(mime, name)),
             status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
         )
 
@@ -463,6 +521,47 @@ def plan_uploaded_attachments(
 BODY_HARD_MAX = _ABSOLUTE_MAX + 1024 * 1024
 
 
+def _declared_length(scope: Any) -> Optional[int]:
+    """The declared `Content-Length`, or None when absent or not a plain
+    non-negative integer. A None is not trusted either way: the byte count
+    decides."""
+    for key, value in scope.get("headers") or ():
+        if key.lower() == b"content-length":
+            raw = bytes(value).strip()
+            return int(raw) if raw.isdigit() else None
+    return None
+
+
+def _body_too_large() -> HTTPException:
+    """The typed refusal, as an exception fastapi's body parser RE-RAISES.
+
+    It has to be an `HTTPException`: fastapi wraps any other exception raised
+    while `request.form()` runs into a generic 400 "There was an error parsing
+    the body", which drops the reason code the clients key their copy on."""
+    return _refuse(
+        REASON_TOO_LARGE,
+        too_large_detail(None),
+        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+    )
+
+
+async def _send_too_large(send: Any) -> None:
+    await send({
+        "type": "http.response.start",
+        "status": 413,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"x-toup-reason", REASON_TOO_LARGE.encode()),
+        ],
+    })
+    await send({
+        "type": "http.response.body",
+        "body": json.dumps(
+            {"detail": too_large_detail(None)}, ensure_ascii=False,
+        ).encode(),
+    })
+
+
 class AttachmentBodyLimitMiddleware:
     """Refuse an oversized upload body BEFORE the framework buffers it.
 
@@ -472,45 +571,71 @@ class AttachmentBodyLimitMiddleware:
     fields accumulated in memory — before the handler's first statement runs.
     On the PLATFORM that disk and that memory are shared by every tenant.
 
-    Content-Length only, deliberately: it is the one thing available before a
-    single body byte is read, and an honest client always sends it. A chunked
-    body still reaches the parser, where `_read_capped` bounds the part.
+    Two gates, both answering the same typed 413:
+
+    * the DECLARED length — refused before a single body byte is received;
+    * the ACTUAL bytes — `receive` is wrapped and counts every `http.request`
+      body. A missing (chunked), malformed or understated `Content-Length`
+      used to walk straight past the first gate into the parser; now the
+      message that carries the total past the ceiling is never handed to the
+      app. The wrapped `receive` raises the typed `HTTPException` itself,
+      which fastapi's body parser re-raises and its exception handler turns
+      into the response — the handler never runs. If the refusal instead
+      escapes the app, it is answered here, unless a response has already
+      started (tracked through the wrapped `send`): one response, ever.
+
+    The rest of the body is not drained: the server closes a connection whose
+    request body was not fully read once the response is complete.
     """
 
     def __init__(self, app: Any) -> None:
         self.app = app
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if (
+        if not (
             scope.get("type") == "http"
             and scope.get("method") == "POST"
             and str(scope.get("path") or "").endswith("/chat/attachments")
         ):
-            declared = 0
-            for key, value in scope.get("headers") or ():
-                if key == b"content-length":
-                    try:
-                        declared = int(value)
-                    except (TypeError, ValueError):
-                        declared = 0
-                    break
-            if declared > BODY_HARD_MAX:
-                await send({
-                    "type": "http.response.start",
-                    "status": 413,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"x-toup-reason", REASON_TOO_LARGE.encode()),
-                    ],
-                })
-                await send({
-                    "type": "http.response.body",
-                    "body": json.dumps(
-                        {"detail": "That file is larger than this chat accepts."}
-                    ).encode(),
-                })
+            await self.app(scope, receive, send)
+            return
+
+        declared = _declared_length(scope)
+        if declared is not None and declared > BODY_HARD_MAX:
+            await _send_too_large(send)
+            return
+
+        received = 0
+        refusal: Optional[HTTPException] = None
+        response_started = False
+
+        async def counting_receive() -> Any:
+            nonlocal received, refusal
+            if refusal is not None:
+                raise refusal
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body") or b"")
+                if received > BODY_HARD_MAX:
+                    refusal = _body_too_large()
+                    raise refusal
+            return message
+
+        async def tracking_send(message: Any) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, tracking_send)
+        except HTTPException as exc:
+            if refusal is None or exc is not refusal:
+                raise
+            if response_started:
+                logger.warning("chat attachment: body ceiling crossed after the response started")
                 return
-        await self.app(scope, receive, send)
+            await _send_too_large(send)
 
 
 def _size_class(n: int) -> str:

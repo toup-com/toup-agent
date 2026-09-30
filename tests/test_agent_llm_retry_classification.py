@@ -208,3 +208,68 @@ def test_the_wire_level_ladder_retries_only_named_transient_classes():
     }, f"a wider SDK error class joined the wire-level ladder: {caught}"
     assert "APIStatusError" not in caught
     assert "APIError" not in caught
+
+
+# ── the monthly model budget (2026-09-28) ─────────────────────────────
+#
+# The proxy's other terminal refusal: HTTP 429 with
+# `X-Toup-Reason: monthly_model_budget_exceeded` once a tenant's monthly AI
+# budget is spent. A 429 is exactly what the ladder retries and crosses
+# providers on — and both go back through the same gate until the budget
+# window rolls. Same shape of pins as the credit branch above.
+
+
+def _proxy_budget_429() -> _SdkError:
+    detail = {   # the proxy's wire shape (spec v3 S2): no spend or budget figures
+        "error": "monthly_model_budget_exceeded",
+        "message": "Monthly openai budget exceeded",
+        "provider": "openai",
+        "period_start": "2026-09-24T19:10:40+00:00",
+        "period_end": "2026-10-24T19:10:40+00:00",
+    }
+    body = {"detail": detail}
+    return _SdkError(f"Error code: 429 - {body}", status_code=429, body=body)
+
+
+def test_a_budget_refusal_and_a_credit_refusal_are_told_apart():
+    """Two terminal refusals, two different stories for the user: the
+    budget 429 must not be read as the credits paywall, nor the 402 as the
+    budget."""
+    from app.services.budget_refusal import is_budget_refusal
+
+    assert is_budget_refusal(_proxy_budget_429())
+    assert not _is_credit_refusal(_proxy_budget_429())
+    assert _is_credit_refusal(_proxy_402())
+    assert not is_budget_refusal(_proxy_402())
+    assert not is_budget_refusal(
+        _SdkError("Error code: 429 - rate_limit_exceeded", status_code=429))
+
+
+def test_the_budget_branch_runs_after_the_credit_branch_and_before_the_hop():
+    """ORDER: after the credit branch (whose pins slice up to the hop) and
+    before `_should_cross_provider` — which also reads `_is_auth_error`, and
+    the typed detail carries numbers that can contain "401"."""
+    h = _handler()
+    assert h.index("if _is_out_of_credits:") < h.index("if is_budget_refusal(e):") \
+        < h.index("_should_cross_provider =")
+
+
+def test_the_budget_branch_raises_bare_and_writes_one_terminal_row():
+    h = _handler()
+    branch = h[h.index("if is_budget_refusal(e):"):h.index("_should_cross_provider =")]
+    code_only = "\n".join(
+        l for l in branch.splitlines() if not l.strip().startswith("#")
+    )
+    assert "\n                        raise\n" in code_only, (
+        "the branch does not re-raise — it must not reach the fallback arm"
+    )
+    for banned in ("attempt = MAX_RETRIES", "fallback", "continue", "asyncio.sleep"):
+        assert banned not in code_only, banned
+    # Unconverted, so ws_chat can lift the typed detail and name the reset.
+    assert "raise RuntimeError" not in branch
+    assert "from e" not in branch
+    assert 'error_type="llm_error"' in branch
+    assert '"terminal": "model_budget_exceeded"' in branch
+    log = branch[:branch.index("self._log_error(")]
+    assert "type(e).__name__" in log and "%s" in log
+    assert "str(e)" not in log, "the detail carries spend figures — row only, not the log"

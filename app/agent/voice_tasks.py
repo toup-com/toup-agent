@@ -38,6 +38,9 @@ from app.db.models import (
 logger = logging.getLogger(__name__)
 
 SOURCE_KIND = "voice_task"
+#: Every managed voice task row's `job_type` column (JobRunner handler
+#: discriminator) — and the kind its `job_update` frame names.
+JOB_TYPE = "agent_task"
 RUNNING = "running"
 WAITING = "waiting_on_user"
 TERMINAL_DB = frozenset({"completed", "failed", "cancelled"})
@@ -497,7 +500,7 @@ class VoiceTaskService:
             }
             job = BuildJob(
                 id=task_id, user_id=user_id, title=message[:200], prompt=message,
-                job_type="agent_task", source_kind=SOURCE_KIND, source_id=session_id,
+                job_type=JOB_TYPE, source_kind=SOURCE_KIND, source_id=session_id,
                 conversation_id=session_id,
                 idempotency_key=f"voice:{hashlib.sha256(request_id.encode()).hexdigest()}",
                 status="queued", model=model or "", layer=0, steps_json="[]",
@@ -1214,6 +1217,9 @@ class VoiceTaskService:
             await broadcast_to_user(user_id, {
                 "type": "job_update", "job_id": snapshot["task_id"],
                 "status": snapshot["status"], "name": snapshot["title"],
+                # Named, so a tab meeting the task first does not draw it as
+                # an app build ("Couldn't build …").
+                "job_type": JOB_TYPE,
             })
             await broadcast_to_user(
                 user_id, {"type": "voice_task.updated", "task": snapshot}

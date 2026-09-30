@@ -417,6 +417,23 @@ def _derive_health(trigger, watch_provisioned: bool) -> str:
 # ── Response helpers ─────────────────────────────────────────────────
 
 
+def _served_error(raw: Optional[str]) -> Optional[str]:
+    """The error text a trigger surface may serve, which the dashboard
+    renders verbatim.
+
+    Unchanged — except a stop by the agent's monthly model budget, whose raw
+    text is the proxy's 429 (period timestamps, provider detail): that is
+    served as the taxonomy's sentence instead, or as our own dated sentence
+    when the row already holds it. The stored text is untouched (operators
+    read it from the row).
+    """
+    if not raw:
+        return raw
+    from app.agent.job_status import served_model_budget_text
+
+    return served_model_budget_text(raw) or raw
+
+
 def _job_to_event_response(j) -> TriggerEventResponse:
     """Project a ``build_jobs`` row into the legacy ``TriggerEventResponse``
     shape so the events history endpoints can serve from BuildJob without
@@ -451,7 +468,9 @@ def _job_to_event_response(j) -> TriggerEventResponse:
                                      on BuildJob; ``error_class`` has
                                      no separate column so we leave
                                      it None — the dashboard renders
-                                     the detail string verbatim)
+                                     the detail string verbatim, so a
+                                     model-budget stop is served as
+                                     its sentence: ``_served_error``)
       BuildJob.summary_message_id → summary_message_id
       BuildJob.coalesced_into_job_id → coalesced_into_event_id
     """
@@ -464,7 +483,7 @@ def _job_to_event_response(j) -> TriggerEventResponse:
         finished_at=j.completed_at,
         status=_job_status_to_legacy(j.status, getattr(j, "outcome", None)),
         error_class=None,
-        error_detail=j.error_message,
+        error_detail=_served_error(j.error_message),
         summary_message_id=j.summary_message_id,
         coalesced_into_event_id=getattr(j, "coalesced_into_job_id", None),
     )
@@ -515,7 +534,7 @@ def _row_to_response(trigger, recent_events=(), recent_jobs=()) -> TriggerRespon
         last_fired_at=trigger.last_fired_at,
         fire_count=trigger.fire_count or 0,
         last_status=trigger.last_status,
-        last_error=trigger.last_error,
+        last_error=_served_error(trigger.last_error),
         created_at=trigger.created_at,
         updated_at=trigger.updated_at,
         delivery_channels=delivery,

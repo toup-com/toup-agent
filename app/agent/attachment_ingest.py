@@ -405,6 +405,12 @@ def _extract_pptx(data: bytes) -> str:
 
     prs = PptxPresentation(io.BytesIO(data))
     parts: List[str] = []
+    # Did ANY slide carry text, a table or notes? A picture-only deck used to
+    # come back as nothing but "--- Slide N ---" markers, which is non-empty
+    # text — so it ingested as `ok`, and the model was handed slide numbers
+    # to "read". Returning "" makes it `empty`, whose guidance tells the model
+    # the file held no readable text instead of inviting a guess.
+    has_content = False
     for i, slide in enumerate(prs.slides, 1):
         slide_parts = [f"--- Slide {i} ---"]
         for shape in slide.shapes:
@@ -421,8 +427,9 @@ def _extract_pptx(data: bytes) -> str:
             notes = slide.notes_slide.notes_text_frame.text.strip()
             if notes:
                 slide_parts.append(f"[Speaker Notes] {notes}")
+        has_content = has_content or len(slide_parts) > 1
         parts.append("\n".join(slide_parts))
-    return "\n\n".join(parts)
+    return "\n\n".join(parts) if has_content else ""
 
 
 def _extract_xlsx(data: bytes) -> str:
@@ -432,14 +439,34 @@ def _extract_xlsx(data: bytes) -> str:
 
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     parts: List[str] = []
+    # len("\n".join(parts)), kept as a running count: re-joining every row
+    # made a sheet with a long run of blank rows quadratic.
+    joined = 0
+
+    def add(line: str) -> None:
+        nonlocal joined
+        joined += len(line) + (1 if parts else 0)
+        parts.append(line)
+
     try:
         for ws in wb.worksheets:
-            parts.append(f"--- Sheet: {ws.title} ---")
+            # A sheet is labelled only once it has a non-blank row, so a
+            # workbook with no cell text extracts to "" and ingests `empty`
+            # (as a picture-only deck does) instead of `ok` with labels alone.
+            label: Optional[str] = f"--- Sheet: {ws.title} ---"
             for row in ws.iter_rows(values_only=True):
                 cells = ["" if c is None else str(c) for c in row]
                 if any(c.strip() for c in cells):
-                    parts.append(" | ".join(cells))
-                if len("\n".join(parts)) > MAX_EXTRACTED_CHARS_PER_DOCUMENT:
+                    if label is not None:
+                        add(label)
+                        label = None
+                    add(" | ".join(cells))
+                # The cap check counts a label still waiting for its first
+                # row, as it did when every label was written up front.
+                pending = 0 if label is None else len(label) + (1 if parts else 0)
+                if joined + pending > MAX_EXTRACTED_CHARS_PER_DOCUMENT:
+                    if label is not None:
+                        add(label)
                     break
     finally:
         try:

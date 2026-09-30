@@ -43,6 +43,9 @@ from app.agent.skills.base import Skill, SkillContext, SkillMeta
 # /proc/1/environ (docs/security/audit-2026.md).
 from app.services.exec_env import sandbox_environ, sandbox_preexec
 from app.services.background_tasks import spawn as _spawn_bg
+from app.services.budget_refusal import (
+    budget_refusal_detail, is_budget_refusal, job_sentence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,19 @@ class TokenLimitError(Exception):
         self.retry_after_seconds = retry_after_seconds
         self.message = message or f"Token limit reached. Resets in {retry_after_seconds}s"
         super().__init__(self.message)
+
+
+class ModelBudgetStop(RuntimeError):
+    """The platform proxy refused the call: this agent's monthly AI budget
+    is spent (``budget_refusal``). Terminal, and never a TokenLimitError —
+    that pauses the build on the 429's Retry-After, which here is the budget
+    window (up to 7 days), and resumes it into the same refusal. Never a
+    cross-provider fallback either: no silent switch into another budget.
+    The message is the user-facing job sentence, not the raw exception."""
+
+
+def _model_budget_stop(exc: BaseException) -> ModelBudgetStop:
+    return ModelBudgetStop(job_sentence(budget_refusal_detail(exc)))
 
 
 # ── LLM prompts ─────────────────────────────────────────────────────
@@ -4005,6 +4021,10 @@ const _webDb = {
                 )
                 self._last_llm_provider = f"anthropic/{model}"
                 return result
+            except ModelBudgetStop:
+                # The monthly model budget: terminal, and never a hop to the
+                # other provider (no silent switch into another budget).
+                raise
             except TokenLimitError:
                 # Rate-limit / overload — only pause if no OpenAI fallback
                 if not openai_key:
@@ -4033,6 +4053,9 @@ const _webDb = {
                 )
                 self._last_llm_provider = f"openai/{self._resolve_openai_model()}"
                 return result
+            except ModelBudgetStop:
+                # Its own sentence, not "check your API keys".
+                raise
             except Exception as _oai_err:
                 errors.append(f"OpenAI: {type(_oai_err).__name__}: {_oai_err}")
 
@@ -4105,6 +4128,10 @@ const _webDb = {
                             await blog.warn(f"text_stream short ({len(text)} chars), recovered {len(combined)} chars")
                         text = combined
         except anthropic.RateLimitError as e:
+            # The monthly model budget first: its Retry-After is the budget
+            # window (up to 7 days), which the pause below would persist.
+            if is_budget_refusal(e):
+                raise _model_budget_stop(e) from e
             retry_after = 300
             try:
                 retry_after = int(getattr(e.response, 'headers', {}).get('retry-after', 300))
@@ -4196,6 +4223,10 @@ const _webDb = {
                 "OpenAI API key is invalid or expired — check your API key in Settings"
             ) from e
         except RateLimitError as e:
+            # The monthly model budget is not "too many requests": a 60 s
+            # pause would resume into the same refusal until it resets.
+            if is_budget_refusal(e):
+                raise _model_budget_stop(e) from e
             err_str = str(e).lower()
             if any(kw in err_str for kw in ("quota", "billing", "credit", "insufficient")):
                 raise RuntimeError(

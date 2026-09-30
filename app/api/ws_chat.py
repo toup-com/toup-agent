@@ -54,6 +54,15 @@ from app.api._fault_codes import (
 from app.api.message_cards import job_marker_content as _job_marker
 from app.config import settings, presave_refresh_trim_enabled
 from app.db import db_span as _db_span_mod
+from app.services.budget_refusal import (
+    ERROR_CLASS as _BUDGET_ERROR_CLASS,
+    budget_refusal_detail,
+    chat_sentence as _budget_chat_sentence,
+    frame_fields as _budget_frame_fields,
+    is_budget_refusal,
+    job_sentence as _budget_job_sentence,
+    push_body as _budget_push_body,
+)
 from app.services.credit_exhausted import (
     REASON_DAILY_CAP_EXCEEDED,
     REASON_EMAIL_NOT_VERIFIED,
@@ -126,8 +135,11 @@ def _extract_out_of_credits_detail(text: str) -> Optional[dict]:
     return None
 
 
-def _friendly_error(exc: Exception) -> str:
-    """Convert raw exceptions into user-friendly, actionable error messages."""
+def _friendly_error(exc: Exception, tz_name: Optional[str] = None) -> str:
+    """Convert raw exceptions into user-friendly, actionable error messages.
+
+    ``tz_name`` — the user's IANA zone, for copy that names a date (the
+    monthly model budget's reset). None renders that date in UTC."""
     name = type(exc).__name__
     msg = str(exc)
     msg_lower = msg.lower()
@@ -160,6 +172,16 @@ def _friendly_error(exc: Exception) -> str:
             f"You're out of Toup credits. They refill {when} — "
             f"open Credits to top up or upgrade your plan and keep going."
         )
+
+    # ── The agent's monthly model budget — BEFORE any keyword matching ───
+    # The platform proxy's 429 once this agent's monthly AI budget is spent
+    # (typed `monthly_model_budget_exceeded`, or the legacy "Monthly openai
+    # budget exceeded"). Further down it reads as "Rate limit reached —
+    # please wait a moment", which stays false until the budget resets, and
+    # its typed detail carries numbers the keyword buckets were never meant
+    # to see. Credits are not involved, so never the paywall copy either.
+    if is_budget_refusal(exc):
+        return _budget_chat_sentence(budget_refusal_detail(exc), tz_name)
 
     # ── Anthropic Claude subscription quota exhausted (CLI OAuth tokens) ──
     # Example: "You're out of extra usage. Add more at claude.ai/settings/usage..."
@@ -807,6 +829,29 @@ async def _stored_user_tz(user_id: str):
         return exc
 
 
+async def _budget_copy_tz(client_tz: Optional[str], user_id: str) -> Optional[str]:
+    """The zone a monthly-budget sentence names its reset date in.
+
+    This turn's validated ``client_tz``; else the runner's per-turn cache;
+    else the stored ``users.timezone``. None means UTC. Never raises — a
+    date in UTC beats an error bubble that failed to render. Only called for
+    that refusal, so an ordinary error costs no lookup.
+    """
+    if client_tz:
+        return client_tz
+    try:
+        from app.agent._user_tz_cache import get_cached_user_tz
+        cached = get_cached_user_tz(user_id)
+        if cached:
+            return cached
+    except Exception:  # noqa: BLE001 — a cache is an optimisation
+        pass
+    stored = await _stored_user_tz(user_id)
+    if isinstance(stored, tuple) and stored[1]:
+        return stored[1]
+    return None
+
+
 # ── The accept→register frame-loss window (round 46) ─────────────────
 # A socket that has been ACCEPTED but not yet AUTHENTICATED has no broadcast
 # queue, and every frame broadcast in that window is dropped with no trace
@@ -1410,6 +1455,17 @@ _TASK_INTENT_PATTERN = _re.compile(
 )
 
 
+def _chat_task_title(text: str) -> str:
+    """The title a chat-intent task job is created with — and the `name`
+    every `job_update` frame about it carries, so a client meeting the job
+    for the first time in one of those frames draws the task, not a build."""
+    return text.strip()[:60]
+
+
+#: The `job_type` of a chat-intent task (see `_detect_and_create_task`).
+_CHAT_TASK_JOB_TYPE = "agent_task"
+
+
 async def _detect_and_create_task(
     text: str, user_id: str, session_id: Optional[str],
     broadcast_queue: asyncio.Queue,
@@ -1421,7 +1477,7 @@ async def _detect_and_create_task(
     if not _TASK_INTENT_PATTERN.search(text.strip()):
         return None
 
-    title = text.strip()[:60]
+    title = _chat_task_title(text)
 
     # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
     # so the new columns are populated for chat-intent tasks.
@@ -1442,7 +1498,7 @@ async def _detect_and_create_task(
     )
     try:
         job = await JobRunner().create_job(
-            job_type="agent_task",
+            job_type=_CHAT_TASK_JOB_TYPE,
             spec=spec,
             title=title,
             prompt=text[:2000],
@@ -6245,11 +6301,18 @@ async def ws_chat(
 
                 # Task intent detection — detect imperative task requests in regular chat
                 _chat_task_job_id = None
+                # The job's title, for the `name` of every job_update frame
+                # below: the web never handles `task_created`, so one of those
+                # frames can be where a client first meets this job — and a
+                # frame with no name/job_type is drawn as "App Build".
+                _chat_task_name = None
                 if channel != "vibecoding" and not _fast_result:
                     _pt.start("task_detect")
                     _chat_task_job_id = await _detect_and_create_task(
                         text, user_id, session_id, broadcast_queue
                     )
+                    if _chat_task_job_id:
+                        _chat_task_name = _chat_task_title(text)
                     _pt.end("task_detect")
 
                 # Reply-to preamble (LLM-only): prepend a short quoted reference
@@ -6528,6 +6591,8 @@ async def ws_chat(
                             await broadcast_queue.put({
                                 "type": "job_update",
                                 "job_id": _chat_task_job_id,
+                                "name": _chat_task_name,
+                                "job_type": _CHAT_TASK_JOB_TYPE,
                                 "status": "completed",
                             })
                         except Exception as _te:
@@ -6838,6 +6903,8 @@ async def ws_chat(
                             await broadcast_queue.put({
                                 "type": "job_update",
                                 "job_id": _chat_task_job_id,
+                                "name": _chat_task_name,
+                                "job_type": _CHAT_TASK_JOB_TYPE,
                                 "status": "cancelled",
                             })
                         except Exception as _ce:  # noqa: BLE001
@@ -6876,18 +6943,45 @@ async def ws_chat(
                     except (asyncio.CancelledError, Exception):
                         pass
                     logger.exception(f"[WS] Agent error for {user_id}")
+                    # The proxy's monthly model budget refusal: the job row,
+                    # the push and the bubble below all say so, and name the
+                    # reset date in the user's own zone.
+                    _budget_refused = is_budget_refusal(e)
+                    _budget_detail = budget_refusal_detail(e) if _budget_refused else None
+                    _copy_tz = (await _budget_copy_tz(client_tz, user_id)
+                                if _budget_refused else None)
                     # Mark chat task job as failed if one was created
                     if _chat_task_job_id:
                         try:
                             from app.db.database import async_session_maker as _sm2
                             from app.db.models import BuildJob as _BJ2
+                            _budget_job_msg = None
                             async with _sm2() as _fdb:
                                 _fj = await _fdb.get(_BJ2, _chat_task_job_id)
                                 if _fj and _fj.status == "running":
                                     _fj.status = "failed"
                                     _fj.error_message = str(e)[:500]
+                                    if _budget_refused:
+                                        # The fields a client renders; the
+                                        # raw text above is for operators.
+                                        _budget_job_msg = _budget_job_sentence(
+                                            _budget_detail, _copy_tz)
+                                        _fj.error_class = _BUDGET_ERROR_CLASS
+                                        _fj.user_message = _budget_job_msg
                                     _fj.completed_at = datetime.utcnow()
                                     await _fdb.commit()
+                            if _budget_job_msg:
+                                # So a card still on screen says why, and
+                                # drops a retry the same gate would refuse.
+                                await broadcast_queue.put({
+                                    "type": "job_update",
+                                    "job_id": _chat_task_job_id,
+                                    "name": _chat_task_name,
+                                    "job_type": _CHAT_TASK_JOB_TYPE,
+                                    "status": "failed",
+                                    "user_message": _budget_job_msg,
+                                    "error_class": _BUDGET_ERROR_CLASS,
+                                })
                         except Exception:
                             pass
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
@@ -6910,7 +7004,11 @@ async def ws_chat(
                             await notify(
                                 event_kind="mission_failed",
                                 title="Couldn't finish your answer",
-                                body="Something went wrong — open the app and ask again.",
+                                body=(
+                                    _budget_push_body(_budget_detail, _copy_tz)
+                                    if _budget_refused else
+                                    "Something went wrong — open the app and ask again."
+                                ),
                                 data=_fail_data,
                                 priority="high",
                                 dedup_key=f"{_turn_mission_id}:failed",
@@ -6943,7 +7041,10 @@ async def ws_chat(
                     # Convert it to the same structured frame the typed path
                     # sends, rebuilt from the live credit state; only when the
                     # reporter cannot confirm exhaustion does it stay an error.
-                    user_msg = _friendly_error(e)
+                    # `_copy_tz` is set only for a monthly-budget refusal; the
+                    # bare call is kept as the literal that
+                    # test_ws_chat_credit_boundary anchors its window on.
+                    user_msg = _friendly_error(e) if _copy_tz is None else _friendly_error(e, _copy_tz)
                     _credit_frame = None
                     try:
                         if isinstance(e, OutOfCreditsError):
@@ -6983,7 +7084,12 @@ async def ws_chat(
                     if _credit_frame is not None:
                         await _safe_send(_credit_frame)
                     else:
-                        await _safe_send({"type": "error", "message": user_msg})
+                        _err_frame = {"type": "error", "message": user_msg}
+                        if _budget_refused:
+                            # A plain error frame, never credit_exhausted:
+                            # code, retryable false, resets_at (UTC or null).
+                            _err_frame.update(_budget_frame_fields(_budget_detail))
+                        await _safe_send(_err_frame)
                 finally:
                     # However this turn ended — answer, error, user stop,
                     # cancellation — it is no longer in flight. Retire the

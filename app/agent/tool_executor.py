@@ -2023,7 +2023,10 @@ class ToolExecutor:
     # On-demand reading of originals uploaded to an ordinary chat turn.
     # ------------------------------------------------------------------
     async def _tool_analyze_attachment(self, inp: Dict[str, Any]) -> str:
-        from app.agent.attachment_analysis import _wants_unit_details, public_state, start_analysis
+        from app.agent.attachment_analysis import (
+            _wants_unit_details, blocked_guidance, public_state, start_analysis,
+        )
+        from app.agent.attachment_limits import MAX_BYTES_PER_DOCUMENT, format_limit_bytes
         from app.api.chat_attachments import load_attachment_record
 
         uid = self._current_user_id
@@ -2054,7 +2057,9 @@ class ToolExecutor:
                 "empty_document": "The document contains no readable text.",
                 "invalid_pdf": "The stored original is not a valid PDF.",
                 "unreadable_pdf": "The PDF could not be opened or may be password-protected.",
-                "file_too_large": "The stored file exceeds the 25 MiB analysis limit.",
+                "file_too_large": (
+                    f"The stored file exceeds the {format_limit_bytes(MAX_BYTES_PER_DOCUMENT)} "
+                    "analysis limit."),
                 "invalid_page_range": "A focused PDF request must name 1–20 valid consecutive pages.",
                 "page_range_requires_pdf": "Page ranges are available only for PDFs.",
             }
@@ -2062,7 +2067,9 @@ class ToolExecutor:
         except (FileNotFoundError, OSError):
             return "ERROR: The original upload is missing. Ask the user to attach it again."
         result = public_state(state)
-        result["guidance"] = (
+        # A job stopped by the monthly model budget is not a stored result:
+        # say what was not read instead of pointing at numbered details.
+        result["guidance"] = blocked_guidance(state) or (
             "Analysis is running in the background. Tell the user it is processing and "
             "that the result will appear in this chat. Never claim to have read unfinished units."
             if state["status"] in ("queued", "running") else
@@ -2071,7 +2078,9 @@ class ToolExecutor:
         return json.dumps(result, ensure_ascii=False)
 
     async def _tool_read_attachment_analysis(self, inp: Dict[str, Any]) -> str:
-        from app.agent.attachment_analysis import ensure_running, load_state_async, public_state
+        from app.agent.attachment_analysis import (
+            blocked_guidance, ensure_running, load_state_async, public_state,
+        )
         from app.api.chat_attachments import load_attachment_record
 
         uid = self._current_user_id
@@ -2092,7 +2101,11 @@ class ToolExecutor:
             limit = min(10, max(1, int(inp.get("limit", 5))))
         except (TypeError, ValueError):
             return "ERROR: start and limit must be integers."
-        return json.dumps(public_state(state, include_units=True, start=start, limit=limit), ensure_ascii=False)
+        result = public_state(state, include_units=True, start=start, limit=limit)
+        guidance = blocked_guidance(state)
+        if guidance:
+            result["guidance"] = guidance
+        return json.dumps(result, ensure_ascii=False)
 
     # ------------------------------------------------------------------
     # 5. memory_search — file bodies + the document/media leg (v3 §3.2/§3.4)
@@ -4014,6 +4027,24 @@ class ToolExecutor:
             "content_policy", "content policy", "image_generation_user_error",
         ))
 
+    def _image_budget_refusal(self, exc: Exception) -> Optional[str]:
+        """The tool result when the platform's monthly AI budget refused the
+        image call, else None. The job sentence (reset date in the user's
+        zone) replaces the raw 429 text, which carries the proxy's typed
+        detail into model context; the same budget gates the fallback model,
+        so there is nothing to retry."""
+        from app.services import budget_refusal
+
+        if not budget_refusal.is_budget_refusal(exc):
+            return None
+        tz_name = None
+        if self._current_user_id:
+            from app.agent._user_tz_cache import get_cached_user_tz
+            tz_name = get_cached_user_tz(self._current_user_id)
+        logger.info("image tool: model budget refusal from the proxy")
+        return "ERROR: " + budget_refusal.job_sentence(
+            budget_refusal.budget_refusal_detail(exc), tz_name)
+
     @staticmethod
     def _kie_poll_is_transient(response) -> bool:
         """Is this poll response a lost question, or a verdict on the render?
@@ -4546,13 +4577,17 @@ class ToolExecutor:
                     "retrying, and offer a genuinely different subject."
                 )
             logger.warning("generate_image: %s failed (%s)", primary, primary_exc)
+            _budget = self._image_budget_refusal(primary_exc)
+            if _budget:
+                return _budget
             if fallback_usable:
                 try:
                     b64 = await self._openai_generate_image(client, fallback, prompt, size, quality)
                     used_model = fallback
                 except Exception as fb_exc:
                     logger.exception("generate_image fallback failed")
-                    return f"ERROR: Image generation failed: {str(fb_exc)[:300]}"
+                    return (self._image_budget_refusal(fb_exc)
+                            or f"ERROR: Image generation failed: {str(fb_exc)[:300]}")
             else:
                 return f"ERROR: Image generation failed: {str(primary_exc)[:300]}"
 
@@ -5141,13 +5176,17 @@ class ToolExecutor:
                     "style, cropping) still work."
                 )
             logger.warning("edit_image: %s failed (%s)", model, edit_exc)
+            _budget = self._image_budget_refusal(edit_exc)
+            if _budget:
+                return _budget
             if edit_fallback:
                 try:
                     b64 = await self._openai_edit_image(client, edit_fallback, image_file, edit_prompt, size, quality)
                     used_model = edit_fallback
                 except Exception as fb_exc:
                     logger.exception("edit_image fallback failed")
-                    return f"ERROR: Image edit failed: {str(fb_exc)[:300]}"
+                    return (self._image_budget_refusal(fb_exc)
+                            or f"ERROR: Image edit failed: {str(fb_exc)[:300]}")
             else:
                 return f"ERROR: Image edit failed: {str(edit_exc)[:300]}"
 

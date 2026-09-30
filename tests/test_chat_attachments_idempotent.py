@@ -361,8 +361,10 @@ async def test_the_ceiling_only_guards_this_route():
 
 @pytest.mark.asyncio
 async def test_a_body_with_no_declared_length_still_reaches_the_read_cap():
-    """Content-Length is the only thing available before a body byte is read.
-    A chunked body is not refused here — `_read_capped` bounds the part."""
+    """With no declared length there is nothing to refuse before the first
+    body byte: the request reaches the app, and the middleware's wrapped
+    `receive` counts the bytes as they arrive (driven end to end, through the
+    real route and parser, in test_attachment_upload_byte_limit.py)."""
     status, _ = await _drive(_scope("/api/chat/attachments", None))
     assert status == 200
 

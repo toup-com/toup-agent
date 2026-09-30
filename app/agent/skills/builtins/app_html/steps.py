@@ -243,6 +243,12 @@ _PHASE_USER_MESSAGE: Dict[str, str] = {
 #: route.
 _ERROR_CLASS = "tool_failure"
 
+#: job_status.ERR_MODEL_BUDGET — written onto a build row when the turn
+#: building it was refused by the monthly model budget. Transient from the
+#: row's point of view: a later rebuild of the same card (one card per app)
+#: must not keep saying the budget is used up.
+_STALE_ON_PROGRESS = (_ERROR_CLASS, "model_budget")
+
 
 def phase_label(step_type: str, status: str) -> str:
     """The ONE place a step's user-visible words are chosen."""
@@ -812,7 +818,7 @@ async def emit_step(
                     job.status = "running"
                     if hasattr(job, "completed_at"):
                         job.completed_at = None
-                if getattr(job, "error_class", None) == _ERROR_CLASS:
+                if getattr(job, "error_class", None) in _STALE_ON_PROGRESS:
                     job.error_class = None
                     job.user_message = None
 

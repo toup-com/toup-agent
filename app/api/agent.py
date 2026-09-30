@@ -847,7 +847,9 @@ async def resolve_job_for_pending_action(
     except Exception:  # callback acceleration must not block legacy resolvers
         voice_resolved = 0
 
-    resolved: list[tuple[str, str, str]] = []
+    from app.agent.job_reaper import wire_job_type
+
+    resolved: list[tuple[str, str, str, Optional[str]]] = []
     automation_run_ids: set[str] = set()
     async with async_session_maker() as db:
         rows = (await db.execute(
@@ -861,6 +863,8 @@ async def resolve_job_for_pending_action(
                 continue
             if cfg.get("pending_action_id") != body.action_id:
                 continue
+            # The kind for the frame below, read before anything writes the row.
+            kind = wire_job_type(job)
             if job.job_type == "automation_run":
                 # R29: an automation run's terminal rides the engine's
                 # exactly-once finalize gate (outcome vocabulary,
@@ -873,7 +877,7 @@ async def resolve_job_for_pending_action(
                 if await resolve_parked_run(
                     db, job, outcome=body.outcome, detail=body.detail,
                 ):
-                    resolved.append((job.id, job.title or "", job.user_id))
+                    resolved.append((job.id, job.title or "", job.user_id, kind))
                     automation_run_ids.add(job.id)
                 continue
             job.status = new_status
@@ -893,17 +897,17 @@ async def resolve_job_for_pending_action(
                 None if new_status == "completed"
                 else (body.detail or "This wasn't approved, so nothing was sent.")
             )
-            resolved.append((job.id, job.title or "", job.user_id))
+            resolved.append((job.id, job.title or "", job.user_id, kind))
         if resolved:
             await db.commit()
 
-    for job_id, title, user_id in resolved:
+    for job_id, title, user_id, kind in resolved:
         try:
             from app.api.ws_chat import broadcast_to_user
 
             await broadcast_to_user(user_id, {
                 "type": "job_update", "job_id": job_id,
-                "name": title, "status": new_status,
+                "name": title, "job_type": kind, "status": new_status,
             })
         except Exception:  # noqa: BLE001
             pass

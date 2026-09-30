@@ -126,6 +126,10 @@ _REASON_ERROR_CLASS: Dict[str, str] = {
     "watchdog": "turn_interrupted",
     "reaper": "turn_interrupted",
     "manual": "turn_interrupted",
+    # The turn building the app was refused by the proxy's monthly model
+    # budget. Its own class, so no client offers a "Try again" the same
+    # gate would refuse; the caller passes the dated sentence.
+    "model_budget": "model_budget",
 }
 
 _STOPPED_MESSAGE = (
@@ -150,6 +154,10 @@ class SettledBuild:
     total: int = 0
     percent: int = 0
     steps: List[Dict[str, Any]] = field(default_factory=list)
+    #: What the row now says to the user and why (None on a clean close).
+    #: Carried so the frame and the push tell the same story as the row.
+    user_message: Optional[str] = None
+    error_class: Optional[str] = None
 
 
 def _phase_label(step_type: str, status: str) -> str:
@@ -203,6 +211,7 @@ async def settle_build(
     now: Optional[datetime] = None,
     reason: str = "watchdog",
     announce: bool = True,
+    user_message: Optional[str] = None,
 ) -> Optional[SettledBuild]:
     """Terminalise one app build. The ONE abnormal close for the build lane.
 
@@ -211,6 +220,10 @@ async def settle_build(
     piggy-backed on the caller's transaction would be silently discarded.
     The guarded ``WHERE status IN (queued, running)`` re-checks at write
     time, so a publish racing this settle wins.
+
+    ``user_message`` is the caller's own account of why the build stopped
+    (the monthly-budget sentence). It wins over a phase message already on
+    the row, which in turn wins over the generic stopped/broken copy.
 
     Returns None when the row was not ours to settle — already terminal,
     paused, missing, not an app build, or another sweep got there first.
@@ -283,7 +296,8 @@ async def settle_build(
                 values["error_class"] = None
             if final == "failed":
                 values["user_message"] = (
-                    getattr(job, "user_message", None)
+                    user_message
+                    or getattr(job, "user_message", None)
                     or (_BROKEN_MESSAGE if published else _STOPPED_MESSAGE)
                 )
                 values["error_class"] = _REASON_ERROR_CLASS.get(
@@ -318,6 +332,8 @@ async def settle_build(
                 chat_id=getattr(job, "conversation_id", None),
                 published=published, done=done, total=total, percent=percent,
                 steps=public_steps(steps),
+                user_message=values.get("user_message"),
+                error_class=values.get("error_class"),
             )
     except Exception:  # noqa: BLE001 - a failed settle leaves the reaper's net
         logger.warning("[build_watchdog] settle failed for %s", job_id[:8],
@@ -404,6 +420,10 @@ async def announce_settled(settled: SettledBuild) -> None:
             "steps": settled.steps,
             "app_id": settled.app_id,
             "chat_id": settled.chat_id,
+            # The row's own words, so a live card can say what a reloaded
+            # one would (both are None on a clean close).
+            "user_message": settled.user_message,
+            "error_class": settled.error_class,
         })
     except Exception:  # noqa: BLE001 - the DB row is already honest
         logger.debug("[build_watchdog] terminal broadcast failed", exc_info=True)
@@ -445,6 +465,10 @@ async def announce_settled(settled: SettledBuild) -> None:
                   else "mission_failed"),
             title=settled.title or "Your app",
             body=(f"{settled.title} is ready to open." if settled.status == "completed"
+                  # "Ask me to pick it up again" is false while the monthly
+                  # budget is spent: the row's sentence names the reset.
+                  else settled.user_message
+                  if settled.error_class == "model_budget" and settled.user_message
                   else "This build stopped before it finished. Ask me to pick "
                        "it up again."),
             progress=settled.percent,

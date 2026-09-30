@@ -1126,7 +1126,12 @@ class Settings(BaseSettings):
     # has a platform half (llm_proxy honouring `system.cache_warm`) that must
     # be deployed and observed BEFORE any agent starts sending warms, or every
     # warm is a real ~10-credit charge to a user who asked for nothing. Enable
-    # only when all three hold: (1) the platform build with
+    # only when all four hold: (0) llm_proxy_system_operation_exemption is ON
+    # in the platform — and that switch may only be turned on AFTER an
+    # attested platform-side warm path ships (today the proxy trusts the
+    # request's shape, pinned as it is; it cannot tell the agent's warm from
+    # an agent-token holder's). It is OFF by default since 2026-09-30, so a
+    # warm sent today is a real charge. (1) the platform build with
     # `_system_operation_for` is live everywhere, (2) llm_cache_warm_max_per_day
     # is in place, (3) one canary tenant has been watched for a day and its
     # llm_proxy_events rows for the warm carry operation_type='system.cache_warm'
@@ -3141,6 +3146,49 @@ class Settings(BaseSettings):
     bundle_anthropic_budget_cents: int = 3000           # $30/month Anthropic allocation
     bundle_openai_budget_cents: int = 1000              # $10/month OpenAI allocation
     bundle_anthropic_daily_cap_cents: int = 100          # $1/day Anthropic soft cap (triggers fallback)
+    # The budgets above are MONTHLY, but until 2026-09-29 the proxy summed
+    # spend since bundle_started_at whenever no Stripe period was stamped —
+    # most bundle tenants, because free-tier and Apple activations never set
+    # bundle_period_start/end — so "$10/month" was a lifetime cap. In the
+    # 2026-09-29 document-analysis incident a paying subscriber was refused
+    # on every OpenAI call once their lifetime spend crossed the cap.
+    # True: llm_proxy.budget_period_bounds' rolling monthly window, anchored
+    # on the Stripe period start or the activation and recomputed from that
+    # anchor every month. False restores the lifetime caps. Read from the
+    # environment at process start: both platform-api replicas need a
+    # restart to flip it.
+    bundle_budget_rolling_month: bool = True
+    # 2026-09-30 pre-merge audit: the `X-Toup-Operation-Type: system.cache_warm`
+    # header exempts a proxy call from the credit charge AND the monthly spend
+    # window on the strength of a request SHAPE alone — and any holder of an
+    # agent token can send that header. Hidden provider-side context
+    # (previous_response_id, conversation, stored prompts) or large
+    # instructions/tools made "a free warm" an unmetered call. Until an
+    # attested platform-side path exists, the exemption is OFF: a warm is
+    # served but billed and counted as ordinary traffic (the agent's own warm
+    # producer, llm_cache_warm_on_connect, is off by default too, so nothing
+    # live changes). Turning this on re-enables the bounded, allow-listed
+    # warm shape in llm_proxy._system_operation_for (exact field/value
+    # pins, known warm model, byte cap, fleet-wide 12/day from the rows,
+    # and a usage-side re-check after the call) — still shape trust, so it
+    # stays off until the warm path is attested.
+    llm_proxy_system_operation_exemption: bool = False
+    # Option A chosen by the owner on 2026-09-30: on TEXT model calls (chat,
+    # responses, embeddings — what chat, memory and document analysis make)
+    # an Unlimited-entitled tenant (credit_balances.plan_id == 'unlimited')
+    # is NOT refused by the proxy's monthly OpenAI/Anthropic allocation
+    # above. Reaching 1x, 2x and 5x of the allocation in a window logs
+    # `[budget] unlimited over allocation` and sends an infra alert instead
+    # (docs/billing/UNLIMITED_ENTITLEMENT_DESIGN.md: log -> alert -> pace,
+    # refusal off). OpenAI image generation/edits are NOT covered: an
+    # Unlimited tenant keeps the monthly stop there whatever this says.
+    # True restores the typed monthly refusal for Unlimited tenants on text
+    # calls exactly as for every other plan. Env
+    # UNLIMITED_PROXY_BUDGET_REFUSAL_ENABLED, read at process start (restart
+    # both platform-api replicas to flip). Admins stay exempt either way; the
+    # Anthropic daily soft cap (a routing cap that falls back to OpenAI)
+    # applies either way.
+    unlimited_proxy_budget_refusal_enabled: bool = False
     # G-20: per-tenant request cap on the LLM proxy (sliding 60s window,
     # ALL endpoints share one budget — chat, responses and embeddings).
     #

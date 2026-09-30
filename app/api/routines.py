@@ -555,6 +555,15 @@ class RoutineRecentJob(BaseModel):
     completed_at: Optional[datetime] = None
 
 
+def _served_last_error(raw: Optional[str]) -> Optional[str]:
+    """``Routine.last_error`` as served: a stop by the monthly model budget
+    reads as its sentence, never the proxy's raw 429; anything else as
+    stored."""
+    from app.agent.job_status import served_model_budget_text
+
+    return served_model_budget_text(raw) or raw
+
+
 def _run_to_response(j) -> RoutineRunResponse:
     """Project a ``build_jobs`` row into the legacy ``RoutineRunResponse``
     shape so the runs-history endpoints can serve from BuildJob without
@@ -600,6 +609,18 @@ def _run_to_response(j) -> RoutineRunResponse:
     err_detail: Optional[str] = (
         err_json.get("error_detail") if isinstance(err_json, dict) else None
     ) or j.error_message
+    # A run stopped by the agent's monthly model budget stores the proxy's
+    # raw 429 (period timestamps, provider detail) — the dashboard renders
+    # error_detail verbatim, so serve the taxonomy's sentence instead. Rows
+    # written by agent images that predate the incident fix (2026-09-29)
+    # carry exactly that raw text; newer rows hold our dated sentence, which
+    # is served as is. The stored row is untouched.
+    if err_detail:
+        from app.agent.job_status import ERR_MODEL_BUDGET, served_model_budget_text
+
+        _served = served_model_budget_text(err_detail)
+        if _served:
+            err_class, err_detail = ERR_MODEL_BUDGET, _served
 
     return RoutineRunResponse(
         id=j.id,
@@ -686,7 +707,7 @@ def _row_to_response(routine, recent_runs=(), recent_jobs=()) -> RoutineResponse
         last_run_at=routine.last_run_at,
         next_run_at=routine.next_run_at,
         last_status=routine.last_status,
-        last_error=routine.last_error,
+        last_error=_served_last_error(routine.last_error),
         created_at=routine.created_at,
         updated_at=routine.updated_at,
         recent_runs=[_run_to_response(r) for r in recent_runs],

@@ -425,15 +425,17 @@ async def agent_deduct(
     if cfg is None:
         raise HTTPException(403, "agent key mismatch")
 
-    # System ops aren't charged to the user. Match the proxy hook's
-    # rule: "system.*" → platform overhead, exempt.
+    # `operation_type` is recorded (ledger metadata) but grants NOTHING.
+    # Until 2026-09-30 a body whose operation_type started with "system."
+    # returned `system_op_exempt` here, before the bundle/manual guard —
+    # a client-controlled exemption: any X-Agent-Key holder could label a
+    # report "system.*" and have it not charged. The platform's own system
+    # calls never reach this endpoint (openai_agent_service skips the
+    # deduct report for a system operation), so the only reports that
+    # ever wore the label were ones nobody should trust. The proxy's
+    # exemption is separately switched off by default
+    # (llm_proxy_system_operation_exemption).
     op = body.operation_type or "user"
-    if op.startswith("system."):
-        return AgentDeductResponse(
-            success=True, bucket=_BUCKET_MESSAGE, amount_charged=0.0,
-            balance_after=0.0, enforcement_enabled=False,
-            reason="system_op_exempt",
-        )
 
     # Bundle-mode guard — DO NOT double-charge.
     #

@@ -48,6 +48,24 @@ _BOOT_DELAY_S = 120
 PARKED_ON_CARD_STALE_AFTER = timedelta(hours=25)
 
 
+def wire_job_type(job) -> Optional[str]:
+    """The ``job_type`` a ``job_update`` frame carries for this row.
+
+    The ``create_job`` icon tag (``config_json["job_type"]``) when the row has
+    one — what the create_job/update_job frames and the history cards send —
+    else the row's ``job_type`` column (``agent_task``, ``subagent``, …). A
+    frame that names a job but not its kind can START a card on a tab that
+    has none yet, and the web draws a kind-less card as an app build: a
+    stopped task read "Couldn't build …". Never raises.
+    """
+    try:
+        cfg = getattr(job, "config_json", None)
+        tag = cfg.get("job_type") if isinstance(cfg, dict) else None
+        return tag or getattr(job, "job_type", None) or None
+    except Exception:  # noqa: BLE001 — a frame key must never cost the close
+        return None
+
+
 async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
     """Fail every stalled job; returns how many were reaped."""
     from app.db.database import async_session_maker
@@ -93,7 +111,7 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
             ).all()
         ) if jobs else {}
 
-        reaped: list[tuple[str, str, str]] = []
+        reaped: list[tuple[str, str, str, Optional[str]]] = []
         builds: list[str] = []
         for job in jobs:
             # Explicit leases and fencing own this lane. The generic age-based
@@ -133,7 +151,8 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
                 "reaped so progress surfaces stay honest."
             )
             job.completed_at = now
-            reaped.append((job.id, job.title or "", job.user_id))
+            # The kind is read here, before the commit expires the row.
+            reaped.append((job.id, job.title or "", job.user_id, wire_job_type(job)))
         if reaped:
             await db.commit()
 
@@ -147,7 +166,7 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
         except Exception:  # noqa: BLE001 — one bad row never stops the sweep
             logger.exception("[job_reaper] build settle failed for %s", job_id)
 
-    for job_id, title, user_id in reaped:
+    for job_id, title, user_id, job_type in reaped:
         logger.warning(
             "[job_reaper] failed stalled job %s (%s)", job_id[:8], title[:60]
         )
@@ -160,6 +179,7 @@ async def sweep_stalled_jobs(now: Optional[datetime] = None) -> int:
                 "type": "job_update",
                 "job_id": job_id,
                 "name": title,
+                "job_type": job_type,
                 "status": STATUS_CANCELLED,
             })
         except Exception:  # noqa: BLE001 — reaping must never crash
@@ -236,7 +256,7 @@ async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:
         )).scalars().all())
         if not rows:
             return 0
-        closed: list[tuple[str, str, str]] = []
+        closed: list[tuple[str, str, str, Optional[str]]] = []
         for job in rows:
             job.status = STATUS_CANCELLED
             job.completed_at = now
@@ -248,10 +268,10 @@ async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:
                 "Parked on a confirmation card for longer than "
                 f"{int(PARKED_ON_CARD_STALE_AFTER.total_seconds() // 3600)}h."
             )
-            closed.append((job.id, job.title or "", job.user_id))
+            closed.append((job.id, job.title or "", job.user_id, wire_job_type(job)))
         await db.commit()
 
-    for job_id, title, user_id in closed:
+    for job_id, title, user_id, job_type in closed:
         logger.info(
             "[job_reaper] closed expired card-park %s (%s)", job_id[:8], title[:60]
         )
@@ -260,7 +280,7 @@ async def sweep_expired_card_parks(now: Optional[datetime] = None) -> int:
 
             await broadcast_to_user(user_id, {
                 "type": "job_update", "job_id": job_id,
-                "name": title, "status": STATUS_CANCELLED,
+                "name": title, "job_type": job_type, "status": STATUS_CANCELLED,
             })
         except Exception:  # noqa: BLE001
             pass

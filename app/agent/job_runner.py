@@ -275,13 +275,40 @@ class JobRunner:
                 "[job_runner] handler_crash job_id=%s job_type=%s err=%s",
                 job.id, job.job_type, e,
             )
-            await self._mark_failed(job.id, repr(e)[:1000])
+            # The proxy's monthly model budget has its own story: the
+            # user-facing sentence names the reset date in the user's zone,
+            # and the class tells both clients not to offer a retry that
+            # the same gate would refuse. `error_message` keeps the raw
+            # text for operators.
+            verdict = None
+            try:
+                from app.agent.job_status import model_budget_verdict, user_tz_name
+                from app.services.budget_refusal import is_budget_refusal
+                if is_budget_refusal(e):
+                    verdict = model_budget_verdict(
+                        e, await user_tz_name(spec.user_id or job.user_id),
+                    )
+            except Exception:  # noqa: BLE001 — copy must never cost the close
+                logger.debug("[job_runner] budget verdict skipped", exc_info=True)
+            await self._mark_failed(
+                job.id, repr(e)[:1000],
+                user_message=verdict.user_message if verdict else None,
+                error_class=verdict.error_class if verdict else None,
+            )
             raise
 
-    async def _mark_failed(self, job_id: str, error_message: str) -> None:
+    async def _mark_failed(
+        self, job_id: str, error_message: str, *,
+        user_message: Optional[str] = None,
+        error_class: Optional[str] = None,
+    ) -> None:
         """Race-safe terminal failure write — preserves an existing
         terminal status set by the handler before raising (e.g.
-        skipped_filter, skipped_rate_limit)."""
+        skipped_filter, skipped_rate_limit).
+
+        ``user_message`` / ``error_class``, when the caller knows why the
+        job failed, win over the generic "interrupted" story and become the
+        push body — never the raw ``error_message``."""
         from app.db.models import BuildJob
 
         async with self._session_maker() as db:
@@ -303,9 +330,9 @@ class JobRunner:
                     from app.agent.automations.executor import _finalize_job
                     await _finalize_job(
                         db, job_id, status="failed", outcome="lost",
-                        error_class="interrupted",
-                        user_message="This run stopped before it "
-                                     "finished.",
+                        error_class=error_class or "interrupted",
+                        user_message=user_message or "This run stopped "
+                                                     "before it finished.",
                     )
                     return
                 except Exception as e:  # noqa: BLE001 — never lose the terminal
@@ -317,9 +344,10 @@ class JobRunner:
             fresh.error_message = error_message
             # Even the fallback leaves a story: a failure the user can
             # see must say something true about itself.
-            fresh.error_class = fresh.error_class or "interrupted"
+            fresh.error_class = error_class or fresh.error_class or "interrupted"
             fresh.user_message = (
-                fresh.user_message
+                user_message
+                or fresh.user_message
                 or "This run stopped before it finished."
             )
             fresh.completed_at = datetime.utcnow()
@@ -339,7 +367,7 @@ class JobRunner:
             await notify(
                 event_kind="mission_failed",
                 title=f"⚠️ {label} failed"[:200],
-                body=(error_message or "")[:300] or None,
+                body=(user_message or error_message or "")[:300] or None,
                 data={
                     "route": "mission-control",
                     "mission_id": job_id,

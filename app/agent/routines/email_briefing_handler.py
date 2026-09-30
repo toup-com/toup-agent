@@ -350,6 +350,7 @@ class EmailBriefingHandler:
         # emails ARE the latest, not the "new."
         system_prompt = SYSTEM_PROMPT_LATEST_N if mode == "latest_n" else SYSTEM_PROMPT
 
+        failure: dict = {}
         summary_text = await llm(
             user_id=routine.user_id,
             operation_type=_OPERATION_TYPE,
@@ -358,8 +359,30 @@ class EmailBriefingHandler:
             system=system_prompt,
             messages=[{"role": "user", "content": prompt_body}],
             timeout=60,
+            failure_out=failure,
         )
         if not summary_text:
+            from app.services.budget_refusal import ERROR_CLASS, job_sentence
+
+            if failure.get("reason") == ERROR_CLASS:
+                # The platform proxy refused on the monthly model budget.
+                # `error_detail` reaches the Routines dashboard and the job
+                # row verbatim, so it is the job sentence (reset date in the
+                # user's zone, undated when the refusal named none) — never
+                # "timeout". `error_class` is the taxonomy class, which the
+                # runner's retry gate reads as terminal: a retry would walk
+                # back into the same gate before the reset.
+                from app.agent.job_status import user_tz_name
+
+                period_end = failure.get("period_end")
+                return RoutineResult(
+                    status="failed",
+                    error_class=ERROR_CLASS,
+                    error_detail=job_sentence(
+                        {"period_end": period_end} if period_end else None,
+                        await user_tz_name(routine.user_id),
+                    ),
+                )
             return RoutineResult(
                 status="failed",
                 error_class="llm_returned_none",

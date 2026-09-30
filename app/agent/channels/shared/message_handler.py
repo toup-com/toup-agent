@@ -34,7 +34,8 @@ Design notes
   does not touch the reply text.
 * **Error surfaces.** Any exception during the agent run is logged
   with full traceback but the user sees a generic apology — no Python
-  internals are leaked.
+  internals are leaked. The one exception is the monthly model budget
+  refusal, which gets the chat's own budget sentence (`_run_failure_text`).
 * **Phone-number redaction.** WhatsApp `chat_id`s are E.164 phone
   numbers; logs only ever contain a redacted form.
 
@@ -76,6 +77,11 @@ from app.agent.channels.base import (
     InboundMessage,
     MessageCallback,
 )
+from app.services.budget_refusal import (
+    budget_refusal_detail,
+    chat_sentence as budget_chat_sentence,
+    is_budget_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +91,27 @@ logger = logging.getLogger(__name__)
 _GENERIC_ERROR_TEXT = (
     "⚠️ Sorry, something went wrong on my side. Please try again in a moment."
 )
+
+
+def _run_failure_text(exc: BaseException, user_id: Optional[str]) -> str:
+    """What the chat is told when the agent run raised.
+
+    The generic apology, except for the platform proxy's monthly model
+    budget refusal: "try again in a moment" is false until the budget
+    resets, so the channel gets the same sentence the app's chat bubble
+    shows, dated in the user's zone (the runner's per-turn cache; UTC when
+    it is cold). Built from the typed detail, never from the exception
+    text. Never raises — the apology is the floor.
+    """
+    try:
+        if is_budget_refusal(exc):
+            from app.agent._user_tz_cache import get_cached_user_tz
+
+            tz_name = get_cached_user_tz(user_id) if user_id else None
+            return budget_chat_sentence(budget_refusal_detail(exc), tz_name)
+    except Exception:  # noqa: BLE001 — copy must never cost the reply
+        logger.debug("channel.budget_copy_failed", exc_info=True)
+    return _GENERIC_ERROR_TEXT
 
 
 def _signal(name: str) -> None:
@@ -560,14 +587,14 @@ def make_channel_handler(
                     chat_label,
                 )
                 raise
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "channel.run_failed channel=%s chat=%s",
                     channel_type.value,
                     chat_label,
                 )
                 try:
-                    await channel.send_text(chat_id, _GENERIC_ERROR_TEXT)
+                    await channel.send_text(chat_id, _run_failure_text(exc, user_id))
                 except Exception:
                     logger.exception(
                         "channel.error_send_failed channel=%s chat=%s",

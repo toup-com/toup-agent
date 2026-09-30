@@ -195,3 +195,160 @@ def test_the_legacy_in_frame_cap_is_smaller_than_the_upload_caps():
     in-frame one must stay the tighter of the two."""
     assert L.LEGACY_MAX_FRAME_MEDIA_BYTES < L.MAX_BYTES_PER_IMAGE
     assert L.LEGACY_MAX_FRAME_MEDIA_BYTES < L.MAX_BYTES_PER_DOCUMENT
+
+
+# ── The number a refusal states (incident 2026-09-28) ─────────────────────
+#
+# The 413 detail said "That file is larger than this chat accepts." — no number,
+# no way to act on it — and both clients' sentences carry the limit through
+# their own `formatBytes`. The server now states the same number the clients
+# do, formatted the same way, so the three can never disagree about "25 MB".
+
+
+@pytest.mark.parametrize(
+    "n,shown",
+    [
+        (25 * 1024 * 1024, "25 MB"),
+        (15 * 1024 * 1024, "15 MB"),
+        (60 * 1024 * 1024, "60 MB"),
+        (6 * 1024 * 1024, "6 MB"),
+        (50 * 1024 * 1024, "50 MB"),
+        (int(9.5 * 1024 * 1024), "9.5 MB"),
+        (1024 * 1024, "1 MB"),
+        (1536, "2 KB"),
+        (1, "1 KB"),
+        (1023 * 1024, "1023 KB"),
+        # JavaScript's Math.round rounds half UP; Python's round() would give
+        # "10 MB" and "2.2 MB" here and drift from the clients.
+        (int(10.5 * 1024 * 1024), "11 MB"),
+        (int(2.25 * 1024 * 1024), "2.3 MB"),
+        (0, "0 MB"),
+        (-5, "0 MB"),
+        (float("nan"), "0 MB"),
+        (float("inf"), "0 MB"),
+        (None, "0 MB"),
+    ],
+)
+def test_format_limit_bytes_is_the_clients_formatBytes(n, shown):
+    assert L.format_limit_bytes(n) == shown
+
+
+def test_the_too_large_detail_states_the_limit_of_its_kind():
+    assert L.too_large_detail(L.KIND_IMAGE) == (
+        "That image is too large — 15 MB is the most one image can be.")
+    document = "That file is too large — 25 MB is the most one file can be."
+    assert L.too_large_detail(L.KIND_DOCUMENT) == document
+    assert L.too_large_detail(None) == document
+
+
+class _Upload:
+    """An `UploadFile` stand-in that yields `total` zero bytes."""
+
+    def __init__(self, total, filename, content_type):
+        self.filename = filename
+        self.content_type = content_type
+        self._left = total
+
+    async def read(self, n):
+        take = max(0, min(n, self._left))
+        self._left -= take
+        return b"\0" * take
+
+
+class _User:
+    id = "user-limits-413"
+
+
+async def _refusal_for(monkeypatch, upload):
+    from fastapi import HTTPException
+
+    from app.api import chat_attachments as CA
+
+    async def _must_not_run(*a, **kw):
+        raise AssertionError("ingest ran on a refused upload")
+
+    monkeypatch.setattr(CA, "ingest_and_store", _must_not_run)
+    with pytest.raises(HTTPException) as exc:
+        await CA.upload_chat_attachment(
+            file=upload, sha256=None, client_attachment_id=None,
+            current_user=_User(), db=None,
+        )
+    return exc.value
+
+
+@pytest.mark.asyncio
+async def test_an_image_over_its_cap_is_told_the_image_number(monkeypatch):
+    """`check_one` answers kind=None on the too-large path (pinned above), so
+    the route must look the kind up again or an image is told 25 MB."""
+    err = await _refusal_for(monkeypatch, _Upload(
+        L.MAX_BYTES_PER_IMAGE + 1, "photo.png", "image/png"))
+    assert err.status_code == 413
+    assert err.headers.get("X-Toup-Reason") == L.REASON_TOO_LARGE
+    assert err.detail == L.too_large_detail(L.KIND_IMAGE)
+    assert "15 MB" in err.detail
+
+
+@pytest.mark.asyncio
+async def test_a_part_over_the_read_ceiling_is_told_the_document_number(monkeypatch):
+    from app.api import chat_attachments as CA
+
+    err = await _refusal_for(monkeypatch, _Upload(
+        CA._ABSOLUTE_MAX + 1, "deck.pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"))
+    assert err.status_code == 413
+    assert err.headers.get("X-Toup-Reason") == L.REASON_TOO_LARGE
+    assert err.detail == L.too_large_detail(None)
+    assert "25 MB" in err.detail
+
+
+@pytest.mark.asyncio
+async def test_the_body_ceiling_states_the_number_too():
+    from app.api import chat_attachments as CA
+
+    sent = []
+
+    async def _send(msg):
+        sent.append(msg)
+
+    async def _inner(_scope, _receive, _send):  # pragma: no cover - must not run
+        raise AssertionError("an oversized body reached the app")
+
+    scope = {
+        "type": "http", "method": "POST", "path": "/api/chat/attachments",
+        "headers": [(b"content-length", str(CA.BODY_HARD_MAX + 1).encode())],
+    }
+    await CA.AttachmentBodyLimitMiddleware(_inner)(scope, None, _send)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    body = next(m for m in sent if m["type"] == "http.response.body")
+    assert start["status"] == 413
+    assert dict(start["headers"])[b"x-toup-reason"] == L.REASON_TOO_LARGE.encode()
+    assert json.loads(body["body"].decode("utf-8")) == {"detail": L.too_large_detail(None)}
+
+
+def test_the_webs_too_large_copy_says_what_to_do_and_keeps_the_kind():
+    """`frontend/` has no test runner. The refusal a user reads is composed on
+    the client from the reason code: it must state the limit, offer a remedy
+    that fits the file (saving a PDF as a PDF is not one), and — on the
+    server-413 path, where only the code comes back — keep the item's kind so
+    an image is not told the document number. The app pins the same table in
+    its `scripts/check-attachments.js`."""
+    limits = _read("frontend/src/modules/chat/attachmentLimits.ts")
+    assert "export function tooLargeRemedy(name: string)" in limits
+    remedy = limits[limits.index("export function tooLargeRemedy"):]
+    remedy = remedy[: remedy.index("\n}\n") + 3]
+    office = remedy[remedy.index("case 'pptx':"):remedy.index("case 'pdf':")]
+    assert "case 'docx':" in office
+    assert "saving it as a PDF" in office
+    pdf = remedy[remedy.index("case 'pdf':"):remedy.index("default:")]
+    assert "as a PDF" not in pdf
+    assert "Compress" not in remedy and "→" not in remedy, "no menu paths"
+    refusal = limits[limits.index("export function refusalText"):]
+    refusal = refusal[: refusal.index("\n}\n") + 3]
+    assert "tooLargeRemedy(name)" in refusal
+    assert "MAX_BYTES_PER_IMAGE" in refusal and "MAX_BYTES_PER_DOCUMENT" in refusal
+
+    atts = _read("frontend/src/modules/chat/attachments.ts")
+    failure = atts[atts.index("export function uploadFailureText"):]
+    assert re.search(r"uploadFailureText\(\s*name: string,\s*reason: string,\s*kind\?", failure)
+    page = _read("frontend/src/modules/chat/ChatPage.tsx")
+    assert "uploadFailureText(item.name, reason, item.kind)" in page

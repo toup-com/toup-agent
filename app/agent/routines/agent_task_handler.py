@@ -51,6 +51,32 @@ _DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+async def _model_budget_result(exc: BaseException, user_id: Optional[str]) -> Optional[RoutineResult]:
+    """The failed result for a run the platform proxy's monthly model budget
+    refused, or None for any other error.
+
+    `error_detail` reaches the Routines dashboard and the job row, which
+    render it verbatim, so it is the job sentence (reset date in the user's
+    zone) — never the raw 429, which carries the proxy's period timestamps.
+    The raw text stays in the log line above. `error_class` is the taxonomy
+    class, which the runner's retry gate reads as terminal: a retry goes
+    back through the same gate until the budget resets.
+    """
+    from app.services.budget_refusal import (
+        ERROR_CLASS, budget_refusal_detail, is_budget_refusal, job_sentence,
+    )
+
+    if not is_budget_refusal(exc):
+        return None
+    from app.agent.job_status import user_tz_name
+
+    return RoutineResult(
+        status="failed",
+        error_class=ERROR_CLASS,
+        error_detail=job_sentence(budget_refusal_detail(exc), await user_tz_name(user_id)),
+    )
+
+
 class AgentTaskHandler:
     """RoutineHandler for `kind="agent_task"`."""
 
@@ -150,6 +176,9 @@ class AgentTaskHandler:
                 "[agent_task] runner.run failed routine_id=%s err=%s",
                 routine.id, e,
             )
+            budget_stop = await _model_budget_result(e, routine.user_id)
+            if budget_stop is not None:
+                return budget_stop
             return RoutineResult(
                 status="failed",
                 error_class=type(e).__name__,

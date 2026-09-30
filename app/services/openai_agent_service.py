@@ -19,6 +19,7 @@ from typing import AsyncGenerator, Dict, Any, List, Optional
 from openai import AsyncOpenAI, RateLimitError, APIConnectionError, AuthenticationError
 
 from app.config import settings
+from app.services.budget_refusal import is_budget_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -583,6 +584,18 @@ class OpenAIAgentService:
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # F-12: has this attempt already handed output to the
+                # consumer? The retry wraps the whole `async for`, so a
+                # restart after partial output replays text the caller
+                # already has. See _abort_rather_than_replay.
+                #
+                # FIRST, before `create()`: a 429 or connection error
+                # raised by the request itself reaches the except arms
+                # below, which read this flag. Assigned after `create()`
+                # it was unbound there, so every request-time failure
+                # became `UnboundLocalError` instead of a retry — the
+                # "Something went wrong" of 2026-09-28.
+                emitted_any = False
                 stream = await self.client.chat.completions.create(**kwargs)
 
                 # Track tool calls being built across chunks
@@ -595,11 +608,6 @@ class OpenAIAgentService:
                 # metering_correctness_v2 is on (per-request billing
                 # dedupe key); harmless capture otherwise.
                 completion_id = ""
-                # F-12: has this attempt already handed output to the
-                # consumer? The retry wraps the whole `async for`, so a
-                # restart after partial output replays text the caller
-                # already has. See _abort_or_retry.
-                emitted_any = False
 
                 async for chunk in stream:
                     if not completion_id and getattr(chunk, "id", None):
@@ -779,6 +787,13 @@ class OpenAIAgentService:
                     continue
                 raise
             except RateLimitError as e:
+                # The platform proxy's monthly model budget is a 429 too,
+                # but it is TERMINAL: nothing changes until the budget
+                # window rolls, so a retry is one more guaranteed refusal
+                # and a sleep the user waits through. Raised unconverted —
+                # agent_runner and ws_chat read its typed detail.
+                if is_budget_refusal(e):
+                    raise
                 if _abort_rather_than_replay(emitted_any, e, attempt):
                     raise
                 if attempt < max_retries - 1:
@@ -1102,6 +1117,10 @@ class OpenAIAgentService:
         max_retries = 3
         for attempt in range(max_retries):
             try:
+                # F-12: see _abort_rather_than_replay. First, before
+                # `create()`, for the reason given on the chat wire: the
+                # except arms read it when the request itself fails.
+                emitted_any = False
                 # Capture the exact client used by this attempt. A worker may
                 # rebuild self.client after the caller's settings-based gate;
                 # checking one client and sending through another would leak
@@ -1137,8 +1156,6 @@ class OpenAIAgentService:
                 incomplete_reason = ""
                 completion_id = ""  # "resp_…" — metering key (v2) only
                 pending_reasoning: Optional[Dict[str, Any]] = None
-                # F-12: see _abort_rather_than_replay.
-                emitted_any = False
 
                 async for ev in stream:
                     ev_type = getattr(ev, "type", "")
@@ -1361,6 +1378,9 @@ class OpenAIAgentService:
                     continue
                 raise
             except RateLimitError as e:
+                # Terminal budget refusal — see the chat wire.
+                if is_budget_refusal(e):
+                    raise
                 if _abort_rather_than_replay(emitted_any, e, attempt):
                     raise
                 if attempt < max_retries - 1:

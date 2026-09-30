@@ -48,12 +48,17 @@ agent's own `report_llm_usage_bg` for a system operation, and the platform's
 `llm_proxy.proxy_responses` honours the `X-Toup-Operation-Type` header so the
 `llm_proxy_events` row is filed with `operation_type="system.cache_warm"` —
 which `_log_event`, `_get_spend` and `/cache/daily` all already exempt.
-Enable only when the platform build carrying `_system_operation_for` is
+Since 2026-09-30 the platform half is ALSO behind a switch that is off by
+default — `llm_proxy_system_operation_exemption` — because the header is
+client-supplied and the proxy cannot tell this module's warm from an
+agent-token holder's; until an attested warm path exists a warm is served
+but billed and counted like any request. Enable only when the platform
+switch is on, the platform build carrying `_system_operation_for` is
 deployed everywhere, the per-day cap is in place, and one canary tenant has
 been watched for a day with its warm rows carrying that operation_type and no
 matching `credit_ledger` entry. Sending a warm against a platform that
-predates the exemption is a real ~10-credit charge per warm to a user who
-asked for nothing.
+predates the exemption, or one with the switch off, is a real ~10-credit
+charge per warm to a user who asked for nothing.
 
 Cost, when it is on: one warm is the head at the uncached input rate —
 40,192 tokens x $2.50/1M on gpt-5.6-terra = $0.100, all of it Toup's. When it

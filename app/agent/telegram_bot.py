@@ -37,9 +37,11 @@ from telegram.ext import (
 )
 
 from app.agent.agent_runner import AgentRunner
+from app.agent.channels.shared.message_handler import _run_failure_text
 from app.agent.streaming import TelegramStreamHandler, extract_reaction, extract_buttons
 from app.agent.message_queue import MessageQueue
 from app.config import settings
+from app.services.budget_refusal import is_budget_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -1354,7 +1356,12 @@ class ToupTelegramBot:
 
         except Exception as e:
             logger.warning(f"Compact failed: {e}")
-            await update.message.reply_text(f"❌ Compaction failed: {str(e)[:200]}")
+            if is_budget_refusal(e):
+                # The proxy's monthly budget refusal carries its period
+                # timestamps and enum: the chat's budget sentence instead.
+                await update.message.reply_text(_run_failure_text(e, user_id))
+            else:
+                await update.message.reply_text(f"❌ Compaction failed: {str(e)[:200]}")
 
     async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /usage — show token usage and estimated cost."""
@@ -1631,7 +1638,10 @@ class ToupTelegramBot:
             )
         except Exception as e:
             logger.exception("Export failed")
-            await update.message.reply_text(f"❌ Export failed: {str(e)[:200]}")
+            if is_budget_refusal(e):
+                await update.message.reply_text(_run_failure_text(e, user_id))
+            else:
+                await update.message.reply_text(f"❌ Export failed: {str(e)[:200]}")
 
     async def _cmd_subagents(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /subagents — list background tasks."""
@@ -1792,7 +1802,10 @@ class ToupTelegramBot:
         except Exception as e:
             logger.exception(f"Callback query error")
             handler._stop_typing()
-            await handler.finalize(f"❌ Error: {str(e)[:200]}")
+            # Never the exception text: a budget refusal's is the proxy's raw
+            # 429 (enum, provider, period timestamps). Same copy as the other
+            # channels — the budget sentence, else the generic apology.
+            await handler.finalize(_run_failure_text(e, user_id))
         finally:
             self._cancel_flags.pop(chat_id, None)
 
@@ -2214,7 +2227,12 @@ class ToupTelegramBot:
         except Exception as e:
             logger.exception(f"Agent error for Telegram user {tg_user_id}")
             handler._stop_typing()
-            error_text = f"❌ Sorry, something went wrong:\n`{str(e)[:200]}`"
+            # The bot bypasses `make_channel_handler`, so it takes that
+            # handler's failure copy explicitly: the chat's budget sentence
+            # (dated in the user's zone) for the proxy's monthly budget
+            # refusal, the generic apology for anything else. The exception
+            # text is in the log line above, never in the chat.
+            error_text = _run_failure_text(e, user_id)
             await handler.finalize(error_text)
             # Remove ACK
             try:

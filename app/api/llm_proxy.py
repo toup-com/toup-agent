@@ -12,8 +12,11 @@ to providers directly.
 """
 
 import asyncio
+import json
+from collections import deque
 import hashlib
 import logging
+import math
 import os
 import re
 import secrets
@@ -21,9 +24,10 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Deque, Dict, NamedTuple, Optional
 
 import httpx
+from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -33,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.admin.deps import require_admin
 from app.config import settings
 from app.db import get_db, AgentConfig, LLMProxyEvent
+from app.services import budget_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +62,13 @@ def _get_cached_spend(key: str) -> Optional[Decimal]:
 
 
 def _set_cached_spend(key: str, cents: Decimal):
-    _budget_cache[key] = (time.time() + _CACHE_TTL, cents)
+    now = time.time()
+    # Keys carry their window start (see _get_spend), so every window roll and
+    # every UTC day mints a new key and the old one is never read again. Drop
+    # expired entries here or they accumulate for the life of the process.
+    for stale in [k for k, (expiry, _) in _budget_cache.items() if expiry <= now]:
+        _budget_cache.pop(stale, None)
+    _budget_cache[key] = (now + _CACHE_TTL, cents)
 
 
 def _invalidate_cache(user_id: str):
@@ -197,7 +208,7 @@ async def _auth_agent(request: Request, db: AsyncSession) -> AgentConfig:
     return config
 
 
-# ── Budget checks ────────────────────────────────────────────────────
+# ── Budget spend ─────────────────────────────────────────────────────
 
 
 async def _get_spend(
@@ -213,7 +224,11 @@ async def _get_spend(
     platform-side operations (e.g. end-of-day archival) tracked for cost dashboards
     but exempt from user budget caps.
     """
-    cache_key = _cache_key(user_id, provider, cache_scope)
+    # The window start is part of the key, so a rolled window (or a new UTC
+    # day for the daily cap) is never answered with the previous window's sum
+    # for up to _CACHE_TTL. The user id stays the key PREFIX: _invalidate_cache
+    # matches with startswith.
+    cache_key = _cache_key(user_id, provider, f"{cache_scope}@{since.isoformat()}")
     cached = _get_cached_spend(cache_key)
     if cached is not None:
         return cached
@@ -241,40 +256,703 @@ def _today_utc_start() -> datetime:
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) -> Optional[str]:
-    """
-    Check budget. Returns None if OK, or an error reason string.
-    Also returns the HTTP status code to use.
-    """
-    # Admins are unlimited — same policy as the credit system (admins are
-    # never gated or deducted). Without this, an admin/founder/canary account
-    # still hit the per-tenant monthly OpenAI budget cap and got the
-    # misleading "Rate limit reached — too many requests" chat error once the
-    # $10 default was exhausted (2026-07-05: the chat canary, running every
-    # 5 min, tripped it and started false-alarming). One cheap role lookup.
-    try:
-        from sqlalchemy import select as _select
-        from app.db.models import User as _User
-        _role = (await db.execute(
-            _select(_User.role).where(_User.id == config.user_id)
-        )).scalar_one_or_none()
-        if _role == "admin":
-            return None
-    except Exception:
-        pass  # role lookup best-effort; fall through to normal budget checks
+# ── Budget window ────────────────────────────────────────────────────
+#
+# Time contract: every datetime in here is NAIVE UTC, like the DateTime
+# columns it is compared with — asyncpg rejects an aware value bound against
+# a naive column, and Python refuses to compare the two, so one aware value
+# anywhere would 500 every non-admin call. Inputs go through
+# budget_refusal.to_naive_utc; "now" is read through this module's
+# `datetime` name (tests freeze it); values leave the process only through
+# budget_refusal.iso_utc (explicit +00:00, no microseconds). Window bounds are
+# whole seconds (_whole_second_utc), so the boundary the gate enforces is the
+# very second the wire names.
 
-    period_start = config.bundle_period_start or config.bundle_started_at
-    if not period_start:
+
+def _naive_utc_now(now=None) -> datetime:
+    current = budget_refusal.to_naive_utc(now) if now is not None else None
+    if current is None:
+        current = budget_refusal.to_naive_utc(datetime.utcnow())
+    return current
+
+
+def _whole_second_utc(value) -> Optional[datetime]:
+    """Naive UTC, truncated to the second. Production ``bundle_started_at``
+    values carry microseconds and ``iso_utc`` drops them: with a .9 s anchor,
+    a refusal in the window's last second named an end that had already
+    passed (and a Retry-After of 1 s for it)."""
+    value = budget_refusal.to_naive_utc(value)
+    return value.replace(microsecond=0) if value is not None else None
+
+
+def budget_period_bounds(config, now=None) -> tuple[Optional[datetime], Optional[datetime]]:
+    """The budget window ``[start, end)`` in force at ``now``, naive UTC both.
+
+    * A live Stripe period (``bundle_period_start <= now < bundle_period_end``)
+      is used unchanged.
+    * Anything else is anchored on ``bundle_period_start or
+      bundle_started_at``. A set but ended Stripe period is NOT live: Stripe
+      renewal does not re-stamp these columns in production (the pinned
+      Basil API dropped ``Subscription.current_period_end``), so trusting it
+      would freeze a cap since an old start and promise a reset in the past.
+    * ``settings.bundle_budget_rolling_month`` (default): the month since the
+      latest anniversary, ``anchor + k months <= now < anchor + (k+1)
+      months``. Every anniversary is computed from the anchor itself —
+      relativedelta clamps the day to the month's last and keeps the time —
+      and never chained from the previous window, so a 31st anchor is back on
+      the 31st after February. Before the anchor (replica clock skew) the
+      window is the first month.
+    * Flag off: ``(anchor, bundle_period_end if it is still ahead else
+      None)`` — the pre-2026-09-29 lifetime cap.
+    * No anchor: ``(None, None)`` — no period tracking yet, nothing is gated.
+
+    The anchor and a Stripe period's bounds are aligned to whole seconds
+    first, so every bound is exactly the ISO second the refusal and /usage
+    emit, and an emitted ``period_end`` is never already past.
+    """
+    current = _naive_utc_now(now)
+    period_start = _whole_second_utc(getattr(config, "bundle_period_start", None))
+    period_end = _whole_second_utc(getattr(config, "bundle_period_end", None))
+    if period_start is not None and period_end is not None and period_start <= current < period_end:
+        return period_start, period_end
+    anchor = period_start or _whole_second_utc(getattr(config, "bundle_started_at", None))
+    if anchor is None:
+        return None, None
+    if not getattr(settings, "bundle_budget_rolling_month", True):
+        return anchor, (period_end if period_end is not None and period_end > current else None)
+    if current < anchor:
+        return anchor, anchor + relativedelta(months=1)
+    months = (current.year - anchor.year) * 12 + (current.month - anchor.month)
+    if anchor + relativedelta(months=months) > current:
+        months -= 1
+    return anchor + relativedelta(months=months), anchor + relativedelta(months=months + 1)
+
+
+def _safe_budget_bounds(config, now=None) -> tuple[Optional[datetime], Optional[datetime]]:
+    """``budget_period_bounds``, or the legacy window (start =
+    ``bundle_period_start or bundle_started_at``, no end) if computing it
+    raises. The budget gate must never turn a call into a 500."""
+    try:
+        return budget_period_bounds(config, now=now)
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning(
+            "[budget] window_error user=%s: %s",
+            str(getattr(config, "user_id", "") or "")[:8], type(exc).__name__,
+        )
+        start = (_whole_second_utc(getattr(config, "bundle_period_start", None))
+                 or _whole_second_utc(getattr(config, "bundle_started_at", None)))
+        return start, None
+
+
+# ── Budget gate ──────────────────────────────────────────────────────
+
+#: What /usage reports as "remaining" for an exempt tenant. Finite on
+#: purpose: JSON has no Infinity.
+_EXEMPT_REMAINING_CENTS = 1e12
+
+_MONTHLY_BUDGET_FIELD = {
+    "openai": "bundle_openai_budget_cents",
+    "anthropic": "bundle_anthropic_budget_cents",
+}
+
+
+class _BudgetStanding(NamedTuple):
+    """Who the tenant is to the monthly gate. ``exempt``: an admin, never
+    gated. ``unlimited``: holds the Unlimited plan (``credit_balances.plan_id
+    == 'unlimited'``, the single materialisation of the entitlement — see
+    ``credit_service._entitlement_is_unlimited``), so on a TEXT call the
+    monthly allocation alerts instead of refusing unless
+    ``settings.unlimited_proxy_budget_refusal_enabled`` (image calls keep the
+    stop — ``_monthly_allocation_refuses``)."""
+    exempt: bool
+    unlimited: bool
+
+
+_NO_STANDING = _BudgetStanding(exempt=False, unlimited=False)
+
+
+def _standing_statement(user_id: str):
+    """ONE query for both halves of the standing: the role (admin → exempt)
+    and the balance row's plan (Unlimited). Outer join: a user without a
+    balance row is simply not Unlimited. Both sides are primary-key lookups
+    (``users.id``, ``credit_balances.user_id``)."""
+    from app.db.models import CreditBalance as _CreditBalance, User as _User
+    return (
+        select(_User.role, _CreditBalance.plan_id)
+        .select_from(_User)
+        .outerjoin(_CreditBalance, _CreditBalance.user_id == _User.id)
+        .where(_User.id == user_id)
+    )
+
+
+async def _budget_standing(config: AgentConfig, db: AsyncSession) -> _BudgetStanding:
+    """The tenant's standing, shared by the gate and /usage so the two can
+    never disagree.
+
+    Admins are unlimited — same policy as the credit system (admins are never
+    gated or deducted). Without this, an admin/founder/canary account still
+    hit the per-tenant monthly OpenAI budget cap and got the misleading "Rate
+    limit reached — too many requests" chat error once the $10 default was
+    exhausted (2026-07-05: the chat canary, running every 5 min, tripped it
+    and started false-alarming).
+
+    Read LIVE on every gate and /usage call, never cached: it is one
+    primary-key query — the same one query per call the admin role lookup
+    always cost — and a cached standing is exactly the decision that matters
+    at an exhausted cap. With a 30 s cache (not invalidated across replicas)
+    a customer who had just upgraded to Unlimited kept getting the 429, and
+    one whose Unlimited had just ended could keep spending past the cap.
+
+    Fails CLOSED: any error reads as "neither admin nor Unlimited", so a
+    failed lookup never opens the budget for anyone and the gate never 500s
+    on it."""
+    user_id = str(config.user_id)
+    try:
+        row = (await db.execute(_standing_statement(user_id))).first()
+    except Exception as exc:  # noqa: BLE001 — fail closed, see docstring
+        logger.warning("[budget] standing_lookup_error user=%s: %s",
+                       user_id[:8], type(exc).__name__)
+        return _NO_STANDING
+    if row is None:
+        return _NO_STANDING
+    from app.db.plan_catalog import UNLIMITED_PLAN_ID
+    role, plan_id = row[0], row[1]
+    return _BudgetStanding(exempt=role == "admin", unlimited=plan_id == UNLIMITED_PLAN_ID)
+
+
+async def _is_budget_exempt(config: AgentConfig, db: AsyncSession) -> bool:
+    """Admin exemption alone (see ``_budget_standing``)."""
+    return (await _budget_standing(config, db)).exempt
+
+
+#: What a gated call spends on. ``text``: chat, responses and embeddings —
+#: the calls chat, memory and document analysis make. ``image``: OpenAI image
+#: generation and edits.
+BUDGET_KIND_TEXT = "text"
+BUDGET_KIND_IMAGE = "image"
+#: The kinds on which an Unlimited tenant's monthly allocation alerts instead
+#: of refusing (Option A, pending the owner's decision). Images are NOT here:
+#: the owner's question was about documents/text, an image request is priced
+#: per image (and up to ``_IMAGE_MAX_N`` of them), and nothing else bounds an
+#: Unlimited tenant's image spend — so for images an Unlimited tenant keeps
+#: the monthly stop exactly as before. An unknown kind refuses.
+_UNLIMITED_HONOURED_KINDS = frozenset({BUDGET_KIND_TEXT})
+
+
+def _monthly_allocation_refuses(standing: _BudgetStanding, kind: str = BUDGET_KIND_TEXT) -> bool:
+    """Does reaching the monthly allocation refuse this tenant on a ``kind``
+    call? Admins: never. Unlimited on a text call: only with
+    ``unlimited_proxy_budget_refusal_enabled``. Everyone else, and Unlimited
+    on an image or hosted-tool call (``_request_budget_kind``): yes. The gate
+    and /usage both ask this."""
+    if standing.exempt:
+        return False
+    if standing.unlimited and kind in _UNLIMITED_HONOURED_KINDS:
+        return bool(getattr(settings, "unlimited_proxy_budget_refusal_enabled", False))
+    return True
+
+
+#: A chat/Responses request that asks the provider to run a HOSTED (or any
+#: non-function) tool. Not in ``_UNLIMITED_HONOURED_KINDS``, so an Unlimited
+#: tenant over its allocation is refused on it exactly as on 69c9445f.
+BUDGET_KIND_HOSTED_TOOL = "hosted_tool"
+
+#: Tool ``type`` values that cost only tokens, which the proxy meters: the
+#: client runs the tool and sends its result back as text. ``None`` is a tool
+#: with no ``type`` at all (Anthropic client tools: name, description,
+#: input_schema). These are the ONLY tool shapes first-party callers send
+#: (openai_agent_service builds ``{"type": "function", ...}`` for Responses
+#: and chat; the Anthropic path sends type-less client tools). Everything
+#: else — including a type this module has never heard of — is not text.
+_TEXT_TOOL_TYPES = frozenset({None, "function", "custom"})
+
+#: Every other tool type the proxy would forward, its kind, and why it does
+#: not ride the Unlimited text exemption (Option A, pending the owner's
+#: decision). Matched exactly or as a dated variant
+#: (``web_search_preview_2025_03_11``, ``web_search_20250305``, ...).
+#: ``image_generation`` is IMAGE kind (the /images routes' stop); the rest is
+#: HOSTED_TOOL kind. Both refuse an Unlimited tenant over its allocation;
+#: under the allocation nothing changes for anyone.
+_GATED_TOOL_TYPES: dict = {
+    # OpenAI Responses, run by OpenAI on Toup's key:
+    "image_generation": (BUDGET_KIND_IMAGE,
+                         "gpt-image output priced per image (and per partial image) at "
+                         "image rates, outside the text tokens the proxy meters"),
+    "web_search": (BUDGET_KIND_HOSTED_TOOL,
+                   "per-call search fee plus search-content tokens, on top of the model's"),
+    "web_search_preview": (BUDGET_KIND_HOSTED_TOOL,
+                           "per-call search fee plus search-content tokens"),
+    "file_search": (BUDGET_KIND_HOSTED_TOOL,
+                    "per-call fee plus vector-store storage in Toup's OpenAI org"),
+    "code_interpreter": (BUDGET_KIND_HOSTED_TOOL,
+                         "per-container session fee, billed apart from tokens"),
+    "mcp": (BUDGET_KIND_HOSTED_TOOL,
+            "OpenAI calls a third-party server on Toup's key; imported tool lists and "
+            "outputs are extra tokens; no first-party caller uses it"),
+    "computer_use_preview": (BUDGET_KIND_HOSTED_TOOL,
+                             "a separately priced computer-use model; no first-party caller"),
+    "computer_use": (BUDGET_KIND_HOSTED_TOOL,
+                     "a separately priced computer-use model; no first-party caller"),
+    # OpenAI tools the client runs (token-billed, but nothing first-party
+    # sends them, so they keep today's stop rather than widen the exemption):
+    "local_shell": (BUDGET_KIND_HOSTED_TOOL, "client-run, token-billed; no first-party caller"),
+    "shell": (BUDGET_KIND_HOSTED_TOOL, "client-run, token-billed; no first-party caller"),
+    "apply_patch": (BUDGET_KIND_HOSTED_TOOL, "client-run, token-billed; no first-party caller"),
+    # Anthropic Messages (proxy_chat forwards tools to Anthropic as sent):
+    "web_fetch": (BUDGET_KIND_HOSTED_TOOL,
+                  "Anthropic server tool: fetched pages become billed input tokens"),
+    "code_execution": (BUDGET_KIND_HOSTED_TOOL,
+                       "Anthropic server tool: container time billed apart from tokens"),
+    "bash": (BUDGET_KIND_HOSTED_TOOL, "Anthropic-defined client tool; no first-party caller"),
+    "text_editor": (BUDGET_KIND_HOSTED_TOOL,
+                    "Anthropic-defined client tool; no first-party caller"),
+    "computer": (BUDGET_KIND_HOSTED_TOOL,
+                 "Anthropic computer-use tool; no first-party caller"),
+    "memory": (BUDGET_KIND_HOSTED_TOOL, "Anthropic-defined client tool; no first-party caller"),
+}
+#: ``tool_choice`` ``type`` values that only choose among the request's own
+#: tools (they add no tool); ``allowed_tools`` is looked into.
+_TOOL_CHOICE_MODES = frozenset({"auto", "any", "none", "required", "tool", "function",
+                                "custom", "allowed_tools"})
+
+
+def _tool_type_kind(tool_type) -> str:
+    """The budget kind of one tool ``type`` (see ``_GATED_TOOL_TYPES``)."""
+    if tool_type is not None and not isinstance(tool_type, str):
+        return BUDGET_KIND_HOSTED_TOOL   # malformed (and maybe unhashable)
+    if tool_type in _TEXT_TOOL_TYPES:
+        return BUDGET_KIND_TEXT
+    for known, (kind, _why) in _GATED_TOOL_TYPES.items():
+        if tool_type == known or tool_type.startswith(known + "_"):
+            return kind
+    return BUDGET_KIND_HOSTED_TOOL   # unknown: never assume it is only text
+
+
+def _request_budget_kind(body) -> str:
+    """What a chat or Responses request spends on, for ``_check_budget``.
+    Decided from the body about to go upstream, BEFORE any upstream call.
+
+    TEXT unless the request asks the provider to run a tool other than a
+    client function: an ``image_generation`` tool — in ``tools``, forced by
+    ``tool_choice`` or allow-listed in it — makes it IMAGE (the /images
+    routes' stop); any other tool type in ``_GATED_TOOL_TYPES``, an unknown
+    one, a malformed ``tools`` entry, chat's ``web_search_options``,
+    Anthropic's ``mcp_servers`` or a Responses stored ``prompt`` (whose tools
+    live in the OpenAI dashboard, out of the proxy's sight) makes it
+    HOSTED_TOOL. IMAGE wins. Neither kind is exempt for an Unlimited tenant
+    over its allocation (``_UNLIMITED_HONOURED_KINDS``): such a request gets
+    the same typed 429 as on 69c9445f. Under the allocation, and for every
+    other tenant, the kind changes nothing."""
+    if not isinstance(body, dict):
+        return BUDGET_KIND_TEXT
+    kinds: set = set()
+
+    def listed(value):
+        return value if isinstance(value, list) else []
+
+    for tool in listed(body.get("tools")):
+        kinds.add(_tool_type_kind(tool.get("type")) if isinstance(tool, dict)
+                  else BUDGET_KIND_HOSTED_TOOL)
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        tc_type = tc.get("type")
+        if not isinstance(tc_type, str):
+            # A dict tool_choice must name its type as a string; a list or
+            # number there used to raise (unhashable in the set test) into a
+            # 500. The provider would refuse it too: say so, before upstream.
+            raise HTTPException(status_code=400, detail={
+                "code": "tool_choice_invalid",
+                "message": "tool_choice.type must be a string.",
+            })
+        if tc_type not in _TOOL_CHOICE_MODES:
+            kinds.add(_tool_type_kind(tc_type))    # e.g. {"type": "image_generation"}
+        elif tc_type == "allowed_tools":
+            # Responses {"type": "allowed_tools", "tools": [...]}; chat
+            # {"type": "allowed_tools", "allowed_tools": {"tools": [...]}}.
+            nested = tc.get("allowed_tools")
+            for tool in listed(tc.get("tools")) + listed(
+                    nested.get("tools") if isinstance(nested, dict) else None):
+                if isinstance(tool, dict):
+                    kinds.add(_tool_type_kind(tool.get("type")))
+    if body.get("web_search_options") is not None:
+        kinds.add(BUDGET_KIND_HOSTED_TOOL)
+    if listed(body.get("mcp_servers")):
+        kinds.add(BUDGET_KIND_HOSTED_TOOL)
+    if isinstance(body.get("prompt"), dict):
+        kinds.add(BUDGET_KIND_HOSTED_TOOL)
+    if BUDGET_KIND_IMAGE in kinds:
+        return BUDGET_KIND_IMAGE
+    if BUDGET_KIND_HOSTED_TOOL in kinds:
+        return BUDGET_KIND_HOSTED_TOOL
+    return BUDGET_KIND_TEXT
+
+
+def _cents_decimal(value) -> Decimal:
+    """A cost as the Decimal the event column stores (fractional cents,
+    migration 084). ``int(float(x))`` used to record a 0.6c low-quality
+    image as 0c, so repeated low images never advanced the window spend the
+    image ceiling is enforced on."""
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _hosted_tool_unsupported(kind: str) -> HTTPException:
+    """The refusal for a chat/Responses/Messages request that asks the
+    provider to run a hosted tool — ``image_generation``, web search, file
+    search, code interpreter, MCP, computer use, Anthropic server tools, a
+    stored prompt, an unknown type — for EVERY tenant, before the budget gate
+    and before any upstream call. The proxy meters such a call by its
+    mainline tokens only; the provider bills these tools per call / per
+    image on top of those tokens, so a request under the allocation could
+    spend money that never reaches the window the monthly ceiling (kept for
+    images and hosted tools under Option A) is enforced on. Until those
+    charges are metered they are refused; images go through the /images
+    routes, which are counted. First-party callers never send hosted tools
+    (the agent sends function tools only; its image tools use /images)."""
+    return HTTPException(status_code=400, detail={
+        "code": "hosted_tool_unsupported",
+        "kind": kind,
+        "message": ("Provider-hosted tools (web search, file search, code interpreter, "
+                    "image generation, MCP, computer use) aren't available through "
+                    "this service; use function tools, or the images endpoint for "
+                    "images."),
+    })
+
+
+def _budget_kind_kw(body) -> dict:
+    """``_check_budget`` keyword for a chat/Responses body: nothing for a
+    text request (the call stays ``_check_budget(config, provider, db)``,
+    the shape many tests fake), ``{"kind": ...}`` otherwise. An image tool
+    is refused here outright (see ``_hosted_image_tool_unsupported``)."""
+    kind = _request_budget_kind(body)
+    if kind != BUDGET_KIND_TEXT:
+        raise _hosted_tool_unsupported(kind)
+    return {}
+
+
+class _BudgetVerdict(NamedTuple):
+    now: datetime
+    start: Optional[datetime]
+    end: Optional[datetime]
+    spent: Decimal
+    budget: Optional[int]
+    over: bool
+
+
+async def _budget_verdict(
+    config: AgentConfig, provider: str, db: AsyncSession, *, now=None,
+) -> _BudgetVerdict:
+    """ONE monthly verdict for ``provider`` — window, spend, budget, over? —
+    computed from a single ``now``. ``over`` is THE gate comparison
+    (``spent >= budget``); /usage and the typed refusal reuse it rather than
+    re-deriving it. Exemption is the caller's business."""
+    current = _naive_utc_now(now)
+    start, end = _safe_budget_bounds(config, now=current)
+    field = _MONTHLY_BUDGET_FIELD.get(provider)
+    budget = getattr(config, field, None) if field else None
+    if start is None or budget is None:
+        return _BudgetVerdict(current, start, end, Decimal(0), budget, False)
+    spent = await _get_spend(db, config.user_id, provider, start, "monthly")
+    return _BudgetVerdict(current, start, end, spent, budget, spent >= budget)
+
+
+# ── Unlimited over its allocation: log + alert, never refuse ─────────
+#
+# When an admitted Unlimited tenant's window spend first reaches 1x, 2x and
+# 5x its allocation it is reported: ONE log line per multiple, and one infra
+# alert per multiple that stays OWED until alerting.py confirms delivery.
+# Owed alerts are delivered one at a time, lowest multiple first, each
+# exactly once. Nothing here depends on another gate call: when a send
+# finishes, the next owed alert is sent at once (after a delivery) or on a
+# backoff timer (after a failure); later gate calls can also retry once the
+# backoff has passed. All of it is per tenant, provider and window IN THIS
+# PROCESS: platform-api runs two replicas, so each replica may report the
+# same crossing once.
+_UNLIMITED_ALERT_MULTIPLES = (1, 2, 5)
+_UNLIMITED_ALERT_CATEGORY = "unlimited_over_allocation"
+#: alerting.py's per-(category, subject) window for these alerts. NONZERO on
+#: purpose: that window is also the per-category window, and its
+#: distinct-subject cap (``infra_alert_category_subject_cap``) only holds
+#: while the window is open — with 0 the window reset on every call and the
+#: cap never applied. So a 2x alert due within 10 minutes of the same
+#: tenant's 1x alert is withheld by alerting.py and delivered by the retry.
+_UNLIMITED_ALERT_INTERVAL_S = 600
+#: Retry an undelivered alert no sooner than this after the failure,
+#: doubling per consecutive failure, capped.
+_UNLIMITED_ALERT_RETRY_FIRST_S = 60.0
+_UNLIMITED_ALERT_RETRY_MAX_S = 3600.0
+#: How many consecutive failures may each arm a backoff TIMER (so an owed
+#: alert is retried with no further gate call). With the delays above that
+#: is 60+120+...+3600+3600 s, about 3 h; after that only gate calls retry
+#: (bounded work per tenant while alerting itself is broken).
+_UNLIMITED_ALERT_TIMER_RETRIES = 8
+# Older than any window (a month is at most 31 days) — pruned on each report.
+_UNLIMITED_ALERT_TTL_S = 40 * 24 * 3600.0
+
+
+class _UnlimitedAlertState:
+    """One tenant/provider/window's reporting state (in-process)."""
+    __slots__ = ("user8", "provider", "logged", "delivered", "owed", "failures",
+                 "next_at", "in_flight", "timer", "timer_retries", "touched")
+
+    def __init__(self, now: float, user8: str = "", provider: str = "") -> None:
+        self.user8 = user8
+        self.provider = provider
+        self.logged = 0        # highest multiple logged
+        self.delivered = 0     # highest multiple whose alert was delivered (or had nowhere to go)
+        self.owed: dict[int, str] = {}   # multiple -> its alert text, sent lowest first
+        self.failures = 0      # consecutive undelivered attempts
+        self.next_at = 0.0     # no retry before this (``_monotonic``)
+        self.in_flight = False
+        self.timer = None      # the armed backoff timer handle, if any
+        self.timer_retries = 0  # timers armed since the last delivery/crossing
+        self.touched = now
+
+    @property
+    def pending(self) -> int:
+        """The lowest owed multiple (0: none owed)."""
+        return min(self.owed) if self.owed else 0
+
+
+_unlimited_alerts: dict[tuple[str, str, str], _UnlimitedAlertState] = {}
+# Strong references to in-flight alert tasks (asyncio keeps only weak ones).
+_unlimited_alert_tasks: set = set()
+# Sends are serialised in this process: alerting.py checks its per-category
+# cap BEFORE awaiting Telegram and counts the send only AFTER it, so
+# concurrent sends (many tenants crossing at once) would all pass the cap.
+# (loop, lock): an asyncio.Lock belongs to one event loop.
+_unlimited_alert_lock: Optional[tuple] = None
+
+
+def _unlimited_alert_send_lock() -> asyncio.Lock:
+    global _unlimited_alert_lock
+    loop = asyncio.get_running_loop()
+    if _unlimited_alert_lock is None or _unlimited_alert_lock[0] is not loop:
+        _unlimited_alert_lock = (loop, asyncio.Lock())
+    return _unlimited_alert_lock[1]
+
+
+def _monotonic() -> float:
+    """The alert-retry clock (a seam so tests need no sleeps)."""
+    return time.monotonic()
+
+
+def _call_later(delay: float, callback, *args):
+    """Arm the alert backoff timer (a seam so tests can fire it without
+    sleeping). Returns a handle with ``cancel()``."""
+    return asyncio.get_running_loop().call_later(delay, callback, *args)
+
+
+def _unlimited_multiple(spent: Decimal, budget: int) -> int:
+    """The highest reported multiple the spend has reached (1 at least —
+    called only when ``spent >= budget``)."""
+    if budget <= 0:
+        return 1
+    reached = [m for m in _UNLIMITED_ALERT_MULTIPLES if spent >= Decimal(budget) * m]
+    return max(reached) if reached else 1
+
+
+def _unlimited_retry_delay(failures: int) -> float:
+    return min(_UNLIMITED_ALERT_RETRY_FIRST_S * (2 ** max(0, failures - 1)),
+               _UNLIMITED_ALERT_RETRY_MAX_S)
+
+
+def _cancel_unlimited_alert_timer(state: _UnlimitedAlertState) -> None:
+    timer, state.timer = state.timer, None
+    if timer is not None:
+        try:
+            timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _kick_unlimited_alert(state: _UnlimitedAlertState) -> None:
+    """Start sending ``state``'s lowest owed alert in the background, unless
+    none is owed, one is already being sent, or the backoff has not passed.
+    Never blocks; may raise (callers catch)."""
+    if not state.owed or state.in_flight or _monotonic() < state.next_at:
+        return
+    _cancel_unlimited_alert_timer(state)
+    multiple = min(state.owed)
+    message = state.owed[multiple]
+    state.in_flight = True
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _deliver_unlimited_alert(state, state.user8, state.provider, multiple, message))
+    except Exception:
+        state.in_flight = False
+        raise
+    _unlimited_alert_tasks.add(task)
+    task.add_done_callback(_unlimited_alert_tasks.discard)
+
+    def _unstick(t, state=state) -> None:
+        if t.cancelled():   # never ran its finally: keep the alert owed
+            state.in_flight = False
+
+    task.add_done_callback(_unstick)
+
+
+def _unlimited_alert_timer_fired(state: _UnlimitedAlertState) -> None:
+    """The backoff timer: its delay IS the backoff, so retry now. Never
+    raises (it runs as a bare event-loop callback)."""
+    state.timer = None
+    try:
+        state.next_at = min(state.next_at, _monotonic())
+        _kick_unlimited_alert(state)
+    except Exception as exc:  # noqa: BLE001 — the alert path never raises
+        logger.warning("[budget] unlimited alert retry failed user=%s: %s",
+                       state.user8, type(exc).__name__)
+
+
+async def _deliver_unlimited_alert(
+    state: _UnlimitedAlertState, user8: str, provider: str, multiple: int, message: str,
+) -> None:
+    """Send one owed alert and settle ``state``. Delivered only when
+    ``send_infra_alert`` returns True. False (Telegram refused it, the send
+    failed, or alerting.py's rate limit/cap withheld it — alerting.py returns
+    False for all three and does not say which) or an exception keeps it
+    owed: it is retried after ``_unlimited_retry_delay`` by a backoff timer
+    (for the first ``_UNLIMITED_ALERT_TIMER_RETRIES`` failures in a row) or
+    by a later gate call. The exception: no Telegram configured at all —
+    there is nowhere to deliver, the log line is the record, and retrying
+    would only repeat the no-op.
+
+    R2b: after a delivery, the next owed (higher) multiple — one that was
+    crossed while this send was in flight — is sent at once, with NO further
+    gate call; before this, it waited for a gate call that might never come.
+    Never raises."""
+    delivered = False
+    nowhere = False
+    try:
+        from app.services import alerting
+        try:
+            async with _unlimited_alert_send_lock():
+                delivered = (await alerting.send_infra_alert(
+                    _UNLIMITED_ALERT_CATEGORY, "warning", message,
+                    subject=user8, min_interval_s=_UNLIMITED_ALERT_INTERVAL_S,
+                )) is True
+        except Exception as exc:  # noqa: BLE001 — the alert path never raises
+            logger.warning("[budget] unlimited alert failed user=%s: %s",
+                           user8, type(exc).__name__)
+        if not delivered:
+            try:
+                nowhere = not alerting.infra_alerts_configured()
+            except Exception:  # noqa: BLE001
+                nowhere = False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[budget] unlimited alert failed user=%s: %s",
+                       user8, type(exc).__name__)
+    finally:
+        try:
+            state.in_flight = False
+            if delivered or nowhere:
+                state.owed.pop(multiple, None)
+                state.delivered = max(state.delivered, multiple)
+                state.failures = 0
+                state.next_at = 0.0
+                state.timer_retries = 0
+                _kick_unlimited_alert(state)     # the next owed multiple, now
+            else:
+                state.failures += 1
+                delay = _unlimited_retry_delay(state.failures)
+                state.next_at = _monotonic() + delay
+                logger.warning(
+                    "[budget] unlimited alert not delivered user=%s provider=%s "
+                    "multiple=%d attempt=%d retry_after_s=%d",
+                    user8, provider, multiple, state.failures, int(delay),
+                )
+                if state.timer_retries < _UNLIMITED_ALERT_TIMER_RETRIES:
+                    state.timer_retries += 1
+                    _cancel_unlimited_alert_timer(state)
+                    state.timer = _call_later(delay, _unlimited_alert_timer_fired, state)
+        except Exception as exc:  # noqa: BLE001 — the alert path never raises
+            logger.warning("[budget] unlimited alert settle failed user=%s: %s",
+                           user8, type(exc).__name__)
+
+
+def _report_unlimited_over_allocation(
+    user_id: str, provider: str, verdict: _BudgetVerdict,
+) -> None:
+    """Report an admitted Unlimited tenant over its allocation. The first
+    time its window spend is seen at 1x, 2x or 5x: one WARNING line, and that
+    multiple's alert becomes owed and is sent in the background (the model
+    call never waits on Telegram). Owed alerts go out lowest first, each
+    until delivered (see ``_deliver_unlimited_alert``); a new crossing
+    clears the backoff so the owed alerts are retried at once. A tenant first
+    seen past several multiples (e.g. after a restart) is reported once, at
+    the highest. Never raises."""
+    try:
+        user8 = user_id[:8]
+        now = _monotonic()
+        for stale in [k for k, st in _unlimited_alerts.items()
+                      if now - st.touched >= _UNLIMITED_ALERT_TTL_S]:
+            _cancel_unlimited_alert_timer(_unlimited_alerts.pop(stale))
+        multiple = _unlimited_multiple(verdict.spent, int(verdict.budget))
+        start_iso = budget_refusal.iso_utc(verdict.start) or "-"
+        key = (user_id, provider, start_iso)
+        state = _unlimited_alerts.get(key)
+        if state is None:
+            state = _unlimited_alerts[key] = _UnlimitedAlertState(now, user8, provider)
+        state.touched = now
+        if multiple > state.logged:
+            state.logged = multiple
+            spent = round(float(verdict.spent), 2)
+            budget = int(verdict.budget)
+            logger.warning(
+                "[budget] unlimited over allocation user=%s provider=%s spent=%.2f "
+                "budget=%d multiple=%d",
+                user8, provider, spent, budget, multiple,
+            )
+            end_iso = budget_refusal.iso_utc(verdict.end) or "-"
+            state.owed[multiple] = (
+                f"Unlimited account {user8} has spent {spent:.2f}c of {provider} "
+                f"in its budget window ({start_iso}..{end_iso}), past {multiple}x its "
+                f"{budget}c allocation. It was NOT refused "
+                f"(unlimited_proxy_budget_refusal_enabled is off). Each replica "
+                f"reports 1x, 2x and 5x once per window."
+            )
+            state.next_at = 0.0            # a new crossing: send now
+            state.timer_retries = 0
+        _kick_unlimited_alert(state)
+    except Exception as exc:  # noqa: BLE001 — the alert path never raises
+        logger.warning("[budget] unlimited report failed user=%s: %s",
+                       str(user_id)[:8], type(exc).__name__)
+
+
+async def _check_budget(
+    config: AgentConfig, provider: str, db: AsyncSession, *, kind: str = BUDGET_KIND_TEXT,
+) -> Optional[str]:
+    """None when the call may proceed; "monthly_exceeded" (refuse it with
+    ``_raise_budget_exceeded``) or "daily_exceeded" (the Anthropic soft cap —
+    proxy_chat falls back to OpenAI). The positional signature and both
+    strings are load-bearing: many tests replace this with
+    ``async def fake(cfg, provider, db): return None`` (so text routes call
+    it without ``kind``; the image routes pass ``kind=BUDGET_KIND_IMAGE``).
+
+    The monthly window is ``budget_period_bounds`` (a rolling month for
+    every tenant without a live Stripe period — before 2026-09-29 it was the
+    lifetime since activation). An Unlimited tenant over its allocation on a
+    text call is admitted and reported (``_report_unlimited_over_allocation``)
+    unless ``unlimited_proxy_budget_refusal_enabled``; on an image call, or a
+    chat/Responses call carrying a hosted tool (``_request_budget_kind``), it
+    is refused like everyone else. The Anthropic daily soft cap still applies
+    to it. The standing is read live on every call (``_budget_standing``)."""
+    standing = await _budget_standing(config, db)
+    if standing.exempt:
+        return None
+    verdict = await _budget_verdict(config, provider, db)
+    if verdict.start is None:
         return None  # No period tracking yet, allow
+    if verdict.over:
+        if _monthly_allocation_refuses(standing, kind):
+            if standing.unlimited and kind != BUDGET_KIND_TEXT:
+                # Say why an Unlimited tenant was refused: the "[budget]
+                # refused" line that follows does not carry the kind.
+                logger.info("[budget] unlimited not exempt user=%s provider=%s kind=%s",
+                            str(config.user_id)[:8], provider, kind)
+            return "monthly_exceeded"
+        _report_unlimited_over_allocation(str(config.user_id), provider, verdict)
 
     if provider == "anthropic":
-        # Monthly check
-        monthly_spend = await _get_spend(
-            db, config.user_id, "anthropic", period_start, "monthly"
-        )
-        if monthly_spend >= config.bundle_anthropic_budget_cents:
-            return "monthly_exceeded"
-
         # Daily soft cap
         daily_spend = await _get_spend(
             db, config.user_id, "anthropic", _today_utc_start(), "daily"
@@ -282,14 +960,101 @@ async def _check_budget(config: AgentConfig, provider: str, db: AsyncSession) ->
         if daily_spend >= config.bundle_anthropic_daily_cap_cents:
             return "daily_exceeded"
 
-    elif provider == "openai":
-        monthly_spend = await _get_spend(
-            db, config.user_id, "openai", period_start, "monthly"
-        )
-        if monthly_spend >= config.bundle_openai_budget_cents:
-            return "monthly_exceeded"
-
     return None
+
+
+# ── Typed budget refusal ─────────────────────────────────────────────
+#
+# The monthly-budget 429 used to be a bare {"detail": "Monthly openai budget
+# exceeded"}: every consumer classified it by substring, the OpenAI SDK
+# retried it as a rate limit, and the platform logged nothing. Now it is
+# typed (budget_refusal.REASON in the X-Toup-Reason header and in
+# detail.error), says when it resets, tells the SDK not to retry, and leaves
+# one WARNING line per tenant, provider and window per minute and replica.
+
+_RETRY_AFTER_CAP_S = 7 * 24 * 3600
+_REFUSAL_LOG_INTERVAL_S = 60.0
+_refusal_logged_at: dict[tuple[str, str, str], float] = {}
+
+
+def _log_budget_refusal(user_id: str, provider: str, spent_cents: float,
+                        budget_cents: int, start_iso: Optional[str],
+                        end_iso: Optional[str]) -> None:
+    now = time.monotonic()
+    for stale in [k for k, at in _refusal_logged_at.items()
+                  if now - at >= _REFUSAL_LOG_INTERVAL_S]:
+        _refusal_logged_at.pop(stale, None)
+    key = (user_id, provider, start_iso or "-")
+    if key in _refusal_logged_at:
+        return
+    _refusal_logged_at[key] = now
+    logger.warning(
+        "[budget] refused user=%s provider=%s spent=%.2f budget=%d window=%s..%s",
+        user_id[:8], provider, spent_cents, budget_cents,
+        start_iso or "-", end_iso or "-",
+    )
+
+
+async def _raise_budget_exceeded(
+    config: AgentConfig, provider: str, db: AsyncSession, *,
+    now=None, message: Optional[str] = None,
+) -> None:
+    """Refuse the call with the typed monthly-budget 429 — or return, and let
+    the caller proceed, when a fresh verdict no longer refuses it.
+
+    Call it only after ``_check_budget`` said "monthly_exceeded". The window,
+    spend and budget in the refusal come from ONE verdict at ONE ``now``: if
+    the window rolled between that check and this call, the fresh verdict is
+    under budget and the call is admitted, instead of being refused with next
+    month's numbers (a reset date a month out).
+
+    ``message`` keeps each call site's legacy sentence ("Monthly openai budget
+    exceeded", ...) in ``detail.message`` for consumers that still match the
+    text. ``detail`` is exactly ``error, message, provider, period_start,
+    period_end`` and JSON-safe (a Decimal or a datetime in an HTTPException
+    detail makes Starlette raise, turning the 429 into a 500). Spend and
+    budget are deliberately NOT on the wire — they are Toup's underlying
+    provider cost, and ``str(exc)`` of the SDK error reaches job rows,
+    trigger/routine surfaces and model context; they go to the
+    ``[budget] refused`` log line only. ``x-should-retry: false`` stops the
+    OpenAI SDK from retrying, which it otherwise does for every 429 unless
+    Retry-After exceeds 120 s (and then sleeps that Retry-After first).
+    Retry-After is the seconds until the window ends (at least 1, at most 7
+    days) and is only sent when there is a future end. Writes no event row.
+    """
+    verdict = await _budget_verdict(config, provider, db, now=now)
+    user_id = str(config.user_id)
+    if not verdict.over:
+        logger.info(
+            "[budget] re-check admitted user=%s provider=%s window=%s..%s",
+            user_id[:8], provider,
+            budget_refusal.iso_utc(verdict.start) or "-",
+            budget_refusal.iso_utc(verdict.end) or "-",
+        )
+        return
+    end = verdict.end if verdict.end is not None and verdict.end > verdict.now else None
+    start_iso = budget_refusal.iso_utc(verdict.start)
+    end_iso = budget_refusal.iso_utc(end)
+    headers = {
+        budget_refusal.REASON_HEADER: budget_refusal.REASON,
+        "x-should-retry": "false",
+    }
+    if end is not None:
+        seconds = math.ceil((end - verdict.now).total_seconds())
+        headers["Retry-After"] = str(max(1, min(_RETRY_AFTER_CAP_S, seconds)))
+    _log_budget_refusal(user_id, provider, round(float(verdict.spent), 2),
+                        int(verdict.budget), start_iso, end_iso)
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "error": budget_refusal.REASON,
+            "message": message or f"Monthly {provider} budget exceeded",
+            "provider": provider,
+            "period_start": start_iso,
+            "period_end": end_iso,
+        },
+        headers=headers,
+    )
 
 
 # ── Cost calculation ─────────────────────────────────────────────────
@@ -436,20 +1201,228 @@ OPERATION_TYPE_HEADER = "x-toup-operation-type"
 #: a closed set means adding an exemption is a platform change, reviewed here.
 _ALLOWED_SYSTEM_OPERATIONS = frozenset({"system.cache_warm"})
 
+#: A genuine warm replays the recorded cacheable head — instructions + tools,
+#: ~40k tokens (~160k characters) in the 2026-09-14 sample — at most
+#: `llm_cache_warm_max_per_day` (12) times per user per agent process. The
+#: bound is on the WHOLE serialised body (instructions + tools + input + the
+#: rest), because the provider bills every text-bearing field. The
+#: header exempts the call from the credit charge AND from the monthly spend
+#: window, so a caller holding an agent key could otherwise send unbounded
+#: "warms" of any size for free. Two proxy-side bounds mirror the genuine
+#: warm with headroom; a request past either is still served but is billed
+#: and counted as a user request (fail-to-counted, never fail-to-free).
+_WARM_MAX_INPUT_CHARS = 250_000          # serialised UTF-8 bytes of the WHOLE body
+_WARM_MAX_PER_DAY = 12
+_warm_calls: Dict[str, Deque[float]] = {}
+#: Decided a SECOND time from the provider's own usage, after the call: a
+#: body under the byte cap can still be ~1 token per byte of adversarial
+#: text (measured, o200k_base), ten times the ~40k-token genuine head. A
+#: "warm" the provider reports as larger than this is filed as user traffic.
+_WARM_MAX_INPUT_TOKENS = 60_000
+_WARM_MAX_OUTPUT_TOKENS = 32
+#: Model ids that are text chat models but not warm targets, by substring
+#: of the resolved id. (Pro tiers are barred by has_cached_input_rate.)
+_WARM_MODEL_EXCLUDED_MARKS = ("image", "audio", "realtime", "transcribe", "tts",
+                              "embedding", "search", "codex", "moderation")
+_WARM_FUNCTION_TOOL_KEYS = frozenset({"type", "name", "description", "parameters", "strict"})
+#: EXACTLY the top-level fields the agent's warm sends
+#: (cache_warm.warm_prefix → OpenAIAgentService.create_message_stream on the
+#: Responses wire). A body with any other key is not a warm. The ones that
+#: matter are the ones that pull PROVIDER-SIDE context the proxy never sees
+#: and cannot bound — previous_response_id, conversation, prompt (a stored
+#: prompt template), include values that fetch tool results — because a
+#: tiny body carrying one of those is a full-sized billed request.
+_WARM_ALLOWED_FIELDS = frozenset({
+    "model", "input", "instructions", "tools", "tool_choice", "max_output_tokens",
+    "stream", "store", "include", "temperature", "prompt_cache_key",
+    "prompt_cache_retention", "prompt_cache_options", "safety_identifier",
+})
+_WARM_ALLOWED_INCLUDE = frozenset({"reasoning.encrypted_content"})
+_WARM_INPUT_PART_TYPES = frozenset({"input_text"})
 
-def _system_operation_for(raw: Optional[str], body: dict) -> Optional[str]:
+
+def _warm_input_is_plain_text(items) -> bool:
+    """One USER message whose content is a string or input_text parts only —
+    no files, images or URLs (those are fetched and billed provider-side),
+    no item references (``{"type": "item_reference"}`` replays stored
+    items), no developer/system role (the warm's head rides ``instructions``)."""
+    if not (isinstance(items, list) and len(items) == 1 and isinstance(items[0], dict)):
+        return False
+    item = items[0]
+    if set(item) - {"role", "content", "type"}:
+        return False
+    if item.get("role") != "user" or item.get("type") not in (None, "message"):
+        return False
+    content = item.get("content")
+    if isinstance(content, str):
+        return True
+    if isinstance(content, list):
+        return all(isinstance(part, dict) and part.get("type") in _WARM_INPUT_PART_TYPES
+                   and isinstance(part.get("text"), str) and set(part) <= {"type", "text"}
+                   for part in content)
+    return False
+
+
+def _warm_tools_are_functions(tools) -> bool:
+    """The warm replays the agent's FUNCTION tools. A hosted tool (file_search,
+    web_search, code_interpreter, image_generation, mcp…) is billed by the
+    provider per use and reads server-side state; none belongs in a warm."""
+    if tools is None:
+        return True
+    return (isinstance(tools, list)
+            and all(isinstance(t, dict) and t.get("type") == "function"
+                    and isinstance(t.get("name"), str)
+                    and set(t) <= _WARM_FUNCTION_TOOL_KEYS for t in tools))
+
+
+def _warm_model_ok(model) -> bool:
+    """A KNOWN warm model, not a ``gpt-`` prefix: the resolved id must be a
+    priced text model with a cached-input rate. A ``gpt-*-pro`` tier ($30/M
+    input, no cache discount, absent from the pricing table on purpose) or
+    an image/audio/realtime id wearing the prefix is not a warm."""
+    if not isinstance(model, str) or not model.strip():
+        return False
+    from app.services.model_resolver import has_cached_input_rate
+    resolved = str(_resolve_model_alias(model.strip())).lower()
+    return (resolved.startswith("gpt-")
+            and resolved in settings.pricing_per_1k
+            and has_cached_input_rate(resolved)
+            and not any(mark in resolved for mark in _WARM_MODEL_EXCLUDED_MARKS))
+
+
+def _warm_shape_ok(body, user_id: Optional[str]) -> bool:
+    """EXACTLY the request cache_warm.warm_prefix sends, value by value —
+    every allowed field is pinned to the type/value the agent sends, so
+    the gate is a description of one request, not a family. Order: the
+    per-user slot is spent LAST, only by a passing shape."""
+    if not isinstance(body, dict) or (set(body) - _WARM_ALLOWED_FIELDS):
+        return False
+    max_out = body.get("max_output_tokens")
+    if type(max_out) is not int or not (0 < max_out <= _WARM_MAX_OUTPUT_TOKENS):
+        return False
+    if body.get("tool_choice") != "none":
+        return False
+    store = body.get("store")
+    if store is not None and store is not False:
+        return False
+    stream = body.get("stream")
+    if stream is not None and type(stream) is not bool:
+        return False
+    instructions = body.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        return False
+    temperature = body.get("temperature")
+    if temperature is not None and (type(temperature) not in (int, float)
+                                    or not math.isfinite(temperature)
+                                    or not 0 <= temperature <= 2):
+        return False
+    if body.get("prompt_cache_retention") not in (None, "24h"):
+        return False
+    if body.get("prompt_cache_options") not in (None, {"ttl": "30m"}):
+        return False
+    for key in ("prompt_cache_key", "safety_identifier"):
+        value = body.get(key)
+        if value is not None and not (isinstance(value, str) and 0 < len(value) <= 256):
+            return False
+    include = body.get("include")
+    if include is not None and not (isinstance(include, list)
+                                    and all(isinstance(i, str) for i in include)
+                                    and set(include) <= _WARM_ALLOWED_INCLUDE):
+        return False
+    return (_warm_tools_are_functions(body.get("tools"))
+            and _warm_model_ok(body.get("model"))
+            and _warm_input_is_plain_text(body.get("input"))
+            and _warm_body_chars(body) <= _WARM_MAX_INPUT_CHARS
+            and _warm_rate_ok(user_id))
+
+
+def _warm_operation_after_usage(operation_type: Optional[str], input_tokens, output_tokens) -> Optional[str]:
+    """Second decision, from the PROVIDER's reported usage: a request that
+    passed the warm shape but was billed as more than a warm's head is
+    filed as user traffic — charged and counted — not as a free warm."""
+    if operation_type != "system.cache_warm":
+        return operation_type
+    try:
+        inp, out = int(input_tokens or 0), int(output_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    if inp > _WARM_MAX_INPUT_TOKENS or out > _WARM_MAX_OUTPUT_TOKENS:
+        logger.warning("[LLM-PROXY] operation_type=system.cache_warm used %s in / %s out tokens — "
+                       "more than a warm; billing as a user request", inp, out)
+        return None
+    return operation_type
+
+
+async def _warm_db_rate_ok(db: AsyncSession, user_id: str) -> bool:
+    """Fleet-wide twin of `_warm_rate_ok`: that counter is per process, so
+    N replicas hand out N × 12 and a restart hands out 12 more. The rows
+    the proxy already writes are the durable count."""
+    since = datetime.utcnow() - timedelta(hours=24)
+    n = (await db.execute(select(func.count()).select_from(LLMProxyEvent).where(
+        LLMProxyEvent.user_id == user_id,
+        LLMProxyEvent.operation_type == "system.cache_warm",
+        LLMProxyEvent.created_at >= since))).scalar() or 0
+    if n >= _WARM_MAX_PER_DAY:
+        logger.warning("[LLM-PROXY] operation_type=system.cache_warm: %s warms recorded in 24h "
+                       "for user=%s — billing as a user request", n, str(user_id)[:8])
+        return False
+    return True
+
+
+def _warm_body_chars(body) -> int:
+    """Size of the WHOLE request the provider will bill — instructions, tools,
+    input and every other field — as its serialised JSON length. Counting
+    only ``input`` let a caller put a huge ``instructions`` (which Responses
+    forwards verbatim and bills as mainline input) beside a one-character
+    input item and still pass as a free warm."""
+    try:
+        return len(json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return _WARM_MAX_INPUT_CHARS + 1   # unserialisable: not a warm
+
+
+def _warm_rate_ok(user_id: Optional[str], now: Optional[float] = None) -> bool:
+    if not user_id:
+        return True
+    now = _monotonic() if now is None else now
+    q = _warm_calls.setdefault(str(user_id), deque())
+    while q and now - q[0] >= 86_400:
+        q.popleft()
+    if len(q) >= _WARM_MAX_PER_DAY:
+        return False
+    q.append(now)
+    return True
+
+
+def _system_operation_for(raw: Optional[str], body: dict,
+                          user_id: Optional[str] = None) -> Optional[str]:
     """The operation_type to record, or None (→ user-attributable).
 
-    Two gates, because the header is client-supplied and lands on the billing
-    decision. The value must be one we issue, AND the request must still LOOK
-    like the operation it claims to be: a cache warm asks for at most a
-    handful of output tokens, forbids tool calls and sends a single input
-    item. A chat turn dressed in this header fails the shape test and is
-    billed normally, so the worst a leaked agent key buys is a free 16-token
-    completion — not free chat.
+    Three gates, because the header is client-supplied and lands on the
+    billing decision. (0) The exemption is a platform switch
+    (``llm_proxy_system_operation_exemption``, default OFF): with it off every
+    request is billed and counted whatever the header says. (1) The value
+    must be one we issue. (2) The request must still LOOK like the operation
+    it claims to be: a cache warm asks for at most a handful of output
+    tokens, forbids tool calls, sends a single plain-text input item, carries
+    ONLY the top-level fields the agent's warm sends (so no
+    previous_response_id / conversation / prompt / file inputs pulling
+    provider-side context), names a KNOWN warm model (priced text model with
+    a cached-input rate — no pro/image/audio tier), fits the serialised-size
+    bound and the per-user daily rate; and after the call the provider's
+    usage must still look like a warm (`_warm_operation_after_usage`). A chat turn dressed in this header
+    fails the shape test and is billed normally, so the most a leaked agent
+    key buys is a bounded number of bounded 16-token completions — not free
+    chat.
     """
     value = (raw or "").strip().lower()
     if not value:
+        return None
+    if not getattr(settings, "llm_proxy_system_operation_exemption", False):
+        # Off until an attested platform-side path exists (config.py): the
+        # request is served, billed and counted like any other.
+        logger.info("[LLM-PROXY] operation_type header %r ignored: system exemption is off "
+                    "— billing as a user request", value[:64])
         return None
     if value not in _ALLOWED_SYSTEM_OPERATIONS:
         logger.warning(
@@ -459,14 +1432,7 @@ def _system_operation_for(raw: Optional[str], body: dict) -> Optional[str]:
         return None
     if value == "system.cache_warm":
         try:
-            max_out = int(body.get("max_output_tokens") or 0)
-            items = body.get("input")
-            shape_ok = (
-                0 < max_out <= 32
-                and body.get("tool_choice") == "none"
-                and isinstance(items, list)
-                and len(items) == 1
-            )
+            shape_ok = _warm_shape_ok(body, user_id)
         except Exception:  # noqa: BLE001 — a malformed body is not a warm
             shape_ok = False
         if not shape_ok:
@@ -511,6 +1477,29 @@ def _sanitize_channel(raw: Optional[str]) -> Optional[str]:
         return None
     cleaned = "".join(ch for ch in raw.strip().lower() if ch.isalnum() or ch in "_-")
     return cleaned[:_CHANNEL_MAX] or None
+
+
+async def _report_after_spend(db: AsyncSession, user_id: str, provider: str) -> None:
+    """After an event is recorded: if the tenant is Unlimited (live standing)
+    and its window spend is now over the allocation, report the crossing
+    (``_report_unlimited_over_allocation`` deduplicates per multiple). One
+    standing query per recorded event; the verdict is recomputed only for an
+    Unlimited tenant. Never raises."""
+    try:
+        config = (await db.execute(
+            select(AgentConfig).where(AgentConfig.user_id == user_id)
+        )).scalar_one_or_none()
+        if config is None:
+            return
+        standing = await _budget_standing(config, db)
+        if standing.exempt or not standing.unlimited:
+            return
+        verdict = await _budget_verdict(config, provider, db)
+        if verdict.start is not None and verdict.over:
+            _report_unlimited_over_allocation(str(user_id), provider, verdict)
+    except Exception as exc:  # noqa: BLE001 — reporting never costs the call
+        logger.warning("[budget] post-spend report failed user=%s: %s",
+                       str(user_id)[:8], type(exc).__name__)
 
 
 async def _log_event(
@@ -582,6 +1571,7 @@ async def _log_event(
     row but never denies. System ops (operation_type startswith "system.")
     are platform overhead and are NOT charged to the user.
     """
+    operation_type = _warm_operation_after_usage(operation_type, input_tokens, output_tokens)
     event = LLMProxyEvent(
         id=str(uuid.uuid4()),
         user_id=user_id,
@@ -669,6 +1659,12 @@ async def _log_event(
     # System operations don't affect user caps so they can leave the cache intact.
     if not is_system_op:
         _invalidate_cache(user_id)
+        if status == "ok" and cost_cents and Decimal(str(cost_cents)) > 0:
+            # The call that CROSSES 1x/2x/5x must report it: the preflight in
+            # _check_budget only sees the spend before the call, so a tenant
+            # whose last call of the day crossed a multiple would otherwise
+            # never be reported (Option A has no hard text ceiling).
+            await _report_after_spend(db, user_id, provider)
 
     logger.info(
         "llm_proxy user=%s provider=%s model=%s tokens_in=%d tokens_out=%d "
@@ -2348,8 +3344,28 @@ class UsageResponse(BaseModel):
     anthropic_budget_cents: int
     anthropic_daily_cap_cents: int
     openai_budget_cents: int
+    # The window the gate enforces right now (budget_period_bounds), as
+    # ISO 8601 with an explicit +00:00. The *_monthly_cents above are the
+    # spend inside it.
     period_start: Optional[str] = None
     period_end: Optional[str] = None
+    # What the gate would decide, computed by the gate itself so a consumer
+    # (the agent's document-analysis preflight) never re-derives it from
+    # budget - spend. Defaults keep older constructors valid.
+    openai_remaining_cents: Optional[float] = None
+    anthropic_remaining_cents: Optional[float] = None
+    openai_blocked: bool = False
+    budget_exempt: bool = False
+    # The tenant holds the Unlimited plan. With
+    # unlimited_proxy_budget_refusal_enabled off, its allocation alerts
+    # instead of refusing on TEXT calls (chat, responses, embeddings — what
+    # openai_blocked describes), so openai_blocked stays False even when
+    # openai_remaining_cents reads 0 (Option A, pending owner decision).
+    unlimited: bool = False
+    # Would the OpenAI image generation/edit routes refuse right now? The
+    # same as openai_blocked for every tenant except an Unlimited one over
+    # its allocation: its images keep the monthly stop (Option A scope).
+    openai_image_blocked: bool = False
 
 
 @router.post("/chat")
@@ -2484,10 +3500,19 @@ async def proxy_chat(
         logger.warning("[credits] pre-flight check failed for user=%s: %s",
                        config.user_id[:8], e)
 
-    # Budget check
-    budget_result = await _check_budget(config, backend.name, db)
+    # Budget check. A monthly refusal is the typed 429 (see
+    # _raise_budget_exceeded), which returns instead of raising only when a
+    # fresh verdict admits the call (the window rolled since the check).
+    # The kind comes from the body about to go upstream: a hosted tool (e.g.
+    # an Anthropic web_search server tool) is not a text call for the
+    # Unlimited exemption — see _request_budget_kind.
+    budget_kind_kw = _budget_kind_kw(body)
+    budget_result = await _check_budget(config, backend.name, db, **budget_kind_kw)
     if budget_result == "monthly_exceeded":
-        raise HTTPException(429, f"Monthly {backend.name} budget exceeded")
+        await _raise_budget_exceeded(
+            config, backend.name, db,
+            message=f"Monthly {backend.name} budget exceeded",
+        )
     if budget_result == "daily_exceeded":
         # Anthropic daily cap hit — try OpenAI fallback. Prefer the user's
         # auto-provisioned per-project key here too, fall back to master.
@@ -2496,6 +3521,14 @@ async def proxy_chat(
             logger.info("Daily Anthropic cap hit for user %s, falling back to OpenAI", config.user_id[:8])
             backend = _openai
             api_key = fallback_key
+            # The fallback spends the OpenAI allocation, so it has to pass the
+            # OpenAI gate too — never a silent switch into an exhausted budget.
+            if await _check_budget(config, "openai", db,
+                                   **budget_kind_kw) == "monthly_exceeded":
+                await _raise_budget_exceeded(
+                    config, "openai", db,
+                    message="Monthly openai budget exceeded",
+                )
             # Convert Anthropic request to OpenAI format
             body = _anthropic_to_openai_request(body)
             model = body.get("model", "gpt-4o-mini")
@@ -2828,8 +3861,10 @@ async def proxy_responses(
     # tracking but never charged and never counted against the user's cap —
     # `_log_event` and `_get_spend` both key that off "system.".
     req_operation = _system_operation_for(
-        request.headers.get(OPERATION_TYPE_HEADER), body,
+        request.headers.get(OPERATION_TYPE_HEADER), body, user_id=str(config.user_id),
     )
+    if req_operation == "system.cache_warm" and not await _warm_db_rate_ok(db, str(config.user_id)):
+        req_operation = None
     requested_model = body.get("model")
     # No claude-* default here — this endpoint is OpenAI-only, and letting
     # _route_chat's unknown-prefix→Anthropic default apply would route a
@@ -2917,10 +3952,19 @@ async def proxy_responses(
         logger.warning("[credits] pre-flight check failed for user=%s: %s",
                        config.user_id[:8], e)
 
-    # Budget check (openai only — no Anthropic fallback on this endpoint)
-    budget_result = await _check_budget(config, "openai", db)
+    # Budget check (openai only — no Anthropic fallback on this endpoint).
+    # R4b: classified from the final body (after dedup, the tool cap and the
+    # tool_choice prune) BEFORE any upstream call. A request carrying an
+    # image_generation tool, in `tools` or forced/allow-listed through
+    # `tool_choice`, is IMAGE kind — the /images routes' stop — and any other
+    # hosted tool is HOSTED_TOOL kind; neither rides the Unlimited text
+    # exemption (_UNLIMITED_HONOURED_KINDS), so an Unlimited tenant over its
+    # allocation gets the same typed 429 as there, and OpenAI is never
+    # called. Otherwise it could generate images here while /images refuses.
+    budget_result = await _check_budget(config, "openai", db, **_budget_kind_kw(body))
     if budget_result == "monthly_exceeded":
-        raise HTTPException(429, "Monthly openai budget exceeded")
+        await _raise_budget_exceeded(
+            config, "openai", db, message="Monthly openai budget exceeded")
 
     # W0.2b request-side [CACHE] line — the shared extractor reads both
     # prompt_cache_retention and GPT-6's prompt_cache_options.ttl.
@@ -3188,7 +4232,8 @@ async def proxy_embeddings(
     # Budget check
     budget_result = await _check_budget(config, "openai", db)
     if budget_result == "monthly_exceeded":
-        raise HTTPException(429, "Monthly OpenAI budget exceeded")
+        await _raise_budget_exceeded(
+            config, "openai", db, message="Monthly OpenAI budget exceeded")
 
     start_ts = time.time()
     try:
@@ -3209,6 +4254,60 @@ async def proxy_embeddings(
     await _log_event(db, config.user_id, "openai", model, "embeddings", total_tokens, 0, cost, latency)
 
     return resp_data
+
+
+#: Most images one OpenAI image generation/edit request may ask for. Every
+#: first-party caller sends n=1 (the agent's generate_image/edit_image tools,
+#: tool_executor._openai_generate_image/_openai_edit_image; nothing in the web
+#: or iOS app calls these routes — they need an agent token), and OpenAI
+#: itself accepts up to 10. Each image is charged, and counted against the
+#: allocation, only after it is produced, so without a bound one admitted
+#: request could spend 10 high-quality images at once.
+_IMAGE_MAX_N = 4
+
+
+_IMAGE_COUNT_DIGITS = re.compile(r"\A[0-9]{1,6}\Z")
+
+
+def _parse_image_count(raw) -> int:
+    """The ``n`` of an image request as a whole number ≥ 1, or a truthful 400
+    (nothing reserved or spent). Absent (None, or an empty form field) means
+    the default 1. A JSON integer or a form field of digits is accepted; a
+    boolean, a fraction, a non-finite number, text, zero or a negative count
+    is refused — it used to raise into a 500 (generate) or silently become 1
+    (edit, and generate for 0)."""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        return 1
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, str) and _IMAGE_COUNT_DIGITS.match(raw.strip()):
+        n = int(raw.strip())
+    if n is None or n < 1:
+        raise HTTPException(status_code=400, detail={
+            "code": "image_count_invalid",
+            "max": _IMAGE_MAX_N,
+            "message": (f"The number of images (n) must be a whole number from 1 to "
+                        f"{_IMAGE_MAX_N}."),
+        })
+    return n
+
+
+def _enforce_image_count(n: int) -> None:
+    """Refuse (400, nothing reserved or spent) an image request asking for
+    more than ``_IMAGE_MAX_N`` images. Smaller or missing ``n`` is passed
+    through exactly as before."""
+    if n > _IMAGE_MAX_N:
+        raise HTTPException(status_code=400, detail={
+            "code": "image_count_too_large",
+            "requested": n,
+            "max": _IMAGE_MAX_N,
+            "message": (f"This service creates at most {_IMAGE_MAX_N} images per "
+                        f"request (n={n} was asked for). Ask for {_IMAGE_MAX_N} or "
+                        f"fewer, or send several requests."),
+        })
 
 
 @router.post("/openai/v1/images/generations")
@@ -3233,6 +4332,21 @@ async def proxy_openai_images(
     """
     config = await _auth_agent(request, db)
     _enforce_rate_limit(config)
+    # Budget check — image cost lands on the tenant's OpenAI allocation. It
+    # runs BEFORE the free-image reservation below: that reservation commits,
+    # so a budget refusal after it held one of a free user's monthly images
+    # for its 10-minute TTL (at their last free image, the next request was
+    # told they had used them all). kind=image: an Unlimited tenant keeps
+    # the monthly stop on images (see _UNLIMITED_HONOURED_KINDS).
+    budget_result = await _check_budget(config, "openai", db, kind=BUDGET_KIND_IMAGE)
+    if budget_result == "monthly_exceeded":
+        await _raise_budget_exceeded(
+            config, "openai", db, message="Monthly OpenAI budget exceeded")
+    # Parse the request, and bound n, BEFORE the free-image reservation too:
+    # a rejected request must not hold a slot.
+    body = await request.json()
+    n = _parse_image_count(body.get("n") if isinstance(body, dict) else None)
+    _enforce_image_count(n)
     # Free-tier monthly image cap (audit-2026 re-audit round 7): the same hard
     # product limit the Kie route enforces. Without it here, a free-tier user
     # bypasses the cap by routing image generation through the OpenAI proxy.
@@ -3246,20 +4360,13 @@ async def proxy_openai_images(
             "message": (f"Your free plan includes {_limit} images per month, and "
                         f"you've used them all. Upgrade for unlimited images."),
         })
-    body = await request.json()
     model = body.get("model") or getattr(settings, "image_gen_model", "gpt-image-1")
     size = body.get("size") or getattr(settings, "image_gen_default_size", "1024x1024")
     quality = body.get("quality") or getattr(settings, "image_gen_default_quality", "high")
-    n = int(body.get("n", 1) or 1)
 
     api_key = config.bundle_openai_api_key or settings.platform_openai_api_key
     if not api_key:
         raise HTTPException(500, "Platform OpenAI key not configured")
-
-    # Budget check — image cost lands on the tenant's OpenAI allocation.
-    budget_result = await _check_budget(config, "openai", db)
-    if budget_result == "monthly_exceeded":
-        raise HTTPException(429, "Monthly OpenAI budget exceeded")
 
     start_ts = time.time()
     try:
@@ -3315,7 +4422,7 @@ async def proxy_openai_images(
     # commit both the charge ledger row and the event together.
     await _log_event(
         db, config.user_id, "openai", model, "images",
-        0, 0, int(float(total_cents)), latency,
+        0, 0, _cents_decimal(total_cents), latency,
     )
 
     return resp_data
@@ -3335,6 +4442,22 @@ async def proxy_openai_image_edits(
     """
     config = await _auth_agent(request, db)
     _enforce_rate_limit(config)
+    # Budget check BEFORE the free-image reservation — same reason as the
+    # generate route: a refusal after the committed reservation held the slot.
+    # kind=image: an Unlimited tenant keeps the monthly stop on images.
+    budget_result = await _check_budget(config, "openai", db, kind=BUDGET_KIND_IMAGE)
+    if budget_result == "monthly_exceeded":
+        await _raise_budget_exceeded(
+            config, "openai", db, message="Monthly OpenAI budget exceeded")
+    # Parse the form, and bound n, before the reservation too.
+    form = await request.form()
+
+    def _sval(key: str, default: str) -> str:
+        v = form.get(key)
+        return v if isinstance(v, str) and v else default
+
+    n = _parse_image_count(form.get("n"))
+    _enforce_image_count(n)
     # Free-tier monthly image cap — mirror the generate route so the edit path
     # can't bypass the cap either. RESERVE before generating (round 12 TOCTOU).
     from app.services.credit_service import (
@@ -3347,20 +4470,10 @@ async def proxy_openai_image_edits(
             "message": (f"Your free plan includes {_limit} images per month, and "
                         f"you've used them all. Upgrade for unlimited images."),
         })
-    form = await request.form()
-
-    def _sval(key: str, default: str) -> str:
-        v = form.get(key)
-        return v if isinstance(v, str) and v else default
-
     model = _sval("model", getattr(settings, "image_gen_model", "gpt-image-1"))
     size = _sval("size", getattr(settings, "image_gen_default_size", "1024x1024"))
     quality = _sval("quality", getattr(settings, "image_gen_default_quality", "high"))
     prompt = _sval("prompt", "")
-    try:
-        n = int(_sval("n", "1"))
-    except (TypeError, ValueError):
-        n = 1
 
     # Collect the uploaded source image(s) + optional mask. The SDK sends the
     # field as "image" (gpt-image-1 also accepts "image[]" for multi-image
@@ -3389,10 +4502,6 @@ async def proxy_openai_image_edits(
     api_key = config.bundle_openai_api_key or settings.platform_openai_api_key
     if not api_key:
         raise HTTPException(500, "Platform OpenAI key not configured")
-
-    budget_result = await _check_budget(config, "openai", db)
-    if budget_result == "monthly_exceeded":
-        raise HTTPException(429, "Monthly OpenAI budget exceeded")
 
     start_ts = time.time()
     try:
@@ -3444,7 +4553,7 @@ async def proxy_openai_image_edits(
     await settle_free_image_slot(db, _img_slot)   # slot consumed → stop double-counting
     await _log_event(
         db, config.user_id, "openai", model, "images",
-        0, 0, int(float(total_cents)), latency,
+        0, 0, _cents_decimal(total_cents), latency,
     )
 
     return resp_data
@@ -3849,9 +4958,29 @@ async def get_proxy_usage(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the calling agent's current usage and budget."""
+    """Return the calling agent's budget window, the spend inside it, and
+    what the gate would decide — ``openai_blocked`` is ``_check_budget``'s
+    own comparison and live standing for a text call, and
+    ``openai_image_blocked`` the same for an image call; an exempt (admin)
+    tenant reports ``budget_exempt=True`` with a finite sentinel as
+    remaining. An Unlimited tenant reports ``unlimited=True``; unless
+    ``unlimited_proxy_budget_refusal_enabled`` its ``openai_blocked`` is
+    False even past the allocation (``openai_remaining_cents`` then reads 0,
+    which is spend accounting, not a refusal) while
+    ``openai_image_blocked`` is True there.
+
+    Deliberately not rate limited: it reports spend, it causes none."""
     config = await _auth_agent(request, db)
-    period_start = config.bundle_period_start or config.bundle_started_at
+    standing = await _budget_standing(config, db)
+    exempt = standing.exempt
+    now = _naive_utc_now()
+    oa = await _budget_verdict(config, "openai", db, now=now)
+    period_start, period_end = oa.start, oa.end
+
+    def _remaining(budget, spent) -> float:
+        if exempt:
+            return _EXEMPT_REMAINING_CENTS
+        return max(0.0, round(float(Decimal(budget or 0) - Decimal(spent)), 4))
 
     if not period_start:
         return UsageResponse(
@@ -3861,21 +4990,34 @@ async def get_proxy_usage(
             anthropic_budget_cents=config.bundle_anthropic_budget_cents,
             anthropic_daily_cap_cents=config.bundle_anthropic_daily_cap_cents,
             openai_budget_cents=config.bundle_openai_budget_cents,
+            openai_remaining_cents=_remaining(config.bundle_openai_budget_cents, 0),
+            anthropic_remaining_cents=_remaining(config.bundle_anthropic_budget_cents, 0),
+            openai_blocked=False,
+            budget_exempt=exempt,
+            unlimited=standing.unlimited,
+            openai_image_blocked=False,
         )
 
-    anthropic_monthly = await _get_spend(db, config.user_id, "anthropic", period_start, "monthly")
+    an = await _budget_verdict(config, "anthropic", db, now=now)
     anthropic_daily = await _get_spend(db, config.user_id, "anthropic", _today_utc_start(), "daily")
-    openai_monthly = await _get_spend(db, config.user_id, "openai", period_start, "monthly")
 
     return UsageResponse(
-        anthropic_monthly_cents=anthropic_monthly,
+        anthropic_monthly_cents=an.spent,
         anthropic_daily_cents=anthropic_daily,
-        openai_monthly_cents=openai_monthly,
+        openai_monthly_cents=oa.spent,
         anthropic_budget_cents=config.bundle_anthropic_budget_cents,
         anthropic_daily_cap_cents=config.bundle_anthropic_daily_cap_cents,
         openai_budget_cents=config.bundle_openai_budget_cents,
-        period_start=period_start.isoformat() if period_start else None,
-        period_end=config.bundle_period_end.isoformat() if config.bundle_period_end else None,
+        period_start=budget_refusal.iso_utc(period_start),
+        period_end=budget_refusal.iso_utc(
+            period_end if period_end is not None and period_end > now else None),
+        openai_remaining_cents=_remaining(config.bundle_openai_budget_cents, oa.spent),
+        anthropic_remaining_cents=_remaining(config.bundle_anthropic_budget_cents, an.spent),
+        openai_blocked=bool(oa.over and _monthly_allocation_refuses(standing, BUDGET_KIND_TEXT)),
+        budget_exempt=exempt,
+        unlimited=standing.unlimited,
+        openai_image_blocked=bool(
+            oa.over and _monthly_allocation_refuses(standing, BUDGET_KIND_IMAGE)),
     )
 
 

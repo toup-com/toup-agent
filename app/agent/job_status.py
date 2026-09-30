@@ -36,6 +36,12 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from app.services.budget_refusal import (
+    budget_refusal_detail as _budget_refusal_detail,
+    is_budget_refusal as _is_budget_refusal,
+    job_sentence as _budget_job_sentence,
+)
+
 # ── Status values ────────────────────────────────────────────────────────
 # `completed` is deliberately NOT renamed to `succeeded`: 38 readers across
 # mobile, web, backend and tests consume this string, two of which hard-fail
@@ -107,6 +113,10 @@ ERR_TURN_INTERRUPTED = "turn_interrupted"
 #: Pairs with ``STATUS_WAITING_ON_USER``; see `awaiting_confirmation()`.
 ERR_AWAITING_CONFIRMATION = "awaiting_confirmation"
 ERR_INFRA_UNRECOVERABLE = "infra_unrecoverable"
+#: The platform proxy refused the model call because this agent's monthly AI
+#: budget is spent (``budget_refusal.ERROR_CLASS``). Not the user's credits,
+#: and nothing the user can buy: it clears when the budget window rolls.
+ERR_MODEL_BUDGET = "model_budget"
 ERR_CREDITS_TOUP = "credits_toup"
 ERR_CREDITS_UPSTREAM = "credits_upstream"
 ERR_CONNECTOR_AUTH = "connector_auth"
@@ -244,6 +254,42 @@ _rule(
     ),
 )
 
+# -- the agent's monthly model budget -----------------------------------------
+# The proxy's refusal is an HTTP 429, so without this rule it read as
+# `rate_limited` — RETRY, "your agent is retrying" — for a job that cannot
+# run again until the budget window rolls. Its typed detail also carries
+# numbers (period timestamps) that `connector_auth`'s bare "401" and
+# `upstream`'s 5xx would match, so it goes ahead of every status-code rule,
+# and ahead of `credits_toup` because it is NOT a credit refusal.
+#
+# Recognised only in text that is OURS (budget_refusal's S3 rule):
+#   * the openai/anthropic SDK's "Error code: 429" prefix — str(e), repr(e)
+#     and every row that stored either — together with the typed reason or
+#     the legacy sentence. A marker merely quoted inside third-party text (an
+#     email a summariser failed on, a customer's own words) is not a refusal
+#     and must never pass for a terminal stop.
+#   * our own job sentence at the head of the text. Routine and trigger
+#     handlers store it as `error_detail` instead of the raw exception, and
+#     the routine runner's retry gate classifies f"{error_class}: {detail}";
+#     read as `unknown` that would be RETRY and "Something went wrong".
+_MODEL_BUDGET_TEXT = (
+    r"\A(?=.*?\bError code: 429\b)"
+    r"(?=.*?(?:monthly_model_budget_exceeded|monthly (?:openai|anthropic) budget exceeded))"
+    r"|\A(?:[A-Za-z_][\w.]*: )?This task couldn[’']t finish because your "
+    r"agent[’']s (?:monthly )?AI budget is used up\."
+)
+_rule(
+    "model_budget",
+    _MODEL_BUDGET_TEXT,
+    ErrorClassification(
+        ERR_MODEL_BUDGET,
+        # == budget_refusal.job_sentence(None): the undated sentence.
+        "This task couldn’t finish because your agent’s AI budget is used "
+        "up. Your credits aren’t affected.",
+        DISPOSITION_TERMINAL,
+    ),
+)
+
 # -- needs the user ------------------------------------------------------
 # Toup's own 402. Must precede the generic 4xx rules.
 _rule(
@@ -362,6 +408,34 @@ def classify(error: object) -> ErrorClassification:
     return _UNKNOWN
 
 
+
+# ``budget_refusal.job_sentence`` exactly as it renders, dated or undated,
+# optionally behind an exception-class prefix. Text of this shape was written
+# by us and carries the reset date in the user's zone, so a surface serves it
+# as is; anything else that classifies as a budget stop (the proxy's raw 429)
+# gets the static copy.
+_OWN_BUDGET_SENTENCE = re.compile(
+    r"\A(?:[A-Za-z_][\w.]*: )?"
+    r"(This task couldn’t finish because your agent’s (?:"
+    r"monthly AI budget is used up\. It resets on [A-Z][a-z]+ \d{1,2}(?:, \d{4})?"
+    r"(?: at \d{1,2}:\d{2} [AP]M(?: UTC)?)?\."
+    r"|AI budget is used up\.) Your credits aren’t affected\.)\s*\Z"
+)
+
+
+def served_model_budget_text(raw: Optional[str]) -> Optional[str]:
+    """What a surface serves for stored error text that records a stop by the
+    monthly model budget, or None when ``raw`` is not one (serve it as is).
+
+    Our own job sentence is served unchanged, so a dated row keeps its reset
+    date; any other form (an older image's raw 429 with its payload and
+    period timestamps) becomes the undated taxonomy sentence.
+    """
+    if not raw or classify(raw).error_class != ERR_MODEL_BUDGET:
+        return None
+    own = _OWN_BUDGET_SENTENCE.match(raw.strip())
+    return own.group(1) if own else classify(raw).user_message
+
 def technical_detail(error: object, *, limit: int = 2000) -> str:
     """Internal-only diagnostic string.
 
@@ -380,3 +454,54 @@ def is_retryable(error: object) -> bool:
     so a 402 out-of-credits burned 3 routine attempts x the LLM ladder.
     """
     return classify(error).disposition == DISPOSITION_RETRY
+
+
+def model_budget_verdict(
+    error: object, tz_name: Optional[str] = None, *, now: object = None,
+) -> Optional[ErrorClassification]:
+    """The verdict for a job the proxy's monthly model budget stopped, with
+    the reset date named in the user's zone — or None for any other error.
+
+    ``classify`` can only give the ``model_budget`` rule's static copy: it
+    reads text and has no zone. Every close that holds the live exception
+    asks this first, so the row, the card and the push all say when the
+    budget comes back. Built from the refusal's typed detail, but never
+    carries its cents or its ISO timestamps (``budget_refusal.job_sentence``).
+    """
+    if not _is_budget_refusal(error):
+        return None
+    return ErrorClassification(
+        ERR_MODEL_BUDGET,
+        _budget_job_sentence(_budget_refusal_detail(error), tz_name, now),
+        DISPOSITION_TERMINAL,
+    )
+
+
+async def user_tz_name(user_id: Optional[str]) -> Optional[str]:
+    """The user's IANA zone for job copy that names a date.
+
+    The per-process cache the runner seeds on every turn, then the tenant's
+    ``users.timezone``; None (the copy then falls back to UTC) when neither
+    is known. Never raises: a date in UTC beats a job that failed to close.
+    """
+    if not user_id:
+        return None
+    try:
+        from app.agent._user_tz_cache import get_cached_user_tz
+        name = get_cached_user_tz(user_id)
+        if name:
+            return name
+    except Exception:  # noqa: BLE001 — a cache is an optimisation
+        pass
+    try:
+        from sqlalchemy import select
+
+        from app.db.database import async_session_maker
+        from app.db.models import User
+        async with async_session_maker() as db:
+            name = (await db.execute(
+                select(User.timezone).where(User.id == user_id)
+            )).scalar_one_or_none()
+        return name or None
+    except Exception:  # noqa: BLE001
+        return None

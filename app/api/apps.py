@@ -280,6 +280,15 @@ def _taxonomy_fields(job: BuildJob) -> Dict[str, Any]:
         return {"error_class": None, "user_message": None}
 
     verdict = classify(raw)
+    from app.agent.job_status import ERR_MODEL_BUDGET, served_model_budget_text
+
+    if verdict.error_class == ERR_MODEL_BUDGET:
+        # The routine and trigger runners store only `error_message`, and for
+        # a budget stop it is already the handler's dated sentence: serve it
+        # as the Routines/Triggers panels do, date included. The proxy's raw
+        # 429 still gets the undated taxonomy sentence.
+        return {"error_class": ERR_MODEL_BUDGET,
+                "user_message": served_model_budget_text(raw) or verdict.user_message}
     return {"error_class": verdict.error_class, "user_message": verdict.user_message}
 
 
@@ -334,6 +343,23 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         from app.services.model_alias import public_model_label
         _job_model = public_model_label(_job_model)
 
+    # Classify on read for rows written before the taxonomy landed (and for
+    # any writer not yet migrated), so the client NEVER has to fall back to
+    # `error_message`. `classify` is a handful of pre-compiled regexes over a
+    # short string — cheap enough for a list serializer, and it means the
+    # 79-day-old legacy corpses render with humanized copy without a data
+    # migration.
+    _taxonomy = _taxonomy_fields(job)
+    # A job the monthly model budget stopped: the raw text is the proxy's 429
+    # (period timestamps, provider detail), and the legacy clients that still
+    # render `error_message` would show it verbatim. They get the sentence.
+    from app.agent.job_status import ERR_MODEL_BUDGET
+    _error_message = (
+        _taxonomy["user_message"]
+        if _taxonomy["error_class"] == ERR_MODEL_BUDGET
+        else job.error_message
+    )
+
     return JobResponse(
         id=job.id,
         app_id=job.app_id,
@@ -344,14 +370,8 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         steps=steps,
         model=_job_model,
         total_tokens=job.total_tokens or 0,
-        error_message=job.error_message,
-        # Classify on read for rows written before the taxonomy landed
-        # (and for any writer not yet migrated), so the client NEVER has
-        # to fall back to `error_message`. `classify` is a handful of
-        # pre-compiled regexes over a short string — cheap enough for a
-        # list serializer, and it means the 79-day-old legacy corpses
-        # render with humanized copy without a data migration.
-        **_taxonomy_fields(job),
+        error_message=_error_message,
+        **_taxonomy,
         progress_step=getattr(job, 'progress_step', None),
         progress_total=getattr(job, 'progress_total', None),
         **_progress_fields(steps, job),
@@ -745,6 +765,11 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
         layer=0,
     )
     job_id = job.id
+    from app.agent.job_reaper import wire_job_type
+
+    # Read now, while the row is loaded: the frames below name the job's kind
+    # as well as its title, so a tab meeting it first never draws an app build.
+    job_kind = wire_job_type(job)
 
     # Execute the task via the agent runner in background
     if _agent_runner:
@@ -785,17 +810,35 @@ async def create_job(req: CreateJobRequest) -> JobResponse:
                         "job_id": job_id,
                         "status": "completed",
                         "name": req.title,
+                        "job_type": job_kind,
                     })
             except Exception as e:
                 logger.error(f"[DASHBOARD] Task {job_id[:8]} failed: {e}")
-                await blog.error(f"Task failed: {e}")
-                await blog.persist()
                 from app.agent.job_status import (
                     DISPOSITION_NEEDS_USER, STATUS_WAITING_ON_USER, classify,
-                    technical_detail,
+                    model_budget_verdict, technical_detail, user_tz_name,
                 )
+                from app.services.budget_refusal import is_budget_refusal
 
-                _v = classify(e)
+                # The proxy's monthly model budget refusal: its text is the
+                # raw 429 (enum, provider, period timestamps), and the Jobs
+                # page's Logs tab renders this line verbatim. The job
+                # sentence instead, dated in the user's zone — the same one
+                # the row and the frame carry below. Other errors unchanged.
+                try:
+                    _budget = (
+                        model_budget_verdict(e, await user_tz_name(user_id))
+                        if is_budget_refusal(e) else None
+                    )
+                except Exception:  # noqa: BLE001 — copy must never cost the close
+                    _budget = None
+                if _budget is not None:
+                    await blog.error(f"Task stopped: {_budget.user_message}")
+                else:
+                    await blog.error(f"Task failed: {e}")
+                await blog.persist()
+
+                _v = _budget if _budget is not None else classify(e)
                 _st = (
                     STATUS_WAITING_ON_USER
                     if _v.disposition == DISPOSITION_NEEDS_USER

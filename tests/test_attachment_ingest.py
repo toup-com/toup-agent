@@ -128,6 +128,77 @@ def test_docx_pptx_xlsx_and_zip_each_carry_their_token():
     assert z.status == STATUS_OK and "DELTATOKEN" in (z.text or "")
 
 
+_PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+
+
+def test_a_deck_with_nothing_but_pictures_is_empty_not_ok(monkeypatch):
+    """A picture-only deck came back as nothing but "--- Slide N ---" markers,
+    which is non-empty text — so it ingested `ok` and the model was handed six
+    slide numbers to "read". It is `empty` now, whose guidance says the file
+    held no readable text. A deck with words on one slide still reads.
+
+    python-pptx is stubbed so this runs on every box (the real-deck twin
+    below needs the library); the stub has exactly the attributes
+    `_extract_pptx` reads."""
+    import io
+    import types
+    import zipfile
+
+    class _Frame:
+        def __init__(self, text):
+            self.text = text
+
+    class _Shape:
+        def __init__(self, text=None):
+            self.has_text_frame = text is not None
+            self.text_frame = _Frame(text or "")
+            self.has_table = False
+
+    class _Slide:
+        def __init__(self, *shapes):
+            self.shapes = list(shapes)
+            self.has_notes_slide = False
+
+    decks = {
+        "pictures.pptx": [_Slide(_Shape()), _Slide(_Shape(), _Shape("   "))],
+        "words.pptx": [_Slide(_Shape()), _Slide(_Shape("EPSILONTOKEN"))],
+    }
+    current = {}
+    stub = types.ModuleType("pptx")
+    stub.Presentation = lambda _stream: types.SimpleNamespace(slides=decks[current["name"]])
+    monkeypatch.setitem(sys.modules, "pptx", stub)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:   # enough of an OOXML container to route
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("ppt/presentation.xml", "<p:presentation/>")
+
+    current["name"] = "pictures.pptx"
+    empty = ingest_one(buf.getvalue(), "pictures.pptx", _PPTX_MIME)
+    assert empty.status == STATUS_EMPTY and empty.text is None
+
+    current["name"] = "words.pptx"
+    words = ingest_one(buf.getvalue(), "words.pptx", _PPTX_MIME)
+    assert words.status == STATUS_OK
+    assert "EPSILONTOKEN" in words.text and "--- Slide 2 ---" in words.text
+
+
+@pytest.mark.skipif(not fx.have("pptx"), reason="python-pptx not installed here")
+def test_a_real_picture_only_deck_is_empty():
+    import io
+
+    from pptx import Presentation
+
+    prs = Presentation()
+    for _ in range(3):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])   # the blank layout
+        slide.shapes.add_picture(io.BytesIO(fx.png_image()), 0, 0)
+    buf = io.BytesIO()
+    prs.save(buf)
+    ing = ingest_one(buf.getvalue(), "pictures.pptx", _PPTX_MIME)
+    assert ing.status == STATUS_EMPTY and ing.text is None
+
+
 # ── images ───────────────────────────────────────────────────────────────
 
 def test_a_large_photo_is_downscaled_to_the_model_edge():

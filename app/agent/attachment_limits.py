@@ -142,6 +142,37 @@ def max_bytes_for(kind: str) -> int:
     return MAX_BYTES_PER_IMAGE if kind == KIND_IMAGE else MAX_BYTES_PER_DOCUMENT
 
 
+def format_limit_bytes(n: float) -> str:
+    """The clients' ``formatBytes`` (binary MiB shown as "MB"), byte-for-byte:
+    25 MiB → "25 MB", 15 MiB → "15 MB", 9.5 MiB → "9.5 MB", 1536 B → "2 KB".
+    ``math.floor(x + 0.5)`` rather than ``round`` because Python rounds half
+    to even and JavaScript rounds half up."""
+    import math
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "0 MB"
+    if n != n or math.isinf(n) or n <= 0:
+        return "0 MB"
+    if n < 1024 * 1024:
+        return f"{max(1, math.floor(n / 1024 + 0.5))} KB"
+    mb = n / (1024 * 1024)
+    if mb >= 10:
+        return f"{math.floor(mb + 0.5)} MB"
+    return f"{math.floor(mb * 10 + 0.5) / 10:g} MB"
+
+
+def too_large_detail(kind: Optional[str]) -> str:
+    """The 413 ``detail`` sentence, stating the limit the way the clients do.
+    Clients compose their own sentence from the reason code; this is for
+    logs, API callers and any client that shows the body."""
+    if kind == KIND_IMAGE:
+        return (f"That image is too large — {format_limit_bytes(MAX_BYTES_PER_IMAGE)} "
+                "is the most one image can be.")
+    return (f"That file is too large — {format_limit_bytes(MAX_BYTES_PER_DOCUMENT)} "
+            "is the most one file can be.")
+
+
 def check_one(size_bytes: int, mime: str, filename: str = "") -> Tuple[Optional[str], Optional[str]]:
     """``(kind, reason)`` — exactly one of the two is ``None``."""
     kind = kind_for(mime, filename)

@@ -163,6 +163,56 @@ async def test_successful_job_carries_no_error_fields(monkeypatch):
     assert row["user_message"] is None
 
 
+#: What a job writer stored for the platform proxy's monthly-budget 429:
+#: str(e) of openai's RateLimitError (fix pass S2 shape, synthetic dates).
+BUDGET_429 = (
+    "Error code: 429 - {'detail': {'error': 'monthly_model_budget_exceeded', "
+    "'message': 'Monthly openai budget exceeded', 'provider': 'openai', "
+    "'period_start': '2026-09-24T19:10:40+00:00', "
+    "'period_end': '2026-10-24T19:10:40+00:00'}}"
+)
+
+
+@pytest.mark.parametrize("stored", [False, True, "handler-sentence"],
+                         ids=["classified-on-read", "stored-class", "handler-sentence-on-read"])
+@pytest.mark.asyncio
+async def test_a_model_budget_stop_never_serves_the_raw_429(monkeypatch, stored):
+    """`error_message` is still rendered verbatim by legacy clients (the web
+    Kanban card), and for this class it held the proxy's 429 with its period
+    timestamps. It is served as the sentence, list and detail alike."""
+    from app.config import settings
+    from app.services.budget_refusal import job_sentence
+
+    uid = await _mk_user()
+    monkeypatch.setattr(settings, "user_id", uid)
+    sentence = (
+        "This task couldn’t finish because your agent’s monthly AI budget is used "
+        "up. It resets on October 24. Your credits aren’t affected."
+    )
+    columns = dict(error_message=BUDGET_429)
+    if stored == "handler-sentence":
+        # A routine or trigger run: the runner stores only error_message, and
+        # it is the handler's dated sentence. The date is kept.
+        columns = dict(error_message=sentence)
+    elif stored:
+        columns.update(error_class="model_budget", user_message=sentence)
+    jid = await _mk_job(uid, **columns)
+
+    async with _client() as ac:
+        listed = next(j for j in (await ac.get("/api/apps/jobs/")).json() if j["id"] == jid)
+        detail = (await ac.get(f"/api/apps/jobs/{jid}")).json()
+
+    expected = sentence if stored else job_sentence(None)
+    for row in (listed, detail):
+        assert row["error_class"] == "model_budget"
+        assert row["user_message"] == expected
+        assert row["error_message"] == expected
+        strings = [v for v in row.values() if isinstance(v, str)]
+        for token in BANNED + ("+00:00", "2026-10-24T", "monthly_model_budget_exceeded"):
+            for value in strings:
+                assert token not in value, f"{token!r} leaked into the job payload"
+
+
 # ── archive (soft retirement) ────────────────────────────────────────────
 
 
