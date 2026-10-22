@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/voice", tags=["Voice"])
 
 
+@router.post("/warm", status_code=202)
+async def warm_voice(current_user=Depends(get_current_user)) -> dict:
+    """Voice round 2026-10-07 (D-R2(4)): warm the Live voice context before
+    the tap.  The app calls it fire-and-forget (chat open, orb shown); the
+    server-side foreground trigger is the presence report.  Body ``{}``.
+    ``202 {ok, warming, cache: fresh|built|pending|skipped, ttl_ms}``; an
+    older platform answers 404/405, which the app reads as absent."""
+
+    from app.api.ws_realtime import request_live_voice_warm
+
+    state = await request_live_voice_warm(str(current_user.id), "explicit")
+    return {"ok": True, **state}
+
+
 class TTSRequest(BaseModel):
     text: str
     voice: str = "alloy"

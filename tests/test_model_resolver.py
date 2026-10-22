@@ -235,6 +235,43 @@ class TestProviderClassification(unittest.TestCase):
         self.assertFalse(is_openai_model(""))
 
 
+class TestRoleModelsFailClosed(unittest.TestCase):
+    """TW-6. An admin-typed executor/supervisor model reaches the proxy for
+    every worker, so it must be a chat model this deployment knows — a
+    routable prefix alone admitted typos and image/transcribe/realtime ids."""
+
+    def _resolve(self, value, *, anthropic=False):
+        with patch.object(mr, "settings", SimpleNamespace(
+                agent_model=None, subagent_model=None, supervisor_model=None,
+                anthropic_enabled=anthropic,
+                pricing_per_1k=mr.settings.pricing_per_1k)):
+            return (mr.subagent_model({"executor_model": value}),
+                    mr.supervisor_model({"supervisor_model": value}, fallback_default=False))
+
+    def test_known_chat_models_resolve(self):
+        for good in ("gpt-5.6-luna", "gpt-6-sol", "gpt-4o-mini", "o3-mini"):
+            self.assertEqual(self._resolve(good), (good, good))
+
+    def test_typos_and_non_chat_models_fall_back(self):
+        default = mr._CANONICAL_AGENT_MODEL
+        for bad in ("gpt-5.5-mni", "gpt-image-1", "gpt-4o-transcribe",
+                    "gpt-realtime", "gpt-realtime-2.1", "o3-nonsense",
+                    "text-embedding-3-small", "whisper-1"):
+            self.assertEqual(self._resolve(bad), (default, None), bad)
+
+    def test_claude_needs_both_the_table_and_anthropic(self):
+        self.assertEqual(self._resolve("claude-opus-4-7", anthropic=True)[1], "claude-opus-4-7")
+        self.assertIsNone(self._resolve("claude-opus-4-7")[1])
+        self.assertIsNone(self._resolve("claude-opus-9", anthropic=True)[1])
+
+    def test_the_known_set_holds_no_non_chat_model(self):
+        known = mr.known_chat_models()
+        self.assertIn(mr._CANONICAL_AGENT_MODEL, known)
+        self.assertFalse({m for m in known
+                          if any(w in m for w in ("image", "transcribe", "realtime",
+                                                  "embedding", "whisper", "tts"))})
+
+
 class TestOAuthDetection(unittest.TestCase):
     def test_detects_claude_code_oauth_token(self):
         self.assertTrue(is_oauth_anthropic_token("sk-ant-oat01-eACw6b1XYZ"))

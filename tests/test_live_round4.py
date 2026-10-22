@@ -247,7 +247,12 @@ CLOSING_CONTROLS = [
 ]
 
 
-@pytest.mark.parametrize("text", PRESENCE + CLOSINGS)
+#: D-R5 (2026-10-06 call): «ها» ("huh") at 4:39 became a causal turn — a task
+#: titled «ها» that superseded the reply owed to «فورمولوان».
+HUH = ["ها", "هان", "ها؟", "هان؟"]
+
+
+@pytest.mark.parametrize("text", PRESENCE + CLOSINGS + HUH)
 def test_presence_checks_and_closings_are_phatic(text):
     assert live.is_phatic(text), text
     assert not live._LiveSession.is_request_turn(None, _turn(text), SUBJECT), text
@@ -2165,3 +2170,222 @@ def test_control_negations_stay_out_and_bare_words_stay_bare(words, expected):
 async def test_an_acknowledgement_lead_in_inside_the_stop_turn_is_backstopped(monkeypatch, words):
     client, controls, _thinks = await _backstop(monkeypatch, [words], ack="چشم." if words[0] > "z" else "Okay.")
     assert controls == ["stop"]
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D-R5 (2026-10-06 call): a filler never supersedes the reply that is owed
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later", HUH[:2] + ["آره", "اوکی", "okay", "yeah"])
+async def test_d_r5_a_filler_or_bare_assent_while_a_reply_is_owed_never_supersedes_it(
+    monkeypatch, later,
+):
+    """The request got no reply and the agent has said nothing since: «ها»,
+    and a bare «آره» / "okay" with nothing to consent to, are fillers —
+    `phatic` on the wire, and the request stays the one owed (its reask is
+    accepted, never `stale`)."""
+
+    H.fast_clocks(monkeypatch)
+    H.patch_relay(monkeypatch)
+    box: dict = {}
+
+    async def later_turn():
+        await _wait(lambda: len(_finals(client)) >= 1)
+        await asyncio.sleep(0.3)
+        box["p"].push(H.user_delta(later, 4000, 4300))
+        await _wait(lambda: len(_finals(client)) >= 2)
+        first = _finals(client)[0]
+        _send(client, {
+            "type": "inject_text", "text": first["text"], "reason": "no_response",
+            "reask_of_user_turn_id": first["turn_id"],
+        })
+
+    client = Phone([H.config(features=V03), later_turn, 0.4, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_silent_after(box, UNANSWERED), auto_ack=True)
+    await H.run_relay(client, provider, timeout=8, db_session_id=_db("d-r5", later))
+
+    finals = _finals(client)
+    assert finals[1].get("phatic") is True, finals[1]
+    assert [(f["user_turn_id"], f["outcome"]) for f in client.of("reask_result")] == [
+        (finals[0]["turn_id"], "accepted"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("said", [
+    # The agent answered the request: an assent now may consent to it.
+    "I could look up dentists near Union Station for you.",
+    # …and an open question makes it a consent, as always.
+    "Do you want me to look one up?",
+])
+async def test_d_r5_a_bare_assent_after_the_agent_spoke_stays_a_request(monkeypatch, said):
+    H.fast_clocks(monkeypatch)
+    H.patch_relay(monkeypatch)
+    box: dict = {}
+
+    async def later_turn():
+        await _wait(lambda: len(_finals(client)) >= 1)
+        await asyncio.sleep(0.3)
+        box["p"].push(H.user_delta("آره", 4000, 4300))
+        await _wait(lambda: len(_finals(client)) >= 2)
+
+    extra = [H.out_text(said, 1200, 2400), H.out_audio("SAID")]
+    client = Phone([H.config(features=V03), later_turn, 0.4, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_silent_after(box, UNANSWERED, extra=extra), auto_ack=True)
+    await H.run_relay(client, provider, timeout=8, db_session_id=_db("d-r5-ctl", said))
+
+    finals = _finals(client)
+    assert finals[1].get("phatic") is None, finals[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("assent", "offer"), [
+    ("yeah", "Nobu has a table at eight tonight. Do you want me to book it?"),
+    ("آره", "Nobu has a table at eight tonight. Do you want me to book it?"),
+    # A proposal with no question mark: `agent_question_open` is blind to it
+    # (critic R6) — only "the agent SPOKE since" keeps the consent a request.
+    ("yeah", "Nobu has a table at eight tonight. I can book it for you."),
+    ("آره", "Nobu has a table at eight tonight. I can book it for you."),
+])
+async def test_d_r5_consent_to_a_delivered_results_offer_stays_a_request_while_another_reply_is_owed(
+    monkeypatch, caplog, assent, offer,
+):
+    """Phase D (correctness-relay-1): request A is delegated, request B gets no
+    reply (owed), and A's result is VOICED — a claimed epoch ending «…book
+    it?».  `reply_pending_turn` ignores claimed epochs, so it still names B;
+    read through it, "the agent said nothing since" was true and the consent
+    to the result's offer went on the wire as `phatic` and was never
+    dispatched.  The agent DID speak since B closed: the assent is a request."""
+
+    import logging
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    H.fast_clocks(monkeypatch)
+    thinks: list = []
+
+    async def think(*_a, **kw):
+        thinks.append(kw.get("delegation_id"))
+        await asyncio.sleep(1.2)
+        return "Nobu has a table at 8 tonight. Do you want me to book it?", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    box: dict = {}
+
+    def on_send(provider, event):
+        box["p"] = provider
+        if event["type"] == "session.start":
+            provider.push(H.user_delta("find me a table at Nobu tonight", 0, 900))
+            provider.push(H.delegation("d1", 950))
+        elif event["type"] == "session.commentary.append":
+            provider.push(H.out_text(offer, 5000, 6000))
+            provider.push(H.out_audio("SPEAK"))
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def script():
+        await _wait(lambda: len(_finals(client)) >= 1)
+        await asyncio.sleep(0.3)
+        box["p"].push(H.user_delta("what is the capital of Peru", 2000, 2800))  # no reply: owed
+        await _wait(lambda: len(_finals(client)) >= 2)
+        await _wait(lambda: any("result spoken" in r.getMessage() for r in caplog.records), timeout=5)
+        await asyncio.sleep(0.5)
+        box["p"].push(H.user_delta(assent, 7000, 7300))
+        await _wait(lambda: len(_finals(client)) >= 3)
+        await asyncio.sleep(0.5)
+
+    client = Phone([H.config(features=V03), script, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=12, db_session_id=_db("d-r5-offer", assent, offer))
+
+    finals = _finals(client)
+    assert thinks[:1] == ["d1"]
+    assert any("result spoken id=d1" in r.getMessage() for r in caplog.records)
+    assert finals[2]["text"] == assent
+    assert finals[2].get("phatic") is None, finals[2]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Voice round 2026-10-07 (D-R4 (3)): the relay's play reading of a spoken
+# ask — «یه دنه», «حالا», «واسم», "now", "okay now"
+# ══════════════════════════════════════════════════════════════════════
+
+_PLAY_ASKS_1007 = [
+    ("حالا یه دنه آهنگ دریک واسم پخش کن", "Drake"),        # the recorded ask
+    ("یه دنه آهنگ دریک واسم پخش کن", "Drake"),
+    ("حالا یه دونه آهنگ از دریک برام پخش کن", "Drake"),
+    ("یه دانه آهنگ از ابی برام بذار", "ابی"),
+    ("یک دانه آهنگ از گوگوش پخش کن", "گوگوش"),
+    ("حالا یه آهنگ از مدونا واسه من پخش کن", "مدونا"),
+    ("یه‌دونه آهنگ از دریک پخش کن", "Drake"),
+    ("اوکی حالا یه دنه آهنگ از دریک پخش کن", "Drake"),
+    ("یه دنه آهنگ واسم پخش کن", "آهنگ"),
+    ("now play a song by drake", "drake"),
+    ("okay now play a song by drake", "drake"),            # two leads
+    ("alright then play halo", "halo"),
+]
+
+_NOT_PLAYS_1007 = [
+    "حالا یه دنه آهنگ دریک واسم پخش نکن",
+    "یه دونه آهنگ از دریک دیشب شنیدم",
+    "حالا این آهنگ چیه",
+    "یه دنه سوال دارم",
+    "حالا اسمش چیه",
+    "یه دونه آهنگ از دریک پخش کردی؟",
+    "حالا بیخیال آهنگ",
+    "حالا یه دنه آهنگ دریک واسم پیدا کن ولی پخش نکن",
+    "حالا",
+    "یه دنه",
+    "حالا دریک",
+    "now play it back",
+    "now don't play anything",
+    "now stop the music",
+    "okay now what's this song",
+]
+
+
+@pytest.mark.parametrize(("text", "query"), _PLAY_ASKS_1007)
+def test_a_spoken_play_with_leads_and_one_piece_of_reaches_the_fast_path(text, query):
+    ask, is_play = live.play_request_evidence(text)
+    assert is_play and ask is not None, text
+    assert ask.query == query
+
+
+@pytest.mark.parametrize("text", _NOT_PLAYS_1007)
+def test_the_new_leads_and_determiners_never_make_a_play(text):
+    ask, is_play = live.play_request_evidence(text)
+    assert ask is None, text
+    assert is_play is False, text
+
+
+def test_two_leads_are_stripped_and_never_three():
+    readings = live._play_repairs("okay now play a song by drake")
+    assert "play a song by drake" in readings
+    assert "now play a song by drake" in readings
+    # The bound is the point: a third lead is a sentence, not a lead.
+    assert "play halo" not in live._play_repairs("okay so now play halo")
+
+
+def test_now_as_a_title_is_still_the_time_word_pinned():
+    """PINNED current behaviour (not changed in 2026-10-07): «حالا» is a lead
+    word of the shared grammar, so a song titled «حالا» is swallowed and the
+    artist is the query."""
+
+    ask, is_play = live.play_request_evidence("آهنگ حالا از ابی رو پخش کن")
+    assert is_play and ask is not None and ask.query == "ابی"
+
+
+@pytest.mark.parametrize(("text", "query"), [
+    ("now play a song by drake", "drake"),
+    ("okay now play a song by drake", "drake"),
+    ("then play halo", "halo"),
+])
+def test_a_model_delegation_of_a_repaired_play_reads_the_same_ask(text, query):
+    """`task_media_ask` — the fast path's ONE reader — falls back to the
+    relay's repairs, so GPT-Live delegating "now play …" gets the play the
+    backstop would have parsed, and the ledger counts it as a play."""
+
+    task = live.DelegatedTask(delegation_id="d-1007", offset_ms=0, transcript=text)
+    ask = live.task_media_ask(task)
+    assert ask is not None and ask.query == query
+    assert live._LiveSession.is_media_play(task)

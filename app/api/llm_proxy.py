@@ -2997,12 +2997,19 @@ def _namespace_of(name: str) -> str:
 #: LLM_PROXY_PROTECTED_CORE_TOOLS (comma-separated) to widen or empty it
 #: without a deploy of new code.
 #:
-#: Exactly the five names the brief specifies, and no more. Every extra entry
+#: The five names the original brief specified, plus the two the 2026-10-06
+#: voice round added (below, with its reason), and no more. Every extra entry
 #: is one more name the floor can hold on the wire at the expense of a tool
 #: the REQUEST named — the trade `_cap_tools` makes below — so widening this
 #: set is not free and is not a judgement call to make while writing it.
 _PROTECTED_CORE_DEFAULT = (
     "play_media", "web_search", "web_fetch", "recall_day", "memory_search",
+    # Voice round 2026-10-06 (D-T1/D-T2), widened deliberately with the
+    # trade named above accepted: a `full` turn's 173-name array is trimmed
+    # to 128 by position, and both of these sit past the protected head —
+    # `media_control` is the only way a delegated "stop it" can act, and
+    # `delegate` is the only way a heavy request reaches the supervisor.
+    "media_control", "delegate",
 )
 
 

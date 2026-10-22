@@ -183,6 +183,9 @@ AGENT_ONLY_TABLES: set[str] = {
 }
 
 PLATFORM_ONLY_TABLES: set[str] = {
+    # Derived chat headings and cross-replica generation leases. No message
+    # bodies or FK to tenant-only messages/day_chats are stored here.
+    "chat_topic_titles",
     # VPS & infrastructure
     "vps_plans",
     "vps_instances",

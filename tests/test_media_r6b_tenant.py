@@ -432,9 +432,14 @@ def test_t4_every_media_play_producer_goes_through_the_chokepoint():
     # hub's browser-agent pane), never to the user's chat sockets the stop
     # reaches — not a device this gate speaks for (R6-10 TA7; the evidence is
     # pinned in tests/test_media_r6c_tenant.py).
+    # Re-pinned 2026-10-06 (voice round, D-T1): `radio/control.py` now builds
+    # ONE media_play frame — `resume` re-announces the recorded item — and it
+    # leaves through the same chokepoint, asserted right here.
     assert producers == [
-        "agent/radio/player.py", "agent/tool_executor.py", "api/ws_browser.py", "api/ws_chat.py",
+        "agent/radio/control.py", "agent/radio/player.py", "agent/tool_executor.py",
+        "api/ws_browser.py", "api/ws_chat.py",
     ], producers
+    assert "send_media_play(" in inspect.getsource(control._execute_resume)
 
 
 # ══ 9. newer_playing: the wire shape, and paused (residual 4) ══════════════
@@ -617,4 +622,10 @@ def test_the_three_shared_lexicon_sets_are_unchanged():
 
 
 # sha256 of the three texts as shipped in the snapF media_intent (3bacb9b1…).
-_SNAPF_LEXICON_SHA256 = "340573129ee54fad6149d719cfb2a6325ecd9d58667a619d1a1a3d7d84ec7c97"
+# PIN FLIPPED 2026-10-06 (voice round D-R5, a recorded, deliberate change of
+# the one class): «ها» / «هان» ("huh") joined CONTENT_FREE_WORDS_TEXT together
+# with the relay's `_DISCOURSE_FILLERS` (still pinned EQUAL by
+# tests/test_media_order_scope_r6.py) — on the 2026-10-06 call «ها» became a
+# causal turn, a task titled «ها», and superseded the owed reply.  Was
+# "340573129ee54fad6149d719cfb2a6325ecd9d58667a619d1a1a3d7d84ec7c97".
+_SNAPF_LEXICON_SHA256 = "3ceb03a20dfcd72d5f9e17746f7c227a8c615ec42f7ca3f90d7773064dad00d6"

@@ -1088,6 +1088,10 @@ class ChatMessageResponse(BaseModel):
     job_outcome: Optional[str] = None
     job_error_class: Optional[str] = None
     job_user_message: Optional[str] = None
+    # Voice round 2026-10-06 (D-R8 d): the relay delegation a voice card is,
+    # and the caller turn that asked for it (projected from the job row).
+    job_delegation_id: Optional[str] = None
+    job_parent_user_turn_id: Optional[str] = None
     # Cross-channel reply-to (migration 049): soft pointer to a previous
     # message anywhere in this user's day. Frontend resolves the target
     # client-side from its in-memory day-chat list and renders a quoted

@@ -220,3 +220,28 @@ def test_the_always_included_affordances_are_not_what_plays_music():
     ten legal moves on iteration 0 of every short question, and putting a
     player in it is the ND-18 mistake."""
     assert "play_media" not in _ALWAYS_INCLUDED_TOOLS
+
+
+# ── Voice round 2026-10-06 (D-T1): a control ask can CONTROL ─────────────
+# «استاپش کن» reached an agent with no tool that could stop music; "stop it"
+# (two Latin words, zero score) lands in `question`, whose round-0 set held no
+# media tool at all. `media_control` is always included — unlike `play_media`
+# above, a control is the canonical zero-score ask.
+CONTROL_ASKS = ["stop it", "pause", "skip", "استاپش کن", "بسه", "قطعش کن", "نگهش دار"]
+
+
+@pytest.mark.parametrize("message", CONTROL_ASKS)
+def test_a_control_ask_sees_media_control_on_round_zero(message):
+    defs = TOOL_DEFS + [{"name": "media_control"}]
+    intent = classify_query_intent(message)
+    exposed = {t["name"] for t in filter_tools_by_intent(defs, intent)}
+    assert intent.category == "full" or "media_control" in exposed, (
+        message, intent.category, sorted(exposed),
+    )
+
+
+def test_media_control_rides_the_media_intent_too():
+    from app.agent.query_intent import TOOLS_MEDIA
+
+    assert "media_control" in TOOLS_MEDIA
+    assert "media_control" in _ALWAYS_INCLUDED_TOOLS

@@ -258,8 +258,12 @@ async def test_production_shape_proxy_budget_and_first_call_capability():
         for name in sorted(manifest_names + first_party + unknown)
     ]
     stable = core + skills + mcp
+    # 66 / 178 since the supervisor's `delegate` (voice round 2026-10-05) —
+    # a core def that is filtered out of the wire whenever its gate is off.
+    # 67 / 179 since `media_control` (voice round 2026-10-06, D-T1): the
+    # agent's own stop/pause/resume/next/previous tool, re-pinned on purpose.
     assert (len(core), len(skills), len(manifest_names), len(first_party), len(stable)) == (
-        65, 37, 60, 10, 177,
+        67, 37, 60, 10, 179,
     )
     intent = classify_query_intent('Hi')
     allowed = sorted({t['name'] for t in filter_tools_by_intent(stable, intent)})
@@ -275,7 +279,10 @@ async def test_production_shape_proxy_budget_and_first_call_capability():
     deduped, duplicates = _dedup_tool_names(full_wire)
     capped, dropped = _cap_tools(deduped, protected=set(allowed))
     pruned_wire = _anthropic_tools_to_responses(selected)
-    assert (len(full_wire), len(deduped), len(capped), len(pruned_wire)) == (177, 176, 128, 11)
+    # 179/178/…/12 since `media_control` (voice round 2026-10-06, D-T1): one
+    # more core def, and ALWAYS-INCLUDED, so a greeting's first-call wire
+    # carries it too — re-pinned on purpose.
+    assert (len(full_wire), len(deduped), len(capped), len(pruned_wire)) == (179, 178, 128, 12)
     assert 'memory_search' in duplicates
     assert not (set(allowed) & set(dropped))
     assert {t['name'] for t in pruned_wire} == set(allowed)

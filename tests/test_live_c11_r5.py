@@ -281,6 +281,9 @@ async def test_a_contextual_correction_of_running_work_asks_and_binds(monkeypatc
     refined = calls[-1]
     assert BINDING in refined and first in refined.split("Current caller request:")[0], refined
     assert "(non-binding context" not in refined.split("Current caller request:")[0]
+    # Voice round 2026-10-06 (D-6a): the reworded context rule's stem — the
+    # old stem alone would now pass vacuously.
+    assert "(context only" not in refined.split("Current caller request:")[0]
 
 
 @pytest.mark.asyncio

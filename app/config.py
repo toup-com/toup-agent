@@ -1350,6 +1350,16 @@ class Settings(BaseSettings):
     # Live exposes transcript deltas but no transcript-done event, so those
     # turns wait for this bounded hard silence instead of executing a fragment.
     voice_live_utterance_hard_gap_ms: int = 2600
+    # PR-7 (F3b): a turn that closed on the ordinary gap WITHOUT ending a
+    # phrase (no terminal punctuation, not phatic) gets its held reply only
+    # after the hard gap, and a caller who resumes inside it drops that reply.
+    # OFF by default. GPT-Live's speech recognition often sends no terminal
+    # punctuation: none of the 7 caller turns on 2026-10-02 had any. So when
+    # on, nearly every direct reply would start about (hard gap - gap) later,
+    # about +1.4 s (end+1.2 s becomes end+2.6 s). Turn it on only once the
+    # measurements show it is worth that: `live_turn_gap_close phrase_end=`
+    # (the punctuation rate) and `live_turn_split_by_arrival_jitter` (F3c).
+    voice_live_phrase_window_enabled: bool = False
     voice_live_utterance_max_chars: int = 600
     voice_live_utterance_max_ms: int = 60000
     # A delegation binds to the contiguous run of unanswered caller turns that
@@ -1371,7 +1381,11 @@ class Settings(BaseSettings):
     # Progress notes for the model while a delegation runs (thinking.append,
     # never commentary: a progress note must not be spoken over the caller).
     voice_live_progress_min_interval_s: float = 4.0
-    voice_live_progress_max_per_delegation: int = 6
+    # Voice round 2026-10-07 (D-R4 (2)): two notes per task — one at the first
+    # real tool start, one when the tool KIND changes — each marked as silent
+    # context.  Six read as a running commentary the model voiced on its own
+    # («همین الان دارم یه صفحه رو دقیق می‌خونم», the 10-07 call's epoch 6).
+    voice_live_progress_max_per_delegation: int = 2
     # …and the one exception, grounded (R2 §E): once a REAL tool.start has
     # arrived and the caller has heard nothing for this long, ONE short line
     # from the relay's fixed fa/en table ("still searching the web") is spoken
@@ -1380,17 +1394,41 @@ class Settings(BaseSettings):
     voice_live_progress_speak_after_s: float = 6.0
     # R2 addendum 7: at most this many unprompted lines per task — the first
     # after a real tool.start, a second only when a tool of a DIFFERENT spoken
-    # kind really starts (search → reading a page).
-    voice_live_progress_spoken_max: int = 2
+    # kind really starts (search → reading a page).  Voice round 2026-10-07
+    # (D-R4 (2)): ONE line per task — a second line ate airtime and held the
+    # result behind its own unvoiced claim.
+    voice_live_progress_spoken_max: int = 1
     # …and a task that never started a tool gets at most one honest "still
     # working on «title»" line after this much silence (never "searching"; not
     # earlier than `voice_live_progress_speak_after_s`).
     voice_live_progress_idle_after_s: float = 8.0
+    # Voice round 2026-10-07 (D-R4 (2)): no progress line within this many
+    # seconds of a task's EXPECTED finish (`_PROGRESS_EXPECTED_S` by plan kind:
+    # search 20 s, media 8 s, generic 12 s), and none once the tenant's answer
+    # beat arrived.  A line said a second before the result is a line the
+    # result has to wait behind.  `[LIVE] progress suppressed … elapsed=
+    # expected=` logs every suppression so the re-recording can tune the table.
+    # 0 turns the near-finish rule off (the answer-beat rule stays).
+    voice_live_progress_min_remaining_s: float = 8.0
     # Output epochs. GPT-Live has no response id and no output-complete event,
     # so the relay closes an epoch on the client ack OR on this much provider
     # silence — one missed native ack used to fuse an entire call into one
     # caption with the mic gate latched open behind it.
     voice_live_output_epoch_gap_ms: int = 700
+    # PR-7 (F1): held audio that no transcript has timed (audio-only output)
+    # waits at most one output-epoch gap from its arrival for its transcript.
+    # If none comes, it is dropped (`live_deferred_output_dropped
+    # reason=untimed_audio`) and never played into the caller's pause.
+    # `live_untimed_audio_timed lag_ms=` measures how far audio leads its
+    # transcript. Off is a no-build rollback: untimed audio is released
+    # parentless when the hold ends, as before PR-7.
+    voice_live_untimed_audio_hold_enabled: bool = True
+    # PR-7 (F6b): the provider silence required before closing an output
+    # epoch whose text so far does NOT end a sentence — "…in the LLM" + a
+    # stall + "program." was two bubbles and two rows on 2026-10-02. An epoch
+    # whose text ends a sentence, and an audio-only epoch (no text to judge),
+    # keep the gap above. Never below that gap.
+    voice_live_output_epoch_hard_gap_ms: int = 2500
     # The interrupt fence is time-bounded. Its predecessor had no deadline and
     # one unlucky comparison muted the assistant for the rest of the session.
     voice_live_interrupt_suppress_ms: int = 2500
@@ -1399,14 +1437,21 @@ class Settings(BaseSettings):
     # echo test fails.
     voice_live_bargein_enabled: bool = True
     # R13: barge-in is decided on NON-ECHO transcript evidence, and needs BOTH
-    # this much speech AND this many words — a single delta can never be an
-    # interruption. A delta whose content words are at least `echo_overlap`
-    # the agent's own recent words is its voice coming back through the
-    # speaker and counts for nothing. A `speech_started` the client does not
-    # answer with an interrupt within `rearm_ms` is given back for that reply.
-    voice_live_bargein_min_ms: int = 600
-    voice_live_bargein_min_tokens: int = 3
+    # this much speech AND this many words. A delta whose content words are at
+    # least `echo_overlap` the agent's own recent words is its voice coming
+    # back through the speaker and counts for nothing. A `speech_started` the
+    # client does not answer with an interrupt within `rearm_ms` is given back
+    # for that reply. D-P9 (2026-10-05): a two-word interjection («چی شد»,
+    # "wait what") counts — 600 ms / 3 words / 2 deltas let the agent talk
+    # straight over it.
+    voice_live_bargein_min_ms: int = 400
+    voice_live_bargein_min_tokens: int = 2
     voice_live_bargein_rearm_ms: int = 1500
+    # D-P9 / D-P1: the relay's "Stop speaking now." instruction is permanent
+    # session state, so it goes only to a caller who keeps talking this long
+    # over the reply. A short interjection is answered by the model itself;
+    # the phone's cut and the interrupt fence silence the old reply.
+    voice_live_stop_instruction_min_speech_ms: int = 1500
     voice_live_echo_overlap: float = 0.6
     # Appends are limited to 500 TOKENS each. Budget below that, in tokens —
     # the old 350-CHARACTER cap split ordinary answers into two independently
@@ -1455,14 +1500,57 @@ class Settings(BaseSettings):
     # discarded (production: "persistence drain timed out; 25 queued" and no
     # loss signal after it). A record still queued when it runs out is counted
     # and logged as lost, one by one. It outlives the socket, not the process.
-    voice_live_persist_background_drain_s: float = 120.0
-    # A transcript row whose write fails because the TENANT is away (refused
+    #
+    # Measured from the lane's LAST PROGRESS (a write that landed, or the lane
+    # starting to wait with nothing ahead of it), not from hang-up: a tenant
+    # that keeps taking rows keeps the finisher going, and one that took
+    # nothing for this long is not coming back in time. Sized for a stall plus
+    # an in-place restart booting under host load: the 2026-10-02 call needed
+    # ≈4.9 min (first failed write 02:29:47, tenant back 02:34:42); 120 s gave
+    # up 32 s before it returned, and the ten rows still queued were lost.
+    voice_live_persist_background_drain_s: float = 420.0
+    # A transcript row whose write fails the way an outage fails (refused
     # connection, timeout, 502/503/504, no tenant address while it deploys)
-    # keeps retrying — backoff 0.5/1/2/4/8 s — for this long after its first
-    # attempt while the call is live; the detached finisher widens it to its
-    # own budget above. A row-specific failure (a tenant 500) still gets three
-    # attempts, and a permanent one only one.
+    # while the tenant is NOT confirmed away keeps retrying — backoff
+    # 0.5/1/2/4/8 s — for this long after its first counted attempt while the
+    # call is live; the detached finisher widens it to its own budget above. A
+    # row-specific failure (a tenant 500) still gets three attempts, and a
+    # permanent one only one. A CONFIRMED outage is the lane's, not the row's:
+    # see `voice_live_persist_lane_deadline_s`.
     voice_live_persist_retry_window_s: float = 30.0
+    # The transcript lane's outage budget (P3). When a write fails the way an
+    # outage fails AND an independent probe of the tenant fails the same way,
+    # the lane is `tenant_away`: it keeps retrying its HEAD row without
+    # charging that row's attempts, so the rows queued behind it lose nothing
+    # while they wait. The budget is the lane's, counted from when the tenant
+    # went away — not each row's, which spent one 47 s ladder per row while the
+    # rest of the call queued behind it. Past it the lane still reaches a LOST
+    # verdict, row by row; after hang-up the finisher's own budget above is the
+    # one that ends it (and `teardown_budget` counts what is left).
+    voice_live_persist_lane_deadline_s: float = 600.0
+    # Per-attempt HTTP timeout for a row write, and for the probe, while the
+    # lane is `tenant_away` — instead of the 15 s default, so a stalled tenant
+    # costs seconds per retry. A tenant that answers the probe in time is not
+    # away, and its rows go back to the full timeout.
+    voice_live_persist_away_timeout_s: float = 5.0
+    # Proxy load shedding for a STALLED tenant (PR-15, 2026-10-02 incident §3).
+    # The platform's read proxies to a tenant (apps/jobs polling, autopilot
+    # missions, day-chats, sessions) each tried the tunnel and then re-dialled
+    # over HTTPS — another 6-12 s request — even right after a forward to the
+    # same tenant had just timed out, so the app's 5 s job poll and the chat
+    # screens piled onto a tenant whose event loop was already stalled.
+    #
+    # After a tunnel forward or a proxied read to a tenant TIMES OUT, its
+    # guarded read proxies answer 503 `agent_unreachable` immediately, with a
+    # `Retry-After` of the time left, for this many seconds — no tunnel, no
+    # HTTPS re-dial. Per process (each replica learns on its own). The app
+    # honours a Retry-After of up to 10 s, so keep it ≤ 10. 0 disables.
+    tenant_proxy_timeout_memo_s: float = 10.0
+    # At most this many guarded proxied reads in flight to one tenant from this
+    # process; the next one answers 503 `agent_unreachable` at once instead of
+    # queueing behind them. Writes, health probes and the voice relay's own
+    # tenant calls are never refused or counted. 0 disables.
+    tenant_proxy_max_inflight: int = 8
     # Memory curation is a tenant LLM call (60 s timeout) and rides its own
     # bounded, low-priority lane so it can never hold a transcript row or the
     # teardown drain behind it. Full ⇒ the OLDEST waiting curation is dropped
@@ -1484,6 +1572,45 @@ class Settings(BaseSettings):
     # «آهنگ رو قطع» closed, GPT-Live only said «چشم», and nothing stopped.
     voice_live_media_backstop_enabled: bool = True
     voice_live_media_backstop_grace_ms: int = 1500
+    # D-R4 (2026-10-06 call, «استاپش کن» while a song played): a BARE playback
+    # command (no media noun: «استاپش کن», "stop it", «بسه», "pause") is a
+    # media command only while the phone reports playback, and the backstop
+    # for it waits this much less — the stop has to land within ~1 s.
+    voice_live_media_backstop_playing_grace_ms: int = 400
+    # D-R3 (2026-10-06 call, «اوکی برا می آهنگ پخش کن»): the PLAY backstop.  A
+    # closed caller turn that asks to play something and that no model
+    # delegation claims within the grace is started by the relay itself (a
+    # parsed ask through the media fast path; an unparsed one through the
+    # agent).  The recorded model said «حتماً، دارم پخش می‌کنم.» and delegated
+    # nothing; nothing played.
+    voice_live_play_backstop_enabled: bool = True
+    # Voice round 2026-10-07 (D-R4 (3)): 800 → 300 ms for a PARSED ask.  A
+    # parsed play is deterministic; the grace only waits for the model's own
+    # delegation, which `play_backstop_hold` still waits for while it is
+    # pending at/after the turn, and a late one is absorbed.  The unparsed
+    # (agent) play keeps `voice_live_media_backstop_grace_ms`.
+    voice_live_play_backstop_grace_ms: int = 300
+    # Voice round 2026-10-07 (D-R4 (4)): "what's playing" («این آهنگ چیه»,
+    # «اسمش چیه», "what's this song") is answered by the relay from the phone's
+    # own now-playing report — no card, no agent turn.  A closed turn that asks
+    # it, with a titled track playing, is answered after this grace unless the
+    # model delegated it (then the delegation is answered, Hook A) or answered
+    # it itself.  Off: such a turn goes to the model / the agent as before.
+    voice_live_media_status_enabled: bool = True
+    voice_live_media_status_grace_ms: int = 400
+    # D-R6: how long after the agent's spoken result asked the caller a
+    # question a SHORT turn is read as the answer to it (`link_answer`), and how
+    # recently a running task's request must have closed for a one-word turn
+    # to be read as its correction.
+    voice_live_answer_window_s: float = 30.0
+    # D-P3 (2026-10-05 call), the research BACKSTOP: a closed caller turn that
+    # explicitly asks to search / look up / google / find out («خب سرچ کن
+    # برام», «چرا سرچ نمی کنی») and that no model delegation claims within the
+    # grace becomes a relay-opened web-research task (`require_web`).  The
+    # recorded call asked three times; GPT-Live answered from memory, then said
+    # «من چیزی رو سرچ نکردم», and nothing ever searched.
+    voice_live_research_backstop_enabled: bool = True
+    voice_live_research_backstop_grace_ms: int = 800
     # ── Delivering a delegated result out loud (R12) ────────────────
     # A finished task is not delivered until the provider has actually STARTED
     # an output epoch for the commentary that carries it. This is how long the
@@ -1497,6 +1624,176 @@ class Settings(BaseSettings):
     # before it is spoken anyway. Bounded, because an answer nobody ever hears
     # is the defect this whole section exists to remove.
     voice_live_result_defer_max_ms: int = 4000
+    # R7 (2026-10-06 call, problem 6): two requests in flight are answered in
+    # the order they were ASKED. A result that finished first while an
+    # earlier-asked task still runs waits at most this long for it, then goes
+    # out of order (`[LIVE] result held for order`). 0 disables the wait.
+    voice_live_result_order_wait_s: float = 4.0
+    # ── Voice round 2026-10-07 (D-R1): the delivery proof reads the WORDS ──
+    # GPT-Live usually starts voicing an append BEFORE its ack reaches the
+    # relay (7 of the 12 identified voicings of the 10-07 call), so "the first
+    # epoch after the ack" bound the wrong epoch (epochs 14, 21, 23) and missed
+    # the real telling (epochs 7, 13, 17, 20). A result is now spoken when the
+    # epoch's own words prove it (`words_verdict`).
+    # Two results finishing within this many seconds of each other go out as
+    # ONE append group (a pair cue + both commentaries) told in ask order.
+    # 0 disables the merge (each result waits for the previous one to retire).
+    voice_live_result_merge_window_s: float = 5.0
+    # A result that lands while another is being voiced is sent after that
+    # epoch retires with one short "continue, do not start over" cue.
+    voice_live_result_continue_cue_enabled: bool = True
+    # A media result (or a cross-language telling) binds the first epoch BORN
+    # within this many ms after its send that is not parented on a newer
+    # caller turn — a Latin title spoken in Persian shares too few tokens.
+    voice_live_result_bind_window_ms: int = 2500
+    # While an epoch is open the model is talking: no nudge and no verdict.
+    # Bounded from the append — past it the model has talked this long
+    # without saying this answer.
+    voice_live_result_verdict_max_s: float = 120.0
+    # A result written off unspoken stays a words candidate this long, so a
+    # late paraphrase (a muted caller unmuting) is still recognised as it.
+    voice_live_result_late_words_s: float = 60.0
+    # An unbound epoch born this soon after a media line's send folds onto
+    # the media act's row (one act, one row). 0 disables the fold.
+    voice_live_media_fold_window_s: float = 6.0
+    # F14 (critic C7): a relay line (progress/status) holds a waiting result
+    # only while its bound epoch is open or, unbound, for this long after its
+    # SEND; then its claim is withdrawn (`reason=result_waiting`).
+    voice_live_relay_line_hold_ms: int = 1500
+    # ── A delegated task the agent could not run (2026-10-02 call, P2) ──
+    # A Live delegation is a task the voice model chose NOT to answer itself,
+    # so a model with no tools answering it anyway is the wrong answer however
+    # honest its prompt. When the user's agent cannot be reached, or starts and
+    # then times out, Live fails the task at once with a typed reason and a
+    # spoken retry offer instead of falling back to the tool-less model
+    # ("Option B" in ws_realtime._think). True restores that fallback for Live;
+    # the legacy Realtime path keeps it either way.
+    voice_live_toolless_fallback_enabled: bool = False
+    # LOG-ONLY: an agent think stream whose first frame (the tenant's `ready`,
+    # sent before any work) arrives later than this many seconds is logged, as
+    # is one that fails with no first frame by then. 0 = off. Nothing is cut
+    # short: this becomes a deadline only once the tenant's first-frame latency
+    # has been measured (on 2026-10-02 a stalled tenant held the relay 30 s,
+    # the full per-chunk read timeout, before anything could be said).
+    voice_live_think_ready_deadline_s: float = 0.0
+    # ── A task's short title (2026-10-02 call, D2 / PR-14) ──────────────
+    # GPT-Live's `session.delegation.created` carries no text, so a task card
+    # was titled with the caller's raw words ("Everything is good. Can you
+    # search…", or "Task" for "retry"). The relay now asks ONE small model for
+    # a title of at most six words, in the caller's language, from the request
+    # it hands the agent (a correction or a retry resolved). It is requested
+    # immediately before the agent call and never awaited by it: the dispatch
+    # does not wait for a title. It reaches a client that lists `task_summary`
+    # (`delegation.summary` and the `task_summary` frame) and the saved row
+    # (`voice.task_summary`); `delegation.title` keeps the caller's words for
+    # every client. A title not back within the timeout is dropped (the card
+    # keeps today's title) and the late answer is only logged, so the budget
+    # can be set from measured latency. Off: no call, no frame, no capability.
+    voice_live_task_summary_enabled: bool = True
+    voice_live_task_summary_model: str = "gpt-4o-mini"
+    voice_live_task_summary_timeout_s: float = 2.5
+    # P1 (2026-10-02 call): GPT-Live consumes an append only while its INPUT
+    # audio timeline moves; a muted caller (build 138 sends no frame at all)
+    # or the app's silent idle stops it, and the speak budget above then
+    # expired into a void ("Result in chat" 12 s after the job, the answer
+    # voiced 22 s later as a row of its own). While NO input has reached the
+    # provider since a result's latest append, its deadline is re-armed
+    # instead of expiring — at most this long after the result was handed
+    # over, so the verdict still lands inside the app's 30 s delivery grace
+    # (DELIVERY_GRACE_MS); then the usual nudge/verdict runs. Re-arms are
+    # counted `live_result_rearmed{reason=no_input|no_input_after_nudge}`;
+    # no frame changes. 0 disables the hold.
+    voice_live_speak_no_input_max_s: float = 24.0
+    # The UPLINK KEEPER (same incident): while the relay owes the caller speech
+    # (a result, a relay line waiting for its epoch) and the phone has sent no
+    # audio for 500 ms, the relay sends PCM16 24 kHz digital silence at
+    # real-time pace so GPT-Live's input keeps moving; it stops the moment
+    # phone audio arrives and never fires mid-utterance. Each episode is capped
+    # at `voice_live_uplink_keeper_max_s`. ON since the controlled experiment
+    # (backend/scripts/live_append_experiment.py, 2026-10-05, inside a
+    # production container): with no input the append was never acked in 20 s
+    # and the provider closed on `context_injection_incomplete`; with
+    # real-time digital silence it was acked at ~600 ms and voiced.
+    # The keeper is NOT free: usage follows the INPUT timeline (measured
+    # 2026-10-05: 0.0 s billed with no input and ~22 s open, 20.0 s billed for
+    # 20 s of keeper silence), so every chunk is billed — about $0.025 per
+    # 30 s, at most ~$0.04 per episode at the 45 s cap. The cap is per
+    # EPISODE and an episode ends whenever nothing is owed for one tick; there
+    # is no per-call ceiling. Each episode logs `uplink keeper off … sent_ms=`.
+    # It also runs while a DIRECT reply or an accepted reask is owed, and for
+    # the whole of an open reply: GPT-Live voices nothing while its input
+    # timeline stands still (reply owed + relay reask + its 12 s watch fit
+    # inside one episode).
+    voice_live_uplink_keeper_enabled: bool = True
+    voice_live_uplink_keeper_max_s: float = 45.0
+    # A direct reply still owed this long after its turn closed — while input
+    # is moving (the phone's audio or the keeper) and no output or delegation
+    # came for it — is asked for again by the relay itself.  Voice round
+    # 2026-10-06 (D-R1): 8.0 → 3.0.  A healthy first output lands +0.6…+1.7 s
+    # after speech end and the turn closes +1.2 s after it, so 3 s of nothing
+    # after the close is already ≥2× the slowest healthy reply; the 8 s rung
+    # left the caller in «دارم فکر می‌کنم» past the app's own 12 s strand.  A
+    # refused attempt (output still open, input still, a decision on its way)
+    # is retried 0.5 s later instead of being spent; the relay files ONE such
+    # reask (`_REPLY_REGEN_ATTEMPTS`) and then the reply backstop below.
+    voice_live_reply_regen_after_s: float = 3.0
+    # Voice round 2026-10-06 (D-R1 (d)): the LAST rung of a direct reply the
+    # model will not give — the relay opens its own `relay-reply:` delegation
+    # for the whole request span (GPT-Live's accepted reask produced nothing
+    # for 10 s in the 08:38 call while input moved).  It fires one
+    # `voice_live_reply_regen_after_s` after the accepted reask (≈6 s after the
+    # close), or at `voice_live_reply_backstop_after_s` after the close when
+    # every reask was refused.  Off: the relay re-asks up to the per-turn cap
+    # and then reports the turn `unanswered` (reason `backstop_off`).
+    voice_live_reply_backstop_enabled: bool = True
+    voice_live_reply_backstop_after_s: float = 8.0
+    # D-R1 (e): how long after a direct reply that only CLAIMED an action
+    # («دارم پخش می‌کنم») retires the relay waits for a delegation or a
+    # backstop to bind its turn before reading the reply as a promise.
+    # 0 turns promise mode off (the harness's `fast_clocks` pin).  ONE
+    # definition: RA and RB both declared it (merge, voice round 2026-10-06).
+    voice_live_claim_grace_ms: int = 1500
+    # ── Voice round 2026-10-07, lane RB (relay turns + start-up) ──────────
+    # D-R3(4): the endpoint rules.  A hesitant span (a trailing «اه»/"um", or
+    # two hesitation marks in the unanswered span) and a verbless Persian
+    # clause after an object-less ask or an announcer keep the HARD gap
+    # instead of closing on the ordinary one (`UtteranceAssembler.
+    # boundary_gap_ms`).  The harness pins it off (`fast_clocks`).
+    voice_live_endpoint_rules_enabled: bool = True
+    # D-R3(2): a question tail / restatement / prepositional continuation that
+    # STARTS within this many provider-timeline ms of a running or queued
+    # task's last request word joins that task (one card, forwarded to the
+    # running tenant turn).  0 = the join is off (the harness pin).  Also the
+    # seam's inter-turn gap bound (D-R3(1)) — 0 switches the join AND the
+    # seam off — and, ×3, both windows' bound on the relay's own clock
+    # (Phase D2 ruling 49).
+    voice_live_addendum_window_ms: int = 5000
+    # D-R3(1): a provider delegation decided within this many ms of the ONSET
+    # of the next turn — before it could have heard a word of it — belongs to
+    # the running task that consumed the previous turn (the seam absorber).
+    # 0 = off (the harness pin).  The gap bound between that turn and the
+    # previous one is voice_live_addendum_window_ms (Phase D2 ruling 50).
+    voice_live_seam_onset_ms: int = 400
+    # D-R3(5) Layer B: a cut fragment of the agent's speech («باشه» split off
+    # its sentence) is carried into the next unbound epoch persisted within
+    # this many seconds, or dropped — never written as a row of its own.
+    # 0 = off: every epoch keeps its own row (the harness pin).
+    voice_live_fragment_carry_s: float = 3.0
+    # D-R3(5) Layer C (Phase D2 ruling 47 — its kill switch): a deferred stop
+    # instruction is DROPPED (`outcome=new_reply_held`) when the model's reply
+    # to the interrupting turn is already held — "stop the reply in progress"
+    # would land on that new reply.  The test is positional, so a model still
+    # speaking its OLD reply over the barge-in is never stopped; False sends
+    # the stop as before Layer C.  No `fast_clocks` pin: it only removes a
+    # relay-sent message.
+    voice_live_new_reply_held_enabled: bool = True
+    # D-R2(1): when GPT-Live has not answered `session.start` within
+    # `voice_live_session_start_attempt_s`, the relay opens ONE fresh provider
+    # socket inside the ready budget and re-sends the same `session.start`
+    # (measured healthy starts 515–1012 ms; one stall 6,863 ms).  The harness
+    # pins the retry off; the attempt bound is the production value.
+    voice_live_provider_start_retry_enabled: bool = True
+    voice_live_session_start_attempt_s: float = 3.5
     # gpt-4o-transcribe, measured — not assumed. 2026-08-16, after a session
     # transcribed "grok bot" six different wrong ways and every downstream
     # consumer (UI, session history that think() loads, memory extraction)
@@ -1598,6 +1895,19 @@ class Settings(BaseSettings):
     # timeout, so give it a generous ceiling. The realtime session has no turn
     # watchdog once past connect, and the model verbally holds the floor.
     voice_realtime_think_timeout_s: float = 60.0
+    # The ONE extension of that budget: a delegated turn whose tenant reports
+    # `supervisor.started` (the `delegate` tool spawned executor sub-agents,
+    # each with its own work) gets at least this many seconds from the start
+    # of the stream instead…
+    voice_live_supervisor_timeout_s: float = 300.0
+    # …and at least the plan's own deadline (the frame's `deadline_s`, which
+    # the tenant counts from the `delegate` CALL, not from the stream) plus
+    # this margin for the merged answer the supervisor still has to write
+    # (OC-3: a `delegate` at t=35 s with a 240 s plan left the answer 25 s).
+    voice_live_supervisor_answer_margin_s: float = 60.0
+    # Hard ceiling from the start of the stream, whatever the frame says.
+    # The tenant's `delegate` tool itself times out at 600 s.
+    voice_live_supervisor_ceiling_s: float = 600.0
     # Relay the hosted agent's INNER tool activity (which tool, the exact
     # query, the sources) to the phone during a voice `think`. Ships DARK:
     # it requires an agent image exposing /api/v1/internal/agent-turn/stream.
@@ -2308,6 +2618,9 @@ class Settings(BaseSettings):
     tool_timeout_overrides: dict[str, int] = {  # Per-tool timeout overrides
         "exec": 120, "web_fetch": 60, "web_search": 30,
         "browser": 120, "spawn": 300, "process": 300,
+        # Above supervisor_timeout_seconds (240): the plan's own deadline
+        # must win, so the tool reports which workers finished.
+        "delegate": 600,
         # Image tools must outlast the SLOWEST render, not the average one.
         # Kie/Nano Banana is highly variable — 25s/36s/39s/74s and a measured
         # 399s success — and at 200s the wrapper killed the tool while the job
@@ -2381,6 +2694,38 @@ class Settings(BaseSettings):
     # to `failed`. See app/agent/subagent_dispatcher.py orphan sweep
     # (mirrors triggers/runner.py:177 pattern).
     subagent_orphan_sweep_threshold_minutes: int = 10
+
+    # ── Supervisor + executor sub-agents (`delegate`) ────────
+    # The user's own agent plans a heavy request, runs 2–6 steps on
+    # SUPERVISED sub-agents inside its own turn, waits for them, and writes
+    # the merged answer itself. Gated like Autopilot (agent/supervisor_gate.py):
+    # this flag image-wide, or the bound user in the allowlist baked into
+    # Dockerfile.agent, or a per-tenant `enabled` in the platform_settings row
+    # `subagent.settings.<user_id>` (read through GET /api/agent/runtime-flags).
+    # The image ships the two admin accounts + the simulator test account in
+    # SUPERVISOR_USER_ALLOWLIST (Dockerfile.agent). Old-client caveat: an app
+    # older than 141 (or a web tab not reloaded since the deploy) draws each
+    # worker as its own card until it updates. Kill switch per tenant: admin
+    # PUT …/subagent-settings {"enabled": false} — live within 60 s, and sticky
+    # across a failed runtime-flags fetch (supervisor_gate.get_overrides).
+    supervisor_enabled: bool = False
+    supervisor_user_allowlist: str = ""
+    # Executor sub-agent model. None = the user's own agent model. A value that
+    # is not a chat model this deployment knows (model_resolver
+    # .known_chat_models) fails CLOSED to that default, never to a 400 per
+    # worker.
+    subagent_model: Optional[str] = None
+    # Model for a VOICE delegation when the supervisor is on (the relay sets
+    # the delegated body's `model`); chat keeps the user's agent model.
+    supervisor_model: Optional[str] = None
+    # Concurrent workers inside ONE delegate call. Never above
+    # subagent_max_per_user_concurrent in effect — the dispatcher still gates.
+    supervisor_max_workers: int = 3
+    # Whole-plan deadline, retries included, counted from the `delegate`
+    # call. The relay's voice budget follows it (`deadline_s` on
+    # `supervisor.started` + voice_live_supervisor_answer_margin_s), so a
+    # voice answer can still land after the plan ends.
+    supervisor_timeout_seconds: int = 240
 
     # ── Enhanced Telegram ────────────────────────────────────
     telegram_forum_support: bool = True  # Support Telegram forum topics
@@ -3066,6 +3411,58 @@ class Settings(BaseSettings):
     # not a rollout gate: flip via ROLLOUT_CONVERGENCE_SWEEP=false if a
     # sweep ever misbehaves. Pinned in tests/test_rollout_convergence_sweep.py.
     rollout_convergence_sweep: bool = True
+    # Voice round 2026-10-06 (D-T3): the per-call context cache for voice
+    # delegations (`app/agent/call_context_cache.py`) — agent config, day
+    # context (validated by one aggregate query) and system prompt reused
+    # across one call's delegations. Kill switch.
+    voice_call_context_cache: bool = True
+    # Voice round 2026-10-06 (D-T3): for a voice delegation that must search
+    # (`require_web` / an explicit search ask), start the FIRST search at t0
+    # through the real executor instead of waiting 3.4–6.4 s for the model's
+    # first round to ask for it; its result is handed to round 0 when it lands
+    # within `voice_speculative_search_deadline_s` of phase 1's end.
+    voice_speculative_search_enabled: bool = True
+    voice_speculative_search_deadline_s: float = 1.0
+    # ── Voice round 2026-10-07 — tenant lane (DESIGN-R3 D-T, §3) ──────────
+    # T5: the Responses `reasoning.effort` EVERY round of a voice delegation
+    # sends (one constant value per run — one cache lineage). Measured on the
+    # 10-07 call: default-effort rounds 2.5–7.9 s (n=16), `low` 2.9–4.1 s
+    # (n=3). A quality risk judged on the re-recording; "" restores the
+    # per-intent map (`REASONING_EFFORT_BY_INTENT`) — the kill switch.
+    voice_delegation_reasoning_effort: str = "low"
+    # T6, DARK: a voice delegation never sends an `allowed_tools` dict — the
+    # platform proxy's 128-tool cap keeps a different 128 for a restricted
+    # round than for an unrestricted one, forking the cache lineage between
+    # round 0 and round 1. Off until the proxy's `tools_sha` lines confirm it.
+    voice_delegation_string_tool_choice: bool = False
+    # T7: the research budget of one spoken answer — web searches (the
+    # speculative first search counts as one) and page reads; ×factor for a
+    # depth ask («کامل», "in depth", a multi-part request). Over-budget calls
+    # are refused with no frames, and the round after exhaustion — and the
+    # LAST allowed round of every voice delegation — is tool-less, so the
+    # step-budget boilerplate is never a voice answer. 0 = budget off.
+    voice_research_max_searches: int = 2
+    voice_research_max_reads: int = 1
+    voice_research_deep_factor: int = 2
+    # D-R2(4): the tenant's `/voice-context` build is cached this long, keyed
+    # on its request and validated by the call-context cache's one-aggregate
+    # day query (a new message invalidates it). 0 = no cache.
+    voice_context_cache_ttl_s: float = 120.0
+    # Voice round 2026-10-06 — the sweep re-imaged c47c5b4b at 04:22:46Z,
+    # three minutes after its hand canary to 10f3084932f5: that image was
+    # built by a `[skip rollout]` merge, so NO rollout row names it, the
+    # sweep's target stayed the last COMPLETE rollout's tag (b2459dcdf012)
+    # and the canaried tenant read as "divergent" and was converged
+    # BACKWARD (bridge log: blue-green 404 → /whois → legacy /upgrade, i.e.
+    # `upgrade_tenant_image`). Two code-side pins, both in
+    # `rollout_service._convergence_sweep_once`: (1) a tenant whose current
+    # image is a tag NO rollout row has ever targeted was put there by hand
+    # (a canary) and is never re-driven by the sweep; (2) these comma-separated
+    # 8-char tenant prefixes are exempt from the sweep outright (the admin
+    # canary accounts). Real rollouts still upgrade them; only the automatic
+    # backward convergence skips them. Set ROLLOUT_SWEEP_EXEMPT_PREFIXES="" to
+    # lift the pin.
+    rollout_sweep_exempt_prefixes: str = "871bac24,c47c5b4b"
     # ── Canary resource gate (2026-09-06 incident) ─────────────
     # Rollout 48191bdd promoted image a962b7340717 with "7 ok, 0 failed" and
     # health_checks_passed=3 on every attempt. That image's voice supervisor

@@ -446,11 +446,20 @@ async def _backstop_call(
 @pytest.mark.parametrize("words", ["next", "بعدی", "skip"])
 async def test_a_bare_media_word_is_never_backstopped(monkeypatch, words):
     """R2: music plays, the caller says a bare "next" (the model only answers).
-    With no media noun the relay never executes it itself."""
+
+    PIN FLIPPED, voice round 2026-10-06 (DESIGN-R2 D-R4, a recorded reversal):
+    R2 required a media noun.  While the phone REPORTS playback a bare playback
+    command IS the media command — the 2026-10-06 call's «استاپش کن» never ran
+    because of exactly this rule — so the relay now carries it out itself,
+    once, as a correlated control (test_live_media_backstop's D-R4 table pins
+    the same for "next").  With nothing playing it is still left alone
+    (test_d_r4_with_nothing_playing_a_bare_command_is_left_alone)."""
 
     client, _provider, controls, _thinks = await _backstop_call(monkeypatch, [words], ack="Sure.")
-    assert controls == [], f"a bare {words!r} skipped the track"
-    assert client.of("media_control") == []
+    assert controls == ["next"], f"a bare {words!r} while playing must skip the track once"
+    assert [(f["action"], f["status"]) for f in client.of("media_control")] == [
+        ("next", "requested"), ("next", "executed"),
+    ]
 
 
 @pytest.mark.asyncio

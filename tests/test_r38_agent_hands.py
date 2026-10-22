@@ -161,6 +161,10 @@ _WITHHELD = {
     "triggers__create",
     "triggers__update",
     "triggers__delete",
+    # Voice round 2026-10-06 (D-T1): the agent's own stop/pause/resume/skip
+    # tool. A question about one automation must not stop or skip the
+    # user's music as a side effect.
+    "media_control",
 }
 
 

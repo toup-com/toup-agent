@@ -576,10 +576,13 @@ async def test_a_spoken_row_is_stamped_at_its_epoch_start_and_keeps_it(monkeypat
     assert user and spoken
     assert len(spoken) >= 2, "the late ack must revise the spoken row"
     assert len({s["assistant_occurred_at"] for s in spoken}) == 1
-    # The user row is the call's first stamp (provider 0 ms); the reply began
-    # at provider 1500 ms, and its row says exactly that.
+    # PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b): the row is
+    # stamped at the WALL time its first words reached the phone (≈0.3 s after
+    # the caller turn appeared, the script's own pause), no longer at
+    # `anchor + provider 1500 ms` — the provider timeline ran tens of seconds
+    # ahead of the wall in the 2026-10-06 call.
     offset = spoken[0]["assistant_occurred_at"] - user[0]["user_occurred_at"]
-    assert offset.total_seconds() == pytest.approx(1.5, abs=0.001), offset
+    assert 0.15 <= offset.total_seconds() < 1.0, offset
 
 
 @pytest.mark.asyncio
@@ -651,7 +654,8 @@ async def test_think_reports_the_agents_own_time_and_tokens(monkeypatch):
     async def vps(_user_id):
         return ("https://u.agents.test", "agent-key")
 
-    async def vps_api(agent_url, key, method, path, params=None, json_body=None, timeout=15.0):
+    async def vps_api(agent_url, key, method, path, params=None, json_body=None, timeout=15.0,
+                      outcome=None):
         return {"text": "Booked.", "model": "gpt-5.5", "processing_time_ms": 4200,
                 "tokens_input": 26000, "tokens_output": 150}
 

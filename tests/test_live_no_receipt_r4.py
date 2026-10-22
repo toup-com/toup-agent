@@ -70,6 +70,33 @@ APP_FEATURES = [
     # (src/shared/voice/liveProtocol.ts) now also lists these two, so the tapes these
     # recorders write must negotiate exactly what the shipped new app sends.
     "media_scope_floor", "output_attribution",
+    # PIN CHANGED (2026-10-02 call, P2/D6): the app's LIVE_FEATURES lists
+    # `typed_task_failures` with its typed failure copy (delegation_unreachable /
+    # delegation_timeout), so these recorders negotiate it too.
+    "typed_task_failures",
+    # PIN CHANGED (PR-10, 2026-10-02 call P10): `retry_relation` (the `retries`
+    # relation kind and the card's `anchor_assistant_turn_id`). The app's LIVE_FEATURES
+    # gains it in the paired app PR, which must land with or before this one so
+    # the app's cross-layer pin and its recorded tapes agree.
+    "retry_relation",
+    # PIN CHANGED (PR-14, 2026-10-02 call D2): `task_summary` (the relay's short
+    # task title: `delegation.summary` and the `task_summary` frame), appended
+    # AFTER the two above in the app's LIVE_FEATURES. The harness stubs the
+    # summarizer to answer nothing, so these recorders' frames differ only by
+    # `ready.capabilities.task_summary`; the app's tapes are re-recorded from
+    # this list by the cross-layer owner.
+    "task_summary",
+    # PIN CHANGED (voice round 2026-10-05, D-P5): `task_job` (the card drawn from
+    # the tenant's job: `job_update` / `step_event` on the voice socket, `job_id`
+    # on lifecycle observations, `ready.capabilities.task_job`), appended LAST in
+    # the app's LIVE_FEATURES. The tapes are re-recorded from this list in Phase C.
+    "task_job",
+    # PIN CHANGED (voice round 2026-10-06, D-R2): `reply_status` (the relay's word
+    # on a direct reply it owes: the `reply_status` frame and
+    # `ready.capabilities.reply_status` + the three millisecond bounds), appended
+    # LAST in the app's LIVE_FEATURES. The tapes are re-recorded from this list in
+    # Phase C — never hand-edited.
+    "reply_status",
 ]
 #: The shipped TestFlight build: receipts, but no `reask_turns` (text-only
 #: replays, no `reask_result`).

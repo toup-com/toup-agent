@@ -1191,3 +1191,169 @@ async def test_the_task_title_survives_the_real_write_and_every_read_surface(mon
         row = next((r for r in rows if r["id"] == answer_id), None)
         assert row is not None, f"{where}: the answer row is missing"
         assert row["voice"]["task_title"] == title, f"{where}: {row['voice']}"
+
+
+# ── PR-14 (2026-10-02 call, D2): the task's SHORT title survives too ──────
+#
+# The relay's summarizer writes at most six words in the caller's language —
+# the title the call's card wore instead of the caller's raw words — as
+# `voice.task_summary`, beside `task_title` (which keeps the caller's own
+# request for every older reader). It is the second key that carries words,
+# so it is pinned on both sides of the rule exactly like `task_title`: it gets
+# through, one line, bounded, dropped-not-truncated, never logged by value.
+# A tenant image without the key drops it and logs the drop (safe: the app
+# then keeps `task_title`) — which is why the image has to roll for the day
+# chat to show it.
+
+PR14_SUMMARY = "استادهای LLM دانشگاه تورنتو"
+
+
+def test_the_task_summary_survives_the_allowlist(caplog):
+    from app.api.sessions import _VOICE_KEYS, _VOICE_TEXT_KEYS, _clean_voice
+
+    assert "task_summary" in _VOICE_KEYS
+    assert "task_summary" in _VOICE_TEXT_KEYS, "words, so sanitized and bounded like task_title"
+    sent = {**_titled_result_voice(), "task_summary": PR14_SUMMARY}
+    with caplog.at_level(logging.WARNING, logger="app.api.sessions"):
+        out = _clean_voice(dict(sent))
+    assert out == sent, out
+    assert out["task_summary"] == PR14_SUMMARY and out["task_title"] == _af6_title()
+    assert not [r for r in caplog.records if "voice provenance" in r.getMessage()]
+
+
+def test_a_task_summary_is_one_line_bounded_and_never_logged(caplog):
+    from app.api.sessions import _VOICE_STR_MAX, _clean_voice
+
+    out = _clean_voice({"source": "delegated", "task_summary": "  Find\nU of T\x00 LLM\tprofessors "})
+    assert out == {"source": "delegated", "task_summary": "Find U of T LLM professors"}, out
+    assert _clean_voice({"task_summary": "می‌خوام"})["task_summary"] == "می‌خوام"
+    assert _clean_voice({"task_summary": "b" * _VOICE_STR_MAX})["task_summary"] == "b" * _VOICE_STR_MAX
+    secret = "SECRET-SUMMARY " * 12
+    with caplog.at_level(logging.WARNING, logger="app.api.sessions"):
+        for bad in (secret, "z" * 100_000, "", " \n ", 7, None, ["x"], {"s": "x"}):
+            assert _clean_voice({"source": "delegated", "task_summary": bad}) == {
+                "source": "delegated",
+            }, bad
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "task_summary:oversize" in blob and "task_summary:empty" in blob, blob
+    assert "SECRET-SUMMARY" not in blob, blob
+
+
+async def test_a_late_task_summary_revision_survives_the_real_write_and_the_reads(monkeypatch):
+    """The relay's late-title shape, driven for real: the delegated row is
+    written WITHOUT a summary (it was not back yet), then revised in place with
+    one — same `client_msg_id`, next revision, no `occurred_at` — through
+    `POST /api/sessions/{id}/messages` with the agent key. The stored row, the
+    live frame the route broadcasts and the day chat all carry it, and
+    `task_title` beside it is untouched."""
+    import asyncio as _asyncio
+
+    from sqlalchemy import select
+
+    import app.api.day_chats as day_chats_api
+    import app.api.sessions as sessions_mod
+    import app.api.ws_chat as ws_chat
+    from app.api.ws_realtime import _message_payload, voice_client_msg_id
+    from app.config import settings
+    from app.db.database import async_session_maker
+    from app.db.models import Conversation, Message
+    from app.db.models.user import User
+    from app.schemas import SessionMessageCreate
+
+    agent_key = "test-agent-key-pr14"
+    monkeypatch.setattr(settings, "agent_api_key", agent_key, raising=False)
+
+    async def _no_proxy(*a, **k):
+        return None
+
+    monkeypatch.setattr(day_chats_api, "_get_agent_proxy_info", _no_proxy)
+    frames: list = []
+
+    async def _capture(_uid, frame):
+        frames.append(frame)
+
+    monkeypatch.setattr(ws_chat, "broadcast_to_user", _capture)
+
+    uid, conv = str(uuid.uuid4()), str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"pr14-{uuid.uuid4().hex[:10]}@example.com",
+                    hashed_password="x", name="PR14", timezone="UTC"))
+        db.add(Conversation(id=conv, user_id=uid, title="Voice", channel="voice",
+                            message_count=0, total_tokens=0))
+        await db.commit()
+
+    class _Req:
+        headers = {"x-agent-key": agent_key}
+
+    async def _post(body: dict):
+        async with async_session_maker() as db:
+            user = await db.get(User, uid)
+            await sessions_mod.create_session_message(
+                session_id=conv, body=SessionMessageCreate(**body),
+                request=_Req(), current_user=user, db=db,
+            )
+        await _asyncio.sleep(0)
+
+    title = _af6_title()
+    ask, _ = _message_payload("user", AF6_REQUEST)
+    await _post(ask)
+    ref = "live-delegation:ps-pr14:dlg-7"
+    first_voice = {**TASK_RESULT_VOICE, "task_title": title}
+    for revision, voice in ((1, first_voice), (2, {**first_voice, "task_summary": PR14_SUMMARY})):
+        body, params = _message_payload(
+            "assistant", TASK_RESULT_TEXT, "gpt-live",
+            client_msg_id=voice_client_msg_id(conv, ref),
+            voice=dict(voice), revision=revision,
+        )
+        assert params is None
+        await _post(body)
+
+    answer_frames = [f for f in frames if f.get("role") == "assistant"]
+    assert len(answer_frames) == 2, frames
+    assert "task_summary" not in answer_frames[0]["voice"]
+    assert answer_frames[1]["voice"]["task_summary"] == PR14_SUMMARY
+    assert answer_frames[1]["voice"]["task_title"] == title
+
+    async with async_session_maker() as db:
+        msgs = (await db.execute(
+            select(Message).where(Message.conversation_id == conv)
+            .order_by(Message.created_at.asc(), Message.id.asc())
+        )).scalars().all()
+        assert [m.role for m in msgs] == ["user", "assistant"], "one row, revised in place"
+        stored = json.loads(msgs[1].metadata_json)
+        assert stored["voice"]["task_summary"] == PR14_SUMMARY
+        assert stored["voice"]["task_title"] == title
+        day = (msgs[1].occurred_at or msgs[1].created_at).date()
+        answer_id = msgs[1].id
+
+    user = await _user(uid)
+    async with async_session_maker() as db:
+        rows = _rows(await day_chats_api.get_day_chat_messages(
+            date_str=day.isoformat(), limit=500, current_user=user, db=db,
+        ))
+    row = next((r for r in rows if r["id"] == answer_id), None)
+    assert row is not None, rows
+    assert row["voice"]["task_summary"] == PR14_SUMMARY, row["voice"]
+    assert row["voice"]["task_title"] == title
+
+
+# ── F4: a supervised worker's attribution survives the write and the reload ──
+
+def test_a_reloaded_voice_row_keeps_its_worker_attribution():
+    """The relay stamps `worker_job_id`/`parent_job_id`/`worker_index`/`label`/
+    `model` on every tool row a supervised worker ran. The voice row is
+    written through `_clean_tool_events`; an allowlist without those keys made
+    the reopened thread fold every helper's actions under the supervisor."""
+    from app.api.day_chats import _serialize_tool_events
+    from app.api.sessions import _build_metadata, _clean_tool_events
+
+    worker = {"worker_job_id": "w-1", "parent_job_id": "sup-1", "worker_index": 1,
+              "label": "Check the second phone", "model": "gpt-exec"}
+    rec = {"tool": "web_search", "started_at_ms": 10, "completed_at_ms": 20,
+           "summary": "ok", "job_id": "sup-1", **worker}
+    meta = _build_metadata(None, _clean_tool_events([rec]), None, None)
+    row = SimpleNamespace(metadata_json=meta)
+    got = _serialize_tool_events(row)
+    assert got and len(got) == 1
+    for k, v in worker.items():
+        assert got[0].get(k) == v, (k, got[0])

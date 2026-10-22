@@ -206,6 +206,84 @@ async def test_the_cancelled_card_keeps_the_steps_it_actually_reached(voice_job_
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_declared_card_skips_its_plan_and_keeps_other_writers_keys(
+        voice_job_env):
+    """Voice round 2026-10-05: a delegation's card is DECLARED at t0, so a
+    hang-up before any tool leaves a whole plan of never-started steps — every
+    one `skipped`, none greened. And the close MERGES `config_json`: another
+    writer (a supervisor stamping `role`) may have added keys since the card
+    opened, and replacing the column erased them."""
+    import json
+    from app.db import async_session_maker
+    from app.db.models import BuildJob
+
+    vj = voice_job_env["vj"]
+    user_id = await _make_user()
+    conv = await _make_conversation(user_id)
+    job = vj.TurnJob(user_id=user_id, conversation_id=conv,
+                     request_text="search for the two pricing pages",
+                     delegation_id="dlg-c")
+    vj.set_current_voice_job(job)
+    job.declare(vj.template_plan("search for the two pricing pages", "web"))
+    await voice_job_env["drain"]()
+    async with async_session_maker() as db:
+        row = await db.get(BuildJob, job.job_id)
+        row.config_json = {**(row.config_json or {}), "role": "supervisor"}
+        await db.commit()
+    vj.sweep_current_voice_job()
+    await voice_job_env["drain"]()
+
+    row = (await _job_rows(user_id))[0]
+    assert row.status == "cancelled"
+    assert [s["status"] for s in json.loads(row.steps_json)] == ["skipped"] * 3
+    assert (row.config_json or {}).get("role") == "supervisor"
+    assert (row.config_json or {}).get("voice_delegation_id") == "dlg-c"
+
+
+@pytest.mark.asyncio
+async def test_a_producer_that_plans_its_own_work_adopts_the_card(voice_job_env):
+    """The supervisor's `delegate` (lane PF) re-plans the turn's card through
+    `adopt_plan`/`note_config`/`start_step` rather than writing `steps_json`
+    beside this card's own writer — two writers over one column is how a
+    re-plan gets erased by the next progress tick."""
+    import json
+
+    vj = voice_job_env["vj"]
+    user_id = await _make_user()
+    conv = await _make_conversation(user_id)
+    job = vj.TurnJob(user_id=user_id, conversation_id=conv,
+                     request_text="compare the three best laptops with sources",
+                     delegation_id="dlg-s")
+    vj.set_current_voice_job(job)
+    job.declare(vj.template_plan("compare the three best laptops", "web"))
+    job.plan([{"name": "web_search"}])
+    # One key before the row is inserted (the insert writes it), one after
+    # (the progress writer merges it) — both writers must carry them.
+    job.note_config(role="supervisor")
+    await voice_job_env["drain"]()
+    job.adopt_plan(["Laptop A", "Laptop B", "Check and merge", "Write the answer"])
+    job.note_config(workers_total=2)
+    job.start_step(1)
+    await voice_job_env["drain"]()
+    row = (await _job_rows(user_id))[0]
+    steps = json.loads(row.steps_json)
+    # The search that already ran is kept and closed by the move; the
+    # supervisor's plan replaces what had not started.
+    assert [(s["label"], s["status"]) for s in steps] == [
+        ("Search the web", "done"), ("Laptop A", "running"), ("Laptop B", "pending"),
+        ("Check and merge", "pending"), ("Write the answer", "pending"),
+    ], steps
+    assert steps[-1]["type"] == "step_answer"
+    assert (row.config_json or {}).get("role") == "supervisor"
+    assert (row.config_json or {}).get("workers_total") == 2
+    job.seal(final_text="done")
+    await voice_job_env["drain"]()
+    row = (await _job_rows(user_id))[0]
+    assert row.status == "completed"
+    assert (row.config_json or {}).get("role") == "supervisor"
+
+
+@pytest.mark.asyncio
 async def test_a_hung_up_turn_whose_answer_landed_still_closes_completed(voice_job_env):
     """Today's intended behaviour, guarded. The caller hanging up AFTER the
     reply is how a voice call normally ends; the relay has already written the
@@ -436,6 +514,49 @@ async def test_a_row_with_no_voice_provenance_is_still_proof(voice_job_env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tail", [
+    "*[Generation stopped by user]*",
+    "*[Response interrupted due to an error]*",
+])
+async def test_a_stopped_chat_turn_closes_cancelled_whatever_the_thread_holds(
+        voice_job_env, tail):
+    """TW-1. The chat runner card shares this closer, and on chat ws_chat
+    writes the stopped partial (no voice provenance) the moment the user
+    presses Stop — `_row_is_proof` would read that row as the answer and close
+    the card completed with every step green. On chat only `finalize` proves
+    delivery, so a cancel stays a cancel."""
+    import json
+
+    from app.db import async_session_maker
+    from app.db.models import Message
+
+    vj = voice_job_env["vj"]
+    user_id = await _make_user()
+    conv = await _make_conversation(user_id)
+    job = vj.TurnJob(user_id=user_id, conversation_id=conv,
+                     request_text="research how the new pricing works",
+                     channel="web")
+    vj.set_current_voice_job(job)
+    job.plan([{"name": "web_search"}])
+    await voice_job_env["drain"]()
+    async with async_session_maker() as db:
+        db.add(Message(
+            id=str(uuid.uuid4()), conversation_id=conv, role="assistant",
+            content="Let me look that up.\n\n" + tail,
+            created_at=datetime.utcnow() + timedelta(seconds=1),
+            metadata_json=json.dumps({"stopped": True}),
+        ))
+        await db.commit()
+    vj.sweep_current_voice_job()
+    await voice_job_env["drain"]()
+    row = (await _job_rows(user_id))[0]
+    assert row.status == "cancelled"
+    from app.agent.job_steps import parse_steps
+    assert "done" not in [s.get("status") for s in parse_steps(row.steps_json)]
+    assert not any(f.get("status") == "completed" for f in voice_job_env["frames"])
+
+
+@pytest.mark.asyncio
 async def test_an_answer_that_lands_while_the_card_is_closing_is_still_proof(
         voice_job_env, monkeypatch):
     """The proof is a bounded POLL, not one guessed interval.
@@ -451,6 +572,22 @@ async def test_an_answer_that_lands_while_the_card_is_closing_is_still_proof(
     vj = voice_job_env["vj"]
     monkeypatch.setattr(vj, "_CANCEL_PROOF_POLL_S", 0.02)
     monkeypatch.setattr(vj, "_CANCEL_PROOF_MAX_WAIT_S", 3.0)
+    # The test engine is in-memory sqlite on StaticPool: every session shares
+    # ONE connection, so a poll whose session closed between the late write's
+    # flush and its commit rolled that connection back and the commit landed
+    # nothing — the card closed `cancelled` with no row ever written (2 of 24
+    # runs of this file at 4-wide load). In production the relay writes from
+    # another process on its own connection, so to the poll the write is one
+    # atomic event; the lock restores exactly that and nothing more. The poll
+    # still has to find a row that landed after its first read.
+    one_connection = asyncio.Lock()
+    proof_read = vj.VoiceTurnJob._answer_was_delivered
+
+    async def _proof_read_alone(self):
+        async with one_connection:
+            return await proof_read(self)
+
+    monkeypatch.setattr(vj.VoiceTurnJob, "_answer_was_delivered", _proof_read_alone)
 
     user_id = await _make_user()
     conv = await _make_conversation(user_id)
@@ -463,10 +600,11 @@ async def test_an_answer_that_lands_while_the_card_is_closing_is_still_proof(
 
     async def _late_write():
         await asyncio.sleep(0.15)
-        await _add_assistant_row(
-            conv, when=datetime.utcnow() + timedelta(seconds=1),
-            voice={"source": "delegated", "delegation_id": "dlg-LATE"},
-        )
+        async with one_connection:
+            await _add_assistant_row(
+                conv, when=datetime.utcnow() + timedelta(seconds=1),
+                voice={"source": "delegated", "delegation_id": "dlg-LATE"},
+            )
 
     vj.sweep_current_voice_job()
     writer = asyncio.get_event_loop().create_task(_late_write())
@@ -608,8 +746,11 @@ def test_a_one_word_caption_fragment_is_not_a_title():
     used to be titled `ایونتش`."""
     import app.agent.voice_jobs as vj
 
+    # Re-pinned 2026-10-06 (voice round, D-T4): the Persian generic is
+    # «درخواست صوتی» now — «جمع‌بندی …» sat beside the answer step
+    # «جمع‌بندی پاسخ» and read as a step of the card.
     assert vj.VoiceTurnJob(user_id="u", conversation_id=None,
-                           request_text="ایونتش").title == "جمع‌بندی درخواست صوتی"
+                           request_text="ایونتش").title == "درخواست صوتی"
     assert vj.VoiceTurnJob(user_id="u", conversation_id=None,
                            request_text="benchmarks").title == "Voice request"
     # …and a real short request still titles itself.
@@ -627,7 +768,7 @@ def test_the_word_floor_does_not_blank_a_script_that_has_no_word_spaces():
     for said in ("播放周杰伦的歌", "ニュースを教えて", "ข่าววันนี้เป็นอย่างไร"):
         title = vj.VoiceTurnJob(user_id="u", conversation_id=None,
                                 request_text=said).title
-        assert title not in ("Voice request", "جمع‌بندی درخواست صوتی"), said
+        assert title not in ("Voice request", "درخواست صوتی"), said
         assert said[:4] in title, (said, title)
     # The floor still bites on a fragment in those scripts: two ideographs is
     # a word, not a request.

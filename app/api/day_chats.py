@@ -16,6 +16,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select, and_, or_, func, distinct
 from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -456,13 +457,25 @@ class AgentUnreachable(Exception):
     gets a 503 and the client keeps whatever it already had on screen.
     """
 
-    def __init__(self, detail: str, reason: str = "agent_unreachable"):
+    def __init__(
+        self,
+        detail: str,
+        reason: str = "agent_unreachable",
+        *,
+        retry_after: Optional[int] = None,
+        shed: Optional[str] = None,
+    ):
         super().__init__(detail)
         self.detail = detail
         # `agent_unreachable` (silence, transport, 502/503/504) vs
         # `agent_error` (the tenant answered 500). The client treats both as
         # 503 — the split is for the trail and for anyone reading the header.
         self.reason = reason
+        # PR-15: set when the tenant load guard refused the read before any
+        # dial (`recent_timeout` / `inflight_cap`); `retry_after` is then the
+        # seconds left in the guard's window rather than the default 2.
+        self.retry_after = retry_after
+        self.shed = shed
 
 
 # The tenant read budget, and it is the WHOLE LADDER that has to fit.
@@ -485,7 +498,46 @@ _PROXY_ATTEMPTS = 2
 _PROXY_BACKOFF_S = 0.4
 
 
-async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", params: dict = None):
+async def _proxy_day_chats(
+    agent_url: str,
+    agent_api_key: str,
+    path: str = "",
+    params: dict = None,
+    *,
+    user_id: Optional[str] = None,
+):
+    """Proxy a day-chats request to the VPS agent, under the tenant load guard.
+
+    PR-15: with `user_id`, the read is refused before any dial — raising
+    `AgentUnreachable` with the guard's Retry-After — right after this tenant
+    timed out, or while too many reads to it are already in flight from this
+    process; a read that ends in a timeout marks the tenant, one it answers
+    clears the mark. Without `user_id` it dials exactly as before.
+    """
+    if not user_id:
+        return await _dial_day_chats(agent_url, agent_api_key, path, params)
+    from app.services import tenant_proxy_guard as guard
+
+    try:
+        async with guard.guarded_read(user_id):
+            return await _dial_day_chats(
+                agent_url, agent_api_key, path, params, user_id=user_id,
+            )
+    except guard.TenantProxyShed as shed:
+        raise AgentUnreachable(
+            str(shed), reason=shed.reason,
+            retry_after=shed.retry_after, shed=shed.why,
+        )
+
+
+async def _dial_day_chats(
+    agent_url: str,
+    agent_api_key: str,
+    path: str = "",
+    params: dict = None,
+    *,
+    user_id: Optional[str] = None,
+):
     """Proxy a day-chats request to the VPS agent.
 
     TKT-LAT-007: uses the shared agent_http client so calendar opens
@@ -500,9 +552,13 @@ async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", p
 
     from app.services.agent_http import get_agent_http_client
 
+    from app.services import tenant_proxy_guard as guard
+
     url = f"{agent_url}/api/day-chats/{path}" if path else f"{agent_url}/api/day-chats"
     last: str = "unknown"
+    last_timed_out = False
     for attempt in range(1, _PROXY_ATTEMPTS + 1):
+        last_timed_out = False
         try:
             client = get_agent_http_client()
             resp = await client.get(
@@ -511,6 +567,8 @@ async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", p
                 params=params or {},
                 timeout=_PROXY_TIMEOUT_S,
             )
+            if user_id and resp.status_code < 500:
+                guard.note_answered(user_id)
             if resp.status_code == 200:
                 return resp.json()
             # A 4xx is the tenant ANSWERING — most importantly the 404 that
@@ -546,6 +604,7 @@ async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", p
             # incident could not name its own cause. `repr` always says which
             # exception it was.
             last = repr(e)
+            last_timed_out = guard.is_timeout_error(e)
         if attempt < _PROXY_ATTEMPTS:
             logger.info(
                 "Day-chats proxy %s attempt %d/%d failed (%s) — retrying",
@@ -554,6 +613,8 @@ async def _proxy_day_chats(agent_url: str, agent_api_key: str, path: str = "", p
             await asyncio.sleep(_PROXY_BACKOFF_S)
     logger.warning("Day-chats proxy %s failed after %d attempts: %s",
                    url, _PROXY_ATTEMPTS, last)
+    if user_id and last_timed_out:
+        guard.note_timeout(user_id)
     raise AgentUnreachable(last)
 
 
@@ -569,10 +630,17 @@ def _unreachable(exc: "AgentUnreachable") -> HTTPException:
     reason = getattr(exc, "reason", "agent_unreachable")
     logger.warning("[day_chats] answering 503 %s: %s",
                    reason, getattr(exc, "detail", exc))
+    headers = {
+        "Retry-After": str(getattr(exc, "retry_after", None) or 2),
+        "X-Toup-Reason": reason,
+    }
+    shed = getattr(exc, "shed", None)
+    if shed:
+        headers["X-Toup-Shed"] = shed
     return HTTPException(
         status_code=503,
         detail="Your agent did not answer in time. Your history is safe — try again.",
-        headers={"Retry-After": "2", "X-Toup-Reason": reason},
+        headers=headers,
     )
 
 
@@ -741,7 +809,9 @@ async def list_day_chats(
         if before:
             params["before"] = before
         try:
-            data = await _proxy_day_chats(proxy[0], proxy[1], "", params)
+            data = await _proxy_day_chats(
+                proxy[0], proxy[1], "", params, user_id=current_user.id,
+            )
         except AgentSaidNo as e:
             raise _agent_4xx(e)
         except AgentUnreachable as e:
@@ -902,6 +972,56 @@ async def list_day_chats(
     return JSONResponse(content=items)
 
 
+class ChatTopicsRequest(BaseModel):
+    message_ids: List[str] = Field(min_length=1, max_length=20)
+
+
+@router.post("/{date_str}/topics")
+async def get_day_chat_topics(
+    date_str: str,
+    request: ChatTopicsRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate cached reading titles without creating a chat turn or running tools."""
+    try:
+        day = Date.fromisoformat(date_str)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    if any(not value or len(value) > 50 for value in request.message_ids):
+        raise HTTPException(status_code=400, detail="Invalid message ID.")
+    user_id, tz_name = current_user.id, getattr(current_user, "timezone", None)
+    from app.api.tenant_proxy import serving_locally
+    if not serving_locally():
+        from app.services.chat_topics import get_remote_chat_topics
+
+        # Reuse the owned-day reader and its established tenant load guard.
+        # Presentation titles can run on the platform without updating or
+        # restarting an agent. The only tenant request is a history GET.
+        await db.commit()
+        async def load_history():
+            history = await get_day_chat_messages(
+                day.isoformat(), limit=2000, current_user=current_user, db=db,
+            )
+            await db.commit()
+            return _json.loads(history.body) if isinstance(history, JSONResponse) else history
+
+        return await get_remote_chat_topics(
+            user_id=user_id, day=day, message_ids=request.message_ids, load_messages=load_history,
+        )
+
+    from app.services.chat_topics import get_chat_topics
+
+    try:
+        return await get_chat_topics(
+            db, user_id=user_id, day=day,
+            message_ids=request.message_ids, tz_name=tz_name,
+        )
+    except _MISSING_TABLE_ERRORS:
+        await db.rollback()
+        return {"topics": [], "unavailable": True}
+
+
 @router.get("/{date_str}/messages")
 async def get_day_chat_messages(
     date_str: str,
@@ -930,6 +1050,7 @@ async def get_day_chat_messages(
         try:
             data = await _proxy_day_chats(
                 proxy[0], proxy[1], f"{date_str}/messages", {"limit": limit},
+                user_id=current_user.id,
             )
         except AgentSaidNo as e:
             raise _agent_4xx(e)
@@ -1247,7 +1368,10 @@ async def resolve_app_conversation(
     proxy = await _get_agent_proxy_info(current_user.id, db)
     if proxy:
         try:
-            data = await _proxy_day_chats(proxy[0], proxy[1], f"app-conversation/{app_id}")
+            data = await _proxy_day_chats(
+                proxy[0], proxy[1], f"app-conversation/{app_id}",
+                user_id=current_user.id,
+            )
         except AgentSaidNo as e:
             raise _agent_4xx(e)
         except AgentUnreachable as e:

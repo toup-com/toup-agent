@@ -36,6 +36,17 @@ So the producer moves from the model to the server:
   which is what makes the ``job_update`` frames, the Live Activity card, the
   step timing and the terminal push identical rather than merely similar.
 
+Voice round 2026-10-05 (D-P4/D-P5): the class is ``TurnJob`` now, one
+producer for both channels. A Live delegation's card is opened EAGERLY at the
+top of the turn with a plan declared from the request (``template_plan``), so
+the call has a card before phase 1 ends; steps start when a tool lands on
+them, an unforeseen tool kind is inserted before the answer step, and a
+planned step that never ran closes ``skipped``. A chat turn whose model does
+not call ``create_job`` gets the same card, opened lazily at its first work
+round. Every state change is mirrored onto the delegation stream as a
+``job.update`` frame (``frame_sink``) and onto the chat socket as
+``job_update`` with the step list and the sources it read.
+
 **Nothing here is allowed on the critical path.** The user is holding a live
 audio session open and TTS starts when the turn returns; ``create_job`` alone
 was measured at 0.6–1 s of DB + notify work. Every method below is
@@ -62,7 +73,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.services.background_tasks import spawn as _spawn_bg
 
@@ -72,14 +83,23 @@ __all__ = [
     "SEAL_CANCELLED",
     "SEAL_COMPLETED",
     "SEAL_INTERRUPTED_AFTER_ANSWER",
+    "CHAT_TURN_JOB_CHANNELS",
+    "TurnJob",
     "VoiceTurnJob",
     "clean_request_text",
     "current_voice_job",
+    "explicit_search_requested",
     "is_work_tool",
     "set_current_voice_job",
     "step_label_for_tool",
     "sweep_current_voice_job",
+    "template_plan",
 ]
+
+#: Interactive chat channels whose turns get the runner-minted card when the
+#: model does not open one itself (D-P4: one producer for voice and chat).
+#: Routines, triggers, sub-agents, missions and vibecoding own their jobs.
+CHAT_TURN_JOB_CHANNELS: frozenset = frozenset({"web", "mobile", "app"})
 
 # ── How a card ENDED ──────────────────────────────────────────────────────
 #: The turn produced its answer. Today's normal close.
@@ -198,11 +218,14 @@ def _title_is_fragment(title: str) -> bool:
 # connector tool should count as work on the day it ships, not on the day
 # someone remembers to add it here.
 NON_WORK_TOOLS: frozenset = frozenset({
-    "navigate_to", "play_media", "play_netflix", "radio",
+    "navigate_to", "play_media", "media_control", "play_netflix", "radio",
     "tts", "tts_prefs", "talk_mode",
     "memory_search", "recall_day",
     "session_status", "sessions_list", "sessions_history", "thread",
     "start_mission", "spawn",
+    # The supervisor (`delegate`) re-plans THIS card itself (`follow_steps`);
+    # counted as work it would also add a step of its own beside that plan.
+    "delegate",
     # Voice cannot call these (VOICE_DISABLED_TOOLS) — listed so that a
     # future loadout change cannot make the runner open a second card
     # alongside the model's own.
@@ -242,6 +265,7 @@ _LABELS_EN: Dict[str, str] = {
     "connector_read": "Check {brand}",
     "connector_write": "Update {brand}",
     "other": "Work on it",
+    "media": "Control the music",
     "answer": "Put the answer together",
 }
 
@@ -261,6 +285,7 @@ _LABELS_FA: Dict[str, str] = {
     "connector_read": "بررسی {brand}",
     "connector_write": "به‌روزرسانی {brand}",
     "other": "انجام کار",
+    "media": "کنترل پخش",
     "answer": "جمع‌بندی پاسخ",
 }
 
@@ -287,6 +312,10 @@ _TOOL_KEYS: Dict[str, str] = {
     "routines__run_now": "schedule", "routines__list": "schedule",
     "triggers__create": "schedule", "triggers__update": "schedule",
     "triggers__delete": "schedule", "cron": "schedule",
+    # D-T1: both media tools land on the card's media step. They stay
+    # NON-work (the phone's player is the surface; neither earns a card of
+    # its own), but a planned media step is started by them — see `attribute`.
+    "play_media": "media", "media_control": "media",
 }
 
 #: Connector actions that only READ. Everything else on a connector is treated
@@ -431,6 +460,468 @@ def answer_step_label(*, rtl: bool = False) -> str:
     return (_LABELS_FA if rtl else _LABELS_EN)["answer"]
 
 
+# ── An explicit ask to search ─────────────────────────────────────────────
+# "search it", «سرچ کن», «چرا سرچ نمی کنی» — the caller named the method, so
+# the answer must come from the web this turn, never from the model's memory
+# (the 2026-10-05 call: three asks, a guess, then "I didn't search"). Closed
+# grammar, both languages. A question ABOUT a search («اینو از کجا سرچ
+# کردی», "where did you search") is not a new ask, and a search over the
+# user's own data (inbox, calendar, files) is not a web search.
+_SEARCH_ASK_RE = re.compile(
+    r"\b(?:search(?:\s+for)?|google|look\s+(?:it\s+|that\s+|this\s+)?up|lookup"
+    r"|find\s+out|check\s+online|web\s+search)\b"
+    r"|سرچ|جستجو|جست\s*و\s*جو|گوگل",
+    re.IGNORECASE,
+)
+_SEARCH_PROVENANCE_RE = re.compile(
+    r"\bwhere\s+(?:did|do)\s+you\s+(?:search|look|find|get)\b"
+    r"|\bwhat\s+did\s+you\s+(?:search|google|look\s+up)\b"
+    r"|از\s*کجا|کجا\s*(?:رو|را)?\s*سرچ",
+    re.IGNORECASE,
+)
+_OWNED_SEARCH_EN_RE = re.compile(
+    r"\b(?:my|in\s+my|from\s+my|through\s+my)\s+(?:e-?mails?|inbox|gmail|calendar"
+    r"|files?|drive|messages?|slack|notes?|docs?|documents?|chats?)\b",
+    re.IGNORECASE,
+)
+
+
+# Phase D (lens-tenant-2): the caller's OWN data in Persian, ANCHORED.
+# `query_intent._PERSIAN_OWNED_DATA_RE` (the classifier's, unchanged) is an
+# unanchored substring list — «قراره» (is supposed to), «قرارداد», «پیامد»,
+# «چت جی پی تی», «گزارش هواشناسی», «جلسه امروز مجلس» all matched — and the
+# runner's T4 guard used it to STRIP the relay's `require_web` from ordinary
+# research asks (no speculative search, no forced web round).  Own data is a
+# data noun that is the caller's: a possessive suffix (تقویمم، ایمیلام،
+# پیام‌هام، جلسه‌ام), «… من», a colloquial plural (ایمیلا، پیامای), the noun
+# phrase's next word marked possessive (جلسه فردام، قرار بعدیم، فایل
+# قراردادم), or a connector named as a place or an object (تو اسلک، تقویمو).
+_FA_OWNED_NOUNS = (
+    r"ایمیل|رایانامه|جیمیل|پیام|چت|مکالمه|واتساپ|تلگرام|اسلک|مخاطب|تقویم|"
+    r"جلسه|قرار|رویداد|فایل|پرونده|پوشه|سند|اسناد|درایو|یادداشت|وظیفه|وظایف|اینباکس"
+)
+_FA_OWNED_PLACES = r"جیمیل|اسلک|واتساپ|تلگرام|تقویم|درایو|ایمیل|اینباکس"
+#: Words ending in «م» that are not a possessive (ordinals and common ones).
+_FA_NOT_POSSESSIVE = frozenset(
+    "دوم سوم چهارم پنجم ششم هفتم هشتم نهم دهم تمام کدام نام مردم عموم مهم لازم "
+    "کم هم کلام سلام پیام قدیم مستقیم اعلام انجام تیم سیستم فیلم علم حجم رقم "
+    "خانم آدم رسم مدام دائم عظیم".split()
+)
+_FA_OWNED_RE = re.compile(
+    r"(?<!\S)(?:" + _FA_OWNED_NOUNS + r")(?:\s?(?:ها|های))?\s?(?:م|ام|مو|امو|مم)(?!\S)"
+    r"|(?<!\S)(?:" + _FA_OWNED_NOUNS + r")(?:\s?(?:ها|های)|ی)?\s+من(?!\S)"
+    r"|(?<!\S)(?:" + _FA_OWNED_NOUNS + r")(?:ا|ای|امون)(?!\S)"
+    r"|(?<!\S)(?:تو|توی|در|از|داخل)\s+(?:" + _FA_OWNED_PLACES + r")(?:\s?(?:ها|های))?(?!\S)"
+    r"|(?<!\S)(?:" + _FA_OWNED_PLACES + r")(?:\s?رو|و)(?!\S)",
+)
+_FA_OWNED_PHRASE_RE = re.compile(
+    r"(?<!\S)(?:" + _FA_OWNED_NOUNS + r")(?:ی|ای|ا)?\s+(\S{2,}?)(?:م|ام)(?!\S)",
+)
+
+
+def owned_data_request(text: Optional[str]) -> bool:
+    """True when ``text`` asks about the caller's OWN data — mail, calendar,
+    files, messages — en + fa; reused by the runner's `require_web` guard
+    (voice round 2026-10-07, T4): a relay that marks «تقویممو سرچ کن» as
+    research must not force a WEB search over it.  The Persian half is the
+    ANCHORED rule above (Phase D lens-tenant-2), not the classifier's
+    substring list."""
+    if not text or not isinstance(text, str):
+        return False
+    try:
+        from app.agent.query_intent import normalize_fa
+        norm = normalize_fa(text.lower()).replace("\u200c", " ")
+    except Exception:  # noqa: BLE001 — a missing helper keeps the raw text
+        norm = text.lower().replace("\u200c", " ")
+    norm = re.sub(r"[،,.!?؟:;«»\"']", " ", norm)
+    if _OWNED_SEARCH_EN_RE.search(norm) or _FA_OWNED_RE.search(norm):
+        return True
+    for match in _FA_OWNED_PHRASE_RE.finditer(norm):
+        word = match.group(0).split()[-1]
+        if word not in _FA_NOT_POSSESSIVE:
+            return True
+    return False
+
+
+def explicit_search_requested(text: Optional[str]) -> bool:
+    """True when ``text`` (the caller's own words) explicitly asks to search
+    the web — the predicate that forces the web tools on the first round and
+    plans the card as a search."""
+    if not text or not isinstance(text, str):
+        return False
+    try:
+        from app.agent.query_intent import (
+            _PERSIAN_OWNED_DATA_RE, normalize_fa,
+        )
+        norm = normalize_fa(text.lower()).replace("\u200c", " ")
+    except Exception:  # noqa: BLE001 — a missing helper must not hide the ask
+        _PERSIAN_OWNED_DATA_RE = None  # type: ignore[assignment]
+        norm = text.lower().replace("\u200c", " ")
+    if not _SEARCH_ASK_RE.search(norm):
+        return False
+    if _SEARCH_PROVENANCE_RE.search(norm):
+        return False
+    if _OWNED_SEARCH_EN_RE.search(norm):
+        return False
+    if _PERSIAN_OWNED_DATA_RE is not None and _PERSIAN_OWNED_DATA_RE.search(norm):
+        return False
+    return True
+
+
+# ── The research budget's depth ask (voice round 2026-10-07, T7) ─────────
+# A spoken answer gets a small research budget (`voice_research_max_searches`
+# / `_max_reads`); a caller who asks for depth gets ×`voice_research_deep_factor`.
+# «دقیق» counts only as a whole word: «دقیقا/دقیقاً» is "exactly" and «دقیقه»
+# is "minute" — neither asks for depth.
+_DEPTH_EN_RE = re.compile(
+    # "deep learning", DeepMind, DeepSeek, a deepfake are TOPICS, not depth.
+    r"\b(?:thorough(?:ly)?|in[- ]depth|deeply|deep(?!\s*(?:learning|mind|seek|fakes?)\b)"
+    r"|detailed|comprehensive"
+    r"|research\s+(?:it|this|that))\b",
+    re.IGNORECASE,
+)
+_DEPTH_FA_RE = re.compile(
+    r"(?<!\S)(?:کامل|مفصل|عمیق|دقیق)(?!\S)|با\s+جزئیات|با\s+جزییات|همه\s*جانبه"
+    r"|تحقیق\s*(?:کن|بکن)",
+)
+
+
+def research_depth_requested(text: Optional[str]) -> bool:
+    """True when ``text`` (the caller's words) asks for a thorough answer."""
+    if not text or not isinstance(text, str):
+        return False
+    norm = text.replace("\u200c", " ")
+    if _DEPTH_EN_RE.search(norm):
+        return True
+    try:
+        from app.agent.query_intent import normalize_fa
+        norm = normalize_fa(norm)
+    except Exception:  # noqa: BLE001 — a missing helper keeps the raw text
+        pass
+    return bool(_DEPTH_FA_RE.search(norm))
+
+
+# ── The speculative first search (D-T3) ──────────────────────────────────
+# A voice delegation that must search starts its first search at t0, before
+# the model's first round (3.4–6.4 s measured) asks for it. The query is the
+# caller's request with the search ASK removed ("search it", «سرچ کن») — no
+# model call. A wrong query costs one extra search the model makes anyway.
+_SPEC_FILLER_RE = re.compile(
+    r"\b(?:please|can\s+you|could\s+you|for\s+me|it|that|this|now|quickly|ok(?:ay)?)\b"
+    r"|(?<!\S)(?:برام|برامون|لطفا|لطفاً|میشه|می\s*شه|اینو|اونو|رو|را|کن|بکن|هم|یه|یک|خب|حالا"
+    # Voice round 2026-10-07 (T12): the call's queries carried the caller's
+    # hesitation and discourse words («باشه … ببین … اه …»). NOT bare «چیز»
+    # (a noun) nor bare «بعد» (after) — only these.
+    r"|اه|ببین|ببینم|باشه|اوکی|الان|چیزی|سؤال|سوال|بعد\s+به\s+نظرت|به\s+نظرت)(?!\S)",
+    re.IGNORECASE,
+)
+_SPEC_MIN_WORDS = 2
+_SPEC_MAX_CHARS = 200
+
+
+def speculative_search_query(text: Optional[str]) -> Optional[str]:
+    """The query the speculative first search runs, or None when the request
+    minus its search ask leaves nothing worth searching (< 2 words)."""
+    if not text or not isinstance(text, str):
+        return None
+    q = text.replace("\u200c", " ")
+    q = _SEARCH_ASK_RE.sub(" ", q)
+    # Punctuation first (T12): «سرچ کن.» left `کن.`, and the filler's `(?!\S)`
+    # does not match a word followed by its own period.
+    q = re.sub(r"[\s،,.!?؟:;]+", " ", q)
+    q = _SPEC_FILLER_RE.sub(" ", q)
+    q = re.sub(r"\s+", " ", q).strip()
+    if len(q.split()) < _SPEC_MIN_WORDS:
+        return None
+    return q[:_SPEC_MAX_CHARS]
+
+
+def speculative_search_block(query: str, result: str) -> str:
+    """The context block a speculative result rides into round 0 as (critic
+    R8): a plain user-role block, NOT a fabricated tool_use/tool_result pair —
+    a reasoning model's provider can refuse a function_call item it did not
+    emit, and nothing here can prove it accepts one. The result string is the
+    tool's own, already fenced as external content by the executor."""
+    return (
+        f"<speculative_search query=\"{query}\">\n"
+        "A web_search for the request above ran while you were reading it; its "
+        "results are below and already count as this turn's search. Answer from "
+        "them, search again only if they do not answer the request, and cite "
+        "only URLs that appear in them.\n"
+        f"{result}\n"
+        "</speculative_search>"
+    )
+
+
+# ── A media command ───────────────────────────────────────────────────────
+# Plans the card's media step (D-T1). Closed and conservative — it only picks
+# a step label, never a tool: play / stop / pause / resume / skip, en + fa,
+# with the clitic forms the 2026-10-06 call used («استاپش کن»).
+_MEDIA_COMMAND_RE = re.compile(
+    r"^\W*(?:(?:please|ok(?:ay)?|hey)\W+)?(?:stop|pause|resume|unpause|skip|kill)"
+    r"(?:\s+(?:it|this|that|playing|the\s+(?:music|song|track)|music|song|track))?\W*$"
+    r"|\b(?:stop|pause|resume|unpause|kill|skip)\s+(?:the\s+)?(?:music|song|track|playback)\b"
+    r"|\b(?:next|previous|last)\s+(?:song|track)\b"
+    r"|\bplay\b.*\b(?:songs?|music|tracks?|albums?|playlists?|by)\b"
+    r"|(?:استاپ|استپ|قطع|خاموش|متوقف|مکث|پاز)ش?\s*(?:کن|بکن|شه)"
+    r"|^\s*بسه\s*$|نگهش\s*دار"
+    r"|آهنگ\s*(?:بعدی|قبلی)|(?:آهنگ|موزیک|موسیقی)\S*\s*.*(?:پخش|بذار|بزار|بزن)",
+    re.IGNORECASE,
+)
+
+
+def media_command_requested(text: Optional[str]) -> bool:
+    """True when ``text`` (the caller's words) is a play/stop/pause/resume/
+    skip request — the card then declares one media step."""
+    if not text or not isinstance(text, str):
+        return False
+    return bool(_MEDIA_COMMAND_RE.search(text.replace("\u200c", " ")))
+
+
+# ── A multi-part (heavy) request ─────────────────────────────────────────
+# Voice round 2026-10-06, D-T2: the supervisor (`delegate`) is for a request
+# with several searches or parts — "compare the three best X with sources" —
+# and the turn's first round could not reach it: a search ask forced round 0 to
+# the web tools only, and a `question` intent never offered it. This predicate
+# is what lifts both, so it is CONSERVATIVE: a comparison / ranking of several,
+# two real questions, or two clauses joined by an explicit "and also". A
+# single lookup («یواف‌سی چی», "one more thing, Miami FC") is never multi-part.
+_MULTI_COMPARE_RE = re.compile(
+    # Phase D (correctness-tenant-4): a bare "vs" is a FIXTURE ("Lakers vs
+    # Celtics score"), not a comparison — only with a comparison ask; a
+    # ranking needs a plural noun after its number ("best 2 for 1" is a deal).
+    r"\bcompar(?:e|es|ed|ing|ison)\b|\bpros\s+and\s+cons\b"
+    r"|(?=.*\b(?:better|worse|which|pros|difference|should\s+i)\b)"
+    r".*(?:\bversus\b|\bvs\.?(?=\s))"
+    r"|\b(?:top|best)\s+(?:two|three|four|five|six|[2-9])\s+\w+s\b"
+    r"|\b(?:two|three|four|five|six|[2-9])\s+(?:best|top)\b"
+    r"|مقایسه"
+    r"|(?:دو|سه|چهار|پنج|شش|[۲-۹2-9])\s*تا\s*(?:از\s*)?(?:بهترین|برترین)"
+    r"|(?:بهترین|برترین)\s*(?:دو|سه|چهار|پنج|شش|[۲-۹2-9])\s*(?:تا|مورد)",
+    re.IGNORECASE,
+)
+_MULTI_JOIN_RE = re.compile(
+    # Not a bare "plus" (Disney plus, iPhone 16 plus) nor "and then" (one
+    # narrative question, one reminder with two steps) — Phase D, tenant-4.
+    r"\b(?:and\s+also|as\s+well\s+as)\b"
+    r"|\sو\s*همچنین\s|\sو\s*بعدش\s|\sو\s*بعد\s+هم\s",
+    re.IGNORECASE,
+)
+_MULTI_MIN_WORDS = 4
+_MULTI_CLAUSE_MIN_WORDS = 3
+_MULTI_QUESTION_MIN_WORDS = 3   # "what is the score? who scored?" is one ask
+
+
+def multi_part_request(text: Optional[str]) -> bool:
+    """True when ``text`` (the caller's own words) is a heavy, multi-part ask
+    — the one shape the supervisor exists for. fa + en, closed grammar.
+
+    Never for a media command, an owned-data ask (inbox, calendar, files —
+    the same exclusions `explicit_search_requested` makes) or anything under
+    four words."""
+    if not text or not isinstance(text, str):
+        return False
+    try:
+        from app.agent.query_intent import _PERSIAN_OWNED_DATA_RE, normalize_fa
+        norm = normalize_fa(text.lower()).replace("\u200c", " ")
+    except Exception:  # noqa: BLE001 — a missing helper must not hide the ask
+        _PERSIAN_OWNED_DATA_RE = None  # type: ignore[assignment]
+        norm = text.lower().replace("\u200c", " ")
+    words = norm.split()
+    if len(words) < _MULTI_MIN_WORDS or media_command_requested(text):
+        return False
+    if _OWNED_SEARCH_EN_RE.search(norm):
+        return False
+    if _PERSIAN_OWNED_DATA_RE is not None and _PERSIAN_OWNED_DATA_RE.search(norm):
+        return False
+    if _MULTI_COMPARE_RE.search(norm):
+        return True
+    questions = [q for q in re.split(r"[?؟]", norm) if q.strip()]
+    if (len(re.findall(r"[?؟]", norm)) >= 2 and len(questions) >= 2
+            and all(len(q.split()) >= _MULTI_QUESTION_MIN_WORDS for q in questions[:2])):
+        return True
+    parts = _MULTI_JOIN_RE.split(f" {norm} ", maxsplit=1)
+    if len(parts) == 2 and all(
+        len(p.split()) >= _MULTI_CLAUSE_MIN_WORDS for p in parts
+    ):
+        return True
+    return False
+
+
+#: Connector names a request can name, mapped to the brand the connector
+#: tool's label carries (``_brand`` of the tool prefix), so a planned
+#: "Check Gmail" is the step a ``gmail__…`` call lands on.
+_PLAN_BRANDS_RE = re.compile(
+    r"\b(gmail|google\s+calendar|calendar|google\s+drive|drive|outlook|github"
+    r"|linkedin|notion|linear|slack|stripe|figma)\b"
+    r"|(جیمیل|تقویم|اسلک|گیت\s*هاب|نوشن|درایو|لینکدین)",
+    re.IGNORECASE,
+)
+_PLAN_BRAND_NAMES: Dict[str, str] = {
+    "google calendar": "Calendar", "google drive": "Drive",
+    "جیمیل": "Gmail", "تقویم": "Calendar", "اسلک": "Slack",
+    "گیت هاب": "GitHub", "گیتهاب": "GitHub", "نوشن": "Notion",
+    "درایو": "Drive", "لینکدین": "LinkedIn",
+}
+
+
+def _planned_brand(text: str) -> Optional[str]:
+    m = _PLAN_BRANDS_RE.search(text or "")
+    if not m:
+        return None
+    word = re.sub(r"\s+", " ", (m.group(1) or m.group(2) or "").lower()).strip()
+    return _PLAN_BRAND_NAMES.get(word) or _brand(word)
+
+
+#: The plan kinds a declared plan may carry — the `_LABELS_*` keys. The relay
+#: seeds the card with these (`plan: [{kind, label}]`) and hands the same keys
+#: to the tenant as `planned_steps` (voice round 2026-10-07, DESIGN-R3 D-R4(6)).
+PLAN_KINDS: frozenset = frozenset(_LABELS_EN)
+#: The most rows a body `planned_steps` may declare (answer included).
+PLANNED_STEPS_MAX = 6
+
+#: Question-shape fallback (voice round 2026-10-07, card 2): a request the
+#: classifier reads as `full` («…همین توی آیسآکادمیک چجوریه») but that is a
+#: QUESTION gets the search plan, not «انجام کار». Closed: a request ending in
+#: ?/؟, or whose last word is one of these question tails. «make it nicer»
+#: stays generic.
+_QUESTION_TAIL_WORDS: frozenset = frozenset({
+    "چیه", "چیست", "کیه", "کیست", "کجاست", "چنده", "چطوره", "چجوریه", "کدومه",
+})
+_QUESTION_TAIL_PAIRS: frozenset = frozenset({("کی", "بود")})
+
+
+def _question_shaped(text: str) -> bool:
+    raw = (text or "").replace("\u200c", " ").strip()
+    if not raw:
+        return False
+    if raw.endswith(("?", "؟")):
+        return True
+    try:
+        from app.agent.query_intent import normalize_fa
+        raw = normalize_fa(raw)
+    except Exception:  # noqa: BLE001 — a missing helper keeps the raw text
+        pass
+    words = re.sub(r"[\s،,.!:;«»\"']+", " ", raw).split()
+    if not words:
+        return False
+    if words[-1] in _QUESTION_TAIL_WORDS:
+        return True
+    return len(words) >= 2 and (words[-2], words[-1]) in _QUESTION_TAIL_PAIRS
+
+
+def template_plan_keys(
+    display_request: Optional[str], intent: Any = None, rtl: bool = False,
+    *, require_web: bool = False,
+) -> List[str]:
+    """The KINDS of the plan a delegated turn's card declares before any tool
+    runs (D-P5) — `_LABELS_*` keys, the answer last. ONE function for both
+    sides of the wire: the relay seeds the card's first frame with exactly
+    these (DESIGN-R3 D-R4(6)) and `template_plan` renders them, so the seed and
+    the tenant's declared plan cannot drift. ``rtl`` does not change a kind;
+    it is accepted so the two signatures stay one call shape."""
+    category = str(getattr(intent, "category", intent) or "")
+    text = display_request or ""
+    if require_web or explicit_search_requested(text):
+        work = ["web", "fetch"]
+    elif category == "media" or media_command_requested(text):
+        # D-T1: a delegated «استاپش کن» read "Work on it · 1 skipped" because
+        # the only tool it ran (play_media / media_control) is not work and
+        # the generic step never started. One media step the tool starts.
+        work = ["media"]
+    elif category in ("web", "question"):
+        work = ["web", "fetch"]
+    elif _planned_brand(text):
+        work = ["connector_read"]
+    elif category == "code":
+        work = ["file_read", "other"]
+    elif category in ("full", "") and _question_shaped(text) and not owned_data_request(text):
+        # Phase D (search-play-title-4): never for the caller's OWN data —
+        # «ایمیلای امروزم چیه؟», «جلسه فردام کیه؟» are questions, but the card
+        # opened on «جست‌وجو در وب · خواندن منابع» over a Gmail / Calendar
+        # read (985e611e planned «انجام کار»).  Ruling 37 is card 2's research
+        # question only.
+        work = ["web", "fetch"]
+    else:
+        work = ["other"]
+    return work + ["answer"]
+
+
+def plan_step_label(
+    kind: str, *, rtl: bool = False, display_request: Optional[str] = None,
+) -> str:
+    """The card label of one plan kind, in the request's language. A
+    connector kind names the brand the request names (``{brand}``)."""
+    labels = _LABELS_FA if rtl else _LABELS_EN
+    label = labels.get(str(kind or ""), labels["other"])
+    if "{brand}" in label:
+        label = label.format(brand=_planned_brand(display_request or "") or "")
+    return label
+
+
+def valid_planned_steps(
+    kinds: Any, display_request: Optional[str] = None,
+) -> Optional[List[str]]:
+    """``kinds`` as a plan this card may declare verbatim, or None. Every kind
+    must be known, ``answer`` must be last and only last, there must be at
+    least one work step, at most `PLANNED_STEPS_MAX` rows, and a connector kind
+    needs a brand the request names — anything else falls back to
+    `template_plan` (DESIGN-R3 D-R4(6): "exactly when every key is known and
+    answer is last")."""
+    if not isinstance(kinds, (list, tuple)):
+        return None
+    out = [str(k).strip() for k in kinds if isinstance(k, str)]
+    if len(out) != len(kinds) or not (2 <= len(out) <= PLANNED_STEPS_MAX):
+        return None
+    if out[-1] != "answer" or "answer" in out[:-1]:
+        return None
+    if any(k not in PLAN_KINDS for k in out):
+        return None
+    if any(k.startswith("connector_") for k in out) and not _planned_brand(display_request or ""):
+        return None
+    return out
+
+
+def template_plan(
+    display_request: Optional[str], intent: Any = None, rtl: bool = False,
+    *, require_web: bool = False,
+) -> List[str]:
+    """The plan a delegated turn's card declares BEFORE any tool runs (D-P5).
+
+    Chosen from the request alone, in the request's language, from the same
+    closed vocabulary the steps are attributed with — so a planned step is the
+    step a tool call lands on, and a tool kind the plan did not foresee is
+    inserted honestly (``TurnJob.plan``) rather than hidden. The answer step
+    is always last. ``intent`` is a ``QueryIntent`` or its category string.
+    The labels of `template_plan_keys` — one decision, two renderings.
+    """
+    return [
+        plan_step_label(k, rtl=rtl, display_request=display_request)
+        for k in template_plan_keys(display_request, intent, rtl, require_web=require_web)
+    ]
+
+
+def _close_step(step: Dict[str, Any], now: datetime) -> None:
+    """A running step is done at ``now``, with the window it really ran."""
+    step["status"] = "done"
+    if step.get("completed_at"):
+        return
+    step["completed_at"] = _iso_ms(now)
+    start_dt = _parse_iso_ms(step.get("started_at"))
+    if start_dt is not None:
+        dur = int(max(0.0, (now - start_dt).total_seconds() * 1000))
+        step["duration_ms"] = dur
+        step["durationMs"] = dur
+
+
+#: Tools whose results name the pages the work read (`config_json.sources`).
+_SOURCE_TOOLS = frozenset({
+    "web_search", "web_fetch", "extension_search", "extension_read",
+    "extension_research",
+})
+_SOURCES_MAX = 6
+
+
 # ── Per-turn handle ───────────────────────────────────────────────────────
 # Set by ``AgentRunner._run_inner`` and read by ``AgentRunner.run``'s finally,
 # which is the only place a CANCELLED voice turn can still be caught. There is
@@ -476,14 +967,79 @@ def sweep_current_voice_job() -> None:
         logger.exception("[voice-job] sweep failed")
 
 
-class VoiceTurnJob:
-    """The job card for one voice turn. Every public method is synchronous,
-    returns immediately, and never raises."""
+def _voice_of(raw: Any) -> Optional[Dict[str, Any]]:
+    """``metadata_json.voice`` of one row, or None when it has none."""
+    if isinstance(raw, dict):
+        meta: Any = raw
+    elif isinstance(raw, str) and raw:
+        try:
+            meta = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+    if not isinstance(meta, dict):
+        return None
+    voice = meta.get("voice")
+    return voice if isinstance(voice, dict) else None
+
+
+def voice_row_is_proof(raw_metadata: Any, delegation_id: Optional[str]) -> bool:
+    """Is this assistant row the answer to the voice card for
+    ``delegation_id``?
+
+    A row with no ``voice`` provenance at all is the Realtime path, where
+    the only assistant writer is the turn itself — unchanged behaviour, and
+    the reason this is not simply "voice.source == 'delegated'".
+
+    A ``live_spoken`` row is NEVER proof. That is the whole defect: the
+    Live prompt tells the model to "say one short line and delegate", so a
+    filler line — and therefore a spoken row — lands in the same
+    conversation a second after the job opens, and the cancelled outcome
+    became unreachable in exactly the scenario it was written for. The
+    delivered-turn watchdog (`job_reconciler`) asks the same question of a
+    still-running voice card, where a spoken progress line from a long
+    supervised run would otherwise close it while its workers run.
+    """
+    voice = _voice_of(raw_metadata)
+    if voice is None:
+        return True
+    if str(voice.get("source") or "") != "delegated":
+        return False
+    if voice.get("cancelled") or voice.get("superseded"):
+        return False
+    if not delegation_id:
+        return True
+    # Two concurrent delegations are an ordinary Live state (D9 allows
+    # two, queues the third). The OTHER one's answer is somebody else's
+    # proof.
+    #
+    # Both sides are bounded to the SAME length before comparing. The id is
+    # provider-supplied and unbounded, and it reaches the two sides of this
+    # comparison down different paths with different bounds: the card's
+    # copy came through the relay body (`[:64]`) and `ChatRequest`
+    # (max_length=64), while the row's copy is stamped straight onto the
+    # persisted message. Compared raw, an id longer than 64 characters
+    # makes this permanently False — so every DELIVERED delegated answer
+    # would close `cancelled`, which is the A5-05 lie inverted and looks
+    # correct from outside.
+    return (str(voice.get("delegation_id") or "")[:_DELEGATION_ID_MAX]
+            == str(delegation_id)[:_DELEGATION_ID_MAX])
+
+
+class TurnJob:
+    """The job card for one turn the RUNNER opens — a voice delegation
+    (eagerly, with a declared plan) or a chat/voice turn whose first work round
+    the model did not put in a job of its own (lazily, steps from the tools).
+    Every public method is synchronous, returns immediately, and never raises.
+    """
 
     __slots__ = (
-        "_active", "_answer_label", "_conversation_id", "_delegation_id",
-        "_job_id", "_lock", "_opened", "_opened_at", "_row_exists", "_rtl",
-        "_sealed", "_steps", "_title", "_user_id",
+        "_active", "_anchor", "_answer_label", "_config_extra", "_conversation_id",
+        "_delegation_id", "_frame_sink", "_job_id", "_lock", "_opened", "_opened_at",
+        "_plan_offset", "_plan_source", "_planned_ids", "_provisional", "_row_exists",
+        "_row_ready", "_rtl",
+        "_sealed", "_sources", "_steps", "_title", "_tracker", "_user_id", "_voice",
     )
 
     def __init__(
@@ -494,6 +1050,10 @@ class VoiceTurnJob:
         request_text: Optional[str],
         display_request: Optional[str] = None,
         delegation_id: Optional[str] = None,
+        channel: Optional[str] = "voice",
+        frame_sink: Optional[Any] = None,
+        task_title: Optional[str] = None,
+        anchor: Optional[Dict[str, Any]] = None,
     ) -> None:
         """``display_request`` is what the caller SAID, when the caller knows
         it separately from what the model was given. On the Live path they are
@@ -504,6 +1064,11 @@ class VoiceTurnJob:
         cancelled close can tell this turn's answer from a different one that
         landed in the same conversation at the same time — two concurrent
         delegations are an ordinary Live state, not an edge case.
+
+        ``frame_sink`` is the delegation stream's synchronous ``put`` (api_v1's
+        SSE route): every state change is mirrored onto it as a ``job.update``
+        frame so the call draws the card from t0 instead of waiting for a
+        chat socket the phone may not have open.
         """
         from app.agent.job_titles import derive_job_title, is_rtl_text
 
@@ -514,16 +1079,32 @@ class VoiceTurnJob:
         )
         _display = clean_request_text(display_request) or clean_request_text(request_text)
         self._rtl = is_rtl_text(_display if _display else request_text)
-        _fallback = "جمع‌بندی درخواست صوتی" if self._rtl else "Voice request"
+        # Voice round 2026-10-06 (D-T4): the generic no longer reads like a
+        # step («جمع‌بندی درخواست صوتی» sat on the card beside the answer
+        # step «جمع‌بندی پاسخ» and looked like one).
+        _fallback = "درخواست صوتی" if self._rtl else "Voice request"
+        # Precedence (D-T4): the relay's own title for the task (its summary,
+        # or the request words it carries — the «ها» card was titled with the
+        # filler that triggered it), then the caller's words, then the
+        # generic. A one-word title is a caption fragment at every rung:
+        # `derive_job_title` normalises a REQUEST and has no notion of "this is
+        # only part of one", so the floor lives here, where the input is known
+        # to be a transcript. Which floor depends on the SCRIPT: a space-free
+        # one measures the fragment in characters, because there every request
+        # is one `split()` token.
+        _given = derive_job_title(clean_request_text(task_title), fallback="")
+        if _title_is_fragment(_given):
+            _given = ""
         _derived = derive_job_title(_display, fallback="")
-        # A one-word title is a caption fragment. `derive_job_title` normalises
-        # a REQUEST; it has no notion of "this is only part of one", so the
-        # floor lives here, where the input is known to be a transcript. Which
-        # floor depends on the SCRIPT: a space-free one measures the fragment
-        # in characters, because there every request is one `split()` token.
         if _title_is_fragment(_derived):
             _derived = ""
-        self._title = _derived or derive_job_title(None, fallback=_fallback)
+        self._title = _given or _derived or derive_job_title(None, fallback=_fallback)
+        # D-R8: the caller turn that asked, for the thread marker and the row.
+        self._anchor: Dict[str, Any] = {
+            k: anchor[k] for k in (
+                "parent_user_turn_id", "request_turn_ids", "anchor_occurred_at",
+            ) if isinstance(anchor, dict) and anchor.get(k)
+        }
         self._answer_label = answer_step_label(rtl=self._rtl)
         # Minted here, not by JobRunner: the id has to exist synchronously so
         # the StepTracker can stamp `job_id` on the tool frames of the very
@@ -538,8 +1119,26 @@ class VoiceTurnJob:
         self._active: int = 0
         self._opened = False
         self._row_exists = False
+        # Set once `_open` has an answer (row committed, or the insert
+        # failed): the turn may await it, and no `running` frame goes out
+        # before it (W3).
+        self._row_ready = asyncio.Event()
         self._sealed = False
         self._lock = asyncio.Lock()
+        self._voice = (channel or "").strip().lower() == "voice"
+        self._frame_sink = frame_sink
+        self._plan_source: str = "tools"
+        self._planned_ids: set = set()
+        self._sources: List[Dict[str, Any]] = []
+        self._config_extra: Dict[str, Any] = {}
+        # The turn's StepTracker, kept from the last `bind` so a plan adopted
+        # from OUTSIDE the turn's own calls (`follow_steps`) re-points it.
+        self._tracker: Any = None
+        # Rows of steps that ran before an adopted supervisor plan; the
+        # plan's step i is card row `_plan_offset + i`.
+        self._plan_offset: int = 0
+        # D-T3: the card state before a PROVISIONAL begin_answer, or None.
+        self._provisional: Optional[Tuple[List[Dict[str, Any]], int]] = None
 
     # ── read-only state ───────────────────────────────────────────────
     @property
@@ -558,8 +1157,315 @@ class VoiceTurnJob:
     def delegation_id(self) -> Optional[str]:
         return self._delegation_id
 
+    @property
+    def rtl(self) -> bool:
+        return self._rtl
+
+    @property
+    def conversation_id(self) -> Optional[str]:
+        return self._conversation_id
+
+    @property
+    def plan_offset(self) -> int:
+        """Card row of the followed supervisor plan's step 0."""
+        return self._plan_offset if self._plan_source in ("supervisor", "model") else 0
+
     def step_labels(self) -> List[str]:
         return [str(s.get("label") or "") for s in self._steps]
+
+    def progress(self) -> Tuple[int, int, int]:
+        """(done, total, active row) of the card as it stands."""
+        from app.agent.job_steps import counts
+        done, total = counts(self._steps)
+        return done, total, self._active
+
+    # ── declared up front (a voice delegation) ────────────────────────
+    def declare(self, labels: Iterable[str], tracker: Any = None) -> None:
+        """Open the card NOW with a declared plan — before phase 1, before the
+        first model round. Nothing is running yet: the plan is what the turn
+        intends, and a step only starts when a tool lands on it, so a planned
+        step the turn never reaches closes ``skipped``, never done."""
+        try:
+            if self._opened:
+                return
+            for label in labels or ():
+                label = str(label or "").strip()
+                if not label or label == self._answer_label:
+                    continue
+                if self._ensure_step(label):
+                    self._planned_ids.add(self._steps[-2]["id"])
+            if not self._steps:
+                return
+            self._plan_source = "template"
+            self._opened = True
+            self.bind(tracker)
+            # The first `running` frame is `_open`'s, after the row commits.
+            self._spawn(self._open())
+        except Exception:  # noqa: BLE001 — a turn must never fail on a card
+            logger.exception("[turn-job] declare failed")
+
+    def adopt_plan(self, labels: Iterable[str], tracker: Any = None,
+                   *, source: str = "supervisor") -> None:
+        """Replace the steps that have not started with ``labels`` — the last
+        of them becomes the answer step. For a producer that plans the work
+        itself (the supervisor's ``delegate``, or the model's own
+        ``create_job`` on a turn whose card is already open): the steps
+        already run stay, in order, and the card keeps one writer instead of
+        two racing over ``steps_json``. The plan's step i is card row
+        ``plan_offset + i``."""
+        try:
+            labels = [str(x).strip() for x in labels or () if str(x or "").strip()]
+            if len(labels) < 2 or self._sealed:
+                return
+            kept = [st for st in self._steps
+                    if st.get("type") != "step_answer"
+                    and st.get("status") not in (None, "pending")]
+            fresh = [{"id": str(uuid.uuid4()), "label": lb, "status": "pending"}
+                     for lb in labels]
+            self._planned_ids = {st["id"] for st in fresh[:-1]}
+            self._steps = kept + fresh
+            self._plan_offset = len(kept)
+            for i, st in enumerate(self._steps):
+                st["type"] = "step_answer" if i == len(self._steps) - 1 else f"step_{i}"
+            self._answer_label = labels[-1]
+            self._plan_source = source
+            self._active = max(0, len(kept) - 1)
+            if not self._opened:
+                self._opened = True
+                self.bind(tracker)
+                self._spawn(self._open())
+            else:
+                self.bind(tracker)
+                self._emit("running")
+                self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.exception("[turn-job] adopt_plan failed")
+
+    def retitle(self, task_title: Optional[str]) -> bool:
+        """The relay's late title for this card (its six-word summary, landed
+        after dispatch) — voice round 2026-10-07, T11. Same floors as the
+        constructor: a fragment never replaces a title. The next frame carries
+        the new `name`, `_advance` writes `BuildJob.title`, and the thread
+        marker is written from it at close. True when the title changed."""
+        try:
+            if self._sealed:
+                return False
+            from app.agent.job_titles import derive_job_title
+            title = derive_job_title(clean_request_text(task_title), fallback="")
+            if not title or _title_is_fragment(title) or title == self._title:
+                return False
+            self._title = title
+            if self._opened:
+                self._emit("running")
+                self._spawn(self._advance())
+            return True
+        except Exception:  # noqa: BLE001 — a title never costs a turn
+            logger.debug("[turn-job] retitle failed", exc_info=True)
+            return False
+
+    def start_step(self, index: int, tracker: Any = None) -> None:
+        """Start step ``index`` (a step that already ran is left alone)."""
+        try:
+            if self._opened and not self._sealed and self._start(int(index)):
+                self.bind(tracker if tracker is not None else self._tracker)
+                self._emit("running")
+                self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] start_step failed", exc_info=True)
+
+    def note_config(self, **values: Any) -> None:
+        """Merge keys into the row's ``config_json`` (e.g. ``role``) through
+        this card's own writer, so a later card write cannot erase them."""
+        try:
+            self._config_extra.update(values)
+            if self._opened:
+                self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] note_config failed", exc_info=True)
+
+    def rebind_conversation(self, conversation_id: Optional[str]) -> None:
+        """The session phase 1 resolved, when it differs from the one the
+        card was declared with (a conversation the tenant had not seen)."""
+        try:
+            if not conversation_id or conversation_id == self._conversation_id:
+                return
+            self._conversation_id = conversation_id
+            if self._opened:
+                self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] rebind failed", exc_info=True)
+
+    def follow_steps(self, steps: Iterable[Dict[str, Any]]) -> None:
+        """Adopt an external plan WITH its live statuses — the supervisor's
+        (`delegate`, lane PF), whose workers run concurrently, which
+        `adopt_plan`/`start_step` (one running step at a time) cannot say.
+        No IO and no frame: the supervisor writes the row and announces it;
+        this keeps the card's own later writers (progress, the terminal frame,
+        the close) carrying the SAME plan instead of rewriting the template
+        over it. The last row is the answer step.
+
+        A FRESH plan (none of its rows is on the card yet) keeps the steps
+        that already ran ahead of it, as `adopt_plan` does — a search the
+        model made before delegating really ran, and its actions are filed
+        under it. A plan that already carries the card's rows (the
+        supervisor's own progress writes, built from `followed_steps`)
+        replaces them. Either way the turn's tracker is re-pointed, so the
+        delegate's own tool frames and the closing step event name rows of
+        THIS card rather than the template's."""
+        try:
+            rows = [dict(st) for st in steps or () if isinstance(st, dict)]
+            if len(rows) < 2 or not self._opened or self._sealed:
+                return
+            incoming = {st.get("id") for st in rows if st.get("id")}
+            if not incoming & {st.get("id") for st in self._steps}:
+                kept = [dict(st) for st in self._steps
+                        if st.get("type") != "step_answer"
+                        and st.get("status") not in (None, "pending")]
+                # The step that was running ended when the work was handed
+                # to the helpers.
+                now = datetime.utcnow()
+                for st in kept:
+                    if st.get("status") == "running":
+                        _close_step(st, now)
+                self._plan_offset = len(kept)
+                rows = kept + rows
+            for i, st in enumerate(rows):
+                st["type"] = "step_answer" if i == len(rows) - 1 else f"step_{i}"
+            self._steps = rows
+            self._planned_ids = {st.get("id") for st in rows[:-1]}
+            self._answer_label = str(rows[-1].get("label") or self._answer_label)
+            self._plan_source = "supervisor"
+            running = [i for i, st in enumerate(rows) if st.get("status") == "running"]
+            self._active = running[-1] if running else min(self._plan_offset, len(rows) - 1)
+            if self._tracker is not None:
+                self._sync_tracker(self._tracker, active=self._active)
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] follow_steps failed", exc_info=True)
+
+    async def open_following(self, steps: Iterable[Dict[str, Any]], **config: Any) -> Optional[str]:
+        """Open a card that has not opened yet DIRECTLY on an external plan —
+        a chat turn whose first round is `delegate` (TW-5). The supervisor's
+        card is then this turn's card, so the runner's lazy open finds it
+        open and a later work tool lands on it instead of minting a second
+        one. Awaits the row: the plan's workers are inserted under it as
+        their parent. Returns the job id, or None when the insert failed."""
+        try:
+            rows = [dict(st) for st in steps or () if isinstance(st, dict)]
+            if len(rows) < 2 or self._opened or self._sealed:
+                return None
+            for i, st in enumerate(rows):
+                st["type"] = "step_answer" if i == len(rows) - 1 else f"step_{i}"
+            self._steps = rows
+            self._planned_ids = {st.get("id") for st in rows[:-1]}
+            self._answer_label = str(rows[-1].get("label") or self._answer_label)
+            self._plan_source = "supervisor"
+            self._plan_offset = 0
+            self._active = 0
+            self._config_extra.update(config)
+            self._opened = True
+            self.bind(self._tracker)
+            await self._open()
+            return self._job_id if self._row_exists else None
+        except Exception:  # noqa: BLE001
+            logger.exception("[turn-job] open_following failed")
+            return None
+
+    async def wait_row(self, timeout: float) -> bool:
+        """Wait (bounded) until the card's row is committed. True when it is."""
+        try:
+            await asyncio.wait_for(self._row_ready.wait(), timeout)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            pass
+        return self._row_exists
+
+    def followed_steps(self) -> Optional[List[Dict[str, Any]]]:
+        """The supervisor-followed plan (a copy), else None."""
+        return self._snapshot() if self._plan_source == "supervisor" and self._steps else None
+
+    def begin_answer(
+        self, started_at: Optional[datetime] = None, *, provisional: bool = False,
+    ) -> None:
+        """The model's tool-less closing round began at ``started_at``: the
+        answer step is running from then, and the step before it closed then.
+
+        ``provisional`` (D-T3, the round-START beat): the round has written
+        text but may still call a tool — the card state before the move is
+        kept so `retract_answer` can put it back. A later non-provisional call
+        (the post-round confirmation) settles it."""
+        try:
+            if not self._opened or self._sealed or not self._steps:
+                return
+            if not provisional:
+                self._provisional = None
+            last = len(self._steps) - 1
+            before = ([dict(st) for st in self._steps], self._active)
+            if self._move_to(last, started_at or datetime.utcnow()):
+                if provisional:
+                    self._provisional = before
+                self._emit("running")
+                self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] begin_answer failed", exc_info=True)
+
+    def retract_answer(self) -> None:
+        """Undo a PROVISIONAL `begin_answer`: the round's text turned out to be
+        a preamble before a tool call, so the card returns to the step it was
+        on (its window reopened, nothing greened). No-op otherwise."""
+        try:
+            saved = self._provisional
+            self._provisional = None
+            if saved is None or not self._opened or self._sealed:
+                return
+            restored, active = saved
+            # The walk-back is a BACKWARD move (the prior step done→running,
+            # the answer running→pending) and both clients merge steps by
+            # status rank — they keep the higher status unless the row's
+            # `rev` changed. Without the bump the retraction was discarded
+            # and the card sat on "writing the answer" through the search
+            # (Phase D, contract-wire-1).
+            for i, row in enumerate(restored):
+                cur = self._steps[i] if i < len(self._steps) else {}
+                if (row.get("status"), row.get("completed_at")) != (
+                    cur.get("status"), cur.get("completed_at")
+                ):
+                    row["rev"] = max(int(row.get("rev") or 0), int(cur.get("rev") or 0)) + 1
+            self._steps, self._active = restored, active
+            if self._tracker is not None:
+                self._sync_tracker(self._tracker, active=self._active)
+            self._emit("running")
+            self._spawn(self._advance())
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] retract_answer failed", exc_info=True)
+
+    def note_sources(self, tool_name: Optional[str], tool_input: Any, result: Any) -> None:
+        """Keep the pages the work read — deduped by domain, at most six — for
+        ``config_json.sources`` and every frame from here on."""
+        try:
+            if not self._opened or str(tool_name or "") not in _SOURCE_TOOLS:
+                return
+            from app.api.api_v1 import _vs_sources
+            found = _vs_sources(
+                str(tool_name), tool_input if isinstance(tool_input, dict) else {},
+                result if isinstance(result, str) else str(result or ""),
+            )
+            seen = {s.get("domain") for s in self._sources}
+            for src in found or ():
+                dom = (src or {}).get("domain")
+                if dom and dom in seen and src.get("icon"):
+                    # D-T4: a domain first met in a SEARCH gains the icon its
+                    # page carried once that page was FETCHED.
+                    for kept in self._sources:
+                        if kept.get("domain") == dom and not kept.get("icon"):
+                            kept["icon"] = src["icon"]
+                    continue
+                if not dom or dom in seen or len(self._sources) >= _SOURCES_MAX:
+                    continue
+                seen.add(dom)
+                self._sources.append(dict(src))
+                if len(self._sources) >= _SOURCES_MAX:
+                    break
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] note_sources failed", exc_info=True)
 
     # ── the turn feeds these ──────────────────────────────────────────
     def plan(self, tool_calls: Iterable[Dict[str, Any]], tracker: Any = None) -> None:
@@ -576,8 +1482,17 @@ class VoiceTurnJob:
         first synced in the per-call loop is synced after those frames have
         already gone out, so a batched round — which is what a voice research
         turn is — would ship its actions with no step on them.
+
+        With a DECLARED plan the round is attributed to the planned step its
+        tool kind names; a kind the plan did not foresee takes over a never
+        started generic "Work on it" step, else is inserted before the answer
+        step — honest growth, never a hidden tool.
         """
         try:
+            # Kept even for a round with no work tool: a card opened later
+            # from outside the turn's own calls (`open_following`) binds it.
+            if tracker is not None:
+                self._tracker = tracker
             fresh = False
             first: Optional[str] = None
             for tc in tool_calls or ():
@@ -596,16 +1511,14 @@ class VoiceTurnJob:
             # round's first work tool is what a batched round needs; the
             # per-call `attribute` below refines each frame the loop emits
             # itself.
-            was = self._active
-            self._active = max(self._active, self._index_of(first))
+            moved = self._start(self._index_of(first))
             self.bind(tracker)
-            if not fresh and self._active == was:
-                return
             if not self._opened:
                 self._opened = True
                 self.bind(tracker)
                 self._spawn(self._open())
-            else:
+            elif fresh or moved:
+                self._emit("running")
                 self._spawn(self._advance())
         except Exception:  # noqa: BLE001 — a turn must never fail on a card
             logger.exception("[voice-job] plan failed")
@@ -616,6 +1529,34 @@ class VoiceTurnJob:
                 return i
         return self._active
 
+    def _start(self, idx: int) -> bool:
+        """Start step ``idx`` if it has never run. A revisit of a step that
+        already ran leaves the card alone — the tracker still files the action
+        under it — so the done count only ever grows."""
+        if not (0 <= idx < len(self._steps)):
+            return False
+        if self._steps[idx].get("status") not in (None, "pending"):
+            return False
+        return self._move_to(idx, datetime.utcnow())
+
+    def _move_to(self, idx: int, now: datetime) -> bool:
+        """Step ``idx`` is the running step from ``now``; the step that was
+        running closes then, with the window it really ran. Applied to the
+        live list on the turn's coroutine (no IO) so a fast walk through three
+        steps cannot be coalesced into one by a background writer."""
+        changed = False
+        for i, st in enumerate(self._steps):
+            if i != idx and st.get("status") == "running":
+                _close_step(st, now)
+                changed = True
+        target = self._steps[idx]
+        if target.get("status") in (None, "pending"):
+            target["status"] = "running"
+            target.setdefault("started_at", _iso_ms(now))
+            changed = True
+        self._active = idx
+        return changed
+
     def attribute(self, tool_name: Optional[str], tracker: Any) -> None:
         """Point ``tracker`` at the step this tool call belongs to, so the
         tool frames and the persisted ``tool_events`` carry the same
@@ -623,23 +1564,31 @@ class VoiceTurnJob:
         try:
             if not self._opened or tracker is None:
                 return
-            if not is_work_tool(tool_name):
-                return
             label = step_label_for_tool(tool_name, rtl=self._rtl)
             idx = next(
                 (i for i, s in enumerate(self._steps) if s.get("label") == label),
                 None,
             )
+            # A non-work tool files under a step only when it is a MEDIA tool
+            # and the PLAN declared the media step (D-T1). Every other
+            # non-work tool still starts nothing — a memory lookup must not
+            # green a planned "Work on it".
+            if not is_work_tool(tool_name) and (
+                _TOOL_KEYS.get(str(tool_name or "")) != "media"
+                or idx is None
+                or self._steps[idx].get("id") not in self._planned_ids
+            ):
+                return
             if idx is None:
                 return
             # The TRACKER gets the true index — this action belongs to this
             # step whether or not the turn has been here before.
             self._sync_tracker(tracker, active=idx)
-            # The CARD's progress only ever moves forward. A turn that goes
+            # The CARD only starts steps that never ran. A turn that goes
             # search → fetch → search revisits step 0, and a bar that walked
             # backwards would read as the job losing work it had already done.
-            if idx > self._active:
-                self._active = idx
+            if self._start(idx):
+                self._emit("running")
                 self._spawn(self._advance())
         except Exception:  # noqa: BLE001
             logger.debug("[voice-job] attribute failed", exc_info=True)
@@ -647,6 +1596,8 @@ class VoiceTurnJob:
     def bind(self, tracker: Any) -> None:
         """Adopt this job into the turn's :class:`StepTracker`."""
         try:
+            if tracker is not None:
+                self._tracker = tracker
             if self._opened and tracker is not None:
                 self._sync_tracker(tracker, active=self._active)
         except Exception:  # noqa: BLE001
@@ -671,6 +1622,17 @@ class VoiceTurnJob:
             if not self._opened or self._sealed:
                 return
             self._sealed = True
+            # The delegation stream is still open on the happy path (`done`
+            # follows this call), so its terminal frame goes out now, with the
+            # same step rules the background close writes to the row.
+            from app.agent.job_steps import finish_all_steps, skip_unstarted_steps
+            now = datetime.utcnow()
+            if reason == SEAL_CANCELLED:
+                self._emit("cancelled", _stop_open_steps(self._snapshot(), now))
+            else:
+                self._emit("completed", finish_all_steps(
+                    skip_unstarted_steps(self._snapshot()), now,
+                    keep_failed=self._config_extra.get("role") == "supervisor"))
             self._spawn(self._close(final_text, total_tokens, model, reason))
         except Exception:  # noqa: BLE001
             logger.exception("[voice-job] seal failed")
@@ -691,6 +1653,15 @@ class VoiceTurnJob:
         last, always."""
         if any(s.get("label") == label for s in self._steps):
             return False
+        # A declared generic step ("Work on it") that never started is a
+        # placeholder for exactly this: the first concrete kind takes it over
+        # instead of standing beside it as a step that will only be skipped.
+        generic = (_LABELS_FA if self._rtl else _LABELS_EN)["other"]
+        for st in self._steps:
+            if (st.get("id") in self._planned_ids and st.get("label") == generic
+                    and st.get("status") in (None, "pending")):
+                st["label"] = label
+                return True
         step = {
             "id": str(uuid.uuid4()),
             "type": f"step_{len(self._steps)}",
@@ -730,20 +1701,89 @@ class VoiceTurnJob:
         turn's own list to the ORM while the turn is still appending to it."""
         return [dict(s) for s in self._steps]
 
+    def _config(self) -> Dict[str, Any]:
+        """``config_json`` as this card writes it. ``turn_job`` is the marker
+        every closer reads (`job_reconciler.close_job_completed`) to skip a
+        planned step that never started instead of greening it."""
+        return {
+            "job_type": self._job_type(), "turn_job": True,
+            "plan_source": self._plan_source,
+            **({"voice_turn": True} if self._voice else {}),
+            **({"voice_delegation_id": self._delegation_id}
+               if self._delegation_id else {}),
+            **({"sources": list(self._sources)} if self._sources else {}),
+            # D-R8: the asking turn — `message_cards.job_card_fields` projects
+            # it, and `ws_chat._persist_job_card` stamps its marker from it.
+            **self._anchor,
+            **self._config_extra,
+        }
+
+    def _frame(self, status: str, steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """The ``job_update`` body every surface gets — the chat socket and
+        the delegation stream alike. Additive over the shape ``create_job``
+        emits: ``steps`` (the whole plan with live statuses) and ``sources``,
+        so no client waits for a REST read to draw the card."""
+        from app.agent.job_steps import counts, public_steps
+        done, total = counts(steps)
+        running = next((str(s.get("label") or "") for s in steps
+                        if s.get("status") == "running"), "")
+        if status == "completed":
+            done = total
+        if status == "cancelled":
+            step = _STOPPED_STEP_FA if self._rtl else _STOPPED_STEP_EN
+        elif status == "completed":
+            step = str(steps[-1].get("label") or "") if steps else "Done"
+        else:
+            step = running or "Working..."
+        out: Dict[str, Any] = {
+            "job_id": self._job_id,
+            "job_type": self._job_type(),
+            "name": self._title,
+            "status": status,
+            "step": step,
+            "total_steps": total,
+            "completed_steps": done,
+            "chat_id": self._conversation_id,
+            # No `message_id`: on voice the answer row is written by the
+            # platform relay under an id it mints itself.
+            "message_id": None,
+            "steps": public_steps(steps),
+        }
+        if self._sources:
+            out["sources"] = list(self._sources)
+        if self._anchor.get("parent_user_turn_id"):
+            # D-R8 (additive): the live card can fold under its bubble too.
+            out["parent_user_turn_id"] = self._anchor["parent_user_turn_id"]
+        return out
+
+    def _emit(self, status: str, steps: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Mirror the card onto the delegation stream as ``job.update``.
+        Synchronous and never raises: the sink is a non-blocking queue put."""
+        if self._frame_sink is None:
+            return
+        if status == "running" and not self._row_exists:
+            # W3: the phone reaps a job its next poll does not list, so a
+            # card announced before its row commits can be deleted and
+            # redrawn. `_open` sends the first frame, with every step change
+            # made meanwhile, the moment the row exists.
+            return
+        try:
+            frame = self._frame(status, steps if steps is not None else self._snapshot())
+            if self._delegation_id:
+                frame["delegation_id"] = self._delegation_id
+            self._frame_sink({"type": "job.update", **frame})
+        except Exception:  # noqa: BLE001
+            logger.debug("[turn-job] job.update sink failed", exc_info=True)
+
     # -- background writes (serialised behind one lock) ----------------
     async def _open(self) -> None:
         from app.agent.job_runner import JobRunner, TaskSpec
-        from app.agent.job_steps import dump_steps, open_first_step
+        from app.agent.job_steps import dump_steps
         from app.config import settings
 
         async with self._lock:
-            now = datetime.utcnow()
-            # Applied to the LIVE list, then snapshotted — not the other way
-            # round. `open_first_step` is what stamps step 0's `started_at`,
-            # and stamping it on a throwaway copy would leave the live list
-            # unstamped, so the next `advance_steps` would close step 0 with
-            # `now` for both edges and print the 0ms Round 8 removed.
-            open_first_step(self._steps, now)
+            # The step windows are stamped on the live list by the turn itself
+            # (`_move_to`); this only persists them.
             steps = self._snapshot()
             job_type = self._job_type()
             try:
@@ -773,11 +1813,7 @@ class VoiceTurnJob:
                         # Durable link back to the Live delegation. A repaired
                         # socket may land on another platform replica, so the
                         # tenant job row is the source of truth for its card.
-                        config_json={
-                            "job_type": job_type, "voice_turn": True,
-                            **({"voice_delegation_id": self._delegation_id}
-                               if self._delegation_id else {}),
-                        },
+                        config_json=self._config(),
                     ),
                     title=self._title,
                     prompt=self._title,
@@ -788,8 +1824,12 @@ class VoiceTurnJob:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("[voice-job] could not open job %s", self._job_id[:8])
+                self._row_ready.set()
                 return
             self._row_exists = True
+            self._row_ready.set()
+            if not self._sealed:
+                self._emit("running")
             logger.info(
                 "[voice-job] opened %s \"%s\" (%d steps)",
                 self._job_id[:8], self._title[:60], len(steps),
@@ -824,7 +1864,9 @@ class VoiceTurnJob:
         after, so the card lands between them: exactly where chat puts it.
         """
         from sqlalchemy import select as _sel
-        from app.api.message_cards import job_marker_content
+        from app.api.message_cards import (
+            job_marker_content, job_marker_row_fields, marker_day_instant,
+        )
         from app.db.database import async_session_maker
         from app.db.message_helpers import resolve_day_chat_id_for_now
         from app.db.models import Message as _Msg
@@ -839,10 +1881,20 @@ class VoiceTurnJob:
                 )).first()
                 if exists:
                     return
+                # D-R8 (d): stamped at the asking turn, linked to it —
+                # through the one helper both marker writers share — and
+                # filed under THAT instant's day (Phase D, tenant-8), not the
+                # day the card closed.
+                marker_fields = job_marker_row_fields(
+                    delegation_id=self._delegation_id, **self._anchor,
+                )
                 db.add(_Msg(
                     id=row_id,
                     conversation_id=self._conversation_id,
-                    day_chat_id=await resolve_day_chat_id_for_now(db, self._user_id),
+                    day_chat_id=await resolve_day_chat_id_for_now(
+                        db, self._user_id,
+                        utc_now=marker_day_instant(marker_fields.get("occurred_at")),
+                    ),
                     role="job",
                     # The marker, through the ONE writer — never a local
                     # json.dumps, whose default `ensure_ascii=True` is what
@@ -854,6 +1906,7 @@ class VoiceTurnJob:
                     content=job_marker_content(
                         self._job_id, self._title, self._job_type(),
                     ),
+                    **marker_fields,
                 ))
                 await db.commit()
         except Exception:  # noqa: BLE001 — the card is not worth a raise
@@ -862,24 +1915,13 @@ class VoiceTurnJob:
     async def _advance(self) -> None:
         """Re-write the step list and push progress. Cheap and idempotent —
         the card's steps grow as the turn discovers what it needs."""
-        from app.agent.job_steps import (
-            advance_steps, counts, dump_steps, open_first_step,
-        )
+        from app.agent.job_steps import counts, dump_steps
         from app.db.database import async_session_maker
         from app.db.models import BuildJob, JobEvent
 
         async with self._lock:
             if not self._row_exists:
                 return
-            now = datetime.utcnow()
-            # Live list first, snapshot second — see `_open`. Everything
-            # before the active step is finished; the active one is running.
-            # Same transitions, and the same per-step windows, the
-            # `update_job` tool writes, from the same module.
-            if self._active > 0:
-                advance_steps(self._steps, self._active - 1, now)
-            else:
-                open_first_step(self._steps, now)
             steps = self._snapshot()
             done, total = counts(steps)
             try:
@@ -888,6 +1930,15 @@ class VoiceTurnJob:
                     if job is None or job.status != "running":
                         return
                     job.steps_json = dump_steps(steps)
+                    if job.title != self._title:
+                        job.title = self._title     # `retitle` (T11)
+                    if self._conversation_id and job.conversation_id != self._conversation_id:
+                        job.conversation_id = self._conversation_id
+                    if self._sources or self._config_extra:
+                        job.config_json = {
+                            **(job.config_json or {}), **self._config_extra,
+                            **({"sources": list(self._sources)} if self._sources else {}),
+                        }
                     db.add(JobEvent(
                         job_id=self._job_id, user_id=self._user_id,
                         kind="info", level="info",
@@ -905,27 +1956,15 @@ class VoiceTurnJob:
         """The live surfaces: the in-app ``job_update`` frame and the phone
         card. Byte-for-byte the frame ``create_job`` / ``update_job`` emit —
         the clients must not be able to tell which producer wrote it."""
-        from app.agent.job_steps import counts, current_label
+        from app.agent.job_steps import counts
         done, total = counts(steps)
-        label = current_label(steps)
+        label = next((str(s.get("label") or "") for s in steps
+                      if s.get("status") == "running"), "")
         job_type = self._job_type()
         try:
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(self._user_id, {
-                "type": "job_update",
-                "job_id": self._job_id,
-                "job_type": job_type,
-                "name": self._title,
-                "status": "running",
-                "step": label or "Working...",
-                "total_steps": total,
-                "completed_steps": done,
-                "chat_id": self._conversation_id,
-                # No `message_id`: on voice the answer row is written by the
-                # platform relay under an id it mints itself, so the runner's
-                # pre-minted id would deep-link the card to a message that
-                # does not exist. The chat_id alone opens the conversation.
-                "message_id": None,
+                "type": "job_update", **self._frame("running", steps),
             })
         except Exception:  # noqa: BLE001
             logger.debug("[voice-job] job_update broadcast failed", exc_info=True)
@@ -975,59 +2014,10 @@ class VoiceTurnJob:
         except Exception:  # noqa: BLE001
             logger.debug("[voice-job] card push failed", exc_info=True)
 
-    @staticmethod
-    def _voice_of(raw: Any) -> Optional[Dict[str, Any]]:
-        """``metadata_json.voice`` of one row, or None when it has none."""
-        if isinstance(raw, dict):
-            meta: Any = raw
-        elif isinstance(raw, str) and raw:
-            try:
-                meta = json.loads(raw)
-            except (ValueError, TypeError):
-                return None
-        else:
-            return None
-        if not isinstance(meta, dict):
-            return None
-        voice = meta.get("voice")
-        return voice if isinstance(voice, dict) else None
-
     def _row_is_proof(self, raw_metadata: Any) -> bool:
-        """Is THIS assistant row the answer to THIS turn?
-
-        A row with no ``voice`` provenance at all is the Realtime path, where
-        the only assistant writer is the turn itself — unchanged behaviour, and
-        the reason this is not simply "voice.source == 'delegated'".
-
-        A ``live_spoken`` row is NEVER proof. That is the whole defect: the
-        Live prompt tells the model to "say one short line and delegate", so a
-        filler line — and therefore a spoken row — lands in the same
-        conversation a second after the job opens, and the cancelled outcome
-        became unreachable in exactly the scenario it was written for.
-        """
-        voice = self._voice_of(raw_metadata)
-        if voice is None:
-            return True
-        if str(voice.get("source") or "") != "delegated":
-            return False
-        if voice.get("cancelled") or voice.get("superseded"):
-            return False
-        if self._delegation_id is None:
-            return True
-        # Two concurrent delegations are an ordinary Live state (D9 allows
-        # two, queues the third). The OTHER one's answer is somebody else's
-        # proof.
-        #
-        # Both sides are bounded to the SAME length before comparing. The id is
-        # provider-supplied and unbounded, and it reaches the two sides of this
-        # comparison down different paths with different bounds: the card's
-        # copy came through the relay body (`[:64]`) and `ChatRequest`
-        # (max_length=64), while the row's copy is stamped straight onto the
-        # persisted message. Compared raw, an id longer than 64 characters
-        # makes this permanently False — so every DELIVERED delegated answer
-        # would close `cancelled`, which is the A5-05 lie inverted and looks
-        # correct from outside.
-        return str(voice.get("delegation_id") or "")[:_DELEGATION_ID_MAX] == self._delegation_id
+        """Is THIS assistant row the answer to THIS turn? See
+        :func:`voice_row_is_proof` — one rule, shared with the reconciler."""
+        return voice_row_is_proof(raw_metadata, self._delegation_id)
 
     async def _answer_was_delivered(self) -> bool:
         """Did THIS turn's answer land in this conversation after it opened?
@@ -1094,13 +2084,20 @@ class VoiceTurnJob:
         from app.agent.job_reconciler import announce_completed, close_job_completed
         from app.db.database import async_session_maker
 
-        if reason == SEAL_CANCELLED:
+        if reason == SEAL_CANCELLED and self._voice:
             # A cancel reaches here because `AgentRunner.run`'s finally ran
             # without `finalize` — so THIS turn produced no answer. It does not
             # follow that the user got nothing: the relay may already have
             # persisted the answer of a delegation that was detached rather
             # than killed. Ask — repeatedly, up to a ceiling — and upgrade to
             # the honest completed word when the thread says so.
+            #
+            # VOICE ONLY. On chat the turn is the only writer of its answer,
+            # so `finalize` is the only proof — and ws_chat writes an
+            # assistant row with no voice provenance on every Stop that
+            # streamed text ("…*[Generation stopped by user]*") and on every
+            # error, which `_row_is_proof` would read as the answer and close
+            # a stopped turn's card completed, every step green.
             if await self._await_answer_proof():
                 reason = SEAL_INTERRUPTED_AFTER_ANSWER
 
@@ -1118,6 +2115,13 @@ class VoiceTurnJob:
             now = datetime.utcnow()
             try:
                 async with async_session_maker() as db:
+                    # The turn's own step windows, not the last background
+                    # write's: `begin_answer` may still be queued behind us.
+                    from app.agent.job_steps import dump_steps
+                    from app.db.models import BuildJob
+                    _row = await db.get(BuildJob, self._job_id)
+                    if _row is not None and _row.status == "running":
+                        _row.steps_json = dump_steps(self._snapshot())
                     closed = await close_job_completed(
                         db, self._job_id, user_id=self._user_id, now=now,
                         # No message_id: the answer row is the relay's, under
@@ -1126,6 +2130,10 @@ class VoiceTurnJob:
                         message_id=None,
                         total_tokens=total_tokens, model=model,
                         reason="turn_end",
+                        config_updates={
+                            **self._config_extra,
+                            **({"sources": list(self._sources)} if self._sources else {}),
+                        } or None,
                     )
                     if closed is None:
                         # Already terminal — the sweep, the reconciler or the
@@ -1185,6 +2193,12 @@ class VoiceTurnJob:
             verdict = turn_interrupted()
             try:
                 async with async_session_maker() as db:
+                    # Merged, not replaced: another writer (a supervisor's
+                    # `role`, say) may have added keys since this card opened.
+                    _row = await db.get(BuildJob, self._job_id)
+                    _cfg = {**((_row.config_json if _row is not None else None) or {}),
+                            **self._config_extra,
+                            **({"sources": list(self._sources)} if self._sources else {})}
                     res = await db.execute(
                         _upd(BuildJob)
                         .where(BuildJob.id == self._job_id,
@@ -1193,6 +2207,7 @@ class VoiceTurnJob:
                         .values(
                             status=STATUS_CANCELLED,
                             completed_at=now,
+                            config_json=_cfg or self._config(),
                             # The steps as they stood. `finish_all_steps` would
                             # paint the unreached ones done, which is the
                             # overclaim.
@@ -1227,9 +2242,9 @@ class VoiceTurnJob:
             "[voice-job] cancelled %s title_len=%d (%d/%d steps, nothing delivered)",
             self._job_id[:8], len(self._title), done, total,
         )
-        await self._announce_cancelled(done, total)
+        await self._announce_cancelled(steps)
 
-    async def _announce_cancelled(self, done: int, total: int) -> None:
+    async def _announce_cancelled(self, steps: List[Dict[str, Any]]) -> None:
         """The live surfaces for a stopped card.
 
         The in-app frame is the whole announcement, and there is deliberately
@@ -1258,16 +2273,12 @@ class VoiceTurnJob:
         try:
             from app.api.ws_chat import broadcast_to_user
             await broadcast_to_user(self._user_id, {
-                "type": "job_update",
-                "job_id": self._job_id,
-                "job_type": self._job_type(),
-                "name": self._title,
-                "status": "cancelled",
-                "step": _STOPPED_STEP_FA if self._rtl else _STOPPED_STEP_EN,
-                "total_steps": total,
-                "completed_steps": done,
-                "chat_id": self._conversation_id,
-                "message_id": None,
+                "type": "job_update", **self._frame("cancelled", steps),
             })
         except Exception:  # noqa: BLE001
             logger.debug("[voice-job] cancel broadcast failed", exc_info=True)
+
+
+#: The Round-13 name. Every call site and test that imported the voice-only
+#: class keeps working; the class is channel-agnostic now.
+VoiceTurnJob = TurnJob

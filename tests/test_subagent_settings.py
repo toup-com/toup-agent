@@ -105,3 +105,50 @@ def test_caps_can_be_overridden_via_env(monkeypatch):
     assert s.subagent_default_timeout_seconds == 120
     assert s.subagent_max_timeout_seconds == 600
     assert s.subagent_orphan_sweep_threshold_minutes == 15
+
+
+def test_supervisor_defaults(monkeypatch):
+    """D-P6: the supervisor is off image-wide, staged by allowlist; executor
+    and supervisor models default to the user's own model; 3 workers / 240 s."""
+    s = _reload_settings(monkeypatch)
+    assert s.supervisor_enabled is False
+    assert s.supervisor_user_allowlist == ""
+    assert s.subagent_model is None and s.supervisor_model is None
+    assert s.supervisor_max_workers == 3
+    assert s.supervisor_timeout_seconds == 240
+    assert s.tool_timeout_overrides["delegate"] > s.supervisor_timeout_seconds
+
+
+def test_supervisor_settings_hot_reload():
+    from app.agent.config_reload import RELOADABLE_FIELDS
+    assert {"supervisor_enabled", "supervisor_user_allowlist", "subagent_model",
+            "supervisor_model", "supervisor_max_workers",
+            "supervisor_timeout_seconds"} <= RELOADABLE_FIELDS
+
+
+def _dockerfile_allowlist(path):
+    import re
+    from pathlib import Path
+
+    text = Path(path).read_text()
+    found = re.findall(r'^ENV SUPERVISOR_USER_ALLOWLIST="([^"]*)"\s*$', text, re.M)
+    return found
+
+
+def test_the_relay_and_the_tenant_image_carry_one_supervisor_allowlist():
+    """Voice round 2026-10-06, D-T2. The gate is read in TWO processes: the
+    tenant image (may this turn call `delegate`?) and platform-api (the voice
+    relay applies a tenant's `supervisor_model` only when the gate is on for
+    it). Only the agent image carried the allowlist, so the relay's gate was
+    OFF for exactly the accounts whose turns could delegate. Both Dockerfiles
+    carry the line exactly once and byte-identical."""
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parent.parent
+    agent = _dockerfile_allowlist(backend / "Dockerfile.agent")
+    platform = _dockerfile_allowlist(backend.parent / "Dockerfile")
+    assert len(agent) == 1 and len(platform) == 1, (agent, platform)
+    assert agent == platform
+    ids = [u for u in agent[0].split(",") if u]
+    assert "871bac24-c366-42b5-b224-8802c73aef3a" in ids
+    assert "c47c5b4b-16d2-498c-b231-15d53d7454b9" in ids

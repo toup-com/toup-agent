@@ -598,6 +598,17 @@ class AgentRuntimeFlagsResponse(BaseModel):
     — keep the keys snake_case so they pair 1:1 with the
     ``agent_configs`` column names."""
     subagent_spawning_enabled: bool
+    # Supervisor / executor overrides from platform_settings
+    # `subagent.settings.<user_id>` (admin PUT …/subagent-settings). Additive
+    # and null when unset: an older agent ignores them, a newer one falls back
+    # to its image settings. Read by agent/supervisor_gate.py (60 s cache).
+    supervisor_enabled: Optional[bool] = None
+    executor_model: Optional[str] = None
+    supervisor_model: Optional[str] = None
+    supervisor_max_workers: Optional[int] = None
+    max_children_per_parent: Optional[int] = None
+    max_per_user_concurrent: Optional[int] = None
+    worker_timeout_seconds: Optional[int] = None
 
 
 async def _authenticated_agent_tenant(
@@ -644,10 +655,19 @@ async def get_runtime_flags(
         # test_subagent_spawning_tenant_flag.py, is 403).
         raise HTTPException(status_code=403, detail="agent key mismatch")
 
+    from app.services import subagent_settings as _ss
+    ov = await _ss.load(db, str(x_agent_user_id))
     return AgentRuntimeFlagsResponse(
         subagent_spawning_enabled=bool(
             getattr(cfg, "subagent_spawning_enabled", False)
         ),
+        supervisor_enabled=ov.get("enabled"),
+        executor_model=ov.get("executor_model"),
+        supervisor_model=ov.get("supervisor_model"),
+        supervisor_max_workers=ov.get("max_workers"),
+        max_children_per_parent=ov.get("max_children_per_parent"),
+        max_per_user_concurrent=ov.get("max_per_user_concurrent"),
+        worker_timeout_seconds=ov.get("worker_timeout_seconds"),
     )
 
 

@@ -119,6 +119,18 @@ def _build_test_app() -> FastAPI:
     return app
 
 
+@pytest.fixture(autouse=True)
+def _reset_tenant_proxy_guard():
+    """PR-15: the tenant load guard is process-wide state (a per-tenant
+    "recently timed out" memo and in-flight counts). One test's timeout must
+    not make the next test's proxied read answer a fast 503."""
+    from app.services import tenant_proxy_guard
+
+    tenant_proxy_guard.reset_for_test()
+    yield
+    tenant_proxy_guard.reset_for_test()
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def _reset_database():
     """Fresh schema for every test — no cross-test pollution.

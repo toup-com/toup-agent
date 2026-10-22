@@ -197,6 +197,56 @@ def test_request_turn_ids_are_bounded_and_keep_the_anchor():
     assert all(t.consumed_by == "d20" for t in turns)
 
 
+def test_the_wire_names_every_turn_the_task_consumed_after_it_bound():
+    """D-P10: `request_turn_ids` is fixed at bind, but a task also consumes
+    turns later (a media tail, an answer to its question), and the media
+    backstop records none.  Unlisted, such a fragment was watched by the app
+    as a request of its own and quoted in the "no answer yet" header while the
+    card ran.  Every frame names the union, in spoken order — never an
+    asks-nothing turn the task merely swallowed (C6)."""
+
+    from app.services import live_voice_protocol as live
+
+    session = live._LiveSession.__new__(live._LiveSession)
+    session.utterances = live.UtteranceAssembler("p")
+    head = _turn(2, "search for the best book", 1000, 1800)
+    anchor = _turn(3, " on fundraising", 2000, 2600)
+    later = _turn(4, " in the world", 3000, 3400)
+    phatic = _turn(5, "Are you there?", 3600, 4000, asks_nothing=True)
+    other = _turn(6, "thanks", 5000, 5300)
+    for turn in (head, anchor, later, phatic):
+        turn.consumed_by = "d1"
+    session.utterances.closed_queue = [head, anchor, later, phatic, other]
+    # The lead-in it swept up was never recorded; the tail closed after it
+    # bound; a recorded turn that aged out of the queue keeps its place first.
+    bound = live.DelegatedTask(
+        delegation_id="d1", offset_ms=2700, transcript="x", turn_id=anchor.turn_id,
+        request_turn_ids=["live-utt:p:1", anchor.turn_id],
+    )
+    assert session.wire_request_turn_ids(bound) == [
+        "live-utt:p:1", head.turn_id, anchor.turn_id, later.turn_id,
+    ]
+    # The card's Retry consumed nothing: it names nothing.
+    relay = live.DelegatedTask(
+        delegation_id="relay-retry:1", offset_ms=6000, transcript="retry", turn_id=other.turn_id,
+    )
+    assert session.wire_request_turn_ids(relay) == []
+    # An orphan (no turn) names nothing.
+    orphan = live.DelegatedTask(delegation_id="d9", offset_ms=0, transcript="", turn_id="")
+    assert session.wire_request_turn_ids(orphan) == []
+    # Bounded like `span_turn_ids`: the anchor (here the OLDEST) and the newest.
+    many = [_turn(10 + i, f" w{i}", 10_000 + i * 500, 10_100 + i * 500) for i in range(20)]
+    for turn in many:
+        turn.consumed_by = "d20"
+    session.utterances.closed_queue = many
+    wide = live.DelegatedTask(
+        delegation_id="d20", offset_ms=30_000, transcript="x", turn_id=many[0].turn_id,
+    )
+    assert session.wire_request_turn_ids(wide) == (
+        [many[0].turn_id] + [t.turn_id for t in many[-(live.REQUEST_TURN_IDS_MAX - 1):]]
+    )
+
+
 # ── end to end: the frame carries it, on every observation ────────────────
 
 @pytest.mark.asyncio

@@ -590,7 +590,8 @@ def test_the_runner_declares_the_keyword_the_route_probes_for():
     from app.agent.agent_runner import AgentRunner
 
     params = inspect.signature(AgentRunner._run_inner).parameters
-    for kw in ("display_request", "reply_language", "voice_delegation_id"):
+    for kw in ("display_request", "reply_language", "voice_delegation_id",
+               "require_web", "job_frame_sink"):
         assert kw in params, kw
         assert params[kw].kind is inspect.Parameter.KEYWORD_ONLY, kw
 
@@ -616,3 +617,472 @@ def test_the_live_flag_reaches_the_builder():
     from app.api import api_v1
     src = inspect.getsource(api_v1.internal_voice_context)
     assert "live=req.live" in src
+
+
+# ── The card on the delegation stream (voice round 2026-10-05, D-P5/D-P3) ──
+
+def test_require_web_is_forwarded_only_when_set_and_accepted():
+    """The relay's research backstop marks its delegation; an older runner
+    (no `require_web` in its signature) must not be handed a keyword it would
+    raise on."""
+    req = ChatRequest(message="hi", require_web=True)
+    assert _forward_display_kwargs(_OldRunner(), req) == {}
+
+    class _R(_OldRunner):
+        async def _run_inner(self, *, user_message, user_id, require_web=False, **rest):
+            return None
+
+    assert _forward_display_kwargs(_R(), req) == {"require_web": True}
+    assert _forward_display_kwargs(_R(), ChatRequest(message="hi")) == {}
+    assert ChatRequest(message="hi").require_web is False
+
+
+class _CardRunner(_MediaRunner):
+    """Floods the tool budget, then drives the card sink and the step sink —
+    what a long research delegation does."""
+
+    async def _run_inner(self, *, user_message, user_id, on_tool_event=None,
+                         on_step_event=None, job_frame_sink=None, **rest):
+        for i in range(130):
+            await on_tool_event({"phase": "start", "call_id": f"c{i}",
+                                 "name": "web_search", "input": {}})
+        job_frame_sink({"type": "job.update", "job_id": "j1", "status": "completed",
+                        "steps": [{"id": "a", "label": "Search the web", "status": "done"}]})
+        await on_step_event({"kind": "reasoning", "job_id": "j1", "step_index": 2,
+                             "step_name": "Put the answer together", "steps_total": 3,
+                             "elapsed_ms": 812, "final": True, "iteration": 4,
+                             "output_tokens": 50})
+        await on_step_event({"kind": "reasoning", "iteration": 1, "final": False})
+        return _FakeResponse({})
+
+
+@pytest.mark.asyncio
+async def test_the_card_frames_are_never_spent_by_the_tool_budget(agent_mode, monkeypatch):
+    """`_VS_MAX_EVENTS` caps tool/status frames per turn. A research turn
+    spends it on tool frames, and a card whose terminal state is dropped by
+    the same budget is a card frozen at "In progress" in the call."""
+    from app.api.api_v1 import _VS_MAX_EVENTS
+
+    frames = await _drive_stream(monkeypatch, _CardRunner({}),
+                                 ChatRequest(message="search it", delegation_id="d1"))
+    assert len([f for f in frames if f.get("type") == "tool.start"]) == _VS_MAX_EVENTS
+    job = [f for f in frames if f.get("type") == "job.update"]
+    assert job and job[-1]["status"] == "completed"
+    steps = [f for f in frames if f.get("type") == "step.event"]
+    assert steps == [{"type": "step.event", "kind": "reasoning", "job_id": "j1",
+                      "step_index": 2, "steps_total": 3, "elapsed_ms": 812,
+                      "step_name": "Put the answer together", "final": True}], steps
+
+
+# ── Voice round 2026-10-06 (D-T1): `tool.end.media` ───────────────────────
+
+@pytest.mark.asyncio
+async def test_a_media_control_end_frame_carries_the_structured_verdict(
+    agent_mode, monkeypatch,
+):
+    """The relay must know a delegated stop EXECUTED, from structure and not
+    from prose: `media {action, reason, ok, title?}` off the tool's own
+    `ToolResult.media`, plus the closed-table sentence as `preview`. Only
+    `media_control` carries it; `ok` stays the plain not-an-ERROR boolean
+    (an honest "nothing was playing" is not a failed tool)."""
+    from app.agent.tool_display import ToolResult
+
+    verdict = ToolResult("Nothing was playing on the user's device.",
+                         display="Nothing was playing")
+    verdict.media = {"action": "stop", "reason": "nothing_playing", "ok": False}
+    skipped = ToolResult("Skipped to the next track.", display="Next track")
+    skipped.media = {"action": "next", "reason": "advanced", "ok": True,
+                     "title": "Hotline\x00 Bling"}
+    runner = _ToolEventRunner([
+        {"phase": "start", "call_id": "c1", "name": "media_control",
+         "input": {"action": "stop", "reason": "the user's own words"},
+         "started_ms": 1},
+        {"phase": "end", "call_id": "c1", "name": "media_control",
+         "input": {"action": "stop"}, "elapsed_ms": 40, "result": verdict},
+        {"phase": "end", "call_id": "c2", "name": "media_control",
+         "input": {"action": "next"}, "elapsed_ms": 40, "result": skipped},
+        {"phase": "end", "call_id": "c3", "name": "web_search", "input": {},
+         "elapsed_ms": 5, "result": "1. A result\n   https://example.com"},
+    ])
+    frames = await _drive_stream(monkeypatch, runner,
+                                 ChatRequest(message="stop it"))
+    start = [f for f in frames if f.get("type") == "tool.start"][0]
+    assert start["args"] == {"action": "stop"}, "the user's words stay off the wire"
+    ends = {f["call_id"]: f for f in frames if f.get("type") == "tool.end"}
+    assert ends["c1"]["media"] == {"action": "stop", "reason": "nothing_playing", "ok": False}
+    assert ends["c1"]["ok"] is True
+    assert ends["c1"]["preview"].startswith("Nothing was playing")
+    assert ends["c2"]["media"] == {"action": "next", "reason": "advanced", "ok": True,
+                                   "title": "Hotline Bling"}
+    assert "media" not in ends["c3"]
+
+
+# ── Voice round 2026-10-06 (D-R8 c / D-T4): the asking turn and the title ──
+
+class _AnchorRunner(_OldRunner):
+    async def _run_inner(self, *, user_message, user_id, channel=None,
+                         task_title=None, voice_anchor=None, **rest):
+        return None
+
+
+def test_the_asking_turn_and_title_reach_only_a_runner_that_takes_them():
+    req = ChatRequest(
+        message="hi", task_title=" The F1 race this weekend ",
+        parent_user_turn_id="turn-1", request_turn_ids=["turn-0", "turn-1"],
+        anchor_occurred_at="2026-10-06T12:41:09.123Z",
+    )
+    assert _forward_display_kwargs(_OldRunner(), req) == {}
+    assert _forward_display_kwargs(_AnchorRunner(), req) == {
+        "task_title": "The F1 race this weekend",
+        "voice_anchor": {
+            "parent_user_turn_id": "turn-1",
+            "request_turn_ids": ["turn-0", "turn-1"],
+            "anchor_occurred_at": "2026-10-06T12:41:09.123000",
+        },
+    }
+    from app.agent.agent_runner import AgentRunner
+    assert _runner_run_accepts(AgentRunner.__new__(AgentRunner), "task_title")
+    assert _runner_run_accepts(AgentRunner.__new__(AgentRunner), "voice_anchor")
+
+
+def test_the_new_body_keys_are_lenient_never_a_422():
+    """A newer relay must never be able to break an older contract: garbage
+    reads as absent, an over-long list is cut to 8, an aware stamp becomes
+    naive UTC."""
+    req = ChatRequest(message="hi", parent_user_turn_id=7, request_turn_ids="t",
+                      anchor_occurred_at="yesterday", task_title="   ")
+    assert (req.parent_user_turn_id, req.request_turn_ids,
+            req.anchor_occurred_at, req.task_title) == (None, None, None, None)
+    req = ChatRequest(message="hi", request_turn_ids=[f"t{i}" for i in range(12)] + [5],
+                      anchor_occurred_at="2026-10-06T08:41:09-04:00")
+    assert req.request_turn_ids == [f"t{i}" for i in range(8)]
+    assert req.anchor_occurred_at == "2026-10-06T12:41:09"
+    assert _forward_display_kwargs(_AnchorRunner(), ChatRequest(message="hi")) == {}
+
+
+def test_a_fetched_pages_touch_icon_rides_its_source_and_a_search_carries_none():
+    from app.agent.smart_fetch import reader
+    from app.api.api_v1 import _vs_sources
+
+    reader._touch_icons.clear()
+    reader.note_touch_icon(
+        "https://www.espn.com/f1/story",
+        '<html><head><link rel="apple-touch-icon" sizes="180x180" '
+        'href="/apple-touch-icon.png"><title>x</title></head><body></body></html>',
+    )
+    fetched = _vs_sources("web_fetch", {"url": "https://www.espn.com/f1/story"},
+                          "# F1 results\nbody")
+    assert fetched[0]["icon"] == "https://www.espn.com/apple-touch-icon.png"
+    searched = _vs_sources("web_search", {}, "1. ESPN\n   https://www.espn.com/f1\n")
+    assert "icon" not in searched[0], "a source the work only SEARCHED was never read"
+    # http-only icons and pages with none record nothing.
+    assert reader.note_touch_icon("http://plain.example/", '<link rel="apple-touch-icon" href="/i.png">') is None
+    assert reader.touch_icon_for("plain.example") is None
+    reader._touch_icons.clear()
+
+
+@pytest.mark.asyncio
+async def test_the_round_start_answer_beat_reaches_the_stream_as_provisional(
+    agent_mode, monkeypatch,
+):
+    """D-T3: the SSE route passes `provisional` on the round-START beat, and
+    only there — the post-round event stays exactly the frame build 141 reads."""
+
+    class _BeatRunner(_MediaRunner):
+        def __init__(self):
+            super().__init__({})
+
+        async def _run_inner(self, *, user_message, user_id, on_step_event=None, **rest):
+            for ev in (
+                {"kind": "reasoning", "final": True, "provisional": True,
+                 "job_id": "j-1", "step_index": 2},
+                {"kind": "reasoning", "final": True, "job_id": "j-1",
+                 "step_index": 2, "elapsed_ms": 900},
+            ):
+                await on_step_event(ev)
+            return _FakeResponse({})
+
+    frames = await _drive_stream(monkeypatch, _BeatRunner(), ChatRequest(message="hi"))
+    steps = [f for f in frames if f.get("type") == "step.event"]
+    assert [f.get("provisional") for f in steps] == [True, None], steps
+    assert all(f["final"] is True and f["kind"] == "reasoning" for f in steps)
+
+
+# ── Voice round 2026-10-07 (T3 / T11): the live delegations of this process ──
+
+class _CountingSessions:
+    """Stands in for `async_session_maker`: counts every session the route
+    opens and refuses it — a route answered from memory opens none."""
+
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self, *a, **kw):
+        self.n += 1
+        raise RuntimeError("DB opened")
+
+
+def _fresh_live(monkeypatch, delegation_id="d-live", session_id="sess-live", job_id=None):
+    from app.api import api_v1
+
+    monkeypatch.setattr(api_v1, "_VS_LIVE", {})
+    monkeypatch.setattr(api_v1, "_VS_DONE", api_v1.OrderedDict())
+    live = api_v1._VsLive(delegation_id, session_id)
+    if job_id:
+        live.job_id, live.job_status = job_id, "running"
+    api_v1._vs_register(live)
+    return live
+
+
+class _FakeJob:
+    def __init__(self):
+        self.titles: list = []
+
+    def retitle(self, title):
+        self.titles.append(title)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_an_addendum_is_answered_from_the_live_registry(agent_mode, monkeypatch):
+    """DESIGN-R3 D-R3(3): one route, the tenant's answers, idempotent on the
+    caller turn id — and no DB at all."""
+    from app.api import api_v1
+    from app.api.api_v1 import VoiceDelegationAddendumRequest as R
+
+    sessions = _CountingSessions()
+    monkeypatch.setattr(api_v1, "async_session_maker", sessions)
+    live = _fresh_live(monkeypatch)
+
+    async def post(**kw):
+        body = {"session_id": "sess-live", "task_id": "d-live", "lang": "fa", **kw}
+        return await api_v1.internal_voice_delegation_addendum(R(**body), _FakeRequest())
+
+    first = await post(addendum_id="turn:12", text="کیه")
+    assert first == {"accepted": True, "state": "queued"}
+    assert await post(addendum_id="turn:12", text="کیه") == first, "a repeat is its first answer"
+    assert await post(addendum_id="turn:13", text="  کیه ") == {"accepted": False, "reason": "duplicate"}
+    assert (await post(addendum_id="turn:14", text="at u of t"))["accepted"]
+    assert (await post(addendum_id="turn:15", text="in llms"))["accepted"]
+    assert await post(addendum_id="turn:16", text="and when") == {"accepted": False, "reason": "limit"}
+    assert await post(addendum_id="turn:x", text="hi", task_id="nope") == {
+        "accepted": False, "reason": "not_running"}
+    assert await post(addendum_id="turn:y", text="hi", session_id="other") == {
+        "accepted": False, "reason": "not_running"}
+    # The runner drains them in order, as model-facing notes; the ids applied.
+    notes = await live()
+    assert len(notes) == 3 and "«کیه»" in notes[0] and "part of the same request" in notes[0]
+    assert live.applied == ["turn:12", "turn:14", "turn:15"]
+    # The answer is written: nothing queued → closing, atomically; late → answer_written.
+    assert await live(final=True) == [] and live.state == "closing"
+    assert await post(addendum_id="turn:17", text="one more") == {
+        "accepted": False, "reason": "answer_written"}
+    api_v1._vs_unregister(live)
+    assert await post(addendum_id="turn:18", text="again") == {
+        "accepted": False, "reason": "finished"}
+    assert sessions.n == 0
+
+
+@pytest.mark.asyncio
+async def test_a_late_addendum_is_not_taken_once_the_extra_round_is_spent(agent_mode, monkeypatch):
+    live = _fresh_live(monkeypatch)
+    assert live.offer("turn:20", "and in 2024", None)["accepted"]
+    assert await live(final=True, take=False) == []
+    assert live.state == "closing" and live.applied == [], "reported unapplied, never dropped silently"
+
+
+@pytest.mark.asyncio
+async def test_the_late_title_rides_the_addendum_route(agent_mode, monkeypatch):
+    """D-R4(5): the model's six-word title lands after dispatch and rides the
+    addendum route with empty text; `text` empty WITHOUT a title is refused."""
+    import pydantic
+    from app.api import api_v1
+    from app.api.api_v1 import VoiceDelegationAddendumRequest as R
+
+    with pytest.raises(pydantic.ValidationError):
+        R(session_id="s", task_id="d", addendum_id="a", text="  ")
+    # Over-long values are cut, never a 422 that loses the caller's words.
+    long = R(session_id="s", task_id="d", addendum_id="a", text="x" * 400,
+             task_title="t" * 90, lang="fa-IR")
+    assert len(long.text) == 300 and len(long.task_title) == 60 and long.lang is None
+    live = _fresh_live(monkeypatch)
+    ans = await api_v1.internal_voice_delegation_addendum(
+        R(session_id="sess-live", task_id="d-live", addendum_id="title:1",
+          text="", task_title="آیلتس آکادمیک ریدینگ"), _FakeRequest())
+    assert ans == {"accepted": True, "state": "queued"} and live.queued == []
+    job = _FakeJob()
+    live.bind_job(job)                      # the runner binds its card…
+    assert job.titles == ["آیلتس آکادمیک ریدینگ"], "…and the held title lands on it"
+    live.offer("title:2", "", "IELTS academic reading")
+    assert job.titles[-1] == "IELTS academic reading"
+
+
+@pytest.mark.asyncio
+async def test_status_answers_a_live_delegation_from_memory(agent_mode, monkeypatch):
+    """T3: the relay polled `/status` every 1.5 s per running task and each poll
+    read up to 100 jobs + 250 messages. A delegation running HERE is answered
+    from memory; only ids that are not live touch the DB."""
+    from app.api import api_v1
+    from app.api.api_v1 import VoiceDelegationStatusRequest as S
+
+    sessions = _CountingSessions()
+    monkeypatch.setattr(api_v1, "async_session_maker", sessions)
+    live = _fresh_live(monkeypatch, job_id="job-live-1")
+    out = await api_v1.internal_voice_delegations_status(
+        S(session_id="sess-live", task_ids=["d-live"]), _FakeRequest())
+    assert out == {"tasks": {"d-live": {
+        "status": "running", "job_id": "job-live-1", "cancel_requested": False}}}
+    assert api_v1._vs_signal_cancel("d-live", "sess-live")
+    out = await api_v1.internal_voice_delegations_status(
+        S(session_id="sess-live", task_ids=["d-live"]), _FakeRequest())
+    assert out["tasks"]["d-live"]["cancel_requested"] is True
+    assert sessions.n == 0
+    live.job_status = "completed"            # finished: the recovery fields are the DB's
+    with pytest.raises(RuntimeError):
+        await api_v1.internal_voice_delegations_status(
+            S(session_id="sess-live", task_ids=["d-live"]), _FakeRequest())
+    assert sessions.n == 1
+
+
+class _AddendumRunner(_MediaRunner):
+    """A runner that reads its addendum box at a round barrier, the way the
+    real one does, after the relay queued «کیه» through the route."""
+
+    def __init__(self):
+        super().__init__({})
+        self.notes: list = []
+
+    async def _run_inner(self, *, user_message, user_id, addendum_check=None,
+                         job_frame_sink=None, **rest):
+        from app.api import api_v1
+        from app.api.api_v1 import VoiceDelegationAddendumRequest as R
+
+        job_frame_sink({"type": "job.update", "job_id": "job-a", "status": "running"})
+        await api_v1.internal_voice_delegation_addendum(
+            R(session_id="sess-add", task_id="d-add", addendum_id="turn:12", text="کیه"),
+            _FakeRequest())
+        self.notes = await addendum_check()
+        assert await addendum_check(final=True) == []
+        return _FakeResponse({})
+
+
+@pytest.mark.asyncio
+async def test_the_done_frame_names_the_addenda_the_run_folded(agent_mode, monkeypatch):
+    from app.api import api_v1
+    from app.api.api_v1 import VoiceDelegationAddendumRequest as R
+
+    monkeypatch.setattr(api_v1, "_VS_LIVE", {})
+    monkeypatch.setattr(api_v1, "_VS_DONE", api_v1.OrderedDict())
+    runner = _AddendumRunner()
+    frames = await _drive_stream(monkeypatch, runner, ChatRequest(
+        message="who is the strongest llm professor", session_id="sess-add",
+        delegation_id="d-add", save=False))
+    assert runner.notes and "«کیه»" in runner.notes[0]
+    done = next(f for f in frames if f.get("type") == "done")
+    assert done["addenda_applied"] == ["turn:12"]
+    assert "d-add" not in api_v1._VS_LIVE, "the registry forgets a finished delegation"
+    late = await api_v1.internal_voice_delegation_addendum(
+        R(session_id="sess-add", task_id="d-add", addendum_id="turn:13", text="and where"),
+        _FakeRequest())
+    assert late == {"accepted": False, "reason": "finished"}
+    plain = await _drive_stream(monkeypatch, _MediaRunner({}), ChatRequest(message="hi"))
+    assert "addenda_applied" not in next(f for f in plain if f.get("type") == "done")
+
+
+class _SlowCancellableRunner(_MediaRunner):
+    def __init__(self):
+        super().__init__({})
+
+    async def _run_inner(self, *, user_message, user_id, cancel_check=None, **rest):
+        import asyncio as _a
+        for _ in range(300):                 # 3 s, polling like the real loop
+            if cancel_check and cancel_check():
+                raise _a.CancelledError("Generation cancelled by user")
+            await _a.sleep(0.01)
+        return _FakeResponse({})
+
+
+@pytest.mark.asyncio
+async def test_a_stop_wakes_the_running_delegation_without_a_db_poll(agent_mode, monkeypatch):
+    """T3: the watch read 100 build_jobs every 1.5 s from t0. The cancel route
+    now sets the delegation's in-process event beside the durable bit, so the
+    stop lands at once and the DB is not read at all inside the first 5 s."""
+    import asyncio as _a
+    import time as _t
+    from app.api import api_v1
+
+    monkeypatch.setattr(api_v1, "_VS_LIVE", {})
+    sessions = _CountingSessions()
+    monkeypatch.setattr(api_v1, "async_session_maker", sessions)
+    signalled: dict = {}
+
+    async def _stop_soon():
+        await _a.sleep(0.2)
+        signalled["t"] = _t.perf_counter()
+        assert api_v1._vs_signal_cancel("d-stop", "sess-stop")
+
+    stopper = _a.ensure_future(_stop_soon())
+    frames = await _drive_stream(monkeypatch, _SlowCancellableRunner(), ChatRequest(
+        message="search the thing", session_id="sess-stop", delegation_id="d-stop",
+        save=False))
+    ended = _t.perf_counter()
+    await stopper
+    assert frames[-1] == {"type": "cancelled", "reason": "voice_stop"}, frames[-3:]
+    assert ended - signalled["t"] < 1.0, f"stop took {ended - signalled['t']:.2f}s"
+    assert sessions.n == 0, "the event path reads no DB"
+
+
+# ── Phase C seam (DESIGN-R3 D-R3(3)): the relay's poster IS the route's body ──
+
+@pytest.mark.asyncio
+async def test_the_relays_addendum_post_is_the_routes_body(agent_mode, monkeypatch):
+    """The relay half (`post_tenant_addendum`, `forward_task_title`) and the
+    tenant half (`VoiceDelegationAddendumRequest` + the route) were written
+    in two lanes against one contract.  Here the relay's real body goes
+    through the tenant's real model and route: a caller's tail is queued on
+    the live delegation, the title-only ride renames its card, and the
+    `done.addenda_applied` ids clear the relay's unapplied list."""
+
+    from app.api import api_v1
+    from app.api import ws_realtime as rt
+    from app.services import live_voice_protocol as lvp
+
+    live = _fresh_live(monkeypatch)
+    bodies: list = []
+
+    async def vps(_user_id):
+        return ("http://tenant.invalid", "secret-agent-key")
+
+    async def vps_api(url, key, method, path, params=None, json_body=None, timeout=15.0,
+                      outcome=None):
+        assert (method, path) == ("POST", "/api/v1/internal/voice-delegations/addendum")
+        bodies.append(dict(json_body))
+        req = api_v1.VoiceDelegationAddendumRequest.model_validate(json_body)
+        return await api_v1.internal_voice_delegation_addendum(req, _FakeRequest())
+
+    monkeypatch.setattr(rt, "_get_vps_info", vps)
+    monkeypatch.setattr(rt, "_vps_api", vps_api)
+    session = lvp._LiveSession.__new__(lvp._LiveSession)
+    session.user_id, session.db_session_id = "owner-1", "sess-live"
+    task = lvp.DelegatedTask(
+        delegation_id="d-live", offset_ms=0, reply_language="fa",
+        transcript="قوی‌ترین استاد یوافتی توی بحث ال‌ال‌ام رو پیدا کن",
+        summary="استاد ال‌ال‌ام یوافتی",
+    )
+    assert await session.post_tenant_addendum(task, "live-utt:p:5", "کیه") == "accepted"
+    assert live.queued == [("live-utt:p:5", "کیه")]
+    assert await session.forward_task_title(task) == "accepted"
+    job = _FakeJob()
+    live.bind_job(job)
+    assert job.titles == ["استاد ال‌ال‌ام یوافتی"]
+    assert {k for b in bodies for k in b} <= {
+        "session_id", "task_id", "addendum_id", "text", "lang", "task_title",
+    }, bodies
+    # The run folds the tail; its done event names it; the relay drops it
+    # from what the delivery must still answer.
+    notes = await live()
+    assert len(notes) == 1 and "«کیه»" in notes[0]
+    task.addenda = [{"id": "live-utt:p:5", "text": "کیه", "forwarded": True}]
+    task.addenda_unapplied = ["کیه"]
+    session.note_addenda_applied(task, {"addenda_applied": list(live.applied)})
+    assert task.addenda_unapplied == []

@@ -127,6 +127,10 @@ TOOLS_DOCGEN: FrozenSet[str] = frozenset({
 # array before intent gating and subtracted from the allowed names.
 TOOLS_WORK_TRACKING: FrozenSet[str] = frozenset({
     "create_job", "update_job", "start_mission",
+    # The supervisor rides with the work intents for the same reason, and
+    # stays off question/greeting turns: small talk is never delegated.
+    # Its runtime gate (agent/supervisor_gate.py) still applies.
+    "delegate",
 })
 
 TOOLS_MEMORY: FrozenSet[str] = frozenset({
@@ -139,7 +143,7 @@ TOOLS_WEB: FrozenSet[str] = frozenset({
 
 TOOLS_MEDIA: FrozenSet[str] = frozenset({
     "send_file", "send_photo", "analyze_image", "generate_image", "edit_image",
-    "tts", "play_media", "tts_prefs", "canvas",
+    "tts", "play_media", "media_control", "tts_prefs", "canvas",
 }) | TOOLS_RECALL | TOOLS_WORK_TRACKING
 
 TOOLS_CODE: FrozenSet[str] = frozenset({
@@ -601,6 +605,18 @@ def with_automation_tools(intent: QueryIntent) -> QueryIntent:
                    tool_names=frozenset(intent.tool_names) | TOOLS_AUTOMATIONS)
 
 
+def with_supervisor_tool(intent: QueryIntent) -> QueryIntent:
+    """Offer the supervisor (`delegate`) on an intent that would not carry it
+    — a `question`, a `greeting`-shaped short ask — when the request itself is
+    multi-part (voice round 2026-10-06, D-T2; `voice_jobs.multi_part_request`).
+    The runtime gate (`supervisor_gate`) still decides whether the tool exists
+    for this user at all; this only stops the intent from hiding it."""
+    if intent.category == "full" or "delegate" in intent.tool_names:
+        return intent
+    return replace(intent,
+                   tool_names=frozenset(intent.tool_names) | {"delegate"})
+
+
 # Short but meaningful messages that should NOT be classified as greetings
 _SHORT_BUT_MEANINGFUL_RE = re.compile(
     r'\b(?:delete|remove|cancel|stop|abort|undo|redo|reset|clear|wipe)\b'
@@ -964,6 +980,12 @@ _ALWAYS_INCLUDED_TOOLS = frozenset({
     "analyze_attachment",  # A short "summarize this" may need the full uploaded file.
     "read_attachment_analysis",  # Follow-up turns can retrieve stored page evidence.
     "navigate_to",  # Page transfers — needed in any intent
+    # Voice round 2026-10-06 (D-T1): "stop it" / "pause" / «استاپش کن» is the
+    # canonical zero-score ask — two Latin words land in `question`, whose
+    # round-0 set held no media tool, so the model could only apologise while
+    # the music kept playing. Same reasoning as navigate_to: a control the
+    # user can ask for in any intent.
+    "media_control",
     "recall_day",   # Past-day questions can fall under any category
     "memory_search",  # "what do you remember about X" can hit any intent
     # Same reasoning, and stronger: the `# User Brain` index NAMES the

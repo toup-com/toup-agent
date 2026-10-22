@@ -39,6 +39,8 @@ import asyncio
 import pytest
 
 import test_live_harness as H
+from app.config import settings
+from app.services import live_voice_protocol as live
 
 
 RESEARCH = "research the toronto robotics faculty"
@@ -774,7 +776,19 @@ async def test_an_unmarked_qualifier_after_dispatch_carries_the_running_request(
     second = inputs["d2"]
     assert displays["d2"] == qualifier, "the qualifier is still the card's request"
     assert "Work still in progress when the caller said this" in second
-    assert "non-binding context — apply it only if the current request modifies it" in second
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R7 / D-6a): the
+    # context rule was "(non-binding context — apply it only if the current
+    # request modifies it)", which invited the agent to read a NEW question as
+    # a revision of the previous one (the UFC answer framed as a correction of
+    # F1).  It is context for pointer words and incomplete requests only now —
+    # a qualifier like this one is still completed by it.
+    assert "context only — separate work still in progress" in second
+    assert "incomplete without it" in second
+    assert "never treat the current request as a correction of it" in second
+    # Voice round 2026-10-07 (T10, the IELTS pair): the running request is
+    # answered separately — the follow-up job answers ONLY its own request.
+    assert "That request is being answered separately" in second
+    assert "Answer ONLY the current request" in second
     assert "استادای رباتیک یوآفتی رو پیدا کن" in second
     assert second.rstrip().split("Current caller request: ")[-1].startswith(qualifier)
     assert all("relation" not in f for f in _frames_for(client, "d2")), "no relation without evidence"
@@ -790,6 +804,9 @@ async def test_a_follow_up_right_after_an_answer_carries_that_request_as_context
     assert len(thinks) == 2
     assert "Request made just before this one" in thinks[1]
     assert "find a robotics professor at toronto" in thinks[1]
+    # Voice round 2026-10-07 (T10): the caller already heard that answer.
+    assert "That request was already answered and the caller heard the answer" in thinks[1]
+    assert "Answer ONLY the current request" in thinks[1]
     assert all("relation" not in f for f in _frames_for(client, "d2"))
 
 
@@ -935,3 +952,165 @@ def test_every_new_relay_line_and_label_is_bilingual_and_private():
     )
     label = next(line for line in message.splitlines() if line.startswith("Request this one follows"))
     assert sanitize_user_visible_answer(label) == ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D-R6 (2026-10-06 call): a one-word answer or correction resolves the
+# open question instead of opening a task of its own
+# ══════════════════════════════════════════════════════════════════════
+#
+# «مسابقه اف‌وان» was heard as «مصاحبه عرفان»; the agent's spoken RESULT asked
+# «منظورت مصاحبهٔ کدوم عرفانه؟» (and then said more, so its LAST sentence is not
+# a question); the caller's «رضوان», «افوانه», «فورمولوان» each became a task.
+
+MISHEARD = "اوکی یه چیزی میخواستم ببینم که این مصاحبه عرفان کجا برگزار میشه"
+ASKED = "منظورت مصاحبهٔ کدوم عرفانه؟"
+RECORDED_ANSWER = (
+    ASKED + " اسم کاملش یا لینک خبر رو بگی، محل برگزاریش رو برات پیدا می‌کنم."
+)
+
+
+def _created(client, did):
+    return next(f for f in _frames_for(client, did) if f.get("phase") == "created")
+
+
+#: The answer context's own words (fa: «پاسخ تماس‌گیرنده … است») — never in the
+#: accepted-result ledger, which carries the question verbatim either way.
+ANSWER_MARK = "پاسخ تماس‌گیرنده"
+
+
+def test_the_recorded_result_asked_a_question_its_last_sentence_does_not_show():
+    assert not live.latest_sentence_asks(RECORDED_ANSWER)
+    assert live.asked_question(RECORDED_ANSWER) == ASKED
+    assert live.asked_question("The race is on Sunday at 2 pm.") == ""
+
+
+@pytest.mark.asyncio
+async def test_d_r6_a_one_word_reply_to_the_results_question_refines_that_request(monkeypatch):
+    client, _provider, thinks = await _after_finished(
+        monkeypatch, MISHEARD, "فورمولوان", db="db-auth-d-r6-answer",
+        prior_answer=RECORDED_ANSWER,
+    )
+    assert len(thinks) == 2
+    d1, d2 = _created(client, "d1"), _created(client, "d2")
+    # The card names the request it continues, never the bare word.
+    assert d2["title"] == d1["title"]
+    # The agent gets the question, the request, and the word — marked as
+    # speech that may be misheard.
+    assert ANSWER_MARK in thinks[1] and ASKED in thinks[1] and "فورمولوان" in thinks[1]
+    assert "مصاحبه عرفان" in thinks[1]
+    assert "اشتباه شنیده" in thinks[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second", [
+    "هوا چطوره؟",                      # a request with its own predicate
+    "what's the weather in tokyo right now",
+])
+async def test_d_r6_control_a_request_after_the_question_is_its_own(monkeypatch, second):
+    client, _provider, thinks = await _after_finished(
+        monkeypatch, MISHEARD, second, db=f"db-auth-d-r6-ctl-{abs(hash(second)) % 10**6}",
+        prior_answer=RECORDED_ANSWER,
+    )
+    assert len(thinks) == 2
+    assert _created(client, "d2")["title"] != _created(client, "d1")["title"]
+    assert ANSWER_MARK not in thinks[1]
+
+
+@pytest.mark.asyncio
+async def test_d_r6_control_a_reply_after_the_window_is_its_own(monkeypatch):
+    # `fast_clocks` leaves the window alone: past it, the word is its own.
+    monkeypatch.setattr(settings, "voice_live_answer_window_s", 0.0)
+    client, _provider, thinks = await _after_finished(
+        monkeypatch, MISHEARD, "فورمولوان", db="db-auth-d-r6-late",
+        prior_answer=RECORDED_ANSWER,
+    )
+    assert ANSWER_MARK not in thinks[1]
+    assert _created(client, "d2")["title"] != _created(client, "d1")["title"]
+
+
+@pytest.mark.asyncio
+async def test_d_r6_control_a_result_that_asked_nothing_links_nothing(monkeypatch):
+    client, _provider, thinks = await _after_finished(
+        monkeypatch, MISHEARD, "فورمولوان", db="db-auth-d-r6-noq",
+        prior_answer="مصاحبهٔ عرفان فردا در تهران برگزار می‌شه.",
+    )
+    assert _created(client, "d2")["title"] != _created(client, "d1")["title"]
+
+
+@pytest.mark.asyncio
+async def test_d_r6_one_word_while_its_request_still_runs_corrects_it(monkeypatch):
+    """«رضوان» (12:42:05) arrived while the misheard F1 task still ran and
+    became a concurrent task titled «جمع‌بندی درخواست صوتی».  One content word,
+    straight after the request, nothing in between: a correction of it —
+    superseded, the card titled from it, the word marked as a correction."""
+
+    client, _provider, inputs, displays, killed = await _while_running(
+        monkeypatch, "رضوان", running=MISHEARD, db="db-auth-d-r6-running",
+    )
+    assert killed == ["d1"], "the misheard task kept running beside its correction"
+    assert displays["d2"] == displays["d1"]
+    assert "رضوان" in inputs["d2"] and "مصاحبه عرفان" in inputs["d2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("followup", [
+    "هوا چطوره؟",          # a predicate: a request of its own
+    "weather?",            # a one-word QUESTION is a request
+    "هوای تورنتو",         # two content words
+    "حتما",                # consent ("sure"), not a word of the request
+])
+async def test_d_r6_control_these_never_supersede_the_running_task(monkeypatch, followup):
+    _client, _provider, _inputs, _displays, killed = await _while_running(
+        monkeypatch, followup, running=MISHEARD, db=f"db-auth-d-r6-run-ctl-{abs(hash(followup)) % 10**6}",
+    )
+    assert killed == []
+
+
+def test_the_callers_correction_opener_is_not_the_agents_word_heard_back():
+    """«منظورم» (+250.4) was judged echo-only while the agent said «منظورت…»,
+    so the caller's correction lost its opener.  One stem, another person."""
+
+    assert live._echo_token_heard("منظورم", frozenset({"منظورت"})) is False
+    # …the agent's own word heard back is still echo.
+    assert live._echo_token_heard("منظورت", frozenset({"منظورت"})) is True
+    assert live._echo_token_heard("مصاحبه", frozenset({"مصاحبهٔ", "مصاحبه"})) is True
+
+
+@pytest.mark.asyncio
+async def test_d_r6_control_a_request_said_in_between_ends_the_answer_window(monkeypatch):
+    """The result asked, then the caller asked something else, then said one
+    word: that word answers nothing the relay can prove — its own task."""
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    thinks: list[str] = []
+    box: dict = {}
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        thinks.append(task)
+        return (RECORDED_ANSWER if len(thinks) == 1 else "Okay, done."), "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    async def script():
+        await _wait(lambda: _terminal(client, "d1"))
+        await asyncio.sleep(0.5)
+        # A request the model answers itself: no task, so the newest finished
+        # task is still the one that asked — only the turn in between differs.
+        box["p"].push(H.user_delta("ساعت توکیو چنده؟", 8000, 8600))
+        box["p"].push(H.out_text("ساعت سه بعد از ظهره.", 8700, 9300))
+        box["p"].push(H.out_audio("TIME"))
+        await asyncio.sleep(0.6)
+        box["p"].push(H.user_delta("فورمولوان", 12000, 12500))
+        box["p"].push(H.delegation("d3", 12550))
+        await _wait(lambda: _terminal(client, "d3"), timeout=2.0)
+        await asyncio.sleep(0.2)
+
+    client = H.FakeClient([H.config(), script, 0.3, {"type": "stop"}])
+    provider = H.FakeProvider(
+        on_send=_opener(box, MISHEARD), auto_ack=True, speak_on_commentary=True,
+    )
+    await H.run_relay(client, provider, timeout=12, db_session_id="db-auth-d-r6-between")
+    assert len(thinks) == 2
+    assert ANSWER_MARK not in thinks[1]
+    assert _created(client, "d3")["title"] != _created(client, "d1")["title"]

@@ -170,6 +170,9 @@ _FA_CONSUME_RE = re.compile(
 # one, which is exactly what `variety` means downstream.
 _FA_OPEN_RE = re.compile(
     rf"(?:(?<![{_FA}])یه(?![{_FA}])|(?<![{_FA}])یک(?![{_FA}])|چیزی|هرچی|یکی"
+    # 2026-10-07: the fused «یدونه» / «یدنه» are «یه دونه» written as one
+    # word (`_FA_DET`) — the same open "a song", so the same `variety`.
+    rf"|(?<![{_FA}])یدونه(?![{_FA}])|(?<![{_FA}])یدنه(?![{_FA}])"
     r"|\bsome\b|\bsomething\b|\banything\b|\bany\b)"
 )
 
@@ -483,7 +486,10 @@ CONTENT_FREE_WORDS_TEXT = (
     "ok okay alright right yeah yes yep yup sure well so hey hi hello wait "
     "look listen thanks thank you "
     "اه ام هوم اوم آه اِ خب خوب اوکی باشه آره آهان ببین میگم پس حالا "
-    "مرسی ممنون الو سلام بله"
+    "مرسی ممنون الو سلام بله "
+    # D-R5 (2026-10-06): «ها» / «هان» ("huh"), added to the relay's
+    # `_DISCOURSE_FILLERS` in the same change (pinned equal).
+    "ها هان"
 )
 # The closed modal framing around a play ask, ONE entry per modal (and
 # person) — R6-9 T2. Every spelling of an entry is the same entry: matching
@@ -672,6 +678,11 @@ _SEQUENCE = _phrase_set("بعد", "بعدش")
 _EMPHATIC = _phrase_set("دیگه", "دیگر")
 _FA_DET = _phrase_set(
     "یه", "یک", "یکم", "کمی", "یه کم", "یه سری", "یه دونه", "چند", "چندتا", "چند تا",
+    # Voice round 2026-10-07 (D-R4 (3)): the ASR's and the written spellings of
+    # "one (piece of)" — «حالا یه دنه آهنگ دریک واسم پخش کن» failed on «دنه»
+    # alone and became a 12 s agent play.  Shared grammar: typed chat gains
+    # the same forms (one grammar, two callers).
+    "یه دنه", "یه دانه", "یک دانه", "یک دونه", "یدونه", "یدنه",
 )
 # "something" — the head of an open «بذار یه چیزی گوش بدم».
 _FA_OPEN_HEAD = frozenset({"چیزی", "چیز"})

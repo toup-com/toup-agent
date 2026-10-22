@@ -211,10 +211,34 @@ from app.config import settings
 #
 # Cost accepted an eighth time: one more prompt-cache re-warm per tenant, for
 # the whole round rather than once per lane.
+#
+# MOVED A NINTH TIME, DELIBERATELY, 2026-10-05 (was 17e2267329c5…bcd952609c119, 63).
+# Voice round 2026-10-05, D-P6 — `delegate` is the +1 (65 → 66): the user's own
+# agent plans a heavy request and runs it on supervised sub-agents inside its
+# turn. It is in the core array for every tenant (the supervisor gate hides it
+# per turn through the disabled-tools set, which keeps the wire one array).
+# The 63 → 65 step before it is NOT this round's: 6a9380ce ("Add durable
+# on-demand analysis for chat attachments") added `analyze_attachment` and
+# `read_attachment_analysis` without moving this pin, which is why this file
+# was red on main 99bc4814 (65 == 63 at the count assertion). Pinned here so
+# the lineage has one recorded value again.
+#
+# Cost accepted a ninth time: one more prompt-cache re-warm per tenant.
+#
+# MOVED A TENTH TIME, DELIBERATELY, 2026-10-06 (was 112b1ed2ec88…c067224c1, 66).
+# Voice round 2026-10-06, D-T1 — `media_control` is the +1 (66 → 67): the
+# agent's own stop / pause / resume / next / previous tool, on the relay's
+# executor (`radio.control.run_media_control`). The call's delegated
+# «استاپش کن» reached an agent whose only media tool was `play_media`, so it
+# apologised while the song kept playing. A core def for every tenant;
+# withheld from sub-agents, missions, triggers and automation threads through
+# their disabled sets, which keeps the wire one array.
+#
+# Cost accepted a tenth time: one more prompt-cache re-warm per tenant.
 MAIN_CORE_TOOLS_SHA256 = (
-    "17e2267329c54ada53c88e95a23213b0ac197752299782146f3bcd952609c119"
+    "62cc118aa30ac3c6b465151ec34756b2942352c2d8daaa8f69c43a5df6cacd8b"
 )
-MAIN_CORE_TOOLS_COUNT = 63
+MAIN_CORE_TOOLS_COUNT = 67
 
 DOC_TOOL_NAMES = {
     "generate_pdf", "generate_docx", "generate_xlsx", "generate_pptx",

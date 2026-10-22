@@ -126,3 +126,34 @@ def test_stacked_openers_all_come_off():
 def test_derive_never_raises_on_anything():
     for junk in (None, 0, [], {}, b"bytes", "\x00\x00"):
         derive_job_title(junk)  # must not raise
+
+
+# ── Voice round 2026-10-06 (D-T1): a media request plans one media step ──
+
+@pytest.mark.parametrize("said,rtl", [
+    ("استاپش کن", True), ("آهنگ بعدی رو بذار", True), ("بسه", True),
+    ("stop it", False), ("pause the music", False), ("next song", False),
+])
+def test_a_media_request_plans_the_media_step(said, rtl):
+    from app.agent.voice_jobs import media_command_requested, template_plan
+
+    assert media_command_requested(said)
+    plan = template_plan(said, "full", rtl)
+    assert plan == (["کنترل پخش", "جمع‌بندی پاسخ"] if rtl
+                    else ["Control the music", "Put the answer together"])
+
+
+@pytest.mark.parametrize("said", [
+    "stop by the store tomorrow and buy milk", "what is the next step",
+    "یواف‌سی چی", "who won the last F1 race",
+])
+def test_a_non_media_request_is_not_planned_as_media(said):
+    from app.agent.voice_jobs import media_command_requested
+
+    assert not media_command_requested(said)
+
+
+def test_a_search_ask_still_wins_over_a_media_word():
+    from app.agent.voice_jobs import template_plan
+
+    assert template_plan("search for the next song by Drake", "media")[0] == "Search the web"

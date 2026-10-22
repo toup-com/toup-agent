@@ -1379,3 +1379,175 @@ async def test_a_late_ack_after_the_grace_settles_nothing(monkeypatch):
     assert not control._pending_acks
     # The command is over; a straggler is matched to nothing.
     assert control.deliver_media_ack("owner-1", {**ack, "stopped": True, "was_playing": True}) is False
+
+
+# ── Voice round 2026-10-06, D-T1: the agent's own `media_control` tool ──
+#
+# The founder said «استاپش کن» while a song played; the delegation reached an
+# agent whose only media tool was `play_media`, so it apologised ("I can't
+# stop it from here") and the music kept playing. The tool now drives the SAME
+# executor the relay's route does, and `resume` is real.
+
+
+def _media_tool(tmp_path, user_id: str, channel: str = "voice"):
+    from app.agent.tool_executor import ToolExecutor
+
+    tools = ToolExecutor(workspace=str(tmp_path))
+    tools.set_user_id(user_id)
+    tools.set_channel(channel)
+    return tools
+
+
+@pytest.mark.asyncio
+async def test_the_route_and_the_tool_call_the_one_shared_runner(
+    agent_mode, monkeypatch, tmp_path,
+):
+    """ONE body: the relay's route and the agent's tool both go through
+    `run_media_control`, so the two can never drift into two stops."""
+    seen: list[tuple] = []
+
+    async def shared(user_id, action, channel=None, **ordered):
+        seen.append((user_id, action, channel, ordered))
+        return MediaControlOutcome(
+            ok=True, user_id=user_id, action=action, channel=channel or "app",
+            changed=True, reason="stopped",
+        )
+
+    monkeypatch.setattr(control, "run_media_control", shared)
+    await api_v1.internal_media_control(
+        MediaControlRequest(user_id="owner-1", action="stop"),
+        _FakeRequest("secret-agent-key"),
+    )
+    await _media_tool(tmp_path, "owner-1")._tool_media_control({"action": "stop"})
+    assert [(u, a, c) for u, a, c, _ in seen] == [
+        ("owner-1", "stop", "app"), ("owner-1", "stop", "app"),
+    ], seen
+
+
+@pytest.mark.asyncio
+async def test_the_tool_halts_in_the_callers_order_when_the_run_carries_one(
+    monkeypatch, tmp_path,
+):
+    """A stop the agent decides on inside a delegated run carries the run's
+    order (contract v0.3 §7), exactly like the relay's fast-path halt."""
+    import uuid
+
+    uid = f"order-{uuid.uuid4().hex[:8]}"
+    got: dict = {}
+
+    async def execute(user_id, action, channel=None, **kwargs):
+        got.update(kwargs, action=action, channel=channel)
+        return MediaControlOutcome(
+            ok=True, user_id=user_id, action=action, channel=channel or "app",
+            changed=True, reason="stopped",
+        )
+
+    monkeypatch.setattr(control, "execute_media_control", execute)
+    mark = control.media_halt_mark(uid, media_order=7, media_scope="sess-a",
+                                   media_scope_started_ms=1_700_000_000_000)
+    assert mark.ordered
+    token = control.bind_run_halt_mark(mark)
+    try:
+        await _media_tool(tmp_path, uid)._tool_media_control({"action": "stop"})
+    finally:
+        control.reset_run_halt_mark(token)
+    assert got["before_order"] == 7 and got["media_scope"] == "sess-a", got
+    assert got["media_scope_started_ms"] == 1_700_000_000_000, got
+    assert got["channel"] == "app", "voice controls the app's station"
+
+    got.clear()
+    await _media_tool(tmp_path, uid)._tool_media_control({"action": "next"})
+    assert "before_order" not in got, "only a halt is ordered"
+
+
+def test_the_verdict_table_is_closed_and_only_real_failures_are_errors():
+    def text(reason, action="stop", title=""):
+        return control.media_control_texts(MediaControlOutcome(
+            ok=reason in ("stopped", "paused", "advanced", "resumed"),
+            user_id="u", action=action, channel="app", changed=False,
+            reason=reason, title=title,
+        ))
+
+    # An honest answer that changed nothing is NOT a failure.
+    for reason in ("nothing_playing", "unacknowledged", "partially_confirmed",
+                   "nothing_to_resume", "unchanged", "exhausted",
+                   "no_active_session", "stopped", "paused", "resumed"):
+        assert not text(reason)[0].startswith("ERROR"), reason
+    assert "Nothing was playing" in text("nothing_playing")[0]
+    # The call breaking IS one.
+    for reason in ("error", "timeout", "delivery_failed"):
+        assert text(reason)[0].startswith("ERROR:"), reason
+    # A verdict nobody taught the table is never voiced as success.
+    assert text("brand_new_verdict")[0].startswith("ERROR:")
+    # The resolved title rides the sentence, and only the resolved one.
+    assert '"Hotline Bling"' in text("advanced", "next", "Hotline Bling")[0]
+
+
+@pytest.mark.asyncio
+async def test_the_tool_result_carries_the_structured_verdict(monkeypatch, tmp_path):
+    from app.agent.tool_display import display_of
+
+    async def shared(user_id, action, channel=None, **ordered):
+        return MediaControlOutcome(
+            ok=False, user_id=user_id, action=action, channel="app",
+            changed=False, reason="nothing_playing",
+        )
+
+    monkeypatch.setattr(control, "run_media_control", shared)
+    result = await _media_tool(tmp_path, "owner-1")._tool_media_control(
+        {"action": "pause"},
+    )
+    assert not str(result).startswith("ERROR")
+    assert display_of(result) == "Nothing was playing"
+    assert result.media == {"action": "pause", "reason": "nothing_playing", "ok": False}
+
+    bad = await _media_tool(tmp_path, "owner-1")._tool_media_control({"action": "shuffle"})
+    assert str(bad).startswith("ERROR") and not hasattr(bad, "media")
+
+
+def test_the_endpoint_accepts_resume():
+    assert MediaControlRequest(user_id="u", action="resume").action == "resume"
+
+
+@pytest.mark.asyncio
+async def test_resume_reannounces_the_paused_item_and_clears_the_pause(monkeypatch):
+    """There is no resume frame on any client: a `media_play` naming the item
+    already loaded is the phone's same-id resume. Sent WITHOUT `reannounces`,
+    so the paused-reannouncement hold cannot swallow the caller's own ask."""
+    import uuid
+
+    uid = f"resume-{uuid.uuid4().hex[:8]}"
+    _, wire = _stop_rig(monkeypatch, session=None)
+    control.note_media_broadcast(uid, None, video_id="vid-123", title="Hotline Bling")
+    state = control._user_state(uid)
+    state.playing = control.replace(state.playing, paused=True)
+
+    outcome = await control.execute_media_control(uid, "resume", "app")
+
+    assert (outcome.ok, outcome.reason, outcome.title) == (True, "resumed", "Hotline Bling")
+    plays = wire.of("media_play")
+    assert len(plays) == 1 and plays[0]["video_id"] == "vid-123", wire.frames
+    assert control.recorded_media_item(uid)["paused"] is False
+
+
+@pytest.mark.asyncio
+async def test_resume_is_honest_when_there_is_nothing_or_no_socket(monkeypatch):
+    import uuid
+
+    uid = f"resume-{uuid.uuid4().hex[:8]}"
+    _, wire = _stop_rig(monkeypatch, session=None)
+    outcome = await control.execute_media_control(uid, "resume", "app")
+    assert (outcome.ok, outcome.reason) == (False, "nothing_to_resume")
+    assert not wire.of("media_play"), "nothing recorded ⇒ nothing sent"
+
+    control.note_media_broadcast(uid, None, video_id="vid-9", title="T")
+    _, wire = _stop_rig(monkeypatch, session=None, recipients=0)
+    outcome = await control.execute_media_control(uid, "resume", "app")
+    assert (outcome.ok, outcome.reason) == (False, "delivery_failed")
+
+    _, wire = _stop_rig(monkeypatch, session=None)
+    outcome = await control.execute_media_control(uid, "resume", "app")
+    assert (outcome.ok, outcome.reason) == (True, "resume_sent"), (
+        "an item the tenant never paused (paused on the phone) is still sent, "
+        "and named for what is known"
+    )

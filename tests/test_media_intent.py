@@ -458,3 +458,54 @@ def test_the_language_tag_reaches_the_log_line(message, expected, caplog,
     assert expected in blob, blob
     # The query and the message are still lengths, never content.
     assert message not in blob, blob
+
+
+# ── Voice round 2026-10-07 (D-R4 (3)): «یه دنه» and its spellings ─────────
+# «حالا یه دنه آهنگ دریک واسم پخش کن» failed on ONE token: the ASR's «دنه»
+# (`_FA_DET` had «یه دونه» only).  «حالا» and «واسم» already parsed.  The
+# grammar is shared, so typed chat reads these forms too — on purpose.
+
+@pytest.mark.parametrize("message,query", [
+    ("حالا یه دنه آهنگ دریک واسم پخش کن", "Drake"),       # the recorded ask
+    ("یه دنه آهنگ دریک واسم پخش کن", "Drake"),
+    ("حالا یه دونه آهنگ از دریک برام پخش کن", "Drake"),
+    ("یه دانه آهنگ از ابی برام بذار", "ابی"),
+    ("یک دانه آهنگ از گوگوش پخش کن", "گوگوش"),
+    ("حالا یه آهنگ از مدونا واسه من پخش کن", "مدونا"),
+    ("یه‌دونه آهنگ از دریک پخش کن", "Drake"),            # ZWNJ
+    ("اوکی حالا یه دنه آهنگ از دریک پخش کن", "Drake"),
+    ("یه دنه آهنگ واسم پخش کن", "آهنگ"),                  # open-ended
+    ("یدونه آهنگ از ابی پخش کن", "ابی"),
+    ("یک دونه آهنگ از ابی پخش کن", "ابی"),
+    ("یدنه آهنگ از ابی پخش کن", "ابی"),
+])
+def test_one_piece_of_in_every_spelling_is_a_determiner(message, query):
+    ask = media_request(message)
+    assert ask is not None, message
+    assert (ask.query, ask.variety, ask.lang) == (query, True, "fa")
+
+
+@pytest.mark.parametrize("message", [
+    "حالا یه دنه آهنگ دریک واسم پخش نکن",              # negation
+    "یه دونه آهنگ از دریک دیشب شنیدم",                  # a report
+    "حالا این آهنگ چیه",                                # a question (now-playing)
+    "یه دنه سوال دارم",                                 # det, no media noun
+    "حالا اسمش چیه",
+    "یه دونه آهنگ از دریک پخش کردی؟",                   # a past question
+    "حالا بیخیال آهنگ",                                 # a retraction
+    "حالا یه دنه آهنگ دریک واسم پیدا کن ولی پخش نکن",
+    "حالا",
+    "یه دنه",
+    "حالا دریک",
+])
+def test_the_new_determiners_open_no_new_play(message):
+    assert media_request(message) is None, message
+
+
+def test_a_title_that_is_the_word_now_is_still_read_as_the_time_word():
+    """PINNED current behaviour (2026-10-07, not changed): «حالا» is a lead
+    of the shared grammar, so a song CALLED «حالا» is swallowed as the time
+    word and the artist becomes the query.  A change here must be deliberate."""
+
+    ask = media_request("آهنگ حالا از ابی رو پخش کن")
+    assert ask is not None and ask.query == "ابی"

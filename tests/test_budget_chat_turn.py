@@ -397,85 +397,28 @@ def test_the_error_frame_is_plain_and_carries_the_budget_fields():
     assert "out of Toup credits" not in _friendly_error(exc)
 
 
-def test_the_turns_job_row_and_push_carry_the_budget_sentence():
-    """Pinned in the source for the same reason as the frame. The chat-intent
-    job keeps the raw text for operators and gains the two fields a client
-    renders (and the live frame that carries them); a gone client's push
-    says when the budget resets instead of "Something went wrong"."""
+def test_the_turns_push_carries_the_budget_sentence():
+    """Pinned in the source for the same reason as the frame: a gone client's
+    push says when the budget resets instead of "Something went wrong"."""
     from app.api import ws_chat
 
     src = inspect.getsource(ws_chat)
     block = src[src.index("_budget_refused = is_budget_refusal(e)"):
                 src.index("user_msg = _friendly_error(e)")]
-    assert block.index("_fj.error_message = str(e)[:500]") \
-        < block.index("_fj.error_class = _BUDGET_ERROR_CLASS") \
-        < block.index("await _fdb.commit()")
-    assert "_fj.user_message = _budget_job_msg" in block
-    frame = block[block.index('"type": "job_update"'):]
-    assert '"user_message": _budget_job_msg' in frame
-    assert '"error_class": _BUDGET_ERROR_CLASS' in frame
     assert "_budget_push_body(_budget_detail, _copy_tz)" in block
 
 
-def _chat_task_frames() -> dict:
-    """status → the source of each chat-intent `job_update` frame literal."""
+def test_the_chat_intent_regex_intake_is_retired():
+    """Voice round 2026-10-05 (D-P4). The English-only prefix regex minted an
+    empty-step `agent_task` row at t0 — never for Persian, and a SECOND card
+    whenever the model then called `create_job`. The runner mints the card
+    now (`voice_jobs.TurnJob`); nothing in ws_chat may mint one again."""
     from app.api import ws_chat
 
-    src = inspect.getsource(ws_chat.ws_chat)
-    frames = {}
-    at = 0
-    while True:
-        at = src.find('"job_id": _chat_task_job_id,', at)
-        if at < 0:
-            return frames
-        start = src.rfind("{", 0, at)
-        end = src.index("})", at)
-        literal = src[start:end + 1]
-        status = re.search(r'"status": "(\w+)"', literal).group(1)
-        frames[status] = literal
-        at = end
-
-
-def test_every_chat_intent_frame_names_the_task():
-    """A client can meet a chat-intent job first in one of these frames (the
-    web never handles `task_created`), and a frame with neither `name` nor
-    `job_type` was drawn as "Couldn't build App Build" — for a task that was
-    never a build. Pinned in the source: the frames need a live socket."""
-    frames = _chat_task_frames()
-    assert set(frames) == {"completed", "cancelled", "failed"}, sorted(frames)
-    for status, literal in frames.items():
-        assert '"type": "job_update"' in literal, status
-        assert '"name": _chat_task_name' in literal, status
-        assert '"job_type": _CHAT_TASK_JOB_TYPE' in literal, status
-
-
-def test_the_frame_name_is_the_title_the_job_was_created_with():
-    from app.api import ws_chat
-
-    src = inspect.getsource(ws_chat.ws_chat)
-    detect = src.index("_chat_task_job_id = await _detect_and_create_task(")
-    assert "_chat_task_name = _chat_task_title(text)" in src[detect:detect + 400]
-    assert ws_chat._CHAT_TASK_JOB_TYPE == "agent_task"
-    creator = inspect.getsource(ws_chat._detect_and_create_task)
-    assert "title = _chat_task_title(text)" in creator
-    assert "job_type=_CHAT_TASK_JOB_TYPE" in creator
-    text = "  Write me a short summary of the budget refusal copy for the release notes  "
-    assert ws_chat._chat_task_title(text) == text.strip()[:60]
-
-
-async def test_the_created_task_and_its_frames_share_title_and_type():
-    """Behavioural half: the row `_detect_and_create_task` writes has the
-    title and job_type the frames name."""
-    from app.api import ws_chat
-
-    uid = await _seed_user()
-    queue: asyncio.Queue = asyncio.Queue()
-    text = "Draft me a proposal outline for the spring workshop series"
-    jid = await ws_chat._detect_and_create_task(text, uid, str(uuid.uuid4()), queue)
-    assert jid
-    row = await _row(jid)
-    assert row.title == ws_chat._chat_task_title(text)
-    assert row.job_type == ws_chat._CHAT_TASK_JOB_TYPE
+    src = inspect.getsource(ws_chat)
+    for gone in ("_detect_and_create_task", "_TASK_INTENT_PATTERN",
+                 '"type": "task_created"', "_chat_task_job_id"):
+        assert gone not in src, gone
 
 
 async def test_the_bubble_zone_is_the_turns_then_the_stored_one():

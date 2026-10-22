@@ -438,7 +438,28 @@ def test_debt_is_not_growing_silently():
     # failure skipped the agent-mode step. ROUTING entry, not an excuse: it RUNS
     # in the agent-mode step (24/24 there). The docstring-lane check at the end
     # of this file now catches that omission locally.
-    CEILING = 116
+    # 2026-10-02 voice call (+2), both ROUTING entries that RUN in the
+    # agent-mode step, neither an excuse:
+    # - PR-3: test_agent_runner_invalid_request_no_retry.py drives the REAL
+    #   AgentRunner.run() over `conversations` (AGENT_ONLY) to prove a provider
+    #   400 invalid_request_error is not retried (8/8 under agent; 'no such
+    #   table: conversations' under platform). It shipped without moving this
+    #   number.
+    # - Pre-existing on f49c49a6: test_llm_trace_header.py (2a0ba0fd,
+    #   2026-09-24) is the same lane (63/63 under agent on the integrated tree)
+    #   and also shipped without moving this number, so this test has been red
+    #   at 117 since that commit. Raised for both here rather than left red.
+    # - PR-11 (+1): test_sessions_voice_row_guards.py drives the REAL
+    #   POST /api/sessions/{id}/messages writer and GET /api/day-chats over
+    #   `conversations`/`messages`/`day_chats` (AGENT_ONLY) to prove a late
+    #   older revision does not rewind a row and a row is filed under its
+    #   occurred_at day (7/7 under agent). ROUTING entry; it RUNS there.
+    # Voice round 2026-10-05, lane PF (+1): test_supervisor_delegate.py drives
+    # the real supervised spawn/join/finalize over build_jobs/job_events/users
+    # (AGENT_ONLY), 20/20 under agent. ROUTING entry; it RUNS there. Lane PE
+    # added no agent-mode file (its tests extend existing ones), so the
+    # integrated count is 120 — reconciled at the merge.
+    CEILING = 120
     n = len(_debt_entries())
     assert n <= CEILING, (
         f"{n} files are now excused from the sweep, up from {CEILING}. "

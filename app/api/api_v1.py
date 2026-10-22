@@ -29,14 +29,14 @@ import logging
 import re
 import secrets
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,195 @@ class VoiceDelegationCancelRequest(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=64)
     task_id: str = Field(..., min_length=1, max_length=64)
     job_id: str = Field(..., min_length=1, max_length=64)
+
+
+class VoiceDelegationAddendumRequest(BaseModel):
+    """Voice round 2026-10-07 (DESIGN-R3 D-R3(3)): words the caller added to a
+    RUNNING delegation («کیه» after the UofT question), or the late six-word
+    title. `addendum_id` is the caller turn id, so a repeat is idempotent;
+    `text` may be empty only when `task_title` rides alone."""
+
+    session_id: str = Field(..., min_length=1, max_length=64)
+    task_id: str = Field(..., min_length=1, max_length=64)
+    addendum_id: str = Field(..., min_length=1, max_length=160)
+    # Lenient like the agent-turn body: an over-long value is cut, never a
+    # 422 that would lose the caller's words along with it.
+    text: str = ""
+    lang: Optional[str] = None
+    task_title: Optional[str] = None
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def _check_text(cls, value):
+        return str(value or "")[:300] if isinstance(value, str) else ""
+
+    @field_validator("task_title", mode="before")
+    @classmethod
+    def _check_title(cls, value):
+        return value[:60] if isinstance(value, str) else None
+
+    @field_validator("lang", mode="before")
+    @classmethod
+    def _check_lang(cls, value):
+        v = str(value or "").strip().lower()[:8]
+        return v if v in ("fa", "en") else None
+
+    @model_validator(mode="after")
+    def _text_or_title(self):
+        self.text = _VS_LIVE_CTRL_RE.sub(" ", self.text or "").strip()
+        self.task_title = (_VS_LIVE_CTRL_RE.sub(" ", self.task_title or "").strip() or None)
+        if not self.text and not self.task_title:
+            raise ValueError("text may be empty only when task_title is present")
+        return self
+
+
+# ── Voice round 2026-10-07 (T3/T11): the live voice delegations of THIS process ──
+# One uvicorn worker per tenant (`Dockerfile.agent`), so the delegation that is
+# running and the routes that ask about it share one process: the Stop bit, the
+# status a repaired relay polls for, and the words a caller adds while it runs
+# are answered from memory. A crash loses the entry; every reader falls back to
+# the DB exactly as before.
+_VS_LIVE_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_VS_ADDENDA_MAX = 3
+_VS_DONE_MAX = 256
+_VS_DONE_TTL_S = 600.0
+#: The cancel watch's DB read once the in-process Stop event exists: a backstop
+#: (a Stop written by another process), not the path — it was every 1.5 s from t0.
+_VS_CANCEL_DB_POLL_S = 5.0
+_VS_ADDENDUM_NOTE = (
+    "[The caller added, while you were working on this: «{text}». It is part of the "
+    "same request — cover it in this answer. Do not start over, and do not treat it "
+    "as a separate question.]"
+)
+#: Phase D (lens-tenant-4): the note for the ONE extra round after a WRITTEN
+#: answer.  That round's text REPLACES the answer (only it reaches `done`), so
+#: "do not start over" beside the model's own complete answer invited a reply
+#: of the delta alone — «His wife is Brigitte Macron.» and the president's name
+#: never said.
+_VS_ADDENDUM_AFTER_ANSWER_NOTE = (
+    "[After you wrote the answer above, the caller added: «{text}». It is part of "
+    "the same request. Write the COMPLETE answer again so it also covers this — "
+    "your new reply REPLACES the one above, so keep everything in it that still "
+    "holds. Do not treat it as a separate question.]"
+)
+
+
+class _VsLive:
+    """One running voice delegation. The runner's ``addendum_check`` IS this
+    object: ``await live(final=…, take=…)`` drains the queued addenda; with
+    ``final=True`` and nothing to take, the delegation turns ``closing`` in the
+    same synchronous step (asyncio-atomic), so a later POST is told
+    ``answer_written`` instead of being queued and silently dropped."""
+
+    def __init__(self, delegation_id: str, session_id: Optional[str]) -> None:
+        self.delegation_id = delegation_id
+        self.session_id = session_id
+        self.cancel = asyncio.Event()
+        self.job_id: Optional[str] = None
+        self.job_status: Optional[str] = None
+        self.state = "open"                       # open | closing | closed
+        self.queued: List[tuple] = []             # (addendum_id, text)
+        self.applied: List[str] = []
+        self.answers: Dict[str, dict] = {}
+        self.texts: set = set()
+        self.count = 0
+        self.job: Any = None
+        self.pending_title: Optional[str] = None
+
+    async def __call__(self, final: bool = False, take: bool = True) -> List[str]:
+        note = _VS_ADDENDUM_AFTER_ANSWER_NOTE if final else _VS_ADDENDUM_NOTE
+        return [note.format(text=t) for t in self.take(final=final, take=take)]
+
+    def take(self, *, final: bool = False, take: bool = True) -> List[str]:
+        if self.state != "open":
+            return []
+        if self.queued and take:
+            out, self.queued = self.queued, []
+            self.applied.extend(aid for aid, _ in out)
+            return [text for _, text in out]
+        if final:
+            self.state = "closing"
+        return []
+
+    def bind_job(self, job: Any) -> None:
+        self.job = job
+        if job is not None and self.pending_title:
+            title, self.pending_title = self.pending_title, None
+            self._retitle(title)
+
+    def _retitle(self, title: str) -> None:
+        if self.job is None:
+            self.pending_title = title
+            return
+        try:
+            self.job.retitle(title)
+        except Exception:  # noqa: BLE001 — a title never costs a delegation
+            logger.debug("[VSTREAM] voice addendum retitle failed", exc_info=True)
+
+    def offer(self, addendum_id: str, text: str, task_title: Optional[str]) -> dict:
+        if addendum_id in self.answers:
+            return self.answers[addendum_id]
+        if self.state == "closed":
+            answer = {"accepted": False, "reason": "finished"}
+        elif self.state == "closing":
+            answer = {"accepted": False, "reason": "answer_written"}
+        elif text:
+            key = " ".join(text.lower().split())
+            if key in self.texts:
+                answer = {"accepted": False, "reason": "duplicate"}
+            elif self.count >= _VS_ADDENDA_MAX:
+                answer = {"accepted": False, "reason": "limit"}
+            else:
+                self.queued.append((addendum_id, text))
+                self.texts.add(key)
+                self.count += 1
+                answer = {"accepted": True, "state": "queued"}
+        else:
+            answer = {"accepted": True, "state": "queued"}
+        if task_title and self.state != "closed":
+            self._retitle(task_title)
+        self.answers[addendum_id] = answer
+        return answer
+
+
+_VS_LIVE: Dict[str, _VsLive] = {}
+#: delegation id → (session id, monotonic end) of the delegations that FINISHED
+#: here recently: an addendum for one of them is `finished`, not `not_running`.
+_VS_DONE: "OrderedDict[str, tuple]" = OrderedDict()
+
+
+def _vs_register(live: _VsLive) -> None:
+    _VS_LIVE[live.delegation_id] = live
+    _VS_DONE.pop(live.delegation_id, None)
+
+
+def _vs_unregister(live: _VsLive) -> None:
+    live.state = "closed"
+    if _VS_LIVE.get(live.delegation_id) is live:
+        _VS_LIVE.pop(live.delegation_id, None)
+    done = _VS_DONE
+    now = time.monotonic()
+    done[live.delegation_id] = (live.session_id, now)
+    done.move_to_end(live.delegation_id)
+    while done and (len(done) > _VS_DONE_MAX
+                    or now - next(iter(done.values()))[1] > _VS_DONE_TTL_S):
+        done.popitem(last=False)
+
+
+def _vs_live_for(task_id: str, session_id: str) -> Optional[_VsLive]:
+    live = _VS_LIVE.get(task_id)
+    if live is None or live.state == "closed" or live.session_id != session_id:
+        return None
+    return live
+
+
+def _vs_signal_cancel(task_id: str, session_id: str) -> bool:
+    """The Stop bit, in process: the running delegation's watch wakes at once."""
+    live = _vs_live_for(task_id, session_id)
+    if live is None:
+        return False
+    live.cancel.set()
+    return True
 
 
 def _voice_recovery_user(request: Request) -> str:
@@ -147,6 +336,28 @@ async def internal_voice_delegations_status(
     if not task_ids:
         raise HTTPException(status_code=422, detail="Task id required")
 
+    # Voice round 2026-10-07 (T3): a delegation still running in THIS process
+    # is answered from memory — the relay polls this every 1.5 s per running
+    # task, and each poll read up to 100 jobs + 250 messages (41 in the 10-07
+    # call). The recovery fields exist only for a FINISHED task, which is not
+    # in `_VS_LIVE`; only the remaining ids touch the DB.
+    by_task: dict[str, dict] = {}
+    rest: List[str] = []
+    for task_id in task_ids:
+        live = _vs_live_for(task_id, req.session_id)
+        if (live is not None and live.job_id
+                and live.job_status not in ("completed", "cancelled", "failed")):
+            by_task[task_id] = {
+                "status": "running",
+                "job_id": live.job_id,
+                "cancel_requested": live.cancel.is_set(),
+            }
+        else:
+            rest.append(task_id)
+    if not rest:
+        return {"tasks": by_task}
+    task_ids = rest
+
     async with async_session_maker() as db:
         await _owned_voice_session(db, req.session_id, user_id)
 
@@ -158,7 +369,7 @@ async def internal_voice_delegations_status(
             BuildJob.conversation_id == req.session_id,
             BuildJob.job_type == "agent_task",
         ).order_by(BuildJob.created_at.desc()).limit(100))).scalars().all()
-        by_task: dict[str, dict] = {task_id: {"status": "unknown"} for task_id in task_ids}
+        by_task.update({task_id: {"status": "unknown"} for task_id in task_ids})
         for job in jobs:
             config = job.config_json if isinstance(job.config_json, dict) else {}
             task_id = str(config.get("voice_delegation_id") or "")
@@ -219,7 +430,43 @@ async def internal_voice_delegation_cancel(
         if job.stop_requested_at is None:
             job.stop_requested_at = datetime.utcnow()
             await db.commit()
+        # Voice round 2026-10-07 (T3): beside the durable bit, the in-process
+        # event — the running delegation's watch wakes now, not on its next poll.
+        _vs_signal_cancel(req.task_id, req.session_id)
         return {"requested": True, "status": "running", "job_id": job.id}
+
+
+@router.post("/internal/voice-delegations/addendum", include_in_schema=False)
+async def internal_voice_delegation_addendum(
+    req: VoiceDelegationAddendumRequest, request: Request,
+):
+    """Voice round 2026-10-07 (DESIGN-R3 D-R3(3)): fold the caller's added words
+    into a RUNNING delegation instead of opening a second card for «کیه».
+
+    Answers synchronously from the in-process registry — no DB, no model call.
+    ``{accepted: true, state: queued}`` means the runner will read it at its
+    next round barrier (or in ≤1 extra final round); the relay learns which
+    were folded from ``done.addenda_applied``. ``finished`` / ``answer_written``
+    mean it arrived too late — the relay tells the model at delivery. A repeat
+    ``addendum_id`` returns its first answer."""
+
+    _voice_recovery_user(request)
+    live = _vs_live_for(req.task_id, req.session_id)
+    if live is not None:
+        answer = live.offer(req.addendum_id, req.text, req.task_title)
+    else:
+        done = _VS_DONE.get(req.task_id)
+        answer = {
+            "accepted": False,
+            "reason": "finished" if done and done[0] == req.session_id else "not_running",
+        }
+    logger.info(
+        "[VSTREAM] voice addendum id=%s aid=%s accepted=%d reason=%s chars=%d title=%d",
+        req.task_id[:24], req.addendum_id[-24:], int(bool(answer.get("accepted"))),
+        answer.get("reason") or answer.get("state") or "-", len(req.text),
+        int(bool(req.task_title)),
+    )
+    return answer
 
 
 @router.post("/internal/voice-delegations/claim-speech", include_in_schema=False)
@@ -405,6 +652,11 @@ class ChatRequest(BaseModel):
     # delegations can run at once — so without this the OTHER task's answer
     # closes this card `completed` (addendum C1).
     delegation_id: Optional[str] = Field(default=None, max_length=64)
+    # D-P3: the relay's research backstop opened this delegation because the
+    # caller asked for a SEARCH. The runner restricts its first round to the
+    # web tools and re-enters one search round rather than answer from
+    # memory. Absent (every other caller, an older relay) = today's turn.
+    require_web: bool = False
     # Contract v0.3 §7 (addendum 6 R6-4 / R6-4b): the caller-turn ORDER of the
     # request that started this run, the provider session it belongs to and
     # that session's STAMP (the relay's hybrid logical clock, app-floored:
@@ -417,6 +669,65 @@ class ChatRequest(BaseModel):
     media_order: Optional[int] = None
     media_scope: Optional[str] = None
     media_scope_started_ms: Optional[int] = None
+    # ── Voice round 2026-10-06 (D-R8 c / D-T4): WHICH caller turn asked ──
+    # The relay's identity for the asking turn (`task.turn_id`), the turns the
+    # request spans (≤ 8), the real wall-clock stamp of the asking user row
+    # (ISO, naive UTC — the tenant adds the +1 ms for its marker, one owner),
+    # and the title the relay already holds for the task (its six-word
+    # summary, or the request words — never a one-word fragment). All optional
+    # and LENIENT: a malformed value reads as absent, never a 422, so an older
+    # image ignores them and a newer relay cannot break an older tenant.
+    parent_user_turn_id: Optional[str] = None
+    request_turn_ids: Optional[List[str]] = None
+    anchor_occurred_at: Optional[str] = None
+    task_title: Optional[str] = None
+    # ── Voice round 2026-10-07 (DESIGN-R3 D-R4(1)/(6)) — LENIENT, optional ──
+    # `planned_steps`: the plan KINDS the relay drew on the card at t0
+    # (`voice_jobs.template_plan_keys`); the TurnJob declares them verbatim
+    # when every kind is known and the answer is last. `search_query`: the
+    # relay's cleaned request (≤ 12 words) the speculative first search runs
+    # instead of re-cleaning the display text. A malformed value is absent.
+    planned_steps: Optional[List[str]] = None
+    search_query: Optional[str] = None
+
+    @field_validator("planned_steps", mode="before")
+    @classmethod
+    def _check_planned_steps(cls, value):
+        if not isinstance(value, (list, tuple)) or not value:
+            return None
+        if not all(isinstance(v, str) and 0 < len(v) <= 32 for v in value):
+            return None
+        return [str(v) for v in value][:8]
+
+    @field_validator("search_query", mode="before")
+    @classmethod
+    def _check_search_query(cls, value):
+        return _lenient_text(value, 200)
+
+    @field_validator("parent_user_turn_id", mode="before")
+    @classmethod
+    def _check_parent_user_turn_id(cls, value):
+        return _lenient_text(value, 160)
+
+    @field_validator("task_title", mode="before")
+    @classmethod
+    def _check_task_title(cls, value):
+        return _lenient_text(value, 200)
+
+    @field_validator("request_turn_ids", mode="before")
+    @classmethod
+    def _check_request_turn_ids(cls, value):
+        if not isinstance(value, (list, tuple)):
+            return None
+        out = [str(v)[:160] for v in value if isinstance(v, str) and v.strip()]
+        return out[:_REQUEST_TURN_IDS_MAX] or None
+
+    @field_validator("anchor_occurred_at", mode="before")
+    @classmethod
+    def _check_anchor_occurred_at(cls, value):
+        parsed = _lenient_naive_utc(value)
+        return parsed.isoformat() if parsed is not None else None
+
 
     @field_validator("media_order", mode="before")
     @classmethod
@@ -432,6 +743,36 @@ class ChatRequest(BaseModel):
     @classmethod
     def _check_media_scope_started_ms(cls, value):
         return _lenient_started_ms(value)
+
+
+#: `request_turn_ids` bound (the relay's own REQUEST_TURN_IDS_MAX).
+_REQUEST_TURN_IDS_MAX = 8
+
+
+def _lenient_text(value, cap: int):
+    """A stripped string of at most ``cap`` characters, else None."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:cap] if text else None
+
+
+def _lenient_naive_utc(value) -> Optional[datetime]:
+    """An ISO timestamp as a NAIVE UTC datetime (the `messages` clock), else
+    None. An aware value is converted; garbage reads as absent."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        from datetime import timezone as _utc_tz
+        dt = dt.astimezone(_utc_tz.utc).replace(tzinfo=None)
+    return dt
 
 
 def _lenient_media_order(value):
@@ -552,6 +893,28 @@ def _forward_display_kwargs(runner: Any, req: "ChatRequest") -> Dict[str, Any]:
     # delegated work. Same signature probe as its two siblings.
     if req.delegation_id and _runner_run_accepts(runner, "voice_delegation_id"):
         out["voice_delegation_id"] = req.delegation_id
+    if req.require_web and _runner_run_accepts(runner, "require_web"):
+        out["require_web"] = True
+    # Voice round 2026-10-06 (D-T4 / D-R8): the title the relay holds, and
+    # the asking turn's identity + stamp for the card's thread marker. Same
+    # signature probe: an older runner simply never receives them.
+    if req.task_title and _runner_run_accepts(runner, "task_title"):
+        out["task_title"] = req.task_title
+    _anchor = {
+        k: v for k, v in (
+            ("parent_user_turn_id", req.parent_user_turn_id),
+            ("request_turn_ids", req.request_turn_ids),
+            ("anchor_occurred_at", req.anchor_occurred_at),
+        ) if v
+    }
+    if _anchor and _runner_run_accepts(runner, "voice_anchor"):
+        out["voice_anchor"] = _anchor
+    # Voice round 2026-10-07: same signature probe — an older runner never
+    # receives the relay's plan or its cleaned search query.
+    if req.planned_steps and _runner_run_accepts(runner, "planned_steps"):
+        out["planned_steps"] = list(req.planned_steps)
+    if req.search_query and _runner_run_accepts(runner, "search_query"):
+        out["search_query"] = req.search_query
     return out
 
 
@@ -705,7 +1068,9 @@ class MediaControlRequest(BaseModel):
     user_id: str = Field(..., min_length=1, max_length=128)
     # stop/pause (contract v0.3 §H, `media_transport`) are confirmed by the
     # phone, not by the station; see `radio.control._execute_transport`.
-    action: Literal["next", "previous", "stop", "pause"]
+    # `resume` (voice round 2026-10-06, D-T1): re-announces the item recorded
+    # as live; see `radio.control._execute_resume`.
+    action: Literal["next", "previous", "stop", "pause", "resume"]
     channel: Optional[str] = Field(default="app", max_length=32)
     # Contract v0.3 §7, stop/pause only: the caller-turn order of this halt,
     # its provider session and that session's stamp (R6-4b). It then halts
@@ -931,43 +1296,19 @@ async def internal_media_control(req: MediaControlRequest, request: Request):
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User mismatch")
 
-    from app.agent.radio.control import (
-        MediaControlOutcome,
-        execute_media_control,
-        media_control_budget_s,
-    )
+    from app.agent.radio.control import run_media_control
 
-    # The stop/pause ack wait ends inside this same budget (minus a margin),
-    # so an unanswered stop reports `unacknowledged` rather than `timeout`.
-    timeout_s = media_control_budget_s()
-    # Contract v0.3 §7: the halt's own order, passed only when the relay sent
-    # one (and only for stop/pause), so a legacy body calls exactly as before.
-    ordered = (
-        {
-            "before_order": req.before_order,
-            "media_scope": req.media_scope,
-            "media_scope_started_ms": req.media_scope_started_ms,
-        }
-        if req.action in ("stop", "pause")
-        and req.before_order is not None and req.media_scope
-        else {}
+    # One body for the relay's route and the agent's `media_control` tool
+    # (voice round 2026-10-06, D-T1): the wall-clock budget, the halt's own
+    # order (contract v0.3 §7 — passed only when the relay sent one, and only
+    # for stop/pause, so a legacy body calls exactly as before) and the
+    # timeout mapping all live in `radio.control.run_media_control`.
+    outcome = await run_media_control(
+        user_id, req.action, req.channel,
+        before_order=req.before_order,
+        media_scope=req.media_scope,
+        media_scope_started_ms=req.media_scope_started_ms,
     )
-    try:
-        outcome = await asyncio.wait_for(
-            execute_media_control(user_id, req.action, req.channel, **ordered),
-            timeout=timeout_s,
-        )
-    except asyncio.TimeoutError:
-        outcome = MediaControlOutcome(
-            ok=False,
-            user_id=user_id,
-            action=req.action,
-            channel=req.channel or "app",
-            changed=False,
-            # stop/pause answer from a closed reason set the relay words
-            # from; a hung OFF or broadcast there is an error, not a state.
-            reason="timeout" if req.action in ("next", "previous") else "error",
-        )
     return outcome.as_dict()
 
 
@@ -1093,6 +1434,10 @@ class VoiceContextRequest(BaseModel):
     # call tools it does not have. Default False: an older relay sends nothing
     # and gets exactly today's prompt.
     live: bool = Field(default=False)
+    # Voice round 2026-10-07 (D-R2(4)): the platform's warm-up — the app came
+    # to the foreground or the orb was shown. Builds (or validates) the cached
+    # context and prewarms the call caches; the response is the same shape.
+    warm: bool = Field(default=False)
 
 
 class VoiceContextResponse(BaseModel):
@@ -1100,11 +1445,91 @@ class VoiceContextResponse(BaseModel):
     day_date: Optional[str] = None
     sections: Dict[str, str] = Field(default_factory=dict)
     degraded: List[str] = Field(default_factory=list)
+    # D-R2(4): served from the tenant's 120 s cache, and how old the build is.
+    cached: bool = False
+    age_ms: int = 0
+
+
+# ── Voice round 2026-10-07 (D-R2(4), T2): the voice-context cache + prewarm ──
+#: Builds by key — (onboarding, live, budget_chars, tz_name, the day it read,
+#: the caller's local date, the memory generation) — stored with the day's
+#: one-aggregate validator (`call_context_cache.day_validator`): a message
+#: added, revised or re-stamped since the build is a miss. The clock line
+#: (`voice_mode`) is re-rendered on a hit; nothing else in the build reads it.
+_VC_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_VC_CACHE_MAX = 16
+#: One prewarm of the call caches per user per this many seconds.
+_VOICE_PREWARM_DEBOUNCE_S = 45.0
+_voice_prewarm_last: Dict[str, float] = {}
+
+
+def _schedule_voice_prewarm(background: Optional[BackgroundTasks], user_id: str,
+                            reason: str) -> bool:
+    """Queue the call-cache prewarm to run AFTER the response (never on the
+    start-up's critical path), at most once per user per 45 s."""
+    if background is None or _agent_runner is None:
+        return False
+    now = time.monotonic()
+    last = _voice_prewarm_last.get(user_id)
+    if last is not None and now - last < _VOICE_PREWARM_DEBOUNCE_S:
+        return False
+    _voice_prewarm_last[user_id] = now
+    background.add_task(_prewarm_voice_call, user_id, reason)
+    return True
+
+
+async def _prewarm_voice_call(user_id: str, reason: str = "call") -> None:
+    """Fill what the call's FIRST delegation missed on 10-07 (tenant §1.1):
+    the day-chat latch (a second dial + a ≥2 s SELECT), the agent-config row
+    (the speculative search's private read, 1.05 s in phase 1) and the voice
+    system prompt (0.83 s) — the prompt through the runner's own
+    `_build_system_prompt`, so it is stored under exactly the key phase 1
+    derives. Never raises; one line."""
+    t0 = time.perf_counter()
+    latch = config = prompt = "skip"
+    try:
+        from app.agent.day_chat_resolver import should_use_day_chat_context
+        latch = "set" if await should_use_day_chat_context() else "off"
+    except Exception:  # noqa: BLE001
+        latch = "error"
+    try:
+        from app.agent import call_context_cache as _cc
+        from app.agent.agent_runner import stable_prefix_enabled
+        from app.agent.prompt_profile import PromptProfile
+        from app.db import AgentConfig
+
+        if _cc.enabled() and _agent_runner is not None:
+            async with async_session_maker() as db:
+                row = (await db.execute(
+                    select(AgentConfig).where(AgentConfig.user_id == user_id)
+                )).scalars().first()
+                _cc.put_agent_config(user_id, row)
+                config = "set"
+                if stable_prefix_enabled(user_id):
+                    tz = await _agent_runner._resolve_effective_tz(db, user_id, None, "voice")
+                    await _agent_runner._build_system_prompt(
+                        db, user_id, "", channel="voice", intent=None,
+                        client_tz=tz, prompt_profile=PromptProfile.FULL,
+                        turn_context_out={}, prompt_config_snapshot=None,
+                    )
+                    prompt = "set"
+                else:
+                    prompt = "skip_unstable"
+    except Exception:  # noqa: BLE001 — a prewarm never costs a call
+        logger.debug("[PERF] voice_prewarm failed", exc_info=True)
+        prompt = prompt if prompt != "skip" else "error"
+    logger.info(
+        "[PERF] voice_prewarm ms=%d latch=%s agent_config=%s prompt=%s reason=%s",
+        int((time.perf_counter() - t0) * 1000), latch, config, prompt, reason,
+    )
 
 
 @router.post("/internal/voice-context", response_model=VoiceContextResponse,
              include_in_schema=False)
-async def internal_voice_context(req: VoiceContextRequest, request: Request):
+async def internal_voice_context(
+    req: VoiceContextRequest, request: Request,
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
+):
     """Internal-only: assemble the Realtime session's instructions HERE.
 
     Same hop, same authentication and same visibility rules as
@@ -1146,27 +1571,107 @@ async def internal_voice_context(req: VoiceContextRequest, request: Request):
         if _now is not None and _now.tzinfo is None:
             _now = _now.replace(tzinfo=_tz.utc)
 
+        cached_ctx = None
+        age_ms = 0
         async with async_session_maker() as db:
-            ctx = await build_voice_context(
-                db, user_id,
-                onboarding=req.onboarding,
-                budget_chars=req.budget_chars,
-                tz_name=req.tz_name,
-                now_utc=_now,
-                live=req.live,
-            )
+            key, validator = await _voice_context_cache_key(db, user_id, req, _now)
+            if key is not None:
+                hit = _VC_CACHE.get(key)
+                ttl = float(getattr(settings, "voice_context_cache_ttl_s", 0) or 0)
+                # Phase D (turns-startup-7): a WARM refreshes a build past half
+                # its life.  Answered from the cache, a warm at t=70 s left the
+                # build's stamp at t=0, so the tap at t=130 s missed and built
+                # on the critical path — a warm cadence could never keep the
+                # context fresh past the first build's TTL.
+                limit = ttl / 2.0 if req.warm else ttl
+                if hit is not None and hit[1] == validator \
+                        and time.monotonic() - hit[2] < limit:
+                    cached_ctx = hit[0]
+                    age_ms = int((time.monotonic() - hit[2]) * 1000)
+            if cached_ctx is None:
+                ctx = await build_voice_context(
+                    db, user_id,
+                    onboarding=req.onboarding,
+                    budget_chars=req.budget_chars,
+                    tz_name=req.tz_name,
+                    now_utc=_now,
+                    live=req.live,
+                )
             # Genuinely read-only since the day leg moved to the relay's
             # newest-day selection (W-6 parity): nothing here INSERTs any
             # more, so there is nothing to commit and nothing to roll back.
-        return VoiceContextResponse(
-            instructions=ctx.instructions,
-            day_date=ctx.day_date,
-            sections=ctx.sections,
-            degraded=ctx.degraded,
-        )
+        if cached_ctx is not None:
+            # The one section that reads the clock is re-rendered at THIS
+            # request's instant (the relay's W-6 shadow hashes it).
+            from app.agent.voice_context import VOICE_SECTION_ORDER, render_voice_mode
+            sections = dict(cached_ctx.sections)
+            sections["voice_mode"] = render_voice_mode(
+                _now or datetime.now(_tz.utc), live=req.live)
+            instructions = "\n\n".join(
+                sections[k] for k in VOICE_SECTION_ORDER if sections.get(k))
+            out = VoiceContextResponse(
+                instructions=instructions, day_date=cached_ctx.day_date,
+                sections=sections, degraded=list(cached_ctx.degraded),
+                cached=True, age_ms=age_ms,
+            )
+        else:
+            if key is not None and not [d for d in ctx.degraded if d != "day_timezone"]:
+                _VC_CACHE[key] = (ctx, validator, time.monotonic())
+                _VC_CACHE.move_to_end(key)
+                while len(_VC_CACHE) > _VC_CACHE_MAX:
+                    _VC_CACHE.popitem(last=False)
+            out = VoiceContextResponse(
+                instructions=ctx.instructions,
+                day_date=ctx.day_date,
+                sections=ctx.sections,
+                degraded=ctx.degraded,
+            )
+        # T2: a warm-up or a real Live call prewarms the call caches the
+        # first delegation reads — after this response, debounced 45 s.
+        if req.warm or req.live:
+            _schedule_voice_prewarm(
+                background_tasks, user_id, "warm" if req.warm else "call")
+        return out
     except Exception as e:
         logger.exception(f"Internal voice-context error for user {user_id}")
         raise HTTPException(status_code=500, detail=f"Agent error: {type(e).__name__}: {e}")
+
+
+async def _voice_context_cache_key(db, user_id: str, req: "VoiceContextRequest", now_utc):
+    """(key, validator) for the `/voice-context` cache, or (None, None) when it
+    is off or the day cannot be validated — then the route simply builds."""
+    try:
+        if float(getattr(settings, "voice_context_cache_ttl_s", 0) or 0) <= 0:
+            return None, None
+        from datetime import timezone as _tzm
+        from zoneinfo import ZoneInfo
+
+        from app.agent import call_context_cache as _cc
+        from app.agent.voice_context import _resolve_effective_tz, newest_day_chat
+
+        tz_eff = await _resolve_effective_tz(db, user_id, req.tz_name)
+        newest = await newest_day_chat(db, user_id, tz_eff)
+        if newest is not None:
+            validator = await _cc.day_validator(db, newest.id)
+            if validator is None:
+                return None, None
+            day_date = newest.local_date.isoformat() if newest.local_date else ""
+        else:
+            validator, day_date = ("no-day",), ""
+        local_today = ""
+        if tz_eff:
+            try:
+                local_today = (now_utc or datetime.now(_tzm.utc)).astimezone(
+                    ZoneInfo(tz_eff)).strftime("%Y-%m-%d")
+            except Exception:  # noqa: BLE001
+                local_today = ""
+        return (
+            bool(req.onboarding), bool(req.live), int(req.budget_chars or 0),
+            (req.tz_name or "").strip(), day_date, local_today, _cc.memory_generation(),
+        ), validator
+    except Exception:  # noqa: BLE001 — no key, no cache
+        logger.debug("[voice_ctx] cache key unavailable", exc_info=True)
+        return None, None
 
 
 # ── The voice turn's memory write (v3 §2.1.2) ─────────────────────────
@@ -1259,7 +1764,12 @@ async def internal_curate_turn(req: CurateTurnRequest, request: Request):
 # the other's caps, so version skew in either direction can never flood the
 # phone's audio socket.
 _VS_QUEUE_MAX       = 512     # frames buffered between runner and generator
-_VS_MAX_EVENTS      = 120     # tool.*/status frames per turn; `done` is exempt
+_VS_MAX_EVENTS      = 120     # tool.*/status frames per turn; `done` and the
+                              # card's own frames (_VS_UNBUDGETED) are exempt
+#: The card frames the call draws its job from. Never dropped by the per-turn
+#: budget: a research turn spends it on tool frames, and a card that stops
+#: updating mid-run (or never reaches its terminal state) is worse than none.
+_VS_UNBUDGETED = ("job.", "step.", "supervisor.")
 _VS_HEARTBEAT_S     = 10.0
 _VS_CANCEL_POLL_S   = 1.5
 _VS_FRAME_BYTES_MAX = 4096
@@ -1281,6 +1791,9 @@ _VS_ARG_ALLOW: Dict[str, tuple] = {
     # args={} and the relay had no title for an agent play it had to stop, so
     # it quoted the caller's own sentence back as a track name (media-6).
     "play_media":         ("query",),
+    # The action is a closed enum (stop/pause/resume/next/previous) — the
+    # relay names the step from it; `reason` is user words and stays off.
+    "media_control":      ("action",),
     "extension_search":   ("query",),
     "extension_research": ("query",),
     "web_fetch":          ("url",),
@@ -1289,9 +1802,40 @@ _VS_ARG_ALLOW: Dict[str, tuple] = {
     "memory_search":      ("query",),
     "recall_day":         ("date",),
 }
-_VS_PREVIEW_ALLOW     = {"web_fetch", "extension_read"}
+# `media_control` (D-T1): its result is the closed-table verdict sentence, so
+# the relay can quote what the device actually did.
+_VS_PREVIEW_ALLOW     = {"web_fetch", "extension_read", "media_control"}
 _VS_SOURCE_LIST_TOOLS = {"web_search", "extension_search", "extension_research"}
 _VS_SOURCE_ONE_TOOLS  = {"web_fetch", "extension_read", "browser"}
+
+#: The `tool.end.media` keys (D-T1), each with its own bound.
+_VS_MEDIA_ACTIONS = frozenset({"stop", "pause", "resume", "next", "previous"})
+
+
+def _vs_media(name: str, raw: Any) -> Optional[Dict[str, Any]]:
+    """`{action, reason, ok, title?}` for a `media_control` result, else None.
+
+    Read off the tool's own structured `ToolResult.media`, never parsed out
+    of its prose; a result that carries none (a validation error, an older
+    executor) yields no key at all."""
+    if name != "media_control":
+        return None
+    media = getattr(raw, "media", None)
+    if not isinstance(media, dict):
+        return None
+    action = str(media.get("action") or "")
+    if action not in _VS_MEDIA_ACTIONS:
+        return None
+    out: Dict[str, Any] = {
+        "action": action,
+        "reason": _VS_CTRL_RE.sub("", str(media.get("reason") or ""))[:64],
+        "ok": bool(media.get("ok")),
+    }
+    title = _VS_CTRL_RE.sub("", str(media.get("title") or "")).strip()
+    if title:
+        out["title"] = title[:_VS_SRC_TITLE_MAX]
+    return out
+
 
 _VS_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _VS_NUM_RE  = re.compile(r"^\s*\d+\.\s+(.*\S)\s*$")
@@ -1422,7 +1966,18 @@ def _vs_sources(name: str, tool_input: dict, result: str) -> list:
                 head = ln[2:].strip()
                 break
         if url:
-            out.append(_vs_source(head or url, url))
+            src = _vs_source(head or url, url)
+            # D-T4 (additive): the FETCHED page's own large icon, when its
+            # head named one (https only, one per domain). A searched-only
+            # source carries no icon — it was never read.
+            try:
+                from app.agent.smart_fetch.reader import touch_icon_for
+                icon = touch_icon_for(url)
+            except Exception:  # noqa: BLE001
+                icon = None
+            if icon:
+                src["icon"] = icon[:_VS_SRC_URL_MAX]
+            out.append(src)
     return out
 
 
@@ -1447,6 +2002,21 @@ def _vs_step_fields(ev: dict) -> dict:
         if v is None:
             continue
         out[k] = int(v) if k in ("step_index", "steps_total") else str(v)[:120]
+    return out
+
+
+#: A `delegate` worker's action, forwarded onto the supervisor's stream: which
+#: worker did it. Flat scalars, absent (never null) on the turn's own tools.
+_VS_WORKER_KEYS = ("worker_job_id", "parent_job_id", "worker_index", "label", "model")
+
+
+def _vs_worker_fields(ev: dict) -> dict:
+    out = {}
+    for k in _VS_WORKER_KEYS:
+        v = ev.get(k)
+        if v is None:
+            continue
+        out[k] = int(v) if k == "worker_index" else str(v)[:120]
     return out
 
 
@@ -1599,13 +2169,25 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
     q: "asyncio.Queue" = asyncio.Queue(maxsize=_VS_QUEUE_MAX)
     budget = {"n": 0, "dropped": 0}
     cancelled = {"v": False}
+    # Voice round 2026-10-07 (T3/T11): this delegation in the process registry
+    # — the in-process Stop event, status from memory, the addendum box.
+    _live: Optional[_VsLive] = (
+        _VsLive(req.delegation_id, req.session_id) if req.delegation_id else None
+    )
 
     def _put(frame: dict) -> None:
         # NEVER awaits and NEVER raises: the producer is the agent loop, and a
         # slow or dead consumer must not be able to stall or kill a turn.
-        if budget["n"] >= _VS_MAX_EVENTS:
-            return
-        budget["n"] += 1
+        if (_live is not None and frame.get("type") == "job.update"
+                and frame.get("job_id")):
+            # The runner-minted card's own frames: the status route answers
+            # this delegation's job id and state from here (T3).
+            _live.job_id = str(frame.get("job_id"))[:64]
+            _live.job_status = str(frame.get("status") or "")[:32]
+        if not str(frame.get("type") or "").startswith(_VS_UNBUDGETED):
+            if budget["n"] >= _VS_MAX_EVENTS:
+                return
+            budget["n"] += 1
         try:
             q.put_nowait(frame)
         except asyncio.QueueFull:
@@ -1639,7 +2221,7 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
             # them, so the identical action arriving over voice reached the
             # phone with no step to sit under. Absent keys, never nulls, so a
             # turn with no job is byte-identical to before.
-            _attr = _vs_step_fields(ev)
+            _attr = {**_vs_step_fields(ev), **_vs_worker_fields(ev)}
             if ev.get("phase") == "start":
                 _put({"type": "tool.start", "call_id": cid, "name": name,
                       "args": _vs_args(name, inp),
@@ -1682,12 +2264,62 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                     frame["outcome"] = "cancelled"
                 if name in _VS_PREVIEW_ALLOW:
                     frame["preview"] = _vs_clean(body)[:_VS_PREVIEW_MAX]
+                _media = _vs_media(name, raw)
+                if _media is not None:
+                    # D-T1 (additive): what the delegated `media_control`
+                    # actually did, structured — the relay reads it to know a
+                    # media command EXECUTED instead of trusting prose.
+                    frame["media"] = _media
                 _put(frame)
         except Exception:  # noqa: BLE001
             logger.debug("[VSTREAM] on_tool_event sink failed", exc_info=True)
 
+    async def on_step_event(ev: Dict[str, Any]) -> None:
+        # The runner's per-round `reasoning` and `step_change` events, for a
+        # turn that has a job: the final round is the "writing the answer"
+        # action, with its real duration. Jobless rounds stay off the wire.
+        try:
+            if not ev.get("job_id"):
+                return
+            frame: Dict[str, Any] = {"type": "step.event",
+                                     "kind": str(ev.get("kind") or "")[:32],
+                                     "job_id": str(ev.get("job_id"))[:64]}
+            for k in ("step_index", "steps_total", "elapsed_ms"):
+                if isinstance(ev.get(k), (int, float)):
+                    frame[k] = int(ev[k])
+            if ev.get("step_name"):
+                frame["step_name"] = str(ev["step_name"])[:120]
+            if "final" in ev:
+                frame["final"] = bool(ev.get("final"))
+            if ev.get("provisional") is True:
+                # D-T3 (additive): the round-START answer beat — the first
+                # text of a round that called no tool. The post-round event
+                # still follows; a client that ignores the key sees the same
+                # `reasoning`/`final` frame one round earlier.
+                frame["provisional"] = True
+            _put(frame)
+        except Exception:  # noqa: BLE001
+            logger.debug("[VSTREAM] on_step_event sink failed", exc_info=True)
+
+    async def _supervisor_sink(ev: Dict[str, Any]) -> None:
+        # `delegate` (agent/subagent_orchestrator.SUPERVISOR_EVENT_SINK): the
+        # card frames are exempt from the per-turn budget like `done` — a long
+        # supervised plan must not lose its own start or its closing state —
+        # and a worker's tool events take the ordinary tool path above.
+        if ev.get("type") in ("supervisor.started", "job.update"):
+            try:
+                q.put_nowait(ev)
+            except asyncio.QueueFull:
+                budget["dropped"] += 1
+            return
+        await on_tool_event(ev)
+
     async def _run_wrapped():
         _halt_token = _bind_media_run_mark(halt_mark)
+        from app.agent.subagent_orchestrator import SUPERVISOR_EVENT_SINK
+        _sup_token = SUPERVISOR_EVENT_SINK.set(_supervisor_sink)
+        if _live is not None:
+            _vs_register(_live)
         try:
             return await _agent_runner.run(
                 user_message=_compose_agent_message(req.message, req.context_blocks),
@@ -1704,15 +2336,28 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                 on_status=on_status,
                 on_tool_start=on_tool_start,
                 on_tool_event=on_tool_event,
+                on_step_event=on_step_event,
                 cancel_check=lambda: cancelled["v"],
                 # Same signature probe as the blocking sibling — the relay
                 # ships before the agent image rolls.
                 **_forward_display_kwargs(_agent_runner, req),
+                # D-P5: the runner-minted card mirrors itself onto this
+                # stream as `job.update` from t0.
+                **({"job_frame_sink": _put}
+                   if _runner_run_accepts(_agent_runner, "job_frame_sink") else {}),
+                # T11: the words the caller adds while this runs (the route
+                # `voice-delegations/addendum` queues them on `_live`).
+                **({"addendum_check": _live}
+                   if _live is not None
+                   and _runner_run_accepts(_agent_runner, "addendum_check") else {}),
                 # on_text_chunk deliberately NOT passed: voice renders no token
                 # deltas, and omitting it takes the frame count from thousands
                 # per turn to 2-40, which makes backpressure a non-problem.
             )
         finally:
+            if _live is not None:
+                _vs_unregister(_live)
+            SUPERVISOR_EVENT_SINK.reset(_sup_token)
             _reset_media_run_mark(_halt_token)
             try:
                 q.put_nowait(None)          # terminal sentinel
@@ -1726,36 +2371,60 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
         monitor is tied to the original agent run, not its socket, and the
         runner's existing cancel_check handles the next safe tool boundary.
         A bounded hard cancel follows for a tool that never yields back.
+
+        Voice round 2026-10-07 (T3): the cancel route sets this delegation's
+        in-process event beside the durable bit, so the watch wakes at once;
+        the DB read is the backstop for a Stop written elsewhere — every 5 s
+        from 5 s, no longer a 100-row read every 1.5 s from t0.
         """
 
         from app.db.models import BuildJob
 
         if not req.delegation_id or not req.session_id or req.save:
             return
+        loop = asyncio.get_running_loop()
+        next_db = loop.time() + _VS_CANCEL_DB_POLL_S
         while not task.done():
-            await asyncio.sleep(_VS_CANCEL_POLL_S)
-            try:
-                async with async_session_maker() as db:
-                    jobs = (await db.execute(select(BuildJob).where(
-                        BuildJob.user_id == user_id,
-                        BuildJob.conversation_id == req.session_id,
-                        BuildJob.job_type == "agent_task",
-                    ).order_by(BuildJob.created_at.desc()).limit(100))).scalars().all()
-                job = next((item for item in jobs
-                            if isinstance(item.config_json, dict)
-                            and item.config_json.get("voice_delegation_id") == req.delegation_id),
-                           None)
-            except Exception:  # noqa: BLE001
-                logger.warning("[VSTREAM] voice cancel watch read failed")
-                continue
-            if job is None:
-                continue  # voice job opens at its first planned tool round
-            if job.status != "running":
-                return  # terminal completion won the race
-            if job.stop_requested_at is None:
-                continue
+            via = None
+            job_ref = "-"
+            wait_s = max(0.0, next_db - loop.time())
+            if _live is not None:
+                try:
+                    await asyncio.wait_for(_live.cancel.wait(), timeout=wait_s)
+                    via, job_ref = "event", (_live.job_id or "-")
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(wait_s)
+            if task.done():
+                return
+            if via is None:
+                next_db = loop.time() + _VS_CANCEL_DB_POLL_S
+                try:
+                    async with async_session_maker() as db:
+                        jobs = (await db.execute(select(BuildJob).where(
+                            BuildJob.user_id == user_id,
+                            BuildJob.conversation_id == req.session_id,
+                            BuildJob.job_type == "agent_task",
+                        ).order_by(BuildJob.created_at.desc()).limit(100))).scalars().all()
+                    job = next((item for item in jobs
+                                if isinstance(item.config_json, dict)
+                                and item.config_json.get("voice_delegation_id") == req.delegation_id),
+                               None)
+                except Exception:  # noqa: BLE001
+                    logger.warning("[VSTREAM] voice cancel watch read failed")
+                    continue
+                if job is None:
+                    # The delegation's card is declared at t0 (D-P5), so this is
+                    # only the insert still in flight — Stop works from t0.
+                    continue
+                if job.status != "running":
+                    return  # terminal completion won the race
+                if job.stop_requested_at is None:
+                    continue
+                via, job_ref = "db", job.id
             cancelled["v"] = True
-            logger.info("[VSTREAM] voice cancel observed job=%s", job.id[:8])
+            logger.info("[VSTREAM] voice cancel observed job=%s via=%s", str(job_ref)[:8], via)
             await asyncio.sleep(_VS_CANCEL_POLL_S)
             if not task.done():
                 task.cancel()
@@ -1822,6 +2491,11 @@ async def internal_agent_turn_stream(req: ChatRequest, request: Request):
                 # non-empty, so an older relay's parse is unchanged.
                 **({"media": (response.persisted or {})["media"]}
                    if (response.persisted or {}).get("media") else {}),
+                # Voice round 2026-10-07 (T11): the addenda this run FOLDED
+                # into its answer; one the relay sent and that is not here
+                # arrived too late — it tells the model at delivery.
+                **({"addenda_applied": list(_live.applied)}
+                   if _live is not None and _live.applied else {}),
             })
             if budget["dropped"]:
                 logger.warning("[VSTREAM] dropped %d frames (queue full)", budget["dropped"])

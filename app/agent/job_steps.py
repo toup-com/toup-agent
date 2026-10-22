@@ -39,7 +39,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
     "parse_steps", "dump_steps", "open_first_step", "advance_steps",
-    "finish_all_steps", "counts", "current_label",
+    "finish_all_steps", "counts", "current_label", "skip_unstarted_steps",
+    "public_steps",
 ]
 
 
@@ -169,11 +170,17 @@ def advance_steps(
 def finish_all_steps(
     steps: List[Dict[str, Any]], now: datetime,
     fallback_start: Optional[datetime] = None,
+    *, keep_failed: bool = False,
 ) -> List[Dict[str, Any]]:
     """Every remaining step done at ``now`` — the contract's "the system marks
     every remaining step done ... the moment your reply is delivered".
     ``fallback_start`` = the job's ``created_at`` (legacy rows, see
-    ``_last_window_start``)."""
+    ``_last_window_start``).
+
+    ``keep_failed``: a SUPERVISOR card's rows are its workers, and a worker
+    that failed did fail — the supervisor answering anyway does not make that
+    worker's step done. Build and ``create_job`` cards keep the old contract
+    (a failed row there is a step the model recovered from in-turn)."""
     if not steps:
         return steps
     window_start = _last_window_start(steps, len(steps) - 1, now, fallback_start)
@@ -198,16 +205,59 @@ def finish_all_steps(
     running_idx = next(
         (i for i, s in enumerate(steps) if s.get("status") == "running"), None,
     )
+    # A `skipped` step is already resolved — it did not run, and greening it
+    # here is the overclaim `skip_unstarted_steps` exists to prevent.
+    resolved = ("done", "skipped", "failed") if keep_failed else ("done", "skipped")
     owner_idx = running_idx if running_idx is not None else next(
-        (i for i, s in enumerate(steps) if s.get("status") != "done"), None,
+        (i for i, s in enumerate(steps) if s.get("status") not in resolved),
+        None,
     )
     for i, s in enumerate(steps):
-        if s.get("status") != "done":
+        if s.get("status") not in resolved:
             owns = i == owner_idx
             s["status"] = "done"
             _stamp_close(s, window_start if owns else None, now,
                          measured=owns)
     return steps
+
+
+def skip_unstarted_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A DECLARED plan's steps that never started become ``skipped``.
+
+    The runner-minted card (``voice_jobs.TurnJob``) declares its plan before
+    any tool runs, so at close a planned step can still be ``pending`` with no
+    ``started_at`` — "Read the sources" on a turn that fetched nothing.
+    ``finish_all_steps`` would paint it done; this runs first so it cannot.
+    The closing ``step_answer`` is exempt: a turn that reaches a completed
+    close produced its answer, so that step ran by definition.
+
+    Model-declared ``create_job`` plans never pass through here — their
+    contract is "the system marks every remaining step done".
+    """
+    for s in steps:
+        if (s.get("status") in (None, "pending") and not s.get("started_at")
+                and s.get("type") != "step_answer"):
+            s["status"] = "skipped"
+    return steps
+
+
+#: The keys a client frame carries per step (``job_update.steps``). The row
+#: keeps ``durationMs`` for the app's REST reader; the frame names one key.
+#: `rev` (absent unless a writer bumped it): the per-row revision both
+#: clients' `mergeFetchedSteps` honour over the status rank — the only way a
+#: LEGITIMATE backward move (a build's retry-in-place, a voice card's
+#: retracted answer beat) survives the merge.
+_PUBLIC_STEP_KEYS = ("id", "type", "label", "status",
+                     "started_at", "completed_at", "duration_ms", "rev")
+
+
+def public_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The step list as a ``job_update`` frame carries it — absent keys,
+    never nulls, so a client reading the REST shape reads this one too."""
+    return [
+        {k: s[k] for k in _PUBLIC_STEP_KEYS if s.get(k) is not None}
+        for s in steps if isinstance(s, dict)
+    ]
 
 
 def counts(steps: List[Dict[str, Any]]) -> Tuple[int, int]:

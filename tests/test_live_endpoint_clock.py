@@ -158,7 +158,7 @@ async def test_assistant_output_ahead_of_wall_time_does_not_split_the_next_turn(
             p.push(H.out_text(
                 f" sentence {i} of a long spoken reply.", 200 + i * 1400, 200 + (i + 1) * 1400,
             ))
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
         end = await _say(p, at, EN, wall_s=1.5, position_ms=1500)
         p.push(H.delegation("d-en", end + 40))
         await at(1.5 + len(EN) * 0.12 + 1.6)
@@ -347,7 +347,7 @@ async def _agent_speaks(p, at):
         await at(0.2 + i * 0.05)
         position = 200 + i * 50
         p.push(H.out_text(" " + AGENT_WORDS[i % len(AGENT_WORDS)], position, position + 50))
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
 
 
 async def _echo_comes_back(p, at, echo):
@@ -503,6 +503,221 @@ def test_finished_sentences_keep_the_ordinary_gap(text):
     from app.services.live_voice_protocol import looks_unfinished
 
     assert not looks_unfinished(text)
+
+
+# ── Voice round 2026-10-07 (D-R3(4)): the ENDPOINT rules ─────────────────
+# The 12:04 call: «... یه سرچ کن ببین اه» / «. چیز اه قوی‌ترین استاد... اه
+# یو‌اف‌تی توی بحث ال‌ال‌ام» / «کیه» closed as three turns on the 1.2 s gap and
+# the second card was born.  A hesitant span and a verbless Persian clause after
+# an object-less ask keep the HARD gap; a question ending closes on the ordinary
+# one.  `looks_unfinished` (the ``tail`` rule) is untouched.
+
+def _asm(rules=True):
+    from app.services.live_voice_protocol import UtteranceAssembler
+
+    return UtteranceAssembler("p-endpoint", gap_ms=400, hard_gap_ms=900, endpoint_rules=rules)
+
+
+def _closed(asm, text, start_ms, end_ms, *, answered=False):
+    """A closed caller turn already in the queue (the session marks speech)."""
+
+    asm.add(text, start_ms, end_ms)
+    turn = asm.close("gap")
+    turn.causal_speech = True
+    turn.dispatched = answered
+    return turn
+
+
+def _open(asm, text, start_ms, end_ms):
+    _rotated, turn = asm.add(text, start_ms, end_ms)
+    turn.causal_speech = True
+    return turn
+
+
+@pytest.mark.parametrize("text", ["... یه سرچ کن ببین اه", "can you look up, um", "یه سرچ کن ببین"])
+def test_a_turn_ending_on_a_hesitation_keeps_the_hard_gap(text):
+    asm = _asm()
+    turn = _open(asm, text, 0, 400)
+    assert not asm.should_close_on_gap(400 + 400)
+    assert asm.should_close_on_gap(400 + 900)
+    assert turn.gap_rule == "hesitant"
+    # Control: the rules off — the pre-round boundary, exactly.
+    off = _asm(rules=False)
+    _open(off, text, 0, 400)
+    assert off.should_close_on_gap(400 + 400)
+
+
+def test_two_hesitation_marks_across_the_unanswered_span_keep_the_hard_gap():
+    asm = _asm()
+    _closed(asm, "um I was reading about the professors.", 0, 1000)
+    turn = _open(asm, "um the best one at UofT", 2000, 3000)
+    assert not asm.should_close_on_gap(3000 + 400)
+    assert asm.should_close_on_gap(3000 + 900)
+    assert turn.gap_rule == "hesitant"
+    # Control: the first turn was ANSWERED, so the span is the open turn alone
+    # — one mark, and the ordinary gap.
+    alone = _asm()
+    _closed(alone, "um I was reading about the professors.", 0, 1000, answered=True)
+    turn = _open(alone, "um the best one at UofT", 2000, 3000)
+    assert alone.should_close_on_gap(3000 + 400)
+    assert turn.gap_rule == "ordinary"
+
+
+@pytest.mark.parametrize("ending", ["کیه", "who is it?", "قوی‌ترین استاد ال‌ال‌ام توی یوافتی؟"])
+def test_a_question_ending_closes_on_the_ordinary_gap_even_in_a_hesitant_span(ending):
+    asm = _asm()
+    _closed(asm, "... یه سرچ کن ببین اه", 0, 1000)
+    turn = _open(asm, "اه " + ending, 2000, 3000)
+    assert asm.should_close_on_gap(3000 + 400)
+    assert turn.gap_rule == "ordinary"
+
+
+def test_a_verbless_persian_clause_after_an_objectless_ask_keeps_the_hard_gap():
+    asm = _asm()
+    _closed(asm, "یه سرچ کن ببین", 0, 1000)
+    turn = _open(asm, "قوی‌ترین استاد یوافتی توی بحث ال‌ال‌ام", 2000, 4000)
+    assert not asm.should_close_on_gap(4000 + 400)
+    assert asm.should_close_on_gap(4000 + 900)
+    assert turn.gap_rule == "np"
+
+
+@pytest.mark.parametrize(
+    ("prior", "text"),
+    [
+        # An answer to the agent's question: the turn before it was answered.
+        (("یه سرچ کن ببین", True), "تورنتو"),
+        (None, "Hey, Chatty, تو دیگه خوبی"),
+        # F6: content-free sound keeps the ordinary gap.
+        (None, "اه"),
+        # «ال‌ال‌ام» splits into «ال ال ام» — «ام» is not a hesitation: ONE mark.
+        (None, "اه قوی‌ترین استاد ال‌ال‌ام در یوافتی"),
+        # A verbless clause with no object-less ask in its span.
+        (None, "اسم صبحش آهنگ"),
+    ],
+)
+def test_the_endpoint_rules_leave_ordinary_turns_on_the_ordinary_gap(prior, text):
+    from app.services.live_voice_protocol import hesitation_marks
+
+    asm = _asm()
+    if prior is not None:
+        _closed(asm, prior[0], 0, 1000, answered=prior[1])
+    turn = _open(asm, text, 2000, 3000)
+    assert asm.should_close_on_gap(3000 + 400), turn.gap_rule
+    assert turn.gap_rule == "ordinary"
+    assert hesitation_marks("اه قوی‌ترین استاد ال‌ال‌ام") == 1
+
+
+def test_the_colloquial_how_and_how_much_carry_a_predicate():
+    from app.services.live_voice_protocol import _leading_words, _own_predicate
+
+    for text in ("چجوریه", "چقدره", "توی آیسآکادمیک چجوریه", "چقدر طول میکشه"):
+        assert _own_predicate(_leading_words(text)), text
+
+
+#: The 12:04 call's caller turns at their provider-timeline start/end (relay log
+#: `turn closed` + `close_provider_ms`).  Each logged turn is one fragment.
+CALL_1007 = [
+    ("Hey, Chatty, تو دیگه خوبی", 4800, 6000),
+    ("سلامتی! چی کارا میکنی", 13000, 14200),
+    ("باشه چه", 26600, 28000),
+    ("یه چیزی برام سرچ کن. ببین", 30400, 32600),
+    ("آیاس", 34400, 34600),
+    ("جنرال. خب؟ اه", 35800, 37200),
+    ("ریدینگ برای هج شدن میتونی چند تا غلط بزنی", 38600, 42800),
+    ("اوکی. بعد به نظرت همین توی آیسآکادمیک چجوریه", 63200, 68800),
+    ("اوکی، الان یه سؤال", 201600, 203000),
+    ("... یه سرچ کن ببین اه", 206400, 208400),
+    (". چیز اه قوی‌ترین استاد... اه یو‌اف‌تی توی بحث ال‌ال‌ام", 210000, 219200),
+    ("کیه", 220600, 220800),
+    ("حالا یه دنه آهنگ دریک واسم پخش کن", 307800, 311000),
+    ("اسم صبحش آهنگ", 342200, 343800),
+    ("استاپش کن", 356200, 357000),
+    ("یه آهنگ از مدونا برام پخش کن", 373000, 376000),
+    ("بعدی رو پخش کن", 394800, 396000),
+]
+
+
+def _replay(rules):
+    """Feed the call's turns at production gaps; advance the input clock in
+    50 ms ticks.  Returns [(first words, rule, start, end, closed_at)]."""
+
+    from app.services.live_voice_protocol import UtteranceAssembler
+
+    asm = UtteranceAssembler("p-1007", gap_ms=1200, hard_gap_ms=2600, endpoint_rules=rules)
+    out = []
+    clock = 0
+
+    def tick_until(t):
+        nonlocal clock
+        while clock < t:
+            clock += 50
+            if asm.open is not None and asm.should_close_on_gap(clock):
+                out.append((asm.close("gap"), clock))
+
+    for text, start, end in CALL_1007:
+        tick_until(start)
+        rotated, turn = asm.add((" " if asm.open else "") + text, start, end)
+        if rotated is not None:
+            out.append((rotated, start))
+        turn.causal_speech = True
+        clock = max(clock, end)
+    tick_until(400000)
+    return [(u.text.split()[0], u.gap_rule, u.start_ms, u.end_ms, at) for u, at in out]
+
+
+def test_the_recorded_call_replays_as_twelve_turns_with_one_request_ending_in_kie():
+    """The measurement turned into a guard: 17 caller turns become 12; the
+    General question (4 rows) is one turn closing where it did (44000); the
+    announcer waits the hard gap (205600, +1.4 s); «... یه سرچ کن ببین اه» /
+    «. چیز اه …» / «کیه» are ONE turn closing on the ordinary gap after «کیه»
+    (222000); every other turn is untouched."""
+
+    today = _replay(False)
+    assert len(today) == 17
+    assert [r[4] for r in today][9:12] == [209600, 220400, 222000]
+
+    proposed = _replay(True)
+    assert len(proposed) == 12
+    by_start = {r[2]: r for r in proposed}
+    general = by_start[30400]
+    assert (general[3], general[4]) == (42800, 44000)
+    announcer = by_start[201600]
+    assert (announcer[1], announcer[4]) == ("np", 205600)
+    request = by_start[206400]
+    assert (request[3], request[4]) == (220800, 222000)
+    # Every turn the rules did not touch closes exactly when it did today.
+    untouched = [r for r in proposed if r[2] not in (30400, 201600, 206400)]
+    assert all(r[1] == "ordinary" for r in untouched)
+    assert {(r[2], r[4]) for r in untouched} <= {(r[2], r[4]) for r in today}
+
+
+@pytest.mark.asyncio
+async def test_a_hesitant_turn_closes_on_the_hard_gap_and_says_so_in_the_log(monkeypatch, caplog):
+    """End to end: the relay holds «یه سرچ کن ببین اه» for the hard gap and the
+    `turn closed` line names the rule (labels only, never words)."""
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+
+    async def script(p, at):
+        await at(0.3)
+        p.push(H.user_delta("یه سرچ کن ببین اه", 300, 600))
+        await at(2.4)
+
+    box: dict = {}
+    client, _provider, _calls = await _call(
+        monkeypatch, script, clocks={"voice_live_endpoint_rules_enabled": True}, box=box,
+    )
+    finals = [(f, t) for f, t in zip(client.frames, client.times)
+              if f.get("type") == "transcript" and f.get("final")]
+    assert [f["text"] for f, _t in finals] == ["یه سرچ کن ببین اه"]
+    # The ordinary gap would close it ≈1.0 s after session start (0.6 + 0.4);
+    # the hard gap holds it to ≈1.5 s.
+    loop_t0 = box["t0"]
+    wall_t0 = time.monotonic() - (asyncio.get_running_loop().time() - loop_t0)
+    assert finals[0][1] - wall_t0 >= 1.3, finals[0][1] - wall_t0
+    closed = [r.getMessage() for r in caplog.records if "[LIVE] turn closed" in r.getMessage()]
+    assert closed and "gap_rule=hesitant" in closed[0], closed
+    assert "سرچ" not in closed[0]
 
 
 # ── §B: a delegation binds to the whole unanswered request span ──────────

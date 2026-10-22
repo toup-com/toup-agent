@@ -469,6 +469,27 @@ async def report_presence(
     Both edges are reported: `false` on the way out, so the gate lifts
     the moment the user leaves rather than after the TTL lapses."""
     user_id = current_user.id
+    if body.foreground:
+        # Voice round 2026-10-07 (D-R2(4)): the app coming to the foreground
+        # is the moment a voice call becomes likely — warm the Live voice
+        # context on the tenant now (Live cohort only, debounced, detached).
+        # Build 142 already reports this on every foreground: no app release.
+        # Phase D2 ruling 48 (turns-startup-6): the app re-reports every 4
+        # minutes while it is on screen, and nothing pauses that during a
+        # call — so not while this user's Live call is open (the cache keeps
+        # warming between calls, for a caller about to tap).
+        try:
+            from app.api.ws_realtime import live_voice_call_open, schedule_live_voice_warm
+
+            if live_voice_call_open(user_id):
+                logger.info(
+                    "[LIVE] voice warm skipped user=%s reason=call_open source=presence",
+                    str(user_id)[:8],
+                )
+            else:
+                schedule_live_voice_warm(str(user_id), "presence")
+        except Exception:  # noqa: BLE001 — presence never fails on a warm
+            logger.warning("[LIVE] voice warm trigger failed reason=presence")
     now = datetime.utcnow()
     q = select(LiveActivityDevice).where(
         LiveActivityDevice.user_id == user_id,

@@ -752,6 +752,8 @@ async def test_v1_one_continuous_call(monkeypatch):
         "request changes them): " + _words(ADDRESS)
     ) in corrected
     assert "(non-binding context" not in corrected
+    # Voice round 2026-10-06 (D-6a): …nor under the reworded context rule.
+    assert "(context only" not in corrected
     assert (
         "Prior caller request: " + _words(ADDRESS) + "\nAccepted backend result: "
         + ADDRESS_ANSWER
@@ -1377,6 +1379,13 @@ async def test_v3_the_answer_to_the_question_that_barged_in_is_not_held_by_an_ex
         clocks={"voice_live_result_defer_max_ms": 3000, "voice_live_speak_timeout_s": 3.0},
     )
     call.tenant.plan("LLM", LLM_ANSWER, delay=0.9)
+    marks: dict = {}
+
+    def cut():
+        # D-P9: the stop instruction now waits for sustained speech, so the
+        # interrupt's own moment is read here rather than off that append.
+        marks["interrupted"] = time.monotonic()
+        return call.barge_in(7700)
 
     async def scenario(call: Call):
         phone = call.phone
@@ -1388,7 +1397,7 @@ async def test_v3_the_answer_to_the_question_that_barged_in_is_not_held_by_an_ex
             lambda: any("keep" in (f.get("text") or "") for f in phone.of("response_text")),
             "the reply is playing",
         )
-        await call.utter(HESITANT, pauses=HESITANT_PAUSES, after={1: lambda: call.barge_in(7700)})
+        await call.utter(HESITANT, pauses=HESITANT_PAUSES, after={1: cut})
         call.delegate("d-llm")
         await call.done("d-llm")
         await call.until(lambda: LLM_ANSWER in call.spoken(), "the answer is appended", timeout=6)
@@ -1402,10 +1411,7 @@ async def test_v3_the_answer_to_the_question_that_barged_in_is_not_held_by_an_ex
         if f.get("type") == "delegation" and f.get("delegation_id") == "d-llm"
         and f.get("phase") == "completed"
     )
-    interrupted = next(
-        t for e, t in zip(call.provider.sent, call.sent_times)
-        if str(e.get("event_id") or "").startswith("toup-live-interrupt-")
-    )
+    interrupted = marks["interrupted"]
     appended = next(
         t for e, t in zip(call.provider.sent, call.sent_times)
         if e.get("type") == "session.commentary.append" and e.get("content") == LLM_ANSWER

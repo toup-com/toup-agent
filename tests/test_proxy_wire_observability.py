@@ -1675,7 +1675,12 @@ def test_the_cap_still_drops_un_namespaced_first_on_a_realistic_array():
     floor = sorted(lp._PROTECTED_CORE_DEFAULT)
     assert lp.PROTECTED_CORE_TOOLS == frozenset(floor)   # env not overriding
     tools = _over_cap_tools()
-    tools[115:120] = [{"name": n, "description": "x"} for n in floor]
+    # Re-pinned 2026-10-06 (voice round, D-T1/D-T2): the floor grew from five
+    # names to seven (`media_control`, `delegate`), so it is laid over the
+    # LAST len(floor) slots of the 120-entry core block — still exactly the
+    # tail tail-first would take first — instead of a hard-coded five-slot
+    # window that grew the array to 176.
+    tools[120 - len(floor):120] = [{"name": n, "description": "x"} for n in floor]
     assert len(tools) == 174
     kept, dropped = lp._cap_tools(tools)
     assert len(kept) == 128
@@ -1696,19 +1701,24 @@ def test_rule_one_not_the_floor_holds_named_un_namespaced_tail_names():
     names."""
     floor = sorted(lp._PROTECTED_CORE_DEFAULT)
     tools = _over_cap_tools()
-    tools[115:120] = [{"name": n, "description": "x"} for n in floor]
-    named = {"core_113", "core_114", "play_media"}
+    # Re-pinned 2026-10-06 with the floor's growth (see the test above): the
+    # floor sits on the last len(floor) core slots, so the two NON-floor tail
+    # names are the two just ahead of it (core_111/core_112 for seven).
+    start = 120 - len(floor)
+    tools[start:120] = [{"name": n, "description": "x"} for n in floor]
+    tail_a, tail_b = f"core_{start - 2:03d}", f"core_{start - 1:03d}"
+    named = {tail_a, tail_b, "play_media"}
     kept, dropped = lp._cap_tools(tools, protected=named)
     kept_names = {t["name"] for t in kept}
     assert len(kept) == 128
     assert named <= kept_names                      # rule 1 held them
-    assert not {"core_113", "core_114"} & set(lp._PROTECTED_CORE_DEFAULT)
+    assert not {tail_a, tail_b} & set(lp._PROTECTED_CORE_DEFAULT)
     assert (set(floor) - named) <= set(dropped), dropped
     assert all("__" not in n for n in dropped), dropped
 
-    kept, dropped = lp._cap_tools(tools, protected={"core_114"})
+    kept, dropped = lp._cap_tools(tools, protected={tail_b})
     kept_names = {t["name"] for t in kept}
-    assert "core_114" in kept_names
+    assert tail_b in kept_names
     assert set(floor) <= set(dropped), dropped      # floor ∩ {name} = ∅
 
 

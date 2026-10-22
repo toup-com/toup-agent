@@ -707,3 +707,49 @@ async def test_transition_job_status_rejects_invalid_status(db):
 
     with pytest.raises(ValueError):
         await transition_job_status(db, parent, new_status="not-a-real-status")
+
+
+# ── Supervisor (voice round 2026-10-05, D-P6) ─────────────────────────
+
+
+def test_supervised_retry_key_differs_and_the_default_key_does_not_move():
+    """A supervised retry must be a NEW row — the composite UNIQUE would
+    otherwise hand back the failed attempt and fire nothing — while the plain
+    `spawn` key stays byte-identical."""
+    from app.agent.subagent_dispatcher import derive_idempotency_key
+
+    base = derive_idempotency_key("p", "research X")
+    assert base == derive_idempotency_key("p", "research X", attempt=1)
+    a2 = derive_idempotency_key("p", "research X", attempt=2)
+    assert a2 != base and a2.startswith(base)
+    n1 = derive_idempotency_key("p", "research X", nonce="plan-1")
+    assert n1 != base
+    assert n1 != derive_idempotency_key("p", "research X", nonce="plan-2")
+    assert len(derive_idempotency_key("p" * 36, "t", attempt=2, nonce="n" * 12)) <= 120
+
+
+@pytest.mark.asyncio
+async def test_a_tenant_override_can_lower_a_cap_but_never_raise_it(
+    db, enable_spawning, monkeypatch,
+):
+    from app.config import settings
+    from app.agent.subagent_dispatcher import REJECTION_CODES, pre_spawn_checks
+
+    monkeypatch.setattr(settings, "subagent_max_children_per_parent", 2)
+    uid = _new_id()
+    await _seed_user(db, uid)
+    parent = await _make_job(db, user_id=uid)
+    await _make_job(db, user_id=uid, parent_job_id=parent, status="running")
+
+    assert await pre_spawn_checks(db, user_id=uid, parent_job_id=parent, task="X") is None
+    lowered = await pre_spawn_checks(
+        db, user_id=uid, parent_job_id=parent, task="X",
+        caps={"max_children_per_parent": 1},
+    )
+    assert lowered is not None and lowered.error_code == REJECTION_CODES.PARENT_CAP
+    await _make_job(db, user_id=uid, parent_job_id=parent, status="running")
+    raised = await pre_spawn_checks(
+        db, user_id=uid, parent_job_id=parent, task="X",
+        caps={"max_children_per_parent": 50},
+    )
+    assert raised is not None and raised.error_code == REJECTION_CODES.PARENT_CAP

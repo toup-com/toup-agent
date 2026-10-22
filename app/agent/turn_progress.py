@@ -51,6 +51,7 @@ _TOOL_SUBTITLES = {
     "read_file": "Reading a file…",
     "list_files": "Looking at files…",
     "spawn": "Spawning a helper…",
+    "delegate": "Working with helpers…",
     "start_mission": "Starting a mission…",
 }
 

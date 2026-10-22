@@ -267,10 +267,19 @@ def test_every_surface_reaches_the_same_runner():
 
     # Voice declares its channel explicitly at every entry point — that
     # string is what makes the runner's day/tz/tool-gating branch take
-    # the voice path. Three sites: the in-process relay call, and the two
-    # agent-side /internal/agent-turn hops the V2 relay uses.
+    # the voice path. Four sites: the in-process relay call, the two
+    # agent-side /internal/agent-turn hops the V2 relay uses, and the
+    # /internal/voice-context warm (voice round 2026-10-07), which builds
+    # the system prompt AHEAD of the call — it must declare the same channel
+    # the turn will, or it warms a prompt no voice turn ever reads. It is a
+    # prewarm, not a fifth runner entry: it calls `_build_system_prompt`,
+    # never `run`.
+    api_v1 = (BACKEND / "app/api/api_v1.py").read_text()
     assert (BACKEND / "app/api/ws_realtime.py").read_text().count('channel="voice"') >= 1
-    assert (BACKEND / "app/api/api_v1.py").read_text().count('channel="voice"') == 2
+    assert api_v1.count('channel="voice"') == 3
+    assert re.search(
+        r"_build_system_prompt\(\s*db, user_id, \"\", channel=\"voice\"", api_v1
+    ), "the /internal/voice-context warm no longer builds the VOICE prompt"
 
 
 # ──────────────────────────────────────────────────────────────────────

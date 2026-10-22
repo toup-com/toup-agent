@@ -161,6 +161,24 @@ ENV ROUTINES_EMAIL_BRIEFING_ENABLED=true \
 # app/agent/autopilot_gate.py.
 ENV AUTOPILOT_USER_ALLOWLIST="871bac24-c366-42b5-b224-8802c73aef3a,c47c5b4b-16d2-498c-b231-15d53d7454b9,533354ce-40c5-41b6-81a8-e87e33a08a24,e5ec1759-84ac-45bb-b2ec-bc85fa932211"
 
+# Supervisor + executor sub-agents (the `delegate` tool), staged the same
+# way: the bound user in this list gets it while SUPERVISOR_ENABLED stays
+# off image-wide. A per-tenant `enabled` in platform_settings
+# `subagent.settings.<user_id>` (admin PUT …/subagent-settings) overrides
+# this in either direction without a restart; see
+# app/agent/supervisor_gate.py.
+# The two admin accounts (nariman, mrhx) plus the throwaway simulator test
+# account used to verify the round (supervisor decision, reversing OC-4's
+# empty list). Old-client caveat: workers broadcast their own `job_update`
+# frames, so an app older than 1.261005.00 (141) — or a web tab opened before
+# this deploy and not reloaded — draws each worker as its own card until it
+# updates. Per-tenant kill switch: admin PUT …/subagent-settings
+# {"enabled": false}, live within 60 s, no restart, and sticky — a failed
+# runtime-flags fetch keeps the last override (supervisor_gate, TW-7).
+# TWO COPIES: the root Dockerfile (platform-api, the relay's side of the same
+# gate) carries this line byte-identical — tests/test_subagent_settings.py.
+ENV SUPERVISOR_USER_ALLOWLIST="871bac24-c366-42b5-b224-8802c73aef3a,c47c5b4b-16d2-498c-b231-15d53d7454b9,4da11ebe-ec0b-4014-b47a-f6ca623df110"
+
 # Sub-agent spawning — unified job path, image-wide default ON.
 # Every other enable lever is structurally dead for managed tenants:
 # pool binds don't carry the flag (_build_bind_payload/_BIND_FIELDS

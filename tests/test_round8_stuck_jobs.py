@@ -611,3 +611,115 @@ async def test_a_handed_off_job_stays_open_and_the_reconciler_leaves_it(monkeypa
         await db.commit()
     assert await jr.reconcile_delivered_turn_jobs() == 0
     assert (await _job_row(job_id)).status == "running"
+
+
+# ── TW-2: a live voice / supervisor card is not closed by a spoken row ─────
+
+async def _seed_voice_card(user_id, conv, *, created_at, delegation_id="d-1",
+                           role=None) -> str:
+    from app.db import async_session_maker
+    from app.db.models import BuildJob
+    from app.agent.job_steps import dump_steps, open_first_step
+    job_id = str(uuid.uuid4())
+    cfg = {"job_type": "search", "turn_job": True, "voice_turn": True,
+           "voice_delegation_id": delegation_id}
+    if role:
+        cfg["role"] = role
+    async with async_session_maker() as db:
+        db.add(BuildJob(
+            id=job_id, user_id=user_id, title="Plan my trip", prompt="plan",
+            job_type="agent_task", status="running", layer=0,
+            steps_json=dump_steps(open_first_step(_steps(), created_at)),
+            source_kind="manual", conversation_id=conv,
+            config_json=cfg, created_at=created_at,
+        ))
+        await db.commit()
+    return job_id
+
+
+async def _seed_voice_row(conv, when, *, source, delegation_id=None, **extra):
+    from app.db import async_session_maker
+    from app.db.models import Message
+    voice = {"source": source, **({"delegation_id": delegation_id} if delegation_id else {}),
+             **extra}
+    async with async_session_maker() as db:
+        db.add(Message(id=str(uuid.uuid4()), conversation_id=conv, role="assistant",
+                       content="Two helpers are still reading.", created_at=when,
+                       metadata_json=json.dumps({"voice": voice})))
+        await db.commit()
+
+
+@pytest.fixture
+def _quiet_surfaces(monkeypatch):
+    from app.services import agent_notify_client as anc
+    import app.api.ws_chat as ws
+    monkeypatch.setattr(anc, "OPPORTUNISTIC_FLUSH", False)
+
+    async def _noop(*a, **k):
+        return 0
+    monkeypatch.setattr(ws, "broadcast_to_user", _noop)
+
+
+@pytest.mark.asyncio
+async def test_a_spoken_row_never_closes_a_voice_card(_quiet_surfaces, test_user_id):
+    """The relay writes a `live_spoken` row per output epoch into the call's
+    conversation. Only the delegated answer for THIS delegation closes the
+    card — not a filler line, not another delegation's answer, not a
+    cancelled one."""
+    from app.agent import job_reconciler as jr
+    now = datetime.utcnow()
+    conv = await _seed_conversation(test_user_id)
+    created = now - timedelta(minutes=5)
+    card = await _seed_voice_card(test_user_id, conv, created_at=created)
+    await _seed_voice_row(conv, created + timedelta(seconds=30), source="live_spoken")
+    await _seed_voice_row(conv, created + timedelta(seconds=40), source="delegated",
+                          delegation_id="d-other")
+    await _seed_voice_row(conv, created + timedelta(seconds=50), source="delegated",
+                          delegation_id="d-1", cancelled=True)
+    assert await jr.reconcile_delivered_turn_jobs(now, sweep_builds=False) == 0
+    assert (await _job_row(card)).status == "running"
+
+    await _seed_voice_row(conv, created + timedelta(seconds=60), source="delegated",
+                          delegation_id="d-1")
+    assert await jr.reconcile_delivered_turn_jobs(now, sweep_builds=False) == 1
+    assert (await _job_row(card)).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_supervisor_card_with_live_workers_is_left_to_its_plan(
+        _quiet_surfaces, test_user_id):
+    """The review probe: a supervised voice run 3m10s old with a spoken
+    progress row was closed completed while its workers ran. Inside its own
+    deadline, or while any worker is live, the watchdog leaves it; past both
+    it is an ordinary stranded card the delivered answer closes."""
+    from app.agent import job_reconciler as jr
+    from app.db import async_session_maker
+    from app.db.models import BuildJob
+    now = datetime.utcnow()
+    conv = await _seed_conversation(test_user_id)
+    young = await _seed_voice_card(test_user_id, conv, created_at=now - timedelta(seconds=190),
+                                   role="supervisor")
+    await _seed_voice_row(conv, now - timedelta(seconds=100), source="delegated",
+                          delegation_id="d-1")
+    assert await jr.reconcile_delivered_turn_jobs(now, sweep_builds=False) == 0
+    assert (await _job_row(young)).status == "running"
+
+    conv2 = await _seed_conversation(test_user_id)
+    old = await _seed_voice_card(test_user_id, conv2, created_at=now - timedelta(minutes=9),
+                                 delegation_id="d-2", role="supervisor")
+    await _seed_voice_row(conv2, now - timedelta(minutes=8), source="delegated",
+                          delegation_id="d-2")
+    child = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(BuildJob(id=child, user_id=test_user_id, title="Helper 1", prompt="x",
+                        job_type="subagent", status="running", layer=1,
+                        parent_job_id=old, created_at=now - timedelta(minutes=8)))
+        await db.commit()
+    assert await jr.reconcile_delivered_turn_jobs(now, sweep_builds=False) == 0
+    assert (await _job_row(old)).status == "running"
+
+    async with async_session_maker() as db:
+        (await db.get(BuildJob, child)).status = "completed"
+        await db.commit()
+    assert await jr.reconcile_delivered_turn_jobs(now, sweep_builds=False) == 1
+    assert (await _job_row(old)).status == "completed"

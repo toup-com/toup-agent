@@ -140,7 +140,10 @@ _MAX_CHAIN_DEPTH_GUARD = 64
 # ──────────────────────────────────────────────────────────────────────
 
 
-def derive_idempotency_key(parent_job_id: Optional[str], task: str) -> str:
+def derive_idempotency_key(
+    parent_job_id: Optional[str], task: str,
+    *, attempt: int = 1, nonce: Optional[str] = None,
+) -> str:
     """Content-hash key used with JobRunner.create_job's
     ``(source_id, idempotency_key)`` composite UNIQUE so a retried
     spawn tool call on the same parent + same task collapses to one
@@ -149,13 +152,24 @@ def derive_idempotency_key(parent_job_id: Optional[str], task: str) -> str:
     16 hex chars from sha256 — collision-resistant enough for
     per-parent uniqueness, short enough to fit the VARCHAR(120)
     idempotency_key column with room to spare.
+
+    ``nonce`` / ``attempt`` are the supervisor's: a supervised RETRY of the
+    same step must be a new row (the collapse would hand back the failed one
+    and fire nothing), and two ``delegate`` calls on one parent with the same
+    step text are two plans. The default spawn path passes neither, so its
+    key is byte-identical to before.
     """
     # Normalize: strip whitespace + lowercase so a stray space or
     # case change doesn't defeat the dedup.
     normalized = (task or "").strip().lower()
+    if nonce:
+        normalized = f"{nonce}:{normalized}"
     h = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
     parent_tag = parent_job_id or "top"
-    return f"sa:{parent_tag}:{h}"
+    key = f"sa:{parent_tag}:{h}"
+    if attempt and int(attempt) > 1:
+        key = f"{key}:a{int(attempt)}"
+    return key
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -411,6 +425,7 @@ async def pre_spawn_checks(
     user_id: str,
     parent_job_id: Optional[str],
     task: str,
+    caps: Optional[dict] = None,
 ) -> Optional[SpawnRejection]:
     """Run the kill switch + depth + per-parent cap + per-user
     concurrent cap + 24h cap + non-empty-task check in priority
@@ -433,6 +448,17 @@ async def pre_spawn_checks(
     worth the saving.
     """
     from app.config import settings
+
+    # Per-tenant overrides (platform_settings `subagent.settings.<user>`) may
+    # only LOWER a cap — the image's settings stay the ceiling.
+    def _cap(name: str, ceiling: int) -> int:
+        v = (caps or {}).get(name)
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 1:
+            return min(v, ceiling)
+        return ceiling
+
+    max_children = _cap("max_children_per_parent", settings.subagent_max_children_per_parent)
+    max_concurrent = _cap("max_per_user_concurrent", settings.subagent_max_per_user_concurrent)
 
     # 1. Kill switch — env-var first, per-user flag as fallback.
     # tool_executor._tool_spawn already did this two-step check before
@@ -482,23 +508,23 @@ async def pre_spawn_checks(
     # 4. Per-parent children cap
     if parent_job_id:
         running = await count_running_children(db, parent_job_id)
-        if running >= settings.subagent_max_children_per_parent:
+        if running >= max_children:
             return SpawnRejection(
                 error_code=REJECTION_CODES.PARENT_CAP,
                 message=(
                     f"Parent already has {running} active sub-agent(s); "
-                    f"cap is {settings.subagent_max_children_per_parent}."
+                    f"cap is {max_children}."
                 ),
             )
 
     # 5. Per-user concurrent cap
     concurrent = await count_running_subagents_for_user(db, user_id)
-    if concurrent >= settings.subagent_max_per_user_concurrent:
+    if concurrent >= max_concurrent:
         return SpawnRejection(
             error_code=REJECTION_CODES.USER_CONCURRENT_CAP,
             message=(
                 f"You already have {concurrent} active sub-agent(s); "
-                f"cap is {settings.subagent_max_per_user_concurrent}."
+                f"cap is {max_concurrent}."
             ),
         )
 

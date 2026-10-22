@@ -170,6 +170,48 @@ async def acquire_lease(
         return False
 
 
+async def claim_lease(name: str, holder: str, ttl_s: float) -> bool:
+    """Take `name` for `holder` UNCONDITIONALLY — the newest claimant wins.
+
+    Not a leader election (that is `acquire_lease`): an OWNERSHIP record whose
+    newest writer is by definition the owner, e.g. `voice-owner:<user_id>`,
+    where a reconnect on either replica must supersede the socket it replaces
+    whatever that socket's lease still says. One upsert; never raises.
+    """
+    me = (holder or "")[:80]
+    if not me:
+        return False
+    try:
+        from app.db.database import async_session_maker, get_engine
+        from app.db.models import InfraLease
+
+        now = _utcnow()
+        expires = now + timedelta(seconds=max(1.0, float(ttl_s)))
+        dialect = get_engine().dialect.name
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _insert
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as _insert
+        else:                                   # pragma: no cover
+            return False
+        stmt = _insert(InfraLease).values(
+            name=name, holder=me, acquired_at=now, expires_at=expires, tick_seq=1,
+        ).on_conflict_do_update(
+            index_elements=[InfraLease.name],
+            set_={
+                "holder": me, "acquired_at": now, "expires_at": expires,
+                "tick_seq": InfraLease.tick_seq + 1,
+            },
+        )
+        async with async_session_maker() as db:
+            await db.execute(stmt)
+            await db.commit()
+        return True
+    except Exception:
+        logger.info("[infra-lease] claim failed for '%s'", name, exc_info=True)
+        return False
+
+
 async def release_lease(name: str, holder: Optional[str] = None) -> bool:
     """Give up a lease we hold, so the next replica takes over immediately
     instead of after a TTL. Best-effort — shutdown paths only. Never raises.

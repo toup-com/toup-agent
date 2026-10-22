@@ -6,8 +6,8 @@
   "superseded"}`: a stop/pause landed after the play began) says no
   "Starting …" line, is never handed to a full agent turn, and ends
   `cancelled`;
-* item 10 — the media backstop's verdict row is stamped under the turn it
-  answers (`stamp_child`); `tick_loop` backs off after a failing tick instead
+* item 10 — the media backstop's verdict row is stamped where the call shows
+  it (D-P7 R2: at the tail); `tick_loop` backs off after a failing tick instead
   of spinning; `_LANGUAGE_NEG_NEUTRAL` words count only next to a negation;
   the dead `stamp_for` is gone.
 
@@ -338,12 +338,15 @@ def _final_rows(saves):
 
 
 @pytest.mark.asyncio
-async def test_the_backstop_verdict_row_is_saved_under_the_stop_turn(monkeypatch):
+async def test_the_backstop_verdict_row_is_saved_under_the_stop_it_answers(monkeypatch):
     """The caller says a stop the model never delegates; while the tenant waits
-    for the phone's ack they say something else. Live shows the verdict under
-    the stop turn, so the saved row must sort there too — not below the later
-    turn, where the day chat reads it as that turn's answer (reverify
-    w4-persist NEW, F32 class)."""
+    for the phone's ack they say something else.
+
+    PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b).  It was "saved
+    after the later turn": tail stamps put the 2026-10-06 «استاپش کن» card
+    45 s from its question.  The verdict row sits under the stop turn it
+    answers — after the model's own «چشم.» — and above the later turn,
+    whenever it is written, and still names the stop turn as its parent."""
 
     H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=3.0)
     monkeypatch.setattr(settings, "voice_live_media_backstop_grace_ms", 300)
@@ -508,8 +511,220 @@ def test_a_neutral_word_next_to_a_negation_still_counts(text, current, expected)
 
 
 def test_the_dead_stamp_for_is_gone():
-    """Every row is stamped by `stamp_user` / `stamp_child` /
-    `reserve_epoch_stamp` now; a leftover `stamp_for` only let probes patch
-    something nothing calls (reverify w4-persist)."""
+    """Every row is stamped by `stamp_row` / `reserve_epoch_stamp` now; a
+    leftover `stamp_for` (or D-P7 R2's retired `stamp_child` / `stamp_user`)
+    only let probes patch something nothing calls (reverify w4-persist)."""
 
-    assert not hasattr(live._LiveSession, "stamp_for")
+    for gone in ("stamp_for", "stamp_child", "stamp_user"):
+        assert not hasattr(live._LiveSession, gone), gone
+
+
+# ── PR-2 (2026-10-02 call, P2/D6): a failure says which way it failed ────
+
+
+_TYPED = list(H.config()["features"]) + ["typed_task_failures"]
+
+
+def _delegation_error_codes(client) -> list:
+    return [
+        f.get("code") for f in client.of("error")
+        if str(f.get("code") or "").startswith("delegation_")
+    ]
+
+
+async def _run_failing_think(monkeypatch, exc, *, features, text="find me a plumber"):
+    H.fast_clocks(monkeypatch)
+
+    async def think(*_args, **_kwargs):
+        raise exc
+
+    H.patch_relay(monkeypatch, think=think)
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([H.config(features=list(features)), wait, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_single_turn(text), auto_ack=True)
+    await H.run_relay(client, provider, timeout=6)
+    return client, provider
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason, code", [
+    ("agent_unreachable", "delegation_unreachable"),
+    ("agent_timeout", "delegation_timeout"),
+])
+@pytest.mark.parametrize("text, lang", [
+    ("find me a plumber", "en"),
+    ("یه لوله‌کش برام پیدا کن", "fa"),
+])
+async def test_a_typed_think_failure_names_its_category(monkeypatch, reason, code, text, lang):
+    """A client that negotiated `typed_task_failures` gets the typed code on
+    the terminal frame AND on the error frame (one code, rule f), and hears
+    the one-sentence line that names the category and offers a retry."""
+    from app.api import ws_realtime as rt
+
+    client, provider = await _run_failing_think(
+        monkeypatch, rt.VoiceThinkError(reason), features=_TYPED, text=text,
+    )
+
+    frame = _terminal_frame(client)
+    assert frame["phase"] == "failed" and frame["state"] == "failed", frame
+    assert frame.get("reason") == code, frame
+    assert _delegation_error_codes(client) == [code]
+    spoken = _spoken_text(provider)
+    assert relay_line(code, lang) in spoken, spoken
+    assert relay_line("delegation_failed", lang) not in spoken, spoken
+    assert client.of("ready")[0]["capabilities"].get("typed_task_failures") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", [
+    pytest.param(None, id="harness-default"),
+    pytest.param(["delegation_frames", "heard_text", "live_turns", "media_control",
+                  "playback_frames", "task_lifecycle", "turn_timing"], id="tf132"),
+])
+async def test_a_client_without_the_feature_keeps_delegation_failed_byte_for_byte(
+    monkeypatch, features,
+):
+    """Every shipped build maps an unknown reason to `went_wrong`, but the
+    relay does not lean on that: without the feature the frames are exactly
+    today's `delegation_failed`. The spoken line still names the category —
+    speech is not a wire field."""
+    from app.api import ws_realtime as rt
+
+    client, provider = await _run_failing_think(
+        monkeypatch, rt.VoiceThinkError("agent_unreachable"),
+        features=features if features is not None else H.config()["features"],
+    )
+
+    frame = _terminal_frame(client)
+    assert frame.get("reason") == "delegation_failed", frame
+    assert _delegation_error_codes(client) == ["delegation_failed"]
+    import json
+
+    assert "typed_task_failures" not in client.of("ready")[0]["capabilities"]
+    assert "delegation_unreachable" not in json.dumps(client.frames)
+    assert relay_line("delegation_unreachable", "en") in _spoken_text(provider)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc_factory", [
+    pytest.param(lambda rt: RuntimeError("agent exploded"), id="plain-RuntimeError"),
+    pytest.param(lambda rt: rt.VoiceThinkError("agent_error"), id="agent_error"),
+    pytest.param(lambda rt: rt.VoiceThinkError("agent_incomplete"), id="agent_incomplete"),
+])
+async def test_an_untyped_failure_stays_delegation_failed_even_when_negotiated(
+    monkeypatch, exc_factory,
+):
+    from app.api import ws_realtime as rt
+
+    client, provider = await _run_failing_think(monkeypatch, exc_factory(rt), features=_TYPED)
+
+    frame = _terminal_frame(client)
+    assert frame.get("reason") == "delegation_failed", frame
+    assert _delegation_error_codes(client) == ["delegation_failed"]
+    assert relay_line("delegation_failed", "en") in _spoken_text(provider)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_live_hands_think_the_toolless_fallback_setting(monkeypatch, enabled):
+    """Live answers a delegated task with tools or not at all: `_think` is
+    told so unless `voice_live_toolless_fallback_enabled` turns Option B back
+    on (default off)."""
+
+    assert type(settings).model_fields["voice_live_toolless_fallback_enabled"].default is False
+    H.fast_clocks(monkeypatch)
+    monkeypatch.setattr(settings, "voice_live_toolless_fallback_enabled", enabled)
+    seen = []
+
+    async def think(*_args, **kwargs):
+        seen.append(kwargs.get("toolless_fallback"))
+        return "An answer.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([H.config(), wait, {"type": "stop"}])
+    await H.run_relay(
+        client, H.FakeProvider(on_send=_single_turn("find me a plumber"), auto_ack=True),
+        timeout=6,
+    )
+    assert seen == [enabled]
+
+
+
+@pytest.mark.asyncio
+async def test_a_silent_tenant_fails_the_live_task_fast_typed_and_without_a_toolless_answer(
+    monkeypatch,
+):
+    """Job 2 of the 2026-10-02 call, end to end through the REAL `_think` and
+    `_vps_api_stream`: the tenant never sends a byte (httpx ReadTimeout, empty
+    str()). Live no longer posts the task to a tool-less model (which 400'd on
+    `max_tokens` anyway): the card says `delegation_unreachable`, the caller
+    hears the retry offer, and nothing re-issues the turn."""
+    from types import SimpleNamespace
+
+    import httpx
+
+    from app.api import ws_realtime as rt
+    from app.services import agent_http, model_router
+
+    real_think = rt._think
+    H.fast_clocks(monkeypatch)
+    posts, paths = [], []
+
+    class SilentTenant:
+        def build_request(self, *_args, **_kwargs):
+            return object()
+
+        async def send(self, _request, *, stream):
+            raise httpx.ReadTimeout("")
+
+    class OpenAI:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, *_args, **kwargs):
+            posts.append(kwargs.get("json"))
+            raise AssertionError("a delegated Live task is never answered without tools")
+
+    async def vps(_user_id):
+        return ("https://tenant.invalid", "key")
+
+    async def vps_api(_url, _key, _method, path, **_kwargs):
+        paths.append(path)
+        return None
+
+    H.patch_relay(monkeypatch, think=real_think, vps=vps)
+    monkeypatch.setattr(rt, "_vps_api", vps_api)
+    monkeypatch.setattr(rt, "_agent_runner", None)
+    monkeypatch.setattr(rt, "_stream_ok", lambda _url: True)
+    monkeypatch.setattr(agent_http, "get_agent_http_client", lambda: SilentTenant())
+    monkeypatch.setattr(model_router, "classify_request", lambda _t: SimpleNamespace(model="gpt-6-sol"))
+    monkeypatch.setattr(httpx, "AsyncClient", OpenAI)
+    monkeypatch.setattr(settings, "voice_realtime_v2", True)
+    monkeypatch.setattr(settings, "voice_realtime_tool_events", True)
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([H.config(features=_TYPED), wait, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_single_turn("find me a plumber"), auto_ack=True)
+    await H.run_relay(client, provider, timeout=8)
+
+    frame = _terminal_frame(client)
+    assert frame.get("reason") == "delegation_unreachable", frame
+    assert _delegation_error_codes(client) == ["delegation_unreachable"]
+    assert relay_line("delegation_unreachable", "en") in _spoken_text(provider)
+    assert posts == []
+    assert not any(p.startswith("/api/v1/internal/agent-turn") for p in paths), paths

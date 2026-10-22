@@ -338,3 +338,15 @@ def test_a_namespace_is_still_never_emptied():
     kept, dropped = _cap_tools(tools, protected=set(), floor=frozenset())
     assert "solo__only" in {t["name"] for t in kept}
     assert len(kept) == LIMIT
+
+
+def test_the_floor_holds_media_control_and_delegate():
+    """Voice round 2026-10-06 (D-T1/D-T2): the two tools the 2026-10-06 call
+    needed and could not reach on a `full` turn sit past the protected head of
+    the 179-name array — `media_control` (a delegated "stop it") and `delegate`
+    (the supervisor). Both are floor names now, unless the env overrides."""
+    from app.api import llm_proxy as lp
+
+    assert {"media_control", "delegate"} <= set(lp._PROTECTED_CORE_DEFAULT)
+    assert {"play_media", "web_search", "web_fetch", "recall_day",
+            "memory_search"} <= set(lp._PROTECTED_CORE_DEFAULT)

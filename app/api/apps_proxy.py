@@ -29,6 +29,11 @@ from app.api.tenant_proxy import (
     agent_key_stale_json_response as _agent_key_stale,
 )
 
+# PR-15: load shedding for a stalled tenant. The job board polls these reads
+# every 5 s; right after a forward to the tenant timed out they answer 503
+# `agent_unreachable` + Retry-After at once instead of re-dialling it.
+from app.services import tenant_proxy_guard as _guard
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/apps", tags=["Apps Proxy"])
 
@@ -590,12 +595,32 @@ async def _get_agent(user_id: str, db: AsyncSession) -> Optional[Tuple[str, str,
     return None
 
 
+async def _guarded_read(user_id: str, read):
+    """Run one proxied READ under the tenant load guard (PR-15).
+
+    Refused before any dial — the tenant timed out moments ago, or too many
+    reads to it are already in flight from this process — the client gets 503
+    `agent_unreachable` with a Retry-After instead of one more queued request
+    against a stalled loop. Writes never come through here.
+    """
+    try:
+        async with _guard.guarded_read(user_id):
+            return await read()
+    except _guard.TenantProxyShed as shed:
+        return shed.json_response()
+
+
 async def _proxy(
     agent_url: str, agent_api_key: str, path: str,
     method: str = "GET", body: Optional[dict] = None,
     timeout: float = 10.0,
+    user_id: Optional[str] = None,
 ):
-    """TKT-LAT-007 (wave 3): shared agent_http client; per-call timeout."""
+    """TKT-LAT-007 (wave 3): shared agent_http client; per-call timeout.
+
+    `user_id` (guarded reads only) feeds the PR-15 timeout memo: a read that
+    times out marks the tenant, one it answers clears the mark.
+    """
     from app.services.agent_http import get_agent_http_client
 
     url = f"{agent_url}/api/apps/{path}"
@@ -612,11 +637,15 @@ async def _proxy(
             resp = await client.delete(url, headers=headers, timeout=timeout)
         else:
             return None
+        if user_id and resp.status_code < 500:
+            _guard.note_answered(user_id)
         if _is_agent_auth_failure(resp.status_code):
             return _agent_key_stale()
         return JSONResponse(content=resp.json(), status_code=resp.status_code)
     except Exception as e:
-        logger.warning("Apps proxy %s %s failed: %s", method, url, e)
+        if user_id and _guard.is_timeout_error(e):
+            _guard.note_timeout(user_id)
+        logger.warning("Apps proxy %s %s failed: %r", method, url, e)
         raise HTTPException(502, "Agent unreachable")
 
 
@@ -714,6 +743,12 @@ async def get_capabilities(current_user=Depends(get_current_user), db: AsyncSess
 
 @router.get("/")
 async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    return await _guarded_read(
+        current_user.id, lambda: _list_apps(current_user, db),
+    )
+
+
+async def _list_apps(current_user, db: AsyncSession):
     from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
 
     # Try tunnel first (works for NAT'd / self-hosted agents)
@@ -721,10 +756,14 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
         try:
             result = await send_http_forward(current_user.id, "GET", "/api/apps/")
             if result is not None:
+                _guard.note_answered(current_user.id)
                 data = _rewrite_app_urls(result)
                 return JSONResponse(content=data)
         except Exception as e:
             logger.debug("Tunnel forward failed, falling back to HTTP: %s", e)
+        # PR-15: a tunnel forward that just timed out marked the tenant —
+        # do not stack a second request on it over HTTPS.
+        _guard.check_recent_timeout(current_user.id)
 
     # Fall back to direct HTTP (VPS-deployed agents with public IPs)
     agent_info = await _get_agent(current_user.id, db)
@@ -737,11 +776,15 @@ async def list_apps(current_user=Depends(get_current_user), db: AsyncSession = D
     try:
         client = get_agent_http_client()
         resp = await client.get(url, headers={"X-Agent-Key": key}, timeout=10.0)
+        if resp.status_code < 500:
+            _guard.note_answered(current_user.id)
         if _is_agent_auth_failure(resp.status_code):
             return _agent_key_stale()
         data = _rewrite_app_urls(resp.json())
         return JSONResponse(content=data, status_code=resp.status_code)
     except Exception as e:
+        if _guard.is_timeout_error(e):
+            _guard.note_timeout(current_user.id)
         # NOT []. An unreachable agent is not an empty workspace — the same
         # degrade on `GET /jobs/` below showed the founder an empty board
         # during live ticks (2026-07-16), and on 2026-09-15 `GET /api/routines`
@@ -760,6 +803,12 @@ async def list_jobs(
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    return await _guarded_read(
+        current_user.id, lambda: _list_jobs(request, current_user, db),
+    )
+
+
+async def _list_jobs(request: Request, current_user, db: AsyncSession):
     from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
 
     # Forward the query string verbatim so ?include_ticks=true (debug
@@ -772,9 +821,12 @@ async def list_jobs(
                 current_user.id, "GET", f"/api/apps/jobs/{qs}",
             )
             if result is not None:
+                _guard.note_answered(current_user.id)
                 return JSONResponse(content=result)
         except Exception:
             pass
+        # PR-15: skip the HTTPS re-dial right after a tunnel timeout.
+        _guard.check_recent_timeout(current_user.id)
 
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
@@ -782,7 +834,7 @@ async def list_jobs(
         # truthful render for a user who has no agent yet.
         return JSONResponse(content=[])
     agent_url, key, _ = agent_info
-    resp = await _proxy(agent_url, key, f"jobs/{qs}")
+    resp = await _proxy(agent_url, key, f"jobs/{qs}", user_id=current_user.id)
     # Degrading a FAILED fetch to [] made clients render "no tasks"
     # while the agent was merely unreachable (founder saw an empty
     # board during live ticks, 2026-07-16). Surface the failure so
@@ -810,6 +862,12 @@ async def jobs_events_proxy(
     (``limit``/``before``) lives in query params, which ``_proxy``
     call sites don't otherwise carry.
     """
+    return await _guarded_read(
+        current_user.id, lambda: _jobs_events(request, current_user, db),
+    )
+
+
+async def _jobs_events(request: Request, current_user, db: AsyncSession):
     from app.api.ws_agent_tunnel import send_http_forward, is_agent_connected
 
     qs = f"?{request.url.query}" if request.url.query else ""
@@ -819,9 +877,12 @@ async def jobs_events_proxy(
                 current_user.id, "GET", f"/api/apps/jobs/events{qs}",
             )
             if result is not None:
+                _guard.note_answered(current_user.id)
                 return JSONResponse(content=result)
         except Exception:
             pass
+        # PR-15: skip the HTTPS re-dial right after a tunnel timeout.
+        _guard.check_recent_timeout(current_user.id)
 
     agent_info = await _get_agent(current_user.id, db)
     if not agent_info:
@@ -829,13 +890,16 @@ async def jobs_events_proxy(
         # (mirrors list_jobs' graceful empty-list behavior).
         return JSONResponse(content={"events": [], "next_before": None})
     agent_url, key, _ = agent_info
-    return await _proxy(agent_url, key, f"jobs/events{qs}")
+    return await _proxy(agent_url, key, f"jobs/events{qs}", user_id=current_user.id)
 
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, current_user=Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     agent_url, key, _ = _require(await _get_agent(current_user.id, db))
-    return await _proxy(agent_url, key, f"jobs/{job_id}")
+    return await _guarded_read(
+        current_user.id,
+        lambda: _proxy(agent_url, key, f"jobs/{job_id}", user_id=current_user.id),
+    )
 
 
 # ── Job write-side ───────────────────────────────────────────────────

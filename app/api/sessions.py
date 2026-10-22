@@ -97,12 +97,22 @@ class SessionsAgentUnreachable(Exception):
     merely slow. See `day_chats.AgentUnreachable` for the full account.
     """
 
-    def __init__(self, detail: str, reason: str = "agent_unreachable"):
+    def __init__(
+        self,
+        detail: str,
+        reason: str = "agent_unreachable",
+        *,
+        retry_after: Optional[int] = None,
+        shed: Optional[str] = None,
+    ):
         super().__init__(detail)
         self.detail = detail
         # See `day_chats.AgentUnreachable.reason` — `agent_error` means the
         # tenant answered 500, which is an answer and is not retried.
         self.reason = reason
+        # PR-15: see `day_chats.AgentUnreachable.retry_after`.
+        self.retry_after = retry_after
+        self.shed = shed
 
 
 class SessionsAgentSaidNo(Exception):
@@ -127,10 +137,17 @@ def _sessions_unreachable(exc: Exception) -> HTTPException:
     reason = getattr(exc, "reason", "agent_unreachable")
     logger.warning("[sessions] answering 503 %s: %s",
                    reason, getattr(exc, "detail", exc))
+    headers = {
+        "Retry-After": str(getattr(exc, "retry_after", None) or 2),
+        "X-Toup-Reason": reason,
+    }
+    shed = getattr(exc, "shed", None)
+    if shed:
+        headers["X-Toup-Shed"] = shed
     return HTTPException(
         status_code=503,
         detail="Your agent did not answer in time. Your history is safe — try again.",
-        headers={"Retry-After": "2", "X-Toup-Reason": reason},
+        headers=headers,
     )
 
 
@@ -161,7 +178,42 @@ def _sessions_4xx(e: "SessionsAgentSaidNo") -> HTTPException:
 
 
 async def _proxy_sessions(
-    agent_url: str, agent_api_key: str, path: str, params: Optional[dict] = None
+    agent_url: str,
+    agent_api_key: str,
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    user_id: Optional[str] = None,
+):
+    """Proxy a sessions request to the VPS agent, under the tenant load guard.
+
+    PR-15: see `day_chats._proxy_day_chats` — with `user_id` the read can be
+    refused before any dial (raising `SessionsAgentUnreachable` with the
+    guard's Retry-After); without it, it dials exactly as before.
+    """
+    if not user_id:
+        return await _dial_sessions(agent_url, agent_api_key, path, params)
+    from app.services import tenant_proxy_guard as guard
+
+    try:
+        async with guard.guarded_read(user_id):
+            return await _dial_sessions(
+                agent_url, agent_api_key, path, params, user_id=user_id,
+            )
+    except guard.TenantProxyShed as shed:
+        raise SessionsAgentUnreachable(
+            str(shed), reason=shed.reason,
+            retry_after=shed.retry_after, shed=shed.why,
+        )
+
+
+async def _dial_sessions(
+    agent_url: str,
+    agent_api_key: str,
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    user_id: Optional[str] = None,
 ):
     """Proxy a sessions request to the VPS agent.
 
@@ -176,9 +228,13 @@ async def _proxy_sessions(
 
     from app.services.agent_http import get_agent_http_client
 
+    from app.services import tenant_proxy_guard as guard
+
     url = f"{agent_url}/api/sessions/{path}" if path else f"{agent_url}/api/sessions"
     last = "unknown"
+    last_timed_out = False
     for attempt in range(1, _SESSIONS_PROXY_ATTEMPTS + 1):
+        last_timed_out = False
         try:
             client = get_agent_http_client()
             resp = await client.get(
@@ -187,6 +243,8 @@ async def _proxy_sessions(
                 params=params or {},
                 timeout=_SESSIONS_PROXY_TIMEOUT_S,
             )
+            if user_id and resp.status_code < 500:
+                guard.note_answered(user_id)
             if resp.status_code == 200:
                 return resp.json()
             if 400 <= resp.status_code < 500:
@@ -209,12 +267,15 @@ async def _proxy_sessions(
         except Exception as e:
             # `repr`, not `str`: httpx timeout exceptions stringify to "".
             last = repr(e)
+            last_timed_out = guard.is_timeout_error(e)
         if attempt < _SESSIONS_PROXY_ATTEMPTS:
             logger.info("Agent sessions proxy %s attempt %d/%d failed (%s) — retrying",
                         url, attempt, _SESSIONS_PROXY_ATTEMPTS, last)
             await asyncio.sleep(_SESSIONS_PROXY_BACKOFF_S)
     logger.warning("Agent sessions proxy %s failed after %d attempts: %s",
                    url, _SESSIONS_PROXY_ATTEMPTS, last)
+    if user_id and last_timed_out:
+        guard.note_timeout(user_id)
     raise SessionsAgentUnreachable(last)
 
 
@@ -316,7 +377,9 @@ async def list_sessions(
         # merged below — so an unreachable tenant answered 200 with a partial
         # list that read as the whole account. 503 instead.
         try:
-            data = await _proxy_sessions(proxy[0], proxy[1], "", params)
+            data = await _proxy_sessions(
+                proxy[0], proxy[1], "", params, user_id=current_user.id,
+            )
         except SessionsAgentSaidNo as e:
             raise _sessions_4xx(e)
         except SessionsAgentUnreachable as e:
@@ -429,7 +492,10 @@ async def get_session(
             # DB, so falling through on a failed hop reaches a query that can
             # only 404 — "session not found" for a session that exists.
             try:
-                data = await _proxy_sessions(proxy[0], proxy[1], session_id, params)
+                data = await _proxy_sessions(
+                    proxy[0], proxy[1], session_id, params,
+                    user_id=current_user.id,
+                )
             except SessionsAgentSaidNo as e:
                 raise _sessions_4xx(e)
             except SessionsAgentUnreachable as e:
@@ -611,7 +677,10 @@ async def get_session_messages(
             params = {"limit": limit, "offset": offset}
             # Same as above: not local, so the fall-through can only 404.
             try:
-                data = await _proxy_sessions(proxy[0], proxy[1], f"{session_id}/messages", params)
+                data = await _proxy_sessions(
+                    proxy[0], proxy[1], f"{session_id}/messages", params,
+                    user_id=current_user.id,
+                )
             except SessionsAgentSaidNo as e:
                 raise _sessions_4xx(e)
             except SessionsAgentUnreachable as e:
@@ -694,6 +763,11 @@ _TOOL_EVENT_KEYS = {
     # reopened thread is drawn from this id, and dropping it here would make an
     # ingested record render as the generic "N actions" rail.
     "label", "app_slug", "job_id",
+    # D-P6 (F4): which supervised WORKER ran this tool. The relay forwards
+    # them on every live tool row (`ws_realtime._WORKER_ATTR_KEYS`); dropping
+    # them here made a reloaded voice row lose its worker attribution, so the
+    # card folded every action under the supervisor instead of its helper.
+    "worker_job_id", "parent_job_id", "worker_index", "model",
 }
 _TOOL_EVENTS_MAX = 40
 
@@ -769,6 +843,17 @@ _VOICE_KEYS = {
     # flag, and they are the caller's own request as already shown on the
     # card: see `_VOICE_TEXT_KEYS` for how it is sanitized and bounded.
     "task_title",
+    # PR-14 (2026-10-02 call, D2): the task's SHORT title — at most six words
+    # in the caller's language, written by the relay's summarizer and worn by
+    # the call's card instead of the caller's raw words. Words too, so it is
+    # a `_VOICE_TEXT_KEYS` member under the same rules. `task_title` above
+    # keeps the caller's own request, which every older reader still uses; an
+    # image without this key drops it and logs the drop, which is safe.
+    "task_summary",
+    # R8 (voice round 2026-10-06, D-R8 (a)): the spoken paraphrase now folds
+    # onto the task row always, so the row says whether the CALLER cut it off
+    # (never a hangup, a playback failure or teardown). A flag.
+    "spoken_interrupted",
 }
 #: A provenance value is an id, a count or a flag — never prose. Anything
 #: longer is not provenance and is dropped rather than truncated, so a caller
@@ -784,16 +869,18 @@ _VOICE_STR_MAX = 120
 #: an id is not the paragraph the rule above exists to stop.
 _VOICE_ID_MAX = 64
 _VOICE_BOUNDED_IDS = {"delegation_id"}
-#: …and the one key that is WORDS: `task_title` (AF6). Sanitized to one line —
+#: …and the keys that are WORDS: `task_title` (AF6) and `task_summary`
+#: (PR-14, the relay's short title of the same task). Sanitized to one line —
 #: a control character (a newline, a NUL) becomes a space and whitespace runs
 #: collapse, so a name cannot break the card it heads; a ZWNJ is not
 #: whitespace and survives — then bounded by `_VOICE_STR_MAX` with the rule
 #: above: dropped, not truncated. The relay already cuts the title at a word
-#: boundary to 80 (`live_voice_protocol.request_title`), so anything longer is
-#: not a title it wrote, and a half-cut one would be a new fragment. Empty
+#: boundary to 80 (`live_voice_protocol.request_title`) and refuses a summary
+#: past six words or 60 characters (`clean_task_summary`), so anything longer
+#: is not a name it wrote, and a half-cut one would be a new fragment. Empty
 #: after cleaning is dropped too: an empty name still reads as a name, and
 #: without one the app keeps its own ask-derived title.
-_VOICE_TEXT_KEYS = {"task_title"}
+_VOICE_TEXT_KEYS = {"task_title", "task_summary"}
 _VOICE_REQUEST_TURN_IDS_MAX = 16  # live_voice_protocol.REQUEST_TURN_IDS_MAX
 
 
@@ -928,12 +1015,47 @@ def _clean_attachments(atts, *, user_id: str, trusted: bool) -> Optional[list]:
     return out or None
 
 
-def _build_metadata(media, tool_events, app_artifact=None, voice=None) -> Optional[str]:
+# The highest `revision` of a keyed row this route has APPLIED (P3 tenant,
+# PR-11). Bookkeeping, not content: every reader of `metadata_json` picks named
+# keys out of it (`media`, `voice`, `tool_events`, ...), so none returns this
+# one, and the wire `revision` stays what `SessionMessageCreate.revision`
+# documents: a property of one write, absent on a history refetch. It lives in
+# metadata_json rather than a column because agent DBs self-heal their schema
+# instead of migrating, and a column a tenant has not grown yet would cost the
+# write itself.
+_PERSIST_REVISION_KEY = "persist_revision"
+
+
+def _stored_revision(metadata_json) -> Optional[int]:
+    """The revision the row was last written at, or None when it has none (a
+    row from before this guard, or one only ever written without a revision).
+    Unreadable metadata is "unknown", never "newer": it must not block a
+    write."""
+    if not metadata_json:
+        return None
+    try:
+        meta = json.loads(metadata_json) if isinstance(metadata_json, str) else metadata_json
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    value = meta.get(_PERSIST_REVISION_KEY)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _build_metadata(
+    media, tool_events, app_artifact=None, voice=None, revision=None,
+) -> Optional[str]:
     """The message's metadata_json, in AgentRunner._save_messages' shape.
 
     One writer for every key: they used to be mutually exclusive here (media
     replaced the whole blob), so a voice turn that played a song AND used a
     tool could only ever persist one of them.
+
+    `revision` is recorded under `_PERSIST_REVISION_KEY` only when the caller
+    sent one, so a write without it stores exactly what it stored before.
     """
     meta = {}
     if media:
@@ -945,6 +1067,8 @@ def _build_metadata(media, tool_events, app_artifact=None, voice=None) -> Option
         meta["app_artifact"] = app_artifact
     if voice:
         meta["voice"] = voice
+    if revision is not None:
+        meta[_PERSIST_REVISION_KEY] = int(revision)
     return json.dumps(meta) if meta else None
 
 
@@ -1136,9 +1260,10 @@ async def create_session_message(
             detail="Content is required"
         )
 
-    # Resolve day_chat_id from the CURRENT TIME first (mirrors
-    # AgentRunner._save_messages): session.day_chat_id points at the day
-    # the session was CREATED, so preferring it filed post-local-midnight
+    # Resolve day_chat_id from the row's OWN time first: `occurred_at` when
+    # the caller stamped one (PR-11, see below), else the current time
+    # (mirrors AgentRunner._save_messages). session.day_chat_id points at the
+    # day the session was CREATED, so preferring it filed post-local-midnight
     # voice messages into yesterday's day chat until UTC midnight. An
     # explicit day_chat_id param still wins (caller intent); the session's
     # stamp is only the degraded-path fallback.
@@ -1159,12 +1284,34 @@ async def create_session_message(
     _owner_id = current_user.id
     _owner_tz = getattr(current_user, 'timezone', None)
 
+    _occurred = occurred_at
+    if _occurred is not None and _occurred.tzinfo is not None:
+        # Message.created_at/occurred_at are naive UTC everywhere else.
+        _occurred = _occurred.astimezone(timezone.utc).replace(tzinfo=None)
+    if _occurred is not None:
+        # Unvalidated client input that drives the thread's sort key
+        # (COALESCE(occurred_at, created_at)). A far-future stamp pins a row to
+        # the bottom of the day forever. Out of a day's reach in either
+        # direction it is not a stamp, it is noise — and C1 already defines
+        # null as "unknown", which sorts on created_at.
+        _skew = abs((datetime.utcnow() - _occurred).total_seconds())
+        if _skew > 86400:
+            _occurred = None
+    # The day is the day the row HAPPENED, not the day the request arrived
+    # (P3 tenant, PR-11). The relay stamps `occurred_at` when the caller spoke;
+    # a write that reaches a stalled tenant after the caller's local midnight
+    # (a retry, a late commit, a replay) was filed under the NEXT day by the
+    # day-chat index while the thread around it stayed in the old one. With
+    # no stamp, the arrival time decides, exactly as before. `_occurred` is a
+    # plain naive-UTC datetime, so the closure below stays re-runnable after
+    # a rollback.
+
     async def _resolve_day():
         _d = day_chat_id
         if not _d:
             from app.db.message_helpers import resolve_day_chat_id_for_now
             _d = await resolve_day_chat_id_for_now(
-                db, _owner_id, tz_override=_owner_tz,
+                db, _owner_id, tz_override=_owner_tz, utc_now=_occurred,
             )
         if not _d and session is not None:
             _d = session.day_chat_id
@@ -1224,19 +1371,47 @@ async def create_session_message(
             if _day_chat_id and not session.day_chat_id:
                 session.day_chat_id = _day_chat_id
 
-    _occurred = occurred_at
-    if _occurred is not None and _occurred.tzinfo is not None:
-        # Message.created_at/occurred_at are naive UTC everywhere else.
-        _occurred = _occurred.astimezone(timezone.utc).replace(tzinfo=None)
-    if _occurred is not None:
-        # Unvalidated client input that drives the thread's sort key
-        # (COALESCE(occurred_at, created_at)). A far-future stamp pins a row to
-        # the bottom of the day forever. Out of a day's reach in either
-        # direction it is not a stamp, it is noise — and C1 already defines
-        # null as "unknown", which sorts on created_at.
-        _skew = abs((datetime.utcnow() - _occurred).total_seconds())
-        if _skew > 86400:
-            _occurred = None
+    if existing is not None and revision is not None:
+        # A revision never rewinds its row (P3 tenant, PR-11). The relay
+        # abandons a POST after a ReadTimeout, but a stalled tenant still
+        # commits it, sometimes a minute later (the 2026-10-02 call's 77-char
+        # row). Without this, an abandoned revision N committing after N+1
+        # put the older sentence and metadata back. Greater-or-EQUAL applies:
+        # a retry of the same revision is the idempotent upsert it always
+        # was. A write with no revision, or a row that never stored one, is
+        # "unknown" rather than "older" and keeps today's overwrite. Atomic
+        # per session on Postgres: the conversation row is locked FOR UPDATE
+        # above for every keyed write.
+        _stored = _stored_revision(getattr(existing, "metadata_json", None))
+        if _stored is not None and revision < _stored:
+            logger.info(
+                "[sessions] stale revision ignored session=%s role=%s "
+                "revision=%d stored=%d key_tail=%s",
+                str(session_id)[:8], role, revision, _stored,
+                str(client_msg_id)[-8:],
+            )
+            # Answered as a success with the row that EXISTS: the write is
+            # superseded, not failed, and a retry could only be stale again.
+            # No broadcast: an open thread must not be handed the older text.
+            _resp = _message_to_response(
+                existing, None, None, {session.id: session.channel},
+            )
+            # Nothing to keep: release the conversation lock and drop the
+            # DayChat the resolver may have flushed for this write.
+            await db.rollback()
+            return _resp
+
+    if (
+        existing is not None
+        and not day_chat_id
+        and _occurred is None
+        and getattr(existing, "day_chat_id", None)
+    ):
+        # A rewrite with no stamp of its own (a flag-only revision, which
+        # omits `occurred_at` so as not to move the row) keeps the row in the
+        # day it was filed under. Re-resolving from the arrival time MOVED a
+        # row into "today" when its revision landed after local midnight.
+        _day_chat_id = existing.day_chat_id
 
     _msg_kwargs = dict(
         id=str(_uuid.uuid4()),
@@ -1253,7 +1428,10 @@ async def create_session_message(
         # chat-started one does, and a voice RUN gets the same steps, actions
         # and sources a typed run does (`day_chats._serialize_tool_events`
         # reads both through one function).
-        metadata_json=_build_metadata(media, tool_events, app_artifact, voice),
+        # `revision` records the high-water mark the stale-revision guard
+        # above compares against (PR-11).
+        metadata_json=_build_metadata(media, tool_events, app_artifact, voice,
+                                      revision=revision),
     )
     if attachments:
         # The COLUMN, not metadata_json — GET /api/files/{message_id}/{aid}
@@ -1669,6 +1847,7 @@ async def get_messages_by_date(
             data = await _proxy_sessions(
                 proxy[0], proxy[1], f"by-date/{date_str}/messages",
                 {"limit": limit, "tz_offset": tz_offset},
+                user_id=current_user.id,
             )
         except SessionsAgentSaidNo as e:
             raise _sessions_4xx(e)

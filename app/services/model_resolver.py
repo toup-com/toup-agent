@@ -231,6 +231,98 @@ def app_builder_builder_model(agent_config: object | None = None) -> str:
     )
 
 
+#: Prefixes the LLM proxy routes to OpenAI (`api/llm_proxy._route_chat`).
+_OPENAI_ROUTED_PREFIXES = ("gpt", "o1", "o3", "o4")
+
+
+def known_chat_models() -> frozenset:
+    """The chat models THIS deployment knows: the ones it bills
+    (`settings.pricing_per_1k`, `token_tracker.MODEL_PRICING`) and budgets
+    (`context_manager.MODEL_CONTEXT_WINDOWS`). Image, transcription, realtime
+    and embedding models live in tables of their own and are never here."""
+    keys: set = set((getattr(settings, "pricing_per_1k", None) or {}).keys())
+    try:
+        from app.agent.token_tracker import MODEL_PRICING
+        keys |= set(MODEL_PRICING)
+    except Exception:  # noqa: BLE001 — a partial set only narrows
+        pass
+    try:
+        from app.agent.context_manager import MODEL_CONTEXT_WINDOWS
+        keys |= set(MODEL_CONTEXT_WINDOWS)
+    except Exception:  # noqa: BLE001
+        pass
+    return frozenset(str(k).strip().lower() for k in keys if k)
+
+
+def _routable_role_model(candidate: object) -> bool:
+    """True when the proxy can serve ``candidate`` on THIS deployment.
+
+    A role model is an operator/admin-typed string, and every executor of a
+    plan inherits it — so a typo must fall back to the default instead of
+    400-ing each worker. A routable PREFIX is not enough: `gpt-5.5-mni`,
+    `gpt-image-1`, `gpt-4o-transcribe` and `gpt-realtime` all carry one, and
+    each would fail every worker's first attempt at the proxy (TW-6). So the
+    id must be a chat model this deployment knows (`known_chat_models`).
+    Claude only routes while `anthropic_enabled`; the G1 no-cache tier is
+    barred like the chat model."""
+    if not isinstance(candidate, str) or not candidate.strip():
+        return False
+    m = candidate.strip().lower()
+    if m not in known_chat_models():
+        return False
+    if m.startswith("claude"):
+        return bool(getattr(settings, "anthropic_enabled", False))
+    if not m.startswith(_OPENAI_ROUTED_PREFIXES):
+        return False
+    return has_cached_input_rate(m)
+
+
+def _role_model(
+    role: str, override_key: str, settings_key: str,
+    overrides: dict | None, agent_config: object | None,
+    fallback_default: bool = True,
+) -> str | None:
+    for source, candidate in (
+        (f"overrides.{override_key}", (overrides or {}).get(override_key)),
+        (f"settings.{settings_key}", _settings_attr(settings_key)),
+    ):
+        if candidate is None or candidate == "":
+            continue
+        if _routable_role_model(candidate):
+            return str(candidate).strip()
+        logger.warning(
+            "%s: %r (from %s) is not routable here — using the default model",
+            role, candidate, source,
+        )
+    return default_model(agent_config) if fallback_default else None
+
+
+def subagent_model(
+    overrides: dict | None = None, agent_config: object | None = None,
+) -> str:
+    """Executor sub-agent model for a `delegate` plan.
+
+    Per-tenant override (`platform_settings` `subagent.settings.<user_id>`
+    → `executor_model`) → `settings.subagent_model` → `default_model`.
+    Fails CLOSED to the default for anything the proxy cannot route."""
+    return _role_model("subagent_model", "executor_model", "subagent_model",
+                       overrides, agent_config)
+
+
+def supervisor_model(
+    overrides: dict | None = None, agent_config: object | None = None,
+    *, fallback_default: bool = True,
+) -> str | None:
+    """Supervisor model — applied to VOICE delegations only (the relay sets
+    the delegated agent-turn body's `model`); chat keeps the user's model.
+    Same resolution and the same fail-closed rule as `subagent_model`.
+    ``fallback_default=False`` answers None instead of the default model when
+    no role model is configured or routable — the relay then keeps its own
+    choice rather than overwriting it with the default."""
+    return _role_model("supervisor_model", "supervisor_model", "supervisor_model",
+                       overrides, agent_config, fallback_default)
+
+
 def default_anthropic_model(agent_config: object | None = None) -> str:
     """The Anthropic-specific default.
 

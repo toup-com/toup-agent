@@ -49,11 +49,12 @@ must NOT block the DB write or the WS broadcast.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.agent.subagent_dispatcher import (
     REJECTION_CODES,
@@ -91,10 +92,20 @@ async def spawn_subagent(
     agent_runner: Any,
     session_maker: Any = None,
     credit_budget: Optional[float] = None,
+    supervised: bool = False,
+    worker_meta: Optional[dict] = None,
+    caps: Optional[dict] = None,
 ) -> dict[str, Any]:
     """Pre-spawn gate + create job + fire child task. Returns the
     tool-result dict the LLM sees (job_id on success,
     {error, message} on rejection).
+
+    ``supervised=True`` is a ``delegate`` worker (see
+    :func:`run_supervised_plan`): ``worker_meta`` carries its card identity
+    (``worker_index, plan_step_index, role, attempt, label, model``; keys
+    starting with ``_`` are in-memory only), the row is keyed by
+    ``attempt``/``_nonce`` so a retry is a NEW row, and a future the
+    supervisor joins on is registered BEFORE the child is fired.
 
     Returns immediately. The child runs in the spawned asyncio.Task
     and announces back via Day-as-Chat when done. The parent's tool
@@ -141,6 +152,7 @@ async def spawn_subagent(
             user_id=user_id,
             parent_job_id=parent_job_id,
             task=task,
+            caps=caps,
         )
     if rejection is not None:
         subagent_metrics.record_spawn_rejected(reason=rejection.error_code)
@@ -156,7 +168,14 @@ async def spawn_subagent(
     # 2. Create the BuildJob row via JobRunner. Idempotency: the
     # composite (source_id=parent_job_id, idempotency_key=hash)
     # UNIQUE catches a retried tool call automatically.
-    idempotency_key = derive_idempotency_key(parent_job_id, task)
+    if supervised:
+        idempotency_key = derive_idempotency_key(
+            parent_job_id, task,
+            attempt=int((worker_meta or {}).get("attempt") or 1),
+            nonce=(worker_meta or {}).get("_nonce"),
+        )
+    else:
+        idempotency_key = derive_idempotency_key(parent_job_id, task)
 
     # Depth at create time so it lands on the row for telemetry.
     async with session_maker() as db:
@@ -177,6 +196,8 @@ async def spawn_subagent(
         "parent_channel": channel,
         "credit_budget": credit_budget,
     }
+    if supervised:
+        config.update(_worker_public_meta(worker_meta, model))
 
     from app.agent.job_runner import JobRunner, TaskSpec
 
@@ -234,8 +255,10 @@ async def spawn_subagent(
             )
 
     if was_fresh:
+        if supervised:
+            _WORKER_FUTURES[job.id] = asyncio.get_running_loop().create_future()
         # 3. Fire the child. The task owns its own session lifecycle.
-        _spawn_bg(_run_child(
+        _child_task = _spawn_bg(_run_child(
             job_id=job.id,
             user_id=user_id,
             task=task,
@@ -248,7 +271,11 @@ async def spawn_subagent(
             session_maker=session_maker,
             credit_budget=credit_budget,
             parent_channel=channel,
+            supervised=supervised,
+            worker_meta=worker_meta,
         ))
+        if supervised:
+            _WORKER_TASKS[job.id] = _child_task
         subagent_metrics.log_lifecycle(
             event="accepted",
             user_id=user_id,
@@ -327,9 +354,17 @@ async def _run_child(
     session_maker: Any,
     credit_budget: Optional[float] = None,
     parent_channel: Optional[str] = None,
+    supervised: bool = False,
+    worker_meta: Optional[dict] = None,
 ) -> None:
     """Background task: flip status to running, run the child agent
     under a SUBAGENT lane slot, announce-back the result.
+
+    A SUPERVISED child (a ``delegate`` worker) announces nothing of its own:
+    no Live Activity start/terminal (its progress rides the supervisor's
+    card), no day-chat message, no Telegram. Its result and sources land in
+    ``config_json``, its tool boundaries write ``job_events`` heartbeats and
+    throttled worker ``job_update`` frames, and its future is resolved last.
 
     All exceptions terminate the run — they're caught at the outer
     layer and converted to ``status='failed'`` so a buggy child
@@ -351,6 +386,11 @@ async def _run_child(
     tokens_prompt: Optional[int] = None
     tokens_completion: Optional[int] = None
     model_used: Optional[str] = None
+    observer = (
+        _WorkerObserver(job_id=job_id, user_id=user_id, meta=worker_meta or {},
+                        model=model, session_maker=session_maker)
+        if supervised else None
+    )
 
     try:
         # Flip status → running and emit a job_update so Mission
@@ -365,7 +405,11 @@ async def _run_child(
                 .execution_options(synchronize_session=False)
             )
             await db.commit()
-        await _emit_job_update(user_id, job_id, status="running", label=label)
+        await _emit_job_update(
+            user_id, job_id, status="running", label=label,
+            extra=observer.frame_fields() if observer else None,
+            sink=observer.sink if observer else None,
+        )
 
         # Acquire a SUBAGENT lane slot. The semaphore is process-wide
         # (lane_max_concurrent=5 default). If the lane is saturated
@@ -389,14 +433,18 @@ async def _run_child(
         from app.services.plain_text import humanize_label as _hl
         # R30 (D-03): plain words, no glyph — this title is an OS banner and
         # a lock-screen card, and emoji there is the machinery's dialect.
-        await _notify_job_event(
-            job_id=job_id, label=label, kind="mission_started",
-            title=f"Working on: {_hl(label)[:150]}",
-            body=(task or "")[:200],
-            timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
-            dedup_suffix="started",
-            urgent=(parent_channel != "autopilot"),
-        )
+        # A supervised worker starts NO card: every Live Activity start
+        # pre-empts the cards already on the device, and its progress belongs
+        # on the supervisor's card (the emitter below targets that mission).
+        if not supervised:
+            await _notify_job_event(
+                job_id=job_id, label=label, kind="mission_started",
+                title=f"Working on: {_hl(label)[:150]}",
+                body=(task or "")[:200],
+                timer_end_ms=int((time.time() + min(timeout_seconds, 1800)) * 1000),
+                dedup_suffix="started",
+                urgent=(parent_channel != "autopilot"),
+            )
 
         # Live status on the card while the child works (Claude
         # parity): tool-boundary subtitles + interpolated progress ride
@@ -405,12 +453,21 @@ async def _run_child(
         # real status line ("Searching the web…").
         from app.agent.turn_progress import TurnProgressEmitter
 
+        _wm = worker_meta or {}
         _job_emitter = TurnProgressEmitter(
-            mission_id=job_id,
-            mission_title=(label or task or "Background task")[:60],
+            mission_id=(_wm.get("_mission_id") if supervised else None) or job_id,
+            mission_title=(
+                (_wm.get("_mission_title") if supervised else None)
+                or label or task or "Background task"
+            )[:60],
             base_progress=5,
             ceiling=90,
-            route="mission-control",
+            route=("chat" if supervised and _wm.get("_chat_id") else "mission-control"),
+            chat_id=_wm.get("_chat_id") if supervised else None,
+            message_id=_wm.get("_message_id") if supervised else None,
+        )
+        _extra_run_kwargs: dict = (
+            {"on_tool_event": observer.on_tool_event} if observer else {}
         )
 
         try:
@@ -428,6 +485,7 @@ async def _run_child(
                     disable_post_processing=True,
                     model_override=model,
                     on_tool_start=_job_emitter.on_tool_start,
+                    **_extra_run_kwargs,
                 ),
                 timeout=timeout_seconds,
             )
@@ -597,6 +655,7 @@ async def _run_child(
                 parent_channel=parent_channel,
                 user_message=job_user_message,
                 error_class=job_error_class,
+                observer=observer,
             )
         except Exception as fin_err:  # pragma: no cover — defensive
             logger.exception(
@@ -605,6 +664,18 @@ async def _run_child(
                 "err=%s",
                 job_id, fin_err,
             )
+
+        # LAST: the supervisor joins on this. Resolved on every path —
+        # success, failure, timeout and cancel — or its wait would only end
+        # at its own deadline.
+        _resolve_worker(job_id, {
+            "job_id": job_id,
+            "outcome": outcome,
+            "result": (final_text or "") if outcome == "success" else "",
+            "error": error_message,
+            "sources": observer.sources if observer else [],
+            "model": model_used or model,
+        })
 
 
 #: Live Activity mission-id prefix for jobs created inside a chat turn.
@@ -843,8 +914,15 @@ async def _finalize(
     parent_channel: Optional[str] = None,
     user_message: Optional[str] = None,
     error_class: Optional[str] = None,
+    observer: Optional["_WorkerObserver"] = None,
 ) -> None:
     """Announce-back + terminal status transition.
+
+    With an ``observer`` (a supervised ``delegate`` worker) the announce
+    is replaced by the result landing in ``config_json`` — the supervisor
+    merges it into ITS answer, so a second "Sub-agent: …" message beside
+    that answer would be the same content twice — and no Live Activity
+    terminal is sent (the worker never started a card).
 
     ``user_message`` / ``error_class`` are written onto the row, ride the
     terminal ``job_update`` frame, and replace the raw ``error_message`` as
@@ -871,7 +949,11 @@ async def _finalize(
     # explicitly cancelled, no need to surface noise.
     msg_id: Optional[str] = None
     day_chat_id: Optional[str] = None
-    if outcome != "cancelled":
+    if observer is not None:
+        await observer.store_result(
+            final_text if outcome == "success" else None, outcome,
+        )
+    elif outcome != "cancelled":
         async with session_maker() as db:
             msg_id, day_chat_id = await write_subagent_message(
                 db,
@@ -1001,7 +1083,16 @@ async def _finalize(
         summary_message_id=msg_id,
         user_message=user_message,
         error_class=error_class,
+        extra=observer.frame_fields(terminal=True) if observer else None,
+        sink=observer.sink if observer else None,
     )
+    if observer is not None:
+        logger.info(
+            "[subagent_orchestrator] FINALIZED supervised job=%s outcome=%s "
+            "status=%s parent=%s", job_id, outcome, terminal_status,
+            parent_job_id,
+        )
+        return
 
     # 6. Phone surface: end the Live Activity card. Success cards
     # dismiss after 15 min (quick jobs shouldn't clutter the lock
@@ -1065,6 +1156,8 @@ async def _emit_job_update(
     summary_message_id: Optional[str] = None,
     user_message: Optional[str] = None,
     error_class: Optional[str] = None,
+    extra: Optional[dict] = None,
+    sink: Optional[Callable[[dict], Awaitable[None]]] = None,
 ) -> None:
     try:
         from app.api.ws_chat import broadcast_to_user
@@ -1084,7 +1177,11 @@ async def _emit_job_update(
             event["user_message"] = user_message
         if error_class is not None:
             event["error_class"] = error_class
+        if extra:
+            event.update(extra)
         await broadcast_to_user(user_id, event)
+        if sink is not None:
+            await sink({**event, "type": "job.update"})
     except Exception as e:
         logger.debug(
             "[subagent_orchestrator] job_update broadcast skipped: %s", e,
@@ -1279,3 +1376,580 @@ async def orphan_sweep_on_boot(session_maker: Any = None) -> int:
         )
 
     return swept
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Supervised mode — the `delegate` tool's executors (voice round 2026-10-05)
+#
+# The user's own agent is the supervisor: ONE turn plans 2–6 steps, runs
+# them on supervised children (this module), JOINS on them inside the turn
+# and writes the merged answer itself. No migration: the plan is the
+# supervisor job's `steps_json`, every worker is a `build_jobs` row with
+# `parent_job_id` and its identity/result in `config_json`, and the join is a
+# per-process future (children run in this process — `_spawn_bg`).
+# ──────────────────────────────────────────────────────────────────────
+
+#: The voice SSE route binds this for its run (``api_v1``); the supervisor and
+#: its workers emit ``supervisor.started``, ``job.update`` and worker-keyed
+#: ``tool.start``/``tool.end`` events through it. Unset (None) on chat, where
+#: the same frames ride the user's chat socket instead.
+SUPERVISOR_EVENT_SINK: "contextvars.ContextVar[Optional[Callable[[dict], Awaitable[None]]]]" = (
+    contextvars.ContextVar("supervisor_event_sink", default=None)
+)
+
+#: Worker orb colours, picked by ``worker_index``. A client that does not
+#: read ``color`` falls back to the index on its own palette.
+WORKER_COLORS = ("#6366F1", "#10B981", "#F59E0B", "#EC4899", "#0EA5E9", "#8B5CF6")
+
+#: A worker's result as stored on its row (config_json.result).
+WORKER_RESULT_MAX = 16_000
+#: Each step's result as handed back to the supervisor model.
+SUPERVISOR_RESULT_MAX = 4_000
+WORKER_SOURCES_MAX = 6
+_WORKER_FRAME_MIN_INTERVAL_S = 1.5
+_HEARTBEAT_MIN_INTERVAL_S = 10.0
+
+_WORKER_FUTURES: Dict[str, "asyncio.Future"] = {}
+_WORKER_TASKS: Dict[str, "asyncio.Task"] = {}
+
+
+def worker_color(worker_index: Optional[int]) -> str:
+    return WORKER_COLORS[int(worker_index or 0) % len(WORKER_COLORS)]
+
+
+def _display_model(model: Optional[str]) -> Optional[str]:
+    if not model:
+        return None
+    from app.config import settings
+    if getattr(settings, "security_leak_filter", False):
+        from app.services.model_alias import public_model_label
+        return public_model_label(model)
+    return str(model)[:64]
+
+
+def _worker_public_meta(meta: Optional[dict], model: Optional[str]) -> dict:
+    """The persisted half of ``worker_meta`` (config_json keys)."""
+    meta = meta or {}
+    # `role` is the card's vocabulary ('executor'); the plan's own name for
+    # the helper ("Researcher") is kept beside it, never in its place.
+    out = {"supervised": True, "role": "executor"}
+    if meta.get("role") and meta.get("role") != "executor":
+        out["worker_role"] = str(meta["role"])[:40]
+    for k in ("worker_index", "plan_step_index", "attempt"):
+        if isinstance(meta.get(k), int):
+            out[k] = meta[k]
+    if meta.get("label"):
+        out["worker_label"] = str(meta["label"])[:120]
+    if model:
+        out["worker_model"] = str(model)[:64]
+    return out
+
+
+def _resolve_worker(job_id: str, value: dict) -> None:
+    fut = _WORKER_FUTURES.pop(job_id, None)
+    _WORKER_TASKS.pop(job_id, None)
+    if fut is not None and not fut.done():
+        fut.set_result(value)
+
+
+def _sources_from_event(ev: dict) -> List[dict]:
+    """Sources from the runner's own ``domains``/``urls`` on a tool end."""
+    doms = ev.get("domains")
+    if not isinstance(doms, list):
+        return []
+    urls = ev.get("urls") if isinstance(ev.get("urls"), list) else []
+    from urllib.parse import urlparse
+    by_host: Dict[str, str] = {}
+    for u in urls:
+        try:
+            h = (urlparse(str(u)).hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            continue
+        by_host.setdefault(h[4:] if h.startswith("www.") else h, str(u))
+    return [
+        {"title": "", "url": by_host.get(str(d), "")[:500], "domain": str(d)[:120]}
+        for d in doms if isinstance(d, str) and d
+    ]
+
+
+def _merge_sources(into: List[dict], more: List[dict]) -> List[dict]:
+    seen = {s.get("domain") for s in into}
+    for s in more:
+        if s.get("domain") and s["domain"] not in seen and len(into) < WORKER_SOURCES_MAX:
+            into.append(s)
+            seen.add(s["domain"])
+    return into
+
+
+class _WorkerObserver:
+    """One supervised child's live surface: heartbeats, throttled worker
+    ``job_update`` frames, sources, and its tool events forwarded to the
+    supervisor's SSE with the worker keys."""
+
+    def __init__(self, *, job_id: str, user_id: str, meta: dict,
+                 model: Optional[str], session_maker: Any) -> None:
+        self.job_id = job_id
+        self.user_id = user_id
+        self.meta = meta
+        self.model = model
+        self.session_maker = session_maker
+        self.sink = meta.get("_sink")
+        self.sources: List[dict] = []
+        self.step: Optional[str] = None
+        self.result_preview: Optional[str] = None
+        self._last_frame = 0.0
+        self._last_beat = 0.0
+
+    def frame_fields(self, *, terminal: bool = False) -> dict:
+        m = self.meta
+        out: dict = {
+            "parent_job_id": m.get("parent_job_id"),
+            "role": "executor",
+            "worker_index": m.get("worker_index"),
+            "label": m.get("label"),
+            "color": worker_color(m.get("worker_index")),
+            "plan_step_index": m.get("plan_step_index"),
+            "attempt": m.get("attempt") or 1,
+        }
+        dm = _display_model(self.model)
+        if dm:
+            out["model"] = dm
+        if self.step:
+            out["step"] = self.step
+        if self.sources:
+            out["sources"] = list(self.sources)
+        if terminal and self.result_preview:
+            out["result_preview"] = self.result_preview
+        return {k: v for k, v in out.items() if v is not None}
+
+    async def on_tool_event(self, ev: dict) -> None:
+        try:
+            name = str(ev.get("name") or "")
+            if ev.get("phase") == "start":
+                from app.agent.tool_display import public_step_label
+                self.step = public_step_label(name)
+                await self._heartbeat(self.step)
+                now = time.monotonic()
+                if now - self._last_frame >= _WORKER_FRAME_MIN_INTERVAL_S:
+                    self._last_frame = now
+                    await _emit_job_update(
+                        self.user_id, self.job_id, status="running",
+                        label=self.meta.get("label"),
+                        extra=self.frame_fields(), sink=self.sink,
+                    )
+            else:
+                _merge_sources(self.sources, _sources_from_event(ev))
+            if self.sink is not None:
+                m = self.meta
+                fwd = {
+                    **ev,
+                    # The worker's action belongs on the SUPERVISOR's card,
+                    # under the plan step it serves.
+                    "job_id": m.get("parent_job_id"),
+                    "step_index": m.get("_step_index", m.get("plan_step_index")),
+                    "step_name": m.get("label"),
+                    "steps_total": m.get("_steps_total"),
+                    "worker_job_id": self.job_id,
+                    "parent_job_id": m.get("parent_job_id"),
+                    "worker_index": m.get("worker_index"),
+                    "label": m.get("label"),
+                    "model": _display_model(self.model),
+                }
+                await self.sink({k: v for k, v in fwd.items() if v is not None})
+        except Exception:  # noqa: BLE001 — a frame never fails a worker
+            logger.debug("[supervisor] worker event skipped", exc_info=True)
+
+    async def _heartbeat(self, label: str) -> None:
+        """`job_events` row at a tool boundary — the reaper's liveness oracle
+        (job_reaper reads max(job_events.ts)); throttled."""
+        now = time.monotonic()
+        if now - self._last_beat < _HEARTBEAT_MIN_INTERVAL_S:
+            return
+        self._last_beat = now
+        try:
+            from app.db.models import JobEvent
+            async with self.session_maker() as db:
+                db.add(JobEvent(job_id=self.job_id, user_id=self.user_id,
+                                kind="tool_call", level="info",
+                                label=(label or "Working")[:200]))
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug("[supervisor] heartbeat skipped", exc_info=True)
+
+    async def store_result(self, final_text: Optional[str], outcome: str) -> None:
+        from app.services.plain_text import plain_preview
+        text = (final_text or "")[:WORKER_RESULT_MAX]
+        if text:
+            self.result_preview = plain_preview(text, 160)
+        try:
+            from app.db.models import BuildJob
+            async with self.session_maker() as db:
+                row = await db.get(BuildJob, self.job_id)
+                if row is None:
+                    return
+                cfg = dict(row.config_json or {}) if isinstance(row.config_json, dict) else {}
+                cfg["result"] = text
+                cfg["sources"] = list(self.sources)
+                if self.result_preview:
+                    cfg["result_preview"] = self.result_preview
+                cfg["worker_outcome"] = outcome
+                row.config_json = cfg
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("[supervisor] result store failed job=%s", self.job_id,
+                           exc_info=True)
+
+
+def _generic_job_type() -> str:
+    from app.agent.job_type import JOB_TYPE_GENERIC
+    return JOB_TYPE_GENERIC
+
+
+def _rtl(text: str) -> bool:
+    return any("֐" <= ch <= "ࣿ" for ch in (text or ""))
+
+
+def supervisor_plan_steps(plan: List[dict], title: str) -> List[dict]:
+    """The supervisor job's ``steps_json``: one row per plan step, then the
+    supervisor's own two (it checks/merges and writes the answer itself)."""
+    import uuid as _uuid
+    fa = _rtl(title) or any(_rtl(p.get("label", "")) for p in plan)
+    tail = (["بررسی و ادغام نتیجه‌ها", "نوشتن پاسخ"] if fa
+            else ["Check and merge", "Write the answer"])
+    labels = [p["label"] for p in plan] + tail
+    return [
+        {"id": str(_uuid.uuid4()), "type": f"step_{i}", "label": lbl,
+         "status": "pending"}
+        for i, lbl in enumerate(labels)
+    ]
+
+
+def _worker_task_text(title: str, step: dict, plan_state: List[dict], n: int) -> str:
+    parts = [
+        f"[Step {step['i'] + 1} of {n} — {step['label']}] of the job: {title}"
+        + (f" (your role: {step['role']})" if step.get("role") not in (None, "executor") else ""),
+        "You are one helper on a bigger job. Do ONLY this step, then reply "
+        "with a concise, factual result and list the sources (URLs) you used.",
+        "",
+        step["task"],
+    ]
+    inputs = [plan_state[d] for d in step["deps"] if plan_state[d].get("result")]
+    if inputs:
+        parts += ["", "Inputs from earlier steps:"]
+        for d in inputs:
+            parts += [f"### {d['label']}", d["result"][:SUPERVISOR_RESULT_MAX]]
+    return "\n".join(parts)
+
+
+async def run_supervised_plan(
+    *,
+    user_id: str,
+    supervisor_job_id: str,
+    title: str,
+    plan: List[dict],
+    agent_runner: Any,
+    channel: Optional[str],
+    executor_model: str,
+    alternate_model: str,
+    max_workers: int,
+    deadline_s: float,
+    worker_timeout_s: int,
+    caps: Optional[dict] = None,
+    chat_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    job_type_tag: Optional[str] = None,
+    sink: Optional[Callable[[dict], Awaitable[None]]] = None,
+    session_maker: Any = None,
+) -> List[dict]:
+    """Run ``plan`` on supervised workers and JOIN. Returns one entry per plan
+    step: ``{step, label, model, outcome, result, sources}``.
+
+    * Runnable steps (every ``depends_on`` done) start up to ``max_workers``
+      at a time; a dependent step gets its upstreams' results in its task.
+    * A failed/timed-out/rejected worker is re-spawned ONCE (``attempt=2``,
+      a new row) on ``alternate_model``; a step whose upstream finally failed
+      is ``skipped``.
+    * ``deadline_s`` bounds the whole plan, retries included; workers still
+      running at the deadline are cancelled and reported ``timeout``.
+    * A cancel of the supervisor (Stop, hang-up, the tool's own timeout)
+      cancels every child task and cascade-cancels the rows, then re-raises.
+    """
+    import uuid as _uuid
+    from app.agent.subagent_dispatcher import REJECTION_CODES as _RC
+
+    if session_maker is None:
+        from app.db.database import async_session_maker as _maker
+        session_maker = _maker
+
+    loop = asyncio.get_running_loop()
+    t_end = loop.time() + max(1.0, float(deadline_s))
+    nonce = _uuid.uuid4().hex[:12]
+    n = len(plan)
+    state: List[dict] = [
+        {"i": i, "label": p["label"], "task": p["task"],
+         "role": p.get("role") or "executor",
+         "deps": [d for d in (p.get("depends_on") or []) if isinstance(d, int) and 0 <= d < i],
+         "status": "pending", "attempts": 0, "model": None, "result": "",
+         "sources": [], "outcome": None, "error": None,
+         "started_at": None, "completed_at": None}
+        for i, p in enumerate(plan)
+    ]
+    # Card row of plan step 0 (see `_update_supervisor`): the worker's own
+    # actions are filed under the card's row for its step, not the raw index.
+    from app.agent.voice_jobs import current_voice_job as _cvj
+    _tj = _cvj()
+    step_offset = _tj.plan_offset if _tj is not None and _tj.job_id == supervisor_job_id else 0
+    running: Dict[str, int] = {}          # worker job id -> plan index
+    futures: Dict["asyncio.Future", str] = {}
+    worker_seq = 0
+
+    async def _publish(final: bool = False) -> None:
+        await _update_supervisor(
+            user_id=user_id, job_id=supervisor_job_id, title=title, state=state,
+            final=final, chat_id=chat_id, message_id=message_id,
+            job_type_tag=job_type_tag, sink=sink, session_maker=session_maker,
+        )
+
+    async def _start(s: dict) -> bool:
+        nonlocal worker_seq
+        remaining = t_end - loop.time()
+        if remaining < 5:
+            return False
+        attempt = s["attempts"] + 1
+        model = executor_model if attempt == 1 else alternate_model
+        meta = {
+            "parent_job_id": supervisor_job_id, "worker_index": worker_seq,
+            "plan_step_index": s["i"], "role": s["role"], "attempt": attempt,
+            "label": s["label"], "_nonce": nonce, "_sink": sink,
+            "_step_index": step_offset + s["i"],
+            "_steps_total": step_offset + n + 2, "_mission_id": mission_id,
+            "_mission_title": title, "_chat_id": chat_id,
+            "_message_id": message_id,
+        }
+        res = await spawn_subagent(
+            user_id=user_id, task=_worker_task_text(title, s, state, n),
+            label=s["label"], model=model,
+            timeout_seconds=int(max(5, min(worker_timeout_s, remaining))),
+            parent_job_id=supervisor_job_id, channel=channel,
+            telegram_chat_id=None, agent_runner=agent_runner,
+            session_maker=session_maker, supervised=True, worker_meta=meta,
+            caps=caps,
+        )
+        if res.get("error"):
+            code = res.get("error")
+            if code in (_RC.PARENT_CAP, _RC.USER_CONCURRENT_CAP) and running:
+                return False  # a slot frees when a running worker ends
+            s["attempts"] = attempt
+            s["error"] = res.get("message") or code
+            return await _after_failure(s, "failed")
+        fut = _WORKER_FUTURES.get(res["job_id"])
+        if fut is None:  # collapsed onto an existing row: never ours to join
+            s["attempts"] = attempt
+            s["error"] = "duplicate worker"
+            return await _after_failure(s, "failed")
+        worker_seq += 1
+        s["attempts"] = attempt
+        s["model"] = model
+        s["status"] = "running"
+        s["started_at"] = s["started_at"] or datetime.utcnow()
+        running[res["job_id"]] = s["i"]
+        futures[fut] = res["job_id"]
+        return True
+
+    async def _after_failure(s: dict, outcome: str) -> bool:
+        if s["attempts"] < 2 and (t_end - loop.time()) > 15:
+            s["status"] = "pending"   # retried by the scheduler, another helper
+            return False
+        s["status"] = "failed"
+        s["outcome"] = outcome
+        s["completed_at"] = datetime.utcnow()
+        return False
+
+    async def _schedule() -> None:
+        changed = True
+        while changed:
+            changed = False
+            for s in state:
+                if s["status"] != "pending":
+                    continue
+                dep_states = [state[d]["status"] for d in s["deps"]]
+                if any(st in ("failed", "skipped") for st in dep_states):
+                    s["status"], s["outcome"] = "skipped", "skipped"
+                    s["completed_at"] = datetime.utcnow()
+                    changed = True
+                    continue
+                if any(st != "done" for st in dep_states):
+                    continue
+                if len(running) >= max(1, int(max_workers)):
+                    return
+                before = (s["status"], s["attempts"])
+                started = await _start(s)
+                # A refused or collapsed spawn consumes an attempt and may
+                # leave the step pending for its retry — go round again.
+                if started or (s["status"], s["attempts"]) != before:
+                    changed = True
+
+    try:
+        await _schedule()
+        await _publish()
+        while futures:
+            remaining = t_end - loop.time()
+            if remaining <= 0:
+                break
+            done, _ = await asyncio.wait(
+                list(futures), timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for fut in done:
+                job_id = futures.pop(fut)
+                i = running.pop(job_id, None)
+                if i is None:
+                    continue
+                s = state[i]
+                r = fut.result()
+                if r.get("outcome") == "success":
+                    s["status"], s["outcome"] = "done", "success"
+                    s["result"] = (r.get("result") or "")[:SUPERVISOR_RESULT_MAX]
+                    s["sources"] = list(r.get("sources") or [])
+                    s["completed_at"] = datetime.utcnow()
+                else:
+                    s["error"] = r.get("error")
+                    await _after_failure(s, r.get("outcome") or "failed")
+            await _schedule()
+            await _publish()
+        # Deadline: whatever is still running is stopped and reported.
+        if futures:
+            for job_id in list(futures.values()):
+                t = _WORKER_TASKS.get(job_id)
+                if t is not None and not t.done():
+                    t.cancel()
+            await asyncio.wait(list(futures), timeout=3.0)
+            for fut, job_id in list(futures.items()):
+                s = state[running.pop(job_id)]
+                s["status"], s["outcome"] = "failed", "timeout"
+                s["completed_at"] = datetime.utcnow()
+            futures.clear()
+        for s in state:
+            if s["status"] == "pending":
+                s["status"], s["outcome"] = "failed", "timeout"
+                s["completed_at"] = datetime.utcnow()
+        await _publish(final=True)
+    except asyncio.CancelledError:
+        for job_id in list(futures.values()):
+            t = _WORKER_TASKS.get(job_id)
+            if t is not None and not t.done():
+                t.cancel()
+        try:
+            from app.agent.subagent_dispatcher import cascade_cancel
+            async with session_maker() as db:
+                await cascade_cancel(db, supervisor_job_id,
+                                     reason="Supervisor stopped.")
+                await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning("[supervisor] cascade cancel failed", exc_info=True)
+        raise
+
+    return [
+        {"step": s["i"], "label": s["label"],
+         "model": _display_model(s["model"]), "outcome": s["outcome"] or "failed",
+         "result": s["result"], "sources": s["sources"],
+         **({"error": str(s["error"])[:300]} if s["outcome"] != "success" and s["error"] else {})}
+        for s in state
+    ]
+
+
+async def _update_supervisor(
+    *, user_id: str, job_id: str, title: str, state: List[dict], final: bool,
+    chat_id: Optional[str], message_id: Optional[str],
+    job_type_tag: Optional[str], sink: Any, session_maker: Any,
+) -> None:
+    """Write the plan's step statuses onto the supervisor row and announce
+    it (chat ``job_update`` + the SSE ``job.update``). The supervisor's own
+    "Check and merge" step opens once every plan step has an outcome."""
+    from app.agent.job_steps import counts, current_label, dump_steps, parse_steps
+    from app.db.models import BuildJob, JobEvent
+
+    def _iso(dt: Optional[datetime]) -> Optional[str]:
+        return dt.replace(microsecond=(dt.microsecond // 1000) * 1000).isoformat() if dt else None
+
+    status_map = {"pending": "pending", "running": "running", "done": "done",
+                  "failed": "failed", "skipped": "skipped"}
+    steps: List[dict] = []
+    try:
+        async with session_maker() as db:
+            row = await db.get(BuildJob, job_id)
+            if row is None:
+                return
+            # A TurnJob that follows this plan is the authority on its rows
+            # (its own writer may have just rewritten the column).
+            from app.agent.voice_jobs import current_voice_job
+            _tj = current_voice_job()
+            _tj = _tj if _tj is not None and _tj.job_id == job_id else None
+            steps = (_tj.followed_steps() if _tj is not None else None) or parse_steps(row.steps_json)
+            # Plan step i is card row `offset + i`: a card the turn was
+            # already drawing keeps the steps that ran before the plan
+            # (TurnJob.follow_steps), ahead of the plan's rows.
+            offset = (_tj.plan_offset if _tj is not None
+                      else max(0, len(steps) - (len(state) + 2)))
+            for s in state:
+                if offset + s["i"] >= len(steps):
+                    continue
+                st = steps[offset + s["i"]]
+                st["status"] = status_map[s["status"]]
+                if s["started_at"]:
+                    st["started_at"] = _iso(s["started_at"])
+                if s["completed_at"] and s["status"] in ("done", "failed", "skipped"):
+                    st["completed_at"] = _iso(s["completed_at"])
+                    if s["started_at"]:
+                        dur = int(max(0.0, (s["completed_at"] - s["started_at"]).total_seconds() * 1000))
+                        st["duration_ms"] = dur
+                        st["durationMs"] = dur
+            settled = all(s["status"] in ("done", "failed", "skipped") for s in state)
+            if (final or settled) and len(steps) > offset + len(state):
+                merge = steps[offset + len(state)]
+                if merge.get("status") in (None, "pending"):
+                    merge["status"] = "running"
+                    merge["started_at"] = _iso(datetime.utcnow())
+            row.steps_json = dump_steps(steps)
+            if _tj is not None:
+                _tj.follow_steps(steps)
+            if row.status not in ("running", "queued"):
+                await db.commit()
+                return
+            db.add(JobEvent(job_id=job_id, user_id=user_id, kind="info",
+                            level="info",
+                            label=(f"Helpers: {sum(1 for s in state if s['status'] in ('done','failed','skipped'))}/{len(state)}")[:200]))
+            await db.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning("[supervisor] step write failed job=%s", job_id, exc_info=True)
+        return
+    done, total = counts(steps)
+    frame = {
+        "type": "job_update",
+        "job_id": job_id,
+        "job_type": job_type_tag or _generic_job_type(),
+        "name": title,
+        "status": "running",
+        "step": current_label(steps),
+        "total_steps": total,
+        "completed_steps": done,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "steps": steps,
+        "role": "supervisor",
+        "workers_total": len(state),
+        "workers_done": sum(1 for s in state if s["status"] in ("done", "failed", "skipped")),
+    }
+    try:
+        from app.api.ws_chat import broadcast_to_user
+        await broadcast_to_user(user_id, frame)
+    except Exception:  # noqa: BLE001
+        logger.debug("[supervisor] job_update broadcast skipped", exc_info=True)
+    if sink is not None:
+        try:
+            await sink({**frame, "type": "job.update"})
+        except Exception:  # noqa: BLE001
+            logger.debug("[supervisor] job.update sink skipped", exc_info=True)

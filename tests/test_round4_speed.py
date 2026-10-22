@@ -250,6 +250,10 @@ def test_job_tool_contract_forbids_bookkeeping_only_responses():
         "a response containing only update_job is a wasted model",
     ):
         assert phrase in src, phrase
+    # D-P4: the fast path is in the tool's own text, and the plan is 2–6.
+    desc = next(t for t in td.get_extended_tools() if t["name"] == "create_job")["description"]
+    assert "answer now — no tool, no job" in desc
+    assert "declare 2-6 short steps" in desc
 
 
 def test_prompt_rules_no_longer_say_create_job_first_alone():
@@ -779,3 +783,286 @@ def test_browser_precheck_reads_the_drivers_browsers_json(monkeypatch, tmp_path)
     monkeypatch.setattr(B, "_UNAVAILABLE_REASON", None)
     assert B._installed_browser_missing() is None
     assert B.browser_unavailable_reason() is None
+
+
+# ── Voice round 2026-10-06 (D-T3): pre-tool time and the answer beat ─────
+
+def test_the_context_budget_write_is_off_the_critical_path():
+    """`gap_context_budget` — an INSERT awaited between phase 1 and the first
+    model call (66–283 ms per delegation). The numbers are taken in-line; the
+    write is spawned."""
+    assert "_spawn_bg(_write_context_budget(_cbl_kwargs)" in _RUN_INNER_SRC
+    assert "await log_context_budget(" not in _RUN_INNER_SRC
+    assert "await log_context_budget(db=_cbl_db, **kwargs)" in inspect.getsource(
+        AR._write_context_budget)
+
+
+@pytest.mark.parametrize("said,want", [
+    ("search who won the last F1 race", "who won the last F1 race"),
+    ("can you look it up, best pizza in Toronto please", "best pizza in Toronto"),
+    ("search it", None),
+    ("خب سرچ کن برام", None),
+    ("سرچ کن برام مسابقه اف‌وان این هفته کجاست", "مسابقه اف وان این هفته کجاست"),
+    # Voice round 2026-10-07 (T12): the call's two research asks. Punctuation
+    # is folded BEFORE the fillers (`کن.` survived), and the caller's
+    # hesitation words are gone — but not the noun «چیز».
+    ("باشه چه. یه چیزی برام سرچ کن. ببین آیاس جنرال. خب؟ اه ریدینگ برای هج شدن میتونی چند تا غلط بزنی",
+     "چه آیاس جنرال ریدینگ برای هج شدن میتونی چند تا غلط بزنی"),
+    ("اوکی الان یه سؤال ... یه سرچ کن ببین اه. چیز اه قوی‌ترین استاد... اه یو‌اف‌تی توی بحث ال‌ال‌ام",
+     "چیز قوی ترین استاد یو اف تی توی بحث ال ال ام"),
+])
+def test_the_speculative_query_is_the_request_minus_its_search_ask(said, want):
+    from app.agent.voice_jobs import speculative_search_query
+
+    assert speculative_search_query(said) == want
+
+
+@pytest.mark.parametrize("said,deep", [
+    # Voice round 2026-10-07 (T7): a depth ask gets ×factor research budget.
+    ("یه تحقیق کامل بکن درباره آیلتس آکادمیک", True),
+    ("یه جواب دقیق بده", True),
+    ("با جزئیات توضیح بده", True),
+    ("همه‌جانبه بررسی کن", True),
+    ("give me a detailed answer", True),
+    ("research it please", True),
+    ("go deep on this", True),
+    # «دقیق» only as a whole word: "exactly" and "minute" are not depth.
+    ("دقیقاً کی بود", False),
+    ("دقیقا چی گفت", False),
+    ("ده دقیقه دیگه", False),
+    ("کاملا درسته", False),
+    # A topic is not a depth ask.
+    ("deep learning news", False),
+    ("who won the last race", False),
+])
+def test_a_depth_ask_is_recognised(said, deep):
+    from app.agent.voice_jobs import research_depth_requested
+
+    assert research_depth_requested(said) is deep
+
+
+def test_the_speculative_result_rides_round_zero_as_a_context_block():
+    """Critic R8: never a fabricated tool_use/tool_result pair — a reasoning
+    model's provider can refuse a function_call item it did not emit. A plain
+    block, and the runner releases the forced web round once it is in."""
+    from app.agent.voice_jobs import speculative_search_block
+
+    block = speculative_search_block("f1 race", "1. Result\n   https://x.org/a")
+    assert block.startswith('<speculative_search query="f1 race">')
+    assert "https://x.org/a" in block and block.endswith("</speculative_search>")
+    i = _RUN_INNER_SRC.index("speculative_search_block(_spec[\"query\"], _spec_result)")
+    # Phase D (correctness-tenant-3): the release is CONDITIONAL now — a
+    # multi-part ask with `delegate` live keeps round 0's "search OR delegate"
+    # lock (behaviour pinned in test_voice_turn_jobs.py); the window grew with
+    # the comment that explains it.
+    tail = _RUN_INNER_SRC[i:i + 1400]
+    assert "_turn_used_web_tool = True" in tail and "_web_force_iter = None" in tail
+    assert tail.index("_multi_part") < tail.index("_web_force_iter = None")
+    assert '"role": "user"' in _RUN_INNER_SRC[i - 200:i]
+    # Started at t0, after the tool context is bound, and only for a turn that
+    # must search.
+    start = _RUN_INNER_SRC.index("self._speculative_search(")
+    assert _RUN_INNER_SRC.index("self.tools.set_user_id(user_id)") < start
+    assert _RUN_INNER_SRC.index("if _force_web and getattr(settings, \"voice_speculative_search_enabled\"") < start
+    from app.config import Settings
+    assert Settings.model_fields["voice_speculative_search_enabled"].default is True
+
+
+@pytest.mark.asyncio
+async def test_the_speculative_search_runs_through_the_real_frames(monkeypatch):
+    """One `web_search` through the executor with a real start/end pair, the
+    card's search step started and the sources noted — and a user who disabled
+    web_search gets none."""
+    from app.agent import call_context_cache as cc
+
+    cc.reset_for_test()
+    events: list = []
+
+    async def emit(ev):
+        events.append(dict(ev))
+
+    class _Tools:
+        async def execute(self, name, inp):
+            assert name == "web_search"
+            return "1. A page\n   https://example.org/p\n"
+
+    class _Job:
+        def __init__(self):
+            self.calls = []
+
+        def attribute(self, tool, steps):
+            self.calls.append(("attribute", tool))
+
+        def note_sources(self, tool, inp, result):
+            self.calls.append(("sources", tool))
+
+    runner = AgentRunner.__new__(AgentRunner)
+    runner.tools = _Tools()
+    job = _Job()
+    cc.put_agent_config("u-spec", SimpleNamespace(
+        disabled_tools=None, preferred_provider=None, agent_name=None,
+        onboarding_completed=None))
+    out = await runner._speculative_search("f1 race", "u-spec", job, StepTracker(), emit)
+    assert out["query"] == "f1 race" and "example.org" in out["result"]
+    assert [e["phase"] for e in events] == ["start", "end"]
+    assert events[0]["call_id"] == events[1]["call_id"]
+    assert events[1]["domains"] == ["example.org"]
+    assert job.calls == [("attribute", "web_search"), ("sources", "web_search")]
+
+    events.clear()
+    cc.put_agent_config("u-off", SimpleNamespace(
+        disabled_tools='["web_search"]', preferred_provider=None, agent_name=None,
+        onboarding_completed=None))
+    assert await runner._speculative_search("f1 race", "u-off", _Job(), StepTracker(), emit) is None
+    assert events == []
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_the_speculative_search_never_waits_on_the_db_to_start(monkeypatch):
+    """Voice round 2026-10-07 (T1): card 1's search started 4.6 s late — its
+    first act on a call-cache miss was its own `disabled_tools` SELECT inside
+    a contended first second. On a miss the search now starts at once and the
+    row is read beside it; a user who turned web search off gets a started-
+    then-skipped row and no result."""
+    from app.agent import call_context_cache as cc
+
+    cc.reset_for_test()
+    order: list = []
+
+    async def emit(ev):
+        order.append(("emit", ev["phase"], ev.get("result")))
+
+    class _Tools:
+        async def execute(self, name, inp):
+            order.append(("search", "begun", None))
+            await asyncio.sleep(0.05)
+            return "1. A page\n   https://example.org/p\n"
+
+    def _slow_read(answer):
+        async def _read(user_id):
+            await asyncio.sleep(0.5)
+            order.append(("read", "done", None))
+            return answer
+        return staticmethod(_read)
+
+    runner = AgentRunner.__new__(AgentRunner)
+    runner.tools = _Tools()
+    monkeypatch.setattr(AgentRunner, "_read_disabled_tools", _slow_read(None))
+    out = await runner._speculative_search("f1 race", "u-miss", None, StepTracker(), emit)
+    assert out and "example.org" in out["result"]
+    assert order.index(("emit", "start", None)) < order.index(("read", "done", None)), order
+    assert order.index(("search", "begun", None)) < order.index(("read", "done", None)), order
+    assert order[-1][:2] == ("emit", "end"), "the result waits for the row's verdict"
+
+    order.clear()
+    monkeypatch.setattr(AgentRunner, "_read_disabled_tools", _slow_read('["web_search"]'))
+    assert await runner._speculative_search("f1 race", "u-off-miss", None, StepTracker(), emit) is None
+    phases = [(k, p) for k, p, _ in order if k == "emit"]
+    assert phases == [("emit", "start"), ("emit", "end")], order
+    assert order[-1][2] == "Skipped: web search is turned off in your settings."
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_a_search_that_beats_its_row_on_a_warm_cache_still_lands(monkeypatch):
+    """Phase D lens-tenant-1 (P1): on a call-cache HIT there is no read to
+    wait for, and a search that finished while the start frame waited for its
+    row (a tier-0 search-cache hit answers in one loop step) left the loop
+    nothing to wait for — `asyncio.wait(set())` raised ValueError, the started
+    row was never closed (failed at end of stream) and nothing was injected:
+    round 0 stayed web-forced for exactly the repeat questions that should be
+    fastest."""
+    from app.agent import call_context_cache as cc
+
+    cc.reset_for_test()
+    events: list = []
+
+    async def emit(ev):
+        events.append(dict(ev))
+
+    class _Tools:
+        async def execute(self, name, inp):
+            return "1. A page\n   https://example.org/p\n"     # instant
+
+    class _Job:
+        async def wait_row(self, _timeout):
+            await asyncio.sleep(0.02)        # the row commits after the search
+
+        def attribute(self, tool, steps):
+            pass
+
+        def note_sources(self, tool, inp, result):
+            pass
+
+    runner = AgentRunner.__new__(AgentRunner)
+    runner.tools = _Tools()
+    cc.put_agent_config("u-warm", SimpleNamespace(
+        disabled_tools=None, preferred_provider=None, agent_name=None,
+        onboarding_completed=None))
+    out = await runner._speculative_search("f1 race", "u-warm", _Job(), StepTracker(), emit)
+    assert out and "example.org" in out["result"], out
+    assert [e["phase"] for e in events] == ["start", "end"], events
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_a_started_speculative_row_is_closed_whatever_fails(monkeypatch):
+    """Phase D lens-tenant-1: a fault after the row's start frame closes the
+    row (an `end`) before it propagates — it never spins to the end of the
+    stream."""
+    from app.agent import call_context_cache as cc
+
+    cc.reset_for_test()
+    events: list = []
+
+    async def emit(ev):
+        events.append(dict(ev))
+
+    class _Tools:
+        async def execute(self, name, inp):
+            await asyncio.sleep(0.05)
+            return "1. A page\n   https://example.org/p\n"
+
+    async def broken_wait(*_a, **_k):
+        raise RuntimeError("boom")
+
+    runner = AgentRunner.__new__(AgentRunner)
+    runner.tools = _Tools()
+    cc.put_agent_config("u-boom", SimpleNamespace(
+        disabled_tools=None, preferred_provider=None, agent_name=None,
+        onboarding_completed=None))
+    monkeypatch.setattr(AR.asyncio, "wait", broken_wait)
+    with pytest.raises(RuntimeError):
+        await runner._speculative_search("f1 race", "u-boom", None, StepTracker(), emit)
+    monkeypatch.undo()
+    assert [e["phase"] for e in events] == ["start", "end"], events
+    assert str(events[1].get("result") or "").startswith("ERROR"), events[1]
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_the_answer_beat_fires_at_the_round_start_and_is_provisional():
+    """«دارم جواب را می‌نویسم» never showed during the answer round: the
+    step event fired after the round. The round-START beat reuses the shape
+    build 141 already reads (`reasoning`, `final: true`) plus `provisional`."""
+    seen: list = []
+    began: list = []
+
+    async def on_step(ev):
+        seen.append(ev)
+
+    class _Job:
+        def begin_answer(self, at, provisional=False):
+            began.append(provisional)
+
+    st = StepTracker()
+    await AR._emit_answer_beat(_Job(), st, on_step, 2, AR.datetime.utcnow())
+    assert began == [True]
+    assert seen and seen[0]["kind"] == "reasoning"
+    assert seen[0]["final"] is True and seen[0]["provisional"] is True
+    assert seen[0]["iteration"] == 3
+    # Wired at the first text of a tool-less round, retracted by a tool start.
+    assert "len(text_buf) >= _ANSWER_BEAT_MIN_CHARS" in _RUN_INNER_SRC
+    assert "_vjob.retract_answer()" in _RUN_INNER_SRC
+    assert AR._ANSWER_BEAT_MIN_CHARS == 40

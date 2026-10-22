@@ -79,7 +79,14 @@ async def test_a_silence_gap_opens_a_second_turn_with_its_own_key(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_occurred_at_is_anchored_to_the_provider_timeline_and_monotonic(monkeypatch):
+async def test_occurred_at_is_the_wall_clock_and_monotonic(monkeypatch):
+    """PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b).  It was
+    "anchored to the provider timeline": `anchor_wall + provider_ms`, which ran
+    48 s ahead of the wall by 3 min into the 2026-10-06 call.  A caller row is
+    stamped when the relay first SAW the turn now — both turns here arrive in
+    one burst, so their stamps are milliseconds apart however far apart the
+    provider says they were spoken — and the answer still never sorts above
+    its question."""
     H.fast_clocks(monkeypatch, voice_live_utterance_gap_ms=400)
 
     async def think(*args, **kwargs):
@@ -105,10 +112,13 @@ async def test_occurred_at_is_anchored_to_the_provider_timeline_and_monotonic(mo
     ]
     assert stamps and all(s is not None for s in stamps)
     assert stamps == sorted(stamps), "the answer may never sort above its question"
-    # The second utterance is ~3 s later on the provider timeline, and its
-    # stamp says so even though both writes land within milliseconds.
     firsts = [s["user_occurred_at"] for s in _user_rows(recorded["saves"])]
-    assert (max(firsts) - min(firsts)).total_seconds() >= 2.5
+    assert (max(firsts) - min(firsts)).total_seconds() < 1.0, (
+        "the stamp is when the turn was seen, not where the provider placed it"
+    )
+    assert len({s for s in stamps}) == len({(s.get("user_ref") or s.get("assistant_ref"))
+                                          for s in recorded["saves"]
+                                          if s.get("user_occurred_at") or s.get("assistant_occurred_at")})
 
 
 @pytest.mark.asyncio
@@ -711,6 +721,113 @@ async def test_a_delegated_play_row_carries_text_the_receiving_route_accepts(mon
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title", ["Hotline Bling", ""])
+async def test_the_media_fast_path_row_carries_the_relay_line_never_the_models(
+    monkeypatch, caplog, title,
+):
+    """Voice round 2026-10-06 (problem 8, DESIGN-R2 D-R9).  The Drake card's
+    saved message was `_play_media_direct`'s sentence for the MODEL: "Starting
+    Drake - Hotline Bling on the user's device; more in the same style will
+    follow automatically."  The row now carries the line that was SAID, and an
+    untitled play says (and saves) its own relay line, not the model's text."""
+
+    import logging
+
+    import app.services.live_voice_protocol as live
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    H.fast_clocks(monkeypatch)
+    model_text = (
+        f"Starting {title} on the user's device; more in the same style will "
+        "follow automatically." if title else "Playback is starting on the user's device."
+    )
+
+    async def play(_user_id, query, variety=False):
+        return model_text, {"type": "youtube", "video_id": "v1", "title": title}
+
+    recorded = H.patch_relay(monkeypatch, play=play)
+
+    class _Ask:
+        query = "drake"
+        variety = False
+        mode = None
+
+    monkeypatch.setattr(live, "_media_request", lambda text: _Ask() if "drake" in text else None)
+
+    def on_send(provider, event):
+        if event["type"] == "session.start":
+            provider.push(H.user_delta("play something by drake", 0, 500))
+            provider.push(H.delegation("d1", 520))
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    client = H.FakeClient([H.config(), 0.8, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send)
+    await H.run_relay(client, provider, timeout=6)
+
+    line = (
+        live.relay_line("media_playing", "en", title=title) if title
+        else live.relay_line("media_playing_untitled", "en")
+    )
+    rows = [s for s in recorded["saves"] if s.get("media")]
+    assert rows, "the card is persisted"
+    assert {r["assistant_text"] for r in rows} == {line}, [r["assistant_text"] for r in rows]
+    said = [e["content"] for e in provider.of("session.commentary.append")]
+    assert said == [line], said
+    assert not any("user's device" in str(s.get("assistant_text") or "") for s in recorded["saves"])
+    # …and it was right BEFORE the persist wall (D-R9 (2) is the backstop,
+    # not the fix): the wall had nothing to rewrite.
+    assert not [r for r in caplog.records if "persist text sanitized" in r.getMessage()]
+
+
+def test_the_persist_lane_walls_model_text_out_of_every_relay_row(caplog):
+    """D-R9 (2): `PersistenceQueue.submit` is the one door every relay row
+    passes; a backend answer or a tool result is walled there, and a text the
+    wall empties is replaced by the source's relay line (the route 400s on
+    empty content)."""
+
+    import logging
+
+    import app.services.live_voice_protocol as live
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    model = (
+        "Starting Drake - Hotline Bling on the user's device; more in the same "
+        "style will follow automatically."
+    )
+    walled = live._wall_model_text(live.PersistenceRecord(
+        kind="message", key="live-media:p:d1",
+        payload={"assistant_text": model, "media": {"title": "Hotline Bling"},
+                 "assistant_voice": {"source": "live_media"}},
+    ))
+    assert walled.payload["assistant_text"] == live.relay_line(
+        "media_playing", "en", title="Hotline Bling",
+    )
+    scaffold = live._wall_model_text(live.PersistenceRecord(
+        kind="message", key="live-delegation:p:d2",
+        payload={"assistant_text": "Prior caller request: find a plumber",
+                 "assistant_voice": {"source": "delegated"}},
+    ))
+    assert scaffold.payload["assistant_text"] == live.relay_line("delegation_empty", "en")
+    # The relay's own spoken rows and every caller row pass untouched.
+    for source in ("live_spoken", "live_transcript", ""):
+        record = live.PersistenceRecord(
+            kind="message", key="k", payload={
+                "assistant_text": model, "assistant_voice": {"source": source},
+            },
+        )
+        assert live._wall_model_text(record) is record, source
+    answer = live.PersistenceRecord(
+        kind="message", key="live-delegation:p:d3",
+        payload={"assistant_text": "The museum opens at ten.",
+                 "assistant_voice": {"source": "delegated"}},
+    )
+    assert live._wall_model_text(answer) is answer, "an ordinary answer is untouched"
+    lines = [r.getMessage() for r in caplog.records if "persist text sanitized" in r.getMessage()]
+    assert len(lines) == 2 and "source=live_media" in lines[0], lines
+
+
 # ── L1R2-1: two answers in one round trip claim two epochs ─────────────
 
 def test_two_commentary_claims_bind_to_the_two_epochs_actually_minted():
@@ -742,6 +859,60 @@ def test_two_commentary_claims_bind_to_the_two_epochs_actually_minted():
     assert sorted(adapter.commentary_epochs) == [first, second]
     assert adapter.commentary_epochs[first]["payload"]["which"] == "d1"
     assert adapter.commentary_epochs[second]["payload"]["which"] == "d2"
+
+
+def test_an_epoch_minted_before_the_appends_ack_does_not_consume_its_claim():
+    """Voice round 2026-10-06 (DESIGN-R2 D-R7, D-6b (3)).  The model's own
+    running sentence consumed the UFC result's claim: the FIFO bound the first
+    epoch minted after the claim was FILED, acked or not, so the answer was
+    recorded as spoken on «دارم هم UFC هم … چک می‌کنم».  Once the provider acks
+    appends at all, a claim binds only after ITS append was acked — and one
+    acked while an epoch was open binds the NEXT epoch, not that one."""
+
+    import app.services.live_voice_protocol as live
+
+    adapter = live.LiveClientAdapter("db-session")
+    adapter.require_armed = True        # the provider has acked an append
+    claim = {"ref": "live-delegation:p:d1", "payload": {"which": "d1"}, "revision": 1}
+    adapter.claim_next_output(claim)
+
+    # The model is speaking its own sentence before the append is acked.
+    adapter.provider_event(
+        {"type": "session.output_transcript.delta", "delta": "Sure, checking both"}, now=0.0,
+    )
+    own = adapter.epoch
+    assert own not in adapter.commentary_epochs, "an unacked claim bound the model's own epoch"
+    assert adapter.next_claim_parent() == "", "…or gave it its parent"
+
+    # Acked while that epoch is still open: it binds the NEXT epoch only.
+    adapter.arm_claim(claim)
+    assert claim["armed_epoch"] == own and claim["armed_open"] is True
+    adapter.provider_event(
+        {"type": "session.output_transcript.delta", "delta": " right now."}, now=0.1,
+    )
+    assert adapter.epoch == own and own not in adapter.commentary_epochs
+    adapter.close_for_new_output("gap")
+    adapter.provider_event(
+        {"type": "session.output_transcript.delta", "delta": "UFC 300 is on Saturday."}, now=1.0,
+    )
+    answer = adapter.epoch
+    assert answer != own
+    assert adapter.commentary_epochs.get(answer) is claim
+
+
+def test_a_provider_that_never_acks_keeps_the_plain_fifo():
+    """…and only then: with no ack ever seen, strict arming would bind nothing
+    and nudge (and re-voice) every answer, so the FIFO stays as it was."""
+
+    import app.services.live_voice_protocol as live
+
+    adapter = live.LiveClientAdapter("db-session")
+    claim = {"ref": "live-delegation:p:d1", "payload": {}, "revision": 1}
+    adapter.claim_next_output(claim)
+    adapter.provider_event(
+        {"type": "session.output_transcript.delta", "delta": "the answer"}, now=0.0,
+    )
+    assert adapter.commentary_epochs.get(adapter.epoch) is claim
 
 
 # ── C9, the sad path: an unreachable agent must not report a phantom write ──
@@ -840,3 +1011,63 @@ async def test_a_file_only_delegated_answer_is_submitted_at_all(monkeypatch):
     assert rows, "the file needs an authorizing row or it is not in the thread"
     # And it is landable: the receiving route rejects an empty `content`.
     assert rows[-1]["assistant_text"] == live.relay_line("delegation_empty", "en")
+
+
+@pytest.mark.asyncio
+async def test_persistence_log_lines_name_the_rows_key_tail(monkeypatch, caplog):
+    """PR-1 (2026-10-02 incident). `key[:48]` printed the same string for every
+    row of the call: "live-output:" plus a 40-character provider session id is
+    already 52 characters, so the epoch/ordinal that tells one row from another
+    was cut off and the log could not say WHICH row was lost. Every persistence
+    line keeps its `key=` head and now ends with the key's last 24 characters.
+    """
+
+    import logging
+    import re
+
+    import app.services.live_voice_protocol as live
+
+    monkeypatch.setattr(live.PersistenceQueue, "BACKOFF_S", (0.0, 0.0, 0.0))
+
+    async def always_lost(user_id, session_id, **kwargs):
+        return 1
+
+    H.patch_relay(monkeypatch, save=always_lost)
+    psid = "live_u2_EUjmDp3oNPqa8sGGsyFvQ6Ibn1F4cfwB"
+    keys = [f"live-output:{psid}:7", f"live-output:{psid}:8"]
+    assert keys[0][:48] == keys[1][:48], "the scenario needs keys the old head hid"
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    queue = live.PersistenceQueue("user-1", "db-session")
+    queue.start()
+    for key in keys:
+        queue.submit(live.PersistenceRecord(
+            kind="message", key=key,
+            payload={"user_text": "", "assistant_text": "an answer", "assistant_ref": key},
+        ))
+    assert await queue.drain(3.0)
+    await queue.stop()
+
+    retry_lines = [r.getMessage() for r in caplog.records
+                   if "[LIVE] persistence attempt" in r.getMessage()]
+    lost_lines = [r.getMessage() for r in caplog.records
+                  if "[LIVE] persistence LOST" in r.getMessage()]
+    assert retry_lines and len(lost_lines) == 2
+    for key in keys:
+        tail = key[-24:]
+        assert tail.endswith(key[-2:]) and tail != keys[0][:48][-24:]
+        assert any(line.endswith(f"key_tail={tail}") for line in lost_lines), lost_lines
+        assert any(line.endswith(f"key_tail={tail}") for line in retry_lines), retry_lines
+    # The existing fields are unchanged: the head is still where it was.
+    for line in lost_lines + retry_lines:
+        assert f"key={keys[0][:48]} " in line, line
+    tails = {re.search(r"key_tail=(\S+)$", line).group(1) for line in lost_lines}
+    assert tails == {k[-24:] for k in keys}, "two rows, two distinguishable lines"
+
+
+def test_key_tail_is_the_whole_key_when_short():
+    import app.services.live_voice_protocol as live
+
+    assert live._key_tail("live-utt:p:1") == "live-utt:p:1"
+    assert live._key_tail("") == "" and live._key_tail(None) == ""
+    assert live._key_tail("x" * 30 + ":12") == ("x" * 30 + ":12")[-24:]

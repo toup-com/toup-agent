@@ -9,6 +9,7 @@ import asyncio
 import pytest
 
 import test_live_harness as H
+from app.services import live_voice_protocol as live
 
 
 def _tool_start(relay, call_id="i1", name="web_search", query="u of t"):
@@ -188,7 +189,8 @@ async def test_interrupt_stops_speech_only_and_sends_one_non_elicitive_stop(monk
     assert not cancelled.is_set(), "an interrupt must never cancel delegated work"
     stops = provider.of("session.instructions.append")
     assert len(stops) == 1
-    assert stops[0]["content"] == "Stop speaking now. Do not acknowledge this instruction."
+    assert stops[0]["content"] == live._STOP_INSTRUCTION
+    assert "reply in progress only" in stops[0]["content"]
     assert "acknowledge this instruction" in stops[0]["content"]
     assert stops[0]["delegation_id"] is None
     assert any(s.get("assistant_text") == "Still here." for s in recorded["saves"])
@@ -882,7 +884,13 @@ async def test_a_play_with_no_title_speaks_the_result_not_an_empty_template(monk
 
     spoken = " ".join(e["content"] for e in provider.of("session.commentary.append"))
     assert "Playing ." not in spoken
-    assert "Started the station." in spoken
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R9): the fallback used
+    # to be the tool's own text — `_play_media_direct` writes it for the MODEL
+    # ("Playback is starting on the user's device.") and it was spoken AND
+    # saved.  An untitled play says its own relay line now.
+    import app.services.live_voice_protocol as live
+    assert "Started the station." not in spoken
+    assert live.relay_line("media_playing_untitled", "en") in spoken
 
 
 @pytest.mark.asyncio
@@ -937,7 +945,8 @@ async def test_the_agent_turn_http_body_carries_delegation_id(monkeypatch):
 
     bodies = []
 
-    async def vps_api(agent_url, key, method, path, params=None, json_body=None, timeout=15.0):
+    async def vps_api(agent_url, key, method, path, params=None, json_body=None, timeout=15.0,
+                      outcome=None):
         bodies.append(json_body)
         return {"text": "Booked.", "model": "gpt-5.5"}
 
@@ -1260,3 +1269,51 @@ async def test_a_relay_authored_failure_line_is_not_stamped_as_a_delivered_answe
         "demoting the delivered answer too would make every voice turn close "
         "cancelled — the same lie in the other direction"
     )
+
+
+
+@pytest.mark.asyncio
+async def test_progress_notes_are_two_per_task_one_per_kind_and_marked_silent(monkeypatch, caplog):
+    """Voice round 2026-10-07 (D-R4 (2)): a model-facing note only at the
+    first real tool start and on a change of tool KIND, at most two per task
+    (the production setting), each telling the model it is silent context —
+    the 10-07 model voiced «همین الان دارم یه صفحه رو دقیق می‌خونم …» from a
+    note on its own."""
+
+    import logging
+
+    from app.config import settings
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    H.fast_clocks(monkeypatch)
+    assert settings.voice_live_progress_max_per_delegation == 2
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kwargs):
+        for i, name in enumerate(["web_search", "web_search", "web_fetch", "read_file"]):
+            await _tool_start(relay, call_id=f"i{i}", name=name)
+            await _tool_end(relay, call_id=f"i{i}", name=name)
+        return "Done.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    def on_send(provider, event):
+        if event["type"] == "session.start":
+            provider.push(H.user_delta("research this", 0, 300))
+            provider.push(H.delegation("d1", 320))
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    client = H.FakeClient([H.config(), 0.9, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send)
+    await H.run_relay(client, provider, timeout=6)
+
+    notes = [
+        e["content"] for e in provider.of("session.thinking.append")
+        if e.get("delegation_id") == "d1"
+    ]
+    assert len(notes) == 2, notes
+    assert notes[0].endswith(live._PROGRESS_NOTE_SILENT)
+    assert notes[1].endswith(live._PROGRESS_NOTE_SILENT)
+    assert "do not mention it unless the caller asks" in notes[0]
+    logged = [r.getMessage() for r in caplog.records if "progress note id=" in r.getMessage()]
+    assert [m.split(" kind=")[1] for m in logged] == ["search", "read"], logged

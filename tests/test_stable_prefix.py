@@ -338,7 +338,12 @@ class TestRunnerWiring:
         context, inside user_brain. The pin is asserted BOTH ways so a
         future block cannot quietly reappear without its gate."""
         assert '"user_brain" in _profile_sections' in _SRC
-        assert '"user_brain" not in _profile_sections' in _SRC
+        # Re-pinned 2026-10-06 (voice round, D-T3): the memory block moved into
+        # `_user_brain_section` so the per-call prompt cache can recompute it
+        # on a hit; the profile gate now rides in as `profile_allows`, and the
+        # helper refuses on it before any read.
+        assert 'profile_allows="user_brain" in _profile_sections' in _SRC
+        assert "if not profile_allows:" in _SRC
         # The retired block must be gone from the turn-context order tuple:
         # a key not listed there lands last, alphabetically.
         order = _SRC[_SRC.index("_tc_order = ("):]

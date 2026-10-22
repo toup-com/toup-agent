@@ -548,6 +548,12 @@ class AnthropicService:
             kwargs["tools"] = _mark_tools_cacheable(tools)
             if tool_choice == "required":
                 kwargs["tool_choice"] = {"type": "any"}
+            elif tool_choice == "none":
+                # Phase D (lens-tenant-5): a tool-less round KEEPS its tools
+                # (the history holds tool_use / tool_result blocks, and the
+                # Messages API refuses those without a tools definition) and
+                # forbids calling them.
+                kwargs["tool_choice"] = {"type": "none"}
 
         max_retries = 3
         for attempt in range(max_retries):

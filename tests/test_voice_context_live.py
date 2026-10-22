@@ -268,6 +268,33 @@ def test_the_relays_copy_of_the_media_line_is_word_identical():
     )
 
 
+def test_the_search_and_interrupt_rules_are_word_identical_on_both_renderers():
+    """D-P3 / D-P1 (2026-10-05 call). Three spoken "search it" requests were
+    answered from memory — "Do not delegate when you can answer from this
+    conversation" was the only rule the model could cite — and a two-word
+    interjection did not stop the agent. Both documents reach ONE provider
+    session, and the relay's copy serves until the agent image rolls."""
+    from app.services.live_voice_protocol import (
+        LIVE_BACKEND_SECTION,
+        LIVE_SEARCH_AND_INTERRUPT_RULES,
+    )
+
+    search = (
+        "- When the caller asks you to search, look up, check or find out, ALWAYS "
+        "delegate — your own knowledge is never an answer to that request.\n"
+    )
+    interrupt = "- Stop speaking when the user interrupts. Listen to what they say.\n"
+    assert LIVE_SEARCH_AND_INTERRUPT_RULES == search + interrupt
+    for document in (render_live_delegation(), LIVE_BACKEND_SECTION):
+        assert search + interrupt in document
+        # A rule, read after the progress rule and before the clarify rules.
+        assert (
+            document.index("never invent progress")
+            < document.index(search)
+            < document.index("- Before you delegate")
+        )
+
+
 def test_the_delegation_document_claims_nothing_the_runner_cannot_do():
     """The old blacklist, KEPT: it is cheap and it is about a different class
     of overclaim — the Realtime-only paragraphs this document replaced. It is
@@ -310,3 +337,34 @@ def test_the_renderers_never_raise_on_a_naive_clock(live):
     """`now_utc` arrives from a request body and `.strftime` is the one thing
     in here that touches it."""
     assert render_voice_mode(datetime(2026, 1, 1), live=live)
+
+
+def test_the_promise_and_names_rules_are_word_identical_on_both_renderers():
+    """D-R3 / D-T4(i) (2026-10-06 call): «حتماً، دارم پخش می‌کنم.» with no
+    delegation, and «مسابقه اف‌وان» heard as «مصاحبه عرفان».  The Live
+    transcriber takes no prompt, so the vocabulary rides in the session
+    instructions — both documents reach ONE provider session, and the relay's
+    copy serves until the agent image rolls."""
+    from app.services.live_voice_protocol import (
+        LIVE_BACKEND_SECTION,
+        LIVE_PROMISE_AND_NAMES_RULES,
+    )
+
+    promise = (
+        "- A promise such as «دارم پخش می‌کنم» (\"I'm playing it\") is not an "
+        "action: delegate it in the same turn.\n"
+    )
+    names = (
+        "- English names often arrive in Persian spelling — اف‌وان = F1 / Formula "
+        "One, یواف‌سی = UFC, دریک = Drake, میامی اف‌سی = Inter Miami / Miami FC — "
+        "search the English name.\n"
+    )
+    assert LIVE_PROMISE_AND_NAMES_RULES == promise + names
+    for document in (render_live_delegation(), LIVE_BACKEND_SECTION):
+        assert promise + names in document
+        # After the search rule, before the clarify rules.
+        assert (
+            document.index("ALWAYS delegate")
+            < document.index(promise)
+            < document.index("- Before you delegate")
+        )

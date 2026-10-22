@@ -93,7 +93,12 @@ def test_a_job_update_naming_neither_the_job_nor_its_type_starts_no_card():
 def test_build_card_hides_try_again_for_a_budget_stop():
     src = _read("modules/chat/BuildJobCard.tsx")
     assert _has(src, f"const budgetStopped = job.errorClass === '{budget_refusal.ERROR_CLASS}';")
-    assert _has(src, "const canRetry = !budgetStopped;")
+    # PIN CHANGED (voice round 2026-10-05, E3): a supervisor's worker row is
+    # folded under its parent card and is never retried on its own, so the
+    # retry gate also excludes a child (`parentJobId`) — in the SAME expression
+    # as the budget stop, or one of the two affordances would keep it.
+    assert _has(src, "const canRetry = !budgetStopped && !job.parentJobId;")
+    assert re.search(r"const canRetry = [^;\n]*\bbudgetStopped\b[^;\n]*\bjob\.parentJobId\b", src)
     # Both retry affordances (collapsed chip and expanded card) are gated.
     assert _count(src, "&& canRetry && (") >= 2
     # The class name itself is never rendered.

@@ -119,27 +119,26 @@ def test_the_receive_loop_answers_stop_before_the_unknown_type_fallback():
     assert '"type": "stopped"' in branch
 
 
-def test_a_stopped_turn_retires_its_chat_task_job():
-    # The answer branch completes the BuildJob and the error branch fails it;
-    # the cancel branch did neither, so a stopped turn left a `running` row
-    # behind and both clients drew it as an "In progress" card forever, under a
-    # reply that had visibly stopped. Reproduced on the simulator 2026-08-25.
+def test_a_stopped_turns_card_is_retired_by_the_runner():
+    # A stopped turn used to leave its chat-task row `running` forever, so the
+    # cancel branch closed it here (simulator, 2026-08-25). The regex intake is
+    # retired (voice round 2026-10-05, D-P4): the turn's card is now the
+    # runner's own, and the runner's `finally` — reached on exactly this
+    # cancellation — closes it `cancelled`. The cancel branch must not grow a
+    # second writer back.
+    from app.agent import agent_runner
+
     src = inspect.getsource(ws_chat.ws_chat)
-    # The TURN's cancel branch, not `_wait_for_stop`'s own — that one appears
-    # first and swallows its cancellation with a bare `pass`.
     cancel_at = src.find("except asyncio.CancelledError:\n                    stop_task.cancel()")
     assert cancel_at > 0, "the turn's cancel branch is not where this expects it"
     nxt = src.find("except Exception as e:", cancel_at)
     branch = src[cancel_at:nxt if nxt > 0 else len(src)]
-    assert "_chat_task_job_id" in branch, "the cancel branch never touches the task job"
-    # The ROW is written, not merely announced — a broadcast alone leaves the
-    # card `running` in the database and it comes straight back on the next
-    # load. (Asserting only that the string "cancelled" appears somewhere in the
-    # branch passes on the broadcast alone; this is that mutation, killed.)
-    assert '.status = "cancelled"' in branch
-    assert "completed_at" in branch
-    # …and the live client is told, rather than left to its next poll.
-    assert '"type": "job_update"' in branch
+    assert "_chat_task_job_id" not in branch
+    # `AgentRunner.run` is re-bound at import, so read the method's text.
+    mod = inspect.getsource(agent_runner)
+    run_src = mod[mod.index("    async def run(self, *args, **kwargs)"):
+                  mod.index("    async def _run_inner(")]
+    assert run_src.index("finally:") < run_src.index("sweep_current_voice_job()")
 
 
 def test_the_partial_save_cannot_be_attempted_without_a_conversation():

@@ -54,9 +54,34 @@ async def _forward(
     method: str = "GET",
     body: Optional[dict] = None,
 ) -> JSONResponse:
+    agent_url, key = await _agent_info(user_id, db)
+    if method != "GET":
+        return await _dial(request, user_id, agent_url, key, path, method, body)
+    # PR-15: reads (the missions list is polled every 5 s beside the job
+    # board) go through the tenant load guard — refused at once with 503
+    # `agent_unreachable` + Retry-After right after the tenant timed out, or
+    # while too many reads to it are already in flight. Writes never are.
+    from app.services import tenant_proxy_guard as guard
+
+    try:
+        async with guard.guarded_read(user_id):
+            return await _dial(request, user_id, agent_url, key, path, method, body)
+    except guard.TenantProxyShed as shed:
+        return shed.json_response()
+
+
+async def _dial(
+    request: Request,
+    user_id: str,
+    agent_url: str,
+    key: str,
+    path: str,
+    method: str,
+    body: Optional[dict],
+) -> JSONResponse:
+    from app.services import tenant_proxy_guard as guard
     from app.services.agent_http import get_agent_http_client
 
-    agent_url, key = await _agent_info(user_id, db)
     qs = f"?{request.url.query}" if request.url.query else ""
     url = f"{agent_url}/api/autopilot/{path}{qs}"
     try:
@@ -64,6 +89,8 @@ async def _forward(
         headers = {"X-Agent-Key": key}
         if method == "GET":
             resp = await client.get(url, headers=headers, timeout=15.0)
+            if resp.status_code < 500:
+                guard.note_answered(user_id)
         else:
             resp = await client.post(url, headers=headers, json=body or {}, timeout=15.0)
         # An agent-origin 401/403 is the PLATFORM's stale key, never the
@@ -77,7 +104,9 @@ async def _forward(
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — agent recycling / cold start
-        logger.warning("autopilot proxy %s %s failed: %s", method, url, e)
+        if method == "GET" and guard.is_timeout_error(e):
+            guard.note_timeout(user_id)
+        logger.warning("autopilot proxy %s %s failed: %r", method, url, e)
         raise HTTPException(502, "Agent unreachable")
 
 

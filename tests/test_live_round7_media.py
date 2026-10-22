@@ -723,6 +723,43 @@ async def test_f3_control_a_newer_non_media_request_never_hides_evidence(monkeyp
     assert ("media_stop", "Fadat Sham") in tenant.events
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack", ["Okay.", "چشم."])
+async def test_f3_an_acknowledged_stop_is_no_promise_while_its_backstop_is_armed(
+    monkeypatch, caplog, ack,
+):
+    """Merge seam RA × RB (voice round 2026-10-06).  With promise mode ON, the
+    model's «Okay.» to «stop the music» reads as an action CLAIM — but the media
+    backstop is ARMED for that turn and binds it at its own grace.  Reading the
+    acknowledgement as a promise first re-opened the turn, the next delegation
+    swallowed it into its span, and the stop never ran.  A promise is only a
+    reply that nothing — delegation OR armed backstop — will bind (D-R1 (e))."""
+
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    tenant = M.Tenant(device=M._old_song(), agents={"weather": {"think_s": 3.0}})
+
+    async def steps(p, client):
+        monkeypatch.setattr(settings, "voice_live_claim_grace_ms", 100)
+        p.push(H.user_delta("stop the music", 1000, 1500))
+        p.push(H.out_text(ack, 1600, 1800))
+        p.push(H.out_audio("OK"))
+        await M._acknowledged(client)
+        p.push(H.user_delta("what's the weather in Paris", 2000, 2600))
+        p.push(H.delegation("dW", 2620))
+        await M._wait(lambda: tenant.runs(), 3.0)
+        M._send(client, {"type": "now_playing", "title": "Fadat Sham"})
+        await asyncio.sleep(2.5)
+
+    await _call(monkeypatch, tenant, steps)
+    assert len(tenant.controls("stop")) == 1, tenant.events
+    assert [run for run in tenant.runs() if "stop the music" in str(run)] == [], tenant.events
+    assert not any(
+        r.getMessage().startswith("[LIVE] reply was a promise") for r in caplog.records
+    )
+
+
 def test_f1_a_mixed_remainder_is_a_request_only_when_it_asks_for_something():
     # media words, a predicate or a question make the remainder its own card
     assert live.media_request_shaped("just pause it")

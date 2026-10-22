@@ -115,6 +115,55 @@ UTTERANCES = [
         "lang": "en",
         "note": "English carrying a Persian proper noun — must NOT flip the sentence",
     },
+    # ── Voice round 2026-10-06: sports / league / artist names said in Persian ──
+    # The call heard «مسابقه اف‌وان» (the F1 race) as «مصاحبه عرفان» ("Erfan's
+    # interview") and the corrections as «رضوان», «افوان», «افوانه». `forbid`
+    # is scored like script drift — a HARD failure: a transcript carrying a
+    # forbidden word is the wrong question, whatever else it recovered.
+    {
+        "id": "fa-f1-race",
+        "text": "مسابقه اف‌وان این هفته کجاست؟",
+        "keywords": [["f1", "formula", "فرمول", "اف‌وان", "اف وان", "افوان"]],
+        "forbid": ["مصاحبه", "عرفان"],
+        "note": "the 2026-10-06 call — heard as «مصاحبه عرفان»",
+    },
+    {
+        "id": "fa-formula-one",
+        "text": "فورمولوان",
+        "keywords": [["formula", "فرمول", "فورمول"]],
+        "note": "the correction that finally landed, one word",
+    },
+    {
+        "id": "fa-ufc",
+        "text": "یواف‌سی چی؟",
+        "keywords": [["ufc", "یو اف سی", "یواف‌سی", "یو‌اف‌سی", "یوافسی"]],
+        "note": "a league name in Persian spelling",
+    },
+    {
+        "id": "fa-miami-fc",
+        "text": "بازی آخر میامی اف‌سی کی بود؟",
+        "keywords": [["miami", "میامی"], ["fc", "اف سی", "اف‌سی", "افسی"]],
+        "note": "Inter Miami said as «میامی اف‌سی»",
+    },
+    {
+        "id": "fa-drake",
+        "text": "آهنگ از دریک بذار",
+        "keywords": [["drake", "دریک", "دریگ"]],
+        "note": "an artist name in Persian spelling",
+    },
+    {
+        "id": "fa-stop",
+        "text": "استاپش کن",
+        "keywords": [["استاپ", "stop", "استپ"]],
+        "note": "the stop command the relay grammar missed",
+    },
+    {
+        "id": "fa-erfan",
+        "text": "یه مصاحبه با عرفان دیدم",
+        "keywords": [["مصاحبه"], ["عرفان"]],
+        "forbid": ["f1", "formula", "فرمول", "اف‌وان", "اف وان"],
+        "note": "OVER-BIAS control — the real words must survive the sports list",
+    },
 ]
 
 # Mirrors app.api.ws_realtime.transcription_prompt — keep the two in sync;
@@ -140,6 +189,17 @@ PROMPT_BI = (
     f"May mention: {BIAS_TERMS}."
 )
 
+# Voice round 2026-10-06 (D-T4): the vocabulary a Persian speaker says in
+# English — sports, leagues, artists — as its OWN "May mention:" line, so the
+# product-name line above stays byte-identical. Mirrors the candidate
+# `ws_realtime._TRANSCRIPTION_DOMAIN_TERMS`; adopted server-side only if this
+# config recovers MORE keywords than promptBI and `fa-erfan` stays clean.
+DOMAIN_TERMS = (
+    "F1, Formula One, Grand Prix, UFC, MMA, NBA, NFL, MLS, Premier League, "
+    "Champions League, Inter Miami, Drake"
+)
+PROMPT_BI_DOMAIN = PROMPT_BI + f"\nMay mention: {DOMAIN_TERMS}."
+
 CONFIGS = [
     # (label, model, prompt, language)
     ("whisper-1 · pin=fa (V1 prod)", "whisper-1", None, "fa"),
@@ -148,6 +208,7 @@ CONFIGS = [
     ("gpt-4o-transcribe · promptFA (R9 prod)", "gpt-4o-transcribe", PROMPT_FA, None),
     ("gpt-4o-transcribe · promptBI (R10)", "gpt-4o-transcribe", PROMPT_BI, None),
     ("gpt-4o-transcribe · promptFA · pin=fa", "gpt-4o-transcribe", PROMPT_FA, "fa"),
+    ("gpt-4o-transcribe · promptBI+domain (R2026-10-06)", "gpt-4o-transcribe", PROMPT_BI_DOMAIN, None),
 ]
 
 
@@ -223,6 +284,12 @@ def score(transcript: str, keywords: list[list[str]]) -> tuple[int, int]:
     return hit, len(keywords)
 
 
+def forbidden(transcript: str, words: list[str]) -> list[str]:
+    """The forbidden words the transcript carries (a wrong-question hit)."""
+    t = norm(transcript)
+    return [w for w in words or () if norm(w) in t]
+
+
 # Mirrors app.api.voice.detect_script_language's Arabic-script range, which is
 # what the relay and the app both actually test. Measured over LETTERS only,
 # so punctuation and digits cannot dilute a wholly-Persian sentence.
@@ -257,12 +324,14 @@ def main() -> None:
 
     totals: dict[str, list[int]] = {}
     drifts: dict[str, list[int]] = {}
+    forbids: dict[str, int] = {}
     for label, model, prompt, language in CONFIGS:
         print(f"═══ {label} ═══")
         got = 0
         of = 0
         drifted = 0
         en_count = 0
+        forbid_hits = 0
         dead = False
         for u in UTTERANCES:
             wav = (CACHE / f"{u['id']}.wav").read_bytes()
@@ -282,24 +351,30 @@ def main() -> None:
                 if share > 0:
                     drifted += 1
                     mark = f"  ⚠ DRIFT fa={share:.0%}"
+            bad = forbidden(text, u.get("forbid") or [])
+            if bad:
+                forbid_hits += 1
+                mark += f"  ⛔ FORBIDDEN {','.join(bad)}"
             print(f"  {u['id']}: {h}/{n}  «{text.strip()}»{mark}")
         if not dead:
             totals[label] = [got, of]
             drifts[label] = [drifted, en_count]
+            forbids[label] = forbid_hits
             print(f"  → keyword recovery {got}/{of} · English drifted to Persian "
-                  f"script {drifted}/{en_count}\n")
+                  f"script {drifted}/{en_count} · forbidden {forbid_hits}\n")
         else:
             print()
 
     print("═══ SUMMARY ═══")
-    print("  drift  keywords  config")
-    # Sorted by drift FIRST. A config that drifts is disqualified whatever its
-    # keyword score: the downstream consumers read the script, not the words.
-    for label in sorted(totals, key=lambda k: (drifts[k][0], -totals[k][0])):
+    print("  drift  forbid  keywords  config")
+    # Sorted by drift FIRST, then forbidden hits. A config that drifts — or
+    # that hears the wrong question — is disqualified whatever its keyword
+    # score: the downstream consumers read the script and the words.
+    for label in sorted(totals, key=lambda k: (drifts[k][0], forbids[k], -totals[k][0])):
         g, o = totals[label]
         d, e = drifts[label]
-        flag = "  " if d == 0 else " ⚠"
-        print(f"{flag} {d}/{e}    {g:2d}/{o}     {label}")
+        flag = "  " if d == 0 and forbids[label] == 0 else " ⚠"
+        print(f"{flag} {d}/{e}    {forbids[label]}       {g:2d}/{o}     {label}")
 
 
 if __name__ == "__main__":

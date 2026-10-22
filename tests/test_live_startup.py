@@ -1014,3 +1014,236 @@ async def test_the_detached_note_survives_a_history_seed_that_never_returns(
         "It is with the accountant." in e["content"]
         for e in provider.of("session.thinking.append")
     )
+
+
+# ── Voice round 2026-10-07 (D-R2(1)/(2)): the provider-start retry and the
+# typed fault.  The 12:04 call's first socket sent `session.start` and GPT-Live
+# never answered it (6,863 ms, then a cause-less `live_relay_error`); the repair
+# socket started in 515 ms.  One fresh provider socket inside the ready budget,
+# and a fault the phone and the trail can NAME. ──────────────────────────────
+
+def retry_clocks(monkeypatch, **overrides):
+    defaults = {
+        "voice_live_provider_start_retry_enabled": True,
+        "voice_live_session_start_attempt_s": 0.15,
+    }
+    defaults.update(overrides)
+    startup_clocks(monkeypatch, **defaults)
+
+
+class SilentProvider(FakeProvider):
+    """GPT-Live that accepted the socket and never answers `session.start`."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.close_calls = 0
+
+    async def recv(self):
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.close_calls += 1
+
+
+class ClosingStartProvider(SilentProvider):
+    """GPT-Live whose socket drops before `session.started`."""
+
+    async def recv(self):
+        from websockets.exceptions import ConnectionClosedError
+
+        await asyncio.sleep(0.02)
+        raise ConnectionClosedError(None, None)
+
+
+def factory_of(*providers):
+    made: list = []
+    queue = list(providers)
+
+    async def factory():
+        provider = queue.pop(0)
+        made.append(provider)
+        return provider
+
+    return factory, made
+
+
+@pytest.mark.asyncio
+async def test_a_silent_session_start_is_retried_once_on_a_fresh_provider_socket(
+    monkeypatch, caplog,
+):
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    first = SilentProvider()
+    second = FakeProvider(on_send=close_on_close)
+    factory, made = factory_of(second)
+    client = FakeClient([config(), 0.6, {"type": "stop"}])
+    started = time.monotonic()
+    await run_relay(
+        client, first, timeout=5.0, provider_factory=factory,
+        startup_deadline_monotonic=started + 3.0,
+    )
+    assert made == [second]
+    # The SAME `session.start` went out on both sockets.
+    assert len(first.of("session.start")) == 1 and len(second.of("session.start")) == 1
+    assert first.of("session.start")[0]["session"] == second.of("session.start")[0]["session"]
+    assert first.close_calls == 1, "the stalled socket was not closed"
+    ready = client.of("ready")
+    assert ready and ready[0]["capabilities"]["startup_attempts"] == 2
+    retried = [r.getMessage() for r in caplog.records
+               if "[LIVE] provider start retried" in r.getMessage()]
+    assert len(retried) == 1
+    assert "reason=session_started_timeout attempt=2" in retried[0]
+    assert re.search(r"waited_ms=\d+ remaining_ms=\d+", retried[0])
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_closes_before_session_started_is_retried(monkeypatch, caplog):
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    first = ClosingStartProvider()
+    second = FakeProvider(on_send=close_on_close)
+    factory, made = factory_of(second)
+    client = FakeClient([config(), 0.4, {"type": "stop"}])
+    await run_relay(
+        client, first, timeout=5.0, provider_factory=factory,
+        startup_deadline_monotonic=time.monotonic() + 3.0,
+    )
+    assert made == [second] and client.of("ready")
+    assert any("reason=provider_closed attempt=2" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_without_the_factory_or_the_switch_there_is_one_attempt(monkeypatch):
+    """The production default with no factory (the harness) and the switch off
+    with a factory are both today's single six-second wait."""
+
+    for switch, factory_given in ((True, False), (False, True)):
+        retry_clocks(monkeypatch, voice_live_provider_start_retry_enabled=switch)
+        patch_relay(monkeypatch)
+        factory, made = factory_of(FakeProvider(on_send=close_on_close))
+        client = FakeClient([config()])
+        started = time.monotonic()
+        with pytest.raises(TimeoutError) as raised:
+            await run_relay(
+                client, SilentProvider(), timeout=2.0,
+                provider_factory=factory if factory_given else None,
+                startup_deadline_monotonic=started + 0.5,
+            )
+        assert made == []
+        assert raised.value.retried == 0
+        assert raised.value.cause == "provider_session_start_timeout"
+
+
+@pytest.mark.asyncio
+async def test_no_retry_when_the_ready_budget_cannot_fit_a_second_attempt(monkeypatch):
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+    factory, made = factory_of(FakeProvider(on_send=close_on_close))
+    client = FakeClient([config()])
+    with pytest.raises(live.LiveStartupTimeout) as raised:
+        await run_relay(
+            client, SilentProvider(), timeout=2.0, provider_factory=factory,
+            # 0.15 s first attempt leaves 0.35 s < the 1.5 s floor.
+            startup_deadline_monotonic=time.monotonic() + 0.5,
+        )
+    assert made == []
+    assert (raised.value.cause, raised.value.phase, raised.value.retried) == (
+        "provider_session_start_timeout", "startup", 0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_silent_sockets_fail_at_the_ready_deadline_naming_the_retry(monkeypatch):
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+    second = SilentProvider()
+    factory, made = factory_of(second)
+    client = FakeClient([config()])
+    started = time.monotonic()
+    with pytest.raises(TimeoutError) as raised:
+        await run_relay(
+            client, SilentProvider(), timeout=5.0, provider_factory=factory,
+            startup_deadline_monotonic=started + 1.8,
+        )
+    assert made == [second]
+    assert time.monotonic() - started < 2.6
+    assert isinstance(raised.value, live.LiveStartupTimeout)
+    assert (raised.value.cause, raised.value.retried) == ("provider_session_start_timeout", 1)
+    assert not client.of("ready")
+    assert second.close_calls == 1, "the relay's own retry socket must be closed by the relay"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_reconnect_names_its_exception_class(monkeypatch):
+    """Phase D turns-startup-8: the retry's own connect failure kept its
+    exception class only in the message, which the typed line never logs."""
+
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+
+    async def refusing_factory():
+        raise ConnectionRefusedError("refused")
+
+    client = FakeClient([config()])
+    with pytest.raises(live.LiveRelayFault) as raised:
+        await run_relay(
+            client, SilentProvider(), timeout=3.0, provider_factory=refusing_factory,
+            startup_deadline_monotonic=time.monotonic() + 3.0,
+        )
+    assert (raised.value.cause, raised.value.retried) == ("provider_connect_failed", 1)
+    assert raised.value.detail == "ConnectionRefusedError"
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_startup_rejection_is_never_retried(monkeypatch):
+    retry_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+
+    class RejectingProvider(FakeProvider):
+        async def recv(self):
+            await asyncio.sleep(0)
+            return json.dumps({"type": "error", "error": {"code": "model_unavailable"}})
+
+    factory, made = factory_of(FakeProvider(on_send=close_on_close))
+    client = FakeClient([config()])
+    with pytest.raises(RuntimeError) as raised:
+        await run_relay(
+            client, RejectingProvider(), timeout=2.0, provider_factory=factory,
+            startup_deadline_monotonic=time.monotonic() + 3.0,
+        )
+    assert made == []
+    assert isinstance(raised.value, live.LiveRelayFault)
+    assert (raised.value.cause, raised.value.phase) == ("provider_start_rejected", "startup")
+    # Phase D (turns-startup-8): the provider's own code rides the fault.
+    assert raised.value.detail == "model_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_a_provider_socket_that_dies_mid_call_is_named_provider_closed_1006(monkeypatch):
+    """EVIDENCE §2(e): `provider relay exited … code=1006` reached the phone as
+    a cause-less `relay_error`.  Now it is `provider_closed`, `phase=call`,
+    `provider_code=1006`."""
+
+    startup_clocks(monkeypatch)
+    patch_relay(monkeypatch)
+
+    class DyingProvider(FakeProvider):
+        async def __anext__(self):
+            item = await self.queue.get()
+            if item == "DIE":
+                from websockets.exceptions import ConnectionClosedError
+
+                raise ConnectionClosedError(None, None)
+            return json.dumps(item)
+
+    provider = DyingProvider()
+    client = FakeClient([config(), 0.1, lambda: provider.push("DIE")])
+    with pytest.raises(live.LiveRelayFault) as raised:
+        await run_relay(client, provider, timeout=3.0)
+    assert client.of("ready")
+    fault = raised.value
+    assert (fault.cause, fault.phase, fault.provider_code, fault.retried) == (
+        "provider_closed", "call", 1006, 0,
+    )

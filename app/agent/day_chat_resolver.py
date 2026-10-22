@@ -170,6 +170,22 @@ async def get_or_create_day_chat(
     return dc
 
 
+#: Voice round 2026-10-06 (D-T3): session makers whose `day_chat_backfill`
+#: row has been READ as `completed`. A completed backfill never reverts, so
+#: once seen the answer is latched for the process and no turn pays the
+#: second connection dial + `migration_status` select again (measured 0.2–0.5 s
+#: of every voice delegation's phase 1 — `conns=2 dials=2`). A NON-completed
+#: answer is never latched: it is re-asked on the next turn, so a backfill that
+#: finishes mid-process is picked up. Keyed by the maker so a test that hands
+#: in its own maker cannot see another's verdict.
+#: id -> the maker itself, held so a collected maker's id cannot be reused.
+_BACKFILL_COMPLETED: dict = {}
+
+
+def reset_day_chat_latch_for_test() -> None:
+    _BACKFILL_COMPLETED.clear()
+
+
 async def should_use_day_chat_context(
     session_maker=None,
     feature_flag_override: bool = None,
@@ -201,6 +217,8 @@ async def should_use_day_chat_context(
         if session_maker is None:
             from app.db.database import async_session_maker
             session_maker = async_session_maker
+        if _BACKFILL_COMPLETED.get(id(session_maker)) is session_maker:
+            return True
 
         from app.db.models.day_chat import MigrationStatus
 
@@ -221,6 +239,7 @@ async def should_use_day_chat_context(
                     should_use_day_chat_context._fallback_logged = True
                 return False
 
+        _BACKFILL_COMPLETED[id(session_maker)] = session_maker
         return True
     except Exception as e:
         logger.warning("day_chat_context.fallback reason=check_error error=%s", e)

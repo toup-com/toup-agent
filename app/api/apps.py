@@ -177,6 +177,16 @@ class JobResponse(BaseModel):
     credit_budget_allocated: Optional[float] = None
     credit_spent: Optional[float] = None
     outcome: Optional[str] = None
+    # Supervisor / executor (voice round 2026-10-05, D-P6), response-only
+    # projections of `config_json` so a reloaded card can rebuild its worker
+    # rows. Null on every other job.
+    role: Optional[str] = None
+    worker_index: Optional[int] = None
+    label: Optional[str] = None
+    worker_model: Optional[str] = None
+    plan_step_index: Optional[int] = None
+    result_preview: Optional[str] = None
+    sources: Optional[List[Dict[str, Any]]] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -396,9 +406,35 @@ def _job_to_response(job: BuildJob) -> JobResponse:
         credit_budget_allocated=getattr(job, 'credit_budget_allocated', None),
         credit_spent=getattr(job, 'credit_spent', None),
         outcome=getattr(job, 'outcome', None),
+        **_supervisor_fields(job),
         created_at=job.created_at.isoformat() if job.created_at else "",
         completed_at=job.completed_at.isoformat() if job.completed_at else None,
     )
+
+
+def _supervisor_fields(job: BuildJob) -> Dict[str, Any]:
+    """`JobResponse`'s supervisor/executor keys, read off `config_json`."""
+    cfg = getattr(job, "config_json", None)
+    if not isinstance(cfg, dict) or cfg.get("role") not in ("supervisor", "executor"):
+        return {}
+    out: Dict[str, Any] = {"role": cfg["role"]}
+    for key in ("worker_index", "plan_step_index"):
+        if isinstance(cfg.get(key), int):
+            out[key] = cfg[key]
+    if cfg.get("worker_label"):
+        out["label"] = str(cfg["worker_label"])
+    if cfg.get("worker_model"):
+        from app.config import settings as _settings
+        _wm = str(cfg["worker_model"])
+        if _settings.security_leak_filter:
+            from app.services.model_alias import public_model_label
+            _wm = public_model_label(_wm)
+        out["worker_model"] = _wm
+    if cfg.get("result_preview"):
+        out["result_preview"] = str(cfg["result_preview"])
+    if isinstance(cfg.get("sources"), list):
+        out["sources"] = [s for s in cfg["sources"] if isinstance(s, dict)]
+    return out
 
 
 # ── Local reconciliation (agent VPS — direct filesystem access) ────

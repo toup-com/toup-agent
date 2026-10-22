@@ -27,6 +27,9 @@ RELOADABLE_FIELDS: Set[str] = {
     "telegram_reactions_enabled", "telegram_inline_buttons",
     "telegram_polls_enabled", "moderation_enabled", "dm_policy",
     "group_policy", "group_require_mention", "tool_timeout_default",
+    # Supervisor / executor sub-agents — keep in lockstep with config.py.
+    "supervisor_enabled", "supervisor_user_allowlist", "subagent_model",
+    "supervisor_model", "supervisor_max_workers", "supervisor_timeout_seconds",
 }
 
 # Fields that must NOT be reloaded (security-sensitive, require process restart)

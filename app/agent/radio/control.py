@@ -1126,6 +1126,82 @@ def _outcome(
     )
 
 
+#: Every action the one executor accepts — the relay route
+#: (`/internal/media-control`) and the agent's `media_control` tool alike.
+#: `resume` (voice round 2026-10-06, D-T1) has no frame of its own: see
+#: `_execute_resume`.
+MEDIA_CONTROL_ACTIONS: tuple = ("next", "previous", "stop", "pause", "resume")
+
+
+async def _execute_resume(user_id: str, channel: str) -> MediaControlOutcome:
+    """Resume the item recorded as live by RE-ANNOUNCING it.
+
+    There is no `media_resume` frame on any client. What exists is the
+    phone's same-id rule for a `media_play` naming the item already loaded:
+    "same track — resume if paused, no-op if already playing, never restart"
+    (`trackPlayer.ts`; `holds_paused_reannouncement` documents the same). So
+    a resume is one `media_play` of `recorded_media_item`, sent through the
+    one chokepoint (`send_media_play`) WITHOUT `reannounces` — it is the
+    caller's own newest request, not a station echo, so it is never held and
+    it clears the record's `paused` flag.
+
+    Honest outcomes: ``resumed`` (the record says this tenant paused it and
+    the frame reached a socket), ``resume_sent`` (an item is live but the
+    record does not know it is paused — a pause made on the phone itself —
+    so the phone resumes it if it was paused and nothing changes if not),
+    ``nothing_to_resume`` (nothing recorded, or a stop already ended it: a
+    stop turns the station OFF, so there is nothing to continue — the model
+    should play something), ``delivery_failed`` (no socket got the frame).
+    `ok` is true for the first two only. Nothing waits for an ack: the phone
+    has none for a play."""
+
+    item = recorded_media_item(user_id)
+    video_id = str((item or {}).get("video_id") or "")[:64]
+    if not video_id:
+        return MediaControlOutcome(
+            ok=False, user_id=user_id, action="resume", channel=channel,
+            changed=False, reason="nothing_to_resume",
+        )
+    title = str((item or {}).get("title") or "")[:200]
+    was_paused = bool((item or {}).get("paused"))
+    frame = {
+        "type": "media_play",
+        "provider": "youtube",
+        "video_id": video_id,
+        "title": title,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "thumbnail_url": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        # The record keeps no surface; audio is the default every play uses.
+        "mode": "song",
+    }
+    try:
+        sent = await send_media_play(user_id, frame, mark=run_halt_mark(user_id))
+    except Exception as exc:  # noqa: BLE001 - internal result must stay truthful
+        logger.warning(
+            "[media-control] resume failed user=%s error=%s",
+            str(user_id or "")[:8], type(exc).__name__,
+        )
+        return MediaControlOutcome(
+            ok=False, user_id=user_id, action="resume", channel=channel,
+            changed=False, reason="error", video_id=video_id, title=title,
+        )
+    if not sent:
+        return MediaControlOutcome(
+            ok=False, user_id=user_id, action="resume", channel=channel,
+            changed=False, reason="delivery_failed", video_id=video_id, title=title,
+        )
+    reason = "resumed" if was_paused else "resume_sent"
+    logger.info(
+        "[media-control] resume user=%s video=%s reason=%s sent=%d",
+        str(user_id or "")[:8], video_id, reason, sent,
+    )
+    return MediaControlOutcome(
+        ok=True, user_id=user_id, action="resume", channel=channel,
+        changed=False, reason=reason, previous_video_id=video_id,
+        video_id=video_id, title=title,
+    )
+
+
 async def execute_media_control(
     user_id: str,
     action: str,
@@ -1166,7 +1242,7 @@ async def execute_media_control(
 
     normalized_action = str(action or "").strip().lower()
     normalized_channel = str(channel or "app").strip().lower() or "app"
-    if normalized_action not in {"next", "previous", "stop", "pause"}:
+    if normalized_action not in MEDIA_CONTROL_ACTIONS:
         return _outcome(
             ok=False,
             user_id=user_id,
@@ -1174,6 +1250,8 @@ async def execute_media_control(
             channel=normalized_channel,
             reason="unsupported_action",
         )
+    if normalized_action == "resume":
+        return await _execute_resume(user_id, normalized_channel)
     if normalized_action in _TRANSPORT_FRAMES:
         # Before the session check on purpose: a stop/pause does not need a
         # station, and "no station" must never read as "nothing to stop".
@@ -1308,3 +1386,185 @@ async def execute_media_control(
         after=after,
         previous_video_id=previous_video_id,
     )
+
+
+async def run_media_control(
+    user_id: str,
+    action: str,
+    channel: Optional[str] = None,
+    *,
+    before_order: object = None,
+    media_scope: object = None,
+    media_scope_started_ms: object = None,
+) -> MediaControlOutcome:
+    """THE media-control call: `execute_media_control` inside the endpoint's
+    wall-clock budget. One body for both callers — the relay's tool-less
+    route (`api_v1.internal_media_control`) and the agent's `media_control`
+    tool — so a stop said to the relay and a stop the agent decides on are
+    the same operation with the same verdicts (voice round 2026-10-06, D-T1).
+
+    The stop/pause ack wait ends inside this same budget (minus a margin), so
+    an unanswered stop reports `unacknowledged`, not `timeout`. The halt's own
+    order is passed only for stop/pause and only when both an order and a
+    scope are present (contract v0.3 §7), so an unordered call is exactly the
+    legacy call. A timeout is `timeout` for next/previous and `error` for the
+    rest — those answer from a closed reason set the relay words from."""
+
+    normalized = str(action or "").strip().lower()
+    ordered = (
+        {
+            "before_order": before_order,
+            "media_scope": media_scope,
+            "media_scope_started_ms": media_scope_started_ms,
+        }
+        if normalized in ("stop", "pause")
+        and before_order is not None and media_scope
+        else {}
+    )
+    try:
+        return await asyncio.wait_for(
+            execute_media_control(user_id, action, channel, **ordered),
+            timeout=media_control_budget_s(),
+        )
+    except asyncio.TimeoutError:
+        return MediaControlOutcome(
+            ok=False,
+            user_id=user_id,
+            action=action,
+            channel=channel or "app",
+            changed=False,
+            reason="timeout" if normalized in ("next", "previous") else "error",
+        )
+
+
+# ── What the agent is told, and what the card says (D-T1) ────────────────
+# A CLOSED table, keyed by the executor's own reason. The model text says what
+# happened and what to say about it; the display text is the short line a
+# surface draws. Real failures (the call itself broke) start with `ERROR:` so
+# every downstream `ok` reader agrees; an honest answer that changes nothing —
+# "nothing was playing" — is NOT an error: it is the truth, said once.
+_MEDIA_REAL_FAILURES = frozenset({
+    "error", "timeout", "delivery_failed", "unsupported_action",
+    "channel_not_allowed",
+})
+
+_MEDIA_TEXTS = {
+    "stopped": (
+        "Stopped: the user's device confirmed the music stopped.",
+        "Stopped the music",
+    ),
+    "paused": (
+        "Paused: the user's device confirmed the music is paused. It can be "
+        "resumed with media_control action='resume'.",
+        "Paused the music",
+    ),
+    "nothing_playing": (
+        "Nothing was playing on the user's device, so there was nothing to "
+        "{verb}. Say so in one short line.",
+        "Nothing was playing",
+    ),
+    "partially_confirmed": (
+        "The device that answered was not playing anything, but another device "
+        "of the user did not answer, so it is not confirmed that nothing plays. "
+        "Say that plainly; do not claim it stopped.",
+        "Not confirmed by every device",
+    ),
+    "unacknowledged": (
+        "The user's device did not confirm the {verb}. Do not say it worked; "
+        "say it may still be playing and they can use the player.",
+        "The device did not confirm",
+    ),
+    "newer_playing": (
+        "Left alone: what is on the device now was asked for AFTER this "
+        "{verb}{title_clause}. Do not stop it and do not say it stopped.",
+        "Kept the newer request",
+    ),
+    "advanced": (
+        "Skipped to the next track{title_clause}. Name only that title.",
+        "Next track",
+    ),
+    "rewound": (
+        "Went back to the previous track{title_clause}. Name only that title.",
+        "Previous track",
+    ),
+    "unchanged": (
+        "The track did not change (there was nothing further in that "
+        "direction). Say so in one short line.",
+        "Track unchanged",
+    ),
+    "exhausted": (
+        "There is nothing more queued to play next. Say so; offer to play "
+        "something else.",
+        "Nothing more to play",
+    ),
+    "no_active_session": (
+        "There is no station playing to skip. Say so in one short line.",
+        "No station playing",
+    ),
+    "superseded": (
+        "A newer music request replaced this one before it finished; nothing "
+        "else to do.",
+        "Replaced by a newer request",
+    ),
+    "resumed": (
+        "Resumed{title_clause} on the user's device.",
+        "Resumed the music",
+    ),
+    "resume_sent": (
+        "Asked the user's device to resume{title_clause}; if it was paused it "
+        "plays again now, and if it was already playing nothing changed.",
+        "Resumed the music",
+    ),
+    "nothing_to_resume": (
+        "Nothing is paused to resume (the music was stopped or never played). "
+        "If they want music, call play_media.",
+        "Nothing to resume",
+    ),
+    "delivery_failed": (
+        "ERROR: The player on the user's device is not reachable, so the {verb} "
+        "did not happen. Tell them to open the app and ask again.",
+        "The player is not reachable",
+    ),
+    "timeout": (
+        "ERROR: The player did not answer in time; the {verb} is not "
+        "confirmed. Do not say it worked.",
+        "The player did not answer",
+    ),
+    "error": (
+        "ERROR: The {verb} failed on the server. Do not say it worked.",
+        "Could not control the music",
+    ),
+}
+
+_MEDIA_VERBS = {
+    "stop": "stop", "pause": "pause", "resume": "resume",
+    "next": "skip", "previous": "go back",
+}
+
+
+def media_control_texts(outcome: MediaControlOutcome) -> tuple:
+    """``(model_text, display_text)`` for one outcome, from the closed table.
+
+    A reason this table does not know is reported as an unconfirmed failure,
+    never as success — a new executor verdict cannot be voiced as "done"."""
+
+    verb = _MEDIA_VERBS.get(str(outcome.action or ""), "change the music")
+    title = str(outcome.title or "").strip()
+    title_clause = f' ("{title}")' if title else ""
+    entry = _MEDIA_TEXTS.get(str(outcome.reason or ""))
+    if entry is None:
+        return (
+            f"ERROR: The {verb} was not confirmed (reason "
+            f"{str(outcome.reason or 'unknown')[:40]}). Do not say it worked.",
+            "Could not control the music",
+        )
+    model, display = entry
+    if outcome.reason == "newer_playing" and outcome.paused:
+        model += " That newer item is paused; do not say it is playing."
+    return model.format(verb=verb, title_clause=title_clause), display
+
+
+def media_control_failed(reason: str) -> bool:
+    """True for the reasons that mean the CALL broke, not the world said no."""
+
+    return str(reason or "") in _MEDIA_REAL_FAILURES

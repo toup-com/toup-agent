@@ -681,3 +681,746 @@ async def test_a_failed_announced_track_gets_one_spoken_correction(monkeypatch):
     # The model-facing fact still lands for every failure.
     notes = [e["content"] for e in provider.of("session.thinking.append")]
     assert sum("Playback did not start" in n for n in notes) == 3
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D-R4 (2026-10-06 call): «استاپش کن» while a song played
+# ══════════════════════════════════════════════════════════════════════
+#
+# The recorded «استاپش کن» named no media noun, so the closed grammar above
+# declined it (it is still declined there — the context-free rows keep their
+# `null`), it became a delegation to an agent that has no tool that can stop
+# anything, and the agent apologised over a song that played on.  While the
+# phone reports playback the nounless form IS the command: the shared fixture
+# rows with a `while_playing` key are that reading's table.
+
+WHILE_PLAYING = [c for c in FIXTURES if "while_playing" in c]
+
+
+def test_the_while_playing_table_holds_the_recorded_string_and_its_negatives():
+    table = {c["text"]: c["while_playing"] for c in WHILE_PLAYING}
+    assert table["استاپش کن"] == "stop"
+    for negative in ("قطع شد", "قطع نکن", "صبر کن", "hold on", "stop the search"):
+        assert table[negative] is None, negative
+    # The context-free grammar is unchanged for every bare form.
+    bare = {c["text"]: c["expected"] for c in WHILE_PLAYING}
+    for text in ("استاپش کن", "پازش کن", "نگهش دار", "بسه", "kill it", "stop it"):
+        assert bare[text] is None, text
+    assert bare["آهنگو استاپش کن"] == "stop"
+
+
+@pytest.mark.parametrize(
+    "case", WHILE_PLAYING, ids=[f"{i}-{c['while_playing']}" for i, c in enumerate(WHILE_PLAYING)],
+)
+def test_media_command_while_playing_matches_the_shared_fixtures(case):
+    assert live.media_command_while_playing(case["text"]) == case["while_playing"], case
+    # …and the context-free grammar never moves with it.
+    assert detect_media_control(case["text"]) == case["expected"], case
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "action", "lang"), [
+    ("استاپش کن", "stop", "fa"),
+    ("stop it", "stop", "en"),
+    ("pause", "pause", "en"),
+])
+async def test_a_bare_command_while_playing_is_a_correlated_control_not_an_agent_turn(
+    monkeypatch, text, action, lang,
+):
+    """The delegated path: GPT-Live DID delegate «استاپش کن» (299deaad on the
+    recording).  The session verdict rides the task (`media_action`), so the
+    control fast path executes it — no agent turn, which has nothing to stop
+    with — and the R6-4 ledger records a halt, not a run."""
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    thinks, controls = [], []
+    box = {}
+
+    async def think(*a, **k):
+        thinks.append(a)
+        return "ببخشید، از اینجا نمی‌تونم متوقفش کنم.", "m"
+
+    async def control(_u, act):
+        controls.append(act)
+        return {"ok": True, "action": act, "reason": "stopped" if act == "stop" else "paused"}
+
+    H.patch_relay(monkeypatch, think=think, control=control)
+
+    def on_send(provider, event):
+        box["p"] = provider
+        if event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def speak():
+        box["p"].push(H.user_delta(text, 1000, 1400))
+        box["p"].push(H.delegation("d1", 1450))
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+        session = box.get("session")
+        intents = getattr(session, "media_intents", None) or {}
+        box["kinds"] = sorted({i.kind for i in intents.values()})
+
+    original_begin = live._LiveSession.begin
+
+    async def spy_begin(self, task, utterance):
+        box["session"] = self
+        return await original_begin(self, task, utterance)
+
+    monkeypatch.setattr(live._LiveSession, "begin", spy_begin)
+    client = H.FakeClient([
+        transport_config(), {"type": "now_playing", "title": "Hotline Bling - Drake"},
+        0.2, speak, {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=7, db_session_id=f"db-media-playing-{action}")
+
+    assert thinks == [], "the bare command went to a full agent turn, which has no stop tool"
+    assert controls == [action]
+    frames = client.of("media_control")
+    assert [f["action"] for f in frames] == [action, action]
+    key = "media_stopped" if action == "stop" else "media_paused"
+    assert _line(key, lang) in _spoken_text(provider)
+    # R6-4: the ledger reads the task's verdict — a halt, never an agent `run`.
+    assert box["kinds"] == [action], box["kinds"]
+    # D-R4: the model was told at the command, quietly, that the app does it.
+    told = [e for e in provider.of("session.thinking.append")
+            if _line("media_command_started", lang, request=text) in str(e.get("content") or "")]
+    assert told and all(e.get("delegation_id") is None for e in told)
+
+
+@pytest.mark.asyncio
+async def test_a_bare_command_with_nothing_playing_is_still_the_agents(monkeypatch):
+    """Control: without `now_playing` the same «استاپش کن» is not a media
+    command (gate term 1) — the agent gets it, as before."""
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    thinks, controls = [], []
+
+    async def think(*a, **k):
+        thinks.append(a)
+        return "چیزی پخش نمی‌شه.", "m"
+
+    async def control(_u, act):
+        controls.append(act)
+        return {"ok": True, "action": act, "reason": "stopped"}
+
+    H.patch_relay(monkeypatch, think=think, control=control)
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([transport_config(), wait, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_single_turn("استاپش کن"), auto_ack=True)
+    await H.run_relay(client, provider, timeout=7, db_session_id="db-media-playing-none")
+
+    assert controls == []
+    assert len(thinks) == 1
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("resume", True), ("resume the music", True), ("آهنگو ادامه بده", True),
+    ("play it again", True), ("unpause", True), ("دوباره پخشش کن", True),
+    # Never the bare continuer — that is the caller's backchannel.
+    ("ادامه بده", False), ("continue", False), ("go on", False),
+    ("resume the search", False), ("play again", False),
+])
+def test_an_explicit_resume_is_read_and_the_bare_continuer_is_not(text, expected):
+    assert live.media_resume_request(text) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "lang"), [
+    ("آهنگو ادامه بده", "fa"), ("resume the music", "en"),
+])
+async def test_an_explicit_resume_over_a_paused_track_is_the_relays_resume(monkeypatch, text, lang):
+    """Phase D2 (tests-guards-5): `playing_command`'s explicit-resume branch
+    (`media_resume_request` + a titled PAUSED `now_playing`) was pinned by
+    nothing.  The closed grammar has no resume head, so without that branch
+    a delegated «آهنگو ادامه بده» / "resume the music" is a full agent turn.
+    With it the relay runs the tenant's resume itself — never correlated on
+    the wire (`resume` is in no shipped client's closed set) — and speaks the
+    honest verdict."""
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    controls, thinks = [], []
+
+    async def control(_u, action):
+        controls.append(action)
+        return {"ok": True, "action": action, "reason": "resumed", "title": "Halo"}
+
+    async def think(*a, **k):
+        thinks.append(k.get("delegation_id"))
+        return "Resuming it.", "m"
+
+    H.patch_relay(monkeypatch, control=control, think=think)
+    box = {}
+
+    def on_send(provider, event):
+        box["p"] = provider
+        if event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def ask():
+        box["p"].push(H.user_delta(text, 0, 400))
+        box["p"].push(H.delegation("d1", 450))
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([
+        transport_config(),
+        {"type": "now_playing", "title": "Halo - Beyonce", "state": "paused"},
+        0.2, ask, {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=7, db_session_id=f"db-media-resume-{lang}")
+
+    assert controls == ["resume"], controls
+    assert thinks == [], "the resume went to a full agent turn"
+    started = [f for f in client.of("tool_call.started") if f.get("name") == "media_control"]
+    assert [f.get("detail") for f in started] == ["resume"], started
+    assert client.of("media_control") == [], "resume is never a correlated frame"
+    assert _line("media_resumed", lang, title="Halo") in _spoken_text(provider)
+    assert _terminal(client, "d1")
+
+
+def test_the_resume_verdict_has_its_own_honest_lines():
+    key, line = live.media_control_line("resume", True, "resumed", "fa", "Halo")
+    assert key == "media_resumed" and "Halo" in line
+    key, line = live.media_control_line("resume", False, "nothing_to_resume", "en")
+    assert key == "media_nothing_to_resume" and line
+    # A tenant image that predates `resume` refuses it: an honest failure.
+    key, _line = live.media_control_line("resume", False, "unsupported_action", "en")
+    assert key == "media_control_failed"
+
+
+@pytest.mark.asyncio
+async def test_d_t1_the_agents_own_media_control_tool_is_recorded_not_voiced_twice(monkeypatch, caplog):
+    """D-R4 / D-T1: a delegated agent turn that ran its own `media_control`
+    tool reports `tool.end.media`; the relay records it (log + counter) and the
+    spoken outcome stays the agent's own answer — no relay verdict line."""
+
+    import logging
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    counters = H.capture_counters(monkeypatch)
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kwargs):
+        await relay.on_event({"type": "tool.start", "call_id": "m1", "name": "media_control",
+                              "args": {"action": "stop"}})
+        await relay.on_event({
+            "type": "tool.end", "call_id": "m1", "name": "media_control", "ok": True,
+            "elapsed_ms": 30,
+            "media": {"action": "stop", "reason": "stopped", "ok": True, "title": "Halo"},
+        })
+        return "Done — the music is off now.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+
+    client = H.FakeClient([transport_config(), wait, {"type": "stop"}])
+    provider = H.FakeProvider(
+        on_send=_single_turn("can you deal with the music for me"), auto_ack=True,
+    )
+    with caplog.at_level(logging.INFO):
+        await H.run_relay(client, provider, timeout=7, db_session_id="db-media-tool-end")
+
+    assert "action=stop ok=True reason=stopped source=tool" in caplog.text
+    assert ("live_media_control", {"action": "stop", "ok": True, "source": "tool"}) in counters
+    # The relay did not run a control of its own, and spoke no verdict line.
+    assert client.of("media_control") == []
+    assert _line("media_stopped", "en") not in _spoken_text(provider)
+
+
+# ── Voice round 2026-10-07 (D-R1 §4.8): one media act, one row ─────────
+
+def _rows(saves, prefix):
+    return [s for s in saves if str(s.get("assistant_ref") or "").startswith(prefix)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window_s", [0.0, 6.0])
+async def test_a_media_lines_claim_cannot_capture_a_later_unrelated_epoch(monkeypatch, window_s):
+    """10-07: the stop line «موزیک رو قطع کردم.» was never voiced, its claim
+    had no deadline, and 12 s later it bound the model's first word to the
+    NEXT ask — the stop row says `epoch: 23`.  A media line's claim is
+    bounded like every relay line now: a later reply is its own row.
+
+    Phase D (words-proof-9): ALSO at the production fold window (6 s) — the
+    reply lands 1.2 s after the line, inside the window, and the fold used to
+    take it (voice fields only: its words in no row of the day).  An epoch
+    with no media word, no word of the line and more than three words of its
+    own is not about the act."""
+
+    H.fast_clocks(
+        monkeypatch, voice_live_delegation_ttl_s=2.0, voice_live_media_fold_window_s=window_s,
+    )
+
+    async def control(_u, action):
+        return {"ok": True, "action": action, "reason": "stopped"}
+
+    recorded = H.patch_relay(monkeypatch, control=control)
+    box = {}
+    single = _single_turn(STOP)
+
+    def on_send(provider, event):
+        box["p"] = provider
+        single(provider, event)
+
+    later = "By the way, the weather is lovely today."
+
+    async def later_reply():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+        await asyncio.sleep(1.2)      # past the line's speak budget (0.5 s)
+        box["p"].push(H.out_text(later, 5000, 5600))
+        box["p"].push(H.out_audio("LATER"))
+        await asyncio.sleep(0.4)
+
+    client = H.FakeClient([transport_config(), later_reply, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=8, db_session_id=f"db-media-claim-bound-{window_s}")
+
+    control_rows = _rows(recorded["saves"], "live-media-control:")
+    assert control_rows, recorded["saves"]
+    assert not [s for s in control_rows if "epoch" in (s.get("assistant_voice") or {})], (
+        "a later, unrelated reply was folded onto the stop row"
+    )
+    assert later in [s.get("assistant_text") for s in _rows(recorded["saves"], "live-output:")]
+
+
+@pytest.mark.parametrize(("text", "folds"), [
+    ("قطعش کردم.", True),                                   # the 10-07 stop, in its own words
+    ("دارم یه آهنگ از دریک می‌ذارم", True),                  # a media word
+    ("Here it is, enjoy!", True),                           # short
+    ("Starting Hotline Bling now, enjoy the track.", True),  # a word of the line
+    ("By the way, the weather is lovely today.", False),
+    ("Also, your meeting with Sara is at four o'clock.", False),
+])
+def test_only_words_about_the_media_act_fold_onto_its_row(text, folds):
+    """Phase D (words-proof-9): `fold_media_window`'s relatedness test."""
+
+    claim = {"payload": {
+        "assistant_text": "Starting Hotline Bling.",
+        "media": {"type": "youtube", "video_id": "v1", "title": "Hotline Bling"},
+    }}
+    assert live.media_fold_relates(text, claim) is folds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window_s", [6.0, 0.0])
+async def test_a_media_act_is_one_row(monkeypatch, caplog, window_s):
+    """10-07: one stop, two rows — the model's own «قطعش کردم.» (born before
+    the line's ack) and the relay's line.  An unbound epoch born inside a
+    media line's `voice_live_media_fold_window_s` folds onto its row."""
+
+    import logging
+
+    H.fast_clocks(
+        monkeypatch, voice_live_delegation_ttl_s=2.0, voice_live_media_fold_window_s=window_s,
+    )
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+
+    async def control(_u, action):
+        return {"ok": True, "action": action, "reason": "stopped"}
+
+    recorded = H.patch_relay(monkeypatch, control=control)
+    single = _single_turn(STOP)
+
+    def on_send(provider, event):
+        single(provider, event)
+        if event["type"] == "session.commentary.append":
+            line = event["content"]
+
+            async def two_epochs():
+                # The model's own words first, then the line itself.
+                provider.push(H.out_text("قطعش کردم.", 5000, 5300))
+                provider.push(H.out_audio("OWN"))
+                await asyncio.sleep(0.3)
+                provider.push(H.out_text(line, 6000, 6600))
+                provider.push(H.out_audio("LINE"))
+            asyncio.get_running_loop().create_task(two_epochs())
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+        await asyncio.sleep(1.0)
+
+    client = H.FakeClient([transport_config(), wait, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=8, db_session_id=f"db-media-one-row-{window_s}")
+
+    own_rows = [s.get("assistant_text") for s in _rows(recorded["saves"], "live-output:")]
+    folded = [r.getMessage() for r in caplog.records if "media line folded" in r.getMessage()]
+    assert _rows(recorded["saves"], "live-media-control:")
+    if window_s:
+        assert own_rows == [], own_rows
+        assert folded and "reason=send_window" in folded[0], folded
+    else:
+        assert len(own_rows) == 1, own_rows
+        assert folded == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["told_first", "terminal_first"])
+async def test_a_play_line_told_before_its_terminal_frame_is_reported_heard(
+    monkeypatch, caplog, order,
+):
+    """Ruling 35 (F3, pre-existing at 985e611e): a delegated play's relay line
+    can be voiced BEFORE the task's `completed` frame — the cross-layer tape
+    put `response_text «Starting Hotline Bling.»` at index 17 and `completed`
+    at 20.  The line is then inside the card's delivery floor, so the phone's
+    F41 hold (`deliveryPending`) kept the play card "writing the answer" for
+    45 s over the music.  The relay now says the line was heard
+    (`completed{spoken:true}`, the merged group's frame) — in that ORDER: told,
+    then the verdict.  A line voiced AFTER the terminal frame needs no verdict:
+    the phone sees it arrive after its floor and lets go by itself."""
+
+    import logging
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    plays: list = []
+
+    async def play(_u, query, _variety=False):
+        plays.append(query)
+        return "Starting Hotline Bling.", {
+            "type": "youtube", "video_id": "v1", "title": "Hotline Bling",
+        }
+
+    H.patch_relay(monkeypatch, play=play)
+    if order == "told_first":
+        # The fast path's teardown outlives the line's first words (the tape's
+        # order): the epoch opens while the delegation is still finishing.
+        finish = live._LiveSession.finish_delegation
+
+        async def slow_finish(self, *a, **k):
+            await asyncio.sleep(0.3)
+            return await finish(self, *a, **k)
+
+        monkeypatch.setattr(live._LiveSession, "finish_delegation", slow_finish)
+    single = _single_turn("play hotline bling by drake")
+
+    def on_send(provider, event):
+        single(provider, event)
+        if event["type"] == "session.commentary.append":
+            line = event["content"]
+
+            async def tell():
+                if order == "terminal_first":
+                    await _wait_until(lambda: _done(client), label="d1 terminal")
+                provider.push(H.out_text(line, 5000, 5600))
+                provider.push(H.out_audio("LINE"))
+            asyncio.get_running_loop().create_task(tell())
+
+    async def wait():
+        await _wait_until(lambda: _done(client), label="d1 terminal")
+        await asyncio.sleep(0.8)
+
+    client = H.FakeClient([transport_config(), wait, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=8, db_session_id=f"db-play-heard-{order}")
+
+    assert plays, "the play never took the fast path"
+    line = _line("media_playing", "en", title="Hotline Bling")
+    seq = []
+    for frame in client.frames:
+        if frame.get("type") == "response_text" and line[:12] in str(frame.get("text") or ""):
+            seq.append("told")
+        elif frame.get("type") == "delegation" and frame.get("delegation_id") == "d1" \
+                and frame.get("phase") == "completed":
+            seq.append("completed{spoken:true}" if frame.get("spoken") is True else "completed")
+    seq = [k for i, k in enumerate(seq) if i == 0 or k != seq[i - 1]]
+    heard = [r.getMessage() for r in caplog.records if "media line heard" in r.getMessage()]
+    if order == "told_first":
+        assert seq == ["told", "completed", "completed{spoken:true}"], seq
+        assert heard and "before=terminal" in heard[0], heard
+    else:
+        assert seq == ["completed", "told"], seq
+        assert heard == [], heard
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Voice round 2026-10-07 (D-R4 (4)): "what's playing?" answered by the relay
+# ══════════════════════════════════════════════════════════════════════
+# «اسم صبحش آهنگ» (4:37 in the recording) opened a card and a 3.9 s agent turn
+# and was answered 5.3 s after the turn closed, for a fact the relay already
+# held: the phone's own `now_playing` report.  Hook B answers it ~0.4 s after
+# the close with no delegation at all; Hook A answers a delegation of it.
+
+#: What the app reports: "{song} — {artist}" (`nowPlayingLabel`, an EM dash).
+NP_TITLE = "Hotline Bling — Drake"
+
+
+@pytest.mark.parametrize("text", [
+    "این آهنگ چیه", "اسم این آهنگ چیه", "اسم آهنگ چیه", "اسمش چیه", "اسم صبحش آهنگ",
+    "این آهنگ اسمش چیه", "چی داره پخش میشه", "خواننده این آهنگ کیه",
+    "what's this song", "what's playing", "what song is this",
+    "what is this song called", "who sings this song", "what's the name of this song",
+])
+def test_whats_playing_questions_are_read(text):
+    assert live.media_status_question(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "این آهنگ رو پخش کن", "اسم یه آهنگ از ابی رو بگو", "آهنگ قبلی چی بود", "اسم استادش چیه",
+    "چرا این آهنگو گذاشتی", "what's the best song by drake", "what's this song about",
+    "این آهنگ چه سالی اومده", "stop this song", "play this song again", "what's the status",
+    "چی شد", "what happened",
+    # Phase D (search-play-title-5): another track than the one playing —
+    # answered with the CURRENT track, and the turn was consumed.
+    "اسم آهنگ قبلی", "اسم آهنگ قبلی چیه", "اسم آهنگ بعدی چیه", "آهنگ قبلی اسمش چیه",
+    "اسم آهنگ بعدیش چیه", "اسم آهنگ اول", "اسم آهنگ آخر چیه", "اسم آهنگ دیگه چیه",
+    "name the next song", "what was the last song",
+    # …and the forgiven garble only sits BETWEEN the name and the song noun.
+    "اسم آهنگ مدونا چیه", "اسم آهنگ چی بود", "name of madonna song",
+    "اسم قبلی آهنگ چیه",    # a referent word is never the forgiven garble
+])
+def test_what_is_not_a_whats_playing_question(text):
+    assert not live.media_status_question(text), text
+
+
+async def _np_call(
+    monkeypatch, text, *, title=NP_TITLE, state=None, delegate=False, reply=None, db,
+    enabled=True, before=None, wait_s=1.2,
+):
+    """`before` = (words, delegation id) asked and finished first; the phone
+    reports `title` (and `state`) after it, then the caller asks `text`."""
+
+    H.fast_clocks(
+        monkeypatch, voice_live_delegation_ttl_s=2.0,
+        voice_live_media_status_enabled=enabled,
+    )
+    thinks: list = []
+    plays: list = []
+
+    async def think(*_a, **k):
+        thinks.append(k.get("delegation_id"))
+        return "پروفسور جفری هینتون.", "m"
+
+    async def play(_u, query, _variety=False):
+        plays.append(query)
+        return "Starting Hotline Bling.", {
+            "type": "youtube", "video_id": "v1", "title": "Hotline Bling",
+        }
+
+    H.patch_relay(monkeypatch, think=think, play=play)
+    box: dict = {}
+
+    def on_send(p, e):
+        box["p"] = p
+        if e["type"] == "session.close":
+            p.push(H.closed())
+
+    async def first():
+        if before is None:
+            return
+        p = box["p"]
+        p.push(H.user_delta(before[0], 500, 900))
+        p.push(H.delegation(before[1], 950))
+        await _wait_until(lambda: _terminal(client, before[1], "completed"), label="first task")
+        await asyncio.sleep(0.3)
+
+    async def ask():
+        p = box["p"]
+        p.push(H.user_delta(text, 3000, 3500))
+        if delegate:
+            p.push(H.delegation("d1", 3550))
+        if reply:
+            p.push(H.out_text(reply, 3600, 3900))
+            p.push(H.out_audio("R"))
+        await asyncio.sleep(wait_s)
+
+    frames: list = [transport_config(), 0.2, first]
+    if title is not None:
+        report = {"type": "now_playing", "title": title}
+        if state is not None:
+            report["state"] = state
+        frames.append(report)
+    client = H.FakeClient(frames + [0.2, ask, 0.2, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=10, db_session_id=db)
+    return client, provider, thinks, plays
+
+
+def _status_lines(provider, line) -> list[str]:
+    texts = [str(e.get("content") or "") for e in provider.of("session.instructions.append")]
+    texts += [str(e.get("content") or "") for e in provider.of("session.commentary.append")]
+    return [t for t in texts if line in t]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("text", "lang"), [
+    ("اسم صبحش آهنگ", "fa"),              # the recorded garble
+    ("what's this song", "en"),
+])
+async def test_whats_playing_is_answered_from_now_playing_with_no_card(
+    monkeypatch, caplog, text, lang,
+):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    client, provider, thinks, _plays = await _np_call(
+        monkeypatch, text, db=f"db-np-close-{lang}",
+    )
+    line = _line("media_now_playing", lang, song="Hotline Bling", artist="Drake")
+    said = [
+        str(e.get("content") or "") for e in provider.of("session.instructions.append")
+        if line in str(e.get("content") or "")
+    ]
+    assert said == [_line("relay_task_say", lang, line=line)], said
+    assert client.of("delegation") == [], "a card for a fact the relay holds"
+    assert thinks == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("media status armed turn_id=" in m and "grace_ms=400" in m for m in messages)
+    assert any("media status answered turn_id=" in m and "via=close" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_the_answer_is_said_in_the_language_the_caller_asked_in(monkeypatch):
+    """Critic U18: a `relay-status:` id is in no task table, so `speak()`'s
+    instruction wrapper used to take the language of the LINE's own script —
+    an English question about a Persian title went out wrapped in Persian."""
+
+    _client, provider, _thinks, _plays = await _np_call(
+        monkeypatch, "what's this song", title="بهانه — ابی", db="db-np-lang",
+    )
+    line = _line("media_now_playing", "en", song="بهانه", artist="ابی")
+    said = [
+        str(e.get("content") or "") for e in provider.of("session.instructions.append")
+        if line in str(e.get("content") or "")
+    ]
+    assert said == [_line("relay_task_say", "en", line=line)], said
+
+
+@pytest.mark.asyncio
+async def test_whats_playing_is_answered_via_a_model_delegation(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    client, provider, thinks, _plays = await _np_call(
+        monkeypatch, "این آهنگ چیه", delegate=True, db="db-np-delegation",
+    )
+    line = _line("media_now_playing", "fa", song="Hotline Bling", artist="Drake")
+    spoken = [e for e in provider.of("session.commentary.append") if line in e["content"]]
+    assert spoken and spoken[0]["delegation_id"] == "d1", provider.of("session.commentary.append")
+    assert thinks == [], "an agent turn for what the phone reported"
+    assert [f for f in client.of("delegation") if f.get("phase") == "created"] == []
+    assert any(
+        "media status answered turn_id=" in r.getMessage() and "via=delegation" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_with_nothing_playing_the_question_goes_where_it_always_went(monkeypatch):
+    client, provider, thinks, _plays = await _np_call(
+        monkeypatch, "این آهنگ چیه", title=None, delegate=True, db="db-np-nothing",
+    )
+    assert thinks == ["d1"], thinks
+    assert _status_lines(provider, "Hotline Bling") == []
+
+
+@pytest.mark.asyncio
+async def test_a_paused_track_is_not_playing(monkeypatch):
+    _client, provider, thinks, _plays = await _np_call(
+        monkeypatch, "what's this song", state="paused", delegate=True, db="db-np-paused",
+    )
+    assert thinks == ["d1"], thinks
+    assert _status_lines(provider, "Hotline Bling") == []
+
+
+@pytest.mark.asyncio
+async def test_the_harness_pins_the_relays_now_playing_answer_off(monkeypatch):
+    _client, provider, _thinks, _plays = await _np_call(
+        monkeypatch, "اسم صبحش آهنگ", enabled=False, db="db-np-off",
+    )
+    assert _status_lines(provider, "Hotline Bling") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("first", "answered"), [
+    ("play hotline bling by drake", True),                       # media in focus
+    ("who is the best LLM professor at toronto", False),        # a research answer
+], ids=["after_a_play", "after_research"])
+async def test_a_bare_pointer_is_about_the_song_only_while_media_is_in_focus(
+    monkeypatch, first, answered,
+):
+    """«اسمش چیه» ("what's it called") names no song: after a play it asks the
+    song's name; after a research answer about a professor it does not, and it
+    goes to the model/agent as before."""
+
+    _client, provider, thinks, _plays = await _np_call(
+        monkeypatch, "اسمش چیه", delegate=True, before=(first, "d0"),
+        db=f"db-np-focus-{answered}",
+    )
+    line = _line("media_now_playing", "fa", song="Hotline Bling", artist="Drake")
+    if answered:
+        assert _status_lines(provider, line), provider.of("session.commentary.append")
+        assert "d1" not in thinks, thinks
+    else:
+        assert _status_lines(provider, line) == []
+        assert "d1" in thinks, thinks
+
+
+# ── Phase C (ruling 7): Hook B re-checks the model at the moment it SENDS ──
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_answered", [True, False], ids=["model_answered", "silent"])
+async def test_a_held_now_playing_answer_is_dropped_if_the_model_answered_meanwhile(
+    monkeypatch, caplog, model_answered,
+):
+    """Hook B fires at close + 0.4 s; when a result (or the model's own
+    sentence) is being told, `speak` would hold the line and send it later
+    with no second look — by then GPT-Live, which has the now-playing note,
+    may have answered the question itself.  The re-check is made when the
+    line actually goes out."""
+
+    import logging
+    from types import SimpleNamespace
+
+    from app.config import settings
+    from app.services.live_voice_protocol import OUTPUT_UNKNOWN, _LiveSession
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    session = _LiveSession.__new__(_LiveSession)
+    session.settings = settings
+    session.user_id = "user-1"
+    session.held_speech = []
+    session.held_model_since = 0.0
+    session.relay_status_langs = {}
+    session.media_status_seen = {}
+    busy = {"v": True}
+    evidence = {"v": None}
+    spoken: list = []
+    monkeypatch.setattr(session, "may_speak", lambda: True)
+    monkeypatch.setattr(session, "delivery_group_busy", lambda: busy["v"])
+    monkeypatch.setattr(session, "model_speaking_hold_open", lambda: False)
+    monkeypatch.setattr(session, "turn_output_evidence", lambda turn_id, **_k: evidence["v"])
+    monkeypatch.setattr(
+        session, "media_status_answer", lambda _t: ("Hotline Bling — Drake", "playing"),
+    )
+
+    async def speak(delegation_id, text, **kw):
+        spoken.append((delegation_id, text, kw.get("parent_user_turn_id")))
+        return []
+
+    monkeypatch.setattr(session, "speak", speak)
+    session.active_delivery = SimpleNamespace(
+        task=SimpleNamespace(delegation_id="d-result"), resolved=False, speaking_epoch=None,
+    )
+    assert await session.answer_media_status(
+        "live-utt:p:7", delegation_id="relay-status:abc", text="what's this song", via="close",
+    ) is True
+    assert spoken == [] and len(session.held_speech) == 1, "held behind the result"
+    # The result is told; meanwhile the model may have answered the question.
+    busy["v"] = False
+    session.active_delivery = None
+    if model_answered:
+        evidence["v"] = OUTPUT_UNKNOWN
+    await session.flush_held_speech()
+    messages = [r.getMessage() for r in caplog.records]
+    if model_answered:
+        assert spoken == [], spoken
+        assert "[LIVE] media status skipped turn_id=live-utt:p:7 reason=answered" in messages
+    else:
+        assert [(d, p) for d, _t, p in spoken] == [("relay-status:abc", "live-utt:p:7")]
+        assert any(m.startswith("[LIVE] media status answered turn_id=live-utt:p:7 via=close")
+                   for m in messages), messages

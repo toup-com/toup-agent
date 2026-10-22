@@ -18,6 +18,7 @@ from .enums import (
 # User
 from .user import User
 from .user_session import UserSession
+from .chat_topic import ChatTopicTitle
 
 # Identity
 from .identity import Identity
@@ -267,7 +268,7 @@ __all__ = [
     "MemoryType", "EntityType", "MemoryLevel", "MemoryEventType",
     "UserRole", "IdentityType", "DocumentType", "MediaType",
     # Models
-    "User", "UserSession", "Identity",
+    "User", "UserSession", "Identity", "ChatTopicTitle",
     "Conversation", "Message", "ProcessedMessage",
     "Memory", "MemoryFile", "MemoryFileChange", "memory_relationships", "BrainStats", "MemoryEvent", "RetrievalEvent",
     "MediaPlaylist",

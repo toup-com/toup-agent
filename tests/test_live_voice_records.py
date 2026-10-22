@@ -944,26 +944,51 @@ async def test_the_delegated_row_keeps_the_whole_answer_and_loses_the_playback_n
     voice = result["assistant_voice"]
     assert voice["record_kind"] == "task_result"
     assert voice["version"] == 1
-    for playback_key in ("played_ms", "interrupted", "epoch", "start_ms", "end_ms"):
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R8 (a)): `epoch` is
+    # back on the task row — the paraphrase now FOLDS onto it, so the row
+    # names the epoch that voiced it.  The four playback numbers stay off.
+    for playback_key in ("played_ms", "interrupted", "start_ms", "end_ms"):
         assert playback_key not in voice, playback_key
+    assert voice["epoch"] == closed.epoch
     # `heard_chars` deliberately stays, and it is the one field on this row
     # that is about the PARAPHRASE: the frozen spec adds it to every voice
     # payload and its removal list names the five playback numbers and not
     # this. Pinned so the choice is visible rather than incidental.
     assert voice["heard_chars"] == len("Here is")
+    # A barge-in cut (no hangup reason): the caller cut it.
+    assert voice["spoken_interrupted"] is True
 
-    transcript = session.persistence.payload("live-transcript:")
-    assert transcript["assistant_text"] == "Here is"
-    tvoice = transcript["assistant_voice"]
-    assert tvoice["record_kind"] == "assistant_transcript"
-    assert tvoice["heard_chars"] == len("Here is")
-    assert tvoice["interrupted"] is True
-    assert tvoice["played_ms"] == 400
-    assert tvoice["task_id"] == "d1"
-    assert tvoice["source"] != "delegated", (
-        "`voice_jobs.VoiceTurnJob._row_is_proof` reads that exact value as "
-        "'the answer reached the thread', and this row is not that answer"
-    )
+    # PIN FLIPPED (D-R8 (a), "fold always"): no `live-transcript:` sibling —
+    # one row per answer.
+    assert not session.persistence.has("live-transcript:")
+
+
+@pytest.mark.asyncio
+async def test_a_delivery_cut_before_its_first_text_still_records_the_cut_on_the_task_row():
+    """Phase D (correctness-relay-8): `persist_spoken` returned on an empty
+    epoch BEFORE looking up the claim, so a delivered result the caller cut
+    within its first audio — no output transcript yet — never reached
+    `fold_onto_delegated_row`: the task row kept `spoken` with no
+    `spoken_interrupted` and no `epoch`, and the app drew no «قطع شد»."""
+
+    session = _session()
+    _delegated(session)
+    await session.persist_spoken(_epoch(text="", heard="", played_ms=120))
+
+    result = session.persistence.payload("live-delegation:")
+    assert result["assistant_text"] == "The deadline is the first of March."
+    assert result["assistant_voice"]["spoken_interrupted"] is True
+    assert result["assistant_voice"]["epoch"] == 1
+    assert not session.persistence.has("live-output:")
+    assert not session.persistence.has("live-transcript:")
+
+
+@pytest.mark.asyncio
+async def test_an_empty_unclaimed_epoch_still_writes_no_row():
+    session = _session()
+    await session.persist_spoken(_epoch(text="", heard=""))
+    assert not session.persistence.has("live-output:")
+    assert not session.persistence.has("live-delegation:")
 
 
 @pytest.mark.asyncio
@@ -995,7 +1020,7 @@ async def test_a_paraphrase_that_repeats_the_task_result_gets_no_second_row():
 
 
 @pytest.mark.asyncio
-async def test_a_fully_played_paraphrase_that_reworded_the_answer_keeps_its_own_row():
+async def test_a_fully_played_paraphrase_that_reworded_the_answer_folds_onto_the_result():
     """The fourth way a paraphrase differs, and the one nothing checked.
 
     GPT-Live is handed the backend's answer and says it back in its OWN words.
@@ -1019,12 +1044,13 @@ async def test_a_fully_played_paraphrase_that_reworded_the_answer_keeps_its_own_
         "the task result is never projected, clipped or reworded"
     )
     assert result["assistant_voice"]["record_kind"] == "task_result"
-
-    transcript = session.persistence.payload("live-transcript:")
-    assert transcript["assistant_text"] == spoken
-    assert transcript["assistant_voice"]["record_kind"] == "assistant_transcript"
-    assert transcript["assistant_voice"]["interrupted"] is False
-    assert transcript["assistant_voice"]["task_id"] == "d1"
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R8 (a), a recorded
+    # deviation from the brief's "unless I cut it off"): the reworded
+    # paraphrase used to keep its own `live-transcript:` row — the UFC double
+    # of the 2026-10-06 call.  It folds now: one row per answer.
+    assert not session.persistence.has("live-transcript:")
+    assert result["assistant_voice"]["spoken_interrupted"] is False
+    assert result["assistant_voice"]["heard_chars"] == len(spoken)
 
 
 @pytest.mark.asyncio
@@ -1091,10 +1117,13 @@ async def test_a_paraphrase_nobody_heard_at_all_gets_no_row_either():
 
 
 @pytest.mark.asyncio
-async def test_a_paraphrase_the_phone_could_not_play_gets_its_own_row():
+async def test_a_paraphrase_the_phone_could_not_play_folds_and_is_not_a_cut():
     """Playback failing is the third way a paraphrase materially differs from
-    a complete delivery, and the only one with no receipt to prove it: the
-    phone never displayed anything, so it has nothing to report."""
+    a complete delivery, and the only one with no receipt to prove it.
+
+    PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R8 (a)): it used to get
+    its own `live-transcript:` row.  It folds now, and a playback failure is
+    NOT the caller cutting the answer off (`spoken_interrupted` is false)."""
 
     session = _session()
     _delegated(session)
@@ -1102,9 +1131,29 @@ async def test_a_paraphrase_the_phone_could_not_play_gets_its_own_row():
         text="Here is what I found.", played_ms=0, retire_reason="playback_failed",
     ))
 
-    transcript = session.persistence.payload("live-transcript:")
-    assert transcript["assistant_text"] == "Here is what I found."
-    assert "heard_chars" not in transcript["assistant_voice"]
+    assert not session.persistence.has("live-transcript:")
+    voice = session.persistence.payload("live-delegation:")["assistant_voice"]
+    assert voice["spoken_interrupted"] is False
+    assert "heard_chars" not in voice
+
+
+@pytest.mark.asyncio
+async def test_a_hangup_that_cut_the_answer_is_not_the_callers_cut():
+    """R8 (D-R8 (a)): the hangup sends `[interrupt, stop]` and its interrupt
+    carries `reason: client_request` — the 2026-10-06 Miami answer was saved
+    `interrupted: true` because the caller pressed End.  Only a barge-in is
+    `spoken_interrupted`."""
+
+    session = _session()
+    _delegated(session)
+    closed = _epoch(text="Here is what I found.", heard="Here is", played_ms=400)
+    closed.cut_by = "session_end"
+    await session.persist_spoken(closed)
+
+    voice = session.persistence.payload("live-delegation:")["assistant_voice"]
+    assert voice["spoken_interrupted"] is False
+    assert voice["heard_chars"] == len("Here is")
+    assert not session.persistence.has("live-transcript:")
 
 
 # ── negotiation: an old client gets exactly today's rows ──────────────
@@ -1142,6 +1191,7 @@ async def test_a_client_that_never_negotiates_heard_text_gets_todays_behaviour(m
     assert result["assistant_voice"]["played_ms"] == 400
     assert result["assistant_voice"]["interrupted"] is True
     assert result["assistant_voice"]["epoch"] == 1
+    assert result["assistant_voice"]["spoken_interrupted"] is True
     assert "record_kind" not in result["assistant_voice"]
     assert not folded.persistence.has("live-transcript:")
 
@@ -1169,7 +1219,10 @@ async def test_no_new_top_level_payload_key_is_ever_introduced():
     )
     await session.persist_spoken(_epoch(epoch=2, heard="First sentence."))
 
-    assert len(session.persistence.records) == 3
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R8 (a)): the folded
+    # paraphrase writes no `live-transcript:` sibling, so 2 records, not 3
+    # (the task row, then epoch 2's own row).
+    assert len(session.persistence.records) == 2
     for record in session.persistence.records:
         assert set(record.payload) <= allowed, (record.key, set(record.payload) - allowed)
 
@@ -1994,3 +2047,342 @@ async def test_end_to_end_the_window_closes_on_its_own_deadline(monkeypatch):
 
     rows = _rows(recorded["saves"], "live-output:")
     assert rows and rows[-1]["assistant_text"] == "First sentence. Second sentence."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("extra", "who"), [({}, "caller"), ({"reason": "client_request"}, "session_end")])
+async def test_end_to_end_the_hangups_interrupt_is_not_the_callers_cut(monkeypatch, extra, who):
+    """Voice round 2026-10-06 (DESIGN-R2 D-R8 (a)).  The app ends a call
+    with `[interrupt, stop]`, the interrupt carrying `reason: client_request`
+    (`liveProtocol.closeCallFrames`).  The relay records WHO cut the epoch, so
+    only a barge-in reads as `spoken_interrupted` on the task row."""
+
+    import app.services.live_voice_protocol as live
+
+    H.fast_clocks(monkeypatch, voice_live_output_epoch_gap_ms=4000)
+    H.patch_relay(monkeypatch)
+    seen = []
+    original = live._LiveSession.persist_spoken
+
+    async def spy(self, closed):
+        seen.append((closed.epoch, closed.cut_by, live.caller_cut(closed)))
+        return await original(self, closed)
+
+    monkeypatch.setattr(live._LiveSession, "persist_spoken", spy)
+    client = H.FakeClient()
+    client._script = [
+        _config(), _await_frame(client, "audio_delta"), _cut(**extra), 0.2, {"type": "stop"},
+    ]
+    await H.run_relay(client, H.FakeProvider(on_send=_reply_on_send), timeout=8)
+
+    cut = [row for row in seen if row[0] == 1]
+    assert cut and cut[0][1] == who, seen
+    assert cut[0][2] is (who == "caller"), seen
+
+
+# ── voice round 2026-10-07 (D-R1): a WORDS-bound telling folds the same way ──
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cut", [True, False])
+async def test_a_words_bound_telling_folds_voice_fields_only(cut):
+    """D-R1: a result claim no longer enters the epoch FIFO — the epoch whose
+    WORDS prove the answer is bound at retirement and folded onto the task
+    row.  The fold is the D-R8 fold: voice fields only (the row keeps the
+    verified answer, never the paraphrase), `spoken_interrupted` only when the
+    CALLER cut a telling that had begun (the partial-telling floor)."""
+
+    import time as _time
+
+    from app.services.live_voice_protocol import DelegatedTask, ResultDelivery
+
+    session = _session()
+    answer = "The application deadline is the first of March, at noon Toronto time."
+    ref = f"live-delegation:{H.PSID}:d1"
+    payload = {
+        "user_text": "", "assistant_text": answer, "assistant_ref": ref,
+        "assistant_voice": {
+            "source": "delegated", "delegation_id": "d1", "task_id": "d1",
+            "parent_user_turn_id": f"live-utt:{H.PSID}:1", "clock": "provider",
+        },
+    }
+    claim = session.build_commentary_claim(ref, payload, delegation_id="d1")
+    delivery = ResultDelivery(
+        task=DelegatedTask(delegation_id="d1", offset_ms=0, transcript="when is the deadline"),
+        answer=answer, claim=claim,
+    )
+    session.deliveries["d1"] = delivery
+    session.active_delivery = delivery
+    delivery.sent_monotonic = delivery.started_monotonic = _time.monotonic()
+    told = (
+        "It's the first of March at noon" if cut
+        else "The deadline is the first of March, noon, Toronto time."
+    )
+    closed = _epoch(
+        text=told, interrupted=cut, retire_reason="interrupt" if cut else "gap",
+        heard=told if cut else None,
+    )
+    closed.born_monotonic = _time.monotonic()
+    await session.persist_spoken(closed)
+
+    assert delivery.resolved and delivery.spoken
+    assert delivery.words_reason == ("caller_cut" if cut else "words")
+    row = session.persistence.payload("live-delegation:")
+    assert row["assistant_text"] == answer, "the fold wrote the paraphrase onto the result"
+    voice = row["assistant_voice"]
+    assert voice["epoch"] == 1 and voice["record_kind"] == "task_result"
+    assert voice["spoken_interrupted"] is cut
+    assert not session.persistence.has("live-output:")
+    assert not session.persistence.has("live-transcript:")
+
+
+# ── Voice round 2026-10-07 (D-R3(5)): a cut PIECE of a sentence is never a row ─
+# The 12:04 call wrote «باشه» (epoch 8, no audio) and «، حتماً، دارم تو وب
+# می‌گردم.» (epoch 9) as two rows — one sentence the relay rotated on a new
+# causal parent — and «از این نیاز به» (a reply cut by a stale stop) as a row of
+# its own.  Layer B (`carry_spoken_fragment`, called by `persist_spoken` for an
+# unbound epoch) holds such a piece for the next epoch or drops it; a CALLER cut
+# that carried audio keeps its row (`spoken_interrupted`, D-R8).
+
+import logging as _logging  # noqa: E402
+
+from app.config import settings as _settings  # noqa: E402
+import app.services.live_voice_protocol as _live  # noqa: E402
+
+
+def _carry_session(monkeypatch, carry_s=3.0):
+    monkeypatch.setattr(_settings, "voice_live_fragment_carry_s", carry_s)
+    session = _live._LiveSession.__new__(_live._LiveSession)
+    session.settings = _settings
+    session.spoken_carry = None
+    session.last_stop_instruction = 0.0
+    return session
+
+
+def _cut_epoch(epoch, text, *, reason="gap", audio=12, parent="U", retired=None):
+    return _live.ClosedEpoch(
+        epoch=epoch, output_id=f"o{epoch}", text=text, interrupted=reason == "interrupt",
+        parent_user_turn_id=parent, retire_reason=reason, audio_chunks=audio,
+        retired_monotonic=time.monotonic() if retired is None else retired,
+    )
+
+
+def test_a_cut_head_is_carried_into_the_epoch_that_continues_it(monkeypatch, caplog):
+    caplog.set_level(_logging.INFO, logger="app.services.live_voice_protocol")
+    session = _carry_session(monkeypatch)
+    head = _cut_epoch(8, "باشه", reason="new_output", audio=0, parent="U11")
+    assert session.carry_spoken_fragment(head) is True, "the head is held, not written"
+    tail = _cut_epoch(9, "، حتماً، دارم تو وب می‌گردم.", parent="U12")
+    assert session.carry_spoken_fragment(tail) is False
+    assert tail.text == "باشه، حتماً، دارم تو وب می‌گردم."
+    assert session.spoken_carry is None
+    lines = [r.getMessage() for r in caplog.records if "spoken fragment" in r.getMessage()]
+    assert lines == [
+        "[LIVE] spoken fragment held epoch=8 parent=U11 reason=new_output chars=4 audio_chunks=0",
+        "[LIVE] spoken fragment merged epoch=8 into=9 chars=4",
+    ]
+
+
+def test_a_held_fragment_nothing_continues_is_dropped_never_written(monkeypatch, caplog):
+    caplog.set_level(_logging.INFO, logger="app.services.live_voice_protocol")
+    session = _carry_session(monkeypatch)
+    assert session.carry_spoken_fragment(_cut_epoch(14, "از این نیاز به", reason="new_output", audio=28))
+    held_at = session.spoken_carry["at"]
+    session.expire_spoken_carry(now=held_at + 2.9)
+    assert session.spoken_carry is not None, "inside the carry window it waits"
+    session.expire_spoken_carry(now=held_at + 3.1)
+    assert session.spoken_carry is None
+    assert session.carry_spoken_fragment(_cut_epoch(15, "باشه", reason="new_output", audio=0))
+    session.expire_spoken_carry(force=True)
+    dropped = [r.getMessage() for r in caplog.records if "spoken fragment dropped" in r.getMessage()]
+    assert dropped == [
+        "[LIVE] spoken fragment dropped epoch=14 reason=expired voiced=1",
+        "[LIVE] spoken fragment dropped epoch=15 reason=teardown voiced=0",
+    ]
+    # Words only in the held text, never in a log line.
+    assert not any("نیاز" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("closed", "carried"),
+    [
+        # A finished sentence keeps its row, however short.
+        (dict(epoch=1, text="باشه.", reason="new_output", audio=0), False),
+        # A long unfinished VOICED epoch the relay rotated keeps its row.
+        (dict(epoch=1, text="این یک جملهٔ طولانی است که هنوز تمام نشده و", reason="new_output",
+              audio=30), False),
+        # C4: a CALLER cut that carried audio is what they heard — its row stays.
+        (dict(epoch=1, text="از این نیاز به", reason="interrupt", audio=28), False),
+        (dict(epoch=1, text="از این نیاز به", reason="spoken_over", audio=28), False),
+        # …a caller cut before a single chunk was voiced is a fragment.
+        (dict(epoch=1, text="از این نیاز به", reason="interrupt", audio=0), True),
+        # A short epoch the gap ended right after the relay's own stop note.
+        (dict(epoch=1, text="از این نیاز به", reason="gap", audio=28, stop=True), True),
+        # …and without that stop it is an ordinary short reply.
+        (dict(epoch=1, text="از این نیاز به", reason="gap", audio=28), False),
+    ],
+)
+def test_only_a_cut_piece_is_a_fragment(monkeypatch, closed, carried):
+    session = _carry_session(monkeypatch)
+    stop = closed.pop("stop", False)
+    now = time.monotonic()
+    if stop:
+        session.last_stop_instruction = now - 0.5
+    epoch = _cut_epoch(closed.pop("epoch"), closed.pop("text"), retired=now, **closed)
+    assert session.carry_spoken_fragment(epoch) is carried
+
+
+def test_a_row_never_starts_with_cut_punctuation_and_the_switch_turns_it_all_off(monkeypatch, caplog):
+    caplog.set_level(_logging.INFO, logger="app.services.live_voice_protocol")
+    session = _carry_session(monkeypatch)
+    lead = _cut_epoch(9, "، حتماً، دارم تو وب می‌گردم.")
+    assert session.carry_spoken_fragment(lead) is False
+    assert lead.text == "حتماً، دارم تو وب می‌گردم."
+    assert any(r.getMessage() == "[LIVE] spoken text lead trimmed epoch=9" for r in caplog.records)
+    off = _carry_session(monkeypatch, carry_s=0)
+    head = _cut_epoch(8, "باشه", reason="new_output", audio=0)
+    assert off.carry_spoken_fragment(head) is False and off.spoken_carry is None
+    untouched = _cut_epoch(9, "، حتماً.")
+    assert off.carry_spoken_fragment(untouched) is False and untouched.text == "، حتماً."
+
+
+@pytest.mark.parametrize(
+    ("text", "reason", "audio", "flag"),
+    [
+        ("باشه", "new_output", 0, True),
+        ("باشه", "interrupt", 0, True),
+        ("باشه", "new_output", 3, False),     # voiced: the phone played it
+        ("باشه.", "new_output", 0, False),    # a whole sentence
+        ("باشه", "gap", 0, False),            # nothing cut it
+    ],
+)
+def test_the_live_wire_marks_a_structurally_cut_epoch(text, reason, audio, flag):
+    adapter = _live.LiveClientAdapter("psid-fragment")
+    frames = adapter._segment_frames(_cut_epoch(3, text, reason=reason, audio=audio))
+    segment = next(f for f in frames if f["type"] == "speech_segment_complete")
+    assert segment.get("fragment", False) is flag
+    assert ("fragment" in segment) is flag, "additive: absent unless true"
+
+
+def _parked_rows(session):
+    return {
+        r.key.rsplit(":", 1)[1]: r.payload["assistant_text"]
+        for r in session.persistence.records if r.key.startswith("live-output:")
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_pass", ["flush", "late_receipt"])
+async def test_a_parked_epochs_second_pass_never_takes_a_later_fragment(monkeypatch, second_pass):
+    """Phase D turns-startup-3: on a heard_text client a gap-retired epoch is
+    PARKED and `persist_spoken` runs for it again — the park's flush, or a
+    late playback receipt.  A fragment held in between (a relay-cut «باشه»)
+    was merged into that OLDER epoch on its second pass: its row became
+    «باشه The library opens at nine.» and the real continuation lost its
+    head.  Layer B judges an epoch once, and never merges into an epoch born
+    before the fragment."""
+
+    from app.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "voice_live_fragment_carry_s", 3.0)
+    session = _session(park=True)
+    session.spoken_carry = None
+    session.last_stop_instruction = 0.0
+    session.spoken_settle_s = lambda: 2.5
+    reply = _cut_epoch(7, "The library opens at nine.", audio=40, parent="U6")
+    await session.persist_spoken(reply)                       # parked
+    await session.persist_spoken(_cut_epoch(8, "باشه", reason="new_output", audio=0, parent="U7"))
+    if second_pass == "flush":
+        await session.flush_parked_spoken(now=time.monotonic() + 3.0)
+    else:
+        reply.retire_reason, reply.played_ms = "playback_idle", 2000
+        await session.persist_spoken(reply)
+    tail = _cut_epoch(9, "، حتماً، دارم تو وب می‌گردم.", audio=30, parent="U7")
+    tail.retire_reason = "playback_idle"
+    await session.persist_spoken(tail)
+    rows = _parked_rows(session)
+    assert rows.get("7") == "The library opens at nine.", rows
+    assert rows.get("9") == "باشه، حتماً، دارم تو وب می‌گردم.", rows
+
+
+_KEEP_HEAD, _KEEP_TAIL, _KEEP_HEARD = "باشه", "، حتماً، دارم تو وب می‌گردم.", "، حتماً،"
+
+
+def _receipt_session(monkeypatch, *, park):
+    from app.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "voice_live_fragment_carry_s", 3.0)
+    session = _client_session(park=park)
+    session.spoken_carry = None
+    session.last_stop_instruction = 0.0
+    return session
+
+
+def _receipt_head():
+    return _live.ClosedEpoch(
+        epoch=0, output_id=_oid(0), text=_KEEP_HEAD, interrupted=False, played_ms=None,
+        parent_user_turn_id="U1", start_ms=100, end_ms=200, retire_reason="new_output",
+        audio_chunks=0, retired_monotonic=time.monotonic(),
+    )
+
+
+def _receipt_rows(session):
+    return [
+        (r.payload["assistant_text"], r.payload["assistant_voice"].get("heard_chars"))
+        for r in session.persistence.records if r.key.startswith("live-output:")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_receipt_row_keeps_the_carried_head_and_no_leading_comma(monkeypatch):
+    """Phase D turns-startup-4 (a): «باشه» is held; the caller barges into the
+    continuation «، حتماً…» and the phone sends its receipt «، حتماً،».  The row
+    was written from the receipt — validated against the epoch BEFORE Layer B
+    ran — so the head was lost and the row began with «،» (D-R3(5): leading
+    punctuation never starts a row).  The receipt now gets the same prepend
+    and trim as the epoch's text."""
+
+    counters = H.capture_counters(monkeypatch)
+    session = _receipt_session(monkeypatch, park=False)
+    await session.persist_spoken(_receipt_head())
+    session.adapter.provider_event(H.out_text(_KEEP_TAIL, 300, 900), now=1.0)
+    session.adapter.provider_event(H.out_audio("AQID"), now=1.0)
+    oid = session.adapter.output_id
+    _ok, closed = session.adapter.interrupt(oid, oid, 900, heard_text=_KEEP_HEARD, now=2.0)
+    closed.cut_by = "caller"
+    session.note_heard_text({
+        "type": "interrupt", "response_id": oid, "item_id": oid, "played_ms": 900,
+        "heard_text": _KEEP_HEARD,
+    }, closed)
+    await session.persist_spoken(closed)
+    texts = [text for text, _chars in _receipt_rows(session)]
+    assert texts == ["باشه، حتماً،"], texts
+    assert not [c for c in counters if c[0] == "live_heard_text_rejected"], counters
+
+
+@pytest.mark.asyncio
+async def test_a_parked_merged_epoch_accepts_its_own_receipt(monkeypatch):
+    """Phase D turns-startup-4 (b): the gap-retired continuation was merged
+    («باشه، حتماً…») and parked; the caller's barge-in then sends the receipt
+    of what the phone displayed for THAT epoch («، حتماً،»).  It was refused
+    `not_prefix` (a client defect on the counter) and the full generated text
+    went on a row the caller cut.  The receipt is judged against the epoch's
+    own words, and the row says what was heard, head included."""
+
+    counters = H.capture_counters(monkeypatch)
+    session = _receipt_session(monkeypatch, park=True)
+    await session.persist_spoken(_receipt_head())
+    session.adapter.provider_event(H.out_text(_KEEP_TAIL, 300, 900), now=1.0)
+    session.adapter.provider_event(H.out_audio("AQID"), now=1.0)
+    oid = session.adapter.output_id
+    _frames, closed = session.adapter.rotate_on_gap(now=100.0)
+    await session.persist_spoken(closed)                      # merged, parked
+    _ok, past = session.adapter.interrupt(oid, oid, 900, heard_text=_KEEP_HEARD, now=101.0)
+    assert past is closed
+    session.note_heard_text({
+        "type": "interrupt", "response_id": oid, "item_id": oid, "played_ms": 900,
+        "heard_text": _KEEP_HEARD,
+    }, past)
+    await session.persist_spoken(past)
+    assert not [c for c in counters if c[0] == "live_heard_text_rejected"], counters
+    assert past.heard_text == "باشه، حتماً،", past.heard_text
+    assert [text for text, _chars in _receipt_rows(session)] == ["باشه، حتماً،"]

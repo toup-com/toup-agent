@@ -15,6 +15,10 @@ variant.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+
 from app.services.anthropic_service import (
     AnthropicService,
     _mark_messages_cacheable,
@@ -129,3 +133,38 @@ def test_mark_tools_cacheable_marks_last_tool_only():
 def test_mark_tools_cacheable_empty_passthrough():
     assert _mark_tools_cacheable([]) == []
     assert _mark_tools_cacheable(None) is None
+
+
+
+@pytest.mark.asyncio
+async def test_a_tool_less_round_keeps_its_tools_and_says_none(monkeypatch):
+    """Phase D lens-tenant-5: `tool_choice="none"` maps to {"type": "none"}
+    WITH the tools defined — a request carrying tool_use / tool_result blocks
+    and no `tools` is a 400 invalid_request_error."""
+
+    import app.services.credit_reporter as CR
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(CR, "raise_if_exhausted_async", _noop, raising=False)
+    captured: dict = {}
+
+    class _Msgs:
+        def stream(self, **kw):
+            captured.update(kw)
+            raise RuntimeError("captured")
+
+    svc = _make_service(is_oauth=False)
+    svc.client = SimpleNamespace(messages=_Msgs())
+    svc.default_model, svc.default_max_tokens = "claude-sonnet-4-6", 1024
+    svc._ensure_client = lambda: None
+    tools = [{"name": "web_search", "description": "d", "input_schema": {"type": "object"}}]
+    with pytest.raises(Exception):
+        async for _ in svc.create_message_stream(
+            messages=[{"role": "user", "content": "who won"}], system="s",
+            tools=tools, tool_choice="none", model="claude-sonnet-4-6",
+        ):
+            pass
+    assert captured.get("tool_choice") == {"type": "none"}, captured.get("tool_choice")
+    assert captured.get("tools"), "the tools stay defined"

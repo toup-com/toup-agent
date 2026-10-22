@@ -253,7 +253,7 @@ class Tenant:
                 return payload
             return None
 
-        async def vps_api_stream(_url, _key, path, json_body, relay):
+        async def vps_api_stream(_url, _key, path, json_body, relay, cause=None):
             body = dict(json_body or {})
             self.bodies.append((path, body))
             return await self.agent_turn(body, relay)
@@ -850,11 +850,27 @@ async def test_r6_4b_tf132_ready_and_frames_are_byte_identical(monkeypatch):
             "voice_tasks": False, "voice_provider": "live", "playback_ack": True,
             "audio": {"type": "pcm16le", "rate": 24000}, "live_turns": True,
             "delegation_frames": True, "media_fast_path": True, "task_lifecycle": True,
-            "playback_frames": True, "reask_turns": True, "language_pref": True,
+            "playback_frames": True, "reask_turns": True, "response_delayed": True,
+            "language_pref": True,
             "turn_timing": True, "media_control": True, "media_transport": True,
             "heard_text": True,
+            # 2026-10-05 voice round (D-P1/D-P7/D-P11): additive base keys,
+            # ignored by every shipped client.
+            # The phone joins fragments across pauses shorter than this
+            # (D-P7 R5/R6): it is the HARD gap the relay closes turns on, by
+            # value — read back from the frame it would pin nothing (GH-7).
+            "reply_pending": True,
+            "utterance_hard_gap_ms": max(
+                int(settings.voice_live_utterance_gap_ms) + 1,
+                int(settings.voice_live_utterance_hard_gap_ms),
+            ),
+            "voice_language": None,
+            # Voice round 2026-10-07 (D-R2(1)): how many provider sockets
+            # this `ready` took (2 after a retried `session.start`).
+            "startup_attempts": 1,
         },
     }
+    assert isinstance(ready["capabilities"]["utterance_hard_gap_ms"], int)
     dumped = json.dumps(client.frames)
     assert "media_scope" not in dumped and "before_order" not in dumped and "media_order" not in dumped
     assert "newer_playing" not in dumped
@@ -1148,3 +1164,20 @@ async def test_newer_playing_is_worded_as_the_newer_request_playing(monkeypatch,
     if not ack:
         assert "completed" in _phases(client, "dStop"), client.of("delegation")
         assert not any(e.get("code") == "delegation_failed" for e in client.of("error"))
+
+
+@pytest.mark.asyncio
+async def test_the_advertised_hard_gap_follows_the_setting(monkeypatch):
+    """GH-7: the ready frame advertises the relay's own HARD utterance gap —
+    the bound the phone joins fragments across — not the soft gap or a
+    constant."""
+
+    real = H.fast_clocks
+
+    def clocks(mp, **kw):
+        real(mp, **{**kw, "voice_live_utterance_hard_gap_ms": 333})
+
+    monkeypatch.setattr(H, "fast_clocks", clocks)
+    client, _provider, _stop = await _stop_scope(monkeypatch, features=TF132)
+    assert settings.voice_live_utterance_hard_gap_ms == 333
+    assert _ready(client)["capabilities"]["utterance_hard_gap_ms"] == 333

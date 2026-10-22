@@ -53,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +64,8 @@ from app.agent.job_steps import (
     dump_steps,
     finish_all_steps,
     parse_steps,
+    public_steps,
+    skip_unstarted_steps,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,18 @@ MIN_AGE = timedelta(seconds=20)
 LEGACY_PROOF_MIN_AGE = timedelta(minutes=3)
 #: How far back the sweep looks. Older running rows are the reaper's.
 LOOKBACK = timedelta(hours=48)
+#: Assistant rows read per voice card: a long call writes one spoken row per
+#: output epoch, so the answer can sit behind many of them.
+_VOICE_PROOF_SCAN = 200
+
+
+def _supervisor_window() -> timedelta:
+    """How long a supervisor card is the plan's own to close: the whole-plan
+    deadline plus the answer the supervisor writes after it (the relay's
+    voice budget is the larger of the two, `voice_live_supervisor_timeout_s`)."""
+    from app.config import settings
+    plan_s = int(getattr(settings, "supervisor_timeout_seconds", 240) or 240)
+    return max(LEGACY_PROOF_MIN_AGE, timedelta(seconds=plan_s + 120))
 
 
 @dataclass
@@ -90,6 +104,11 @@ class ClosedJob:
     steps_total: int
     last_step: str
     completed_at: datetime
+    # The closed step list and the sources the work read, so the terminal
+    # `job_update` carries the card's final state and no client has to
+    # refetch the row to draw it.
+    steps: List[Dict[str, Any]] = field(default_factory=list)
+    sources: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _job_type_of(job: Any) -> Optional[str]:
@@ -113,11 +132,15 @@ async def close_job_completed(
     total_tokens: Optional[int] = None,
     model: Optional[str] = None,
     reason: str = "turn_end",
+    config_updates: Optional[Dict[str, Any]] = None,
 ) -> Optional[ClosedJob]:
     """Guarded close: only a ``running`` row is completed. Writes the row and
     a ``job_events`` heartbeat in the caller's session (caller commits).
     Returns the card facts for :func:`announce_completed`, or None when the
-    row was not ours to close (already terminal, parked, missing)."""
+    row was not ours to close (already terminal, parked, missing).
+
+    ``config_updates`` is merged into ``config_json`` in the same guarded
+    UPDATE (the runner's card writes its ``sources`` here)."""
     from app.db.models import BuildJob, JobEvent
 
     job = await db.get(BuildJob, job_id)
@@ -144,10 +167,21 @@ async def close_job_completed(
                                         now=now, reason=reason)
         return None
 
-    steps = finish_all_steps(parse_steps(job.steps_json), now,
-                             fallback_start=getattr(job, "created_at", None))
-    done, total = _step_counts(steps)
     cfg = dict(job.config_json or {})
+    steps = parse_steps(job.steps_json)
+    # A runner-minted card declared its plan before any tool ran; a planned
+    # step that never started is `skipped`, never greened. Every closer —
+    # the turn's own seal, this watchdog, the reaper's pre-sweep — comes
+    # through here, so the rule cannot depend on which one won.
+    if cfg.get("turn_job"):
+        skip_unstarted_steps(steps)
+    role = (config_updates or {}).get("role") or cfg.get("role")
+    steps = finish_all_steps(steps, now,
+                             fallback_start=getattr(job, "created_at", None),
+                             keep_failed=role == "supervisor")
+    done, total = _step_counts(steps)
+    if config_updates:
+        cfg.update(config_updates)
     if reason != "turn_end":
         cfg["reconciled_at"] = now.isoformat()
         cfg["reconciled_reason"] = reason
@@ -187,6 +221,8 @@ async def close_job_completed(
         job_id=job_id, title=job.title or "", user_id=user_id,
         chat_id=getattr(job, "conversation_id", None), job_type=_job_type_of(job),
         steps_total=total, last_step=last_step, completed_at=now,
+        steps=steps,
+        sources=[x for x in (cfg.get("sources") or []) if isinstance(x, dict)],
     )
 
 
@@ -241,6 +277,8 @@ async def announce_completed(
             "completed_steps": closed.steps_total,
             "chat_id": chat_id,
             "message_id": message_id,
+            **({"steps": public_steps(closed.steps)} if closed.steps else {}),
+            **({"sources": closed.sources} if closed.sources else {}),
         })
     except Exception:  # noqa: BLE001 — a job must never fail on plumbing
         logger.debug("[job_reconciler] job_update broadcast failed", exc_info=True)
@@ -292,6 +330,7 @@ async def reconcile_delivered_turn_jobs(
     builds too. ``sweep_builds=False`` is for tests that want one rule at a
     time. See :mod:`app.agent.build_watchdog`.
     """
+    from app.agent.subagent_dispatcher import count_running_children
     from app.db.database import async_session_maker
     from app.db.models import BuildJob, Message
 
@@ -329,6 +368,23 @@ async def reconcile_delivered_turn_jobs(
             cfg = job.config_json if isinstance(job.config_json, dict) else {}
             if cfg.get("handed_off"):
                 continue  # spawn / start_mission owns it now
+            # A supervisor whose helpers are still working has not answered
+            # yet, whatever else landed in the thread — and while inside its
+            # own deadline it is the plan's to close, not this watchdog's. A
+            # spoken progress line ("two helpers are still reading") is an
+            # ordinary assistant row on a voice call. Past the deadline with
+            # no live worker it is an ordinary stranded card again (the
+            # reaper reconciles before it cancels, so skipping it outright
+            # would turn a delivered answer into "stopped").
+            if await count_running_children(db, job.id):
+                continue
+            if (cfg.get("role") == "supervisor"
+                    and job.created_at > now - _supervisor_window()):
+                continue
+            # A voice card's thread also holds the relay's spoken rows, one
+            # per output epoch. Only the delegated answer for THIS
+            # delegation proves delivery — the TurnJob's own rule.
+            voice_card = bool(cfg.get("voice_turn") or cfg.get("voice_delegation_id"))
             proof = None
             asst_id = cfg.get("asst_message_id")
             if asst_id:
@@ -337,6 +393,21 @@ async def reconcile_delivered_turn_jobs(
                         Message.id == str(asst_id), Message.role == "assistant",
                     )
                 )).first()
+            elif voice_card and job.created_at <= now - LEGACY_PROOF_MIN_AGE:
+                from app.agent.voice_jobs import voice_row_is_proof
+                rows_after = (await db.execute(
+                    select(Message.id, Message.created_at, Message.content,
+                           Message.metadata_json).where(
+                        Message.conversation_id == job.conversation_id,
+                        Message.role == "assistant",
+                        Message.created_at > job.created_at,
+                    ).order_by(Message.created_at.asc()).limit(_VOICE_PROOF_SCAN)
+                )).all()
+                proof = next(
+                    (r for r in rows_after
+                     if voice_row_is_proof(r[3], cfg.get("voice_delegation_id"))),
+                    None,
+                )
             elif job.created_at <= now - LEGACY_PROOF_MIN_AGE:
                 # Rows written before create_job stamped the answer id.
                 proof = (await db.execute(

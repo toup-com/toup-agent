@@ -58,6 +58,7 @@ __all__ = [
     "is_internal_marker",
     "job_card_fields",
     "job_marker_content",
+    "job_marker_row_fields",
     "load_build_jobs",
     "parse_job_marker",
     "public_text",
@@ -102,6 +103,80 @@ def job_marker_content(
     if job_type:
         body["job_type"] = job_type
     return json.dumps(body, ensure_ascii=False)
+
+
+def job_marker_row_fields(
+    *,
+    delegation_id: Optional[str] = None,
+    parent_user_turn_id: Optional[str] = None,
+    request_turn_ids: Optional[Iterable[str]] = None,
+    anchor_occurred_at: Any = None,
+) -> Dict[str, Any]:
+    """``occurred_at`` + ``metadata_json`` for a job marker row — the ONE
+    helper both writers (``ws_chat._persist_job_card`` and
+    ``voice_jobs.TurnJob._write_chat_card``) go through, so they cannot drift
+    (voice round 2026-10-06, D-R8 d).
+
+    The marker is stamped at the caller turn that ASKED for the work —
+    ``anchor_occurred_at`` (the relay's real stamp for that user row) + 1 ms,
+    the tenant being the one owner of the +1 — whatever time it is written,
+    and it carries ``metadata_json.voice = {kind: "job_marker",
+    delegation_id, task_id, parent_user_turn_id, request_turn_ids}`` so a
+    client folds the card under that bubble. ``kind``, never ``source``: a
+    ``source`` value would make ``voice_row_is_proof`` and the app's
+    ``task_result`` pairing read the marker as an ANSWER.
+
+    ``{}`` when the relay sent neither the asking turn nor its stamp (an older
+    relay, or a chat job): the row is then written exactly as before."""
+    from datetime import datetime, timedelta
+
+    parent = (parent_user_turn_id or "").strip()[:160] if isinstance(parent_user_turn_id, str) else ""
+    anchor = anchor_occurred_at
+    if isinstance(anchor, str):
+        try:
+            anchor = datetime.fromisoformat(anchor.strip().replace("Z", "+00:00"))
+        except ValueError:
+            anchor = None
+    if isinstance(anchor, datetime) and anchor.tzinfo is not None:
+        from datetime import timezone as _tz
+        anchor = anchor.astimezone(_tz.utc).replace(tzinfo=None)
+    if not isinstance(anchor, datetime):
+        anchor = None
+    if not parent and anchor is None:
+        return {}
+    did = (str(delegation_id).strip()[:64] if delegation_id else "") or None
+    voice: Dict[str, Any] = {"kind": "job_marker"}
+    if did:
+        voice["delegation_id"] = did
+        voice["task_id"] = did
+    if parent:
+        voice["parent_user_turn_id"] = parent
+    turns = [str(t)[:160] for t in (request_turn_ids or ()) if isinstance(t, str) and t]
+    if turns:
+        voice["request_turn_ids"] = turns[:8]
+    out: Dict[str, Any] = {"metadata_json": json.dumps({"voice": voice}, ensure_ascii=False)}
+    if anchor is not None:
+        out["occurred_at"] = anchor + timedelta(milliseconds=1)
+    return out
+
+
+#: A marker stamp further than this from "now" is not trusted to choose the
+#: day (sessions.py applies the same bound to a relay `occurred_at`).
+_MARKER_DAY_MAX_SKEW_S = 86400
+
+
+def marker_day_instant(occurred_at: Any) -> Any:
+    """The instant a job marker's DAY is resolved at (Phase D, tenant-8): its
+    own stamp (the asking turn + 1 ms, naive UTC) — a card asked before local
+    midnight and closed after it belongs to the asker's day — or ``None``
+    (resolve "now", as before) for no stamp or one more than a day off."""
+    from datetime import datetime
+
+    if not isinstance(occurred_at, datetime):
+        return None
+    if abs((datetime.utcnow() - occurred_at).total_seconds()) > _MARKER_DAY_MAX_SKEW_S:
+        return None
+    return occurred_at
 
 
 def parse_job_marker(content: Optional[str]) -> Dict[str, Any]:
@@ -285,6 +360,34 @@ def job_card_fields(
 
     out["job_status"] = bj.status
     out["job_app_id"] = getattr(bj, "app_id", None)
+    # Supervisor / executor (D-P6): a client folds a child row INTO its
+    # parent's card instead of drawing it as its own. Additive, absent on
+    # ordinary rows.
+    if getattr(bj, "parent_job_id", None):
+        out["parent_job_id"] = bj.parent_job_id
+    # `job_role`, never `role`: these fields are SPREAD into the message
+    # payload (`**job_card_fields(...)`, `resp.update`), where `role` is the
+    # message's own ('job') — a bare key turned a job marker into an
+    # "executor" message. The web reads `job_role`.
+    _role_cfg = getattr(bj, "config_json", None)
+    if isinstance(_role_cfg, str):
+        try:
+            _role_cfg = json.loads(_role_cfg)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            _role_cfg = None
+    if isinstance(_role_cfg, dict) and _role_cfg.get("role") in ("supervisor", "executor"):
+        out["job_role"] = _role_cfg["role"]
+    # Voice round 2026-10-06 (D-R8 d): which delegation this card is, and the
+    # caller turn that asked for it — projected at READ time from the job row,
+    # so a day saved before the marker carried them is repaired on its next
+    # load. `job_`-prefixed for the same spread reason as `job_role`.
+    if isinstance(_role_cfg, dict):
+        _did = _role_cfg.get("voice_delegation_id")
+        if isinstance(_did, str) and _did:
+            out["job_delegation_id"] = _did[:64]
+        _parent = _role_cfg.get("parent_user_turn_id")
+        if isinstance(_parent, str) and _parent:
+            out["job_parent_user_turn_id"] = _parent[:160]
     if out["job_name"] == "App Build" and getattr(bj, "title", None):
         out["job_name"] = bj.title.replace("Build: ", "")
     if not out.get("job_type"):

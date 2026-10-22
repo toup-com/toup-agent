@@ -55,12 +55,10 @@ from app.api.message_cards import job_marker_content as _job_marker
 from app.config import settings, presave_refresh_trim_enabled
 from app.db import db_span as _db_span_mod
 from app.services.budget_refusal import (
-    ERROR_CLASS as _BUDGET_ERROR_CLASS,
     budget_refusal_detail,
     chat_sentence as _budget_chat_sentence,
     frame_fields as _budget_frame_fields,
     is_budget_refusal,
-    job_sentence as _budget_job_sentence,
     push_body as _budget_push_body,
 )
 from app.services.credit_exhausted import (
@@ -394,14 +392,18 @@ _PRE_TURN_KEYS = (
     # so they sum to more than `lookups` and that is the point — without them
     # `lookups` cannot say which of the three is the slow one.
     "lookups", "automation", "reply_to", "tz", "appctx", "ledger", "presave",
-    "attach", "fast_media", "task_detect",
+    "attach", "fast_media",
 )
 
 
-async def _resolve_day_chat_id_for_now(db_session, user_id: str, tz_override: str = None):
+async def _resolve_day_chat_id_for_now(
+    db_session, user_id: str, tz_override: str = None, utc_now=None,
+):
     """Thin wrapper around the shared helper. See app.db.message_helpers."""
     from app.db.message_helpers import resolve_day_chat_id_for_now
-    return await resolve_day_chat_id_for_now(db_session, user_id, tz_override=tz_override)
+    return await resolve_day_chat_id_for_now(
+        db_session, user_id, tz_override=tz_override, utc_now=utc_now,
+    )
 
 
 #: The day chat this turn's user message was stamped with, published for the
@@ -1433,97 +1435,12 @@ async def _check_age_and_swap(video_id: str, user_id: str) -> None:
         logger.warning("[AGE-SWAP] Error checking %s: %s — YouTube embed stays", video_id, e)
 
 
-# ── Task intent detection ──────────────────────────────────────────
-# Keyword/regex heuristic: detects imperative task requests in chat.
-# Matches phrases like "research X", "find me Y", "monitor Z", "set up A".
-#
-# IMPORTANT: reminder-shaped phrases ("remind me…", "schedule a…", "ping
-# me at…", "wake me up in…") are deliberately EXCLUDED. They flow into
-# the routines/reminder skill (routines__remind), not the agent_task
-# BuildJob pipeline. Pre-2026-05-18 this regex matched "remind\s+me"
-# which created an empty agent_task BuildJob for every reminder, leaving
-# an orphan "Thinking…" indicator in chat (because the BuildJob's
-# steps_json stayed "[]" forever) and a bogus "No build steps recorded"
-# job card on /jobs.
-import re as _re
-_TASK_INTENT_PATTERN = _re.compile(
-    r"^(research|find\s+(me\s+)?|look\s+up|monitor|track|set\s+up|"
-    r"analyze|investigate|summarize|compile|gather|collect|prepare|"
-    r"write\s+(me\s+)?(a\s+)?|draft\s+(me\s+)?(a\s+)?|create\s+(a\s+)?report|"
-    r"compare|review|check\s+(if|whether)|scan|audit|benchmark|evaluate)",
-    _re.IGNORECASE,
-)
-
-
-def _chat_task_title(text: str) -> str:
-    """The title a chat-intent task job is created with — and the `name`
-    every `job_update` frame about it carries, so a client meeting the job
-    for the first time in one of those frames draws the task, not a build."""
-    return text.strip()[:60]
-
-
-#: The `job_type` of a chat-intent task (see `_detect_and_create_task`).
-_CHAT_TASK_JOB_TYPE = "agent_task"
-
-
-async def _detect_and_create_task(
-    text: str, user_id: str, session_id: Optional[str],
-    broadcast_queue: asyncio.Queue,
-) -> Optional[str]:
-    """If text looks like a task request, create an agent_task BuildJob.
-
-    Returns job_id if a task was created, None otherwise.
-    """
-    if not _TASK_INTENT_PATTERN.search(text.strip()):
-        return None
-
-    title = _chat_task_title(text)
-
-    # PR 4c (unified-jobs arc): repoint through ``JobRunner.create_job``
-    # so the new columns are populated for chat-intent tasks.
-    #   - source_kind='chat_intent' (versus 'manual' for dashboard input).
-    #   - source_id = session_id when present — links the task back to
-    #     the chat conversation that spawned it.
-    #   - conversation_id = session_id too — Mission Control reads this
-    #     to show "from chat with ___" attribution.
-    # No idempotency_key: the same text fired twice IS a legitimate
-    # two-task request from the user's perspective.
-    from app.agent.job_runner import JobRunner, TaskSpec
-    spec = TaskSpec(
-        user_id=user_id,
-        channel="chat_intent",
-        source_kind="chat_intent",
-        source_id=session_id,
-        conversation_id=session_id,
-    )
-    try:
-        job = await JobRunner().create_job(
-            job_type=_CHAT_TASK_JOB_TYPE,
-            spec=spec,
-            title=title,
-            prompt=text[:2000],
-            status="running",
-            layer=0,
-        )
-        job_id = job.id
-        # Notify frontend: "Created task → view in Dashboard"
-        broadcast_queue.put_nowait({
-            "type": "task_created",
-            "job_id": job_id,
-            "title": title,
-        })
-        # `title` is the first 60 characters of the user's own message. The
-        # container trail ships to Loki and is retained for days, so the line
-        # carries its LENGTH, the same shape the [FAST-MEDIA] line one
-        # function away already uses.
-        logger.info(
-            "[TASK] Detected task intent, created agent_task job %s title_len=%d",
-            job_id[:8], len(title),
-        )
-        return job_id
-    except Exception as e:
-        logger.warning(f"[TASK] Failed to create task job: {e}")
-        return None
+# ── Task intent detection: RETIRED (voice round 2026-10-05, D-P4) ──────
+# An English-only prefix regex used to mint an empty-step `agent_task` row at
+# t0 for "research …" / "find me …" — never for Persian, and a SECOND card
+# whenever the model then called `create_job` for the same ask. The runner
+# now mints the card itself for a work round without `create_job`
+# (`voice_jobs.TurnJob`, one producer for chat and voice).
 
 
 def _media_halt_mark_now(user_id: str):
@@ -4248,11 +4165,37 @@ async def _persist_job_card(
                 return _JOB_CARD_NOT_OURS
             return _JOB_CARD_NO_TARGET
 
+        # Voice round 2026-10-06 (D-R8 d): a voice delegation's card is
+        # stamped at the caller turn that ASKED and linked to it — the same
+        # helper `TurnJob._write_chat_card` uses, fed from the job row's
+        # config (the relay's `parent_user_turn_id` / `anchor_occurred_at`).
+        # A row without them (a chat job, an older relay) is written as before.
+        if _job is None:
+            _job = await _jdb.get(_BJ, _jid)
+        _cfg = getattr(_job, "config_json", None) if _job is not None else None
+        if isinstance(_cfg, str):
+            try:
+                _cfg = json.loads(_cfg)
+            except (ValueError, TypeError):
+                _cfg = None
+        _cfg = _cfg if isinstance(_cfg, dict) else {}
+        from app.api.message_cards import job_marker_row_fields, marker_day_instant
+        _marker_extra = job_marker_row_fields(
+            delegation_id=_cfg.get("voice_delegation_id"),
+            parent_user_turn_id=_cfg.get("parent_user_turn_id"),
+            request_turn_ids=_cfg.get("request_turn_ids"),
+            anchor_occurred_at=_cfg.get("anchor_occurred_at"),
+        )
         _jdb.add(_Msg(
             id=_mid,
             conversation_id=_conv_id,
+            # Phase D (correctness-tenant-8): the marker's DAY is the day of
+            # its stamp (the asking turn), never the day the card closed — a
+            # card asked at 23:59 and closed at 00:00 sat at the top of the
+            # next day's thread, with no asker there.
             day_chat_id=await _resolve_day_chat_id_for_now(
                 _jdb, user_id, tz_override=tz,
+                utc_now=marker_day_instant(_marker_extra.get("occurred_at")),
             ),
             role="job",
             content=_job_marker(
@@ -4260,6 +4203,7 @@ async def _persist_job_card(
                 event.get("name") or "App Build",
                 event.get("job_type"),
             ),
+            **_marker_extra,
         ))
         await _jdb.commit()
         return _JOB_CARD_WRITTEN
@@ -6299,22 +6243,6 @@ async def ws_chat(
                             "_auto": True,
                         }))
 
-                # Task intent detection — detect imperative task requests in regular chat
-                _chat_task_job_id = None
-                # The job's title, for the `name` of every job_update frame
-                # below: the web never handles `task_created`, so one of those
-                # frames can be where a client first meets this job — and a
-                # frame with no name/job_type is drawn as "App Build".
-                _chat_task_name = None
-                if channel != "vibecoding" and not _fast_result:
-                    _pt.start("task_detect")
-                    _chat_task_job_id = await _detect_and_create_task(
-                        text, user_id, session_id, broadcast_queue
-                    )
-                    if _chat_task_job_id:
-                        _chat_task_name = _chat_task_title(text)
-                    _pt.end("task_detect")
-
                 # Reply-to preamble (LLM-only): prepend a short quoted reference
                 # to `_agent_text` so the model treats the new user turn as a
                 # threaded reply, not a fresh question. Stored content stays
@@ -6574,29 +6502,6 @@ async def ws_chat(
                         await stop_task  # Wait for stop task to actually finish
                     except (asyncio.CancelledError, Exception):
                         pass
-
-                    # Finalize chat task job if one was created
-                    if _chat_task_job_id:
-                        try:
-                            from app.db.database import async_session_maker as _sm
-                            from app.db.models import BuildJob as _BJ
-                            async with _sm() as _tdb:
-                                _tj = await _tdb.get(_BJ, _chat_task_job_id)
-                                if _tj and _tj.status == "running":
-                                    _tj.status = "completed"
-                                    _tj.completed_at = datetime.utcnow()
-                                    _tj.total_tokens = response.tokens_total or 0
-                                    _tj.model = response.model or ""
-                                    await _tdb.commit()
-                            await broadcast_queue.put({
-                                "type": "job_update",
-                                "job_id": _chat_task_job_id,
-                                "name": _chat_task_name,
-                                "job_type": _CHAT_TASK_JOB_TYPE,
-                                "status": "completed",
-                            })
-                        except Exception as _te:
-                            logger.warning(f"[TASK] Failed to finalize task job: {_te}")
 
                     # Terminal activity: show agent response summary
                     resp_preview = response.text[:200].replace("\n", " ")
@@ -6878,37 +6783,6 @@ async def ws_chat(
                     # is over, so nothing downstream should still be scheduling
                     # "working on your answer" for it.
                     _turn_flags["finished"] = True
-                    # …and so is its chat-task job. The answer branch completes
-                    # it and the error branch fails it; this branch did neither,
-                    # so a stopped turn left a `running` BuildJob row behind
-                    # forever and both clients drew it as an "In progress" card
-                    # on every load, under a reply that had visibly stopped.
-                    # Reproduced on the simulator 2026-08-25, first stop ever
-                    # sent from the phone. `cancelled` is already terminal in
-                    # both clients (JobProgressCard renders it "Cancelled",
-                    # neutral) — it just had no producer.
-                    if _chat_task_job_id:
-                        try:
-                            from app.db.database import async_session_maker as _sm3
-                            from app.db.models import BuildJob as _BJ3
-                            async with _sm3() as _cdb:
-                                _cj = await _cdb.get(_BJ3, _chat_task_job_id)
-                                if _cj and _cj.status == "running":
-                                    _cj.status = "cancelled"
-                                    _cj.completed_at = datetime.utcnow()
-                                    await _cdb.commit()
-                            # So a client still on this socket folds the card now
-                            # rather than on its next poll — the answer branch
-                            # broadcasts for the same reason.
-                            await broadcast_queue.put({
-                                "type": "job_update",
-                                "job_id": _chat_task_job_id,
-                                "name": _chat_task_name,
-                                "job_type": _CHAT_TASK_JOB_TYPE,
-                                "status": "cancelled",
-                            })
-                        except Exception as _ce:  # noqa: BLE001
-                            logger.warning("[TASK] Failed to cancel task job: %s", _ce)
                     # Save partial response on user-stop so it's not lost.
                     # `conversation_id` is NOT NULL, and a brand-new user's FIRST
                     # message arrives with session_id=null (see the note at the
@@ -6950,40 +6824,6 @@ async def ws_chat(
                     _budget_detail = budget_refusal_detail(e) if _budget_refused else None
                     _copy_tz = (await _budget_copy_tz(client_tz, user_id)
                                 if _budget_refused else None)
-                    # Mark chat task job as failed if one was created
-                    if _chat_task_job_id:
-                        try:
-                            from app.db.database import async_session_maker as _sm2
-                            from app.db.models import BuildJob as _BJ2
-                            _budget_job_msg = None
-                            async with _sm2() as _fdb:
-                                _fj = await _fdb.get(_BJ2, _chat_task_job_id)
-                                if _fj and _fj.status == "running":
-                                    _fj.status = "failed"
-                                    _fj.error_message = str(e)[:500]
-                                    if _budget_refused:
-                                        # The fields a client renders; the
-                                        # raw text above is for operators.
-                                        _budget_job_msg = _budget_job_sentence(
-                                            _budget_detail, _copy_tz)
-                                        _fj.error_class = _BUDGET_ERROR_CLASS
-                                        _fj.user_message = _budget_job_msg
-                                    _fj.completed_at = datetime.utcnow()
-                                    await _fdb.commit()
-                            if _budget_job_msg:
-                                # So a card still on screen says why, and
-                                # drops a retry the same gate would refuse.
-                                await broadcast_queue.put({
-                                    "type": "job_update",
-                                    "job_id": _chat_task_job_id,
-                                    "name": _chat_task_name,
-                                    "job_type": _CHAT_TASK_JOB_TYPE,
-                                    "status": "failed",
-                                    "user_message": _budget_job_msg,
-                                    "error_class": _BUDGET_ERROR_CLASS,
-                                })
-                        except Exception:
-                            pass
                     _tprint(f"\033[1;31m  ✗ Error: {e}{_RESET}")
                     _turn_flags["finished"] = True
                     # Tell a gone client's phone the turn died — the

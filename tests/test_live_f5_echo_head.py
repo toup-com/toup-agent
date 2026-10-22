@@ -136,7 +136,7 @@ def _agent(words, *, wall_s=0.2, step_s=0.075, position_ms=200):
             await at(wall_s + i * step_s)
             position = position_ms + int(i * step_s * 1000)
             p.push(H.out_text(" " + word, position, position + int(step_s * 1000)))
-            p.push(H.out_audio("AAAA"))
+            p.push(H.out_audio("AQID"))
     return run
 
 

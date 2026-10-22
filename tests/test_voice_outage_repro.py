@@ -41,9 +41,16 @@ async def test_agent_outage_degrades_a_play_request_to_a_toolless_answer(v2_on, 
     attempts = []
 
     async def _dead_agent(agent_url, agent_api_key, method, path,
-                          params=None, json_body=None, timeout=15.0):
+                          params=None, json_body=None, timeout=15.0, outcome=None):
+        # What the REAL `_vps_api` does when the container is mid-swap: it never
+        # raises — it returns None and reports the httpx class through
+        # `outcome`. This double used to RAISE a builtin ConnectionError, which
+        # is the only reason the dead `except (ConnectionError, OSError)` retry
+        # ever looked alive (2026-10-02 call, P2.2).
         attempts.append(path)
-        raise ConnectionError("agent container restarting (rollout)")
+        if outcome is not None:
+            outcome.update(error="ConnectError", failure="transient")
+        return None
     monkeypatch.setattr(rt, "_vps_api", _dead_agent)
 
     captured = {}

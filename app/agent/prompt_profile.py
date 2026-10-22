@@ -262,6 +262,12 @@ SUBAGENT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "memory_read_file",
     # No grandchildren — v1 depth = 1
     "spawn",
+    # A worker is never a supervisor (supervisor_gate also refuses the
+    # `subagent` channel; this is the profile-level half).
+    "delegate",
+    # A background worker must never touch the user's device: stopping or
+    # skipping their music is an attended act (voice round 2026-10-06, D-T1).
+    "media_control",
     # No missions from sub-agents (Autopilot PR8)
     "start_mission",
     # Dashboard / sidebar surfaces are user-intent shapes; a sub-agent
@@ -335,6 +341,9 @@ AUTOPILOT_DISABLED_TOOLS: frozenset[str] = frozenset({
     "save_streaming_credential",
     # No mission-from-mission recursion (Autopilot PR8).
     "start_mission",
+    # The user is away by definition; their player is not a mission's to
+    # stop or skip (D-T1).
+    "media_control",
 }) | DESKTOP_LOCAL_TOOLS
 # ^ Toup for Mac: a mission tick runs while the user is away, by
 # definition. The mutating half would stage a card onto a surface nobody
@@ -438,6 +447,9 @@ TRIGGER_DISABLED_TOOLS: frozenset[str] = frozenset({
     "spawn",
     "start_mission",
     "save_streaming_credential",
+    # An inbound email must not be able to stop or skip the user's music
+    # (D-T1): nobody is in the loop on a trigger turn.
+    "media_control",
 }) | DESKTOP_LOCAL_TOOLS
 # ^ Toup for Mac: "unlike voice there is no user in the loop to notice"
 # is the whole argument, and it applies hardest to a tool whose executor
@@ -527,6 +539,9 @@ AUTOMATION_THREAD_WITHHELD: dict[str, str] = {
     "triggers__update": "the same edit, made invisibly, to something "
                         "the user is not looking at",
     "triggers__delete": "destructive, and out of this thread's scope",
+    # Voice round 2026-10-06 (D-T1).
+    "media_control": "a question about one automation must not stop or "
+                     "skip the music on the user's device as a side effect",
 }
 
 AUTOMATION_THREAD_DISABLED_TOOLS: frozenset[str] = frozenset(

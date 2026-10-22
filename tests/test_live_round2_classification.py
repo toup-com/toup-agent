@@ -539,7 +539,10 @@ async def test_a_negating_opener_before_an_unrelated_request_never_supersedes(mo
     assert all("relation" not in f for f in _frames_for(client, "d2"))
     assert displays.get("d2") == followup
     second = inputs.get("d2", "")
-    assert "non-binding" in second and RESEARCH in second, second
+    # PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R7 / D-6a): the
+    # running work is still carried as CONTEXT, under the reworded rule
+    # ("context only …", was "non-binding context — apply it only if …").
+    assert "context only" in second and RESEARCH in second, second
     assert "Request the caller is correcting" not in second
 
 

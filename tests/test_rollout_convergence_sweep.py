@@ -914,3 +914,95 @@ async def test_upgrade_one_ok_write_clears_stale_orphan_stamp():
         )).scalar_one()
         assert persisted.status == "ok"
         assert persisted.error is None
+
+
+# ─── Voice round 2026-10-06: a hand canary is never converged backward ───
+#
+# 10f3084932f5 was built by a `[skip rollout]` merge and canaried by hand to
+# 871bac24 (04:09Z) and c47c5b4b (04:19Z). No rollout row names it, so the
+# sweep's target stayed the last COMPLETE rollout's tag (b2459dcdf012), and at
+# 04:22:46Z a platform-api replica POSTed /v1/tenants/c47c5b4b/blue-green-
+# upgrade → 404 → /whois → /upgrade with b2459dcdf012: `_upgrade_one` →
+# `upgrade_tenant_image`, i.e. this sweep. 871bac24 was spared by
+# `_running_tenants`' own filter (inferred: a pinned row).
+
+CANARY_TAG = "ghcr.io/toup-com/toup-agent:canary0000"
+
+
+async def _set_started(container_id: str, when):
+    from app.db import async_session_maker
+    from app.db.models import ManagedContainer
+
+    async with async_session_maker() as db:
+        mc = await db.get(ManagedContainer, container_id)
+        mc.started_at = when
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_sweep_never_converges_a_hand_canary_backward(monkeypatch):
+    from app.services import rollout_service
+
+    _clear_sweep_alert_dedup()
+    target = await _seed_rollout(status="complete", image_tag=NEW_TAG)
+    # Canaried by hand AFTER the fleet settled, onto an image no rollout ever
+    # targeted — and stored the way row-sync writes it: the BARE digest.
+    canary = await _seed_tenant(image_tag="canary0000")
+    await _set_started(canary.id, target.completed_at + timedelta(minutes=3))
+    # Same unknown image but never (re)started since the fleet settled: a
+    # stale row the sweep exists to repair.
+    stale = await _seed_tenant(image_tag="canary0000")
+    await _set_started(stale.id, target.completed_at - timedelta(days=2))
+    # The bare form of the TARGET tag is converged, not "divergent".
+    bare_ok = await _seed_tenant(image_tag="newtag00")
+
+    calls: list = []
+
+    async def fake_upgrade(_db, user_id, image_tag, rollout_id=None):
+        calls.append(user_id)
+        return {"health_checks_passed": 3, "duration_ms": 12}
+
+    async def fake_telegram(level, message):
+        pass
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        await rollout_service._convergence_sweep_once()
+
+    assert calls == [stale.user_id], (
+        f"canary={canary.user_id[:8]} stale={stale.user_id[:8]} "
+        f"bare_ok={bare_ok.user_id[:8]} got={calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_the_exempt_admin_prefixes(monkeypatch):
+    from app.config import settings
+    from app.services import rollout_service
+
+    _clear_sweep_alert_dedup()
+    await _seed_rollout(status="complete", image_tag=NEW_TAG)
+    admin = await _seed_tenant(image_tag=OLD_TAG)
+    other = await _seed_tenant(image_tag=OLD_TAG)
+    monkeypatch.setattr(settings, "rollout_sweep_exempt_prefixes", admin.user_id[:8])
+
+    calls: list = []
+
+    async def fake_upgrade(_db, user_id, image_tag, rollout_id=None):
+        calls.append(user_id)
+        return {"health_checks_passed": 3, "duration_ms": 12}
+
+    async def fake_telegram(level, message):
+        pass
+
+    with patch.object(rollout_service, "upgrade_tenant_image", fake_upgrade), \
+         patch.object(rollout_service, "_send_telegram", fake_telegram):
+        await rollout_service._convergence_sweep_once()
+    assert calls == [other.user_id]
+
+
+def test_the_admin_canary_tenants_are_exempt_by_default():
+    from app.config import Settings
+
+    exempt = Settings.model_fields["rollout_sweep_exempt_prefixes"].default
+    assert {"871bac24", "c47c5b4b"} <= set(exempt.split(","))

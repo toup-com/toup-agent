@@ -133,7 +133,13 @@ _FRONTMATTER = re.compile(r"\A\s*---\s*\n.*?\n---\s*\n", re.DOTALL)
 # reads, when shown to the user, as the agent being coached mid-sentence.
 _STAGE_DIRECTION = re.compile(
     r"[^.\n]*\b(?:tell the user|do not paste|say to the user|"
-    r"offer the \[\[|inform the user)\b[^.\n]*\.?\s*",
+    r"offer the \[\[|inform the user|"
+    # Voice round 2026-10-06 (problem 8): `ws_realtime._play_media_direct`'s
+    # sentence for the model — "Starting X on the user's device; more in the
+    # same style will follow automatically." — was saved as a card's message.
+    # A served string that says "the user" in the third person is written for
+    # the model, always.
+    r"on the user's device|will follow automatically)\b[^.\n]*\.?\s*",
     re.IGNORECASE,
 )
 
@@ -436,6 +442,9 @@ _STEP_LABELS = {
     "desktop__ui_key": "Pressing a key on your Mac",
     "doctor": "Running a health check",
     "spawn": "Starting a helper",
+    "delegate": "Working with helpers",
+    # D-T1's tool (Phase D, contract-wire-5): its rows read "Working".
+    "media_control": "Controlling the music",
     "start_mission": "Starting a mission",
     "create_job": "Planning the work",
     "update_job": "Tracking progress",

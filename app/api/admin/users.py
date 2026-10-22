@@ -1567,6 +1567,69 @@ async def set_subagent_spawning(
     )
 
 
+class SubagentSettingsBody(BaseModel):
+    """Per-tenant supervisor / executor overrides. Every field optional; a
+    PUT REPLACES the stored object, so an omitted (or null) field returns to
+    the image default. Caps can only LOWER the image's own ceilings."""
+    enabled: Optional[bool] = None
+    executor_model: Optional[str] = Field(default=None, max_length=80)
+    supervisor_model: Optional[str] = Field(default=None, max_length=80)
+    max_workers: Optional[int] = Field(default=None, ge=1, le=6)
+    max_children_per_parent: Optional[int] = Field(default=None, ge=1, le=20)
+    max_per_user_concurrent: Optional[int] = Field(default=None, ge=1, le=10)
+    worker_timeout_seconds: Optional[int] = Field(default=None, ge=30, le=900)
+
+
+class SubagentSettingsResponse(SubagentSettingsBody):
+    user_id: str
+
+
+@router.get(
+    "/users/{user_id}/subagent-settings",
+    response_model=SubagentSettingsResponse,
+)
+async def get_subagent_settings(
+    user_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The tenant's stored supervisor/executor overrides ({} = image defaults)."""
+    from app.services import subagent_settings as _ss
+
+    if (await db.execute(select(User.id).where(User.id == user_id))).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return SubagentSettingsResponse(user_id=user_id, **await _ss.load(db, user_id))
+
+
+@router.put(
+    "/users/{user_id}/subagent-settings",
+    response_model=SubagentSettingsResponse,
+)
+async def put_subagent_settings(
+    user_id: str,
+    body: SubagentSettingsBody,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Store the tenant's supervisor/executor overrides in ``platform_settings``
+    (``subagent.settings.<user_id>``). NO container restart: the tenant reads
+    them through ``GET /api/agent/runtime-flags`` with a 60 s cache, so a flip
+    is live within a minute and no in-flight turn, call or worker is killed —
+    the reason this is not ``…/subagent-spawning``'s restart path."""
+    from app.services import subagent_settings as _ss
+
+    if (await db.execute(select(User.id).where(User.id == user_id))).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    stored = await _ss.save(
+        db, user_id, body.model_dump(exclude_none=True),
+        admin_id=getattr(admin, "id", None),
+    )
+    await db.commit()
+    logger.info("[admin] subagent settings for %s set by %s: %s",
+                user_id[:8], str(getattr(admin, "id", ""))[:8], sorted(stored))
+    return SubagentSettingsResponse(user_id=user_id, **stored)
+
+
 # ─── Helpers ───────────────────────────────────────────────────
 
 def _invite_to_response(invite: Invite) -> InviteResponse:

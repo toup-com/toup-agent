@@ -650,3 +650,162 @@ def test_the_latch_comes_after_the_attempt():
     writer = writer[:writer.index('@router.websocket("/ws/chat")')]
     attempt = writer.index("await _persist_job_card(")
     assert writer.index("budget.closed.add(") > attempt
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Voice round 2026-10-06 (D-R8 d): the marker is stamped at its ASKER
+# ══════════════════════════════════════════════════════════════════════
+#
+# The «استاپش کن» chip sat at the END of the thread: markers carried no
+# `occurred_at` (so they sorted by write time) and nothing linked them to the
+# bubble that asked. Both writers now go through ONE helper.
+
+_ANCHOR = {
+    "parent_user_turn_id": "turn-ask-1",
+    "request_turn_ids": ["turn-ask-0", "turn-ask-1"],
+    "anchor_occurred_at": "2026-10-06T12:41:09.123000",
+}
+
+
+async def _anchor_job(job_id: str):
+    from app.db.database import async_session_maker
+    from app.db.models import BuildJob
+    async with async_session_maker() as db:
+        bj = await db.get(BuildJob, job_id)
+        bj.config_json = {"voice_turn": True, "voice_delegation_id": "dlg-77", **_ANCHOR}
+        await db.commit()
+
+
+def _voice_meta(row) -> dict:
+    import json as _json
+    return (_json.loads(row.metadata_json or "{}") or {}).get("voice") or {}
+
+
+async def test_the_socket_writer_stamps_the_marker_at_its_asking_turn(requires_job_card_tables):
+    from app.api.ws_chat import _JOB_CARD_WRITTEN, _persist_job_card
+
+    user_id, conv_id, job_id = await _seed()
+    await _anchor_job(job_id)
+    assert await _persist_job_card(user_id, _frame(job_id, conv_id)) == _JOB_CARD_WRITTEN
+    row = await _card(job_id)
+    assert row.occurred_at == datetime(2026, 10, 6, 12, 41, 9, 124000), row.occurred_at
+    assert _voice_meta(row) == {
+        "kind": "job_marker", "delegation_id": "dlg-77", "task_id": "dlg-77",
+        "parent_user_turn_id": "turn-ask-1",
+        "request_turn_ids": ["turn-ask-0", "turn-ask-1"],
+    }
+
+
+async def test_a_job_without_an_anchor_is_written_exactly_as_before(requires_job_card_tables):
+    from app.api.ws_chat import _persist_job_card
+
+    user_id, conv_id, job_id = await _seed()
+    await _persist_job_card(user_id, _frame(job_id, conv_id))
+    row = await _card(job_id)
+    assert row.occurred_at is None and row.metadata_json is None
+
+
+async def test_the_close_writer_stamps_the_same_marker(requires_job_card_tables):
+    """`TurnJob._write_chat_card` — the writer that runs when the phone's chat
+    socket is closed during the call — produces the SAME row."""
+    import app.agent.voice_jobs as vj
+
+    user_id, conv_id, _ = await _seed()
+    tj = vj.TurnJob(user_id=user_id, conversation_id=conv_id,
+                    request_text="what did the UFC fighters weigh in at",
+                    delegation_id="dlg-77", anchor=dict(_ANCHOR))
+    tj._opened = True
+    await tj._write_chat_card()
+    row = await _card(tj._job_id)
+    assert row is not None and row.role == "job"
+    assert row.occurred_at == datetime(2026, 10, 6, 12, 41, 9, 124000)
+    assert _voice_meta(row)["parent_user_turn_id"] == "turn-ask-1"
+    assert _voice_meta(row)["kind"] == "job_marker" and "source" not in _voice_meta(row)
+
+
+def _zone_just_past_midnight() -> tuple[str, datetime]:
+    """A fixed-offset zone whose local clock reads 00:xx NOW, and an anchor
+    two hours ago (naive UTC) — i.e. on the far side of local midnight."""
+    from datetime import timedelta
+    now = datetime.utcnow()
+    for h in range(-12, 15):
+        if (now.hour + h) % 24 == 0:
+            return f"Etc/GMT{-h:+d}", now - timedelta(hours=2)
+    raise AssertionError("no zone found")  # pragma: no cover
+
+
+@pytest.mark.parametrize("writer", ["socket", "close"])
+async def test_a_marker_asked_before_local_midnight_is_filed_under_the_askers_day(
+    requires_job_card_tables, writer,
+):
+    """Phase D (correctness-tenant-8): both writers stamped the marker at its
+    asking turn but resolved its DAY "for now" — a card asked at 23:59 and
+    closed at 00:00 sat at the top of the NEXT day's thread (sorted above every
+    row of it, with no asker there) and was missing from the asker's day."""
+    import app.agent.voice_jobs as vj
+    from app.api.ws_chat import _persist_job_card
+
+    zone, asked = _zone_just_past_midnight()
+    anchor = dict(_ANCHOR, anchor_occurred_at=asked.isoformat(timespec="milliseconds"))
+    user_id, conv_id, job_id = await _seed(user_tz=zone)
+    if writer == "socket":
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+        async with async_session_maker() as db:
+            bj = await db.get(BuildJob, job_id)
+            bj.config_json = {"voice_turn": True, "voice_delegation_id": "dlg-77", **anchor}
+            await db.commit()
+        await _persist_job_card(user_id, _frame(job_id, conv_id), tz=zone)
+        row = await _card(job_id)
+    else:
+        tj = vj.TurnJob(user_id=user_id, conversation_id=conv_id,
+                        request_text="what did the UFC fighters weigh in at",
+                        delegation_id="dlg-77", anchor=anchor)
+        tj._opened = True
+        await tj._write_chat_card()
+        row = await _card(tj._job_id)
+    asked_day = asked.replace(tzinfo=_tzutc.utc).astimezone(ZoneInfo(zone)).date()
+    today = datetime.now(_tzutc.utc).astimezone(ZoneInfo(zone)).date()
+    assert asked_day != today, "the fixture must straddle local midnight"
+    assert await _day_of(row) == asked_day
+
+
+def test_a_marker_stamp_more_than_a_day_off_does_not_choose_the_day():
+    from datetime import timedelta
+    from app.api.message_cards import marker_day_instant
+
+    now = datetime.utcnow()
+    assert marker_day_instant(now - timedelta(hours=2)) == now - timedelta(hours=2)
+    assert marker_day_instant(now - timedelta(days=3)) is None
+    assert marker_day_instant(None) is None
+
+
+def test_both_writers_use_the_one_helper():
+    import inspect as _inspect
+    from app.agent.voice_jobs import TurnJob
+
+    assert "job_marker_row_fields(" in _ws_chat_source()
+    assert "job_marker_row_fields(" in _inspect.getsource(TurnJob._write_chat_card)
+
+
+def test_the_projection_names_the_delegation_and_its_asker():
+    """Read-time projection (`message_cards.job_card_fields`), so a day saved
+    before the marker carried the link is repaired on its next load."""
+    from types import SimpleNamespace
+    from app.api.message_cards import job_card_fields
+
+    msg = SimpleNamespace(role="job", content='{"job_id": "j1", "job_name": "UFC weigh-in"}')
+    bj = SimpleNamespace(
+        status="completed", app_id=None, parent_job_id=None, title="UFC weigh-in",
+        steps_json="[]", outcome=None, error_class=None, user_message=None,
+        config_json={"voice_delegation_id": "dlg-77", **_ANCHOR},
+    )
+    out = job_card_fields(msg, {"j1": bj})
+    assert out["job_delegation_id"] == "dlg-77"
+    assert out["job_parent_user_turn_id"] == "turn-ask-1"
+    bj.config_json = None
+    out = job_card_fields(msg, {"j1": bj})
+    assert "job_delegation_id" not in out and "job_parent_user_turn_id" not in out
+    # DECLARE-OR-DROPPED: the session fallback serializer drops undeclared keys.
+    from app.schemas import ChatMessageResponse
+    assert {"job_delegation_id", "job_parent_user_turn_id"} <= set(ChatMessageResponse.model_fields)

@@ -106,7 +106,9 @@ def test_prod_log_counts_reproduce_before_the_fix_shape():
     # 11 since memory v3: `memory_read_file` joined TOOLS_MEMORY. The index
     # in `# User Brain` names the user's files on every non-trivial turn,
     # so any intent can end up holding a slug it needs to open.
-    assert len(intent.tool_names) == 11, sorted(intent.tool_names)
+    # 12 since the supervisor (voice round 2026-10-05): `delegate` rides with
+    # the work-tracking tools and, like them, never with a question.
+    assert len(intent.tool_names) == 12, sorted(intent.tool_names)
     assert not (TOOLS_DOCGEN & intent.tool_names)
 
 

@@ -921,6 +921,75 @@ def get_agent_tools() -> List[Dict[str, Any]]:
             },
         },
         # ------------------------------------------------------------------
+        # Delegate — you supervise executor sub-agents and answer in-turn
+        # ------------------------------------------------------------------
+        {
+            "name": "delegate",
+            "description": (
+                "Run a HEAVY request as a supervisor: split it into 2-6 steps, "
+                "each done by its own helper agent (up to 3 at once), wait for "
+                "them, then check and merge their results and answer in THIS "
+                "turn. Use only when the request genuinely needs several "
+                "independent pieces of work — e.g. 'compare the three best X "
+                "with sources', research across several sources or accounts, "
+                "a multi-part investigation. Do NOT use it for small talk, for "
+                "anything your memory, this conversation or stable knowledge "
+                "answers, or for a single lookup you can do yourself with one "
+                "search. Before calling it say one short line that you are on "
+                "it; you may keep talking to the user while it runs. Helpers "
+                "start with NO conversation history: put every fact a step "
+                "needs into its `task`. A step that needs an earlier step's "
+                "output names it in `depends_on`; its task then receives that "
+                "output. The result lists each step's outcome, result and "
+                "sources: verify them, reconcile conflicts, name your sources, "
+                "and answer. A failed step is retried once by another helper; "
+                "if it still fails, say what is missing instead of guessing."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Short title for the whole job, in the user's language (shown on the card).",
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 2,
+                        "maxItems": 6,
+                        "description": "2-6 steps, each run by its own helper.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Short step label, in the user's language (shown on the card).",
+                                },
+                                "task": {
+                                    "type": "string",
+                                    "description": "Self-contained instruction for the helper: what to do and what to return, with sources.",
+                                },
+                                "role": {
+                                    "type": "string",
+                                    "description": "Optional helper role/name, e.g. 'Researcher'.",
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                    "description": "Indices (0-based) of EARLIER steps whose results this step needs.",
+                                },
+                            },
+                            "required": ["label", "task"],
+                        },
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Optional overall deadline in seconds (default and max 240).",
+                    },
+                },
+                "required": ["title", "steps"],
+            },
+        },
+        # ------------------------------------------------------------------
         # 14. Process — long-running background shell process management
         # ------------------------------------------------------------------
         {
@@ -1127,6 +1196,42 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                     },
                 },
                 "required": ["query"],
+            },
+        },
+        # ------------------------------------------------------------------
+        # 18b. media_control — stop / pause / resume / skip what is playing
+        # Voice round 2026-10-06 (D-T1): `play_media` was the ONLY media tool,
+        # so a delegated «استاپش کن» could only apologise ("I can't stop it
+        # from here") while the music kept playing. Same executor as the
+        # relay's tool-less route (`radio.control.run_media_control`).
+        # ------------------------------------------------------------------
+        {
+            "name": "media_control",
+            "description": (
+                "Stop, pause, resume, skip or go back on the music or video that is "
+                "playing on the user's device, right now. Call it the moment the user "
+                "asks to stop / pause / continue / skip / go back — in any language, "
+                "with or without naming the song ('stop it', 'pause', 'next one', "
+                "«استاپش کن», «بسه», «قطعش کن», «بعدی»). Never tell the user to tap the "
+                "player instead, and never say it is done before this tool answers. "
+                "Say one short line AFTER it answers, from its result: if it says "
+                "nothing was playing or the device did not confirm, say exactly that. "
+                "To start something new, use play_media instead."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["stop", "pause", "resume", "next", "previous"],
+                        "description": "stop = end playback; pause = hold it so it can resume; resume = continue what was paused; next / previous = skip forward / back one track.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Optional: the user's words that asked for it, for the log.",
+                    },
+                },
+                "required": ["action"],
             },
         },
         # ------------------------------------------------------------------
@@ -1808,8 +1913,10 @@ def get_extended_tools():
             "description": (
                 "Create a trackable job for multi-step work you are doing NOW, in this "
                 "conversation. It appears live in the user's dashboard, sidebar, and on "
-                "their phone's lock screen / Dynamic Island. Declare 2-4 short steps up "
-                "front; the LAST step is writing the answer. SPEED CONTRACT: every "
+                "their phone's lock screen / Dynamic Island. If the User Brain, this "
+                "conversation or stable knowledge answers the request, answer now — no "
+                "tool, no job. Otherwise say one short line and declare 2-6 short steps "
+                "up front; the LAST step is writing the answer. SPEED CONTRACT: every "
                 "response you spend on bookkeeping alone is a full model round-trip the "
                 "user waits through, so (1) call create_job IN THE SAME RESPONSE as the "
                 "first step's real tool calls (create_job first, then the searches/reads, "
@@ -1843,7 +1950,7 @@ def get_extended_tools():
                     "steps": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of step labels (e.g. ['Research', 'Draft outline', 'Write report']). Optional.",
+                        "description": "2-6 step labels, the last one writing the answer (e.g. ['Search the web', 'Compare the options', 'Write the answer']). Optional.",
                     },
                 },
                 "required": ["title"],

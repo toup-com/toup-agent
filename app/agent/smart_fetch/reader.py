@@ -382,6 +382,67 @@ def _parse_and_extract(html: str, url: str, max_chars: int) -> Tuple[str, str]:
     return "ok", result
 
 
+# ── The page's own touch icon (voice round 2026-10-06, D-T4) ─────────────
+# The call's source logos were Google's 32 px favicon stretched to 84–96 px.
+# A page that was actually FETCHED says, in its own head, where its large icon
+# is (`<link rel="apple-touch-icon" href=…>`, 180×180 by convention); that URL
+# rides `sources[].icon` and the client prefers it. One per domain, https only,
+# never guessed: a source the work only SEARCHED carries none.
+_TOUCH_ICON_LINK_RE = re.compile(
+    r"<link\b[^>]*\brel\s*=\s*[\"'][^\"']*apple-touch-icon[^\"']*[\"'][^>]*>",
+    re.IGNORECASE,
+)
+_HREF_RE = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+_TOUCH_ICON_HEAD_BYTES = 64 * 1024
+_TOUCH_ICON_MAX_DOMAINS = 256
+_TOUCH_ICON_URL_MAX = 300
+_touch_icons: "dict[str, str]" = {}
+
+
+def icon_domain(url: str) -> str:
+    """The domain key sources use (`api_v1._vs_source`): netloc minus www."""
+    try:
+        netloc = urlparse(url).netloc.lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def note_touch_icon(page_url: str, html: str) -> Optional[str]:
+    """Record the page's apple-touch-icon for its domain (first one wins).
+    Returns the absolute https URL, or None when the head names none."""
+    try:
+        domain = icon_domain(page_url)
+        if not domain or domain in _touch_icons:
+            return _touch_icons.get(domain)
+        head = html[:_TOUCH_ICON_HEAD_BYTES]
+        end = head.lower().find("</head>")
+        if end >= 0:
+            head = head[:end]
+        for tag in _TOUCH_ICON_LINK_RE.findall(head):
+            m = _HREF_RE.search(tag)
+            if not m:
+                continue
+            icon = urljoin(page_url, m.group(1).strip())
+            if urlparse(icon).scheme != "https" or len(icon) > _TOUCH_ICON_URL_MAX:
+                continue
+            if len(_touch_icons) >= _TOUCH_ICON_MAX_DOMAINS:
+                _touch_icons.pop(next(iter(_touch_icons)))
+            _touch_icons[domain] = icon
+            return icon
+    except Exception:  # noqa: BLE001 — an icon never costs a fetch
+        logger.debug("[ToupReader] touch icon parse failed", exc_info=True)
+    return None
+
+
+def touch_icon_for(url_or_domain: str) -> Optional[str]:
+    """The recorded touch icon for a FETCHED page's domain, else None."""
+    key = icon_domain(url_or_domain) if "://" in (url_or_domain or "") else (
+        (url_or_domain or "").lower().removeprefix("www.")
+    )
+    return _touch_icons.get(key)
+
+
 async def toup_read_page(url: str, max_chars: int = 15000) -> str:
     """
     Fetch and extract clean text from a URL without a browser.
@@ -420,6 +481,7 @@ async def toup_read_page(url: str, max_chars: int = 15000) -> str:
             return f"(Binary content: {content_type})"
 
         html = resp.text
+        note_touch_icon(str(resp.url), html)
 
         # Round 4 (item 7b): parse + extract are CPU-bound (BeautifulSoup +
         # trafilatura on a few hundred KB of HTML: 1–6 s measured on the

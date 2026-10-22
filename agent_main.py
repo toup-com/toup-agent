@@ -1105,6 +1105,22 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             print(f"⚠️ Orphan job recovery skipped: {e}")
 
+        # Sub-agent rows a crash left `running` past the sweep threshold. Its
+        # only caller used to be app/main.py, which no container runs, so the
+        # job reaper's 30-minute stall rule was the sole net — and a
+        # supervisor's caps count those rows as live until then. Not on a
+        # blue-green PASSIVE boot: the outgoing sibling may still be running
+        # a child younger than its 15-minute ceiling, and the 10-minute
+        # threshold would fail it under the running process.
+        if not _bg_passive_active:
+            try:
+                from app.agent.subagent_orchestrator import orphan_sweep_on_boot
+                _swept = await orphan_sweep_on_boot()
+                if _swept:
+                    print(f"🧹 Sub-agent orphan sweep: {_swept} row(s) failed")
+            except Exception as _se:  # noqa: BLE001 — never block boot
+                print(f"⚠️ Sub-agent orphan sweep skipped: {_se}")
+
         _boot_progress.update(percent=50, phase="agent_pipeline")
         # ── App Manager + App Builder Skill ────────────────────
         # Each step has its own try/except so partial init succeeds.

@@ -1,14 +1,15 @@
 """The saved call reads the way the live call read, and nothing the tenant could
 have taken is lost or mis-reported (R2 fix round, F31-F35 + addendum 9).
 
-The phone lays a call out CAUSALLY (liveProtocol.placeCausal): a user turn is
-appended when it appears, and an assistant reply sits under the turn it
-answers, after that turn's earlier replies, however late its row is written.
-The day chat sorts by `occurred_at` alone. These tests drive the real relay
-with provider-shaped events and compare the saved `occurred_at` order with the
-live order the relay's own frames produce (`live_order` below mirrors the app
-reducer's placement rule). Stamps are also required to be distinct at
-MILLISECOND precision, because that is what the app's day-chat sort compares.
+The phone lays a call out in TIME order (D-P7 R3, 2026-10-05; it was causal,
+`placeCausal`, until then): a user turn is appended when it appears, and an
+assistant reply is appended when it first appears — never above a user turn
+that was final before it began, however late it arrives.  The day chat sorts
+by `occurred_at` alone. These tests drive the real relay with provider-shaped
+events and compare the saved `occurred_at` order with the live order the
+relay's own frames produce (`live_order` below mirrors the app reducer's
+placement rule). Stamps are also required to be distinct at MILLISECOND
+precision, because that is what the app's day-chat sort compares.
 """
 
 import asyncio
@@ -74,58 +75,30 @@ def identity(ref):
 
 
 def live_order(frames):
-    """The app's call transcript order for these relay frames.
+    """The app's call transcript order for these relay frames (D-P7 R3).
 
     User bubbles append on their first `transcript` frame; an assistant entry
-    goes right after its parent and after that parent's lower-epoch replies,
-    waiting for a parent that has not appeared yet. A PARENTLESS entry goes to
-    the head (the app's rule for a greeting). `assert_saved_matches_live`
-    compares only user turns and PARENTED replies: a mid-call reply the relay
-    could not attribute is shown at the head live, and that is not a placement
-    the saved thread should copy (a test below pins where it IS saved).
+    appends on its first `response_text`, moving up only past TRAILING
+    assistant entries of a higher epoch — never above a user entry.  Its
+    parent no longer places it.
     """
 
     entries: list[dict] = []
-    pending: list[dict] = []
-
-    def user_at(turn_id):
-        return next((i for i, e in enumerate(entries)
-                     if e["role"] == "user" and e["id"] == turn_id), -1)
-
-    def place(e):
-        at = user_at(e["parent"]) + 1
-        while at < len(entries):
-            sib = entries[at]
-            if sib["role"] != "assistant" or sib["parent"] != e["parent"] or sib["epoch"] > e["epoch"]:
-                break
-            at += 1
-        entries.insert(at, e)
-
     for f in frames:
         kind = f.get("type")
         if kind == "transcript" and f.get("turn_id"):
-            if user_at(f["turn_id"]) < 0:
+            if not any(e["role"] == "user" and e["id"] == f["turn_id"] for e in entries):
                 entries.append({"id": f["turn_id"], "role": "user"})
-                for e in sorted([p for p in pending if p["parent"] == f["turn_id"]],
-                                key=lambda p: p["epoch"]):
-                    pending.remove(e)
-                    place(e)
         elif kind == "response_text" and f.get("assistant_turn_id"):
             aid = f["assistant_turn_id"]
-            if any(e["id"] == aid for e in entries + pending):
+            if any(e["id"] == aid for e in entries):
                 continue
             e = {"id": aid, "role": "assistant",
                  "parent": f.get("parent_user_turn_id") or "", "epoch": int(f.get("epoch") or 0)}
-            if not e["parent"]:
-                at = 0
-                while (at < len(entries) and entries[at]["role"] == "assistant"
-                       and not entries[at]["parent"] and entries[at]["epoch"] <= e["epoch"]):
-                    at += 1
-                entries.insert(at, e)
-            elif user_at(e["parent"]) >= 0:
-                place(e)
-            else:
-                pending.append(e)
+            at = len(entries)
+            while at > 0 and entries[at - 1]["role"] == "assistant" and entries[at - 1]["epoch"] > e["epoch"]:
+                at -= 1
+            entries.insert(at, e)
     return entries
 
 
@@ -137,7 +110,7 @@ def assert_saved_matches_live(recorded, client):
         ident = identity(ref)
         if ident not in saved_ids:
             saved_ids.append(ident)
-    live = [e["id"] for e in live_order(client.frames) if e["role"] == "user" or e["parent"]]
+    live = [e["id"] for e in live_order(client.frames)]
     common = [x for x in live if x in saved_ids]
     assert len(common) >= 3, (common, live, saved_ids)
     assert [x for x in saved_ids if x in common] == common, (
@@ -299,7 +272,8 @@ async def test_a_parentless_reply_barged_into_is_saved_where_it_was_seen(monkeyp
     assert order.index(f"live-output:{H.PSID}:1") < order.index(f"live-utt:{H.PSID}:1"), order
 
 
-# ── F32: parked replies and delegated results sit under their request ─
+# ── F32 → D-P7 R2: parked replies stay where the phone saw them; late
+#    results are saved where they arrive — after the turns said meanwhile ─
 
 @pytest.mark.asyncio
 async def test_a_parked_reply_whose_receipt_lands_after_the_next_turn_stays_above_it(monkeypatch):
@@ -389,28 +363,30 @@ async def _delegated_with_small_talk(monkeypatch, *, think_s=1.6):
 
 
 @pytest.mark.asyncio
-async def test_a_delegated_result_is_saved_under_its_request_not_below_later_turns(monkeypatch):
+async def test_a_delegated_result_is_saved_under_its_question_after_its_own_ack(monkeypatch):
+    """PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b).  It was
+    "saved where it arrived, after later turns": tail stamps put the 2026-10-06
+    «استاپش کن» card 45 s away from its question.  A task result now sits
+    under the question that asked for it — after the task's OWN
+    acknowledgement line, above the small talk said while it ran — whenever it
+    is written.  The paraphrase folds onto it (D-R8 a): no sibling row."""
+
     recorded, client = await _delegated_with_small_talk(monkeypatch)
     order, rows = assert_saved_matches_live(recorded, client)
     result = f"live-delegation:{H.PSID}:d1"
     u1, u2 = f"live-utt:{H.PSID}:1", f"live-utt:{H.PSID}:2"
     assert rows[result]["voice"].get("parent_user_turn_id") == u1
-    assert order.index(u1) < order.index(result) < order.index(u2), order
-    # The paraphrase the caller heard follows its result, still above U2 and
-    # the reply U2 got.
-    heard = [r for r in order if r.startswith("live-transcript:")]
-    assert heard, order
-    assert order.index(result) < order.index(heard[0]) < order.index(u2), order
-    # The holding line the caller heard first stays above the result.
     hold = f"live-output:{H.PSID}:1"
-    assert order.index(hold) < order.index(result), order
+    assert order.index(u1) < order.index(hold) < order.index(result) < order.index(u2), order
+    assert not [r for r in order if r.startswith("live-transcript:")], order
 
 
 @pytest.mark.asyncio
 async def test_rows_fit_between_turns_at_millisecond_precision_despite_timeline_skew(monkeypatch):
     """Production: output positions run seconds ahead of the input timeline,
-    so the next user row is clamped right below the reply. A late result for
-    the EARLIER turn must still get its own millisecond between them."""
+    so the next user row is clamped right below the reply. Every row still
+    gets its own millisecond, in the order the call showed them (D-P7 R2:
+    the late result for the EARLIER turn after the later one)."""
 
     H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=3.0,
                   voice_live_utterance_gap_ms=200, voice_live_output_epoch_gap_ms=150)
@@ -444,14 +420,24 @@ async def test_rows_fit_between_turns_at_millisecond_precision_despite_timeline_
     await H.run_relay(client, provider, timeout=12)
     order, rows = assert_saved_matches_live(recorded, client)
     result = f"live-delegation:{H.PSID}:d1"
+    # PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b): the late result
+    # for the EARLIER turn sits under that turn now, not after the later one.
     assert order.index(f"live-utt:{H.PSID}:1") < order.index(result) < order.index(
         f"live-utt:{H.PSID}:2"), order
+    # …and every stamp is the WALL clock, not `anchor + provider_ms`: the
+    # provider timeline here runs 28 s ahead and no row may follow it.
+    now = datetime.now(timezone.utc)
+    for ref, row in rows.items():
+        assert abs((now - row["at"]).total_seconds()) < 5.0, (ref, row["at"], now)
 
 
 @pytest.mark.asyncio
-async def test_a_media_card_that_starts_after_the_next_turn_is_saved_under_its_request(monkeypatch):
+async def test_a_media_card_that_starts_after_the_next_turn_is_saved_under_its_ask(monkeypatch):
     """The fast path's card is the delegated result of a "play" request, and a
-    slow tenant play can finish after the caller has said something else."""
+    slow tenant play can finish after the caller has said something else.
+
+    PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b): it was saved
+    after that; it sits under the ask that started it now."""
 
     import app.services.live_voice_protocol as live
 
@@ -491,8 +477,13 @@ async def test_a_media_card_that_starts_after_the_next_turn_is_saved_under_its_r
 
 @pytest.mark.asyncio
 async def test_a_request_that_is_still_the_newest_turn_keeps_its_old_stamps(monkeypatch):
-    """No later turn: the delegated row is `utterance.end_ms + 1` after
-    everything so far (unchanged), and every stamp stays in write order."""
+    """No later turn: the delegated row sits right under its question, and
+    every stamp stays in write order.
+
+    PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b): it was
+    `utterance.end_ms + 1` on the provider timeline (0.401 s after the
+    question's START, i.e. the question's length); it is the question's own
+    real stamp + 1 ms now (no acknowledgement epoch was voiced)."""
 
     H.fast_clocks(monkeypatch, voice_live_utterance_gap_ms=400)
 
@@ -514,7 +505,7 @@ async def test_a_request_that_is_still_the_newest_turn_keeps_its_old_stamps(monk
     rows = saved_rows(recorded["saves"])
     u2 = rows[f"live-utt:{H.PSID}:2"]["at"]
     result = rows[f"live-delegation:{H.PSID}:d1"]["at"]
-    assert (result - u2).total_seconds() == pytest.approx(0.401, abs=0.0005)
+    assert (result - u2).total_seconds() == pytest.approx(0.001, abs=0.0005)
     stamps = [
         s.get("user_occurred_at") or s.get("assistant_occurred_at")
         for s in recorded["saves"]
@@ -929,8 +920,12 @@ async def test_every_relay_written_voice_passes_the_tenant_allowlist(monkeypatch
 
 @pytest.mark.asyncio
 async def test_a_heard_paraphrase_row_sends_no_null_either(monkeypatch):
-    """The `live_transcript` sibling of a delegated result, written when its
-    epoch is gap-retired — before any ack."""
+    """The paraphrase of a delegated result, folded when its epoch is
+    gap-retired — before any ack.
+
+    PIN FLIPPED (voice round 2026-10-06, DESIGN-R2 D-R8 a): it was a
+    `live_transcript` sibling row; it folds onto the task row now, which
+    carries `spoken_interrupted` — through the tenant allowlist, no null."""
 
     H.fast_clocks(monkeypatch)
 
@@ -947,7 +942,10 @@ async def test_a_heard_paraphrase_row_sends_no_null_either(monkeypatch):
 
     heard = [s for s in recorded["saves"]
              if (s.get("assistant_voice") or {}).get("source") == "live_transcript"]
-    assert heard, [s.get("assistant_voice") for s in recorded["saves"]]
+    assert heard == [], [s.get("assistant_voice") for s in recorded["saves"]]
+    folded = [s for s in recorded["saves"]
+              if "spoken_interrupted" in (s.get("assistant_voice") or {})]
+    assert folded, [s.get("assistant_voice") for s in recorded["saves"]]
     voices, dropped = _through_tenant_allowlist(recorded["saves"])
     assert not dropped, dropped
     assert all(v is not None for voice in voices for v in voice.values()), voices
@@ -1023,9 +1021,18 @@ async def test_a_directly_answered_turn_logs_one_timeline_line_at_its_first_outp
     assert fields["close_provider_ms"] == "1200"
     assert fields["first_output_provider_ms"] == "1600"
     assert int(fields["first_output_ms"]) >= 0
+    # Pin widened, voice round 2026-10-06 (D-R1 (h)): every line now says
+    # whether the turn was a request, how stale the phone's and the
+    # provider's input were when it was written, and how long the relay HELD
+    # the reply's first output (`held_ms`, present when it was held) — the
+    # relay's own share of direct-reply latency.  Still counts only.
     assert set(_fields(mine[0])) <= {
         "turn_id", "reason", "close_provider_ms", "first_output_ms", "first_output_provider_ms",
+        "request", "since_client_audio_ms", "since_input_audio_ms", "held_ms",
     }, mine[0]
+    assert fields["request"] == "1"
+    assert int(fields["since_input_audio_ms"]) >= -1
+    assert "since_client_audio_ms" in fields
     for word in ("what", "time", "tokyo", "morning"):
         assert word not in _values(mine[0]), mine[0]
 
@@ -1065,3 +1072,226 @@ async def test_a_delegated_turn_logs_one_timeline_line_at_its_task_terminal(monk
     assert int(fields["finished_ms"]) >= int(fields["dispatched_ms"]) >= 0
     for word in ("robarts", "library", "close", "tonight", "check"):
         assert word not in _values(mine[0]), mine[0]
+
+
+@pytest.mark.asyncio
+async def test_a_never_answered_request_still_logs_its_timeline_line(monkeypatch, caplog):
+    """D-P1 (2026-10-05 call): the one per-turn latency record was missing
+    exactly for the turns that FAILED.  A request superseded by a newer one
+    before anything answered it logs `reason=unanswered_superseded`; one the
+    call ended on logs `reason=unanswered` at teardown — with the extra
+    fields only on those lines, never the caller's words."""
+
+    caplog.set_level(logging.INFO)
+    H.fast_clocks(monkeypatch, voice_live_utterance_gap_ms=200,
+                  voice_live_output_epoch_gap_ms=150)
+    H.patch_relay(monkeypatch)
+    provider = _provider()
+    client = H.FakeClient([
+        H.config(features=APP), 0.1,
+        lambda: provider.push(H.user_delta("what time is it in tokyo", 0, 1200)),
+        0.5,
+        lambda: provider.push(H.user_delta("and how about paris", 4000, 5200)),
+        0.5, {"type": "stop"},
+    ])
+    await H.run_relay(client, provider, timeout=8)
+
+    lines = _timeline_lines(caplog)
+    first, second = f"live-utt:{H.PSID}:1", f"live-utt:{H.PSID}:2"
+    mine = [line for line in lines if f"turn_id={first} " in line]
+    assert len(mine) == 1, lines
+    assert _fields(mine[0])["reason"] == "unanswered_superseded", mine[0]
+    assert _fields(mine[0])["close_provider_ms"] == "1200"
+    theirs = [line for line in lines if f"turn_id={second} " in line]
+    assert len(theirs) == 1, lines
+    assert _fields(theirs[0])["reason"] == "unanswered", theirs[0]
+    for line in mine + theirs:
+        # Pin widened (D-R1 (h)): + `request`, the two input clocks, and the
+        # ladder's fields (absent here: nothing re-asked, the ladder is off).
+        assert set(_fields(line)) <= {
+            "turn_id", "reason", "close_provider_ms", "reask_ms", "delayed_ms",
+            "client_audio_end_ms", "request", "since_client_audio_ms",
+            "since_input_audio_ms", "reask_n", "reask_ack_ms", "backstop_ms", "held_ms",
+        }, line
+        assert _fields(line)["request"] == "1", line
+        for word in ("tokyo", "paris", "time"):
+            assert word not in _values(line), line
+
+
+# ── voice round 2026-10-06 (D-R1 (h)): every caller turn, every rung ──
+
+
+@pytest.mark.asyncio
+async def test_an_expired_owed_reply_logs_unanswered_timeout(monkeypatch, caplog):
+    """`_REPLY_PENDING_MAX_S` with nothing — the line used to wait for the
+    turn's eviction or the call's end, and said `unanswered` then."""
+
+    from app.services import live_voice_protocol as live
+
+    caplog.set_level(logging.INFO)
+    H.fast_clocks(monkeypatch, voice_live_utterance_gap_ms=200)
+    monkeypatch.setattr(live, "_REPLY_PENDING_MAX_S", 0.8)
+    H.patch_relay(monkeypatch)
+    provider = _provider()
+    client = H.FakeClient([
+        H.config(features=APP), 0.1,
+        lambda: provider.push(H.user_delta("what is the capital of peru", 0, 1200)),
+        1.8, {"type": "stop"},
+    ])
+    await H.run_relay(client, provider, timeout=8)
+
+    turn = f"live-utt:{H.PSID}:1"
+    mine = [line for line in _timeline_lines(caplog) if f"turn_id={turn} " in line]
+    assert len(mine) == 1, _timeline_lines(caplog)
+    fields = _fields(mine[0])
+    assert fields["reason"] == "unanswered_timeout" and fields["request"] == "1", mine[0]
+    assert "since_client_audio_ms" in fields and "since_input_audio_ms" in fields
+    assert "peru" not in _values(mine[0])
+
+
+@pytest.mark.asyncio
+async def test_a_backstopped_turn_logs_its_reask_and_backstop_at_its_task_terminal(
+    monkeypatch, caplog,
+):
+    caplog.set_level(logging.INFO)
+    H.fast_clocks(
+        monkeypatch, voice_live_utterance_gap_ms=200, voice_live_uplink_keeper_enabled=True,
+        voice_live_reply_regen_after_s=0.3, voice_live_reply_backstop_enabled=True,
+    )
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        await asyncio.sleep(0.2)
+        return "Lima is the capital of Peru.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    provider = _provider(auto_ack=True)
+    client = H.FakeClient([
+        H.config(features=APP), 0.1,
+        lambda: provider.push(H.user_delta("what is the capital of peru", 0, 1200)),
+        2.2, {"type": "stop"},
+    ])
+    await H.run_relay(client, provider, timeout=10)
+
+    turn = f"live-utt:{H.PSID}:1"
+    mine = [line for line in _timeline_lines(caplog) if f"turn_id={turn} " in line]
+    assert len(mine) == 1, _timeline_lines(caplog)
+    fields = _fields(mine[0])
+    assert fields["reason"] == "task_terminal", mine[0]
+    assert int(fields["backstop_ms"]) >= int(fields["reask_ms"]) >= 300, mine[0]
+    assert fields["reask_n"] == "1" and int(fields["reask_ack_ms"]) >= 0, mine[0]
+    assert int(fields["created_ms"]) >= int(fields["backstop_ms"]) - 50, mine[0]
+    assert "peru" not in _values(mine[0]) and "lima" not in _values(mine[0])
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_asked_for_nothing_and_got_nothing_still_logs_request_0(
+    monkeypatch, caplog,
+):
+    caplog.set_level(logging.INFO)
+    H.fast_clocks(monkeypatch, voice_live_utterance_gap_ms=200)
+    H.patch_relay(monkeypatch)
+    provider = _provider()
+    client = H.FakeClient([
+        H.config(features=APP), 0.1,
+        lambda: provider.push(H.user_delta("okay thanks", 0, 800)),
+        0.6, {"type": "stop"},
+    ])
+    await H.run_relay(client, provider, timeout=8)
+
+    turn = f"live-utt:{H.PSID}:1"
+    mine = [line for line in _timeline_lines(caplog) if f"turn_id={turn} " in line]
+    assert len(mine) == 1, _timeline_lines(caplog)
+    fields = _fields(mine[0])
+    assert fields["reason"] == "unanswered" and fields["request"] == "0", mine[0]
+    assert "since_client_audio_ms" in fields, mine[0]
+    assert "thanks" not in _values(mine[0])
+
+
+# ── Voice round 2026-10-06 (DESIGN-R2 D-R8 b): REAL stamps ────────────
+# D-P7 R2 stamped every relay row at the TAIL: `anchor_wall + provider_ms`,
+# clamped above everything already stamped.  The provider timeline ran 48 s
+# ahead of the wall by 3 min into the 2026-10-06 call, so «استاپش کن» —
+# spoken at 12:41:07 — was saved at 12:41:55 and its job marker (which uses
+# `created_at`) sorted 45 s ABOVE it.
+
+def _stamp_session():
+    from app.config import settings as app_settings
+    from app.services.live_voice_protocol import (
+        LiveClientAdapter, UtteranceAssembler, _LiveSession,
+    )
+
+    session = _LiveSession.__new__(_LiveSession)
+    session.settings = app_settings
+    session.provider_session_id = H.PSID
+    session.adapter = LiveClientAdapter(session_id=H.PSID)
+    session.utterances = UtteranceAssembler(provider_session_id=H.PSID)
+    session.anchor_wall = datetime.now(timezone.utc)
+    return session
+
+
+def test_a_tie_moves_one_millisecond_and_nothing_else_moves_a_stamp():
+    from datetime import timedelta
+
+    session = _stamp_session()
+    when = datetime(2026, 10, 6, 12, 41, 7, 123000, tzinfo=timezone.utc)
+    a = session.stamp_at("row-a", when)
+    b = session.stamp_at("row-b", when)
+    later = session.stamp_at("row-c", when - timedelta(seconds=30))
+    assert a == when
+    assert b == when + timedelta(milliseconds=1), "a tie moves +1 ms"
+    assert later == when - timedelta(seconds=30), (
+        "no `last_occurred` clamp: a row stamped earlier than one already "
+        "issued keeps its own time"
+    )
+    assert session.stamp_at("row-a", when + timedelta(hours=1)) == a, "issued once per row"
+
+
+def test_a_row_written_late_keeps_the_moment_it_happened():
+    """The caller turn was SEEN 3 s ago and is written now; the task it asked
+    for finishes now: both keep the real order of events."""
+
+    from datetime import timedelta
+
+    session = _stamp_session()
+    _closed, turn = session.utterances.add("play something by drake", 0, 900)
+    seen = datetime.now(timezone.utc) - timedelta(seconds=3)
+    turn.seen_wall = seen
+    from app.services.live_voice_protocol import DelegatedTask
+
+    task = DelegatedTask(delegation_id="d1", offset_ms=0, transcript=turn.text, turn_id=turn.turn_id)
+    card = session.stamp_task_row(f"live-media:{H.PSID}:d1", task)
+    user = session.stamp_user_row(turn)
+    expect = datetime.fromtimestamp(int(seen.timestamp() * 1000) / 1000.0, tz=timezone.utc)
+    assert user == expect, "the caller row is stamped when it was seen, written late or not"
+    assert card == user + timedelta(milliseconds=1), "the card sits right under its ask"
+    body = session.delegated_turn_fields(task)
+    assert body["parent_user_turn_id"] == turn.turn_id
+    assert body["anchor_occurred_at"] == user.replace(tzinfo=None).isoformat(timespec="milliseconds")
+    assert body["task_title"] == "play something by drake"
+
+
+def test_a_reply_never_sorts_above_the_turn_it_answers():
+    """Critic R7: a reply's first words can reach the relay before a late
+    input transcript makes its turn's row.  The reply's stamp is clamped to
+    ≥ its parent's + 1 ms whenever the parent is known — at reservation, and
+    again when the row is written (a parent settled after the reservation)."""
+
+    from datetime import timedelta
+
+    from app.services.live_voice_protocol import ClosedEpoch
+
+    session = _stamp_session()
+    _closed, turn = session.utterances.add("what is the next ufc event", 0, 900)
+    turn.seen_wall = datetime.now(timezone.utc) + timedelta(seconds=2)   # seen LATE
+    session.adapter.provider_event(H.out_text("UFC 300 is on Saturday.", 1000, 2000), now=0.0)
+    session.reserve_epoch_stamp()
+    reserved = session.epoch_stamps[session.adapter.epoch]
+    # Parentless at reservation, so it is the wall clock (before the turn)…
+    assert reserved < turn.seen_wall
+    closed = ClosedEpoch(
+        epoch=session.adapter.epoch, output_id=session.adapter.output_id,
+        text="UFC 300 is on Saturday.", interrupted=False,
+        parent_user_turn_id=turn.turn_id,          # …settled to the turn later
+    )
+    row = session.stamp_epoch_row(f"live-output:{H.PSID}:{closed.epoch}", closed)
+    assert row == session.stamp_user_row(turn) + timedelta(milliseconds=1)

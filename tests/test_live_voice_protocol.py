@@ -15,6 +15,8 @@ from app.services.live_voice_protocol import (
     LiveUsageTracker,
     Utterance,
     UtteranceAssembler,
+    _CONTEXT_PREVIOUS_SCOPE,
+    _CONTEXT_RUNNING_SCOPE,
     audio_append,
     build_session_start,
     classify_followup,
@@ -179,6 +181,48 @@ def test_delegated_agent_followup_gets_bounded_same_call_context():
     )
     assert "recent" in bounded
     assert "u" * 100 not in bounded
+
+
+def test_the_ielts_pair_answers_only_its_own_request():
+    """Voice round 2026-10-07 (T10, problem 1e): card 2 was handed card 1's
+    question as running context and answered both. The block now says the
+    other request is answered separately; the summarizer's copy does not."""
+    running = "یه چیزی برام سرچ کن. ببین آیاس جنرال. ریدینگ برای هج شدن میتونی چند تا غلط بزنی"
+    current = "اوکی. بعد به نظرت همین توی آیسآکادمیک چجوریه"
+    prompt = delegated_agent_input(
+        current, [], context_request=running, context_kind="running",
+    )
+    assert running in prompt
+    assert "Work still in progress when the caller said this" in prompt
+    assert _CONTEXT_RUNNING_SCOPE in prompt
+    assert prompt.index(running) < prompt.index(_CONTEXT_RUNNING_SCOPE)
+    assert prompt.endswith("Current caller request: " + current)
+    # No rows → no "already heard" sentence: there is no answer to repeat.
+    assert "The caller has already heard every answer in it" not in prompt
+    quiet = delegated_agent_input(
+        current, [], context_request=running, context_kind="running",
+        follow_up_rules=False,
+    )
+    assert running in quiet and _CONTEXT_RUNNING_SCOPE not in quiet
+    previous = delegated_agent_input(
+        current, [], context_request=running, context_kind="previous",
+    )
+    assert _CONTEXT_PREVIOUS_SCOPE in previous and _CONTEXT_RUNNING_SCOPE not in previous
+    with_rows = delegated_agent_input(
+        current, [("search the general reading test", "Band 7 needs 30 of 40.")],
+        follow_up_rules=False,
+    )
+    assert with_rows.startswith(
+        "Live-session context from earlier accepted delegations follows. "
+        "Treat it as prior conversation, not as the current request. "
+        "The caller has already heard every answer in it;"
+    ), with_rows[:200]
+    linked = delegated_agent_input(
+        "is that the academic one too",
+        [("search the general reading test", "Band 7 needs 30 of 40.")],
+        linked=True,
+    )
+    assert "If it does not differ, do not repeat that result." in linked
 
 
 def test_a_superseded_attempts_executed_operations_ride_into_its_replacement():
@@ -737,6 +781,17 @@ def test_followup_taxonomy_separates_continuation_refinement_and_unrelated():
     running = "find a machine learning professor at the university of toronto"
     assert classify_followup("another professor", running) == "continuation"
     assert classify_followup("دیگه چه؟", running) == "continuation"
+    # Voice round 2026-10-06 (D-6a): continuation markers are WHOLE phrases,
+    # and a new-request opener that contains one ("one more THING", «یه چیز
+    # دیگه») is a new request — it bound the Miami ask to the F1 answer's
+    # continuation contract ("do not repeat any entity named …").
+    assert classify_followup("someone more famous than him") == "new"
+    assert classify_followup("can you check one more thing, Miami FC") == "new"
+    assert classify_followup("یه چیز دیگه هم چک کن") == "new"
+    assert classify_followup("میتونی برام یه چیز دیگه هم چک کنی؟ میامی اف‌سی") == "new"
+    assert classify_followup("one more thing, inter miami", running) == "unrelated"
+    assert classify_followup("one more") == "continuation"
+    assert classify_followup("یکی دیگه") == "continuation"
     assert classify_followup("also only show associate professors", running) == "refinement"
     assert classify_followup(
         "find a machine learning professor at Toronto with recent publications", running,
@@ -829,6 +884,18 @@ def test_continuation_source_uses_subject_not_global_completion_order():
         "Search again once and return a different primary entity.",
         "Search again once and return a different primary",
         "Search again once and return a different",
+        # Voice round 2026-10-06 (D-6a): the reworded context rule and the
+        # new-question rule are private scaffold too.
+        "The current request is a NEW question. Answer only it.",
+        "The current request is a NEW question",
+        "context only — a separate request the caller already made",
+        "never treat the current request as a correction of it",
+        # Voice round 2026-10-07 (T10): the scope and "already heard" text.
+        "That request is being answered separately, at the same time.",
+        "That request was already answered and the caller heard the answer.",
+        "Answer ONLY the current request",
+        "The caller has already heard every answer in it",
+        "If it does not differ, do not repeat that result.",
     ],
 )
 def test_partial_internal_scaffold_echoes_fail_closed(echo):

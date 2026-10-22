@@ -380,11 +380,16 @@ async def test_a_newer_request_is_never_answered_by_the_unattributed_epoch(monke
         n_final = _index(phone, lambda f: f.get("type") == "transcript" and f.get("final")
                          and f.get("turn_id") == facts["N"])
         assert await NR._wait(lambda: any(
-            f.get("type") == "response_text" and f.get("assistant_turn_id") == e2
-            for f in phone.frames[n_final + 1:]
+            f.get("type") == "response_text" for f in phone.frames[n_final + 1:]
         ), 3.0)
         await asyncio.sleep(0.3)
         phone.push_frame(NR._idle(e2))                 # the reply was HEARD
+        # D-P7 R1: …and the words after N's final, an epoch of their own.
+        tail = next(
+            f["assistant_turn_id"] for f in phone.frames[n_final + 1:]
+            if f.get("type") == "response_text"
+        )
+        phone.push_frame(NR._idle(tail))
         await asyncio.sleep(0.3)
         facts["R"] = NR._finals(phone)[0]["turn_id"]
         if client == "new":
@@ -399,8 +404,8 @@ async def test_a_newer_request_is_never_answered_by_the_unattributed_epoch(monke
     _record(
         client, "newer_request_over_unattributed_epoch",
         "R's answer failed; its continuation released unsettled (no wire parent); the caller "
-        "asks a NEWER request over it while it keeps streaming — its later frames arrive "
-        "after the newer request's final, still with no parent",
+        "asks a NEWER request over it while it keeps streaming — its later words arrive "
+        "after the newer request's final in a NEW epoch (D-P7 R1), still with no parent",
         [(psid, phone.tape)],
         {"R": rid, "N": nid, "epochs": [facts["e1"], e2], "wire_parents": _wire_parents(phone),
          "attributions": _attributions(phone), "coverage": facts.get("coverage"),
@@ -408,9 +413,11 @@ async def test_a_newer_request_is_never_answered_by_the_unattributed_epoch(monke
     )
     n_final = _index(phone, lambda f: f.get("type") == "transcript" and f.get("final")
                      and f.get("turn_id") == nid)
-    after = [f for f in phone.frames[n_final + 1:]
-             if f.get("type") == "response_text" and f.get("assistant_turn_id") == e2]
-    assert after and all(f.get("parent_user_turn_id") is None for f in after), after
+    after = [f for f in phone.frames[n_final + 1:] if f.get("type") == "response_text"]
+    # D-P7 R1 re-baseline: the words after N's final are a NEW epoch (the old
+    # one is never grown above N), and still name no parent.
+    assert after and all(f["assistant_turn_id"] != e2 for f in after), after
+    assert all(f.get("parent_user_turn_id") is None for f in after), after
     # The reply is R's (the newer request came after its start), never N's.
     assert facts["coverage"]["R"] == live.OUTPUT_HEARD, facts["coverage"]
     assert facts["coverage"]["N"] is None, facts["coverage"]
@@ -641,12 +648,16 @@ async def test_settlement_waits_for_the_input_clock_unless_the_session_ends(monk
     assert session.continuation_pending == {}
 
 
-@pytest.mark.parametrize(("withheld", "placed"), [({2}, ""), (set(), "R")])
-def test_the_saved_row_goes_where_the_phone_placed_the_reply(monkeypatch, withheld, placed):
-    """Transcript parity: a withheld-parent epoch is drawn by the phone as a
-    parentless reply (at arrival), so its row's `occurred_at` is reserved as a
-    parentless one — never under R, where the phone did not put it.  Control:
-    an epoch whose wire parent is R is placed under R, as before."""
+@pytest.mark.parametrize("withheld", [{2}, set()])
+def test_the_saved_row_goes_where_the_phone_placed_the_reply(monkeypatch, withheld):
+    """Transcript parity: the phone draws every reply when it first sees it
+    (R3), whatever its wire parent, so its row's `occurred_at` is reserved at
+    that moment — for a withheld-parent epoch and a parented one alike.
+
+    PIN RE-BASELINED — D-P7 R2 reversed (DESIGN-R2 D-R8 b): it was reserved
+    at the TAIL, after everything already saved (`last_occurred`); it is the
+    WALL clock of the first text delta now, so a row stamped "5 s along the
+    provider timeline" no longer pushes it."""
 
     session = _unit_session(NEW_APP)
     session.adapter._output_text = "Yes, I'm here."
@@ -654,9 +665,12 @@ def test_the_saved_row_goes_where_the_phone_placed_the_reply(monkeypatch, withhe
     session.continuation_withheld = set(withheld)
     session.anchor_wall = _dt.datetime.now(_dt.timezone.utc)
     session.epoch_stamps = {}
-    calls: list = []
-    monkeypatch.setattr(session, "stamp_child", lambda ref, parent, start: calls.append(parent) or session.anchor_wall,
-                        raising=False)
+    # A later caller row is already saved, 5 s along the timeline.
+    later = session.anchor_wall + _dt.timedelta(milliseconds=5000)
+    session.last_occurred = later
     monkeypatch.setattr(session, "timeline_output", lambda parent, start: None, raising=False)
+    before = _dt.datetime.now(_dt.timezone.utc)
     session.reserve_epoch_stamp()
-    assert calls == [placed]
+    stamp = session.epoch_stamps[session.adapter.epoch]
+    assert stamp < later, "no tail clamp"
+    assert abs((stamp - before).total_seconds()) < 1.0, "the wall clock when first seen"

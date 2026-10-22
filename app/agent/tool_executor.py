@@ -642,6 +642,8 @@ TOOL_OUTPUT_LIMITS: Dict[str, int] = {
     "generate_image": 4_000,
     "edit_image": 4_000,
     "spawn": 1_000,
+    # Up to 6 steps × a 4 KB result each, plus the merge instruction.
+    "delegate": 30_000,
     "process": 10_000,
     "tts": 1_000,
     "browser": 50_000,
@@ -5571,6 +5573,224 @@ class ToolExecutor:
         return json.dumps(result)
 
     # ------------------------------------------------------------------
+    # 14b. delegate — this turn supervises executor sub-agents
+    # ------------------------------------------------------------------
+    async def _tool_delegate(self, inp: Dict[str, Any]) -> str:
+        """Plan → supervised workers → join → hand the results back so the
+        model checks, merges and answers in THIS turn (voice round
+        2026-10-05, D-P6). Unlike `spawn`, nothing is announced later: the
+        answer is the turn's own. The supervisor job is the turn's job (the
+        voice/chat TurnJob or this turn's `create_job`), else one opened here
+        exactly like `create_job` opens one."""
+        import json as _json
+        from app.agent.supervisor_gate import (
+            ATTENDED_CHANNELS, get_overrides, supervisor_enabled_for,
+        )
+
+        user_id = self._current_user_id
+        if not user_id:
+            return "ERROR: No user context"
+        channel = (self._current_channel or "").strip().lower()
+        overrides = await get_overrides(user_id)
+        if channel not in ATTENDED_CHANNELS or not supervisor_enabled_for(settings, overrides):
+            return ("ERROR: delegate is not available here — do the work "
+                    "yourself with your own tools.")
+
+        from app.agent.job_titles import normalize_job_title
+        _raw_title = str(inp.get("title") or "").strip()
+        title = normalize_job_title(_raw_title) or _raw_title
+        if not title:
+            return "ERROR: title is required"
+        raw_steps = inp.get("steps")
+        if not isinstance(raw_steps, list) or not 2 <= len(raw_steps) <= 6:
+            return "ERROR: steps must be a list of 2 to 6 steps"
+        from app.services.plain_text import plain_preview as _plain
+        from app.agent.tool_display import strip_emoji as _strip_emoji
+        plan: List[Dict[str, Any]] = []
+        for i, st in enumerate(raw_steps):
+            if not isinstance(st, dict):
+                return f"ERROR: step {i} must be an object with label and task"
+            label = _strip_emoji(_plain(str(st.get("label") or ""), 120)).strip()
+            task = str(st.get("task") or "").strip()
+            if not label or not task:
+                return f"ERROR: step {i} needs both a label and a task"
+            deps = st.get("depends_on") or []
+            if not isinstance(deps, list) or any(
+                not isinstance(d, int) or isinstance(d, bool) or not 0 <= d < i
+                for d in deps
+            ):
+                return (f"ERROR: step {i} depends_on must list indices of "
+                        f"EARLIER steps (0..{i - 1})")
+            plan.append({"label": label, "task": task,
+                         "role": (str(st.get("role") or "").strip()[:40] or None),
+                         "depends_on": deps})
+
+        agent_runner = getattr(self, "agent_runner", None) or getattr(
+            self.subagent_manager, "_agent_runner", None)
+        if agent_runner is None:
+            return "ERROR: delegate has no agent runner in this process."
+
+        from app.services.model_resolver import default_model, subagent_model
+        executor_model = subagent_model(overrides)
+        _default = default_model()
+        alternate_model = _default if _default != executor_model else executor_model
+        ceiling = int(settings.supervisor_timeout_seconds)
+        try:
+            deadline = int(inp.get("timeout_seconds") or ceiling)
+        except (TypeError, ValueError):
+            deadline = ceiling
+        deadline = max(30, min(deadline, ceiling))
+
+        def _lower(key: str, ceiling_value: int) -> int:
+            v = overrides.get(key)
+            return min(v, ceiling_value) if isinstance(v, int) and v >= 1 else ceiling_value
+
+        max_workers = _lower("max_workers", int(settings.supervisor_max_workers))
+        worker_timeout = _lower("worker_timeout_seconds", deadline)
+        caps = {k: overrides[k] for k in ("max_children_per_parent", "max_per_user_concurrent")
+                if k in overrides}
+
+        chat_id, asst_message_id = self.turn_deep_link()
+        sup_job_id, job_type_tag = await self._open_supervisor_job(
+            user_id=user_id, title=title, plan=plan,
+            chat_id=chat_id, asst_message_id=asst_message_id,
+        )
+        # The per-parent cap only applies when the workers have a parent.
+        _JOB_ID_CTX.set(sup_job_id)
+
+        from app.agent.subagent_orchestrator import (
+            SUPERVISOR_EVENT_SINK, job_mission_id, run_supervised_plan,
+        )
+        sink = SUPERVISOR_EVENT_SINK.get()
+        if sink is not None:
+            try:
+                await sink({"type": "supervisor.started", "job_id": sup_job_id,
+                            "workers_total": len(plan), "deadline_s": deadline})
+            except Exception:  # noqa: BLE001 — a frame never fails a tool
+                logger.debug("[delegate] supervisor.started skipped", exc_info=True)
+
+        results = await run_supervised_plan(
+            user_id=user_id, supervisor_job_id=sup_job_id, title=title,
+            plan=plan, agent_runner=agent_runner, channel=channel,
+            executor_model=executor_model, alternate_model=alternate_model,
+            max_workers=max_workers, deadline_s=deadline,
+            worker_timeout_s=worker_timeout, caps=caps, chat_id=chat_id,
+            message_id=asst_message_id,
+            mission_id=job_mission_id(sup_job_id, chat_id),
+            job_type_tag=job_type_tag, sink=sink,
+        )
+        ok = sum(1 for r in results if r.get("outcome") == "success")
+        payload = {
+            "job_id": sup_job_id,
+            "title": title,
+            "steps": results,
+            "instruction": (
+                "Now verify these results, reconcile any conflicts, and answer "
+                "the user in this turn, naming the sources you relied on. If a "
+                "step failed or was skipped, say what is missing rather than "
+                "guessing."
+            ),
+        }
+        return ToolResult(
+            _json.dumps(payload, ensure_ascii=False),
+            display=f"Helpers finished {ok} of {len(results)} steps",
+        )
+
+    async def _open_supervisor_job(
+        self, *, user_id: str, title: str, plan: List[Dict[str, Any]],
+        chat_id: Optional[str], asst_message_id: Optional[str],
+    ) -> tuple:
+        """(job_id, job_type tag) of this turn's supervisor job.
+
+        Reuses the turn's own job — `_JOB_ID_CTX` (the runner's TurnJob, or a
+        routine's job) first, then this turn's newest `create_job` — so the
+        card the user is already watching becomes the supervisor card rather
+        than a second one. Its steps are replaced by the plan (+ check/merge
+        + answer) and `config_json.role='supervisor'` marks it so the TurnJob
+        leaves its steps alone. With no such job, one is opened like
+        `create_job` opens one (and closed by the same turn finalizer)."""
+        from datetime import datetime as _dt
+        from app.agent.job_steps import dump_steps
+        from app.agent.subagent_orchestrator import supervisor_plan_steps
+        from app.db.database import async_session_maker
+        from app.db.models import BuildJob
+
+        steps = supervisor_plan_steps(plan, title)
+        # TW-5: a chat turn whose first work is `delegate` has the runner's
+        # card created but not yet opened (`delegate` is not a work tool).
+        # Open the card ON the plan, so the supervisor's card IS the turn's
+        # card and a later verification search lands on it, not on a second.
+        from app.agent.voice_jobs import current_voice_job as _cvj
+        _unopened = _cvj()
+        if (_unopened is not None and not _unopened.opened
+                and _JOB_ID_CTX.get() is None and not _created_job_registry()):
+            _jid = await _unopened.open_following(
+                steps, role="supervisor", workers_total=len(plan))
+            if _jid:
+                return _jid, _unopened._job_type()
+        candidates = [c for c in [_JOB_ID_CTX.get(), *reversed(_created_job_registry())] if c]
+        for n_try, jid in enumerate(candidates):
+            # The TurnJob's row is inserted off the turn's coroutine; give it a
+            # moment to land before giving up on the card the user can see.
+            for _ in range(12 if n_try == 0 else 1):
+                async with async_session_maker() as db:
+                    row = await db.get(BuildJob, jid)
+                    if row is not None:
+                        if (row.user_id != user_id or row.job_type != "agent_task"
+                                or row.status not in ("running", "queued")):
+                            break
+                        # The runner's TurnJob for this turn keeps writing
+                        # this row (progress, terminal frame, close): it must
+                        # carry the supervisor's plan, not its own template.
+                        from app.agent.voice_jobs import current_voice_job
+                        _tj = current_voice_job()
+                        _card_steps = steps
+                        if _tj is not None and _tj.job_id == jid:
+                            _tj.follow_steps(steps)
+                            _tj.note_config(role="supervisor", workers_total=len(plan))
+                            # The card keeps the steps that ran before the
+                            # plan; the row must say the same.
+                            _card_steps = _tj.followed_steps() or steps
+                        cfg = dict(row.config_json or {}) if isinstance(row.config_json, dict) else {}
+                        cfg.update({"role": "supervisor", "workers_total": len(plan)})
+                        row.config_json = cfg
+                        row.steps_json = dump_steps(_card_steps)
+                        row.status = "running"
+                        await db.commit()
+                        return row.id, cfg.get("job_type")
+                await asyncio.sleep(0.25)
+
+        from app.agent.job_type import classify_job_type
+        from app.agent.job_runner import JobRunner, TaskSpec
+        job_type = classify_job_type(title, title)
+        cfg: Dict[str, Any] = {"job_type": job_type, "role": "supervisor",
+                               "workers_total": len(plan)}
+        if asst_message_id:
+            cfg["asst_message_id"] = str(asst_message_id)[:64]
+        job = await JobRunner().create_job(
+            job_type="agent_task",
+            spec=TaskSpec(user_id=user_id, channel="agent_task",
+                          source_kind="manual",
+                          conversation_id=_SESSION_ID_CTX.get(), config_json=cfg),
+            title=title, prompt=title, status="running",
+            model=settings.agent_model, layer=0, steps_json=dump_steps(steps),
+        )
+        # Closed by the turn finalizer, like a `create_job` job.
+        _created_job_registry().append(job.id)
+        import time as _t_sj
+        from app.agent.subagent_orchestrator import _notify_job_event
+        from app.services.plain_text import humanize_label as _hl_sj
+        await _notify_job_event(
+            job_id=job.id, label=title, kind="mission_started",
+            title=f"Working on: {_hl_sj(title)[:150]}",
+            timer_end_ms=int((_t_sj.time() + 1800) * 1000),
+            dedup_suffix="started", chat_id=chat_id, message_id=asst_message_id,
+            job_type=job_type, step_name=steps[0]["label"],
+            steps_done=0, steps_total=len(steps), refresh_if_started=bool(chat_id),
+        )
+        return job.id, job_type
+
+    # ------------------------------------------------------------------
     # 15. tts — text-to-speech voice message
     # ------------------------------------------------------------------
     async def _tool_tts(self, inp: Dict[str, Any]) -> str:
@@ -7241,6 +7461,83 @@ class ToolExecutor:
             return f"ERROR: Unknown talk_mode action '{action}'"
 
     # ------------------------------------------------------------------
+    # media_control — stop / pause / resume / next / previous (D-T1)
+    # ------------------------------------------------------------------
+    async def _tool_media_control(self, inp: Dict[str, Any]) -> str:
+        """Drive the user's player through the SAME executor the voice relay's
+        tool-less route uses (`radio.control.run_media_control`), so a stop the
+        agent decides on is the stop the relay would have sent: device-acked,
+        ordered by the caller's request when this run carries an order, and
+        answered from the closed verdict set.
+
+        The result is a `ToolResult` whose model text comes from the closed
+        reason table (`media_control_texts`) — `nothing_playing` is an honest
+        answer, not an `ERROR:` — and which carries `.media` = {action, reason,
+        ok, title?} for the delegation stream's `tool.end` frame, so the relay
+        can know a delegated media command actually EXECUTED."""
+        from app.agent.radio.control import (
+            MEDIA_CONTROL_ACTIONS,
+            MediaControlOutcome,
+            media_control_texts,
+            run_halt_mark,
+            run_media_control,
+        )
+        from app.agent.radio.session import RADIO_ALLOWED_CHANNELS
+
+        action = str((inp or {}).get("action") or "").strip().lower()
+        if action not in MEDIA_CONTROL_ACTIONS:
+            return (
+                "ERROR: media_control needs action = one of stop, pause, resume, "
+                "next, previous."
+            )
+        user_id = self._current_user_id or ""
+        if not user_id:
+            return "ERROR: No user is bound to this turn, so no player can be reached."
+        # The radio channel the station lives on. Voice and the phone's chat
+        # socket share the app's station ("app", which is what the relay
+        # sends); a web turn controls the web station.
+        surface = (self._current_channel or "").strip().lower()
+        radio_channel = surface if surface in RADIO_ALLOWED_CHANNELS else "app"
+        # The caller's order for THIS request, when the run carries one
+        # (contract v0.3 §7): a stop said after a play in the same call then
+        # supersedes it by the same pairwise rule the relay's fast path uses.
+        ordered: Dict[str, Any] = {}
+        try:
+            mark = run_halt_mark(user_id)
+            if action in ("stop", "pause") and mark is not None and mark.ordered:
+                ordered = {
+                    "before_order": mark.media_order,
+                    "media_scope": mark.media_scope,
+                    "media_scope_started_ms": mark.media_scope_started_ms,
+                }
+        except Exception:  # noqa: BLE001 — an unordered halt is the legacy halt
+            ordered = {}
+        try:
+            outcome = await run_media_control(
+                user_id, action, radio_channel, **ordered,
+            )
+        except Exception as exc:  # noqa: BLE001 — the verdict must stay truthful
+            logger.warning("[media_control] executor raised: %s", type(exc).__name__)
+            outcome = MediaControlOutcome(
+                ok=False, user_id=user_id, action=action, channel=radio_channel,
+                changed=False, reason="error",
+            )
+        model_text, display_text = media_control_texts(outcome)
+        logger.info(
+            "[media_control] action=%s reason=%s ok=%s ordered=%s",
+            action, outcome.reason, outcome.ok, bool(ordered),
+        )
+        result = ToolResult(model_text, display=display_text)
+        media: Dict[str, Any] = {
+            "action": action, "reason": str(outcome.reason or "")[:64],
+            "ok": bool(outcome.ok),
+        }
+        if outcome.title:
+            media["title"] = str(outcome.title)[:200]
+        result.media = media  # type: ignore[attr-defined]
+        return result
+
+    # ------------------------------------------------------------------
     # play_media — search YouTube and broadcast media_play to frontend
     # ------------------------------------------------------------------
     async def _tool_play_media(self, inp: Dict[str, Any]) -> str:
@@ -7884,6 +8181,31 @@ class ToolExecutor:
         if not user_id:
             return "ERROR: No user context"
 
+        # TW-4: this turn's runner card is already open (the first work round
+        # had no `create_job`). A second job beside it is the double card
+        # D-P4 retired the regex intake for: the model's plan becomes the
+        # card's remaining steps (the ones already run stay) and the model
+        # gets the card's id, so its `update_job` calls land on it too.
+        from app.agent.voice_jobs import current_voice_job
+        _tj = current_voice_job()
+        if _tj is not None and _tj.opened and _tj.job_id:
+            from app.services.plain_text import plain_preview as _plain_tj
+            from app.agent.tool_display import strip_emoji as _strip_tj
+            _labels = [(_strip_tj(_plain_tj(str(lb), 120) or str(lb)) or "").strip()
+                       for lb in (step_labels if isinstance(step_labels, list) else [])]
+            _labels = [lb for lb in _labels if lb]
+            if len(_labels) >= 2:
+                _tj.adopt_plan(_labels, source="model")
+                _tj.start_step(_tj.plan_offset)
+            _done, _total, _ = _tj.progress()
+            return ToolResult(
+                json.dumps({
+                    "job_id": _tj.job_id, "title": _tj.title, "steps": _total,
+                    "job_type": _tj._job_type(),
+                }),
+                display=f"Opened “{_tj.title}” — {_total} step{'' if _total == 1 else 's'}",
+            )
+
         # Round 4 (item 4): step labels are notification-surface strings
         # (LA stepName, push bodies) — store them plain so no surface has to
         # remember to strip. Titles/descriptions are stripped at push time.
@@ -7893,7 +8215,9 @@ class ToolExecutor:
         from app.services.plain_text import plain_preview as _plain
         from app.agent.tool_display import strip_emoji as _strip_emoji
         from datetime import datetime as _dt_cj
-        from app.agent.job_steps import dump_steps as _dump_steps, open_first_step
+        from app.agent.job_steps import (
+            dump_steps as _dump_steps, open_first_step, public_steps as _public_steps,
+        )
         steps = []
         for i, label in enumerate(step_labels):
             steps.append({
@@ -7982,6 +8306,8 @@ class ToolExecutor:
                 "completed_steps": 0,
                 "chat_id": chat_id,
                 "message_id": asst_message_id,
+                # D-P5: the plan rides the frame — no client waits on REST.
+                "steps": _public_steps(steps),
             })
         except Exception:
             pass
@@ -8050,6 +8376,27 @@ class ToolExecutor:
         error_message = inp.get("error_message")
         user_id = self._current_user_id
 
+        # TW-4: the turn's runner card absorbed the model's `create_job`, so
+        # the model's step numbers are relative to ITS plan (card row
+        # `plan_offset + i`) and the card is the one writer of its row.
+        from app.agent.voice_jobs import current_voice_job
+        _tj = current_voice_job()
+        if (_tj is not None and _tj.opened and _tj.job_id == job_id
+                and new_status in (None, "running", "completed")):
+            _done, _total, _ = _tj.progress()
+            if new_status == "completed":
+                _tj.begin_answer()
+            elif isinstance(current_step, int) and not isinstance(current_step, bool) \
+                    and current_step >= 0:
+                _tj.start_step(min(_tj.plan_offset + current_step + 1, max(0, _total - 1)))
+            _done, _total, _active = _tj.progress()
+            return json.dumps({
+                "ok": True, "status": "running", "completed_steps": _done,
+                "total_steps": _total,
+                "current_step": max(0, _active - _tj.plan_offset),
+                "job_type": _tj._job_type(),
+            })
+
         # A job blocked behind a confirmation card is WAITING, not failed —
         # and this coercion is what makes that true regardless of what the
         # model chose. Widening `update_job`'s enum and rewriting
@@ -8072,6 +8419,7 @@ class ToolExecutor:
         from app.agent.job_steps import (
             advance_steps as _advance_steps, counts as _step_counts,
             dump_steps as _dump_steps, finish_all_steps as _finish_all,
+            public_steps as _public_steps,
             parse_steps as _parse_steps,
         )
         async with async_session_maker() as db:
@@ -8173,6 +8521,7 @@ class ToolExecutor:
                 "completed_steps": completed_count,
                 "chat_id": chat_id,
                 "message_id": asst_message_id,
+                "steps": _public_steps(steps or []),
             })
         except Exception:
             pass

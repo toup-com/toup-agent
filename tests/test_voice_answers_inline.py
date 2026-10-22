@@ -191,6 +191,15 @@ class TestVoicePromptOmitsDeferralTools:
         assert "call `create_job` in the SAME response as the first step's tool calls" in pk_web
         assert "never call update_job to mark completed" in pk_web
 
+    def test_web_states_the_fast_path_before_the_job_rule(self, pk_web):
+        """D-P4: memory-or-known answers now, with no tool and no job; only
+        real work gets the 2–6 step card. The fast path comes FIRST — it is
+        the default, the job is the exception."""
+        fast = "If the User Brain, this conversation or stable knowledge answers it, answer now — no tool, no job."
+        assert fast in pk_web
+        assert pk_web.index(fast) < pk_web.index("call `create_job` in the SAME response")
+        assert "2–6 steps, the last one writing the answer" in pk_web
+
     def test_start_mission_is_offered_on_both(self, pk_voice, pk_web):
         assert "start_mission" in pk_voice
         assert "start_mission" in pk_web
@@ -347,3 +356,32 @@ class TestVoiceDetectionCannotDriftFromChannelSafe:
         call = src[i:src.index(")", i)]
         assert "payload_hint" not in call
         assert "conversation_hint" not in call
+
+
+# ── Voice round 2026-10-06 (D-T1): who may touch the user's player ───────
+
+def test_media_control_is_attended_only():
+    """The agent's stop/pause/resume/skip tool exists on every surface a
+    person is talking on (voice included — it is the whole point) and on NONE
+    that runs while nobody is there: a sub-agent, an autopilot mission, an
+    email trigger, an automation thread."""
+    from app.agent.prompt_profile import (
+        AUTOPILOT_DISABLED_TOOLS, SUBAGENT_DISABLED_TOOLS,
+        disabled_tools_for_channel,
+    )
+
+    for ch in ("voice", "web", "app", "mobile", "telegram", "whatsapp"):
+        assert "media_control" not in disabled_tools_for_channel(ch), ch
+    assert "media_control" in SUBAGENT_DISABLED_TOOLS
+    assert "media_control" in AUTOPILOT_DISABLED_TOOLS
+    assert "media_control" in disabled_tools_for_channel("trigger")
+    assert "media_control" in disabled_tools_for_channel("automation_thread")
+
+
+def test_media_control_is_a_core_tool_definition():
+    from app.agent.tool_definitions import get_agent_tools
+
+    defs = {t["name"]: t for t in get_agent_tools()}
+    assert "media_control" in defs
+    enum = defs["media_control"]["input_schema"]["properties"]["action"]["enum"]
+    assert set(enum) == {"stop", "pause", "resume", "next", "previous"}

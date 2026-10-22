@@ -343,6 +343,11 @@ async def test_e_the_tail_of_one_reply_echoing_into_the_next_is_still_echo(monke
 
 @pytest.mark.asyncio
 async def test_f_a_real_interruption_fires_exactly_once_and_stops_the_agent(monkeypatch):
+    """D-P9 re-baseline: the caller keeps talking for 1.7 s — past
+    `voice_live_stop_instruction_min_speech_ms` — so the relay also tells the
+    model to stop (a shorter interjection gets no stop note: see
+    `test_a_short_interjection_gets_no_stop_instruction`)."""
+
     H.fast_clocks(monkeypatch, voice_live_output_epoch_gap_ms=4000)
     counters = H.capture_counters(monkeypatch)
     recorded = H.patch_relay(monkeypatch)
@@ -350,6 +355,7 @@ async def test_f_a_real_interruption_fires_exactly_once_and_stops_the_agent(monk
         ("no stop that", 1200, 1600),
         ("is not what", 1600, 2000),
         ("I asked about", 2000, 2400),
+        ("the Friday meeting", 2400, 2900),
     ]
 
     def on_send(provider, event):
@@ -1016,8 +1022,10 @@ async def test_i_the_echo_of_a_proactively_spoken_result_does_not_cut_it(monkeyp
     recorded = H.patch_relay(monkeypatch, think=_job_think(answer))
 
     def echo(provider):
-        provider.push(H.user_delta("here is what", 1600, 2000))
-        provider.push(H.user_delta("I found", 2000, 2400))
+        # The fake model says the answer it was given (voice round
+        # 2026-10-07), so the hot mic hears THOSE words back.
+        provider.push(H.user_delta("admissions open", 1600, 2000))
+        provider.push(H.user_delta("on the twelfth", 2000, 2400))
 
     client = Build130Client([H.config(), 1.2, {"type": "stop"}])
     provider = H.FakeProvider(
@@ -1077,8 +1085,10 @@ async def test_j_talking_over_a_proactive_result_stops_speech_not_the_job(monkey
     recorded = H.patch_relay(monkeypatch, think=_job_think(answer))
 
     def interrupt(provider):
+        # D-P9 re-baseline: sustained (1.6 s), so the stop note is owed.
         provider.push(H.user_delta("wait wait never mind", 1600, 2000))
         provider.push(H.user_delta("tell me tomorrow instead", 2000, 2500))
+        provider.push(H.user_delta("and send it by email", 2500, 3200))
 
     client = Build130Client([H.config(), 1.2, {"type": "stop"}])
     provider = H.FakeProvider(
@@ -1105,8 +1115,11 @@ async def test_k_an_unanswered_speech_started_re_arms_the_same_reply(monkeypatch
     of the reply with no barge-in at all. After `rearm_ms` with no interrupt,
     a genuine interruption in the SAME epoch fires."""
 
+    # D-P7 R1 re-baseline: one caller turn throughout (a final in between
+    # would end the reply — the TV's words then start a new epoch).
     H.fast_clocks(
         monkeypatch, voice_live_output_epoch_gap_ms=4000, voice_live_bargein_rearm_ms=150,
+        voice_live_utterance_gap_ms=3000, voice_live_utterance_hard_gap_ms=3000,
     )
     H.patch_relay(monkeypatch)
     holder = {}
@@ -1123,7 +1136,8 @@ async def test_k_an_unanswered_speech_started_re_arms_the_same_reply(monkeypatch
 
     def genuine():
         provider = holder["p"]
-        provider.push(H.out_text("more words ", 2300, 2700))
+        # Overlapping the caller's words: still the reply they spoke over.
+        provider.push(H.out_text("more words ", 1500, 1900))
         provider.push(H.out_audio())
         provider.push(H.user_delta("no hang on", 2600, 3000))
         provider.push(H.user_delta("that's wrong actually", 3000, 3500))
@@ -1222,23 +1236,24 @@ def test_the_overlap_is_measured_on_content_words_only():
     assert echo_overlap("uh... hmm", ref) == (0, 0.0)
 
 
-def test_a_single_delta_can_never_satisfy_the_rule():
+def test_one_delta_interrupts_only_when_it_is_long_and_wordy_enough():
+    """D-P9 re-baseline (was "a single delta can never satisfy the rule"): one
+    ASR emission may carry a whole interjection («چی شد», "no wait stop that
+    now"), and the speech, word and content floors still judge it — one word,
+    however long, or a burst too short, never interrupts."""
+
     adapter = LiveClientAdapter("session-one")
     adapter.provider_event({"type": "session.output_audio.delta", "delta": "A"})
     adapter.note_user_input(2000, speech_ms=2000, tokens=1, text="stop")
-    assert adapter.bargein_due(600, 3) is False
+    assert adapter.bargein_due(400, 2) is False
     adapter2 = LiveClientAdapter("session-two")
     adapter2.provider_event({"type": "session.output_audio.delta", "delta": "A"})
     adapter2.note_user_input(300, speech_ms=300, tokens=4, text="no wait stop now")
-    assert adapter2.bargein_due(600, 3) is False
-    # Long AND wordy, but still one ASR emission: not yet an interruption...
+    assert adapter2.bargein_due(400, 2) is False
     adapter3 = LiveClientAdapter("session-three")
     adapter3.provider_event({"type": "session.output_audio.delta", "delta": "A"})
     adapter3.note_user_input(1200, speech_ms=1200, tokens=5, text="no wait stop that now")
-    assert adapter3.bargein_due(600, 3) is False
-    # ...until the speech continues into a second one.
-    adapter3.note_user_input(1500, speech_ms=300, tokens=1, text="please")
-    assert adapter3.bargein_due(600, 3) is True
+    assert adapter3.bargein_due(400, 2) is True
 
 
 # ── (l) A7-08's four values ───────────────────────────────────────────
@@ -1263,3 +1278,220 @@ async def test_l_the_four_load_bearing_values_are_unchanged(monkeypatch):
     deltas = client.of("audio_delta")
     assert deltas and all(f["response_id"] == f["item_id"] for f in deltas)
     assert all(s in LIVE_STATES for s in client.states())
+
+
+# ── D-P9 (2026-10-05): a short interjection stops the agent ──────────
+
+def _shipped_floor() -> tuple[int, int]:
+    from app.config import Settings
+
+    fields = Settings.model_fields
+    return fields["voice_live_bargein_min_ms"].default, fields["voice_live_bargein_min_tokens"].default
+
+
+def test_a_two_word_interjection_interrupts_at_the_shipped_floor():
+    """«چی شد» at 1:51 and 2:59 did not stop the agent: two words are under
+    the old 3-word / 600 ms floor.  At the shipped floor they interrupt —
+    as two deltas or as one — and a single word still never does."""
+
+    min_ms, min_tokens = _shipped_floor()
+    assert (min_ms, min_tokens) == (400, 2)
+    reply = "کتاب «The Lean Startup» از اریک ریس"
+    two = LiveClientAdapter("dp9-two-deltas")
+    two.provider_event(H.out_text(reply, 0, 3000), now=10.0)
+    two.note_user_input(3350, speech_ms=350, tokens=1, text="چی")
+    two.note_user_input(3700, speech_ms=350, tokens=1, text=" شد")
+    assert two.bargein_due(min_ms, min_tokens, now=10.5) is True
+    one = LiveClientAdapter("dp9-one-delta")
+    one.provider_event(H.out_text(reply, 0, 3000), now=10.0)
+    one.note_user_input(3700, speech_ms=700, tokens=2, text="چی شد")
+    assert one.bargein_due(min_ms, min_tokens, now=10.5) is True
+    word = LiveClientAdapter("dp9-one-word")
+    word.provider_event(H.out_text(reply, 0, 3000), now=10.0)
+    word.note_user_input(3700, speech_ms=700, tokens=1, text="صبر")
+    assert word.bargein_due(min_ms, min_tokens, now=10.5) is False
+
+
+def _gap_retired(session: str) -> LiveClientAdapter:
+    """A 4 s reply whose last delta arrived at t=10.0, retired by the relay's
+    700 ms gap timer at 10.8 — the phone is still playing it."""
+
+    adapter = LiveClientAdapter(session, gap_ms=700)
+    adapter.provider_event(H.out_text("Here is a long answer about the library hours.", 0, 4000), now=10.0)
+    adapter.provider_event(H.out_audio(), now=10.0)
+    assert adapter.rotate_on_gap(now=10.8)[1] is not None
+    return adapter
+
+
+def _wrong_friday(adapter: LiveClientAdapter, now: float) -> bool:
+    adapter.note_user_input(5000, speech_ms=350, tokens=1, text="wrong", now=now)
+    adapter.note_user_input(5400, speech_ms=350, tokens=1, text=" Friday", now=now)
+    return adapter.bargein_due(400, 2, now=now)
+
+
+def test_the_audible_tail_of_a_gap_retired_reply_can_still_be_interrupted():
+    """Probe 4: the same interruption fired while the epoch was open and not
+    once the gap timer had retired it — while the phone was still playing
+    seconds of buffered audio.  Within the reply's spoken length of its first
+    delta, with no phone receipt, it is still audible and still interruptible."""
+
+    tail = _gap_retired("dp9-tail")
+    assert tail.still_audible(now=11.0)
+    assert _wrong_friday(tail, now=11.0) is True
+    # Past its spoken length (4 s) and the bounded tail: over, nothing to cut.
+    late = _gap_retired("dp9-late")
+    assert not late.still_audible(now=15.5)
+    assert _wrong_friday(late, now=15.5) is False
+    # The phone said it finished: a receipt is the authority.
+    heard = _gap_retired("dp9-heard")
+    oid = "live:dp9-heard:1"
+    heard.playback_drained(oid, oid, 4000)
+    assert not heard.still_audible(now=11.0)
+    assert _wrong_friday(heard, now=11.0) is False
+    # Nothing was sent to play (text only), or nothing says how long it plays
+    # (audio only, no timed words): never judged audible.
+    silent = LiveClientAdapter("dp9-text-only", gap_ms=700)
+    silent.provider_event(H.out_text("Here is a long answer about the library hours.", 0, 4000), now=10.0)
+    silent.rotate_on_gap(now=10.8)
+    assert not silent.still_audible(now=11.0)
+    untimed = LiveClientAdapter("dp9-audio-only", gap_ms=700)
+    untimed.provider_event(H.out_audio(), now=10.0)
+    untimed.rotate_on_gap(now=10.8)
+    assert not untimed.still_audible(now=10.85)
+
+
+def _cut_frame() -> dict:
+    return {"type": "interrupt", "response_id": _oid(1), "item_id": _oid(1), "played_ms": 900}
+
+
+async def _stop_gate_call(monkeypatch, caller, *, settle_s=0.8):
+    """A reply plays (its epoch held open); `caller(provider)` speaks; the
+    phone cuts the reply; then the call runs on for `settle_s`."""
+
+    H.fast_clocks(
+        monkeypatch, voice_live_output_epoch_gap_ms=4000, voice_live_utterance_gap_ms=300,
+        voice_live_utterance_hard_gap_ms=600, voice_live_stop_instruction_min_speech_ms=1500,
+    )
+    H.patch_relay(monkeypatch)
+    holder = {}
+
+    def on_send(provider, event):
+        holder["p"] = provider
+        if event["type"] == "session.start":
+            _speak(provider, REPLY, start_ms=0)
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    client = H.FakeClient([
+        H.config(), 0.3, lambda: caller(holder["p"]), 0.05, _cut_frame(), settle_s,
+        {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send)
+    await H.run_relay(client, provider, timeout=8, db_session_id=DB)
+    return client, provider
+
+
+@pytest.mark.asyncio
+async def test_a_short_interjection_gets_no_stop_instruction(monkeypatch, caplog):
+    """D-P9: «چی شد» over the reply is cut on the phone and answered by the
+    model — a permanent "Stop speaking now." note would only mute that
+    answer.  Only sustained speech earns it."""
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+
+    def chi_shod(provider):
+        provider.push(H.user_delta("چی", 3000, 3350))
+        provider.push(H.user_delta(" شد", 3350, 3700))
+
+    _client, provider = await _stop_gate_call(monkeypatch, chi_shod)
+
+    assert _stop_instructions(provider) == []
+    assert any("stop instruction dropped outcome=short" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_sustained_speech_over_the_reply_gets_one_stop_instruction(monkeypatch):
+    def keeps_talking(provider):
+        provider.push(H.user_delta("no hang on", 3000, 3500))
+        provider.push(H.user_delta(" that is the wrong library", 3500, 4200))
+        provider.push(H.user_delta(" I meant the one downtown", 4200, 4900))
+
+    _client, provider = await _stop_gate_call(monkeypatch, keeps_talking)
+
+    assert len(_stop_instructions(provider)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model_answered", "layer_c"), [
+    (False, True), (True, True), (True, False),
+], ids=["no_reply", "reply_held", "reply_held_switch_off"])
+async def test_a_stop_is_never_sent_onto_the_reply_to_the_interrupting_turn(
+    monkeypatch, caplog, model_answered, layer_c,
+):
+    """Voice round 2026-10-07 (D-R3(5) Layer C): «از این نیاز به».  The caller
+    barged in; the stop instruction waited for sustained speech; by the time
+    the speech crossed the floor the model had ALREADY produced its reply to
+    the interrupting turn (held behind that open turn).  "Stop the reply in
+    progress" landed on that new reply, which said four words and stopped.
+    With a held reply to the newer turn the stop is dropped
+    (`outcome=new_reply_held`); without one it is sent as before.  Phase D2
+    ruling 47: `voice_live_new_reply_held_enabled` is Layer C's kill switch
+    (the test is positional — a model still speaking its OLD reply over the
+    barge-in is never stopped); off, the stop goes out as before Layer C."""
+
+    from app.config import Settings
+
+    # No behaviour change at the default: Layer C is on in production.
+    assert Settings.model_fields["voice_live_new_reply_held_enabled"].default is True
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    H.fast_clocks(
+        monkeypatch, voice_live_output_epoch_gap_ms=4000, voice_live_utterance_gap_ms=300,
+        voice_live_utterance_hard_gap_ms=600, voice_live_stop_instruction_min_speech_ms=1500,
+        voice_live_new_reply_held_enabled=layer_c,
+    )
+    H.patch_relay(monkeypatch)
+    holder: dict = {}
+
+    def on_send(provider, event):
+        holder["p"] = provider
+        if event["type"] == "session.start":
+            _speak(provider, REPLY, start_ms=0)
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    def starts():
+        holder["p"].push(H.user_delta("no hang on", 3000, 3500))
+
+    def model_replies():
+        if model_answered:
+            holder["p"].push(H.out_text("از این نیاز به", 3600, 3900))
+            holder["p"].push(H.out_audio("NEW"))
+
+    def keeps_talking():
+        holder["p"].push(H.user_delta(" that is the wrong library", 3500, 4200))
+        holder["p"].push(H.user_delta(" I meant the one downtown", 4200, 4900))
+
+    client = H.FakeClient([
+        H.config(), 0.3, starts, 0.05, _cut_frame(), 0.05, model_replies, 0.05,
+        keeps_talking, 0.8, {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send)
+    await H.run_relay(client, provider, timeout=8, db_session_id=DB)
+
+    lines = [r.getMessage() for r in caplog.records if "[LIVE] stop instruction" in r.getMessage()]
+    if model_answered and layer_c:
+        assert _stop_instructions(provider) == []
+        assert "[LIVE] stop instruction dropped outcome=new_reply_held reason=interrupt epoch=1" in lines
+    else:
+        assert len(_stop_instructions(provider)) == 1
+        assert "[LIVE] stop instruction sent outcome=sustained reason=interrupt epoch=1" in lines
+
+
+@pytest.mark.asyncio
+async def test_a_silent_stop_tap_still_stops_the_model(monkeypatch):
+    """A tap on stop carries no caller words at all: the model is told to
+    stop at once, as before."""
+
+    _client, provider = await _stop_gate_call(monkeypatch, lambda _provider: None, settle_s=0.2)
+
+    assert len(_stop_instructions(provider)) == 1

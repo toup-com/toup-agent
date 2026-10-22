@@ -55,6 +55,12 @@ def test_the_live_prompt_names_the_backend_its_rules_and_the_language_rule():
         "Never say that an action has started",
         "Never say you cannot do something listed above",
         "progress notes",
+        "ALWAYS delegate — your own knowledge is never an answer",
+        "Stop speaking when the user interrupts. Listen to what they say.",
+        # D-R3 / D-T4(i) (2026-10-06 call).
+        "is not an action: delegate it in the same turn.",
+        "اف‌وان = F1 / Formula One",
+        "search the English name.",
         "Reply language",
         "the language the user JUST SPOKE",
     ):
@@ -514,8 +520,13 @@ def test_the_voice_context_request_says_which_wire_it_is_for():
     src = pathlib.Path("app/api/ws_realtime.py").read_text()
     body = src.split("async def _agent_voice_context", 1)
     assert len(body) == 2, "marker gone, rewrite this probe"
-    head = body[1].split("data = await _vps_api", 1)[0]
-    assert '"live": use_live,' in head
+    # Voice round 2026-10-07 (D-R2(4)): the body is built by ONE module
+    # function for the call and the warm-up; the closure names the wire.
+    head = body[1].split("async def _instructions_step", 1)[0]
+    assert "live=use_live" in head
+    builder = src.split("async def _voice_context_body", 1)
+    assert len(builder) == 2, "marker gone, rewrite this probe"
+    assert '"live": live,' in builder[1].split("\nasync def ", 1)[0]
 
     from app.api.api_v1 import VoiceContextRequest
     assert "live" in VoiceContextRequest.model_fields, (

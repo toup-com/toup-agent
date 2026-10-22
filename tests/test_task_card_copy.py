@@ -66,6 +66,12 @@ def test_every_recorded_tool_gets_a_sentence_not_its_id():
         assert label[0].isupper() and " " in label, (tool, label)
 
 
+def test_the_agents_media_control_tool_has_its_own_label():
+    """Phase D (contract-wire-5): D-T1's `media_control` fell through to the
+    generic "Working" next to a music change that had already happened."""
+    assert public_step_label("media_control") == "Controlling the music"
+
+
 def test_the_fallback_is_total_never_the_wire_id():
     # An unmapped single-word connector derives its BRAND, never the action.
     assert public_step_label("asana__list_tasks") == "Checking Asana"
@@ -159,6 +165,31 @@ def test_the_doctor_report_line_loses_its_glyphs():
     assert sanitize_for_client(
         "⚠️ The build looked for a file that wasn't there."
     ) == "The build looked for a file that wasn't there."
+
+
+def test_the_media_play_sentence_written_for_the_model_is_redacted():
+    """Voice round 2026-10-06 (problem 8): `ws_realtime._play_media_direct`'s
+    sentence is written for the MODEL, and the Drake card's saved message was
+    literally that sentence.  Both of its shapes are stage direction now; the
+    title alone is ordinary prose."""
+
+    from app.api import ws_realtime as rt
+
+    titled = (
+        "Starting Drake - Hotline Bling on the user's device; more in the "
+        "same style will follow automatically."
+    )
+    assert sanitize_for_client(titled) == ""
+    assert sanitize_for_client("Playback is starting on the user's device.") == ""
+    assert sanitize_for_client("More songs will follow automatically.") == ""
+    assert sanitize_for_client("Starting Drake - Hotline Bling.") == "Starting Drake - Hotline Bling."
+    # …and those ARE the strings the route writes (read off the source, so a
+    # reworded model sentence cannot slip past this test).
+    import inspect
+    source = inspect.getsource(rt._play_media_direct)
+    assert "on the user's device; more in the same style" in source
+    assert "will follow automatically." in source
+    assert '"Playback is starting on the user\'s device."' in source
 
 
 def test_strip_emoji_leaves_prose_alone_and_glyph_only_labels_empty():

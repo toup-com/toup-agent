@@ -990,6 +990,64 @@ async def test_a_follow_up_carries_the_prior_request_and_the_grounding_rules(mon
     assert follow_up.rstrip().endswith("Reply in the caller's language.")
 
 
+@pytest.mark.parametrize(
+    ("follow_up", "correction"),
+    [
+        # The 2026-10-06 call: a NEW question right after the F1 answer.  It
+        # shares no entity with it and opens with no correction marker.
+        ("یو‌اف‌سی چی", False),
+        # …and the explicit opener the brief names keeps the correction rule.
+        ("نه منظورم UFC", True),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_new_question_after_an_answer_is_not_framed_as_its_correction(
+    monkeypatch, follow_up, correction,
+):
+    """Voice round 2026-10-06 (DESIGN-R2 D-R7 / D-6a).  Every follow-up after
+    an accepted answer got rule 3 — "If your answer differs from an accepted
+    backend result above, say so explicitly" — and the tenant model obeyed it:
+    the UFC answer opened «آها، UFC رو می‌گفتی، نه فرمول یک!».  An UNLINKED
+    follow-up gets the new-question rule instead; the accepted ledger stays
+    (pronoun resolution needs it)."""
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    calls = []
+    box = {}
+    f1 = "مسابقه بعدی فرمول یک کی و کجاست"
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append(task)
+        return "مسابقه بعدی فرمول یک، جایزه بزرگ سنگاپور است.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    async def script():
+        await _wait(lambda: _terminal(client, "d1"))
+        box["p"].push(H.user_delta(follow_up, 3000, 3600))
+        box["p"].push(H.delegation("d2", 3650))
+        await _wait(lambda: _terminal(client, "d2"))
+
+    client = H.FakeClient([H.config(), script, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_closer(box, f1, 900), auto_ack=True)
+    await H.run_relay(client, provider, timeout=10, db_session_id=f"db-fu-new-{correction}")
+
+    assert len(calls) == 2
+    second = calls[1]
+    assert "Prior caller request: " + f1 in second, "the ledger stays for pronoun resolution"
+    low = second.lower()
+    if correction:
+        assert "differs from an accepted backend result" in low
+        assert "still apply unless the caller changes them" in low
+        assert "The current request is a NEW question" not in second
+    else:
+        assert "differs from an accepted backend result" not in low
+        assert "still apply unless the caller changes them" not in low
+        assert "The current request is a NEW question" in second
+        # Rule 2 is about answering ANY role question and stays.
+        assert "former role" in low
+
+
 def test_the_voice_research_rule_allows_one_authoritative_fetch_for_current_affiliation():
     """Rule 1 pushed the agent to answer from snippets, which is how a stale
     Georgia Tech snippet could outrank the university's own faculty page."""
@@ -1041,7 +1099,9 @@ async def test_one_grounded_progress_line_is_spoken_after_a_real_tool_start(monk
     assert "toronto robotics faculty" not in line["content"], "no raw query aloud"
     assert "Searching the web" in line["content"], "named from the real step's kind"
     first_turn = _turn_id(client, "research the toronto robotics faculty")
-    assert _parents_of(client, "Here is what I found.")[0] == first_turn
+    # The fake model says what it is given (voice round 2026-10-07): the
+    # progress line's own words are what was voiced, parented on the task.
+    assert _parents_of(client, line["content"])[0] == first_turn
     assert [e for e in _commentary(provider) if "Professor Ada Lovelace." in e["content"]], (
         "the answer still arrives"
     )
@@ -1119,3 +1179,665 @@ def test_every_new_relay_line_exists_in_both_languages():
         en = relay_line(key, "en", step="x")
         fa = relay_line(key, "fa", step="x")
         assert en and fa and en != fa, key
+
+
+# ══════════════════════════════════════════════════════════════════════
+# D-R5 (2026-10-06 call, 4:19–4:40): the recorded tail, replayed
+# ══════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_d_r5_the_recorded_huh_carries_the_owed_request_not_itself(monkeypatch, caplog):
+    """«فورمولوان» closed and got no reply; 18 s later the caller said «ها»
+    and the model delegated.  On build 141 the delegation's request — and its
+    card title — was «ها», and the F1 reply owed was superseded.  Now «ها» is
+    phatic: it supersedes nothing, and the delegation is rebound to the owed
+    request (`phatic_anchor`) — its words, its turn, its title."""
+
+    import logging
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=3.0)
+    asked: list[str] = []
+    seen: list[dict] = []
+
+    async def think(_user_id, task_text, _session_id, **kw):
+        asked.append(task_text)
+        seen.append(kw)
+        return "The next Formula One race is the Mexico City Grand Prix.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    box: dict = {}
+
+    def on_send(provider, event):
+        box["p"] = provider
+        if event["type"] == "session.start":
+            provider.push(H.user_delta("فورمولوان", 0, 800))
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def script():
+        await asyncio.sleep(0.5)
+        box["p"].push(H.user_delta("ها", 18000, 18300))
+        box["p"].push(H.delegation("ep3kr", 18350))
+        for _ in range(200):
+            if _terminal(client, "ep3kr"):
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
+
+    import app.services.live_voice_protocol as live
+
+    titled: dict = {}
+    original_start = live._LiveSession.start_delegation
+
+    async def spy_start(self, task, *args, **kwargs):
+        # What RC's `task_title` reads: the request the task now IS.
+        titled[task.delegation_id] = task.title_request
+        return await original_start(self, task, *args, **kwargs)
+
+    monkeypatch.setattr(live._LiveSession, "start_delegation", spy_start)
+    client = H.FakeClient([H.config(), script, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    with caplog.at_level(logging.INFO):
+        await H.run_relay(client, provider, timeout=8, db_session_id="db-d-r5-huh")
+
+    owed = _turn_id(client, "فورمولوان")
+    huh = _turn_id(client, "ها")
+    finals = {f["turn_id"]: f for f in client.of("transcript") if f.get("final")}
+    assert finals[huh].get("phatic") is True
+    created = [f for f in _frames_for(client, "ep3kr") if f.get("phase") == "created"]
+    assert created, _frames_for(client, "ep3kr")
+    assert created[0]["parent_user_turn_id"] == owed
+    assert "ها" not in (created[0].get("title") or "").split(), created[0].get("title")
+    assert owed in created[0]["request_turn_ids"]
+    assert asked and "فورمولوان" in asked[0] and asked[0].strip() != "ها"
+    # Phase D (tests-guards-2): the D-R8 (c) / D-R5 BODY keys reach the tenant
+    # — deleting the `delegated_turn_fields` spread from `_think`'s call
+    # passed every suite (the stub swallowed **kwargs; the frame assertion
+    # above fell back to `[owed]`).
+    kw = [k for k in seen if k.get("delegation_id") == "ep3kr"][-1]
+    assert kw["parent_user_turn_id"] == owed
+    assert owed in kw["request_turn_ids"]
+    assert kw["task_title"] == "فورمولوان"
+    assert kw["anchor_occurred_at"]
+    assert titled.get("ep3kr") == "فورمولوان", titled
+    assert "status overtaken" in caplog.text and "reason=phatic_anchor" in caplog.text
+    superseded = [
+        line for line in caplog.text.splitlines()
+        if "unanswered_superseded" in line and owed in line
+    ]
+    assert superseded == [], superseded
+
+
+# ── Voice round 2026-10-07 (D-R3(2)/(3)): the ADDENDUM join ───────────────
+# A question tail, a restatement or a continuation that starts within
+# `voice_live_addendum_window_ms` of a running (or queued) request's last word
+# completes THAT request: one card, forwarded to the running tenant turn on
+# `POST /api/v1/internal/voice-delegations/addendum`.  Every other short
+# follow-up keeps today's path (the controls above stay green unchanged).
+
+from app.config import settings as _settings  # noqa: E402
+import app.services.live_voice_protocol as _live  # noqa: E402
+
+PROF = "قوی‌ترین استاد یوافتی توی بحث ال‌ال‌ام رو پیدا کن"
+
+
+def _addenda_on(monkeypatch, window=5000, **kw):
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0, **kw)
+    monkeypatch.setattr(_settings, "voice_live_addendum_window_ms", window)
+
+
+def _tenant(monkeypatch, answer=None, status=None):
+    from app.api import ws_realtime as rt
+
+    posts: list[dict] = []
+
+    async def api(_url, _key, _method, path, json_body=None, timeout=None, outcome=None, **_kw):
+        if path.endswith("/voice-delegations/addendum"):
+            posts.append(dict(json_body or {}))
+            if status is not None:
+                if outcome is not None:
+                    outcome.update(status=status)
+                return None
+            return answer if answer is not None else {"accepted": True, "state": "queued"}
+        return None
+
+    async def vps(_user_id):
+        return ("https://tenant.example", "agent-key")
+
+    monkeypatch.setattr(rt, "_vps_api", api)
+    return posts, vps
+
+
+def _boot(box):
+    def on_send(p, e):
+        box["p"] = p
+        if e["type"] == "session.close":
+            p.push(H.closed())
+    return on_send
+
+
+@pytest.mark.asyncio
+async def test_a_tail_joins_the_models_own_running_task_and_is_forwarded(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    _addenda_on(monkeypatch)
+    posts, vps = _tenant(monkeypatch)
+    calls: list[dict] = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append({"did": kw.get("delegation_id"), "task": task})
+        await asyncio.sleep(1.0)
+        if out is not None:
+            out["addenda_applied"] = [box["kie"]] if box.get("kie") else []
+        return "کالین رافل.", "m"
+
+    H.patch_relay(monkeypatch, think=think, vps=vps)
+    box: dict = {}
+
+    async def script():
+        p = box["p"]
+        p.push(H.user_delta(PROF, 1000, 2500))
+        p.push(H.delegation("d1", 2550))
+        await _wait(lambda: calls, timeout=3.0)
+        p.push(H.user_delta("کیه", 3900, 4100))
+        await _wait(lambda: "کیه" in _final_turns(client).values(), timeout=4.0)
+        box["kie"] = _turn_id(client, "کیه")
+        # The model delegates the tail on its own as well — absorbed.
+        p.push(H.delegation("d2", 4150))
+        await _wait(lambda: _terminal(client, "d1"), timeout=4.0)
+        await asyncio.sleep(0.3)
+
+    client = H.FakeClient([
+        H.config(features=H.config()["features"] + ["reply_status"]), 0.1, script, 0.2,
+        {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=_boot(box), auto_ack=True)
+    await H.run_relay(client, provider, timeout=15, db_session_id="db-r3-addendum-d1")
+
+    kie = box["kie"]
+    assert [c["did"] for c in calls] == ["d1"], calls
+    assert [f["delegation_id"] for f in client.of("delegation") if f["phase"] == "created"] == ["d1"]
+    logs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(f"[LIVE] addendum joined id=d1 turn_id={kie} kind=question_tail ")
+               for m in logs), [m for m in logs if "addendum" in m]
+    assert any(m.startswith(f"[LIVE] delegation absorbed id=d2 turn_id={kie} reason=addendum owner=d1")
+               for m in logs), [m for m in logs if "absorbed" in m]
+    assert [(p["task_id"], p["addendum_id"], p["text"]) for p in posts] == [("d1", kie, "کیه")]
+    frames = _lifecycle(_frames_for(client, "d1"))
+    held = frames[0]["request_turn_ids"]
+    grown = next(f for f in frames if kie in (f.get("request_turn_ids") or []))
+    assert grown["request_turn_ids"][:len(held)] == held and grown["title"].endswith("کیه")
+    assert ("delegated", "d1") in [(f["outcome"], f.get("task_id"))
+                                   for f in client.of("reply_status")
+                                   if f.get("user_turn_id") == kie]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wall_s", [4.0, 40.0])
+@pytest.mark.parametrize("path", ["addendum", "seam"])
+async def test_a_tail_long_after_its_request_on_the_wall_clock_is_its_own_task(
+    monkeypatch, caplog, path, wall_s,
+):
+    """Phase D2 ruling 49, end to end: the request, then «کیه» 1.4 s later on
+    the provider timeline — the relay heard the request `wall_s` before the
+    tail.  4 s: one card, as before (the tail joins; the model's own
+    delegation for it is absorbed — after the tail by the addendum, at its
+    onset by the seam).  40 s: not joined, not absorbed — d2 is a task of
+    its own."""
+
+    import logging
+
+    import app.services.live_voice_protocol as live
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    _addenda_on(monkeypatch, voice_live_seam_onset_ms=400)
+    original_add = live.UtteranceAssembler.add
+
+    def add(self, text, start_ms, end_ms):
+        closed, current = original_add(self, text, start_ms, end_ms)
+        if text == PROF:
+            # The relay heard the request `wall_s` ago (its input timeline
+            # stalled in between).
+            current.last_heard_monotonic -= wall_s
+        return closed, current
+
+    monkeypatch.setattr(live.UtteranceAssembler, "add", add)
+    calls: list[str] = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append(kw.get("delegation_id"))
+        await asyncio.sleep(1.5 if len(calls) == 1 else 0.05)
+        return "کالین رافل.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    box: dict = {}
+
+    async def script():
+        p = box["p"]
+        p.push(H.user_delta(PROF, 1000, 2500))
+        p.push(H.delegation("d1", 2550))
+        await _wait(lambda: calls, timeout=3.0)
+        p.push(H.user_delta("کیه", 3900, 4100))
+        if path == "seam":
+            p.push(H.delegation("d2", 3900))          # decided at the tail's onset
+        await _wait(lambda: "کیه" in _final_turns(client).values(), timeout=4.0)
+        if path == "addendum":
+            p.push(H.delegation("d2", 4150))
+        await asyncio.sleep(1.6)
+
+    client = H.FakeClient([H.config(), 0.1, script, 0.2, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_boot(box), auto_ack=True)
+    await H.run_relay(client, provider, timeout=15, db_session_id=f"db-r49-{path}-{int(wall_s)}")
+    logs = [r.getMessage() for r in caplog.records]
+    if wall_s < 15:
+        assert calls == ["d1"], calls
+        assert [m for m in logs if "[LIVE] addendum joined id=d1" in m], logs
+        assert [m for m in logs if m.startswith("[LIVE] delegation absorbed id=d2")
+                and f"reason={path} owner=d1" in m], logs
+        assert not [m for m in logs if "wall_gap" in m], logs
+        return
+    assert calls == ["d1", "d2"], calls
+    assert not [m for m in logs if "[LIVE] addendum joined" in m], logs
+    assert [m for m in logs if "[LIVE] addendum refused id=d1" in m and "reason=wall_gap" in m], logs
+    if path == "seam":
+        assert [m for m in logs if "[LIVE] seam skipped id=d2" in m and "reason=wall_gap" in m], logs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["late", "finished"])
+async def test_a_tail_outside_the_window_or_after_the_answer_is_its_own_request(
+    monkeypatch, caplog, case,
+):
+    """5001 ms after the request, or after its task FINISHED: today's path —
+    the model's delegation for the tail is a task of its own."""
+
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    _addenda_on(monkeypatch, window=1000)
+    calls: list[str] = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append(kw.get("delegation_id"))
+        await asyncio.sleep(1.0 if case == "late" and len(calls) == 1 else 0.05)
+        return "یک جواب.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    box: dict = {}
+
+    async def script():
+        p = box["p"]
+        p.push(H.user_delta(PROF, 1000, 2500))
+        p.push(H.delegation("d1", 2550))
+        await _wait(lambda: calls, timeout=3.0)
+        if case == "finished":
+            await _wait(lambda: _terminal(client, "d1"), timeout=3.0)
+        start = 3501 if case == "late" else 2900
+        p.push(H.user_delta("کیه", start, start + 200))
+        await asyncio.sleep(0.2)
+        p.push(H.delegation("d2", start + 250))
+        await _wait(lambda: len(calls) >= 2, timeout=3.0)
+        await asyncio.sleep(1.2)
+
+    client = H.FakeClient([H.config(), 0.1, script, 0.2, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_boot(box), auto_ack=True)
+    await H.run_relay(client, provider, timeout=15, db_session_id=f"db-r3-addendum-{case}")
+    assert calls == ["d1", "d2"], calls
+    assert not any("[LIVE] addendum joined" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_tail_joined_to_a_QUEUED_task_rides_its_request_and_its_placement(monkeypatch, caplog):
+    """G2: a queued task is not running yet — the tail goes into the request it
+    will run (no forward), and the saved task is placed after the LAST request
+    turn (`anchor_occurred_at` = the tail's own row)."""
+
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    _addenda_on(monkeypatch, voice_live_max_concurrent_delegations=1)
+    posts, vps = _tenant(monkeypatch)
+    calls: list[dict] = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append({"did": kw.get("delegation_id"), "task": task, **kw})
+        await asyncio.sleep(1.2 if len(calls) == 1 else 0.05)
+        return "یک جواب.", "m"
+
+    saves = H.patch_relay(monkeypatch, think=think, vps=vps)["saves"]
+    box: dict = {}
+
+    async def script():
+        p = box["p"]
+        p.push(H.user_delta("the weather in toronto please", 1000, 2000))
+        p.push(H.delegation("d1", 2050))
+        await _wait(lambda: calls, timeout=3.0)
+        p.push(H.user_delta(PROF, 2600, 4000))
+        p.push(H.delegation("d2", 4050))
+        await asyncio.sleep(0.3)
+        p.push(H.user_delta("کیه", 4800, 5000))
+        await _wait(lambda: len(calls) >= 2, timeout=4.0)
+        await asyncio.sleep(0.4)
+
+    client = H.FakeClient([H.config(), 0.1, script, 0.2, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_boot(box), auto_ack=True)
+    await H.run_relay(client, provider, timeout=15, db_session_id="db-r3-addendum-queued")
+
+    assert [c["did"] for c in calls] == ["d1", "d2"], calls
+    logs = [r.getMessage() for r in caplog.records]
+    assert any("[LIVE] addendum joined id=d2 " in m and "target=queued" in m for m in logs)
+    assert posts == [], "a queued task carries the tail in its request; nothing to forward"
+    d2 = calls[1]
+    assert "کیه" in d2["task"] and d2["display_request"].endswith("کیه")
+    kie_row = next(s for s in saves if s.get("user_text") == "کیه")
+    stamp = kie_row["user_occurred_at"]
+    from datetime import timezone
+
+    assert d2["anchor_occurred_at"] == (
+        stamp.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds")
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("کیه", "question_tail"), ("چیه", "question_tail"), ("کدومه", "question_tail"),
+        ("کجاست", "question_tail"), ("چنده", "question_tail"), ("کی بود", "question_tail"),
+        ("خب کیه", "question_tail"), ("who is it", "question_tail"),
+        ("which one", "question_tail"), ("how much", "question_tail"),
+        ("قوی‌ترین استاد یو‌اف‌تی", "restatement"),
+        ("توی دانشگاه تورنتو", "continuation"), ("که روی ال‌ال‌ام کار می‌کنه", "continuation"),
+        # Never an addendum: repair initiators, D-R6 corrections, an answer to
+        # the agent, new requests with their own predicate or content, a
+        # consent, a new-request opener, a status question, a correction.
+        ("چی؟", ""), ("what?", ""), ("رضوان", ""), ("افوانه", ""), ("هوای تورنتو", ""),
+        ("weather?", ""), ("حتما", ""), ("تورنتو", ""), ("با کی قرار دارم فردا؟", ""),
+        ("برای فردا هم یه قرار بذار", ""), ("and the weather in toronto", ""),
+        ("سرچ کن", ""), ("یه چیز دیگه هم بگو", ""), ("وضعیت چی شد", ""),
+        ("نه، منظورم تورنتو بود", ""),
+        # Phase D (turns-startup-1): a NEW request opening with a preposition
+        # carries an imperative verb the closed predicate list did not know
+        # — joined as a "continuation", it was never done — and "you" is no
+        # filler outside "thank you"; a bare "why" / «چرا» / "how" is a
+        # question of its own.
+        ("برای مامانم پیام بفرست", ""), ("با علی تماس بگیر", ""), ("تو تقویمم بنویس", ""),
+        ("با صدای بلند بخون", ""), ("از یخچال آب بیار", ""), ("برای فردا یه یادآور بساز", ""),
+        ("at 9 wake me up", ""), ("in the calendar add it", ""),
+        ("where are you", ""), ("who are you", ""), ("why", ""), ("چرا", ""), ("how", ""),
+        ("برای نمره هشت", "continuation"), ("in toronto", "continuation"),
+    ],
+)
+def test_the_addendum_kinds_are_closed(text, kind):
+    request = ". چیز اه قوی‌ترین استاد... اه یو‌اف‌تی توی بحث ال‌ال‌ام"
+    assert _live.addendum_kind(text, request) == kind
+
+
+def test_a_related_but_independent_request_is_never_a_restatement():
+    """The `:626` control: 75–80 % of the running request is a different
+    request; only EVERY content word held is a restatement."""
+
+    assert _live.addendum_kind(
+        "find robotics professors at the university of toronto",
+        "research the toronto LLM faculty at the university of toronto",
+    ) == ""
+    assert _live.addendum_kind(
+        "addresses of the robotics labs", "research the toronto robotics faculty",
+    ) == ""
+
+
+def _target_session(monkeypatch, *, window=5000):
+    """A `__new__`-built session with exactly what `addendum_target` reads."""
+
+    monkeypatch.setattr(_settings, "voice_live_addendum_window_ms", window)
+    session = _live._LiveSession.__new__(_live._LiveSession)
+    session.settings = _settings
+    session.utterances = _live.UtteranceAssembler("p-target", gap_ms=400, hard_gap_ms=900)
+    session.supervisor = _live.DelegationSupervisor(max_concurrent=2)
+    session.results_owed = set()
+    session.deliveries = {}
+    request = session.utterances
+    request.add(PROF, 1000, 2500)
+    turn = request.close("gap")
+    turn.causal_speech = True
+    task = _live.DelegatedTask(delegation_id="d1", offset_ms=2550, transcript=PROF,
+                               turn_id=turn.turn_id, request_turn_ids=[turn.turn_id])
+    turn.consumed_by, turn.dispatched = "d1", True
+    task.span = [turn]
+    session.supervisor.running["d1"] = _live.RunningDelegation(task=task, started_monotonic=0.0)
+    return session, task
+
+
+def _tail(session, text, start, end):
+    session.utterances.add(text, start, end)
+    turn = session.utterances.close("gap")
+    turn.causal_speech = True
+    return turn
+
+
+def test_the_addendum_bounds_hold(monkeypatch):
+    """Each bound on its own session (a tail left unconsumed in the queue is
+    itself a request turn between the task and the next tail)."""
+
+    def target(text, start, end, **task_fields):
+        session, task = _target_session(monkeypatch)
+        for key, value in task_fields.items():
+            setattr(task, key, value)
+        return session.addendum_target(_tail(session, text, start, end))
+
+    assert target("کیه", 3900, 4100)[1:] == ("question_tail", 1400)
+    # ≤3 per task.
+    assert target("کیه", 3900, 4100,
+                  addenda=[{"text": "کیه"}, {"text": "کجاست"}, {"text": "چنده"}]) is None
+    assert target("کیه", 3900, 4100, addenda=[{"text": "کیه"}, {"text": "کجاست"}]) is not None
+    # ≤240 characters together.
+    assert target("کجاست", 3900, 4100, addenda=[{"text": "x" * 118}, {"text": "y" * 118}]) is None
+    # ≤120 characters each (a 130-character restatement).
+    long = ("قوی‌ترین استاد یو‌اف‌تی " * 6).strip()
+    assert len(long) > 120
+    assert target(long, 3900, 4100) is None
+    # The window: 5000 ms joins, 5001 ms does not.
+    assert target("کیه", 7500, 7600) is not None
+    assert target("کیه", 7501, 7600) is None
+    # The result already owed (in delivery).
+    session, _task = _target_session(monkeypatch)
+    session.results_owed.add("d1")
+    assert session.addendum_target(_tail(session, "کیه", 3900, 4100)) is None
+
+
+def test_the_seam_owner_rules(monkeypatch):
+    """D-R3(1): decided at the ONSET (≤400 ms, never past the turn's end), the
+    turn before consumed by a task STILL WORKING, within the window."""
+
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(_settings, "voice_live_seam_onset_ms", 400)
+
+    def owner(offset, start=3500, end=4700, **running):
+        session, task = _target_session(monkeypatch)
+        entry = session.supervisor.running["d1"]
+        for key, value in running.items():
+            setattr(entry, key, value)
+        latest = _tail(session, "هوای تورنتو چطوره؟", start, end)
+        got = session.seam_owner(SimpleNamespace(offset_ms=offset), latest)
+        return got and got[0].delegation_id
+
+    assert owner(3500) == "d1"
+    assert owner(3900) == "d1"
+    assert owner(3901) is None                       # past the onset bound
+    assert owner(3600, start=3500, end=3550) is None  # past the turn's own end
+    assert owner(3499) is None                       # before the turn: not its seam
+    assert owner(7501, start=7501, end=8000) is None  # 5001 ms after the request
+    assert owner(3500, ended=True) is None           # the owner finished
+    assert owner(3500, cancelled=True) is None
+    monkeypatch.setattr(_settings, "voice_live_seam_onset_ms", 0)
+    assert owner(3500) is None                       # the switch
+
+
+@pytest.mark.parametrize("wall_s", [4.0, 40.0])
+def test_the_join_and_the_seam_are_bounded_on_the_relays_own_clock(monkeypatch, caplog, wall_s):
+    """Phase D2 ruling 49 (turns-startup-9): both windows are on the
+    INPUT-AUDIO timeline, which stalls whenever the phone uplinks nothing
+    (silent idle under music before the request's final; 17.6 s of skew on
+    10-07).  «کیه» 1.4 s after the request on that timeline but 40 s after it
+    on the relay's clock is not its tail, and a model decision arriving that
+    late is not the request's own.  The relay's clock bounds both: 3 × the
+    5 s window (15 s) from the request's last word as the relay heard it."""
+
+    import logging
+    import time
+    from types import SimpleNamespace
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    monkeypatch.setattr(_settings, "voice_live_seam_onset_ms", 400)
+    session, task = _target_session(monkeypatch)
+    session.user_id = "user-1"
+    request = task.span[0]
+    tail = _tail(session, "کیه", 3900, 4100)
+    request.last_heard_monotonic = tail.seen_monotonic - wall_s
+    got = session.addendum_target(tail)
+    seam = session.seam_owner(SimpleNamespace(
+        delegation_id="d-model", offset_ms=3900, created_monotonic=request.last_heard_monotonic + wall_s,
+    ), tail)
+    logs = [r.getMessage() for r in caplog.records]
+    if wall_s < 15:
+        assert got is not None and got[1:] == ("question_tail", 1400), got
+        assert seam is not None and seam[0].delegation_id == "d1", seam
+        assert not [m for m in logs if "wall_gap" in m], logs
+        return
+    assert got is None and seam is None, (got, seam)
+    assert any(m.startswith(
+        f"[LIVE] addendum refused id=d1 turn_id={tail.turn_id} reason=wall_gap gap_ms=40000"
+    ) for m in logs), logs
+    assert any(m.startswith(
+        f"[LIVE] seam skipped id=d-model turn_id={request.turn_id} reason=wall_gap gap_ms=40000"
+    ) for m in logs), logs
+    # Judged again on the next pass: logged once.
+    assert session.addendum_target(tail) is None
+    assert len([m for m in caplog.records if "addendum refused" in m.getMessage()]) == 1
+
+
+def test_a_request_turn_between_the_task_and_the_tail_stops_the_join(monkeypatch):
+    session, _task = _target_session(monkeypatch)
+    _tail(session, "the weather in toronto please", 2800, 3500)
+    assert session.addendum_target(_tail(session, "کیه", 3900, 4100)) is None
+
+
+def test_media_work_is_never_an_addendum_target(monkeypatch):
+    session, task = _target_session(monkeypatch)
+    task.intent = "media_control"
+    assert session.addendum_target(_tail(session, "کیه", 3900, 4100)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "status", "outcome"),
+    [
+        ({"accepted": True, "state": "queued"}, None, "accepted"),
+        ({"accepted": True, "state": "duplicate"}, None, "duplicate"),
+        ({"accepted": False, "reason": "finished"}, None, "finished"),
+        ({"accepted": False, "reason": "answer_written"}, None, "answer_written"),
+        ({"accepted": False, "reason": "not_running"}, None, "not_running"),
+        ({"accepted": False, "reason": "limit"}, None, "limit"),
+        ({"accepted": False, "reason": "mystery"}, None, "failed"),
+        (None, 404, "unsupported"),
+        (None, 500, "failed"),
+    ],
+)
+async def test_the_addendum_forward_outcomes(monkeypatch, answer, status, outcome):
+    posts, vps = _tenant(monkeypatch, answer=answer, status=status)
+    from app.api import ws_realtime as rt
+
+    monkeypatch.setattr(rt, "_get_vps_info", vps)
+    session = _live._LiveSession.__new__(_live._LiveSession)
+    session.user_id, session.db_session_id, session.tenant_addenda = "u1", "db-1", True
+    task = _live.DelegatedTask(delegation_id="d1", offset_ms=0, transcript=PROF, reply_language="fa")
+    assert await session.post_tenant_addendum(task, "live-utt:p:5", "کیه") == outcome
+    assert posts[0] == {"session_id": "db-1", "task_id": "d1", "addendum_id": "live-utt:p:5",
+                        "text": "کیه", "lang": "fa"}
+    if outcome == "unsupported":
+        # An image without the route: the relay stops posting for the session.
+        assert await session.post_tenant_addendum(task, "live-utt:p:6", "کجاست") == "unsupported"
+        assert len(posts) == 1
+    # The late title rides the same route with empty text.
+    posts.clear()
+    session.tenant_addenda = True
+    await session.post_tenant_addendum(task, "title:d1", "", task_title="استاد ال‌ال‌ام یوافتی")
+    assert posts and posts[0]["text"] == "" and posts[0]["task_title"] == "استاد ال‌ال‌ام یوافتی"
+
+
+def test_the_tenants_applied_list_decides_what_the_delivery_must_still_answer():
+    session = _live._LiveSession.__new__(_live._LiveSession)
+    task = _live.DelegatedTask(delegation_id="d1", offset_ms=0, transcript=PROF)
+    task.addenda = [
+        {"id": "t5", "text": "کیه", "forwarded": True},
+        {"id": "t6", "text": "کجاست", "forwarded": True},
+        {"id": "t7", "text": "توی تورنتو", "forwarded": False},   # rode a queued request
+    ]
+    task.addenda_unapplied = ["کیه", "کجاست"]
+    # An image without the route sends no list: the presumption stands.
+    session.note_addenda_applied(task, {})
+    assert task.addenda_unapplied == ["کیه", "کجاست"]
+    session.note_addenda_applied(task, {"addenda_applied": ["t5"]})
+    assert task.addenda_unapplied == ["کجاست"]
+    # Phase C seam: what RB stores is exactly what RA's delivery line reads.
+    task.reply_language = "fa"
+    note = session.result_addendum_note(task)
+    assert "«کجاست»" in note and "کیه" not in note, note
+    session.note_addenda_applied(task, {"addenda_applied": ["t5", "t6"]})
+    assert task.addenda_unapplied == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("older", [False, True], ids=["alone", "older_task_running"])
+async def test_a_tail_that_closed_before_its_requests_delegation_still_joins(
+    monkeypatch, caplog, older,
+):
+    """The model's delegation for the request can arrive AFTER the tail closed
+    (both pending at once).  The request binds first; the tail joins it in the
+    same pass, and the tail's own delegation is absorbed — one card.
+
+    Phase D turns-startup-10: ALSO while an unrelated older task runs — the
+    tail was judged at its close against that older task only, stamped seen,
+    and never judged again once its own request bound: a second card."""
+
+    import logging
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    _addenda_on(monkeypatch)
+    calls: list[str] = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append(kw.get("delegation_id"))
+        await asyncio.sleep(6.0 if kw.get("delegation_id") == "d0" else 0.8)
+        return "کالین رافل.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+    box: dict = {}
+
+    async def script():
+        p = box["p"]
+        if older:
+            p.push(H.user_delta("هوای تورنتو رو سرچ کن", 100, 600))
+            p.push(H.delegation("d0", 650))
+            await _wait(lambda: calls, timeout=3.0)
+        p.push(H.user_delta(PROF, 1000, 2500))
+        await _wait(lambda: PROF in _final_turns(client).values(), timeout=4.0)
+        p.push(H.user_delta("کیه", 3900, 4100))
+        await _wait(lambda: "کیه" in _final_turns(client).values(), timeout=4.0)
+        p.push(H.delegation("d1", 2550))
+        p.push(H.delegation("d2", 4150))
+        await _wait(lambda: _terminal(client, "d1"), timeout=4.0)
+        await asyncio.sleep(0.3)
+
+    client = H.FakeClient([H.config(), 0.1, script, 0.2, {"type": "stop"}])
+    provider = H.FakeProvider(on_send=_boot(box), auto_ack=True)
+    await H.run_relay(
+        client, provider, timeout=15, db_session_id=f"db-r3-addendum-late-target-{older}",
+    )
+    kie = _turn_id(client, "کیه")
+    assert [c for c in calls if c != "d0"] == ["d1"], calls
+    logs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith(f"[LIVE] addendum joined id=d1 turn_id={kie} ") for m in logs)
+    assert any(m.startswith(f"[LIVE] delegation absorbed id=d2 turn_id={kie} reason=addendum")
+               for m in logs), [m for m in logs if "absorbed" in m or "addendum" in m]

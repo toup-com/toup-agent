@@ -185,7 +185,7 @@ async def test_think_v2_runs_full_agent_via_http(v2_on, monkeypatch):
     calls = []
 
     async def _fake_vps_api(agent_url, agent_api_key, method, path,
-                            params=None, json_body=None, timeout=15.0):
+                            params=None, json_body=None, timeout=15.0, outcome=None):
         calls.append(dict(method=method, path=path, json_body=json_body, timeout=timeout))
         return {"text": "The newest is X.", "model": "gpt-5.5", "tool_calls": 2}
 

@@ -1,7 +1,9 @@
 """Durable Live task recovery after the audio socket changes replicas."""
 
 import asyncio
+import contextlib
 import json
+import time
 import uuid
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
@@ -195,6 +197,74 @@ async def test_late_reask_output_keeps_exact_parent_after_timeout(monkeypatch):
     replies = [f for f in client.of("response_text")
                if "arrived later" in f.get("text", "")]
     assert replies and replies[0]["parent_user_turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+async def test_the_response_watch_reads_the_latest_reask_append(monkeypatch, caplog):
+    """Voice round 2026-10-06 (D-R1 (b)): a turn may now carry TWO reasks
+    (the app's, then the relay's — `_REASK_MAX_PER_TURN` is total and real),
+    each with its own event id.  The `response delayed` line's `acked=` /
+    `ack_ms=` must describe the LATEST note — here the relay's `-2`, which
+    GPT-Live took — not the first, which it never acked."""
+
+    import logging
+
+    import app.services.live_voice_protocol as live
+
+    caplog.set_level(logging.INFO, logger="app.services.live_voice_protocol")
+    H.fast_clocks(
+        monkeypatch, voice_live_uplink_keeper_enabled=True,
+        voice_live_reply_regen_after_s=0.3,
+    )
+    H.patch_relay(monkeypatch)
+    monkeypatch.setattr(live, "_REASK_RESPONSE_WAIT_S", 0.5)
+
+    def on_send(provider, event):
+        if event["type"] == "session.start":
+            provider.push(H.user_delta("Please answer this question", 0, 300))
+        elif (
+            event["type"] == "session.instructions.append"
+            and str(event.get("event_id") or "").endswith("-2")
+        ):
+            provider.push({
+                "type": "session.instructions.appended",
+                "client_event_id": event["event_id"], "start_ms": 0, "end_ms": 0,
+            })
+        elif event["type"] == "session.close":
+            provider.push(H.closed())
+
+    client = H.FakeClient([])
+
+    async def reask_once():
+        for _ in range(50):
+            finals = [f for f in client.of("transcript") if f.get("final")]
+            if finals:
+                client._script.insert(0, {
+                    "type": "inject_text", "text": "Please answer this question",
+                    "reask_of_user_turn_id": finals[0]["turn_id"],
+                })
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("user turn did not finalize")
+
+    config = H.config()
+    config["features"].append("reask_turns")
+    client._script = [config, reask_once, 1.4, {"type": "stop"}]
+    provider = H.FakeProvider(on_send=on_send)
+    await H.run_relay(client, provider, timeout=6)
+
+    turn = [f for f in client.of("transcript") if f.get("final")][0]["turn_id"]
+    reasks = [
+        e["event_id"] for e in provider.of("session.instructions.append")
+        if str(e.get("event_id") or "").startswith("toup-live-reask-")
+    ]
+    assert reasks == [f"toup-live-reask-{turn}", f"toup-live-reask-{turn}-2"], reasks
+    delayed = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("[LIVE] accepted reask response delayed")
+    ]
+    assert len(delayed) == 1, delayed
+    assert "acked=True" in delayed[0] and delayed[0].rsplit(" ack_ms=", 1)[1] != "-1", delayed
 
 
 @pytest.mark.asyncio
@@ -731,6 +801,11 @@ async def test_old_runner_observes_durable_stop_after_socket_detaches(monkeypatc
 
     H.fast_clocks(monkeypatch)
     monkeypatch.setattr(live, "_DURABLE_CANCEL_POLL_S", 0.02)
+    # This agent never starts a tool, and the watch now waits for one (or
+    # `_DURABLE_CANCEL_NO_TOOL_WAIT_S`) before it reads at all — pinned by
+    # test_cancel_watch_waits_for_a_tool_and_backs_off. What this test is
+    # about is the detached runner observing the Stop, so no wait here.
+    monkeypatch.setattr(live, "_DURABLE_CANCEL_NO_TOOL_WAIT_S", 0.0)
     started = asyncio.Event()
     stopped = asyncio.Event()
     reads = {"n": 0}
@@ -839,3 +914,247 @@ async def test_tenant_stream_emits_cancelled_after_durable_stop(monkeypatch):
     assert [f["type"] for f in frames if f["type"] in {"tool.start", "cancelled", "done"}] == [
         "tool.start", "cancelled",
     ]
+
+
+# ── PR-2 (2026-10-02 call, P2.6): the cancel watch stops hammering a stalled tenant ──
+
+
+def _scripted_watch(monkeypatch, responses, *, tool_after_sleeps=None):
+    """Drive `watch_durable_delegation_cancel` on a fake clock.
+
+    `asyncio.sleep` and `time.monotonic` are replaced INSIDE the relay module
+    only (everything else forwards to the real modules), so the waits the
+    watch asks for are recorded exactly and cost no wall time.
+    """
+
+    from app.api import ws_realtime as rt
+    import app.services.live_voice_protocol as live
+
+    clock = {"now": 1000.0}
+    sleeps: list[float] = []
+    reads: list[float] = []
+    real_sleep = asyncio.sleep
+    task = live.DelegatedTask(
+        delegation_id="d1", offset_ms=0, transcript="research this",
+        turn_id="live-utt:x:1", created_ms=0,
+    )
+    entry = live.RunningDelegation(task=task, started_monotonic=clock["now"])
+
+    class _Asyncio:
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+        async def sleep(self, delay, *args, **kwargs):
+            sleeps.append(round(float(delay), 3))
+            clock["now"] += float(delay)
+            if tool_after_sleeps is not None and len(sleeps) == tool_after_sleeps:
+                entry.tool_started = True       # the agent's first tool round
+            await real_sleep(0)
+
+    class _Time:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def monotonic(self):
+            return clock["now"]
+
+    async def vps(_user_id):
+        return "https://tenant.example", "agent-key"
+
+    async def api(_url, _key, _method, path, **_kwargs):
+        assert path == "/api/v1/internal/voice-delegations/status"
+        reads.append(clock["now"] - 1000.0)
+        return responses[len(reads) - 1]
+
+    monkeypatch.setattr(live, "asyncio", _Asyncio())
+    monkeypatch.setattr(live, "time", _Time())
+    monkeypatch.setattr(rt, "_get_vps_info", vps)
+    monkeypatch.setattr(rt, "_vps_api", api)
+
+    session = live._LiveSession.__new__(live._LiveSession)
+    session.user_id = "user-1"
+    session.db_session_id = "db-watch"
+    return session, task, entry, sleeps, reads
+
+
+async def _watch_until_cancelled(session, task, entry):
+    runner = asyncio.ensure_future(asyncio.Event().wait())
+    try:
+        await asyncio.wait_for(
+            session.watch_durable_delegation_cancel(task, entry, runner), timeout=5,
+        )
+    finally:
+        runner.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await runner
+
+
+_STOP = {"tasks": {"d1": {"status": "running", "job_id": "exact-job", "cancel_requested": True}}}
+_NO_JOB = {"tasks": {"d1": {"status": "unknown"}}}
+
+
+@pytest.mark.asyncio
+async def test_cancel_watch_waits_for_a_tool_and_backs_off(monkeypatch):
+    """The voice job — the only place a durable Stop can be marked — opens at
+    the agent's first planned tool round, so a status read before it can never
+    find one; during the 2026-10-02 stall every such read just timed out, 1.5 s
+    apart. Reads now wait for the first tool, and each failed read doubles the
+    next wait (1.5 → 3 → 6 → 10 s cap) until a good read resets it."""
+
+    session, task, entry, sleeps, reads = _scripted_watch(
+        monkeypatch, [None, None, None, _NO_JOB, _STOP], tool_after_sleeps=2,
+    )
+    await _watch_until_cancelled(session, task, entry)
+
+    # Two ticks with no tool and no read; then read, fail ×3 (backing off to
+    # the cap), a good read (reset), and the Stop.
+    assert sleeps == [1.5, 1.5, 3.0, 6.0, 10.0, 1.5]
+    assert reads == [3.0, 6.0, 12.0, 22.0, 23.5]
+    assert entry.cancelled and entry.superseded_by == "explicit_cancel"
+
+
+@pytest.mark.asyncio
+async def test_cancel_watch_without_tool_frames_still_reads_after_the_grace(monkeypatch):
+    """The blocking agent-turn path relays no tool frames at all, so the watch
+    cannot wait for one forever: with none, reads begin after 10 s."""
+
+    session, task, entry, sleeps, reads = _scripted_watch(monkeypatch, [_NO_JOB, _STOP])
+    await _watch_until_cancelled(session, task, entry)
+
+    assert reads and reads[0] >= 10.0, reads
+    assert reads == [10.5, 12.0]
+    assert sleeps == [1.5] * 8
+    assert entry.cancelled
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_ended_before_the_repair_keeps_its_retry(monkeypatch):
+    """D-P12: `last_outcomes` is per SOCKET, so after any repair (either
+    replica) a carried failed card's Retry answered `unknown_task`.  The app
+    now carries the tasks that ENDED in the last 10 min on
+    `recover_delegations`; the relay rebuilds their outcome, and the card's
+    Retry re-runs the failed task instead of being ignored."""
+
+    from app.services import live_voice_protocol as live
+
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    calls = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append((kw.get("delegation_id"), kw.get("display_request")))
+        return "Professor A works on LLMs.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    def on_send(provider, event):
+        if event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def retried():
+        for _ in range(300):
+            if any(
+                (f.get("relation") or {}).get("task_id") == "old-failed"
+                and f.get("phase") == "completed"
+                for f in client.of("delegation")
+            ):
+                return
+            await asyncio.sleep(0.01)
+
+    features = list(H.config()["features"]) + ["retry_relation"]
+    client = H.FakeClient([
+        H.config(features=features),
+        {"type": "recover_delegations", "tasks": [{
+            "task_id": "old-failed", "state": "failed",
+            "title": "find the best professor working on LLMs",
+            "turn_id": "old-turn", "request_turn_ids": ["old-turn"],
+            "reason": "delegation_failed", "reply_language": "en",
+        }]},
+        0.1,
+        {"type": "client_event", "name": "retry_task", "detail": "old-failed"},
+        retried, 0.2, {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=6, db_session_id="db-recover-terminal")
+
+    assert len(calls) == 1, calls
+    assert calls[0][0].startswith(live.RELAY_RETRY_PREFIX), calls
+    frames = [
+        f for f in client.of("delegation")
+        if (f.get("relation") or {}).get("task_id") == "old-failed"
+    ]
+    assert frames and frames[0]["relation"]["kind"] == "retries", client.frames
+    assert {f["turn_id"] for f in frames} == {"old-turn"}
+    assert not [f for f in client.of("delegation") if f.get("task_id") == "old-failed"], (
+        "a terminal task is history to rebuild, never a card to recover"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state, retried, outcome", [
+    # The app's TaskState spelling — the relay's own `send_delegation` maps
+    # cancelled/superseded to it — and the legacy phase spelling.
+    ("canceled", False, "cancelled"),
+    ("cancelled", False, "cancelled"),
+    # The phase a delegation expires in is a failure to the user: Retry works.
+    ("expired", True, "failed"),
+    ("failed", True, "failed"),
+])
+async def test_a_recovered_terminal_task_is_read_in_the_wire_vocabulary(
+        monkeypatch, caplog, state, retried, outcome):
+    """W1 (relay half). The app builds each ended task from
+    `liveProtocol.recoverDelegationsFrame` — EXACTLY `{task_id, state, title,
+    turn_id, request_turn_ids?, result_text?, reason?, reply_language?}`, with
+    `state` in its TaskState vocabulary (`completed`/`failed`/`canceled`).
+    The relay keyed its rebuild on `cancelled`, so a canceled task was never
+    rebuilt: its card's Retry and "what happened?" answered `unknown_task`."""
+
+    import logging
+    from app.services import live_voice_protocol as live
+
+    caplog.set_level(logging.INFO, logger=live.logger.name)
+    H.fast_clocks(monkeypatch, voice_live_delegation_ttl_s=2.0)
+    calls = []
+
+    async def think(user_id, task, session_id, relay=None, out=None, **kw):
+        calls.append(kw.get("delegation_id"))
+        return "Professor A works on LLMs.", "m"
+
+    H.patch_relay(monkeypatch, think=think)
+
+    def on_send(provider, event):
+        if event["type"] == "session.close":
+            provider.push(H.closed())
+
+    async def settled():
+        for _ in range(300):
+            if not retried and "retry_task ignored task=old-x" in caplog.text:
+                return
+            if retried and any(
+                (f.get("relation") or {}).get("task_id") == "old-x"
+                and f.get("phase") == "completed"
+                for f in client.of("delegation")
+            ):
+                return
+            await asyncio.sleep(0.01)
+
+    features = list(H.config()["features"]) + ["retry_relation"]
+    ended = {"task_id": "old-x", "state": state,
+             "title": "find the best professor working on LLMs",
+             "turn_id": "old-turn", "request_turn_ids": ["old-turn"],
+             "reason": "delegation_failed", "reply_language": "en"}
+    client = H.FakeClient([
+        H.config(features=features),
+        {"type": "recover_delegations", "tasks": [ended]},
+        0.1,
+        {"type": "client_event", "name": "retry_task", "detail": "old-x"},
+        settled, 0.2, {"type": "stop"},
+    ])
+    provider = H.FakeProvider(on_send=on_send, auto_ack=True)
+    await H.run_relay(client, provider, timeout=6, db_session_id=f"db-recover-{state}")
+
+    assert f"recovered outcome id=old-x outcome={outcome}" in caplog.text, caplog.text
+    assert "reason=unknown_task" not in caplog.text
+    assert len(calls) == (1 if retried else 0), calls
+    if not retried:
+        assert "retry_task ignored task=old-x reason=not_failed" in caplog.text
+    assert not client.of("delegation_recovery"), "an ended task is never recovered"

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 import json
 import logging
 import math
+import sys
 import time
 import uuid
 from typing import Optional
@@ -36,6 +37,31 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect, Query
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Agent Tunnel"])
+
+
+def _hint_voice_lanes(user_id: str, *, up: bool) -> None:
+    """Tell this replica's live voice transcript lanes that the user's tunnel
+    came up or went away (`live_voice_protocol.note_tenant_link`). A hint for
+    their retry timing only — it never decides anything about the tenant.
+    A no-op while the relay module is not loaded (no call can be live then),
+    and it never raises into the tunnel."""
+    live = sys.modules.get("app.services.live_voice_protocol")
+    if live is None:
+        return
+    try:
+        live.note_tenant_link(user_id, up=up)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _note_tenant_timeout(user_id: str) -> None:
+    try:
+        from app.services import tenant_proxy_guard
+
+        tenant_proxy_guard.note_timeout(user_id)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # ── Active tunnel connections (user_id → TunnelConnection) ───────────
 _tunnels: dict[str, "TunnelConnection"] = {}
@@ -349,6 +375,11 @@ async def send_http_forward(
         return _validated_http_result(method, result)
     except asyncio.TimeoutError:
         logger.warning("[TUNNEL] HTTP forward %s %s timed out for %s", method, path, user_id[:8])
+        _hint_voice_lanes(user_id, up=False)
+        # PR-15: the guarded read proxies skip this tenant (tunnel AND the
+        # HTTPS re-dial) for a short window instead of adding another request
+        # to a stalled loop. A hint for load shedding only; never raises.
+        _note_tenant_timeout(user_id)
         _http_forward_failed_after_dispatch(method)
         return None
     except (TunnelDisconnected, WebSocketDisconnect):
@@ -578,6 +609,8 @@ async def agent_tunnel_ws(
             return
         if not _mark_tunnel_ready(tunnel):
             return
+        # The tenant process is up and answered its config sync.
+        _hint_voice_lanes(user_id, up=True)
 
         # ── Heartbeat task ──
         async def heartbeat():
@@ -619,6 +652,10 @@ async def agent_tunnel_ws(
         # retiring predecessor may fail only calls it actually received and
         # must never erase the new current tunnel or another tenant's work.
         if installed:
+            if _tunnels.get(user_id) is tunnel:
+                # Still current, so no replacement took over: the tunnel is
+                # gone. (A replaced one says nothing about the tenant.)
+                _hint_voice_lanes(user_id, up=False)
             _retire_tunnel(tunnel)
 
 

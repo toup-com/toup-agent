@@ -784,3 +784,152 @@ async def test_the_date_still_reaches_the_model_in_the_turn_context_tail(
     # …and exactly once, nowhere in the cached head.
     assert "Today's date: " not in prompt
     assert clock.count("Today's date: ") == 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Voice round 2026-10-05 F1: the voice contract names `delegate`
+# ══════════════════════════════════════════════════════════════════════
+#: The supervisor gate puts `delegate` on voice for allowlisted users. The voice
+#: contract used to say flatly that "the sub-agent tools" are not in the list,
+#: which told a gated user's model never to touch the one tool built for a heavy
+#: spoken request. The sentence is conditional on the TOOL LIST so the cached
+#: prefix stays identical for every user, gated or not.
+_DELEGATE_RULE = (
+    "If `delegate` is in your tool list, a heavy request (several searches or parts) goes to"
+)
+
+
+@pytest.mark.asyncio
+async def test_voice_contract_routes_a_heavy_request_to_delegate(envelope_on):
+    prompt = (await _prompts(["voice"]))["voice"]
+    flat = re.sub(r"\s+", " ", prompt)
+    assert _DELEGATE_RULE in flat, "flag-on voice contract does not name `delegate`"
+    assert "small talk and direct answers stay inline" in flat
+    assert "the sub-agent tools) are NOT" not in flat
+
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Voice round 2026-10-06 (D-T3): the per-call prompt cache
+# ══════════════════════════════════════════════════════════════════════
+#
+# `sys=b68cf42e` on all eight delegations of the 2026-10-06 call: the prompt
+# did not change and every delegation rebuilt it (49–835 ms). A voice
+# delegation now reuses the call's prompt and recomputes only the per-turn
+# parts. These run the REAL builder.
+
+
+async def _voice_rig(monkeypatch):
+    from app.agent import call_context_cache as cc
+    from app.agent.agent_runner import AgentRunner
+    from app.agent.tool_executor import ToolExecutor
+    from app.db.database import async_session_maker
+    from app.db.models import User
+    from app.services.openai_agent_service import OpenAIAgentService
+
+    monkeypatch.setattr(settings, "stable_prefix_layout", True)
+    cc.reset_for_test()
+    uid = str(uuid.uuid4())
+    from app.db.models import MemoryFile
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"{uid[:8]}@prefix.local", hashed_password="x" * 60,
+                    name=_GOLDEN_USER_NAME))
+        await db.flush()
+        # Memory files whose RELEVANT pick depends on the request — so a hit
+        # that reused the previous request's user brain would be visible.
+        db.add(MemoryFile(user_id=uid, slug="you/profile", section="you",
+                          title="Profile", body_md="- Lives in Toronto.", is_system=True))
+        db.add(MemoryFile(user_id=uid, slug="topics/formula-one", section="topics",
+                          title="Formula One", description="Formula One racing",
+                          body_md="- Follows Formula One racing; favourite driver Max Verstappen."))
+        db.add(MemoryFile(user_id=uid, slug="topics/ufc", section="topics",
+                          title="UFC", description="UFC fighters",
+                          body_md="- Watches UFC fights; follows the fighters' weigh-ins."))
+        await db.commit()
+    runner = AgentRunner(llm_service=OpenAIAgentService(),
+                         tool_executor=ToolExecutor(workspace=_WS))
+    builds = {"n": 0}
+    real = runner._build_system_prompt_uncached
+
+    async def counted(*a, **kw):
+        builds["n"] += 1
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(runner, "_build_system_prompt_uncached", counted)
+
+    async def build(msg, channel="voice"):
+        tc: dict = {}
+        async with async_session_maker() as db:
+            p = await runner._build_system_prompt(
+                db=db, user_id=uid, user_message=msg, channel=channel,
+                client_tz="UTC", turn_context_out=tc,
+            )
+        return p, tc
+
+    return runner, uid, builds, build, real
+
+
+@pytest.mark.asyncio
+async def test_a_voice_calls_prompt_is_built_once_and_its_turn_parts_every_time(monkeypatch):
+    from app.agent import call_context_cache as cc
+    from app.db.database import async_session_maker
+
+    runner, uid, builds, build, real = await _voice_rig(monkeypatch)
+    p1, tc1 = await build("who won the last formula one race this weekend")
+    p2, tc2 = await build("what did the UFC fighters weigh in at")
+    assert builds["n"] == 1, "the second delegation of a call must not rebuild the prompt"
+    assert p2 == p1
+    assert "clock" in tc2 and "__tz_name" not in tc1 and "__tz_name" not in tc2
+    assert "user_brain" in tc1 and "user_brain" in tc2
+    assert tc1["user_brain"] != tc2["user_brain"], (
+        "the relevant files are THIS request's — a hit must not reuse the last one's"
+    )
+    # The per-turn parts are THIS request's: identical to what an uncached
+    # build of the same request writes (the clock aside — it is a minute).
+    fresh: dict = {}
+    async with async_session_maker() as db:
+        assert await real(db, uid, "what did the UFC fighters weigh in at",
+                          channel="voice", client_tz="UTC",
+                          turn_context_out=fresh) == p1
+    fresh.pop("__tz_name", None)
+    strip = lambda d: {k: v for k, v in d.items() if k != "clock"}
+    assert strip(tc2) == strip(fresh)
+    # Any write to what the prompt is built from ends the reuse.
+    cc.bump_memory_generation("test")
+    await build("and the main event")
+    assert builds["n"] == 2
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_only_a_voice_delegation_reuses_the_prompt(monkeypatch):
+    from app.agent import call_context_cache as cc
+
+    runner, uid, builds, build, real = await _voice_rig(monkeypatch)
+    await build("hi there", channel="web")
+    await build("hi again", channel="web")
+    assert builds["n"] == 2, "chat is not cached this round"
+    monkeypatch.setattr(settings, "voice_call_context_cache", False)
+    await build("one", channel="voice")
+    await build("two", channel="voice")
+    assert builds["n"] == 4, "the kill switch"
+    cc.reset_for_test()
+
+
+@pytest.mark.asyncio
+async def test_a_write_to_the_agent_config_bumps_the_memory_generation():
+    """The invalidation is the ORM's own write hook — a flushed row in a
+    tracked table, from any writer in this process."""
+    from app.agent import call_context_cache as cc
+    from app.db.database import async_session_maker
+    from app.db.models import AgentConfig, User
+
+    uid = str(uuid.uuid4())
+    async with async_session_maker() as db:
+        db.add(User(id=uid, email=f"{uid[:8]}@gen.local", hashed_password="x" * 60, name="G"))
+        await db.commit()
+    before = cc.memory_generation()
+    async with async_session_maker() as db:
+        db.add(AgentConfig(user_id=uid))
+        await db.commit()
+    assert cc.memory_generation() > before

@@ -42,6 +42,7 @@ Protocol (Browser ↔ Proxy):
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import contextvars
@@ -424,6 +425,7 @@ VOICE_INCOMPATIBLE_TOOLS = {
     "tts",         # Voice agent already speaks — no need for Telegram voice messages
     "talk_mode",   # Telegram voice chat mode — not applicable
     "spawn",       # Sub-agent spawning — Telegram-specific
+    "delegate",    # Supervisor: the Live path reaches it through a delegation
 }
 
 
@@ -1377,6 +1379,51 @@ async def _get_vps_info(user_id: str) -> Optional[tuple]:
     return None
 
 
+#: D-P6: user_id → (monotonic read time, supervisor model or None). The admin
+#: route writes `platform_settings['subagent.settings.<user_id>']` with no
+#: restart, and both replicas read it; a minute of staleness is the price of
+#: not reading the table once per delegation.
+_SUPERVISOR_MODEL_CACHE: dict = {}
+_SUPERVISOR_MODEL_TTL_S = 60.0
+
+
+async def _tenant_supervisor_model(user_id: str) -> Optional[str]:
+    """The per-tenant `supervisor_model` for this user's voice delegations.
+
+    ONE reader of `subagent.settings.<user_id>` (`services/subagent_settings`)
+    and ONE resolution (`model_resolver.supervisor_model`), the same pair the
+    tenant's gate and workers use. Applied ONLY while the supervisor gate is on
+    for this user (the row's `enabled`, else the image flag / allowlist): a
+    model override on a user whose `delegate` is off would re-route their
+    ordinary voice delegations to a model the admin chose for supervision.
+    No row, an unreadable row, the gate off, or an unroutable model all mean
+    None (keep `classify_request`).
+    """
+    now = time.monotonic()
+    cached = _SUPERVISOR_MODEL_CACHE.get(user_id)
+    if cached is not None and now - cached[0] < _SUPERVISOR_MODEL_TTL_S:
+        return cached[1]
+    model: Optional[str] = None
+    try:
+        from app.agent.supervisor_gate import supervisor_enabled_for
+        from app.db.database import async_session_maker
+        from app.services import model_resolver, subagent_settings
+
+        async def read() -> dict:
+            async with async_session_maker() as db:
+                return await subagent_settings.load(db, user_id)
+
+        # Bounded: the delegation is waiting on this, and a stalled pool must
+        # cost the setting, never the caller's answer.
+        ov = await asyncio.wait_for(read(), timeout=2.0)
+        if supervisor_enabled_for(settings, ov, user_id=user_id):
+            model = model_resolver.supervisor_model(ov, fallback_default=False)
+    except Exception:  # noqa: BLE001 - a settings read never blocks a delegation
+        model = None
+    _SUPERVISOR_MODEL_CACHE[user_id] = (now, model)
+    return model
+
+
 #: Set by a caller that RETRIES a voice-row write (the Live `PersistenceQueue`).
 #: While set, `_save_voice_messages` appends one (transient|permanent, cause)
 #: per row that did not land and leaves the loss verdict to that caller — it
@@ -1384,6 +1431,15 @@ async def _get_vps_info(user_id: str) -> Optional[tuple]:
 #: caller is about to retry. Unset (every other caller), nothing changes.
 _VOICE_SAVE_OUTCOMES: contextvars.ContextVar = contextvars.ContextVar(
     "voice_save_outcomes", default=None,
+)
+
+#: Set by the Live `PersistenceQueue` while its tenant is confirmed away: the
+#: per-attempt HTTP timeout for this write, instead of `_vps_api`'s 15 s, so a
+#: stalled tenant costs seconds per retry (P3). Unset (every other caller and
+#: every ordinary attempt), `_save_voice_messages` passes no timeout at all and
+#: nothing changes.
+_VOICE_SAVE_TIMEOUT_S: contextvars.ContextVar = contextvars.ContextVar(
+    "voice_save_timeout_s", default=None,
 )
 
 # 408/425/429 say "not now", not "never": retrying the same upsert later is
@@ -1537,6 +1593,33 @@ def _step_attr(ev: Optional[dict]) -> dict:
             out[k] = str(v)[:120]
     return out
 
+
+#: D-P6: the keys that say WHICH executor sub-agent ran a tool (the tenant
+#: stamps them on a supervised worker's `tool.start`/`tool.end`). Same rules
+#: as the step keys: re-capped here, ABSENT rather than null, so a frame from
+#: a turn with no workers is byte-identical to what shipped before.
+_WORKER_ATTR_KEYS = ("worker_job_id", "parent_job_id", "worker_index", "label", "model")
+
+
+def _worker_attr(ev: Optional[dict]) -> dict:
+    if not isinstance(ev, dict):
+        return {}
+    out: dict = {}
+    for k in _WORKER_ATTR_KEYS:
+        v = ev.get(k)
+        if v is None or v == "":
+            continue
+        if k == "worker_index":
+            if isinstance(v, bool):
+                continue
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[k] = str(v)[:120]
+    return out
+
 # agent_url → monotonic ts of the last 404/405 on the streaming route. An agent
 # image that predates the route is re-probed after the TTL, so a fleet roll
 # heals itself without a platform-api deploy.
@@ -1545,9 +1628,158 @@ _STREAM_SKEW_TTL = 600.0
 _STREAM_IDLE_S   = 30.0     # per-chunk read timeout — NOT the turn budget
 
 
+def _ms_or_dash(value) -> str:
+    """A diagnostic millisecond field: the number, or `-` when never reached."""
+    return "-" if value is None else str(int(value))
+
+
+def _stream_diag_fields(diag: dict) -> str:
+    """The think-stream diagnostics as trailing `k=v` log fields (PR-1).
+
+    Counts, timings and an exception CLASS name only — never a frame's text.
+    """
+    return (
+        f"cause={diag.get('cause') or '-'} frames={int(diag.get('frames') or 0)} "
+        f"headers_ms={_ms_or_dash(diag.get('headers_ms'))} "
+        f"ready_ms={_ms_or_dash(diag.get('ready_ms'))} "
+        f"elapsed_ms={_ms_or_dash(diag.get('elapsed_ms'))}"
+    )
+
+
+# Secrets a provider error body can echo back ("Incorrect API key provided:
+# sk-…"). The body is logged for its `param`/`code`; a key never is.
+_SECRET_IN_BODY = re.compile(
+    r"(?i)(bearer\s+\S+|\b(?:sk|rk|pk)-[A-Za-z0-9_\-*.]{4,})"
+)
+
+
+def _provider_error_detail(exc: BaseException) -> tuple:
+    """(status, body) of an HTTP error from the direct provider call (PR-1).
+
+    `str()` of httpx's HTTPStatusError names the status and the URL but not
+    the body, and OpenAI's body is the only thing that says WHICH parameter a
+    400 rejected. Duck-typed on `.response` so it never needs `httpx` bound in
+    the caller's scope. The body is cut to 300 chars, flattened to one line and
+    scrubbed of anything shaped like a key; request headers are never read.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if response is None or status is None:
+        return "-", "-"
+    try:
+        body = str(response.text or "")[:300]
+    except Exception:  # noqa: BLE001 - a streamed/closed body has no text
+        body = ""
+    body = _SECRET_IN_BODY.sub("[redacted]", " ".join(body.split()))
+    return str(status), (body or "-")
+
+
 def _stream_ok(agent_url: str) -> bool:
     ts = _stream_skew.get(agent_url)
     return ts is None or (time.monotonic() - ts) > _STREAM_SKEW_TTL
+
+
+# ── Why a voice `think` produced no answer ────────────────────────────
+# `_think` used to fail in exactly one shape — RuntimeError("Voice reasoning
+# temporarily unavailable"), raised once the tool-less fallback had failed
+# too — so the Live relay could only ever say "something went wrong". On
+# 2026-10-02 that one message covered a tenant that sent nothing for 30 s and
+# an edge 502 while the bridge restarted it. These are the cases it can tell
+# apart, and say out loud.
+VOICE_THINK_REASONS = frozenset({
+    # Never reached a running agent turn: no connection, an edge 502/503/504,
+    # or nothing at all on the stream before its read timeout (the tenant sends
+    # `ready` before any work and a heartbeat every 10 s, so silence means it
+    # was not serving the request). Also: no active agent on record.
+    "agent_unreachable",
+    # The turn started, then went silent past the per-chunk read timeout, or
+    # outlived the whole think budget.
+    "agent_timeout",
+    # The agent or its edge answered with an error: an `error` frame, another
+    # non-2xx status, an unreadable body.
+    "agent_error",
+    # The stream ended without an answer: EOF before `done`, or a final frame
+    # or JSON body with no text.
+    "agent_incomplete",
+})
+
+
+class VoiceThinkError(RuntimeError):
+    """`_think` could not answer; `.reason` (VOICE_THINK_REASONS) says which way.
+
+    A RuntimeError with the exact message every caller and test already
+    matches, so an `except RuntimeError` / `except Exception` site behaves as
+    before; only a caller that reads `.reason` learns more (the Live relay maps
+    it to a typed task failure and a spoken line).
+    """
+
+    MESSAGE = "Voice reasoning temporarily unavailable"
+
+    def __init__(self, reason: str = "agent_error", detail: str = ""):
+        super().__init__(self.MESSAGE)
+        self.reason = reason if reason in VOICE_THINK_REASONS else "agent_error"
+        self.detail = str(detail or "")[:80]
+
+
+#: What an edge or the bridge answers for a container that is not serving
+#: (restarting, unhealthy, gone): the agent itself was never reached.
+_AGENT_DOWN_STATUSES = frozenset({502, 503, 504})
+#: Transport failures that prove the request never reached ANY agent: the
+#: connection itself was never made, so no turn can have started from it. The
+#: only failures after which `_think` re-issues an agent turn.
+_AGENT_CONNECT_ERRORS = frozenset({"ConnectError", "ConnectTimeout"})
+
+
+def _never_reached_agent(cause: dict) -> bool:
+    """True only for a request that provably never reached an agent: a
+    connect failure with nothing received (no status, no stream bytes).
+
+    `cause` is `_vps_api_stream`'s cause or `_vps_api`'s outcome dict."""
+
+    return (
+        str(cause.get("error") or "") in _AGENT_CONNECT_ERRORS
+        and not cause.get("status") and not cause.get("started")
+    )
+
+
+def _stream_failure_reason(exc: BaseException, started: bool) -> str:
+    """The VOICE_THINK_REASONS bucket for an exception out of the SSE call.
+
+    `started`: the tenant had sent something on the stream (a data frame or a
+    heartbeat). Its handler sends `ready` before any work, so a timeout or a
+    broken connection with nothing received means it was not serving this
+    request at all; after that the turn was running and stalled (a timeout)
+    or broke off (any other transport failure).
+    """
+
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+        return "agent_unreachable"
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        if not started:
+            return "agent_unreachable"
+        return "agent_timeout" if isinstance(exc, httpx.TimeoutException) else "agent_incomplete"
+    return "agent_error"
+
+
+def _blocking_failure_reason(data, outcome: dict) -> str:
+    """The same buckets for the blocking agent-turn POST (`_vps_api` outcome).
+
+    Here the tenant sends nothing until the turn is over, so a read timeout is
+    a turn that outlived the whole think budget — not a silent tenant. Only
+    what the outcome proves is claimed; anything else is `agent_error`.
+    """
+
+    if data is not None:
+        return "agent_incomplete"              # a 2xx answer with no text
+    error = str(outcome.get("error") or "")
+    status = outcome.get("status")
+    if error in _AGENT_CONNECT_ERRORS or error == "PoolTimeout":
+        return "agent_unreachable"
+    if error == "ReadTimeout":
+        return "agent_timeout"
+    if isinstance(status, int) and status in _AGENT_DOWN_STATUSES:
+        return "agent_unreachable"
+    return "agent_error"
 
 
 def _shrink_frame(frame: dict, limit: int) -> None:
@@ -1633,8 +1865,20 @@ class _InnerToolRelay:
     def __init__(self, websocket, outer_call_id: str, sink: Optional[list] = None,
                  on_progress=None, frame_context: Optional[dict] = None,
                  frame_clock=None, sanitize_text=None, state_sender=None,
-                 frame_sender=None):
+                 frame_sender=None, on_task_frame=None):
         self._ws = websocket
+        # D-P5/D-P6: the tenant's job frames (`job.update`, `step.event`,
+        # `supervisor.started`) go to the owning Live session, which alone
+        # knows the task and what its client negotiated. Without an owner they
+        # are dropped exactly as before.
+        self._on_task_frame = on_task_frame
+        # The turn's budget once the tenant reports a supervisor job: set ONCE
+        # by the first `supervisor.started`, read by `_think`'s deadline.
+        self.budget_s: Optional[float] = None
+        # OC-3: …and the monotonic instant the plan's own deadline plus the
+        # answer margin runs out, from the same frame (`_within_think_budget`
+        # takes the later of the two, under a ceiling).
+        self.budget_until: Optional[float] = None
         # Live has several independent frame producers. Route its tool frames
         # through the session's one socket writer; Realtime keeps its existing
         # direct sender when no callback is supplied.
@@ -1670,6 +1914,14 @@ class _InnerToolRelay:
         # Monotonic instant of the turn's first `tool.intent`/`tool.start`:
         # the relay's "time to first tool" in the delegation-finished line.
         self.first_tool_monotonic: Optional[float] = None
+        # Monotonic instant of the tenant's first SSE `ready` frame (PR-1):
+        # `ready_ms` in the delegation-finished line. The tenant yields it
+        # immediately after the headers, so its absence or lateness says the
+        # tenant never ran the stream — not that the model was slow.
+        self.ready_monotonic: Optional[float] = None
+        # What the last `_vps_api_stream` call saw, for `_think`'s fallback log
+        # line (counts, timings and an exception CLASS name; never content).
+        self.stream_diag: dict = {}
         # ── What the turn DID, for the chat thread it writes into ──────────
         # The phone renders these frames live and then throws them away, so a
         # voice run that read nineteen pages landed in the day chat as a bare
@@ -1700,6 +1952,7 @@ class _InnerToolRelay:
             return
         rec = {"tool": name, "started_at_ms": int(time.time() * 1000)}
         rec.update(_step_attr(ev))
+        rec.update(_worker_attr(ev))
         self._rec[cid] = rec
         self._sink.append(rec)
 
@@ -1714,6 +1967,7 @@ class _InnerToolRelay:
         # (the agent had not named the call yet). The completion always does,
         # so fill it in rather than persisting a step-less record.
         rec.update(_step_attr(ev))
+        rec.update(_worker_attr(ev))
         rec["completed_at_ms"] = (
             rec["started_at_ms"] + elapsed_ms if elapsed_ms
             else int(time.time() * 1000)
@@ -1801,6 +2055,8 @@ class _InnerToolRelay:
 
     async def on_event(self, ev: dict) -> bool:
         t = ev.get("type")
+        if t == "ready" and self.ready_monotonic is None:
+            self.ready_monotonic = time.monotonic()
         if t in ("tool.intent", "tool.start") and self.first_tool_monotonic is None:
             self.first_tool_monotonic = time.monotonic()
         if t == "tool.intent":
@@ -1873,6 +2129,7 @@ class _InnerToolRelay:
                 # call yet); the `tool.start` that adopts it does, and the
                 # client treats a re-arriving call_id as an UPDATE.
                 **_step_attr(ev),
+                **_worker_attr(ev),
             })
         if t == "tool.end":
             inner = str(ev.get("call_id", ""))
@@ -1894,6 +2151,19 @@ class _InnerToolRelay:
                 cid, str(ev.get("name", ""))[:64], bool(ev.get("ok", True)),
                 preview, srcs, int(ev.get("elapsed_ms") or 0), ev,
             )
+            media = ev.get("media")
+            if isinstance(media, dict) and self._on_task_frame is not None:
+                # D-R4 / D-T1: the tenant's own `media_control` tool says what it
+                # did; the Live owner records it (`tool.media`).  Never forwarded
+                # to the phone, which hears the tenant's media broadcast itself.
+                try:
+                    await self._on_task_frame({
+                        "type": "tool.media",
+                        "name": str(ev.get("name", ""))[:64],
+                        "media": dict(media),
+                    })
+                except Exception:  # noqa: BLE001 - bookkeeping never breaks the turn
+                    logger.warning("[REALTIME] tool media hook failed")
             _title, _detail = _tool_activity(str(ev.get("name", ""))[:64], {})
             # NO `preview`: the end-phase note goes to the PROVIDER, and
             # `preview` is the tool's own output. D9 says progress notes carry
@@ -1916,7 +2186,32 @@ class _InnerToolRelay:
                 "sources": srcs,
                 "elapsed_ms": int(ev.get("elapsed_ms") or 0),
                 **_step_attr(ev),
+                **_worker_attr(ev),
             })
+        if t == "supervisor.started" and self.budget_s is None:
+            self.budget_s = max(
+                float(settings.voice_realtime_think_timeout_s),
+                float(getattr(settings, "voice_live_supervisor_timeout_s", 300.0)),
+            )
+            try:
+                plan_s = float(ev.get("deadline_s"))
+            except (TypeError, ValueError):
+                plan_s = float(getattr(settings, "supervisor_timeout_seconds", 240))
+            plan_s = min(max(0.0, plan_s), float(getattr(settings, "voice_live_supervisor_ceiling_s", 600.0)))
+            margin = float(getattr(settings, "voice_live_supervisor_answer_margin_s", 60.0))
+            self.budget_until = time.monotonic() + plan_s + margin
+            logger.info(
+                "[REALTIME] think budget extended outer=%s budget_s=%.0f plan_s=%.0f"
+                " margin_s=%.0f workers=%s",
+                self._outer[:40], self.budget_s, plan_s, margin, ev.get("workers_total"),
+            )
+        if t in ("job.update", "step.event", "supervisor.started"):
+            if self._on_task_frame is not None:
+                try:
+                    await self._on_task_frame(ev)
+                except Exception:  # noqa: BLE001 - a card frame never breaks the turn
+                    logger.warning("[REALTIME] task frame hook failed type=%s", t)
+            return True
         if t == "status" and ev.get("stage") == "thinking":
             # Deliberately NOT {"type":"state","state":"thinking"} — the shipped
             # app clears usingTool on that, which would UN-DOCK the orb on every
@@ -1949,8 +2244,48 @@ class _InnerToolRelay:
         self._open.clear()
 
 
+async def _within_think_budget(stream, relay: Optional["_InnerToolRelay"]):
+    """`asyncio.wait_for(stream, voice_realtime_think_timeout_s)`, except that
+    the budget is re-read from the relay at every wake-up: a `supervisor.started`
+    frame raises it ONCE (`_InnerToolRelay.budget_s`), measured from the same
+    start. Same contract as `wait_for` otherwise — the stream is cancelled and
+    awaited on timeout (TimeoutError) and when this caller is cancelled.
+    """
+    runner = asyncio.ensure_future(stream)
+    began = time.monotonic()
+    try:
+        while True:
+            budget = float(settings.voice_realtime_think_timeout_s)
+            extended = getattr(relay, "budget_s", None)
+            if isinstance(extended, (int, float)) and extended > budget:
+                budget = float(extended)
+            deadline = began + budget
+            until = getattr(relay, "budget_until", None)
+            if isinstance(until, (int, float)):
+                # OC-3: the plan's deadline runs from the `delegate` call, and
+                # the merged answer still has to be written after it.
+                ceiling = began + float(getattr(settings, "voice_live_supervisor_ceiling_s", 600.0))
+                deadline = max(deadline, min(float(until), ceiling))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                runner.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await runner
+                raise asyncio.TimeoutError
+            done, _ = await asyncio.wait({runner}, timeout=remaining)
+            if done:
+                return runner.result()
+    except BaseException:
+        if not runner.done():
+            runner.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runner
+        raise
+
+
 async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
-                          json_body: dict, relay: "_InnerToolRelay") -> tuple:
+                          json_body: dict, relay: "_InnerToolRelay",
+                          cause: Optional[dict] = None) -> tuple:
     """SSE sibling of _vps_api. NEVER raises.
 
     Returns (outcome, payload, frames_seen):
@@ -1960,16 +2295,58 @@ async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
       ("fail",   None,      n) — anything else. n>0 means the turn ALREADY RAN
                                  on the agent; the caller MUST NOT re-issue it.
 
+    `cause`, when given, says WHY a "fail" failed without widening the 3-tuple
+    every caller and test double unpacks. It is kept current while the stream
+    runs — `frames`; `started` (the tenant sent anything at all, a data frame
+    or a heartbeat); `headers_ms` / `ready_ms` (time to the response headers /
+    to the first data frame) — so a caller whose budget cancels this mid-wait
+    still knows how far it got. A "fail" also sets `reason` (one of
+    VOICE_THINK_REASONS) and `status` (a non-200) or `error` (the exception
+    class, or an error frame's code).
+
     Timeout semantics: with stream=True httpx's `read` timeout is a PER-CHUNK
     idle timeout, so it cannot bound the turn — an agent heart-beating every
     10 s would hold the voice floor forever. The caller wraps this in
     asyncio.wait_for(voice_realtime_think_timeout_s), preserving the exact
     ceiling the buffered POST had.
+
+    `voice_live_think_ready_deadline_s` (0 = off) is LOG-ONLY: a first frame
+    later than it, or a failure with none by then, is logged so the tenant's
+    first-frame latency can be measured before any deadline is enforced.
     """
     from app.services.agent_http import get_agent_http_client
     client = get_agent_http_client()
     resp = None
     frames = 0
+    started = False
+    info = cause if cause is not None else {}
+    info.update(frames=0, started=False)
+    began = time.monotonic()
+    ready_deadline_ms = max(0.0, float(settings.voice_live_think_ready_deadline_s or 0.0)) * 1000
+    # PR-1 diagnostics, readable by `_think` through the relay: what failed
+    # (an exception CLASS — `str()` of a ReadTimeout is empty), how many SSE
+    # frames arrived, and how long the headers and the tenant's `ready` took.
+    diag: dict = {"cause": "", "frames": 0, "headers_ms": None, "ready_ms": None,
+                  "elapsed_ms": None}
+    if relay is not None:
+        try:
+            relay.stream_diag = diag
+        except Exception:  # noqa: BLE001 - a test double may refuse attributes
+            pass
+
+    def _elapsed_ms() -> int:
+        return int((time.monotonic() - began) * 1000)
+
+    def _fail(reason: str, **fields) -> tuple:
+        info.update(reason=reason, **fields)
+        if ready_deadline_ms and "ready_ms" not in info and _elapsed_ms() > ready_deadline_ms:
+            logger.warning(
+                "[REALTIME] think stream no first frame within deadline "
+                "elapsed_ms=%d deadline_ms=%d reason=%s",
+                _elapsed_ms(), ready_deadline_ms, reason,
+            )
+        return ("fail", None, frames)
+
     try:
         req = client.build_request(
             "POST", f"{agent_url}{path}",
@@ -1978,20 +2355,33 @@ async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
             timeout=httpx.Timeout(connect=5.0, read=_STREAM_IDLE_S, write=5.0, pool=5.0),
         )
         resp = await client.send(req, stream=True)
+        info["headers_ms"] = diag["headers_ms"] = _elapsed_ms()
         if resp.status_code in (404, 405):
             await resp.aread()
+            diag["cause"] = f"http_{resp.status_code}"
             return ("skew", None, 0)
         if resp.status_code != 200:
             await resp.aread()
-            logger.warning("[REALTIME] think stream → %s", resp.status_code)
-            return ("fail", None, 0)
+            diag["cause"] = f"http_{resp.status_code}"
+            diag["elapsed_ms"] = _elapsed_ms()
+            logger.warning("[REALTIME] think stream → %s %s",
+                           resp.status_code, _stream_diag_fields(diag))
+            return _fail(
+                "agent_unreachable" if resp.status_code in _AGENT_DOWN_STATUSES
+                else "agent_error",
+                status=resp.status_code,
+            )
         if not resp.headers.get("content-type", "").startswith("text/event-stream"):
             body = await resp.aread()
             try:
                 return ("json", json.loads(body), 0)
             except Exception:
-                return ("fail", None, 0)
+                diag["cause"] = "non_json"
+                return _fail("agent_error", error="non_json")
         async for line in resp.aiter_lines():
+            if line and not started:
+                started = True
+                info["started"] = True
             if not line or line[0] == ":" or not line.startswith("data:"):
                 continue                       # heartbeats / blank separators
             try:
@@ -1999,12 +2389,25 @@ async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
             except Exception:
                 continue
             frames += 1
+            info["frames"] = diag["frames"] = frames
+            if frames == 1:
+                info["ready_ms"] = _elapsed_ms()
+                if ready_deadline_ms and info["ready_ms"] > ready_deadline_ms:
+                    logger.warning(
+                        "[REALTIME] think stream first frame late ready_ms=%d deadline_ms=%d",
+                        info["ready_ms"], ready_deadline_ms,
+                    )
             etype = ev.get("type")
+            if etype == "ready" and diag["ready_ms"] is None:
+                diag["ready_ms"] = _elapsed_ms()
             if etype == "done":
                 return ("stream", ev, frames)
             if etype == "error":
-                logger.warning("[REALTIME] think stream error frame: %s", ev.get("code"))
-                return ("fail", None, frames)
+                diag["cause"] = "error_frame"
+                diag["elapsed_ms"] = _elapsed_ms()
+                logger.warning("[REALTIME] think stream error frame: %s %s",
+                               ev.get("code"), _stream_diag_fields(diag))
+                return _fail("agent_error", error=str(ev.get("code") or "error_frame")[:64])
             if etype == "cancelled":
                 return ("cancelled", ev, frames)
             # A dead phone socket only disables wire delivery. The inner agent
@@ -2015,11 +2418,27 @@ async def _vps_api_stream(agent_url: str, agent_api_key: str, path: str,
             # frame discovered that the socket had gone away.
             if relay is not None:
                 await relay.on_event(ev)
-        return ("fail", None, frames)          # stream ended with no terminal frame
+        diag["cause"] = "no_done"
+        diag["elapsed_ms"] = _elapsed_ms()
+        logger.warning("[REALTIME] think stream ended without a done frame %s",
+                       _stream_diag_fields(diag))
+        return _fail("agent_incomplete")       # stream ended with no terminal frame
     except Exception as e:
-        logger.warning("[REALTIME] think stream failed: %s", e)
-        return ("fail", None, frames)
+        reason = _stream_failure_reason(e, started)
+        diag["cause"] = type(e).__name__
+        diag["elapsed_ms"] = _elapsed_ms()
+        # The CLASS, always: `str()` of an httpx ReadTimeout is empty, which is
+        # how 2026-10-02 logged `think stream failed: ` with no cause at all.
+        logger.warning(
+            "[REALTIME] think stream failed: %s: %s reason=%s %s",
+            type(e).__name__, e, reason, _stream_diag_fields(diag),
+        )
+        return _fail(reason, error=type(e).__name__)
     finally:
+        if diag["elapsed_ms"] is None:
+            # Done, or cancelled by the caller's turn budget: either way the
+            # caller's line still gets the time spent here.
+            diag["elapsed_ms"] = _elapsed_ms()
         if resp is not None:
             # MANDATORY. The shared client is a singleton with a bounded pool;
             # a stream=True response not closed here permanently burns a slot,
@@ -2421,6 +2840,9 @@ async def _save_voice_messages(
     # A retrying caller (the Live queue) owns the loss verdict; see
     # `_VOICE_SAVE_OUTCOMES`.
     sink = _VOICE_SAVE_OUTCOMES.get()
+    # …and, while it knows its tenant is away, the per-attempt timeout; see
+    # `_VOICE_SAVE_TIMEOUT_S`. Passed only when set, like `outcome` below.
+    attempt_timeout = _VOICE_SAVE_TIMEOUT_S.get()
 
     vps = await _get_vps_info(user_id)
     if not vps:
@@ -2478,6 +2900,7 @@ async def _save_voice_messages(
             # Only for the retrying caller: a stub `_vps_api` elsewhere in the
             # suite need not accept the keyword.
             **({"outcome": failure} if sink is not None else {}),
+            **({"timeout": float(attempt_timeout)} if attempt_timeout else {}),
         )
         if result:
             saved += 1
@@ -2515,6 +2938,48 @@ async def _save_voice_messages(
         _vcount("voice_transcript_lost", user_id, n=lost)
     logger.info("[REALTIME] Saved %d message(s) to VPS session %s via API", saved, session_id[:8])
     return lost
+
+
+async def _probe_voice_session(user_id: str, session_id: str, *, timeout: float) -> dict:
+    """One cheap authenticated read of the voice session on the user's tenant.
+
+    The Live `PersistenceQueue` asks this after a row write fails the way an
+    outage fails, to tell "the TENANT is away" from "this row is slow or bad"
+    (P3). It is independent of every row: the session's own conversation row,
+    without its messages — the cheapest DB-backed read on the route family
+    the rows are written to. Not `/agent/health`: on 2026-10-02 at 23:00Z that
+    answered 200 while every DB-backed route timed out.
+
+    Returns what happened, never the body (nothing of it is read or logged):
+    `{"status": <code>}` when the tenant or its edge answered,
+    `{"error": <class>, "transport": True}` for a transport error or timeout,
+    `{"error": "vps_unavailable"}` when there is no tenant address to ask, and
+    `{"error": <class>}` when the probe itself could not run. The queue owns
+    the verdict (`live_voice_protocol._probe_verdict`). Never raises.
+    """
+    try:
+        vps = await _get_vps_info(user_id)
+    except Exception:  # noqa: BLE001 - no address is an answer, not a crash
+        vps = None
+    if not vps:
+        return {"error": "vps_unavailable"}
+    agent_url, agent_api_key = vps
+    try:
+        from app.services.agent_http import get_agent_http_client
+
+        resp = await get_agent_http_client().get(
+            f"{agent_url}/api/sessions/{session_id}",
+            headers={"X-Agent-Key": agent_api_key},
+            params={"include_messages": "false"},
+            timeout=timeout,
+        )
+        status = int(resp.status_code)
+    except (httpx.TimeoutException, httpx.TransportError, asyncio.TimeoutError, OSError) as e:
+        logger.debug("[REALTIME] voice session probe failed: %s", type(e).__name__)
+        return {"error": type(e).__name__, "transport": True}
+    except Exception as e:  # noqa: BLE001 - a probe that cannot run is no evidence
+        return {"error": type(e).__name__}
+    return {"status": status}
 
 
 # ── The voice turn's memory write (v3 §2.1.2) ─────────────────────────
@@ -2794,7 +3259,10 @@ async def _control_media_direct(user_id: str, action: str) -> dict:
     """
 
     action = str(action or "").strip().lower()
-    if action not in {"next", "previous", "stop", "pause"}:
+    # D-R4 / D-T1 (2026-10-06): `resume` re-announces the paused item.  A
+    # tenant image that predates it rejects the action, which arrives here as
+    # an honest failure ("I couldn't change the music"), never as a resume.
+    if action not in {"next", "previous", "stop", "pause", "resume"}:
         return {"ok": False, "action": action, "reason": "unsupported_action"}
     vps = await _get_vps_info(user_id)
     if not vps:
@@ -2860,7 +3328,15 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                  out: Optional[dict] = None,
                  display_request: Optional[str] = None,
                  reply_language: Optional[str] = None,
-                 delegation_id: Optional[str] = None) -> tuple:
+                 require_web: bool = False,
+                 delegation_id: Optional[str] = None,
+                 toolless_fallback: bool = True,
+                 parent_user_turn_id: Optional[str] = None,
+                 request_turn_ids: Optional[list] = None,
+                 anchor_occurred_at: Optional[str] = None,
+                 task_title: Optional[str] = None,
+                 search_query: Optional[str] = None,
+                 planned_steps: Optional[list] = None) -> tuple:
     """
     Route reasoning to the best model using the model router.
 
@@ -2895,6 +3371,26 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
     one's answer too. Additive like the other two; `HEAD`'s
     `SessionMessageCreate`/agent-turn models declare no `extra='forbid'`, so
     the deployed image ignores it rather than 422ing.
+
+    `parent_user_turn_id`, `request_turn_ids`, `anchor_occurred_at` and
+    `task_title` (voice round 2026-10-06, DESIGN-R2 D-R8 (c)) place the
+    tenant's job marker under the caller row that asked: the asking turn, the
+    turns the request consumed (≤8), the REAL `occurred_at` of the asking row
+    (ISO, naive UTC — the tenant adds the +1 ms) and the task's name.
+    Additive body keys an older image ignores.
+
+    `search_query` and `planned_steps` (voice round 2026-10-07, D-R4 (1)/(6)):
+    the relay's cleaned request for a research task's speculative first
+    search, and the plan the call's card was seeded with (`_LABELS_*` keys,
+    the answer last) — the TurnJob declares exactly these steps.  Additive.
+
+    `toolless_fallback` is whether a turn the user's agent could not run may
+    still be answered by a model with NO tools (Option B below). True, the
+    default, keeps the legacy Realtime path exactly as it was. The Live relay
+    passes `voice_live_toolless_fallback_enabled` (False by default): a
+    delegated Live task is one the voice model chose not to answer itself, so
+    a tool-less guess is the wrong answer to it. Either way a failure raises
+    `VoiceThinkError`, whose `.reason` says how the agent failed.
     """
     from app.services.model_router import classify_request
 
@@ -2903,6 +3399,9 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
     model_override = decision.model
 
     logger.info("[REALTIME] think: model=%s", model_override)
+    # Why the agent produced no answer: the typed half of a VoiceThinkError.
+    # Every agent path that runs overwrites it; it stays empty when none ran.
+    failure: dict = {}
 
     # Option A: Use agent_runner (preferred — full tool access + memory)
     if _agent_runner:
@@ -2957,6 +3456,7 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
             return response.text, response.model or model_override
         except Exception as e:
             logger.warning("[REALTIME] think via agent_runner failed: %s", e)
+            failure = {"reason": "agent_error", "error": type(e).__name__}
 
     # Option A2 (platform-api, V2): the realtime relay runs on platform-api,
     # where the in-process agent_runner is absent. Route `think` to the user's
@@ -2975,7 +3475,10 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
     # until the flag rolls out globally.
     if _v2_active():
         vps = await _get_vps_info(user_id)
-        if vps:
+        if not vps:
+            # No active agent on record (mid-deploy, or the lookup failed).
+            failure = {"reason": "agent_unreachable", "error": "no_agent"}
+        else:
             agent_url, agent_api_key = vps
             _body = {
                 "message": task,
@@ -2994,28 +3497,102 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                 _body["reply_language"] = reply_language[:16]
             if delegation_id:
                 _body["delegation_id"] = delegation_id[:64]
+            # D-R8 (c): where the job marker belongs in the day chat.
+            if parent_user_turn_id:
+                _body["parent_user_turn_id"] = parent_user_turn_id[:160]
+            _turn_ids = [str(t)[:160] for t in (request_turn_ids or []) if t][:8]
+            if _turn_ids:
+                _body["request_turn_ids"] = _turn_ids
+            if anchor_occurred_at:
+                _body["anchor_occurred_at"] = anchor_occurred_at[:40]
+            if task_title:
+                _body["task_title"] = task_title[:200]
+            if search_query:
+                _body["search_query"] = " ".join(str(search_query).split())[:200]
+            _planned = [str(k)[:32] for k in (planned_steps or []) if k][:6]
+            if _planned:
+                _body["planned_steps"] = _planned
+            if require_web:
+                # D-P3: the caller explicitly asked for a search the voice
+                # model did not delegate; the tenant forces its web tools on
+                # this turn. Additive: an older image ignores the key.
+                _body["require_web"] = True
+            _supervisor_model = await _tenant_supervisor_model(user_id)
+            if _supervisor_model:
+                # D-P6: a delegated voice turn may become the supervisor job;
+                # the tenant's per-user setting names the model that plans
+                # and merges it.
+                _body["model"] = _supervisor_model
+                logger.info("[REALTIME] think model from tenant settings model=%s",
+                            _supervisor_model)
             # Contract v0.3 §7: the run's caller-turn order + scope + stamp, so
             # the tenant supersedes a play inside it only for a halt the caller
             # asked for AFTER this request (additive; absent outside the relay).
             _body.update(_media_order_fields())
             data = None
             _no_retry = False
+            # PR-1: why no answer came back, for the "falling back" line —
+            # `no_result` (with a cause) is not the same incident as an agent
+            # that answered with empty text.
+            _fallback_result, _fallback_cause = "no_result", "no_response"
+            _fallback_diag: dict = {}
             try:
                 # Preferred path: stream, so the phone sees each inner tool —
                 # its name, its query, its sources — WHILE the turn runs.
                 if (settings.voice_realtime_tool_events
                         and relay is not None and _stream_ok(agent_url)):
-                    try:
-                        outcome, payload, frames = await asyncio.wait_for(
-                            _vps_api_stream(
-                                agent_url, agent_api_key,
-                                "/api/v1/internal/agent-turn/stream", _body, relay),
-                            timeout=settings.voice_realtime_think_timeout_s,
-                        )
-                    except asyncio.TimeoutError:
-                        outcome, payload, frames = "fail", None, 1
-                        logger.warning("[REALTIME] think stream exceeded %.0fs budget",
-                                       settings.voice_realtime_think_timeout_s)
+                    stream_cause: dict = {}
+                    for _attempt in (1, 2):
+                        stream_cause = {}
+                        try:
+                            outcome, payload, frames = await _within_think_budget(
+                                _vps_api_stream(
+                                    agent_url, agent_api_key,
+                                    "/api/v1/internal/agent-turn/stream", _body, relay,
+                                    cause=stream_cause),
+                                relay,
+                            )
+                        except asyncio.TimeoutError:
+                            outcome, payload, frames = "fail", None, 1
+                            # Out of budget: a turn that had started took too
+                            # long; a tenant that never sent a byte was not
+                            # serving the request at all.
+                            stream_cause["reason"] = (
+                                "agent_timeout" if stream_cause.get("started")
+                                else "agent_unreachable"
+                            )
+                            _timeout_diag = getattr(relay, "stream_diag", None)
+                            if isinstance(_timeout_diag, dict):
+                                _timeout_diag["cause"] = "budget_exceeded"
+                            logger.warning(
+                                "[REALTIME] think stream exceeded %.0fs budget reason=%s %s",
+                                getattr(relay, "budget_s", None)
+                                or settings.voice_realtime_think_timeout_s,
+                                stream_cause["reason"],
+                                _stream_diag_fields(
+                                    _timeout_diag if isinstance(_timeout_diag, dict)
+                                    else {"cause": "budget_exceeded"}),
+                            )
+                        if (_attempt == 1 and outcome == "fail"
+                                and _never_reached_agent(stream_cause)):
+                            # The connection itself was never made, so this
+                            # request reached no agent and no turn can have
+                            # started: the ONE failure a stream may be re-issued
+                            # after. An image rollout swaps the container, and
+                            # the new one answers within a couple of seconds.
+                            logger.warning(
+                                "[REALTIME] think stream: agent unreachable (%s) — retrying once in %.1fs",
+                                stream_cause.get("error"), _AGENT_RETRY_DELAY_S,
+                            )
+                            await asyncio.sleep(_AGENT_RETRY_DELAY_S)
+                            continue
+                        break
+                    _sd = getattr(relay, "stream_diag", None)
+                    _fallback_diag = dict(_sd) if isinstance(_sd, dict) else {}
+                    if outcome in ("stream", "json"):
+                        _fallback_result, _fallback_cause = "empty_text", "-"
+                    else:
+                        _fallback_cause = _fallback_diag.get("cause") or "unknown"
                     if outcome == "skew":
                         _stream_skew[agent_url] = time.monotonic()
                         logger.info("[REALTIME] agent predates think-stream route: %s", agent_url)
@@ -3041,10 +3618,15 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                         # tool. So the answer came from Option B, and Option B is
                         # what has to be honest. See _THINK_FALLBACK_SYSTEM.
                         _no_retry = True
+                        failure = {
+                            "reason": stream_cause.get("reason") or "agent_incomplete",
+                            "error": str(stream_cause.get("error") or ""),
+                            "status": stream_cause.get("status"),
+                        }
                     await relay.close_open()
 
                 if data is None and not _no_retry:
-                    # Retry ONCE on a transport-level failure. The agent
+                    # Retry ONCE on a connection that was never made. The agent
                     # container is replaced on every agent-image rollout, and a
                     # request that lands in that window gets a connect error
                     # against a container that is back seconds later. Without
@@ -3054,26 +3636,51 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                     # Spotify" on 2026-07-31, eight minutes after music had
                     # played fine.
                     #
-                    # Transport errors ONLY. An HTTP error from a container that
+                    # Connect failures ONLY. An HTTP error from a container that
                     # answered, or a timeout (the agent may be mid-turn and
                     # about to charge credits), must not be replayed — same
                     # reasoning as `_no_retry` above.
+                    #
+                    # Driven by `outcome`, because `_vps_api` never raises: it
+                    # returns None and reports the failure there. The old
+                    # `except (ConnectionError, OSError)` could not run (and
+                    # httpx's ConnectError is neither), so this retry was dead.
+                    attempt_outcome: dict = {}
                     for _attempt in (1, 2):
-                        try:
-                            data = await _vps_api(
-                                agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
-                                json_body=_body,
-                                timeout=settings.voice_realtime_think_timeout_s,
-                            )
+                        attempt_outcome = {}
+                        data = await _vps_api(
+                            agent_url, agent_api_key, "POST", "/api/v1/internal/agent-turn",
+                            json_body=_body,
+                            timeout=settings.voice_realtime_think_timeout_s,
+                            outcome=attempt_outcome,
+                        )
+                        if (data is not None or _attempt == 2
+                                or not _never_reached_agent(attempt_outcome)):
                             break
-                        except (ConnectionError, OSError) as _conn_err:
-                            if _attempt == 2:
-                                raise
-                            logger.warning(
-                                "[REALTIME] think agent unreachable (%s) — retrying once in %.1fs",
-                                type(_conn_err).__name__, _AGENT_RETRY_DELAY_S,
-                            )
-                            await asyncio.sleep(_AGENT_RETRY_DELAY_S)
+                        logger.warning(
+                            "[REALTIME] think agent unreachable (%s) — retrying once in %.1fs",
+                            attempt_outcome.get("error"), _AGENT_RETRY_DELAY_S,
+                        )
+                        await asyncio.sleep(_AGENT_RETRY_DELAY_S)
+                    if not (data and data.get("text")):
+                        failure = {
+                            "reason": _blocking_failure_reason(data, attempt_outcome),
+                            "error": str(attempt_outcome.get("error") or ""),
+                            "status": attempt_outcome.get("status"),
+                        }
+                    # The blocking call, not the stream, is now what answered
+                    # (`_vps_api` logs its own exception class on a failure,
+                    # and reports it through `attempt_outcome`).
+                    _fallback_diag = {}
+                    if data is not None:
+                        _fallback_result, _fallback_cause = "empty_text", "-"
+                    else:
+                        _fallback_result = "no_result"
+                        _fallback_cause = (
+                            str(attempt_outcome.get("error") or "")
+                            or (f"http_{attempt_outcome['status']}"
+                                if attempt_outcome.get("status") else "no_response")
+                        )
                 if data and data.get("text"):
                     logger.info(
                         "[REALTIME] think via agent full-turn: %d chars, model=%s, tool_calls=%s",
@@ -3087,12 +3694,47 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
                             out["app_artifact"] = data["app_artifact"]
                         if data.get("media"):
                             out["media"] = data["media"]
+                        if isinstance(data.get("addenda_applied"), list):
+                            # D-R3(3): the caller turns the tenant folded into
+                            # this answer (`done.addenda_applied`).
+                            out["addenda_applied"] = [str(x) for x in data["addenda_applied"]]
                     return data["text"], data.get("model") or model_override
-                logger.warning("[REALTIME] think via agent full-turn: empty result, falling back")
+                # `result=no_result` (with the stream's cause) is a turn that
+                # produced nothing — on 2026-10-02 this line followed a stream
+                # that never received a byte — and `result=empty_text` is an
+                # agent that answered with no text. `reason` is the typed
+                # VoiceThinkError bucket the caller sees.
+                logger.warning(
+                    "[REALTIME] think via agent full-turn: %s"
+                    " result=%s reason=%s error=%s status=%s %s",
+                    "empty result, falling back" if toolless_fallback
+                    else "no answer, no tool-less fallback",
+                    _fallback_result, failure.get("reason") or "-",
+                    failure.get("error") or "-", failure.get("status") or "-",
+                    _stream_diag_fields({**_fallback_diag, "cause": _fallback_cause}),
+                )
             except Exception as e:
-                logger.warning("[REALTIME] think via agent full-turn failed: %s", e)
+                logger.warning("[REALTIME] think via agent full-turn failed: %s cause=%s",
+                               e, type(e).__name__)
+                failure = {"reason": "agent_error", "error": type(e).__name__}
 
-    # Option B: Direct API call (fallback — no tools but always works)
+    if not toolless_fallback:
+        # The caller does not take a tool-less answer (Live: a delegated task
+        # is one the voice model chose NOT to answer itself, so a model with no
+        # tools guessing at it is the wrong answer — owner decision after the
+        # 2026-10-02 call). Fail now, saying which way, and let the caller
+        # offer the retry.
+        reason = failure.get("reason") or "agent_error"
+        logger.warning(
+            "[REALTIME] think failed reason=%s error=%s (tool-less fallback off)",
+            reason, failure.get("error") or "-",
+        )
+        raise VoiceThinkError(reason, detail=str(failure.get("error") or ""))
+
+    # Option B: a direct model call with NO tools — the last resort of the
+    # legacy Realtime path (and of Live only when
+    # voice_live_toolless_fallback_enabled). It answers questions as best it
+    # can; it cannot act, and _THINK_FALLBACK_SYSTEM tells it so.
     try:
         # If it's a Claude model, use Anthropic API
         if model_override.startswith("claude-"):
@@ -3138,19 +3780,31 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
         else:
             # OpenAI model — direct chat completions call
             import httpx
-            context_messages = [{"role": "user", "content": task}]
+            from app.services.model_resolver import uses_max_completion_tokens
+
+            body = {
+                "model": model_override,
+                "messages": [
+                    {"role": "system", "content": _THINK_FALLBACK_SYSTEM},
+                    {"role": "user", "content": task},
+                ],
+            }
+            # GPT-5/GPT-6 and the o-series reject `max_tokens` with a 400
+            # (`unsupported_parameter`) and take `max_completion_tokens`
+            # instead — replayed against gpt-6-sol on 2026-10-03: 400 with
+            # `max_tokens`, 200 with `max_completion_tokens`. Every voice think
+            # has resolved to such a model since Anthropic was switched off, so
+            # until this the fallback could not answer once.
+            token_key = (
+                "max_completion_tokens" if uses_max_completion_tokens(model_override)
+                else "max_tokens"
+            )
+            body[token_key] = 2048
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(
                     "https://api.openai.com/v1/chat/completions",
                     headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-                    json={
-                        "model": model_override,
-                        "messages": [
-                            {"role": "system", "content": _THINK_FALLBACK_SYSTEM},
-                            {"role": "user", "content": task},
-                        ],
-                        "max_tokens": 2048,
-                    },
+                    json=body,
                 )
                 resp.raise_for_status()
                 result = resp.json()["choices"][0]["message"]["content"]
@@ -3159,12 +3813,20 @@ async def _think(user_id: str, task: str, session_id: Optional[str],
             return result or "I couldn't generate a response.", model_override
 
     except Exception as e:
-        logger.warning("[REALTIME] think fallback failed: %s", e)
+        # The provider's own error body names the parameter it rejected; the
+        # 2026-10-02 400s were logged without it, so their cause was a guess.
+        # Scrubbed of anything key-shaped and cut to 300 chars (PR-1).
+        _status, _body = _provider_error_detail(e)
+        logger.warning("[REALTIME] think fallback failed: %s cause=%s status=%s body=%s",
+                       e, type(e).__name__, _status, _body)
         # A failed agent run followed by a failed direct provider is not an
         # answer.  Returning a reassuring sentence made the Live delegation
         # terminalise as completed (100%) with no search or result.  Let the
-        # caller record a failed task and give its localized retry line.
-        raise RuntimeError("Voice reasoning temporarily unavailable") from e
+        # caller record a failed task and give its localized retry line —
+        # typed by why the AGENT failed, since this was only its stand-in.
+        raise VoiceThinkError(
+            failure.get("reason") or "agent_error", detail=type(e).__name__,
+        ) from e
 
 
 # ── Finalize onboarding — compile profiles + write .md files ─────────
@@ -3709,17 +4371,72 @@ async def resolve_voice_language(user_id: str) -> Optional[str]:
 # still holding the nonce, and six seconds later it ends the card of a call
 # that is very much still live.
 #
-# The app is the backstop and it is the right one: it is the only party that
-# knows whether a call is live, and `voiceActivity.ios.ts::noteVoiceActivityEnded`
-# restores a card ended under a live call (once). A shared-store owner check
-# here would be the cleaner fix and is the tracked follow-up; it needs a
-# cross-replica store this service does not currently have.
+# The app is the backstop: it is the only party that knows whether a call is
+# live, and `voiceActivity.ios.ts::noteVoiceActivityEnded` restores a card
+# ended under a live call (once).  D-P12 adds the shared answer: every connect
+# attempt CLAIMS the `infra_leases` row `voice-owner:<user_id>` (newest
+# writer wins, `claim_lease`), and an older socket — on either replica —
+# reads it before it ends the card or takes ownership.  The dicts stay the
+# same-process fast path; a lease read that fails falls back to them.
 _voice_session_owner: dict = {}
 # A retry can overtake an older attempt while its OpenAI connect is still in
 # flight. Only the newest attempt on this process may claim Live Activity.
 _live_connect_latest: dict[str, str] = {}
 _VOICE_LA_END_GRACE_S = 6.0
 _deferred_la_tasks: set = set()
+#: The owner lease outlives any call; a newer claim replaces it at once.
+_VOICE_OWNER_LEASE_TTL_S = 6 * 3600.0
+_VOICE_OWNER_READ_TIMEOUT_S = 0.5
+
+
+def _voice_owner_lease(user_id: str) -> str:
+    return f"voice-owner:{user_id}"[:64]
+
+
+def _claim_voice_owner(user_id: str, nonce: str) -> "asyncio.Task":
+    """D-P12: record this connect attempt as the user's newest voice socket,
+    cross-replica. Started at once, never awaited on the hot path except by
+    this socket's own ownership check (`_voice_owner_superseded`)."""
+
+    async def _run() -> bool:
+        from app.services.infra_lease import claim_lease
+        return await claim_lease(_voice_owner_lease(user_id), nonce, _VOICE_OWNER_LEASE_TTL_S)
+
+    t = asyncio.create_task(_run())
+    _deferred_la_tasks.add(t)
+    t.add_done_callback(_deferred_la_tasks.discard)
+    return t
+
+
+def _release_voice_owner(user_id: str, nonce: str) -> None:
+    async def _run() -> None:
+        from app.services.infra_lease import release_lease
+        await release_lease(_voice_owner_lease(user_id), nonce)
+
+    t = asyncio.create_task(_run())
+    _deferred_la_tasks.add(t)
+    t.add_done_callback(_deferred_la_tasks.discard)
+
+
+async def _voice_owner_superseded(
+    user_id: str, nonce: str, claim: "Optional[asyncio.Task]" = None,
+) -> bool:
+    """D-P12: has a NEWER socket — on either replica — claimed this user's
+    voice? False whenever the shared store cannot answer for sure (the local
+    dicts decide): our own claim not written yet, or the read failing."""
+
+    try:
+        if claim is not None and not await asyncio.wait_for(
+            asyncio.shield(claim), timeout=_VOICE_OWNER_READ_TIMEOUT_S,
+        ):
+            return False
+        from app.services.infra_lease import lease_holder
+        holder = await asyncio.wait_for(
+            lease_holder(_voice_owner_lease(user_id)), timeout=_VOICE_OWNER_READ_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 - a DB blip never ends or keeps a card by itself
+        return False
+    return bool(holder) and holder != nonce
 
 
 def _defer_voice_la_end(user_id: str, mission_id, nonce: str, immediate: bool) -> None:
@@ -3739,6 +4456,10 @@ def _defer_voice_la_end(user_id: str, mission_id, nonce: str, immediate: bool) -
                 await asyncio.sleep(0.2)
             if _voice_session_owner.get(user_id) != nonce:
                 return  # a reconnect superseded us — the card is theirs now
+            if not immediate and await _voice_owner_superseded(user_id, nonce):
+                # D-P12: the reconnect landed on the OTHER replica.
+                logger.info("[REALTIME] voice LA end skipped: owner moved user=%s", user_id[:8])
+                return
             from app.services.live_activity_service import end_voice_activities
             await asyncio.wait_for(end_voice_activities(user_id, mission_id), timeout=10.0)
         except Exception:  # noqa: BLE001
@@ -3746,6 +4467,9 @@ def _defer_voice_la_end(user_id: str, mission_id, nonce: str, immediate: bool) -
         finally:
             if _voice_session_owner.get(user_id) == nonce:
                 _voice_session_owner.pop(user_id, None)
+            with contextlib.suppress(Exception):
+                from app.services.infra_lease import release_lease
+                await release_lease(_voice_owner_lease(user_id), nonce)
 
     t = asyncio.create_task(_run())
     _deferred_la_tasks.add(t)
@@ -4189,6 +4913,276 @@ def _live_user_allowed(user_id: str) -> bool:
     return str(user_id or "").lower() in valid
 
 
+async def _voice_context_body(
+    user_id: str, *, onboarding: bool, live: bool, now_utc: Optional[datetime] = None,
+) -> dict:
+    """The `/api/v1/internal/voice-context` body — ONE builder for the call's
+    own context leg and the warm-up (D-R2(4)), so the tenant's cache key
+    (onboarding, live, budget_chars, tz_name, day) matches byte for byte.
+    `budget_chars` reads the V2 context var, which the caller pins."""
+
+    return {
+        "onboarding": onboarding,
+        "budget_chars": settings.voice_realtime_instructions_budget_chars if _v2_active() else 0,
+        "tz_name": await _get_user_tz_name(user_id),
+        # Which wire this prompt is for. The agent-side renderer drops the
+        # Realtime-only tool paragraphs and adds the delegation section
+        # itself once the image rolls; until then
+        # `adapt_instructions_for_live` does the same surgery on the text
+        # that comes back, and the two must agree word for word. An image
+        # that predates the field ignores it (pydantic default extra).
+        "live": live,
+        # One instant for both builders — the shadow must never read a
+        # minute tick between the legacy build and this call as a
+        # section divergence.
+        "now": (now_utc or datetime.now(timezone.utc)).isoformat(),
+    }
+
+
+async def _fetch_agent_voice_context(
+    user_id: str, *, onboarding: bool, live: bool,
+    now_utc: Optional[datetime] = None, warm: bool = False, timeout: float = 20.0,
+) -> tuple[str, Optional[dict]]:
+    """Ask the tenant's own agent for the voice instructions (G-19a).
+
+    Returns ``(outcome, data)``: ``no_vps`` (no tenant), ``failed`` (no dict
+    back) or ``ok`` with the response.  ``warm`` asks the tenant to build and
+    cache the context without anyone waiting on it (D-R2(4)); an image that
+    predates the field ignores it."""
+
+    vps = await _get_vps_info(user_id)
+    if not vps:
+        return "no_vps", None
+    agent_url, agent_api_key = vps
+    body = await _voice_context_body(
+        user_id, onboarding=onboarding, live=live, now_utc=now_utc,
+    )
+    if warm:
+        body["warm"] = True
+    data = await _vps_api(
+        agent_url, agent_api_key, "POST",
+        "/api/v1/internal/voice-context", json_body=body, timeout=timeout,
+    )
+    if not isinstance(data, dict):
+        return "failed", None
+    return "ok", data
+
+
+def _context_cache_fields(data: Optional[dict]) -> tuple[str, str]:
+    """(`cached=`, `age_ms=`) for a log line — read defensively: an image
+    without the tenant cache sends neither."""
+
+    data = data if isinstance(data, dict) else {}
+    cached = data.get("cached")
+    age = data.get("age_ms")
+    return (
+        ("1" if cached else "0") if isinstance(cached, bool) else "-",
+        str(int(age)) if isinstance(age, (int, float)) and not isinstance(age, bool) else "-",
+    )
+
+
+# ── D-R2(4): warm the Live voice context before the tap ──────────────────
+# The tenant keeps the last voice-context build for `_VOICE_WARM_TTL_MS` and
+# answers a later identical request from it; this asks it to build one while
+# nobody is waiting.  Worth ≤0.4 s on a healthy start (the 12:04 call's 13 s
+# was the provider stall plus the lost prebuffer), so it is cheap by design:
+# Live cohort only, one warm per user per `_VOICE_WARM_DEBOUNCE_S` in this
+# process, ≤ `_VOICE_WARM_MAX_CONCURRENT` at once, never awaited by a caller
+# beyond `_VOICE_WARM_ROUTE_WAIT_S`.  The platform runs two replicas, so the
+# cache that matters is the TENANT's (one process); these maps only debounce.
+_VOICE_WARM_DEBOUNCE_S = 45.0
+_VOICE_WARM_MAX_CONCURRENT = 8
+_VOICE_WARM_TIMEOUT_S = 8.0
+_VOICE_WARM_TTL_MS = 120_000
+_VOICE_WARM_ROUTE_WAIT_S = 1.0
+#: user → (monotonic of the last warm that ANSWERED, tenant `cached`, tenant `age_ms`)
+_voice_warm_last: dict = {}
+#: user → the warm in flight
+_voice_warm_inflight: dict = {}
+_voice_warm_tasks: set = set()
+
+
+async def warm_live_voice(user_id: str, reason: str) -> str:
+    """Warm one user's Live voice context on their tenant.  Returns the
+    outcome: ``ok`` | ``skipped_recent`` | ``skipped_cohort`` | ``skipped_busy``
+    | ``no_vps`` | ``failed``.  Never raises."""
+
+    user_id = str(user_id)
+    t0 = time.monotonic()
+    outcome = "failed"
+    cached, age_ms = "-", "-"
+    owner = False
+    try:
+        if not _live_protocol_selected(user_id, "live1", onboarding=False):
+            outcome = "skipped_cohort"
+            return outcome
+        last = _voice_warm_last.get(user_id)
+        if user_id in _voice_warm_inflight or (
+            last is not None and t0 - last[0] < _VOICE_WARM_DEBOUNCE_S
+        ):
+            outcome = "skipped_recent"
+            return outcome
+        if len(_voice_warm_inflight) >= _VOICE_WARM_MAX_CONCURRENT:
+            outcome = "skipped_busy"
+            return outcome
+        _voice_warm_inflight[user_id] = asyncio.current_task()
+        owner = True
+        # Pin V2 for THIS task (a copied context), so `budget_chars` is the
+        # call's own value.
+        _v2_ctx.set(_resolve_v2_for_user(user_id))
+        outcome, data = await asyncio.wait_for(
+            _fetch_agent_voice_context(
+                user_id, onboarding=False, live=True, warm=True,
+                timeout=_VOICE_WARM_TIMEOUT_S,
+            ),
+            timeout=_VOICE_WARM_TIMEOUT_S + 0.5,
+        )
+        cached, age_ms = _context_cache_fields(data)
+        if outcome == "ok":
+            _voice_warm_last[user_id] = (
+                time.monotonic(), cached == "1",
+                int(age_ms) if age_ms != "-" else 0,
+            )
+            if len(_voice_warm_last) > 4096:
+                oldest = min(_voice_warm_last, key=lambda k: _voice_warm_last[k][0])
+                _voice_warm_last.pop(oldest, None)
+        return outcome
+    except asyncio.CancelledError:
+        outcome = "failed"
+        raise
+    except Exception:  # noqa: BLE001 — a warm is best-effort, never a fault
+        outcome = "failed"
+        return outcome
+    finally:
+        if owner:
+            _voice_warm_inflight.pop(user_id, None)
+        if outcome not in ("skipped_cohort",):
+            logger.info(
+                "[LIVE] voice warm user=%s reason=%s outcome=%s ms=%d cached=%s age_ms=%s",
+                user_id[:8], reason, outcome, int((time.monotonic() - t0) * 1000),
+                cached, age_ms,
+            )
+
+
+def live_voice_call_open(user_id) -> bool:
+    """Phase D2 ruling 48: does this process hold an open voice session for
+    the user (`_voice_session_owner`)?  The presence trigger asks before it
+    warms: a warm during the call rebuilds a context the call does not use."""
+
+    uid = str(user_id)
+    return any(str(owner) == uid for owner in _voice_session_owner)
+
+
+def schedule_live_voice_warm(user_id: str, reason: str) -> Optional[asyncio.Task]:
+    """Fire-and-forget `warm_live_voice` (the presence trigger)."""
+
+    try:
+        task = asyncio.get_running_loop().create_task(
+            warm_live_voice(str(user_id), reason), name="live-voice-warm",
+        )
+    except RuntimeError:
+        return None
+    _voice_warm_tasks.add(task)
+    task.add_done_callback(_voice_warm_tasks.discard)
+    return task
+
+
+async def request_live_voice_warm(user_id: str, reason: str) -> dict:
+    """`POST /api/voice/warm`: start (or join) a warm, wait at most
+    `_VOICE_WARM_ROUTE_WAIT_S`, and say what the next `ready` will find —
+    ``{warming, cache: fresh|built|pending|skipped, ttl_ms}``.  ``fresh`` = the
+    tenant has a build younger than its TTL (this process warmed it within the
+    debounce window, or the tenant answered from its cache); ``built`` = this
+    request made the tenant build one; ``pending`` = a build is in flight;
+    ``skipped`` = not a Live account (or no tenant): nothing to warm — or
+    nothing was sent (debounced, busy) or the warm failed."""
+
+    user_id = str(user_id)
+    if not _live_protocol_selected(user_id, "live1", onboarding=False):
+        return {"warming": False, "cache": "skipped", "ttl_ms": 0}
+
+    def fresh_ttl() -> Optional[int]:
+        last = _voice_warm_last.get(user_id)
+        if last is None:
+            return None
+        age = int((time.monotonic() - last[0]) * 1000) + (last[2] if last[1] else 0)
+        if (time.monotonic() - last[0]) >= _VOICE_WARM_DEBOUNCE_S or age >= _VOICE_WARM_TTL_MS:
+            return None
+        return _VOICE_WARM_TTL_MS - age
+
+    ttl = fresh_ttl()
+    if ttl is not None:
+        return {"warming": False, "cache": "fresh", "ttl_ms": ttl}
+    inflight = _voice_warm_inflight.get(user_id)
+    started = False
+    if inflight is None:
+        inflight = schedule_live_voice_warm(user_id, reason)
+        started = inflight is not None
+    if inflight is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(inflight), timeout=_VOICE_WARM_ROUTE_WAIT_S)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            pass
+    if inflight is not None and inflight.done() and not inflight.cancelled():
+        outcome = inflight.exception() is None and inflight.result()
+        if outcome == "ok":
+            last = _voice_warm_last.get(user_id)
+            if last is not None and last[1]:
+                return {"warming": started, "cache": "fresh",
+                        "ttl_ms": max(0, _VOICE_WARM_TTL_MS - last[2])}
+            return {"warming": started, "cache": "built", "ttl_ms": _VOICE_WARM_TTL_MS}
+        if outcome == "no_vps":
+            return {"warming": False, "cache": "skipped", "ttl_ms": 0}
+        if outcome in ("skipped_recent", "skipped_busy", "failed"):
+            # Phase D (turns-startup-7): the warm sent NOTHING (debounced,
+            # over the concurrency cap) or failed — "pending, warming" would
+            # tell the phone's trail a build is in flight when none is.
+            return {"warming": False, "cache": "skipped", "ttl_ms": 0}
+    return {"warming": started, "cache": "pending", "ttl_ms": _VOICE_WARM_TTL_MS}
+
+
+def _live_relay_error_frame(exc: BaseException, accept_monotonic: float) -> dict:
+    """The `live_relay_error` frame for a Live relay fault, with its cause
+    (D-R2(2)).  ``code`` is unchanged for every shipped client; ``cause`` is
+    the closed list `RELAY_FAULT_CAUSES`, ``phase`` startup|call,
+    ``elapsed_ms`` accept → fault (what the caller felt), ``retried`` 0|1,
+    ``provider_code`` only when a provider socket closed, ``provider_error``
+    the provider's own rejection code for `provider_start_rejected` (Phase D
+    turns-startup-8; additive, code-shaped)."""
+
+    from app.services.live_voice_protocol import LiveRelayFault, RELAY_FAULT_CAUSES
+
+    if isinstance(exc, LiveRelayFault) and exc.cause in RELAY_FAULT_CAUSES:
+        cause, phase = exc.cause, exc.phase
+        retried, provider_code = exc.retried, exc.provider_code
+    else:
+        cause = "relay_internal"
+        phase = getattr(exc, "relay_phase", "call")
+        retried = getattr(exc, "relay_retried", 0)
+        provider_code = None
+    frame = {
+        "type": "error",
+        "code": "live_relay_error",
+        # This socket is being torn down in the `finally` below, so the session
+        # cannot continue (C5.6). The user reopens it; the frame is not a retry
+        # hint.
+        "recoverable": False,
+        # DELETE THIS `message` once build 129 is no longer installable; build
+        # 130+ localises the code.
+        "message": "Voice disconnected. Tap the orb to try again.",
+        "cause": cause,
+        "phase": phase if phase in ("startup", "call") else "call",
+        "elapsed_ms": int((time.monotonic() - accept_monotonic) * 1000),
+        "retried": 1 if retried else 0,
+    }
+    if isinstance(provider_code, int):
+        frame["provider_code"] = provider_code
+    detail = getattr(exc, "detail", "") if isinstance(exc, LiveRelayFault) else ""
+    if detail and cause == "provider_start_rejected":
+        frame["provider_error"] = detail
+    return frame
+
+
 def _live_protocol_selected(
     user_id: str,
     protocol: Optional[str],
@@ -4300,8 +5294,10 @@ async def realtime_voice_ws(
     # represented in the Live client-delegation backend.
     use_live = _live_protocol_selected(user_id, protocol, onboarding=onboarding)
     _session_nonce = str(uuid.uuid4())
+    _owner_claim = None
     if use_live:
         _live_connect_latest[user_id] = _session_nonce
+        _owner_claim = _claim_voice_owner(user_id, _session_nonce)
     _live_ready_deadline = (
         _accept_monotonic + _LIVE_STARTUP_READY_BUDGET_S if use_live else None
     )
@@ -4333,6 +5329,9 @@ async def realtime_voice_ws(
             await asyncio.wait_for(websocket.send_json({
                 "type": "error", "code": "live_context_unavailable",
                 "recoverable": False,
+                # D-R2(2): which startup dependency (deadline | durable_session
+                # | personal_context | superseded | client_closed); additive.
+                "cause": cause,
                 "message": "Voice is unavailable right now. Try again shortly.",
             }), timeout=0.5)
         except Exception:
@@ -4341,6 +5340,11 @@ async def realtime_voice_ws(
     def _clear_live_attempt() -> None:
         if use_live and _live_connect_latest.get(user_id) == _session_nonce:
             _live_connect_latest.pop(user_id, None)
+        if use_live:
+            # D-P12: an attempt that is over holds no claim (a failed retry's
+            # row would otherwise keep the live call's socket from ending its
+            # own card); only OUR row is ever deleted.
+            _release_voice_owner(user_id, _session_nonce)
 
     async def _close_failed_live_status() -> None:
         _clear_live_attempt()
@@ -4522,30 +5526,11 @@ async def realtime_voice_ws(
 
         Returns None on failure. Realtime can use its legacy builder; Live
         requires owner/day context before its immutable session.start.
+        The request itself is `_fetch_agent_voice_context` — the same body
+        the warm-up sends (D-R2(4)).
         """
-        vps = await _get_vps_info(user_id)
-        if not vps:
-            return None
-        agent_url, agent_api_key = vps
-        body = {
-            "onboarding": onboarding,
-            "budget_chars": settings.voice_realtime_instructions_budget_chars if _v2_active() else 0,
-            "tz_name": await _get_user_tz_name(user_id),
-            # Which wire this prompt is for. The agent-side renderer drops the
-            # Realtime-only tool paragraphs and adds the delegation section
-            # itself once the image rolls; until then
-            # `adapt_instructions_for_live` does the same surgery on the text
-            # that comes back, and the two must agree word for word. An image
-            # that predates the field ignores it (pydantic default extra).
-            "live": use_live,
-            # One instant for both builders — the shadow must never read a
-            # minute tick between the legacy build and this call as a
-            # section divergence.
-            "now": (now_utc or datetime.now(timezone.utc)).isoformat(),
-        }
-        data = await _vps_api(
-            agent_url, agent_api_key, "POST",
-            "/api/v1/internal/voice-context", json_body=body, timeout=20.0,
+        _outcome, data = await _fetch_agent_voice_context(
+            user_id, onboarding=onboarding, live=use_live, now_utc=now_utc,
         )
         if not isinstance(data, dict):
             return None
@@ -4562,9 +5547,10 @@ async def realtime_voice_ws(
             # The opening promise uses this day's conversation. A builder
             # that reports a failed day read cannot satisfy that promise.
             return None
+        cached, age_ms = _context_cache_fields(data)
         logger.info(
-            "[REALTIME] agent voice-context ok user=%s chars=%d day=%s",
-            str(user_id)[:8], len(instr), data.get("day_date"),
+            "[REALTIME] agent voice-context ok user=%s chars=%d day=%s cached=%s age_ms=%s",
+            str(user_id)[:8], len(instr), data.get("day_date"), cached, age_ms,
         )
         return instr
 
@@ -4926,6 +5912,9 @@ async def realtime_voice_ws(
                 raise _LiveStartupUnavailable("client_closed")
             if _live_connect_latest.get(user_id) != _session_nonce:
                 raise _LiveStartupUnavailable("superseded")
+            if await _voice_owner_superseded(user_id, _session_nonce, _owner_claim):
+                # D-P12: a newer attempt on the OTHER replica owns the call.
+                raise _LiveStartupUnavailable("superseded")
             # Claim only after a status frame reaches this socket. A stale
             # socket discovered during provider connect must never replace
             # the newer call's owner even briefly.
@@ -4958,6 +5947,14 @@ async def realtime_voice_ws(
                 raise _LiveStartupUnavailable("durable_session")
             if not live_instructions:
                 raise _LiveStartupUnavailable("personal_context")
+            # D-P11: the account's voice language from its own history, if the
+            # lookup already answered — advertised in `ready` as the phone's
+            # prior for its NEXT call (never waited for: startup is budgeted).
+            _voice_language = None
+            if _lang_t.done() and not _lang_t.cancelled() and _lang_t.exception() is None:
+                _voice_language = _lang_t.result()
+            elif user_id in _lang_cache:
+                _voice_language = _lang_cache[user_id][0]
             for _unused in (_tools_t, _lang_t):
                 _unused.cancel()
             try:
@@ -4986,6 +5983,10 @@ async def realtime_voice_ws(
                 # long before `_pinned_lang` below. REPLY language only (§G):
                 # Live never pins transcription.
                 language_pin=lang if lang in _VOICE_LANG_PINS else None,
+                voice_language=_voice_language if _voice_language in ("en", "fa") else None,
+                # D-R2(1): the one provider-start retry opens its fresh socket
+                # through the same closure (the key never leaves it).
+                provider_factory=_connect_openai,
             )
         except _LiveStartupUnavailable as exc:
             cause = str(exc)
@@ -4993,19 +5994,26 @@ async def realtime_voice_ws(
         except WebSocketDisconnect:
             pass
         except Exception as e:
-            logger.exception("[LIVE] relay failed")
+            frame = _live_relay_error_frame(e, _accept_monotonic)
+            if frame["cause"] == "relay_internal":
+                logger.exception(
+                    "[LIVE] relay failed cause=%s phase=%s provider_code=%s retried=%d elapsed_ms=%d",
+                    frame["cause"], frame["phase"], frame.get("provider_code", "-"),
+                    frame["retried"], frame["elapsed_ms"],
+                )
+            else:
+                # Phase D (turns-startup-8): the typed line logs no exception,
+                # so the provider's rejection code / the reconnect's exception
+                # class rides it as `detail` (a code, never caller words).
+                logger.warning(
+                    "[LIVE] relay failed cause=%s phase=%s provider_code=%s retried=%d"
+                    " elapsed_ms=%d detail=%s",
+                    frame["cause"], frame["phase"], frame.get("provider_code", "-"),
+                    frame["retried"], frame["elapsed_ms"], getattr(e, "detail", "") or "-",
+                )
+            _vcount("live_relay_failed", user_id, cause=frame["cause"], phase=frame["phase"])
             try:
-                await websocket.send_json({
-                    "type": "error",
-                    "code": "live_relay_error",
-                    # This socket is being torn down in the `finally` directly
-                    # below, so the session cannot continue (C5.6). The user
-                    # reopens it; the frame is not a retry hint.
-                    "recoverable": False,
-                    # DELETE THIS `message` once build 129 is no longer
-                    # installable; build 130+ localises the code.
-                    "message": "Voice disconnected. Tap the orb to try again.",
-                })
+                await websocket.send_json(frame)
             except Exception:
                 pass
         finally:

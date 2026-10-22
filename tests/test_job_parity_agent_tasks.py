@@ -1,9 +1,11 @@
 """Job parity — agent-task intake paths populate the unified-arc columns.
 
-PR 4c of the unified-jobs arc. Three intake paths land in this PR:
+PR 4c of the unified-jobs arc. Three intake paths landed in that PR:
 
   1. Dashboard POST ``/apps/jobs/`` (``apps.py:create_job``)
-  2. Chat-intent regex (``ws_chat.py:_detect_and_create_task``)
+  2. Chat-intent regex (``ws_chat.py:_detect_and_create_task``) — RETIRED in
+     the voice round of 2026-10-05 (D-P4): the runner mints a chat turn's
+     card itself (``voice_jobs.TurnJob``); its tests left with it.
   3. ``create_job`` agent tool (``tool_executor.py:_tool_create_job``)
 
 Unlike PR 4a/4b where the legacy "fire" tables coexist with the
@@ -109,23 +111,6 @@ def test_dashboard_post_uses_job_runner():
     )
 
 
-def test_chat_intent_uses_job_runner_with_chat_intent_source():
-    """``_detect_and_create_task`` must use source_kind='chat_intent'
-    and pass the session_id through as both source_id AND
-    conversation_id so Mission Control can attribute the task to
-    the chat that spawned it."""
-    assert "_detect_and_create_task" in _WS_CHAT_SRC
-    func_start = _WS_CHAT_SRC.find("async def _detect_and_create_task")
-    func_end = _WS_CHAT_SRC.find("\nasync def ", func_start + 1)
-    if func_end == -1:
-        func_end = func_start + 3000
-    func_body = _WS_CHAT_SRC[func_start:func_end]
-    assert "JobRunner" in func_body and "create_job" in func_body
-    assert 'source_kind="chat_intent"' in func_body
-    assert "source_id=session_id" in func_body
-    assert "conversation_id=session_id" in func_body
-
-
 def test_create_job_tool_uses_job_runner_with_steps_json():
     """The agent-authored ``create_job`` tool must use JobRunner
     AND pass through the agent-supplied ``steps`` array on
@@ -142,88 +127,3 @@ def test_create_job_tool_uses_job_runner_with_steps_json():
         "the agent's step plan needs to land on the row."
     )
     assert 'source_kind="manual"' in func_body
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Behavioural tests — call the intake paths and assert row state.
-# ──────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_detect_and_create_task_populates_unified_arc_columns(
-    _seed_user,
-):
-    """Drive ``_detect_and_create_task`` directly. The created
-    BuildJob carries source_kind='chat_intent',
-    source_id=conversation_id=session_id, status='running',
-    layer=0, job_type='agent_task'."""
-    import asyncio
-    from app.api.ws_chat import _detect_and_create_task
-    from app.db.database import async_session_maker
-    from app.db.models import BuildJob
-
-    session_id = "conv-" + uuid.uuid4().hex[:12]
-    bq: asyncio.Queue = asyncio.Queue()
-
-    job_id = await _detect_and_create_task(
-        "research the best Postgres-on-NVMe setup",
-        USER_ID,
-        session_id,
-        bq,
-    )
-    assert job_id is not None
-
-    async with async_session_maker() as db:
-        job = await db.get(BuildJob, job_id)
-        assert job is not None
-        assert job.job_type == "agent_task"
-        assert job.status == "running"
-        assert job.layer == 0
-        assert job.source_kind == "chat_intent"
-        assert job.source_id == session_id
-        assert job.conversation_id == session_id
-        assert "research" in (job.title or "").lower()
-
-
-@pytest.mark.asyncio
-async def test_detect_and_create_task_non_task_returns_none(_seed_user):
-    """Non-task text (no intent verb at the start) still bypasses
-    the intake path — regression check that the repoint didn't
-    widen the trigger pattern."""
-    import asyncio
-    from app.api.ws_chat import _detect_and_create_task
-
-    bq: asyncio.Queue = asyncio.Queue()
-    job_id = await _detect_and_create_task(
-        "hey can you say hi",
-        USER_ID,
-        "any-session",
-        bq,
-    )
-    assert job_id is None
-
-
-@pytest.mark.asyncio
-async def test_detect_and_create_task_handles_null_session_id(_seed_user):
-    """When session_id is None (rare — should always be set in
-    practice but the type permits it), the task still gets created
-    with source_kind='chat_intent' and NULL source_id / NULL
-    conversation_id. Don't crash on the optional input."""
-    import asyncio
-    from app.api.ws_chat import _detect_and_create_task
-    from app.db.database import async_session_maker
-    from app.db.models import BuildJob
-
-    bq: asyncio.Queue = asyncio.Queue()
-    job_id = await _detect_and_create_task(
-        "investigate the crash report",
-        USER_ID,
-        None,
-        bq,
-    )
-    assert job_id is not None
-    async with async_session_maker() as db:
-        job = await db.get(BuildJob, job_id)
-        assert job.source_kind == "chat_intent"
-        assert job.source_id is None
-        assert job.conversation_id is None

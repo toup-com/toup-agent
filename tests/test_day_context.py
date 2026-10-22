@@ -510,6 +510,106 @@ async def test_summarizer_produces_output():
 
 # ── Standalone runner ─────────────────────────────────────────────────
 
+# ── Voice round 2026-10-06 (D-T3): the per-call cache's two gates ───────
+
+
+async def test_a_completed_backfill_is_latched_and_nothing_else_is():
+    """Once `day_chat_backfill` reads `completed` it never reverts, so the
+    answer is latched per session maker and no later turn pays the second
+    connection; a NOT-completed answer is re-asked every time."""
+    _dcr_spec = _ilu.spec_from_file_location(
+        "day_chat_resolver_latch",
+        str(Path(__file__).resolve().parent.parent / "app" / "agent" / "day_chat_resolver.py"),
+    )
+    _dcr = _ilu.module_from_spec(_dcr_spec)
+    _dcr_spec.loader.exec_module(_dcr)
+
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with sm() as db:
+        db.add(MigrationStatus(migration_name="day_chat_backfill", status="in_progress",
+                               started_at=datetime.utcnow()))
+        await db.commit()
+    assert await _dcr.should_use_day_chat_context(session_maker=sm, feature_flag_override=True) is False
+    async with sm() as db:
+        ms = (await db.execute(select(MigrationStatus))).scalar_one()
+        ms.status = "completed"
+        await db.commit()
+    assert await _dcr.should_use_day_chat_context(session_maker=sm, feature_flag_override=True) is True
+    # The row moving back cannot be SEEN any more: the answer is latched.
+    async with sm() as db:
+        ms = (await db.execute(select(MigrationStatus))).scalar_one()
+        ms.status = "in_progress"
+        await db.commit()
+    assert await _dcr.should_use_day_chat_context(session_maker=sm, feature_flag_override=True) is True
+    # The flag still wins over the latch.
+    assert await _dcr.should_use_day_chat_context(session_maker=sm, feature_flag_override=False) is False
+    # Another maker reads its own DB.
+    sm2 = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    assert await _dcr.should_use_day_chat_context(session_maker=sm2, feature_flag_override=True) is False
+    _dcr.reset_day_chat_latch_for_test()
+    assert await _dcr.should_use_day_chat_context(session_maker=sm, feature_flag_override=True) is False
+    await engine.dispose()
+
+
+async def test_the_day_validator_moves_with_everything_a_context_is_built_from():
+    """One aggregate query: a new row, a REVISED row (voice rows are rewritten
+    in place, and `messages` has no updated_at), a re-stamped row and a new
+    summary each change it; an untouched day answers the same twice."""
+    from app.agent import call_context_cache as cc
+
+    engine = await _make_engine()
+    sm = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    dc_id, msgs = await _seed_day(sm, user_id="u-val", channels=["web"], msgs_per_conv=3)
+    async with sm() as db:
+        v0 = await cc.day_validator(db, dc_id)
+        assert v0 is not None and v0[0] == 3
+        assert await cc.day_validator(db, dc_id) == v0
+    seen = [v0]
+
+    async def _moved(mutate):
+        async with sm() as db:
+            await mutate(db)
+            await db.commit()
+        async with sm() as db:
+            v = await cc.day_validator(db, dc_id)
+        assert v not in seen, v
+        seen.append(v)
+
+    async def _revise(db):
+        m = await db.get(Message, msgs[0].id)
+        m.content = m.content + " (revised by the relay)"
+
+    async def _restamp(db):
+        m = await db.get(Message, msgs[1].id)
+        m.occurred_at = datetime(2026, 4, 7, 23, 0, 0)
+
+    async def _summary(db):
+        d = await db.get(DayChat, dc_id)
+        d.summary_updated_at = datetime(2026, 4, 7, 23, 30, 0)
+
+    async def _add(db):
+        db.add(Message(id=str(uuid.uuid4()), conversation_id=msgs[0].conversation_id,
+                       day_chat_id=dc_id, role="user", content="one more",
+                       created_at=datetime(2026, 4, 7, 23, 45, 0)))
+
+    for mutate in (_revise, _restamp, _summary, _add):
+        await _moved(mutate)
+
+    # get/put: a hit only for the SAME validator, and always a copy.
+    cc.reset_for_test()
+    key = ("u-val", dc_id, "voice", None, "m", 1000)
+    cc.put_day_context(key, seen[-1], {"messages": [{"role": "user", "content": "x"}]})
+    hit = cc.get_day_context(key, seen[-1])
+    hit["messages"].append({"role": "assistant", "content": "mutated"})
+    assert cc.get_day_context(key, seen[-1]) == {"messages": [{"role": "user", "content": "x"}]}
+    assert cc.get_day_context(key, seen[0]) is None
+    assert cc.get_day_context(key, seen[-1]) is None, "a stale validator drops the entry"
+    assert cc.get_day_context(key, None) is None
+    cc.reset_for_test()
+    await engine.dispose()
+
+
 if __name__ == "__main__":
     async def _run_all():
         tests = [

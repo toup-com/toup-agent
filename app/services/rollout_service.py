@@ -46,6 +46,7 @@ from app.db.models import (
 )
 from app.services.docker_host_service import (
     upgrade_tenant_image, BridgeUpgradeUnhealthy, BridgeContainerNotFound,
+    _normalise_image_tag,
 )
 
 logger = logging.getLogger(__name__)
@@ -1954,6 +1955,50 @@ _sweep_exhausted_alerted: set[str] = set()
 _rollout_creation_lock = asyncio.Lock()
 
 
+def _sweep_exempt_prefixes() -> frozenset:
+    raw = getattr(settings, "rollout_sweep_exempt_prefixes", "") or ""
+    return frozenset(p.strip()[:8] for p in str(raw).split(",") if p.strip())
+
+
+def _sweep_eligible(
+    divergent: list, known_tags: set, settled_at: Optional[datetime] = None,
+) -> list:
+    """The divergent tenants the sweep may re-drive (voice round 2026-10-06).
+
+    Drops (1) a HAND CANARY: a tenant on an image NO rollout row has ever
+    targeted whose container STARTED after the target rollout settled
+    (`settled_at`, its completed_at) — someone put it there after the fleet
+    converged, from a `[skip rollout]` build; re-driving it converges it
+    backward onto settled history, which is what re-imaged c47c5b4b three
+    minutes after its canary. A tenant on an unknown image that has not been
+    (re)started since is the stale row the sweep exists to repair and stays
+    eligible, as does one with no recorded tag or start. And (2) a tenant
+    whose prefix is in `settings.rollout_sweep_exempt_prefixes`. Each skip is
+    logged, so a skip is never silent."""
+    exempt = _sweep_exempt_prefixes()
+    keep = []
+    for t in divergent:
+        prefix = (t.user_id or "")[:8]
+        tag = _normalise_image_tag(t.image_tag)
+        if prefix in exempt:
+            logger.info(
+                "[ROLLOUT-SWEEP] skip tenant=%s on %s: exempt prefix "
+                "(rollout_sweep_exempt_prefixes)", prefix, tag or "-",
+            )
+            continue
+        started = getattr(t, "started_at", None)
+        if (tag and tag not in known_tags and settled_at is not None
+                and started is not None and started > settled_at):
+            logger.info(
+                "[ROLLOUT-SWEEP] skip tenant=%s on %s: no rollout ever targeted "
+                "that image (a hand canary) — not converging it backward",
+                prefix, tag,
+            )
+            continue
+        keep.append(t)
+    return keep
+
+
 async def _convergence_sweep_once() -> None:
     """One convergence-sweep pass. Runs only when no rollout is active.
 
@@ -2038,7 +2083,21 @@ async def _convergence_sweep_once() -> None:
                 return
 
             tenants = await _running_tenants(db)
-            divergent = [t for t in tenants if (t.image_tag or "") != target]
+            divergent = [
+                t for t in tenants
+                if _normalise_image_tag(t.image_tag) != _normalise_image_tag(target)
+            ]
+            # Voice round 2026-10-06: never converge a hand-canaried or an
+            # exempt tenant BACKWARD (see `rollout_sweep_exempt_prefixes`).
+            if divergent:
+                known_tags = {
+                    _normalise_image_tag(tag) for tag in (await db.execute(
+                        select(Rollout.image_tag).distinct()
+                    )).scalars().all()
+                }
+                divergent = _sweep_eligible(
+                    divergent, known_tags, target_rollout.completed_at,
+                )
             if not divergent:
                 return
             prefixes = ", ".join(sorted(t.user_id[:8] for t in divergent))

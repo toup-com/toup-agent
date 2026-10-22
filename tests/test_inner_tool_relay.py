@@ -226,5 +226,64 @@ def test_actual_only_tool_events_are_gated_by_lifecycle_not_timing(
         assert starts[0]["clock"] == "provider"
 
 
+_WORKER = {"worker_job_id": "w-1", "parent_job_id": "job-1", "worker_index": 2,
+           "label": "Researcher", "model": "gpt-x"}
+
+
+def test_a_workers_tool_row_says_which_worker_ran_it() -> None:
+    """D-P6: an executor's tool frames carry its worker keys onto the phone
+    row and the persisted record; a turn with no workers carries none, so its
+    frames are byte-identical to before."""
+    ws, sink = FakeWS(), []
+    relay = _InnerToolRelay(ws, "outer1", sink=sink)
+
+    async def run() -> None:
+        await relay.on_event({"type": "tool.start", "call_id": "c1", "name": "web_search",
+                              "args": {"query": "q"}, **_WORKER, "worker_index": "2"})
+        await relay.on_event({"type": "tool.end", "call_id": "c1", "name": "web_search",
+                              "ok": True, **_WORKER})
+        await relay.on_event({"type": "tool.start", "call_id": "c2", "name": "web_search",
+                              "args": {"query": "q"}, "label": ""})
+
+    asyncio.run(run())
+    first, plain = started(ws.sent)
+    for key, value in _WORKER.items():
+        assert first[key] == value, key
+        assert completed(ws.sent)[0][key] == value, key
+        assert sink[0][key] == value, key
+    assert not set(_WORKER) & set(plain), plain
+
+
+def test_job_frames_go_to_the_owner_never_straight_to_the_phone() -> None:
+    """`job.update` / `step.event` / `supervisor.started` are the session's to
+    forward (it alone knows the task and what the client negotiated), and the
+    first `supervisor.started` raises the turn's budget once."""
+    ws, seen = FakeWS(), []
+
+    async def on_task_frame(ev: dict) -> None:
+        seen.append(ev["type"])
+        if ev["type"] == "step.event":
+            raise RuntimeError("a card frame never breaks the turn")
+
+    relay = _InnerToolRelay(ws, "outer1", on_task_frame=on_task_frame)
+    bare = _InnerToolRelay(FakeWS(), "outer2")
+
+    async def run() -> None:
+        for ev in ({"type": "job.update", "job_id": "job-1"},
+                   {"type": "step.event", "kind": "step_change"},
+                   {"type": "supervisor.started", "workers_total": 2},
+                   {"type": "supervisor.started", "workers_total": 5}):
+            assert await relay.on_event(ev) is True
+            assert await bare.on_event(ev) is True
+
+    from app.api import ws_realtime as rt
+    asyncio.run(run())
+    assert ws.sent == []
+    assert seen == ["job.update", "step.event", "supervisor.started", "supervisor.started"]
+    assert relay.budget_s == max(rt.settings.voice_realtime_think_timeout_s,
+                                 rt.settings.voice_live_supervisor_timeout_s)
+    assert bare.budget_s == relay.budget_s, "the budget does not depend on an owner"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

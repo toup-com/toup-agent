@@ -73,6 +73,25 @@ APPEND_ACKS = {
 }
 
 
+def spoken_for(event: dict) -> str:
+    """What the fake model says aloud for an append it was told to voice.
+
+    A commentary is said as its `content`.  An instruction is said as its
+    SLOT: the relay's speakable instructions (`result_nudge`,
+    `relay_task_say`, `status_result`, the media lines) end in
+    "…: {result}", so the text after the first ": " of the lead is what the
+    caller hears.  The FIRST separator, not the last, so a result that itself
+    contains ": " is said whole.  An instruction with no slot is said whole.
+    """
+
+    content = str(event.get("content") or "").strip()
+    if str(event.get("type") or "") == "session.instructions.append":
+        head, sep, tail = content.partition(": ")
+        if sep and tail.strip():
+            return tail.strip()
+    return content or "Okay."
+
+
 class FakeProvider:
     """GPT-Live.  `on_send(provider, event)` scripts the responses.
 
@@ -150,8 +169,13 @@ class FakeProvider:
         self.push({"type": ack, "client_event_id": event_id, "start_ms": 0, "end_ms": 0})
         if kind in self._speak_after:
             # The model paraphrases it aloud: transcript + audio, i.e. a new
-            # output epoch, which is what the relay reads as "it was said".
-            self.push(out_text("Here is what I found.", 900, 1500))
+            # output epoch.  Voice round 2026-10-07 (D-R1): the relay proves a
+            # delivery by the epoch's WORDS, so the fake says what it was
+            # given — a commentary's `content`, an instruction's slot (the
+            # text after its "…: " lead, `spoken_for`) — exactly the model the
+            # docstring above describes.  The old fixed "Here is what I
+            # found." proved nothing and would record every answer unspoken.
+            self.push(out_text(spoken_for(event), 900, 1500))
             self.push(out_audio("SPEAKING"))
 
     async def send(self, raw):
@@ -256,10 +280,74 @@ def fast_clocks(monkeypatch, **overrides):
         "voice_live_output_epoch_gap_ms": 80,
         "voice_live_interrupt_suppress_ms": 120,
         "voice_live_progress_min_interval_s": 0.0,
+        # D-P3: the research backstop is ON in production; the suites written
+        # before it script their own delegations and turn it on explicitly
+        # (tests/test_live_research_backstop.py).
+        "voice_live_research_backstop_enabled": False,
+        # D-R3 / D-R1(e) / D-R4 (2026-10-06 call): the PLAY backstop and the
+        # promise mode are ON in production; a suite whose fake model leaves a
+        # play-shaped turn unanswered would otherwise grow a `relay-play:`
+        # delegation.  Their tests opt in (tests/test_live_media_backstop.py).
+        # The bare-command grace is pinned at its production value.
+        "voice_live_play_backstop_enabled": False,
+        "voice_live_claim_grace_ms": 0,
+        "voice_live_media_backstop_playing_grace_ms": 400,
         "voice_live_persist_drain_s": 2.0,
         "voice_live_history_rows": 0,
         "voice_live_speak_timeout_s": 0.5,
         "voice_live_result_defer_max_ms": 200,
+        # R7 (DESIGN-R2 D-R7 (6)): results go out in finish order in the
+        # suites written before the ask-order wait; its own tests opt in.
+        "voice_live_result_order_wait_s": 0.0,
+        # P1 (b): the no-input hold's bound, scaled like the speak budget it
+        # extends — twice the 0.5 s above, so a fake that never acks (and no
+        # fake phone here streams audio) gets its nudge and verdict exactly
+        # when it always did: the bound is spent by the first deadline.
+        "voice_live_speak_no_input_max_s": 1.0,
+        # Production runs the keeper (D7); no fake phone here streams audio, so
+        # with it on every suite would hear relay silence. Keeper tests opt in.
+        "voice_live_uplink_keeper_enabled": False,
+        # Voice round 2026-10-06 (D-R1): the reply ladder is ON in production
+        # (regen 3.0 s, then the `relay-reply:` backstop).  The suites written
+        # before it script replies that may take longer than 3 s to arrive (a
+        # fake model that never answers a turn is a scripted fact, not a
+        # stuck model), so the relay's own reasks and reply backstop are OFF
+        # here; the ladder's tests opt in.
+        "voice_live_reply_regen_after_s": 0,
+        "voice_live_reply_backstop_enabled": False,
+        # Voice round 2026-10-07 (D-R1, relay-delivery §4.10): the two-result
+        # merge, the continuation cue and the media fold window are
+        # relay-initiated behaviours, ON in production; the suites written
+        # before them expect one result per append and their own rows, so
+        # they are OFF here and their tests opt in.  The words proof itself
+        # cannot be pinned off — it IS the verdict — which is why the fake
+        # model above says what it is given.  The verdict and late-words
+        # bounds are scaled like the speak budget.
+        "voice_live_result_merge_window_s": 0.0,
+        "voice_live_result_continue_cue_enabled": False,
+        "voice_live_result_verdict_max_s": 3.0,
+        "voice_live_result_late_words_s": 2.0,
+        "voice_live_media_fold_window_s": 0.0,
+        # Voice round 2026-10-07, lane RB: every new relay-initiated turn
+        # behaviour is OFF here and its own tests opt in — the endpoint rules
+        # (hesitant / verbless spans keep the hard gap), the addendum join and
+        # the seam absorber (one card for a question tail), the fragment carry
+        # (a cut piece of the agent's sentence is never its own row) and the
+        # provider-start retry.  `voice_live_session_start_attempt_s` keeps its
+        # production value: with the retry off it bounds nothing.
+        "voice_live_endpoint_rules_enabled": False,
+        "voice_live_addendum_window_ms": 0,
+        "voice_live_seam_onset_ms": 0,
+        "voice_live_fragment_carry_s": 0,
+        "voice_live_provider_start_retry_enabled": False,
+        # Voice round 2026-10-07 (D-R4, relay-search-play): the relay's own
+        # now-playing answer (Hooks A/B) is ON in production; a suite whose
+        # fake phone reports a track and whose caller asks about it would
+        # otherwise have the relay answer before the scripted model does.  The
+        # near-finish progress rule is 0 (off) here: the suites written before
+        # it run tasks for well under a second, and its tests opt in.
+        "voice_live_media_status_enabled": False,
+        "voice_live_progress_min_remaining_s": 0.0,
         "auto_extract_memories": False,
     }
     defaults.update(overrides)
@@ -269,9 +357,15 @@ def fast_clocks(monkeypatch, **overrides):
 
 def patch_relay(
     monkeypatch, *, think=None, save=None, curate=None, play=None,
-    control=None, vps=None,
+    control=None, vps=None, summarize=None,
 ):
-    """Stub every seam that leaves the process.  Returns the recorded calls."""
+    """Stub every seam that leaves the process.  Returns the recorded calls.
+
+    `summarize` is the task summarizer's one model call
+    (`live.summarize_task_text`, PR-14).  By default it answers nothing, so a
+    test that does not script it sees no summary at all — exactly the frames
+    and rows of a relay whose summarizer timed out.
+    """
 
     from app.api import ws_realtime as rt
     import app.services.live_voice_protocol as live
@@ -304,6 +398,9 @@ def patch_relay(
     async def noop_meter(*_args, **_kwargs):
         return None
 
+    async def no_summary(**_kwargs):
+        return None
+
     monkeypatch.setattr(rt, "_think", think or default_think)
     monkeypatch.setattr(rt, "_save_voice_messages", save or default_save)
     monkeypatch.setattr(rt, "_curate_voice_turn", curate or default_curate)
@@ -312,6 +409,7 @@ def patch_relay(
     monkeypatch.setattr(rt, "_get_vps_info", vps or default_vps)
     monkeypatch.setattr(rt, "_apply_client_tz", noop_tz)
     monkeypatch.setattr(live, "meter_live_session", noop_meter)
+    monkeypatch.setattr(live, "summarize_task_text", summarize or no_summary)
     return {"saves": saves, "curates": curates}
 
 

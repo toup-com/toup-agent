@@ -525,8 +525,17 @@ def test_the_endpoint_passes_order_fields_only_for_an_ordered_stop_or_pause():
     fields are lenient: a malformed value is absent, never a 422."""
     import inspect
 
+    # Re-pinned 2026-10-06 (voice round, D-T1): the route body moved into
+    # `radio.control.run_media_control`, shared with the agent's
+    # `media_control` tool — the probe follows the body there, and the route
+    # must still hand it the three order fields.
+    from app.agent.radio import control as _control
+
     src = inspect.getsource(api_v1.internal_media_control)
-    assert "execute_media_control(user_id, req.action, req.channel, **ordered)" in src
+    assert "run_media_control(" in src and "before_order=req.before_order" in src
+    shared = inspect.getsource(_control.run_media_control)
+    assert "execute_media_control(user_id, action, channel, **ordered)" in shared
+    assert 'normalized in ("stop", "pause")' in shared
     req = MediaControlRequest(user_id="u", action="stop", before_order="x", media_scope=7)
     assert (req.before_order, req.media_scope) == (None, None)
     req = PlayMediaRequest(query="q", media_order=True, media_scope_started_ms=-5)

@@ -191,7 +191,7 @@ async def test_f0_the_echoed_acknowledgement_never_becomes_the_anchor(monkeypatc
         client = box["client"]
         await _until(lambda: len(_finals(client)) == 1, label="request final")
         p.push(H.out_text(ACK, 900, 1500))
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
         await _until(lambda: bool(client.of("response_text")), label="ack on the phone")
         if delegation_first:
             p.push(H.delegation("d1", 2000))
@@ -234,7 +234,7 @@ async def test_f0_a_request_asked_over_the_reply_is_not_rebound_to_the_echo_tail
         p.push(H.user_delta(GERSTEIN_Q0, 0, 600))
         await _until(lambda: len(_finals(client)) == 1)
         p.push(H.out_text(GERSTEIN_E1, 700, 1400))
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
         await _until(lambda: bool(client.of("response_text")))
         p.push(H.user_delta(question, 2000, 2400))
         await _until(lambda: len(_finals(client)) == 2)
@@ -275,7 +275,7 @@ async def test_f0_a_direct_reply_is_parented_to_the_question_not_a_later_echo(mo
         p = box["p"]
         await _until(lambda: len(_finals(client)) == 1)
         p.push(H.out_text(GERSTEIN_E1, 700, 1400))
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
         await _until(lambda: bool(client.of("response_text")))
         p.push(H.user_delta("What about Sunday?", 2000, 2300))
         await _until(lambda: len(_finals(client)) == 2)
@@ -653,7 +653,7 @@ async def test_f2_an_acknowledged_reask_still_binds_its_own_delegation(monkeypat
     async def ack_then_delegate():
         p = box["p"]
         await _until(lambda: client.of("reask_result"), label="reask_result")
-        p.push(H.out_audio("AAAA"))
+        p.push(H.out_audio("AQID"))
         p.push(H.out_text(" Let me look that up.", 1000, 1600))
         await asyncio.sleep(0.02)
         p.push(H.delegation("d1", 1650))
@@ -946,7 +946,7 @@ def _agent(words, start, step):
             await at(start + i * step)
             position = int((start + i * step) * 1000)
             p.push(H.out_text(" " + word, position, position + int(step * 1000)))
-            p.push(H.out_audio("AAAA"))
+            p.push(H.out_audio("AQID"))
     return run
 
 
@@ -1041,7 +1041,7 @@ async def test_f6_a_backchannel_over_the_reply_holds_it_no_longer_than_the_gap(
                 await at(1.4 + i * 0.05)
                 position = 1500 + i * 50
                 p.push(H.out_text(" " + words[i % len(words)], position, position + 50))
-                p.push(H.out_audio("AAAA"))
+                p.push(H.out_audio("AQID"))
 
         async def caller():
             await at(1.4 + 0.6)
