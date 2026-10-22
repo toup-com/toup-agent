@@ -20,6 +20,7 @@ def _reset_database():
     topics._RECENT.clear()
     topics._RETRY_AFTER.clear()
     topics._USER_LOCKS.clear()
+    topics._HISTORY_LOCKS.clear()
     topics._REMOTE_CACHE.clear()
     topics._HISTORY_CACHE.clear()
     topics._HISTORY_READS.clear()
@@ -193,6 +194,7 @@ async def test_endpoint_auth_input_bounds_and_owned_history_read(sessions, monke
     app.dependency_overrides[get_db] = database
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor"]})).status_code == 401
+        assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor"], "cache_only": True})).status_code == 401
         app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id="owner", timezone="America/Toronto")
         assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["x"] * 21})).status_code == 422
         assert (await client.post("/api/day-chats/bad/topics", json={"message_ids": ["x"]})).status_code == 400
@@ -222,6 +224,13 @@ async def test_endpoint_auth_input_bounds_and_owned_history_read(sessions, monke
         assert response.status_code == 200
         assert response.json()["topics"][0]["message_id"] == "anchor"
         assert calls == [("https://tenant.test", "test-agent-key", "2026-10-22/messages", {"limit": 2000})]
+        cached = await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor", "missing"], "cache_only": True})
+        assert cached.status_code == 200
+        assert cached.json()["cache_only"] is True and cached.json()["unavailable"] is False
+        assert cached.json()["topics"] == response.json()["topics"]
+        assert len(calls) == 1
+        assert len(topics._RECENT["owner"]) == 1
+        assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor"], "cache_only": "yes"})).status_code == 422
 
 
 def remote_row(id, content="Explain geometric shapes", role="user", **kwargs):
@@ -362,15 +371,16 @@ async def test_remote_history_read_budget_does_not_serve_expired_context(monkeyp
         reads.append(True)
         return [remote_row("anchor")]
 
-    for i in range(6):
+    for i in range(30):
         await topics._remote_history("owner", date(2026, 10, i + 1), ["anchor"], loader)
-    assert len(reads) == 6
+    assert len(reads) == 30
     now[0] += 31
-    assert await topics._remote_history("owner", date(2026, 10, 1), ["anchor"], loader) == []
-    assert len(reads) == 6
+    with pytest.raises(topics.TopicHistoryUnavailable):
+        await topics._remote_history("owner", date(2026, 10, 1), ["anchor"], loader)
+    assert len(reads) == 30
     now[0] += 30
     assert await topics._remote_history("owner", date(2026, 10, 1), ["anchor"], loader)
-    assert len(reads) == 7
+    assert len(reads) == 31
 
 
 async def test_remote_history_projection_and_byte_entry_caps(monkeypatch):
@@ -506,3 +516,96 @@ async def test_local_assistant_anchor_ownership_day_context_and_cache(sessions, 
         await db.commit()
         await fetch(db, ["recap", "answer"])
         assert len(calls) == 2 and [turn["message_id"] for turn in calls[-1]] == ["request"]
+
+
+async def test_local_cache_only_bypasses_generation_lock_and_writes(sessions, monkeypatch):
+    async with sessions() as db:
+        await seed(db, 'cached', content='Plan a product launch')
+        await seed(db, 'missing', content='Find a restaurant', at='2026-10-22 15:00:00')
+        await seed(db, 'foreign', conv='other')
+        await seed(db, 'hidden', conv='hidden')
+        rows = [{'id': 'cached', 'role': 'user', 'content': 'Plan a product launch', 'conversation_id': 'conv'}]
+        fingerprint = topics._canonical_groups(rows)[0]['cached']['fingerprint']
+        metadata = json.dumps({'attachments': ['keep'], 'chat_topic': {'version': topics._VERSION, 'source': fingerprint, 'topic': 'Plan a product launch'}})
+        await db.execute(text("UPDATE messages SET metadata_json=:metadata WHERE id='cached'"), {'metadata': metadata})
+        await db.commit()
+        lock = asyncio.Lock()
+        await lock.acquire()
+        topics._USER_LOCKS['owner'] = lock
+        async def forbidden(*args, **kwargs):
+            raise AssertionError('Cache-only must not generate')
+        monkeypatch.setattr(topics, '_generate', forbidden)
+        try:
+            result = await asyncio.wait_for(topics.get_chat_topics(db, user_id='owner', day=date(2026, 10, 22),
+                message_ids=['cached', 'missing', 'foreign', 'hidden'], tz_name='America/Toronto', cache_only=True), .5)
+        finally:
+            lock.release()
+        assert result['cache_only'] and not result['unavailable']
+        assert [item['message_id'] for item in result['topics']] == ['cached']
+        assert not topics._RECENT and not topics._RETRY_AFTER
+        assert (await db.execute(text("SELECT metadata_json FROM messages WHERE id='cached'"))).scalar() == metadata
+        assert (await db.execute(text("SELECT metadata_json FROM messages WHERE id='missing'"))).scalar() is None
+
+
+async def test_local_cache_only_database_outage_is_not_normal_miss(monkeypatch):
+    from unittest.mock import AsyncMock
+    from sqlalchemy.exc import OperationalError
+    db = SimpleNamespace(commit=AsyncMock(side_effect=OperationalError('read', {}, Exception('unavailable'))), rollback=AsyncMock())
+    result = await topics.get_chat_topics(db, user_id='owner', day=date(2026, 10, 22), message_ids=['anchor'], tz_name=None, cache_only=True)
+    assert result == {'topics': [], 'unavailable': True, 'cache_only': True}
+    db.rollback.assert_awaited_once()
+
+
+async def test_cache_only_history_singleflight_is_independent_of_generation(monkeypatch):
+    from unittest.mock import AsyncMock
+    from app.services import chat_topic_store as store
+    reads = []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    async def loader():
+        reads.append(True)
+        entered.set()
+        await finish.wait()
+        return [remote_row('anchor')]
+    monkeypatch.setattr(store, 'load_topic_titles', AsyncMock(return_value={}))
+    lock = asyncio.Lock()
+    await lock.acquire()
+    topics._USER_LOCKS['owner'] = lock
+    async def fetch(user='owner', day=date(2026, 10, 22)):
+        return await topics.get_remote_chat_topics(user_id=user, day=day, message_ids=['anchor'], load_messages=loader, cache_only=True)
+    tasks = [asyncio.create_task(fetch()) for _ in range(2)]
+    await entered.wait()
+    finish.set()
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*tasks), .5)
+    finally:
+        lock.release()
+    assert results == [{'topics': [], 'unavailable': False, 'cache_only': True}] * 2
+    assert len(reads) == 1
+    await fetch(user='other')
+    await fetch(day=date(2026, 10, 21))
+    assert len(reads) == 3
+    assert not topics._HISTORY_LOCKS and not topics._RECENT and not topics._RETRY_AFTER
+
+
+@pytest.mark.parametrize('failure', ['exception', 'malformed', 'timeout', 'budget'])
+async def test_cache_only_history_failure_is_not_normal_miss(monkeypatch, failure):
+    from unittest.mock import AsyncMock
+    from app.services import chat_topic_store as store
+    async def loader():
+        if failure == 'exception':
+            raise RuntimeError('tenant unavailable')
+        if failure == 'malformed':
+            return {'error': 'unavailable'}
+        if failure == 'timeout':
+            await asyncio.Event().wait()
+        return [remote_row('anchor')]
+    if failure == 'timeout':
+        monkeypatch.setattr(topics, '_HISTORY_READ_TIMEOUT', .02)
+    if failure == 'budget':
+        topics._HISTORY_READS['owner'] = [topics.time.monotonic()] * 30
+    load = AsyncMock()
+    monkeypatch.setattr(store, 'load_topic_titles', load)
+    result = await topics.get_remote_chat_topics(user_id='owner', day=date(2026, 10, 22), message_ids=['anchor'], load_messages=loader, cache_only=True)
+    assert result == {'topics': [], 'unavailable': True, 'cache_only': True}
+    load.assert_not_awaited()
+    assert not topics._HISTORY_LOCKS and not topics._RECENT and not topics._RETRY_AFTER

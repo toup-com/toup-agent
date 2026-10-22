@@ -974,6 +974,7 @@ async def list_day_chats(
 
 class ChatTopicsRequest(BaseModel):
     message_ids: List[str] = Field(min_length=1, max_length=20)
+    cache_only: bool = Field(default=False, strict=True)
 
 
 @router.post("/{date_str}/topics")
@@ -1008,6 +1009,7 @@ async def get_day_chat_topics(
 
         return await get_remote_chat_topics(
             user_id=user_id, day=day, message_ids=request.message_ids, load_messages=load_history,
+            cache_only=request.cache_only,
         )
 
     from app.services.chat_topics import get_chat_topics
@@ -1016,6 +1018,7 @@ async def get_day_chat_topics(
         return await get_chat_topics(
             db, user_id=user_id, day=day,
             message_ids=request.message_ids, tz_name=tz_name,
+            cache_only=request.cache_only,
         )
     except _MISSING_TABLE_ERRORS:
         await db.rollback()

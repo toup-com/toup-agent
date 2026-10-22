@@ -237,3 +237,28 @@ def test_timestamp_offsets_normalized_before_legacy_reply_pairing():
     rows = [row("user", "Stop music", occurred_at="2026-10-22T10:00:00-04:00"),
             row("early", "Old reply", "assistant", occurred_at="2026-10-22T13:59:00Z")]
     assert topics._canonical_groups(rows)[1]["early"] == "early"
+
+
+@pytest.mark.parametrize('followup', ['کیه؟', 'کيه', 'چه کسیه؟', 'Who?', 'Who is that?'])
+def test_bare_identity_followup_keeps_professor_goal_and_reply_aliases(followup):
+    rows = [row('professor', 'قوی‌ترین استاد دانشگاه تورنتو توی بحث ال ال ام'),
+            row('who', followup), row('progress', 'Let me check.', 'assistant')]
+    groups, aliases = topics._canonical_groups(rows)
+    assert set(groups) == {'professor'}
+    assert {aliases[key] for key in ('professor', 'who', 'progress')} == {'professor'}
+    assert groups['professor']['input']['source_text'] == rows[0]['content']
+    assert groups['professor']['input']['followup_intents'] == [followup]
+    assert 'Let me check' not in str(groups['professor']['input'])
+
+
+@pytest.mark.parametrize('question', ['Who is Ada Lovelace?', 'ایلان ماسک کیه؟', 'چند سالشه؟', 'When will he die?'])
+def test_explicit_identity_and_factual_questions_remain_separate(question):
+    groups, aliases = topics._canonical_groups([row('professor', 'Find a professor researching LLMs'), row('new', question)])
+    assert set(groups) == {'professor', 'new'}
+    assert aliases['new'] == 'new'
+
+
+def test_bare_identity_never_borrows_another_conversation():
+    groups, aliases = topics._canonical_groups([row('professor', 'Find an LLM professor'), row('who', 'کیه', conversation='other')])
+    assert aliases['who'] == 'who'
+    assert groups['who']['input']['context_before'] == []

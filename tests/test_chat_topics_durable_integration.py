@@ -209,3 +209,55 @@ async def test_generation_rate_limit_releases_claim_without_model_work(durable_d
     async with durable_db() as db:
         row = (await db.execute(select(ChatTopicTitle))).scalar_one()
         assert row.lease_token is None
+
+
+async def test_cache_only_returns_ready_title_with_missing_neighbor_during_generation(durable_db, monkeypatch):
+    args = lease_identity(lease_token=uuid.uuid4().hex)
+    assert await store.claim_generation(**args)
+    assert await store.complete_generation(**args, topic='Test the pause control')
+    topics._REMOTE_CACHE.clear()
+    lock = asyncio.Lock()
+    await lock.acquire()
+    topics._USER_LOCKS[USER] = lock
+    generate = AsyncMock(side_effect=AssertionError('Cache-only cannot invoke model'))
+    claim = AsyncMock(side_effect=AssertionError('Cache-only cannot claim'))
+    complete = AsyncMock(side_effect=AssertionError('Cache-only cannot publish'))
+    release = AsyncMock(side_effect=AssertionError('Cache-only cannot release'))
+    monkeypatch.setattr(topics, '_generate', generate)
+    monkeypatch.setattr(store, 'claim_generation', claim)
+    monkeypatch.setattr(store, 'complete_generation', complete)
+    monkeypatch.setattr(store, 'release_generation', release)
+    rows = [*ROWS, {'id': 'missing', 'role': 'user', 'content': 'Find a restaurant', 'conversation_id': 'other'}]
+    try:
+        result = await asyncio.wait_for(fetch(['reply', 'missing'], rows=rows, cache_only=True), .5)
+    finally:
+        lock.release()
+    assert result['cache_only'] and not result['unavailable']
+    assert [row['message_id'] for row in result['topics']] == ['reply']
+    assert result['topics'][0]['topic'] == 'Test the pause control'
+    assert not topics._RECENT and not topics._RETRY_AFTER
+    for operation in (generate, claim, complete, release):
+        operation.assert_not_awaited()
+    assert (await fetch(['reply'], rows=[], cache_only=True))['topics'] == []
+    assert (await fetch(['reply'], rows=[dict(ROWS[1], channel='admin')], cache_only=True))['topics'] == []
+    assert (await topics.get_remote_chat_topics(user_id='stranger', day=DAY, message_ids=['reply'], messages=ROWS, cache_only=True))['topics'] == []
+    assert (await topics.get_remote_chat_topics(user_id=USER, day=date(2026, 10, 21), message_ids=['reply'], messages=ROWS, cache_only=True))['topics'] == []
+    assert (await fetch(rows=[dict(ROWS[0], content='Changed user intent'), ROWS[1]], cache_only=True))['topics'] == []
+
+
+@pytest.mark.parametrize('failure', ['unavailable', 'timeout'])
+async def test_cache_only_store_failure_preserves_ready_local_title(durable_db, monkeypatch, failure):
+    group_value = group()['user-anchor']
+    topics._REMOTE_CACHE[(USER, DAY.isoformat(), 'user-anchor', group_value['fingerprint'])] = ('Test the pause control', topics.time.monotonic() + 60)
+    async def read(**kwargs):
+        if failure == 'unavailable':
+            raise store.TopicStoreUnavailable()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(store, 'load_topic_titles', read)
+    monkeypatch.setattr(topics, '_CACHE_READ_TIMEOUT', .02)
+    monkeypatch.setattr(topics, '_generate', AsyncMock(side_effect=AssertionError('No generation')))
+    rows = [*ROWS, {'id': 'missing', 'role': 'user', 'content': 'Find a restaurant', 'conversation_id': 'other'}]
+    result = await fetch(['reply', 'missing'], rows=rows, cache_only=True)
+    assert result['cache_only'] and result['unavailable']
+    assert [row['message_id'] for row in result['topics']] == ['reply']
+    assert not topics._RECENT and not topics._RETRY_AFTER
