@@ -262,3 +262,30 @@ def test_bare_identity_never_borrows_another_conversation():
     groups, aliases = topics._canonical_groups([row('professor', 'Find an LLM professor'), row('who', 'کیه', conversation='other')])
     assert aliases['who'] == 'who'
     assert groups['who']['input']['context_before'] == []
+
+
+def test_noisy_voice_opener_keeps_clear_language_clarification_without_assistant_guess():
+    rows = [row('entity', 'ایلان ماسک'), row('job', 'چی کاره است'),
+            row('noise', 'سیریننگش'),
+            row('guess', 'Did you mean his wealth?', 'assistant'),
+            row('language', 'Say everything in English'),
+            row('reply', 'Switching to English now.', 'assistant'),
+            row('age', 'How old was he?')]
+    groups, aliases = topics._canonical_groups(rows)
+    assert {aliases[key] for key in ('noise', 'language', 'reply')} == {'noise'}
+    assert aliases['age'] == 'age'
+    turn = groups['noise']['input']
+    assert turn['followup_intents'] == ['Say everything in English']
+    assert 'wealth' not in json.dumps(turn)
+    assert groups['age']['input']['source_text'] == 'How old was he?'
+
+
+def test_language_only_followup_does_not_replace_already_clear_goal():
+    rows = [row('age', 'سن ایلان ماسک چقدر است؟'),
+            row('language', 'Say everything in English'),
+            row('reply', 'He is 55.', 'assistant')]
+    groups, aliases = topics._canonical_groups(rows)
+    assert set(groups) == {'age'}
+    assert {aliases[key] for key in ('age', 'language', 'reply')} == {'age'}
+    assert groups['age']['input']['source_text'] == rows[0]['content']
+    assert groups['age']['input']['followup_intents'] == [rows[1]['content']]

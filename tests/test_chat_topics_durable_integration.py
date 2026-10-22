@@ -261,3 +261,37 @@ async def test_cache_only_store_failure_preserves_ready_local_title(durable_db, 
     assert result['cache_only'] and result['unavailable']
     assert [row['message_id'] for row in result['topics']] == ['reply']
     assert not topics._RECENT and not topics._RETRY_AFTER
+
+
+async def test_large_cache_only_batch_never_expands_generation_limit(monkeypatch):
+    rows = [{'id': f'task-{index}', 'role': 'user', 'content': f'Plan task {index}',
+             'conversation_id': f'conversation-{index}'} for index in range(220)]
+    ids = [row['id'] for row in rows]
+    read_sizes = []
+    async def read(**kwargs):
+        read_sizes.append(len(kwargs['sources']))
+        return {key: 'A prepared subject' for key in kwargs['sources']}
+    monkeypatch.setattr(store, 'load_topic_titles', read)
+    forbidden = AsyncMock(side_effect=AssertionError('Cache-only cannot claim or generate'))
+    monkeypatch.setattr(store, 'claim_generation', forbidden)
+    monkeypatch.setattr(topics, '_generate', forbidden)
+    result = await fetch(ids, rows=rows, cache_only=True)
+    assert len(result['topics']) == 200
+    assert result['topics'][-1]['message_id'] == 'task-199'
+    assert read_sizes == [200]
+    assert not topics._RECENT and not topics._RETRY_AFTER
+    forbidden.assert_not_awaited()
+    # Internal callers remain bounded even when they bypass HTTP validation.
+    topics._REMOTE_CACHE.clear()
+    generated_sizes = []
+    async def generate(_user, turns):
+        generated_sizes.append(len(turns))
+        return {turn['message_id']: 'A generated subject' for turn in turns}
+    monkeypatch.setattr(store, 'load_topic_titles', AsyncMock(return_value={}))
+    monkeypatch.setattr(store, 'claim_generation', AsyncMock(return_value=True))
+    monkeypatch.setattr(store, 'complete_generation', AsyncMock(return_value=True))
+    monkeypatch.setattr(store, 'release_generation', AsyncMock())
+    monkeypatch.setattr(topics, '_generate', generate)
+    result = await fetch(ids, rows=rows)
+    assert generated_sizes == [20] and len(result['topics']) == 20
+    assert store.claim_generation.await_count == 20

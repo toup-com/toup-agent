@@ -288,7 +288,7 @@ async def test_timeout_also_covers_transaction_commit_phase(db, monkeypatch):
 async def test_boundaries_reject_unbounded_retention_and_payloads(db):
     await publish("x" * 50)  # Message.id permits 50, even though UUIDs use 36.
     with pytest.raises(ValueError, match="too many"):
-        await load(sources={str(index): SOURCE for index in range(21)})
+        await load(sources={str(index): SOURCE for index in range(201)})
     with pytest.raises(ValueError, match="retention"):
         await store.claim_generation(**identity(), lease_token=uuid.uuid4().hex, lease_seconds=301)
     token = uuid.uuid4().hex
@@ -326,3 +326,24 @@ def test_additive_migration_platform_only_roundtrip(tmp_path, monkeypatch):
                 assert inspect(conn).get_table_names() == ["users"]
     finally:
         engine.dispose()
+
+
+async def test_two_hundred_read_only_titles_remain_fingerprint_scoped(db):
+    now = datetime.utcnow()
+    async with db() as session:
+        await session.execute(ChatTopicTitle.__table__.insert(), [dict(
+            user_id=USER, day=DAY, canonical_id=f'turn-{index}', fingerprint=SOURCE,
+            version=3, topic=f'Task {index}', created_at=now, updated_at=now,
+            expires_at=now + timedelta(days=1),
+        ) for index in range(200)])
+        await session.commit()
+    sources = {f'turn-{index}': SOURCE for index in range(200)}
+    sources['turn-73'] = OTHER_SOURCE
+    result = await load(sources=sources)
+    assert len(result) == 199 and result['turn-199'] == 'Task 199'
+    assert 'turn-73' not in result
+    assert await load(sources=sources, user_id=OTHER_USER) == {}
+    assert await load(sources=sources, day=DAY - timedelta(days=1)) == {}
+    async with db() as session:
+        rows = (await session.execute(select(ChatTopicTitle))).scalars().all()
+    assert all(row.lease_token is None and row.updated_at == now for row in rows)

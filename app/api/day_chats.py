@@ -16,7 +16,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, and_, or_, func, distinct
 from sqlalchemy.exc import ProgrammingError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -973,8 +973,14 @@ async def list_day_chats(
 
 
 class ChatTopicsRequest(BaseModel):
-    message_ids: List[str] = Field(min_length=1, max_length=20)
+    message_ids: List[str] = Field(min_length=1, max_length=200)
     cache_only: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def bound_generation_batch(self):
+        if not self.cache_only and len(self.message_ids) > 20:
+            raise ValueError("Generation requests allow at most 20 message IDs.")
+        return self
 
 
 @router.post("/{date_str}/topics")

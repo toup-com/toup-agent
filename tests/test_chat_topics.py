@@ -79,6 +79,10 @@ async def test_owned_day_turns_only_and_context_excludes_admin(sessions, monkeyp
             assert "Squares have four equal sides" not in kwargs["messages"][0]["content"]
             assert "INTERNAL OPERATOR TEXT" not in kwargs["messages"][0]["content"]
             assert kwargs["operation_type"] == "system.chat_topic"
+            # The stronger title model keeps the established accounted path
+            # and bounded output/provider deadline; no independent SDK bypass.
+            assert kwargs["model"] == "gpt-6-sol"
+            assert kwargs["max_tokens"] == 1600 and kwargs["timeout"] == 12
             assert "tools" not in kwargs
             return json.dumps({"topics": [{"message_id": t["message_id"], "topic": "Understanding squares and their properties"} for t in turns]})
 
@@ -197,6 +201,7 @@ async def test_endpoint_auth_input_bounds_and_owned_history_read(sessions, monke
         assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor"], "cache_only": True})).status_code == 401
         app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(id="owner", timezone="America/Toronto")
         assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["x"] * 21})).status_code == 422
+        assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["x"] * 201, "cache_only": True})).status_code == 422
         assert (await client.post("/api/day-chats/bad/topics", json={"message_ids": ["x"]})).status_code == 400
         assert (await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["x" * 51]})).status_code == 400
 
@@ -224,7 +229,7 @@ async def test_endpoint_auth_input_bounds_and_owned_history_read(sessions, monke
         assert response.status_code == 200
         assert response.json()["topics"][0]["message_id"] == "anchor"
         assert calls == [("https://tenant.test", "test-agent-key", "2026-10-22/messages", {"limit": 2000})]
-        cached = await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": ["anchor", "missing"], "cache_only": True})
+        cached = await client.post("/api/day-chats/2026-10-22/topics", json={"message_ids": [*[f"missing-{index}" for index in range(199)], "anchor"], "cache_only": True})
         assert cached.status_code == 200
         assert cached.json()["cache_only"] is True and cached.json()["unavailable"] is False
         assert cached.json()["topics"] == response.json()["topics"]
@@ -537,7 +542,8 @@ async def test_local_cache_only_bypasses_generation_lock_and_writes(sessions, mo
         monkeypatch.setattr(topics, '_generate', forbidden)
         try:
             result = await asyncio.wait_for(topics.get_chat_topics(db, user_id='owner', day=date(2026, 10, 22),
-                message_ids=['cached', 'missing', 'foreign', 'hidden'], tz_name='America/Toronto', cache_only=True), .5)
+                message_ids=['missing', 'foreign', 'hidden', *[f'absent-{index}' for index in range(196)], 'cached'],
+                tz_name='America/Toronto', cache_only=True), .5)
         finally:
             lock.release()
         assert result['cache_only'] and not result['unavailable']

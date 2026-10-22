@@ -23,7 +23,7 @@ from app.db.models.chat_topic import ChatTopicTitle
 
 DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_TTL_SECONDS = 90 * 24 * 60 * 60
-MAX_BATCH_SIZE = 20
+MAX_READ_BATCH_SIZE = 200
 _OPERATION_TIMEOUT_SECONDS = 2.0
 _CLEANUP_INTERVAL_SECONDS = 300
 _CLEANUP_BATCH_SIZE = 200
@@ -105,7 +105,7 @@ def _owned_lease(user_id, day, canonical_id, fingerprint, version, lease_token):
 async def load_topic_titles(*, user_id: str, day: date, version: int,
                             sources: dict[str, str]) -> dict[str, str]:
     _scope(user_id, day, version)
-    if len(sources) > MAX_BATCH_SIZE:
+    if len(sources) > MAX_READ_BATCH_SIZE:
         raise ValueError("too many topic anchors")
     for canonical_id, fingerprint in sources.items():
         _source(canonical_id, fingerprint)
